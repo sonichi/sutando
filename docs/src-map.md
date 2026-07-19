@@ -3,14 +3,14 @@
 
 # src/ module map
 
-One line per module, taken from that file's own header comment. This is a
-lookup, not required reading — it is deliberately NOT loaded into every
-session (see CLAUDE.md's note on context budget).
+One line per agent-facing source module, taken from that file's own header
+comment. This is a lookup, not required reading — it is deliberately NOT
+loaded into every session (see CLAUDE.md's note on context budget).
 
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-159 modules indexed.
+162 modules indexed.
 
 ## `src/`
 
@@ -39,7 +39,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
 - **`discord_config.py`** — Workspace-local Sutando-specific Discord configuration (closes #1147).
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
-- **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` —
+- **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
@@ -47,9 +47,9 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
-- **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the
+- **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
 - **`inline-tools.ts`** — Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
-- **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned project-level
+- **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned project-level Claude Code hooks (PreCompact + Stop).
 - **`install-credential-proxy-launchd.sh`** — Install / uninstall the launchd-supervised credential-proxy job.
 - **`install-cron-runner-launchd.sh`** — Install / uninstall the launchd-supervised cron-runner job.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
@@ -58,7 +58,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.
 - **`message_chunking.py`** — Shared message chunking — one fence-aware chunker for every outbound surface.
-- **`migrate-plists-to-logs-dir.sh`** — Migrate ~/Library/LaunchAgents/com.sutando.*.plist StandardOutPath /
+- **`migrate-plists-to-logs-dir.sh`** — Migrate ~/Library/LaunchAgents/com.sutando.*.plist StandardOutPath / StandardErrorPath entries from /Desktop/sutando/src/*.log to /Desktop/sutando/logs/*.log, matching PR #251's runtime-artifacts refactor.
 - **`migrate.sh`** — Sutando Migration Script — bundle current machine state for transfer to new Mac
 - **`migration_safety_helpers.sh`** — PR #1440 — auto-migration safety helpers (Mini review).
 - **`morning-briefing.py`** — Morning briefing for Sutando.
@@ -66,12 +66,12 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
-- **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context
+- **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
-- **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style
-- **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent
-- **`read_discord_channel.py`** — Gated Discord channel reader — the ONLY sanctioned way for the agent to pull a
-- **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool)
+- **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
+- **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
+- **`read_discord_channel.py`** — Gated Discord channel reader — the ONLY sanctioned way for the agent to pull a Discord channel's content into its context.
+- **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)
 - **`recording-tools.ts`** — Recording, video playback, and scroll-and-describe tools.
 - **`remote-gateway-bridge.py`** — remote-gateway-bridge.py — sutando loader for the canonical ag2-sparrow client.
 - **`remote-relay-bridge.py`** — remote-relay-bridge.py — DEPRECATED name; renamed to remote-gateway-bridge.py.
@@ -79,63 +79,69 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
 - **`result_channel_key.py`** — Per-channel pull path for task-result files in `results/`.
-- **`result_markers.py`** — Unified parsing for the result-body protocol markers used by every bridge
+- **`result_markers.py`** — Unified parsing for the result-body protocol markers used by every bridge (discord, slack, telegram, voice/task-bridge).
 - **`result_router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
-- **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the
+- **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission).
+- **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`send_allowlist.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
-- **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to
+- **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`task-bridge.ts`** — Voice → Claude Code session bridge.
-- **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor
+- **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor (issue #1947, built under the architecture names per design R3).
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
-- **`tmux-status.ts`** — Tmux-pane status scraper. Fallback signal for `effectiveAgentState()` when
+- **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
 - **`vault_intercept.py`** — Bridge-level vault secret interception.
 - **`verify-gemini-31.sh`** — Sutando Gemini 3.1 rollout verification
 - **`verify-setup.sh`** — Sutando setup verification — checks everything a new user needs
-- **`vision-tools.ts`** — Vision pipeline — pipe JPEG frames from a source (screen, webcam) into the
+- **`vision-tools.ts`** — Vision pipeline — pipe JPEG frames from a source (screen, webcam) into the Gemini Live voice session.
 - **`vision_push.py`** — Small helper for posting one-shot vision frames to the active voice session.
-- **`voice-agent-config.ts`** — Voice agent tuned-prompt configuration — step 5a-1 of the interaction-planes
+- **`voice-agent-config.ts`** — Voice agent tuned-prompt configuration — step 5a-1 of the interaction-planes refactor (LiveAgentRuntime extraction, slice 1).
 - **`voice-agent.ts`** — Sutando — Voice Interface
 - **`voice-config-switch.ts`** — Voice tool: switch voice-agent's model + googleSearch preset at runtime.
 - **`voice-config.ts`** — Per-surface voice configuration loader.
-- **`voice-connect-resolver.ts`** — Transparent voice-connection tier resolution — picks the best reachable
-- **`voice-context.ts`** — Builds a system prompt for the Claude Code subprocess that injects
+- **`voice-connect-resolver.ts`** — Transparent voice-connection tier resolution — picks the best reachable endpoint for "call your agent" so the user never chooses a tier.
+- **`voice-context.ts`** — Builds a system prompt for the Claude Code subprocess that injects Sutando identity and user context from the memory system.
 - **`voice-error-classifier.ts`** — Classify Gemini Live transport close events into actionable categories.
-- **`voice-key.ts`** — Shared Gemini API-key resolution for voice surfaces (voice-agent,
-- **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes
+- **`voice-key.ts`** — Shared Gemini API-key resolution for voice surfaces (voice-agent, phone-conversation, and any plugin voice surface).
+- **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`web-client.ts`** — Web Audio Client for Sutando
-- **`web-voice-transport.ts`** — <reference lib="dom" />
+- **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_lock.py`** — Atomic per-workspace role lock for sutando singleton enforcement (MC1).
-- **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts. Source this file with:
+- **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts.
+
+## `src/Sutando/`
+
+- **`SutandoConfig.swift`** — SutandoConfig.swift — Swift twin of src/sutando_config.{py,ts}.
+- **`main.swift`** — Sutando Drop Menu Bar App
 
 ## `src/agent/`
 
-- **`start-cli.sh`** — Canonical persistent-core launcher. Runtime-specific behavior lives under
+- **`start-cli.sh`** — Canonical persistent-core launcher.
 
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
-- **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core
+- **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 
 ## `src/agent/codex/cli/`
@@ -155,45 +161,45 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`config.py`** — Narrow config slice for the observability + metering spine (Python twin).
 - **`config.ts`** — Narrow config slice for the observability + metering spine.
 - **`events.py`** — The universal observability event envelope (Python twin of types.ts).
-- **`events.ts`** — The universal observability event envelope. EVERY service, bridge, adapter,
-- **`ids.py`** — Id minting for the observability + metering spine. Zero dependencies.
-- **`ids.ts`** — Id minting for the observability + metering spine. Zero dependencies.
+- **`events.ts`** — The universal observability event envelope.
+- **`ids.py`** — Id minting for the observability + metering spine.
+- **`ids.ts`** — Id minting for the observability + metering spine.
 - **`meter-forward.ts`** — Upstream usage forwarder — the metering EXPORT seam.
 - **`meter.py`** — ``record(u)`` -- the durable usage primitive (Python twin of meter.ts).
-- **`meter.ts`** — `meter.record(u)` — the durable usage primitive. Twin of meter.py.
+- **`meter.ts`** — `meter.record(u)` — the durable usage primitive.
 - **`node.py`** — Node (machine) identity for the observability + metering spine.
 - **`node.ts`** — Node (machine) identity for the observability + metering spine.
 - **`obs.py`** — ``emit(ev)`` -- the single, universal observability facade (Python twin of obs.ts).
-- **`obs.ts`** — `obs.emit(ev)` — the single, universal observability facade. Best-effort,
-- **`realtime-map.ts`** — Realtime surface usage MAP — the pure transform from a raw voice/phone usage
-- **`realtime-normalizer.ts`** — Realtime voice + phone usage → spine primitives, as a composable collector
-- **`realtime.ts`** — Realtime usage CLIENT — the voice agent (`src/voice-agent.ts`) and phone
+- **`obs.ts`** — `obs.emit(ev)` — the single, universal observability facade.
+- **`realtime-map.ts`** — Realtime surface usage MAP — the pure transform from a raw voice/phone usage payload into spine primitives: UsageRecord(s) + the matching `usage.recorded` ObsEvent(s).
+- **`realtime-normalizer.ts`** — Realtime voice + phone usage → spine primitives, as a composable collector Normalizer.
+- **`realtime.ts`** — Realtime usage CLIENT — the voice agent (`src/voice-agent.ts`) and phone server (`skills/phone-conversation`) SEND raw usage payloads to the collector (`POST /ingest/realtime`); the collector's RealtimeNormalizer maps them to spine primitives and writes them through the SAME sink-set + meter ledger as every other source.
 - **`sink.py`** — Observability sinks (Python twin of sink.ts).
-- **`sink.ts`** — Observability sinks. A `Sink` accepts a finished `ObsEvent` and ships it
-- **`ticker.ts`** — Generic interval-based usage ticker — emit usage records while a session is
+- **`sink.ts`** — Observability sinks.
+- **`ticker.ts`** — Generic interval-based usage ticker — emit usage records while a session is live instead of accumulating everything into one end-of-session burst.
 - **`usage.py`** — The usage record (Python twin of types.ts).
-- **`usage.ts`** — The usage record — the durable, billable/attributable primitive. Distinct
+- **`usage.ts`** — The usage record — the durable, billable/attributable primitive.
 
 ## `src/observability/claude/`
 
-- **`_map-util.ts`** — Shared helpers for the Claude Code mappers. Pure. */
-- **`cc-hooks.ts`** — The Claude Code hook INGEST CONTRACT — the strict wire shape the core's hook
-- **`cc-otel.ts`** — The Claude Code OTLP/HTTP metrics INGEST CONTRACT — the wire shape Claude
-- **`cc-records.ts`** — Input types for the Claude Code telemetry mappers — the shapes the three
-- **`hook-map.ts`** — `hookMap(hook, ctx)` — map ONE strictly-typed Claude Code hook to spine
+- **`_map-util.ts`** — Shared helpers for the Claude Code mappers.
+- **`cc-hooks.ts`** — The Claude Code hook INGEST CONTRACT — the strict wire shape the core's hook (`obs-hook.sh`) POSTs to `/ingest/claude-code-hooks`, plus the decoder that turns an `unknown` body into that typed shape.
+- **`cc-otel.ts`** — The Claude Code OTLP/HTTP metrics INGEST CONTRACT — the wire shape Claude Code's native OpenTelemetry exporter POSTs to `/v1/metrics`, plus the decoder that flattens it into the `OtelRecord`s the (already-tested) `otelMap` consumes.
+- **`cc-records.ts`** — Input types for the Claude Code telemetry mappers — the shapes the three sources (OTel, hooks, .jsonl transcript) deliver.
+- **`hook-map.ts`** — `hookMap(hook, ctx)` — map ONE strictly-typed Claude Code hook to spine primitives.
 - **`hook-normalizer.ts`** — Claude Code hooks → spine primitives, as a composable collector Normalizer.
-- **`ids.ts`** — Claude Code id adoption (pure). The interactive core is a process we don't
-- **`jsonl-tail.ts`** — Live `.jsonl` transcript source — the first real `ExecutorSource` for the
-- **`otel-map.ts`** — `otelMap(rec, ctx)` — map one Claude Code OpenTelemetry record (metric, log,
-- **`otel-normalizer.ts`** — Claude Code OTel metrics → spine primitives, as a composable collector
+- **`ids.ts`** — Claude Code id adoption (pure).
+- **`jsonl-tail.ts`** — Live `.jsonl` transcript source — the first real `ExecutorSource` for the interactive core.
+- **`otel-map.ts`** — `otelMap(rec, ctx)` — map one Claude Code OpenTelemetry record (metric, log, or span) to spine primitives.
+- **`otel-normalizer.ts`** — Claude Code OTel metrics → spine primitives, as a composable collector Normalizer.
 
 ## `src/observability/claude/hooks/`
 
-- **`build-hook-settings.mjs`** — Build the Claude Code `--settings` hooks JSON that registers the obs collector
-- **`obs-hook.sh`** — Thin Claude Code obs hook — forwards a raw hook payload (JSON on stdin) to the
+- **`build-hook-settings.mjs`** — Build the Claude Code `--settings` hooks JSON that registers the obs collector hook on every relevant lifecycle + tool event.
+- **`obs-hook.sh`** — Thin Claude Code obs hook — forwards a raw hook payload (JSON on stdin) to the Sutando collector IFF an export endpoint is configured.
 
 ## `src/observability/collector/`
 
 - **`collector.ts`** — Collector — the single, source-agnostic local ingestion point.
-- **`normalizer.ts`** — Normalizer — turns ONE source's raw payload into the universal spine
+- **`normalizer.ts`** — Normalizer — turns ONE source's raw payload into the universal spine vocabulary (ObsEvent / UsageRecord).
 - **`server.ts`** — HTTP shell for the Collector — the long-running local daemon.

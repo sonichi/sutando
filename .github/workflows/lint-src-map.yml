@@ -8,8 +8,8 @@ name: lint-src-map
 # finds something else. AGENTS.md drifted for exactly this reason (a sync script
 # existed, nothing ran it), so this one is wired up from the start.
 #
-# The check fires when a src/ file is added, removed, renamed, or has its header
-# comment edited — all of which change the generated output.
+# The check fires when an indexed source module is added, removed, renamed, or
+# has its extracted purpose edited — all of which change the generated output.
 
 on:
   pull_request:

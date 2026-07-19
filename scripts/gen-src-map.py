@@ -9,7 +9,7 @@ WHY THIS EXISTS
     something lives means grepping, and grepping a 38k-line tree burns the
     context budget CLAUDE.md is otherwise careful to protect.
 
-    The raw material already exists: every top-level src/ file opens with a
+    The raw material already exists: agent-facing source modules carry a
     substantive header comment. This script indexes what is already written
     rather than inventing new prose, so the map cannot drift from the code's own
     description of itself — and a stale entry is a signal the header is stale.
@@ -37,48 +37,125 @@ REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
 OUT = REPO / "docs" / "src-map.md"
 
-SUFFIXES = (".ts", ".py", ".sh", ".mjs")
+SUFFIXES = (".ts", ".py", ".sh", ".mjs", ".swift")
 
 # Directories under src/ that are not agent-facing source.
 SKIP_DIRS = {"node_modules", "__pycache__", ".git", "dist", "build"}
 
-# Lines that open a file but carry no meaning for a reader.
-_NOISE = re.compile(
-    r"^(#!|/\*+$|\*+/$|\"\"\"$|'''$|//\s*$|#\s*$|\*\s*$|-{3,}$|={3,}$)"
-)
-# Comment/docstring markers to strip from the front of a line.
-_LEAD = re.compile(r"^(\s*(?:/\*\*?|\*/?|//+|#+|\"\"\"|''')\s?)")
+# Comment/docstring markers to strip from a captured header block.
+_LEAD = re.compile(r"^\s*(?:/\*\*?|\*|//+|#+|\"\"\"|''')\s?")
+_TRAIL = re.compile(r"\s*(?:\*/|\"\"\"|''')\s*$")
+_SENTENCE = re.compile(r"^(.+?[.!?](?:[`*_)]*))(?=\s|$)")
+
+
+def _clean_comment_line(raw: str) -> str:
+    return _TRAIL.sub("", _LEAD.sub("", raw.strip())).strip()
+
+
+def _comment_block(lines: list[str], start: int) -> tuple[list[str], int] | None:
+    """Return the leading comment/docstring block and the next line index."""
+    first = lines[start].lstrip()
+
+    if first.startswith("/*"):
+        block = []
+        i = start
+        while i < len(lines):
+            block.append(_clean_comment_line(lines[i]))
+            if "*/" in lines[i]:
+                return block, i + 1
+            i += 1
+        return block, i
+
+    delimiter = next((d for d in ('"""', "'''") if first.startswith(d)), None)
+    if delimiter:
+        block = []
+        i = start
+        while i < len(lines):
+            block.append(_clean_comment_line(lines[i]))
+            if i > start and delimiter in lines[i]:
+                return block, i + 1
+            if i == start and lines[i].count(delimiter) > 1:
+                return block, i + 1
+            i += 1
+        return block, i
+
+    prefix = "//" if first.startswith("//") else "#" if first.startswith("#") else None
+    if prefix:
+        block = []
+        i = start
+        while i < len(lines) and lines[i].lstrip().startswith(prefix):
+            block.append(_clean_comment_line(lines[i]))
+            i += 1
+        return block, i
+
+    return None
+
+
+def _purpose_from_block(lines: list[str]) -> str:
+    """Extract one complete purpose sentence/phrase from a comment block."""
+    paragraph = []
+    for line in lines:
+        if not line:
+            if paragraph:
+                break
+            continue
+        paragraph.append(line)
+
+    if not paragraph:
+        return ""
+
+    # Swift MARK headers and a following Usage block are already concise labels.
+    if paragraph[0].startswith("MARK:"):
+        return re.sub(r"^MARK:\s*-\s*", "", paragraph[0]).rstrip(".")
+    if len(paragraph) > 1 and paragraph[1].startswith("Usage:"):
+        return paragraph[0]
+
+    # Join physical wrapping before selecting the first sentence. Returning the
+    # first physical line produced fragments whenever a header wrapped naturally.
+    text = " ".join(paragraph)
+    sentence = _SENTENCE.match(text)
+    return sentence.group(1) if sentence else text
 
 
 def purpose(path: Path) -> str:
-    """First meaningful line of the file's header comment.
+    """First complete purpose sentence/phrase from the file's header comment.
 
     Reads only the top of the file — the header is by definition at the top, and
     scanning whole files would make this slow for no benefit.
     """
     try:
-        head = path.read_text(encoding="utf-8", errors="replace").split("\n")[:25]
+        head = path.read_text(encoding="utf-8", errors="replace").split("\n")[:40]
     except OSError:
         return ""
-    for raw in head:
-        line = raw.strip()
-        if not line or _NOISE.match(line):
+
+    i = 0
+    while i < len(head):
+        line = head[i].strip()
+        if not line:
+            i += 1
             continue
-        stripped = _LEAD.sub("", line).strip()
-        # Skip shebangs, coding cookies, and lines that are pure punctuation.
-        if not stripped or stripped.startswith(("!", "-*-")):
+
+        # Boilerplate may legally precede the module header.
+        if line.startswith(("#!", "# -*-", "from __future__ import")):
+            i += 1
             continue
-        # `from __future__ import ...` is required to precede everything else, so
-        # several modules put it ABOVE their docstring (src/vault_intercept.py,
-        # src/screen-capture-server.py). Treat it as boilerplate and keep looking
-        # — bailing here reported those two as undocumented when they are not.
-        if stripped.startswith("from __future__ import"):
+        if path.suffix == ".swift" and line.startswith("import "):
+            i += 1
             continue
-        # Any other line of code means the file has no header comment — say so
-        # plainly rather than quoting an import statement as if it were a purpose.
-        if re.match(r"^(import|from|const|let|var|export|set |function|def |class |source |\.)", stripped):
+
+        captured = _comment_block(head, i)
+        if captured is None:
             return ""
-        return stripped.rstrip()
+        block, next_i = captured
+
+        # A TypeScript reference directive and its explanatory comment block are
+        # compiler setup, not the module purpose. Continue to the real docblock.
+        if line.startswith("/// <reference"):
+            i = next_i
+            continue
+
+        return _purpose_from_block(block)
+
     return ""
 
 
@@ -104,9 +181,9 @@ def render(rows: list[tuple[str, str]]) -> str:
         "",
         "# src/ module map",
         "",
-        "One line per module, taken from that file's own header comment. This is a",
-        "lookup, not required reading — it is deliberately NOT loaded into every",
-        "session (see CLAUDE.md's note on context budget).",
+        "One line per agent-facing source module, taken from that file's own header",
+        "comment. This is a lookup, not required reading — it is deliberately NOT",
+        "loaded into every session (see CLAUDE.md's note on context budget).",
         "",
         "If an entry reads wrong, the file's header comment is wrong: fix the header",
         "and re-run `python3 scripts/gen-src-map.py`.",
