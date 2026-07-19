@@ -7,7 +7,9 @@
 // so those are NOT covered here. No formatter either — tsc already covers
 // types, and formatting is out of scope for this baseline.
 //
-// Scope is src/ for now. Widen to skills/ and tests/ once src/ is clean.
+// Scope is all first-party TypeScript: src/, skills/, tests/. The rule set is
+// shared — the idioms the relaxations exist for (fail-open catch, deliberate
+// double-escaping, optional-dependency @ts-ignore) appear in all three trees.
 
 import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
@@ -17,10 +19,10 @@ export default tseslint.config(
     ignores: ['node_modules/**', 'packages/**', 'workspace/**', 'dist/**'],
   },
   {
-    files: ['src/**/*.ts'],
+    files: ['src/**/*.ts', 'skills/**/*.ts', 'tests/**/*.ts'],
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     linterOptions: {
-      // src/ already carries hand-written eslint-disable comments (no-console,
+      // The tree already carries hand-written eslint-disable comments (no-console,
       // ban-types) for rules this baseline doesn't enable. Don't report them as
       // unused — `--fix` would strip comments that encode author intent.
       reportUnusedDisableDirectives: 'off',
