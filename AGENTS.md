@@ -286,6 +286,13 @@ immediate one-sentence answers that require no tool calls.
 - Task bridge: `src/task-bridge.ts`
 - Skills: `skills/`
 
+**Looking for where an existing module lives?** [`docs/src-map.md`](docs/src-map.md)
+indexes every file under `src/` with a one-line purpose taken from its own header
+comment. Consult it BEFORE grepping the tree — it is a lookup, deliberately not
+loaded into every session (context budget), and it answers "what is this file
+for", which grep cannot. If an entry reads wrong the file's header comment is
+wrong: fix the header, then re-run `python3 scripts/gen-src-map.py`.
+
 ## Task bridge
 
 Tasks arrive from multiple channels via the same file bridge:
