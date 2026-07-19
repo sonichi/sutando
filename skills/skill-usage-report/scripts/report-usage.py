@@ -80,6 +80,11 @@ def main() -> int:
             try:
                 rec = json.loads(line)
                 slug, ts = rec["slug"], int(rec["ts"])
+                # slug becomes a dict key and a report payload — anything but a
+                # non-empty string is malformed (a list slug raised unhashable
+                # at aggregation time, stranding the claim — review round 4).
+                if not isinstance(slug, str) or not slug:
+                    continue
                 # count is reporter-authored (fold_back) but must stay inside
                 # the malformed-record guard: a bad value would otherwise raise
                 # after log.rename(pending) and strand the claim. Malformed →
@@ -88,10 +93,13 @@ def main() -> int:
                     count = max(1, int(rec.get("count", 1)))
                 except Exception:
                     count = 1
+                # Aggregation lives INSIDE the guard so no malformed shape can
+                # raise after log.rename(pending) — the whole per-record unit
+                # either lands or is skipped.
+                counts[slug] += count
+                last[slug] = max(last[slug], ts)
             except Exception:
                 continue
-            counts[slug] += count
-            last[slug] = max(last[slug], ts)
 
     events = [
         {
