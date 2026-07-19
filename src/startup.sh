@@ -546,7 +546,7 @@ fi
 # Services-status emitter — aggregates sidecar liveness into
 # state/services-status.json for the desktop Settings → Services surface.
 # Single instance per host; ~30s cadence; SIGTERM-clean like the heartbeat.
-if ! pgrep -f "src/services_status.py" > /dev/null 2>&1; then
+if ! pgrep -f "$REPO/src/services_status.py" > /dev/null 2>&1; then
   echo "  Starting services-status emitter..."
   python3 "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
   echo "  ✓ services-status emitter"

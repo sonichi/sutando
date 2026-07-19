@@ -111,6 +111,10 @@ def probe_pidfile(path: Path, pid_alive) -> tuple[str, str, float | None]:
         pid = int(raw)
     except (OSError, ValueError) as e:
         return ("unknown", f"unreadable pidfile: {e}", None)
+    if pid <= 0:
+        # os.kill(0, 0) / negative pids signal the process GROUP, which succeeds
+        # and would read as falsely "running" — a 0/negative pidfile is corrupt.
+        return ("unknown", f"non-positive pid {pid} in pidfile", None)
     if pid_alive(pid):
         return ("running", f"pid {pid}", None)
     return ("offline", f"pid {pid} dead", None)
@@ -278,6 +282,9 @@ def emit_once() -> dict:
 
 
 def run_forever(interval: float = 30.0) -> int:
+    # Clamp to a 1s floor: interval <= 0 would make the sleep slices zero and
+    # spin the loop (continuous CPU + disk writes).
+    interval = max(1.0, interval)
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     while not _SHUTDOWN_REQUESTED:

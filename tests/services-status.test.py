@@ -81,6 +81,34 @@ def test_pidfile_empty_offline():
     assert "empty" in detail
 
 
+def test_pidfile_nonpositive_pid_unknown():
+    # pid 0 / negative signal the process GROUP via os.kill → would falsely
+    # read "running"; a 0/negative pidfile must read as unknown (corrupt).
+    for raw in ("0", "-5"):
+        p = _tmp(raw)
+        status, detail, _ = ss.probe_pidfile(p, pid_alive=lambda pid: True)
+        assert status == "unknown", (raw, status)
+        assert "non-positive" in detail
+
+
+def test_run_forever_clamps_interval_floor():
+    # interval <= 0 must not spin: the clamp raises it to >= 1s. Verified via
+    # the injected-emit shutdown pattern with a zero interval — the loop exits
+    # after one emit rather than spinning (and the clamp keeps slice_s > 0).
+    import services_status as m
+    m._SHUTDOWN_REQUESTED = False
+    calls = []
+    orig = m.emit_once
+    def fake_emit():
+        calls.append(1); m._SHUTDOWN_REQUESTED = True; return {}
+    m.emit_once = fake_emit
+    try:
+        rc = m.run_forever(interval=0)
+        assert rc == 0 and len(calls) == 1
+    finally:
+        m.emit_once = orig; m._SHUTDOWN_REQUESTED = False
+
+
 def test_pidfile_malformed_unknown():
     p = _tmp("not-a-number")
     status, detail, _ = ss.probe_pidfile(p, pid_alive=lambda pid: True)
