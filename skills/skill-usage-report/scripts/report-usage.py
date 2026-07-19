@@ -80,9 +80,17 @@ def main() -> int:
             try:
                 rec = json.loads(line)
                 slug, ts = rec["slug"], int(rec["ts"])
+                # count is reporter-authored (fold_back) but must stay inside
+                # the malformed-record guard: a bad value would otherwise raise
+                # after log.rename(pending) and strand the claim. Malformed →
+                # default 1 (keep the event) rather than drop the record.
+                try:
+                    count = max(1, int(rec.get("count", 1)))
+                except Exception:
+                    count = 1
             except Exception:
                 continue
-            counts[slug] += max(1, int(rec.get("count", 1)))
+            counts[slug] += count
             last[slug] = max(last[slug], ts)
 
     events = [
