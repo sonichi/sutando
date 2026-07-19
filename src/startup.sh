@@ -50,6 +50,30 @@ run_tsx() {
   fi
 }
 
+# G1.5 node-bundle (owner-adopted design 2026-07-19): when the desktop app
+# manages the launch it exports SUTANDO_NODE=<exact bundled node executable>.
+# That runtime's dir wins PATH (covers every `#!/usr/bin/env node` re-exec),
+# and services prefer the pre-built dist/<name>.js artifact under it — no npm
+# install, no tsx, no node_modules at runtime. Dev/OSS hosts (SUTANDO_NODE
+# unset) keep tsx-over-src EXACTLY as before, so a stale dist/ can never
+# shadow live src edits.
+if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ]; then
+  _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
+  case ":$PATH:" in *":$_SUTANDO_NODE_DIR:"*) ;; *) PATH="$_SUTANDO_NODE_DIR:$PATH"; export PATH ;; esac
+fi
+run_node_service() {
+  # $1 = dist basename (build-bundle artifact), $2 = ts entry (as run_tsx
+  # expects it today — relative or absolute), rest = service args.
+  _rns_dist="$REPO/dist/$1.js"
+  _rns_entry="$2"
+  shift 2
+  if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ] && [ -f "$_rns_dist" ]; then
+    "$SUTANDO_NODE" "$_rns_dist" "$@"
+  else
+    run_tsx "$_rns_entry" "$@"
+  fi
+}
+
 # Export workspace-scoped CLAUDE_CONFIG_DIR before services launch. Without it,
 # init.sh + the bridge-launcher blocks below (L~262 proxy, L~429 telegram,
 # L~449 discord, L~473 slack) probe `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and
@@ -580,7 +604,7 @@ fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
   _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
-  run_tsx "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
+  run_node_service credential-proxy "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"
@@ -608,7 +632,7 @@ if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
-      run_tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
+      run_node_service boot "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
     echo "  ✓ obs collector"
   else
     echo "  ✓ obs collector (already running on $OBS_PORT)"
@@ -673,7 +697,7 @@ else
     fi
   elif ! lsof -i :9900 > /dev/null 2>&1; then
     echo "  Starting voice agent (port 9900)..."
-    run_tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
+    run_node_service voice-agent src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
     echo "  ✓ voice agent"
   else
     echo "  ✓ voice agent (already running)"
@@ -688,7 +712,7 @@ fi
 # back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
 # advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
 # post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
-run_tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+run_node_service emit-call-tiers src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
 echo "  ✓ call-tiers advertisement (re-emit 60s)"
 
 # 2. Web client (port 8080 by default; CLIENT_PORT may avoid a local conflict)
@@ -713,7 +737,7 @@ if [ "$WEB_CLIENT_PORT" = "8080" ] && launchctl print "gui/$(id -u)/com.sutando.
   fi
 elif ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
   echo "  Starting web client (port $WEB_CLIENT_PORT)..."
-  run_tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
+  run_node_service web-client src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running on $WEB_CLIENT_PORT)"
@@ -1026,7 +1050,7 @@ elif ! phone_stack_enabled; then
 elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
-    run_tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
+    run_node_service conversation-server skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
     echo "  ✓ conversation server (port 3100)"
   else
     echo "  ✓ conversation server (already running)"

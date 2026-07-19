@@ -27,6 +27,7 @@ set -euo pipefail
 # on the supervised launchd path too — not just src/startup.sh (Codex #2154).
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 for _node_cand in \
+    "${SUTANDO_NODE:-}" \
     /opt/homebrew/bin/node \
     /usr/local/bin/node \
     "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/node" \
@@ -94,6 +95,15 @@ kill_stale_holder() {
 }
 
 kill_stale_holder
+
+# G1.5 node-bundle: when the plist exports SUTANDO_NODE (desktop-managed
+# install), run the pre-built dist artifact directly under the pinned
+# runtime — no tsx, no node_modules. Falls through to the tsx path when
+# unset (dev/OSS) or when the artifact is absent (pre-bundle checkout).
+DIST_PROXY="$REPO_ROOT/dist/credential-proxy.js"
+if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ] && [ -f "$DIST_PROXY" ]; then
+    exec "$SUTANDO_NODE" "$DIST_PROXY"
+fi
 
 # Resolve and run.
 TSX_BIN=$(resolve_tsx 2>/dev/null) || true

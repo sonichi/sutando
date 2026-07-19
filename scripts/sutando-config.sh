@@ -254,6 +254,28 @@ print(_host_label(), end='')
     printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
     ;;
 
+  node-bin)
+    # SINGLE SOURCE OF TRUTH for the Node executable (G1.5 node-bundle,
+    # owner-adopted design 2026-07-19). Precedence:
+    #   1. $SUTANDO_NODE — the EXACT executable, exported by the desktop app
+    #      when it manages the launch (its pinned bundled runtime always wins).
+    #   2. app-node-dir/node — the bundled runtime found at its default home
+    #      (covers launchd jobs whose plist doesn't export SUTANDO_NODE).
+    #   3. first `node` on PATH — dev/OSS hosts, unchanged behavior.
+    # Prints the resolved path, or nothing — the caller decides how to fail
+    # (same contract as tsx-bin).
+    if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ]; then
+      printf '%s' "$SUTANDO_NODE"
+    else
+      _app_node="${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}/node"
+      if [ -x "$_app_node" ]; then
+        printf '%s' "$_app_node"
+      else
+        command -v node 2>/dev/null || true
+      fi
+    fi
+    ;;
+
   tsx-bin)
     # SINGLE SOURCE OF TRUTH for tsx resolution — the launchd wrapper and
     # src/startup.sh both call this instead of each duplicating the candidate
