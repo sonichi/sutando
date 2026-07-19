@@ -211,14 +211,26 @@ def check_node_runtime() -> dict:
             "status": "warn",
             "detail": f"bundled runtime dir present but its node is unusable — running on system node {resolved['path']} (pinned-runtime guarantee NOT in effect)",
         }
-    version = ""
+    # Executable permission alone doesn't prove the runtime can launch the
+    # bundled services (Codex re-review F3): a --version that errors or fails
+    # to run means every JS service dies at spawn — that is DOWN, not ok.
     try:
         out = subprocess.run(
             [resolved["path"], "--version"], capture_output=True, text=True, timeout=5
         )
+        if out.returncode != 0:
+            return {
+                "name": "node-runtime",
+                "status": "down",
+                "detail": f"node at {resolved['path']} failed --version (rc={out.returncode}) — runtime not runnable",
+            }
         version = out.stdout.strip()
-    except Exception:
-        version = "version probe failed"
+    except Exception as exc:
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"node at {resolved['path']} could not be executed ({exc}) — runtime not runnable",
+        }
     return {
         "name": "node-runtime",
         "status": "ok",

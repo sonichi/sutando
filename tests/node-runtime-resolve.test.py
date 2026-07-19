@@ -112,9 +112,9 @@ class CheckNodeRuntimeTest(unittest.TestCase):
         self.assertIn("v99.0.0", out["detail"])
         self.assertIn("bundled", out["detail"])
 
-    def test_ok_survives_version_probe_failure(self):
-        # A resolvable-but-broken binary still reports ok with a probe note —
-        # existence is the check's job; runnability shows in the detail.
+    def test_down_when_version_probe_fails(self):
+        # Codex re-review F3: a resolvable-but-broken binary means every JS
+        # service dies at spawn — that is DOWN, not ok-with-a-note.
         with tempfile.TemporaryDirectory() as td:
             broken = Path(td) / "node"
             broken.write_text("not a script")
@@ -125,7 +125,8 @@ class CheckNodeRuntimeTest(unittest.TestCase):
                 out = hc.check_node_runtime()
             finally:
                 hc.resolve_node_runtime = orig
-        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["status"], "down")
+        self.assertIn("not runnable", out["detail"])
 
 
 if __name__ == "__main__":

@@ -96,13 +96,33 @@ kill_stale_holder() {
 
 kill_stale_holder
 
-# G1.5 node-bundle: when the plist exports SUTANDO_NODE (desktop-managed
-# install), run the pre-built dist artifact directly under the pinned
-# runtime — no tsx, no node_modules. Falls through to the tsx path when
-# unset (dev/OSS) or when the artifact is absent (pre-bundle checkout).
+# G1.5 node-bundle (Codex re-review F1b): the wrapper enforces the SAME
+# resolver + fail-closed + mode contract as startup.sh. node-bin exits 1 on a
+# set-but-invalid SUTANDO_NODE — that is a desktop packaging error and the
+# job must FAIL (KeepAlive backs off on ThrottleInterval), never silently
+# slide to tsx/npx on whatever node the host has. Bundled context = explicit
+# env OR this wrapper running from the packaged engine copy (repo inside the
+# engine root that owns the at-rest runtime); in that context the dist
+# artifact is REQUIRED.
+NODE_BIN="$(bash "$REPO_ROOT/scripts/sutando-config.sh" node-bin)" || {
+    echo "credential-proxy-wrapper: SUTANDO_NODE set but invalid — desktop packaging error; fail-closed (no PATH/tsx fallback)" >&2
+    exit 78
+}
+_W_APP_NODE_DIR="$(bash "$REPO_ROOT/scripts/sutando-config.sh" app-node-dir)"
+_W_ENGINE_ROOT="${_W_APP_NODE_DIR%/node/bin}"; _W_ENGINE_ROOT="${_W_ENGINE_ROOT%/runtime}"
+_W_BUNDLED=0
+if [ -n "${SUTANDO_NODE:-}" ]; then
+    _W_BUNDLED=1
+elif [ -x "$_W_APP_NODE_DIR/node" ] && [ "${REPO_ROOT#"$_W_ENGINE_ROOT"/}" != "$REPO_ROOT" ]; then
+    _W_BUNDLED=1
+fi
 DIST_PROXY="$REPO_ROOT/dist/credential-proxy.js"
-if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ] && [ -f "$DIST_PROXY" ]; then
-    exec "$SUTANDO_NODE" "$DIST_PROXY"
+if [ "$_W_BUNDLED" = "1" ]; then
+    if [ ! -f "$DIST_PROXY" ]; then
+        echo "credential-proxy-wrapper: bundled mode but $DIST_PROXY missing — desktop packaging error; fail-closed" >&2
+        exit 78
+    fi
+    exec "$NODE_BIN" "$DIST_PROXY"
 fi
 
 # Resolve and run.
