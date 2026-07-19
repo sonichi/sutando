@@ -55,7 +55,7 @@ function archiveFile(srcPath: string, kind: 'tasks' | 'results', taskId: string)
 		const destDir = join(REPO_DIR, kind, 'archive', ym);
 		mkdirSync(destDir, { recursive: true });
 		renameSync(srcPath, join(destDir, `${taskId}.txt`));
-	} catch (err) {
+	} catch {
 		try { unlinkSync(srcPath); } catch { /* ignore */ }
 	}
 }

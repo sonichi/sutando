@@ -65,6 +65,12 @@ jobs:
       - name: Typecheck skills
         run: npm run typecheck:skills
 
+      # ESLint baseline over src/. Errors fail the build; the ~41 no-explicit-any
+      # findings are warnings by design so the count stays visible without
+      # blocking. See eslint.config.mjs for why individual rules are tuned off.
+      - name: Lint
+        run: npm run lint
+
       # Skill-manifest validator + its own test. The test lives next to the code
       # in scripts/ (not tests/), so the standalone-Python-test step below won't
       # discover it — wire both explicitly here. `--all --strict` validates every
