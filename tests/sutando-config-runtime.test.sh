@@ -174,6 +174,29 @@ vc11="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys
 [ "$vc11" = "http://127.0.0.1:7847" ]; report "$?" "vision_control=$vc11 == default (non-loopback 10.0.0.5 rejected)"
 rm -rf "$T9WS"; rm -f "$CFG"; [ -n "$CFG_BAK" ] && mv "$CFG_BAK" "$CFG"
 
+# -- Test 12: ag2space.connected — legacy .env + AG2_REMOTE_TOKEN alias (#2178 P1) --
+# OSS-path enrollments write channels/ag2space/.env (not relay-client.env), and
+# older ones carry AG2_REMOTE_TOKEN (the alias startup.sh + health-check.py
+# recognize). The probe must report connected for BOTH filenames and BOTH keys —
+# else an enrolled legacy install is offered a fresh identity by the desktop
+# onboarding dialog (the bug #2178 exists to fix).
+echo "[12] runtime.ag2space → connected for legacy .env + AG2_REMOTE_TOKEN (and both canonical shapes)"
+CFG="$REPO_DIR/sutando.config.local.json"; CFG_BAK=""
+[ -f "$CFG" ] && { CFG_BAK="$(mktemp)"; cp "$CFG" "$CFG_BAK"; }
+T12WS="$(mktemp -d)"; mkdir -p "$T12WS/state" "$T12WS/.claude-sutando/channels/ag2space"
+printf '{"workspace":{"path":"%s"}}' "$T12WS" > "$CFG"
+printf 'AG2_REMOTE_TOKEN=tok\n' > "$T12WS/.claude-sutando/channels/ag2space/.env"
+c12a="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["ag2space"]["connected"])')"
+[ "$c12a" = "True" ]; report "$?" "ag2space.connected=$c12a for legacy .env + AG2_REMOTE_TOKEN"
+printf 'REMOTE_TASK_TOKEN=tok\n' > "$T12WS/.claude-sutando/channels/ag2space/.env"
+c12b="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["ag2space"]["connected"])')"
+[ "$c12b" = "True" ]; report "$?" "ag2space.connected=$c12b for legacy .env + REMOTE_TASK_TOKEN"
+rm -f "$T12WS/.claude-sutando/channels/ag2space/.env"
+printf 'REMOTE_TASK_TOKEN=tok\n' > "$T12WS/.claude-sutando/channels/ag2space/relay-client.env"
+c12c="$(bash "$SCRIPT" runtime | python3 -c 'import json,sys;print(json.load(sys.stdin)["ag2space"]["connected"])')"
+[ "$c12c" = "True" ]; report "$?" "ag2space.connected=$c12c for canonical relay-client.env"
+rm -rf "$T12WS"; rm -f "$CFG"; [ -n "$CFG_BAK" ] && mv "$CFG_BAK" "$CFG"
+
 echo
 echo "sutando-config-runtime: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -463,7 +463,9 @@ for _envname in ('relay-client.env', '.env'):
                 if _line and not _line.startswith('#') and '=' in _line:
                     _k, _, _v = _line.partition('=')
                     _kv[_k.strip()] = _v.strip()
-        if _kv.get('REMOTE_TASK_TOKEN'):
+        # AG2_REMOTE_TOKEN is the legacy alias for the same enrollment
+        # (startup.sh + health-check.py both recognize it) — either counts.
+        if _kv.get('REMOTE_TASK_TOKEN') or _kv.get('AG2_REMOTE_TOKEN'):
             probe_ag2space['connected'] = True
             break
     except Exception:
