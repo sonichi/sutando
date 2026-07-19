@@ -2518,6 +2518,9 @@ async def _handle_discord_message(message, force=False):
             return
 
         bot_mentioned = client.user in message.mentions
+        # role_mentioned counts as "addressed to us" — assumes these roles are held
+        # only by this bot; a role shared across sibling bots re-introduces the
+        # mass-answer this gate exists to prevent.
         role_mentioned = any(role.name.lower() in ("sutando", "sutando bot") or str(client.user.id) in str(role.id) for role in message.role_mentions)
         # Also check if any role mention exists and the bot has that role
         if not role_mentioned and message.role_mentions and message.guild:
