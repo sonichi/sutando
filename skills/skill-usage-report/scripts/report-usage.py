@@ -47,11 +47,14 @@ def main() -> int:
     log = ws / "state" / "skill-usage-log.jsonl"
     pending = log.with_suffix(".jsonl.reporting")
 
-    # Fold back a previous failed report, then claim the current log.
+    # Recover a previously claimed log (failed or crashed mid-report), then
+    # claim the current one. A crash between rename and fold-back leaves ONLY
+    # the .reporting file — handle pending-with-no-active by plain rename.
     if pending.exists():
-        with pending.open("a", encoding="utf-8") as out, log.open("r", encoding="utf-8") as cur:
-            out.write(cur.read())
-        log.unlink()
+        if log.exists():
+            with pending.open("a", encoding="utf-8") as out, log.open("r", encoding="utf-8") as cur:
+                out.write(cur.read())
+            log.unlink()
         pending.rename(log)
     if not log.exists() or log.stat().st_size == 0:
         print("usage-report: nothing to report")
@@ -79,7 +82,7 @@ def main() -> int:
                 slug, ts = rec["slug"], int(rec["ts"])
             except Exception:
                 continue
-            counts[slug] += 1
+            counts[slug] += max(1, int(rec.get("count", 1)))
             last[slug] = max(last[slug], ts)
 
     events = [
@@ -89,35 +92,56 @@ def main() -> int:
             "lastUsedAt": datetime.fromtimestamp(last[slug], tz=timezone.utc).isoformat(),
         }
         for slug in counts
-    ][:MAX_EVENTS]
+    ]
     if not events:
         pending.unlink()
         print("usage-report: log had no parseable events")
         return 0
 
-    req = urllib.request.Request(
-        f"{CLOUD}/api/skills/usage",
-        data=json.dumps({"agentId": agent, "events": events}).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = json.load(resp)
-    except Exception as e:
-        # Fold back so nothing is lost; next run retries.
-        if log.exists():
-            with pending.open("a", encoding="utf-8") as out, log.open("r", encoding="utf-8") as cur:
-                out.write(cur.read())
-            log.unlink()
-        pending.rename(log)
-        print(f"usage-report: POST failed ({e}) — log kept for retry")
-        return 0
+    def fold_back(remaining: list) -> None:
+        # Persist unsent slugs back into the ACTIVE log as count-carrying
+        # records (the aggregator honors "count"), then release the claim.
+        # Appending keeps any events that arrived mid-report; order is
+        # irrelevant — aggregation is commutative.
+        with log.open("a", encoding="utf-8") as f:
+            for ev in remaining:
+                f.write(
+                    json.dumps(
+                        {
+                            "slug": ev["slug"],
+                            "ts": int(datetime.fromisoformat(ev["lastUsedAt"]).timestamp()),
+                            "count": ev["count"],
+                        }
+                    )
+                    + "\n"
+                )
+        pending.unlink()
+
+    accepted = skipped = sent = 0
+    for i in range(0, len(events), MAX_EVENTS):
+        chunk = events[i : i + MAX_EVENTS]
+        req = urllib.request.Request(
+            f"{CLOUD}/api/skills/usage",
+            data=json.dumps({"agentId": agent, "events": chunk}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.load(resp)
+        except Exception as e:
+            fold_back(events[i:])
+            print(
+                f"usage-report: POST failed ({e}) after {sent} slug(s) — "
+                f"{len(events) - i} unsent slug(s) folded back for retry"
+            )
+            return 0
+        accepted += int(body.get("accepted") or 0)
+        skipped += int(body.get("skipped") or 0)
+        sent += len(chunk)
 
     pending.unlink()
-    print(
-        f"usage-report: {len(events)} slug(s) reported — accepted={body.get('accepted')} skipped={body.get('skipped')}"
-    )
+    print(f"usage-report: {sent} slug(s) reported — accepted={accepted} skipped={skipped}")
     return 0
 
 

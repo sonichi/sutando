@@ -50,3 +50,12 @@ feature and would accumulate junk rows).
   reporter is idempotent-safe to re-run (server folds counts additively and
   uses GREATEST on timestamps, so a duplicated batch inflates counts but can
   never move last-used backwards; the rename-claim makes duplicates unlikely).
+- v0.1.1 — 2026-07-19 — review fixes (PR #2180 blocking findings): (1)
+  pending-only recovery — a crash between the rename-claim and fold-back left
+  `.reporting` with no active log; the next run then crashed on `log.open`.
+  Recovery now renames pending back when the active log is absent. (2) >100
+  distinct slugs were silently dropped (aggregate sliced to MAX_EVENTS but the
+  claimed file was deleted whole). Reports now send in chunks of 100; on
+  mid-run failure the unsent remainder is folded back into the active log as
+  count-carrying records (`{"slug","ts","count"}` — the aggregator honors
+  `count`), so nothing is ever lost.
