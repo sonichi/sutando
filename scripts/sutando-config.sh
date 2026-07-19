@@ -450,18 +450,24 @@ except Exception:
 # enrolled before it existed -> null, and consumers should treat null as
 # 'enrolled, identity unknown', not 'not enrolled'.
 probe_ag2space = {'connected': False, 'agent_id': None, 'owner': None}
-try:
-    _kv = {}
-    with open(os.path.join(brain, 'channels', 'ag2space', 'relay-client.env')) as f:
-        for _line in f:
-            _line = _line.strip()
-            if _line and not _line.startswith('#') and '=' in _line:
-                _k, _, _v = _line.partition('=')
-                _kv[_k.strip()] = _v.strip()
-    if _kv.get('REMOTE_TASK_TOKEN'):
-        probe_ag2space['connected'] = True
-except Exception:
-    pass
+# Reader fallback (repo convention): relay-client.env is the canonical creds
+# file, but installs enrolled via the OSS path (onboard.sh -> startup.sh) and
+# the AG2 Space desktop launcher (AG2_DEVICE_ENV) write channels/ag2space/.env
+# instead. Try canonical first, then legacy, before concluding not-connected.
+for _envname in ('relay-client.env', '.env'):
+    try:
+        _kv = {}
+        with open(os.path.join(brain, 'channels', 'ag2space', _envname)) as f:
+            for _line in f:
+                _line = _line.strip()
+                if _line and not _line.startswith('#') and '=' in _line:
+                    _k, _, _v = _line.partition('=')
+                    _kv[_k.strip()] = _v.strip()
+        if _kv.get('REMOTE_TASK_TOKEN'):
+            probe_ag2space['connected'] = True
+            break
+    except Exception:
+        pass
 try:
     with open(os.path.join(ws, 'state', 'auth', 'ag2space.json')) as f:
         _aid = json.load(f).get('agent_id') or ''
