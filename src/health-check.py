@@ -40,6 +40,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_config import resolve_core_runtime  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -2479,7 +2480,8 @@ def notify_slack_for_failures(
 # makes it SELF-HEALING.
 #
 # Recovery action is the one mechanism we already own and trust:
-# `src/agent/claude/cli/start-cli.sh --restart`. A restarted session starts fresh under the
+# `src/agent/start-cli.sh --restart`. The dispatcher restarts whichever core
+# runtime is configured. A restarted session starts fresh under the
 # standard context boundary; because the /usage-credits enable persists
 # ACCOUNT-WIDE once a human sets it (and on Max/Team plans 1M is included with
 # no gate at all), the restarted core keeps 1M and re-clears the gate by
@@ -2629,15 +2631,16 @@ def _resolve_launch_env() -> dict:
 
 
 def _default_core_restart(standard_context: bool) -> bool:
-    """Run src/agent/claude/cli/start-cli.sh --restart out-of-process. When
-    standard_context is True, pin SUTANDO_CORE_MODEL=opus so the restarted core
-    runs in the standard 200K window (graceful degradation). Returns True if the
-    restart command exited 0."""
-    script = REPO_DIR / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
+    """Run the selected core CLI dispatcher with --restart out-of-process. When
+    standard_context is True and Claude is selected, pin
+    SUTANDO_CORE_MODEL=opus so the restarted core uses the standard 200K window.
+    Codex restarts without a provider-specific model override. Returns True if
+    the restart command exited 0."""
+    script = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not script.exists():
         return False
     env = _resolve_launch_env()  # pragma: no cover — real-subprocess restart path (integration, not unit)
-    if standard_context:
+    if standard_context and resolve_core_runtime(REPO_DIR) == "claude":
         env["SUTANDO_CORE_MODEL"] = "opus"
     try:
         proc = subprocess.run(

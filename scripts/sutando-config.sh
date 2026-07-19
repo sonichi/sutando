@@ -190,6 +190,15 @@ print(entry['env_name'], end='')
 "
     ;;
 
+  core-runtime)
+    python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_core_runtime
+print(resolve_core_runtime(), end='')
+"
+    ;;
+
   core-config-dir-value)
     # v0.9 — print the resolved value (absolute path) of the matching
     # core_config_dirs entry. Selector semantics identical to
@@ -491,7 +500,7 @@ print(json.dumps({
     ;;
 
   *)
-    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

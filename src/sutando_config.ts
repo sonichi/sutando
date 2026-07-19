@@ -37,7 +37,14 @@ const LOCAL_FILENAME = 'sutando.config.local.json';
  * stays lenient (warn-only) so experimental/scratch keys don't break.
  * Per Mini's review #8 on PR #1395.
  */
-const KNOWN_TOP_LEVEL_KEYS = new Set(['workspace', 'claude_sutando_config_dir', 'vault']);
+const KNOWN_TOP_LEVEL_KEYS = new Set([
+	'core',
+	'workspace',
+	'claude_sutando_config_dir',
+	'core_config_dirs',
+	'vault',
+	'migrate',
+]);
 
 /**
  * Walk upward from `start` until we find a directory containing
@@ -370,6 +377,22 @@ export function resolveVault(repoRoot?: string): VaultConfig {
 		},
 		interval_seconds: typeof vault.interval_seconds === 'number' ? vault.interval_seconds : 1800,
 	};
+}
+
+export type CoreRuntime = 'claude' | 'codex';
+
+/** Resolve the persistent core CLI runtime. */
+export function resolveCoreRuntime(repoRoot?: string): CoreRuntime {
+	const cfg = loadConfig(repoRoot);
+	const core = (cfg.core as { [k: string]: Json } | undefined) ?? {};
+	const configured = typeof core.runtime === 'string' ? core.runtime.trim() : 'claude';
+	const runtime = process.env.SUTANDO_CORE_RUNTIME?.trim() || configured || 'claude';
+	if (runtime !== 'claude' && runtime !== 'codex') {
+		throw new Error(
+			`sutando config: unsupported core.runtime=${JSON.stringify(runtime)}; expected one of: claude, codex`,
+		);
+	}
+	return runtime;
 }
 
 const DEFAULT_CLAUDE_SUTANDO_SUBDIR = '.claude-sutando';

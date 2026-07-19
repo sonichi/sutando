@@ -37,6 +37,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -551,7 +552,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
             watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
-            claude_ok = subprocess.run(["/usr/bin/pgrep", "-f", "claude.*sutando-core"], capture_output=True).returncode == 0
+            # Historical response key is `claude`; its meaning is now "selected
+            # core CLI is alive" so existing web clients remain compatible.
+            try:
+                tmux_bin = (shutil.which("tmux") or
+                            next((p for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")
+                                  if Path(p).is_file()), None))
+                claude_ok = bool(tmux_bin) and subprocess.run(
+                    [tmux_bin, "-S", os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
+                     "has-session", "-t", "=sutando-core"], capture_output=True,
+                ).returncode == 0
+            except OSError:
+                claude_ok = False
             # Scan disk for active tasks, update history (preserve existing text)
             for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
                 task_id = f.stem
