@@ -192,6 +192,44 @@ def _register_key(key: str) -> None:
     os.replace(tmp, path)
 
 
+def _deregister_key(key: str) -> None:
+    manifest = _read_manifest()
+    if key not in manifest:
+        return
+    del manifest[key]
+    path = _manifest_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Atomic write — same pattern as _register_key so concurrent bridge
+    # processes won't corrupt keys.json.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, path)
+
+
+def delete_vault_key(key: str) -> None:
+    """Remove a secret from Keychain + manifest — the public delete path.
+
+    Counterpart to set_vault_key for callers that need to forget a stored
+    secret (CLI `delete` verb; the desktop's cloud_logout forgetting the
+    `sutk_` bearer). Removes the Keychain item AND deregisters the manifest
+    entry; tolerates the two drifting (a manifest entry with no Keychain item,
+    or vice versa, is cleaned up rather than erroring). Raises ValueError on
+    an invalid key name; KeyError when the key exists in neither place.
+    """
+    if not _ENV_KEY_RE.match(key or ""):
+        raise ValueError(f"vault: invalid key name '{key}' (want [A-Za-z_][A-Za-z0-9_]*)")
+    result = subprocess.run(
+        ["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
+        capture_output=True,
+    )
+    keychain_had_it = result.returncode == 0
+    manifest_had_it = key in _read_manifest()
+    if not keychain_had_it and not manifest_had_it:
+        raise KeyError(f"vault: key '{key}' not found")
+    _deregister_key(key)
+
+
 def list_vault_keys() -> list[str]:
     """Return all key names stored in the vault manifest (no values)."""
     return sorted(_read_manifest().keys())

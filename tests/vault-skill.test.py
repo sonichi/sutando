@@ -124,6 +124,67 @@ class TestSetVaultKey(unittest.TestCase):
         mock_store.assert_not_called()
 
 
+class TestDeleteVaultKey(unittest.TestCase):
+    def test_deletes_from_keychain_and_manifest(self):
+        mock_result = MagicMock(returncode=0, stdout=b"", stderr=b"")
+        with patch("subprocess.run", return_value=mock_result) as mock_run, \
+             patch.object(vault_intercept, "_read_manifest", return_value={"MY_KEY": {}}), \
+             patch.object(vault_intercept, "_deregister_key") as mock_dereg:
+            vault_intercept.delete_vault_key("MY_KEY")
+        self.assertIn("delete-generic-password", mock_run.call_args[0][0])
+        mock_dereg.assert_called_once_with("MY_KEY")
+
+    def test_manifest_only_entry_still_deregisters(self):
+        # Keychain item already gone (drift) — the manifest entry is cleaned up
+        # rather than erroring.
+        mock_result = MagicMock(returncode=44, stdout=b"", stderr=b"not found")
+        with patch("subprocess.run", return_value=mock_result), \
+             patch.object(vault_intercept, "_read_manifest", return_value={"MY_KEY": {}}), \
+             patch.object(vault_intercept, "_deregister_key") as mock_dereg:
+            vault_intercept.delete_vault_key("MY_KEY")
+        mock_dereg.assert_called_once_with("MY_KEY")
+
+    def test_raises_key_error_when_nowhere(self):
+        mock_result = MagicMock(returncode=44, stdout=b"", stderr=b"not found")
+        with patch("subprocess.run", return_value=mock_result), \
+             patch.object(vault_intercept, "_read_manifest", return_value={}), \
+             patch.object(vault_intercept, "_deregister_key") as mock_dereg:
+            with self.assertRaises(KeyError):
+                vault_intercept.delete_vault_key("MISSING")
+        mock_dereg.assert_not_called()
+
+    def test_rejects_invalid_key_names(self):
+        for bad in ("", "has space", "has-dash", "a=b"):
+            with patch("subprocess.run") as mock_run:
+                with self.assertRaises(ValueError):
+                    vault_intercept.delete_vault_key(bad)
+            mock_run.assert_not_called()
+
+
+class TestDeregisterKey(unittest.TestCase):
+    def test_removes_key_and_rewrites_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "keys.json")
+            with open(path, "w") as f:
+                json.dump({"KEEP": {"stored_at": "x"}, "DROP": {"stored_at": "y"}}, f)
+            with patch.object(vault_intercept, "_manifest_path", return_value=path), \
+                 patch.object(vault_intercept, "_read_manifest",
+                              return_value={"KEEP": {"stored_at": "x"}, "DROP": {"stored_at": "y"}}):
+                vault_intercept._deregister_key("DROP")
+            with open(path) as f:
+                manifest = json.load(f)
+        self.assertEqual(list(manifest.keys()), ["KEEP"])
+
+    def test_absent_key_is_a_noop_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "keys.json")
+            with patch.object(vault_intercept, "_manifest_path", return_value=path), \
+                 patch.object(vault_intercept, "_read_manifest", return_value={"KEEP": {}}):
+                vault_intercept._deregister_key("NOT_THERE")
+            # No manifest file written for a no-op deregister.
+            self.assertFalse(os.path.exists(path))
+
+
 class TestRegisterKey(unittest.TestCase):
     def _patch_paths(self, canonical, legacy):
         return (
@@ -226,6 +287,22 @@ class TestVaultCliGet(unittest.TestCase):
         with patch("vault.get_vault_key", side_effect=KeyError("not found")):
             with self.assertRaises(SystemExit) as cm:
                 vault_cli.cmd_get("MISSING")
+        self.assertEqual(cm.exception.code, 1)
+
+
+class TestVaultCliDelete(unittest.TestCase):
+    def test_prints_confirmation(self):
+        with patch("vault.delete_vault_key") as mock_del:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                vault_cli.cmd_delete("MY_KEY")
+        mock_del.assert_called_once_with("MY_KEY")
+        self.assertIn("deleted 'MY_KEY'", buf.getvalue())
+
+    def test_exits_1_on_missing_key(self):
+        with patch("vault.delete_vault_key", side_effect=KeyError("not found")):
+            with self.assertRaises(SystemExit) as cm:
+                vault_cli.cmd_delete("MISSING")
         self.assertEqual(cm.exception.code, 1)
 
 
