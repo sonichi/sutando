@@ -6,6 +6,8 @@ plus the payload assembly and atomic write. No real processes or sockets: the
 `pid_alive`/`connect` callables are injected, and `.alive`/pidfiles are temp
 files with controlled mtimes.
 """
+from __future__ import annotations
+
 import json
 import sys
 import tempfile
