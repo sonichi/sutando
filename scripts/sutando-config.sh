@@ -449,7 +449,7 @@ except Exception:
 # clobbers foreign keys). Written by the connect flow; absent on installs
 # enrolled before it existed -> null, and consumers should treat null as
 # 'enrolled, identity unknown', not 'not enrolled'.
-probe_ag2space = {'connected': False, 'agent_id': None}
+probe_ag2space = {'connected': False, 'agent_id': None, 'owner': None}
 try:
     _kv = {}
     with open(os.path.join(brain, 'channels', 'ag2space', 'relay-client.env')) as f:
@@ -468,6 +468,17 @@ try:
     # only trust a well-formed mxid (@localpart:server)
     if isinstance(_aid, str) and _aid.startswith('@') and ':' in _aid[1:]:
         probe_ag2space['agent_id'] = _aid
+except Exception:
+    pass
+# owner: the mxid the core obeys as owner (TOFU enrollment in the gateway
+# bridge's access.json). Lets the dialog render 'you are its owner' vs 'this
+# core belongs to <owner>' when the signed-in user differs — authority itself
+# is enforced at message-processing time (allowFrom/tierMap), this is display.
+try:
+    with open(os.path.join(brain, 'channels', 'ag2space', 'access.json')) as f:
+        _own = json.load(f).get('tofuOwner') or ''
+    if isinstance(_own, str) and _own.startswith('@') and ':' in _own[1:]:
+        probe_ag2space['owner'] = _own
 except Exception:
     pass
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
