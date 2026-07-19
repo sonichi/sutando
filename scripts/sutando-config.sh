@@ -256,16 +256,26 @@ print(_host_label(), end='')
 
   node-bin)
     # SINGLE SOURCE OF TRUTH for the Node executable (G1.5 node-bundle,
-    # owner-adopted design 2026-07-19). Precedence:
-    #   1. $SUTANDO_NODE — the EXACT executable, exported by the desktop app
-    #      when it manages the launch (its pinned bundled runtime always wins).
-    #   2. app-node-dir/node — the bundled runtime found at its default home
-    #      (covers launchd jobs whose plist doesn't export SUTANDO_NODE).
+    # owner-adopted design + owner review 2026-07-19). Precedence:
+    #   1. $SUTANDO_NODE — the EXACT executable, exported by the desktop app.
+    #      AUTHORITATIVE ONCE SET: if it is set but not executable, that is a
+    #      desktop packaging error — FAIL CLOSED (stderr + exit 1) instead of
+    #      silently rescuing via whatever node the host happens to have, which
+    #      would mask the packaging bug and void the deterministic-runtime
+    #      guarantee (owner review P1-1).
+    #   2. app-node-dir/node — the bundled runtime at its canonical home
+    #      <engine-root>/runtime/node/bin (covers launchd jobs whose plist
+    #      doesn't export SUTANDO_NODE).
     #   3. first `node` on PATH — dev/OSS hosts, unchanged behavior.
-    # Prints the resolved path, or nothing — the caller decides how to fail
-    # (same contract as tsx-bin).
-    if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ]; then
-      printf '%s' "$SUTANDO_NODE"
+    # Prints the resolved path; empty output + exit 0 when nothing resolves
+    # (caller decides), exit 1 ONLY for the invalid-explicit case.
+    if [ -n "${SUTANDO_NODE:-}" ]; then
+      if [ -x "${SUTANDO_NODE}" ]; then
+        printf '%s' "$SUTANDO_NODE"
+      else
+        echo "sutando-config: SUTANDO_NODE is set but not an executable: $SUTANDO_NODE (desktop packaging error — refusing PATH fallback)" >&2
+        exit 1
+      fi
     else
       _app_node="${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}/node"
       if [ -x "$_app_node" ]; then

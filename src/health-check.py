@@ -161,8 +161,13 @@ def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict
     """
     env = os.environ if env is None else env
     explicit = env.get("SUTANDO_NODE", "")
-    if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
-        return {"source": "bundled", "path": explicit}
+    if explicit:
+        if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return {"source": "bundled", "path": explicit}
+        # Owner review P1-1: SUTANDO_NODE is the desktop's explicit
+        # declaration — set-but-invalid is a packaging error, NOT a case to
+        # silently rescue via PATH. Surface it as its own failure source.
+        return {"source": "invalid-explicit", "path": explicit}
     app_dir = env.get("SUTANDO_APP_NODE_DIR", "") or os.path.expanduser(
         "~/Library/Application Support/space.ag2.app/engine/runtime/node/bin"
     )
@@ -171,6 +176,11 @@ def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict
         return {"source": "app-bundle", "path": app_node}
     on_path = which("node")
     if on_path:
+        # Desktop-managed installs should never end up here (bundled runtime
+        # dir exists but its node is broken/missing) — flag it so the probe
+        # can degrade instead of reporting a false green (owner review).
+        if os.path.isdir(app_dir):
+            return {"source": "system-degraded", "path": on_path}
         return {"source": "system", "path": on_path}
     return {"source": "none", "path": None}
 
@@ -188,6 +198,18 @@ def check_node_runtime() -> dict:
             "name": "node-runtime",
             "status": "down",
             "detail": "no node found (no SUTANDO_NODE, no app bundle, none on PATH) — JS services cannot start",
+        }
+    if resolved["source"] == "invalid-explicit":
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"SUTANDO_NODE set but not executable: {resolved['path']} — desktop packaging error (fail-closed, no PATH fallback)",
+        }
+    if resolved["source"] == "system-degraded":
+        return {
+            "name": "node-runtime",
+            "status": "warn",
+            "detail": f"bundled runtime dir present but its node is unusable — running on system node {resolved['path']} (pinned-runtime guarantee NOT in effect)",
         }
     version = ""
     try:

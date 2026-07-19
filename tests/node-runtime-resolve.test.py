@@ -34,13 +34,23 @@ class ResolveNodeRuntimeTest(unittest.TestCase):
             )
             self.assertEqual(out, {"source": "bundled", "path": node})
 
-    def test_sutando_node_ignored_when_missing(self):
-        # A dangling SUTANDO_NODE must not mask the PATH fallback.
+    def test_sutando_node_invalid_fails_closed(self):
+        # Owner review P1-1: set-but-invalid is a packaging error — it must
+        # NOT be silently rescued by PATH; it surfaces as its own source.
         out = hc.resolve_node_runtime(
             env={"SUTANDO_NODE": "/nonexistent/node", "SUTANDO_APP_NODE_DIR": "/nonexistent"},
             which=lambda _: "/usr/fake/node",
         )
-        self.assertEqual(out, {"source": "system", "path": "/usr/fake/node"})
+        self.assertEqual(out, {"source": "invalid-explicit", "path": "/nonexistent/node"})
+
+    def test_system_degraded_when_app_dir_present_but_node_unusable(self):
+        # Bundled runtime dir exists but its node is broken -> desktop-managed
+        # install running on system node = degraded, not a clean "system".
+        with tempfile.TemporaryDirectory() as td:
+            out = hc.resolve_node_runtime(
+                env={"SUTANDO_APP_NODE_DIR": td}, which=lambda _: "/usr/fake/node"
+            )
+        self.assertEqual(out, {"source": "system-degraded", "path": "/usr/fake/node"})
 
     def test_app_bundle_beats_path(self):
         with tempfile.TemporaryDirectory() as td:
@@ -58,6 +68,26 @@ class ResolveNodeRuntimeTest(unittest.TestCase):
 
 
 class CheckNodeRuntimeTest(unittest.TestCase):
+    def test_down_when_invalid_explicit(self):
+        orig = hc.resolve_node_runtime
+        hc.resolve_node_runtime = lambda: {"source": "invalid-explicit", "path": "/x/node"}
+        try:
+            out = hc.check_node_runtime()
+        finally:
+            hc.resolve_node_runtime = orig
+        self.assertEqual(out["status"], "down")
+        self.assertIn("packaging error", out["detail"])
+
+    def test_warn_when_system_degraded(self):
+        orig = hc.resolve_node_runtime
+        hc.resolve_node_runtime = lambda: {"source": "system-degraded", "path": "/usr/bin/node"}
+        try:
+            out = hc.check_node_runtime()
+        finally:
+            hc.resolve_node_runtime = orig
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("NOT in effect", out["detail"])
+
     def test_down_when_none(self):
         orig = hc.resolve_node_runtime
         hc.resolve_node_runtime = lambda: {"source": "none", "path": None}
