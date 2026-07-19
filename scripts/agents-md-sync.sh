@@ -7,7 +7,7 @@
 # Substitutions applied (order matters: longer-match-first):
 #   1. "Claude Code default" → "Codex default"
 #   2. "Claude Code"         → "Codex"
-#   3. "pgrep -f claude"     → "pgrep -f Codex"
+#   3. "pgrep -f claude"     → "pgrep -f codex"
 #   4. "CLAUDE.md"           → "AGENTS.md"
 #
 # Usage:

@@ -267,7 +267,7 @@ Use the `task-progress` skill for any task involving research, code changes, PRs
 analysis, or anything likely to take more than ~60 seconds:
 
 ```bash
-python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
+python3 skills/task-progress/scripts/notify.py \
   --source <source> --channel-id <channel_id> \
   --message "On it — looking into that now. Back in a minute."
 ```
@@ -346,6 +346,14 @@ Secrets passed via Slack/Discord (`vault set KEY VALUE`) are intercepted by the 
 **When writing any integration that needs an API key, token, or password — always use vault:**
 
 ```python
+import sys
+from pathlib import Path
+
+# Make the repo's src/ importable from any script stored inside this checkout.
+repo = next(p for p in Path(__file__).resolve().parents
+            if (p / "src" / "vault_intercept.py").is_file())
+sys.path.insert(0, str(repo / "src"))
+
 from vault_intercept import get_vault_key, list_vault_keys
 
 keys = list_vault_keys()  # returns list of stored key names
@@ -396,8 +404,8 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 
 ## Skills
 
-Use skills installed in `$CLAUDE_CONFIG_DIR/skills/` when available. Prefer existing skills over writing new code from scratch.
+Use skills available to the active runtime and under this repo's `skills/` directory when available. Prefer existing skills over writing new code from scratch.
 
-**Updating a skill mid-session.** Skills install as symlinks into `~/.claude/skills/` (`skills/install.sh`), so a `git pull` updates the files on disk — but Codex's skill live-watcher does NOT follow symlinks, so the *running* session keeps the stale skill (verified 2026-05-07; [[reference_skill_update_needs_restart_when_manifest_loaded]]). To make a pulled skill update live in the current session **without a restart**, run `bash skills/refresh-skill.sh <name>` (or `--all`) — it does the cp-then-swap that forces the watcher to re-read it. (Manifest-loaded `config`/`tools` and `src/` agent code instead need a service restart via `src/restart.sh`; SKILL.md/slash-command changes use refresh-skill.sh.)
+**Updating a skill mid-session.** Runtime behavior differs. For the Claude runtime, `skills/install.sh` places symlinks under its configured skills directory; after `git pull`, run `bash skills/refresh-skill.sh <name>` (or `--all`) to force its live watcher to re-read them. For the Codex runtime, `refresh-skill.sh` does not update Codex's skill cache; restart the core with `bash src/agent/start-cli.sh --restart` so Codex reloads its configured skill directories. Manifest-loaded `config`/`tools` and `src/` agent code require a service restart via `src/restart.sh`.
 
 **Skill manifests.** Skills come in two shapes: most are invoked via the slash-command surface (`/skill-name`) or as standalone scripts; a subset are **manifest-loaded** — a `manifest.json` (+ optional `tools.ts`) that contributes inline tools directly into the voice/phone agent tool table at startup (`loadSkillManifestTools()` in `src/inline-tools.ts`). See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the manifest schema, how tools are loaded and who consumes them, and how to add one. Current manifest-loaded skills carry a per-skill `manifest.json` (e.g. `skills/zoom/`, `skills/screen-companion/`, `skills/gws-gmail-voice/`, `skills/obsidian-vault/`).
