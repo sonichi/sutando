@@ -12,6 +12,7 @@
 // double-escaping, optional-dependency @ts-ignore) appear in all three trees.
 
 import js from '@eslint/js';
+import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
@@ -74,5 +75,47 @@ export default tseslint.config(
         { 'ts-ignore': 'allow-with-description', minimumDescriptionLength: 10 },
       ],
     },
+  },
+
+  // --- Plain JavaScript ------------------------------------------------------
+  // Build/utility scripts and the Electron overlay app. These are NOT compiled
+  // by tsc (the tsconfigs are .ts-only), so before this block they had no static
+  // checking of any kind — not even the unused-import and undefined-variable
+  // checks the TypeScript tree gets for free.
+  //
+  // typescript-eslint is deliberately not applied here: these are real .js/.mjs
+  // files, so the base ESLint rules are the correct tool. That means the base
+  // `no-unused-vars` (not the @typescript-eslint/ variant) and, crucially,
+  // `no-undef` — which is off for TS (tsc owns it) but is the main value here.
+  {
+    files: ['**/*.mjs', '**/*.js'],
+    extends: [js.configs.recommended],
+    languageOptions: {
+      ecmaVersion: 2023,
+      sourceType: 'module',
+      globals: { ...globals.node },
+    },
+    rules: {
+      'no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
+      ],
+      'no-empty': ['error', { allowEmptyCatch: true }],
+      'no-useless-escape': 'off',
+    },
+  },
+
+  // Electron main process + preload are CommonJS (`require`, `module.exports`),
+  // not ESM — parsing them as modules makes `require` an undefined global.
+  {
+    files: ['skills/overlay-apps/app/main.js', 'skills/overlay-apps/app/preload.js', 'skills/overlay-apps/app/control-server.js'],
+    languageOptions: { sourceType: 'commonjs', globals: { ...globals.node } },
+  },
+
+  // Renderer-process scripts run in a browser context: `document`, `window`,
+  // and the `overlay` bridge that preload.js exposes via contextBridge.
+  {
+    files: ['skills/overlay-apps/app/stats-renderer.js', 'skills/overlay-apps/app/stats.js'],
+    languageOptions: { sourceType: 'script', globals: { ...globals.browser } },
   },
 );
