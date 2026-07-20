@@ -38,6 +38,45 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIFF="$(gh pr diff "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff $PR\` failed (bad PR number, or no gh auth/remote)" >&2; exit 2; }
 [[ -n "$DIFF" ]] || { echo "review-pr: empty diff for #$PR (already merged with no changes, or not found)" >&2; exit 2; }
 
+# --- hardcoded-path pre-scan (owner directive: run on every review) -----------
+# Deterministic bash/awk pass over the diff's ADDED lines. Flags absolute-path
+# literals (/Users/, /home/<user>, ~/.claude, ~/.sutando, quoted
+# /(Users|home|opt|usr|private)/ ...) while excluding test-fixture/system noise
+# (/nonexistent, /usr/fake, /tmp/, example.com) and comment lines. Tracks the
+# new-file line number from @@ hunk headers so hits report as file:line. No deps.
+scan_hardcoded_paths() {
+    awk '
+    /^\+\+\+ / { f=$2; sub(/^b\//,"",f); next }
+    /^@@ / { m=$0; sub(/^@@ [^+]*\+/,"",m); sub(/[, ].*$/,"",m); ln=m-1; next }
+    /^-/    { next }                 # removed line: no new-file line number
+    /^[^+]/ { ln++; next }           # context line advances the new-file counter
+    /^\+/ {
+        ln++
+        line=substr($0,2)            # strip the leading +
+        t=line; sub(/^[ \t]*/,"",t)  # left-trimmed copy for comment detection
+        if (t ~ /^(#|\/\/|\*)/) next
+        if (line ~ /\/nonexistent|\/usr\/fake|\/tmp\/|example\.com/) next
+        if (line ~ /\/Users\/|\/home\/[A-Za-z]|~\/\.claude|~\/\.sutando|["'"'"']\/(Users|home|opt|usr|private)\//) {
+            s=t; if (length(s) > 160) s=substr(s,1,160) "…"
+            print f ":" ln ": " s
+        }
+    }
+    '
+}
+PATH_HITS="$(printf '%s\n' "$DIFF" | scan_hardcoded_paths)"
+if [[ -n "$PATH_HITS" ]]; then
+    PATH_COUNT="$(printf '%s\n' "$PATH_HITS" | grep -c '')"
+    PATH_LINE="paths: ${PATH_COUNT} flagged"
+else
+    PATH_LINE="paths: clean"
+fi
+emit_path_scan() {
+    echo "$PATH_LINE"
+    [[ -n "$PATH_HITS" ]] && printf '%s\n' "$PATH_HITS"
+    echo
+}
+# -----------------------------------------------------------------------------
+
 OUT="$(mktemp -t review-pr.XXXXXX)"
 trap 'rm -f "$OUT"' EXIT   # clean up even on interrupt / non-zero exit, not just the happy path
 bash "$HERE/codex-bounded.sh" --stall "$STALL" --max "$MAX" -- \
@@ -46,6 +85,7 @@ bash "$HERE/codex-bounded.sh" --stall "$STALL" --max "$MAX" -- \
 $DIFF" < /dev/null
 rc=$?
 
+emit_path_scan   # deterministic path verdict prepended to every review, pass or fail
 if [[ $rc -eq 0 && -s "$OUT" ]]; then
     cat "$OUT"
 else
