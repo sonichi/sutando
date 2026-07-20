@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -130,6 +131,102 @@ async def _exercise():
     return task_id, channel, events
 
 
+class _CapturingDM(_DMChannel):
+    """A resolvable owner DM that records what it was sent."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, content=None, **_kwargs):
+        self.sent.append(content)
+        return types.SimpleNamespace(id=1)
+
+
+async def _case_nonowner_resolves_owner():
+    """Non-owner / non-DM channel → resolve the canonical owner and DM them.
+
+    Exercises the ``else`` branch: read ACCESS_FILE, resolve_owner_id, then
+    ``client.fetch_user`` + ``user.create_dm()``.
+    """
+    cap = _CapturingDM()
+
+    async def _create_dm():
+        return cap
+
+    async def _fetch_user(_uid):
+        return types.SimpleNamespace(bot=False, create_dm=_create_dm)
+
+    bridge.client.fetch_user = _fetch_user
+    access = WORKSPACE / "access-nonowner.json"
+    access.write_text(json.dumps({"allowFrom": ["999"]}))
+    bridge.ACCESS_FILE = access
+    bridge.discord_config.resolve_owner_id = lambda _data: "999"
+    bridge._emit_channel = lambda *_a, **_k: None
+
+    non_dm_channel = types.SimpleNamespace(id=42)
+    await bridge._report_delivery_failure(
+        non_dm_channel, "task-nonowner", "team", RuntimeError("boom-nonowner")
+    )
+    assert any(
+        text and "Result delivery failed" in text for text in cap.sent
+    ), "non-owner path did not DM the resolved owner"
+
+
+async def _case_owner_id_from_allowlist_scan():
+    """resolve_owner_id returns None → fall back to scanning allowFrom for a
+    non-bot user via ``client.fetch_user``."""
+    cap = _CapturingDM()
+
+    async def _create_dm():
+        return cap
+
+    async def _fetch_user(uid):
+        # first id is a bot (skipped), second is the human owner
+        return types.SimpleNamespace(bot=(int(uid) == 111), create_dm=_create_dm)
+
+    bridge.client.fetch_user = _fetch_user
+    access = WORKSPACE / "access-scan.json"
+    access.write_text(json.dumps({"allowFrom": ["111", "222"]}))
+    bridge.ACCESS_FILE = access
+    bridge.discord_config.resolve_owner_id = lambda _data: None
+    bridge._emit_channel = lambda *_a, **_k: None
+
+    await bridge._report_delivery_failure(
+        types.SimpleNamespace(id=7), "task-scan", "team", RuntimeError("boom-scan")
+    )
+    assert any(
+        text and "Result delivery failed" in text for text in cap.sent
+    ), "allowlist-scan path did not DM the first non-bot owner"
+
+
+async def _case_no_owner_resolvable():
+    """No owner resolvable → log and return without raising, no DM sent."""
+    access = WORKSPACE / "access-empty.json"
+    access.write_text(json.dumps({"allowFrom": []}))
+    bridge.ACCESS_FILE = access
+    bridge.discord_config.resolve_owner_id = lambda _data: None
+    bridge._emit_channel = lambda *_a, **_k: None
+    # Must not raise even when there is nobody to notify.
+    await bridge._report_delivery_failure(
+        types.SimpleNamespace(id=7), "task-noowner", "team", RuntimeError("x")
+    )
+
+
+async def _case_notice_send_fails():
+    """Owner DM resolves but ``send`` raises → the final handler swallows it
+    (the failure reporter must never raise)."""
+
+    class _FailingDM(_DMChannel):
+        async def send(self, content=None, **_kwargs):
+            raise RuntimeError("send boom")
+
+    bridge._emit_channel = lambda *_a, **_k: None
+    # owner + DMChannel → owner_dm = channel, then send() raises.
+    await bridge._report_delivery_failure(
+        _FailingDM(), "task-notice-fail", "owner", RuntimeError("orig")
+    )
+
+
 def main():
     task_id, channel, events = asyncio.run(_exercise())
     assert channel.file_attempts == 1, "the attachment failure was not exercised"
@@ -146,6 +243,14 @@ def main():
     assert error_events, "failed delivery did not emit channel.discord.out outcome=error"
     assert error_events[0]["data"]["task_id"] == task_id
     assert "413 Payload Too Large" in error_events[0]["data"]["error"]
+
+    # Branch coverage for _report_delivery_failure's owner-resolution +
+    # never-raise paths (called directly, not through poll_results).
+    asyncio.run(_case_nonowner_resolves_owner())
+    asyncio.run(_case_owner_id_from_allowlist_scan())
+    asyncio.run(_case_no_owner_resolvable())
+    asyncio.run(_case_notice_send_fails())
+
     print("PASS — Discord attachment failures are visible, audited, and observable")
 
 
