@@ -387,5 +387,75 @@ class TestVaultCliEnv(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
 
 
+class TestVaultCliDelete(unittest.TestCase):
+    """Error/exit branches of the delete verb (coverage-gate follow-up,
+    john-the-dev peer note 2026-07-20): the happy path is covered above;
+    these pin the failure contract — exit 1 + the error on stderr."""
+
+    def _main(self, argv):
+        with patch.object(sys, "argv", ["secret-vault.py", *argv]):
+            vault_cli.main()
+
+    def test_delete_missing_key_exits_1_with_stderr(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with patch("vault.delete_vault_key", side_effect=KeyError("vault: key 'NOPE' not found")):
+            with self.assertRaises(SystemExit) as cm, redirect_stderr(buf):
+                self._main(["delete", "NOPE"])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("NOPE", buf.getvalue())
+
+    def test_delete_invalid_name_exits_1(self):
+        with patch("vault.delete_vault_key", side_effect=ValueError("vault: invalid key name")):
+            with self.assertRaises(SystemExit) as cm:
+                self._main(["delete", "bad-name"])
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_delete_without_key_exits_1_with_usage(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, redirect_stderr(buf):
+            self._main(["delete"])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("missing KEY", buf.getvalue())
+
+
+class TestDeleteVaultKeyErrorBranches(unittest.TestCase):
+    """vault_intercept.delete_vault_key / _deregister_key error + no-op paths."""
+
+    def test_not_found_anywhere_raises_keyerror(self):
+        # Keychain says no (rc!=0) AND manifest doesn't have it -> KeyError.
+        with patch.object(vault_intercept.subprocess, "run",
+                          return_value=MagicMock(returncode=44)), \
+             patch.object(vault_intercept, "_read_manifest", return_value={}):
+            with self.assertRaises(KeyError):
+                vault_intercept.delete_vault_key("GHOST_KEY")
+
+    def test_invalid_key_name_raises_valueerror(self):
+        with self.assertRaises(ValueError):
+            vault_intercept.delete_vault_key("not a valid name!")
+
+    def test_manifest_only_drift_still_deletes(self):
+        # Keychain item already gone but manifest has the entry: tolerated,
+        # deregisters instead of erroring (the drift-cleanup contract).
+        with patch.object(vault_intercept.subprocess, "run",
+                          return_value=MagicMock(returncode=44)), \
+             patch.object(vault_intercept, "_read_manifest",
+                          return_value={"DRIFTED": {"stored_at": "x"}}), \
+             patch.object(vault_intercept, "_deregister_key") as mock_dereg:
+            vault_intercept.delete_vault_key("DRIFTED")
+        mock_dereg.assert_called_once_with("DRIFTED")
+
+    def test_deregister_missing_key_is_noop(self):
+        # _deregister_key early-returns when the key isn't in the manifest —
+        # no write attempted.
+        with patch.object(vault_intercept, "_read_manifest", return_value={}), \
+             patch.object(vault_intercept, "_manifest_path") as mock_path:
+            vault_intercept._deregister_key("ABSENT")
+        mock_path.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
