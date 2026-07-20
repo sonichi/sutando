@@ -1,71 +1,83 @@
 /**
- * credential-resolver — resolve a *capability's* credential, not a hardcoded env
- * key, so a BYO key and an AgentUniverse-managed token are interchangeable
- * sources behind one call. Swapping the source changes zero consumer code — the
- * "managed drop-in" property (desktop parity G8).
+ * Credential resolver — capability, not key (G8, desktop-parity plan).
  *
- * This is the SHELL: it establishes the seam. The managed source is absent by
- * default (`getManagedCredentialSource()` → null), so every consumer keeps its
- * exact current behavior — the resolver falls straight through to the BYO env
- * chain. A composition root registers a real source only once a managed session
- * is active (that lands with the AgentUniverse account; W4).
+ * Consumers ask for a CAPABILITY ('gemini-voice', 'gemini-text') and the
+ * resolver decides which credential satisfies it, walking tiers in order:
  *
- * TS services read BYO keys from the environment (the supervisor injects them
- * from the vault/Keychain at startup), so on this side "vault" and "env" are one
- * source — the vault-vs-.env question (G7) is a Python/supervisor concern, not
- * this module's.
+ *   1. managed — desktop/AU-provisioned `<workspace>/state/auth/managed-credentials.json`
+ *                (per-host durable install state, same contract as cloud-auth.json:
+ *                never wiped by transient-state cleanup)
+ *   2. env     — BYO keys from the workspace `.env` / exported environment
+ *                (GEMINI_VOICE_API_KEY / GEMINI_API_KEY — today's behavior)
+ *
+ * Within each tier a voice capability falls back to the text credential,
+ * mirroring the existing GEMINI_VOICE_API_KEY → GEMINI_API_KEY chain, so a
+ * single-key setup keeps working unchanged at every tier.
+ *
+ * With no managed file present (every pre-managed install), resolution is
+ * byte-for-byte identical to the legacy env chain — this module changes where
+ * the decision lives, not what it decides.
+ *
+ * The `source` field is the point of G8: Settings and health-check surface
+ * WHICH tier satisfied the capability ("voice: managed" / "voice: BYO"), so
+ * managed-vs-BYO drop-in is observable rather than asserted.
+ *
+ * Managed-file schema (version 1):
+ *   { "version": 1, "capabilities": { "gemini-voice": { "key": "..." }, ... } }
+ * Malformed or unreadable files skip the managed tier — never throw.
  */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { resolveWorkspace } from './workspace_default.js';
 
-/** A capability the app needs a credential for. Extend as consumers are routed. */
-export type Capability =
-	| 'gemini'
-	| 'gemini-voice'
-	| 'anthropic'
-	| 'cartesia'
-	| 'twilio';
+export type Capability = 'gemini-voice' | 'gemini-text';
 
-/**
- * A source of managed credentials (e.g. AgentUniverse). Returns the token for a
- * capability, or `undefined`/`''` when it can't provide one — in which case the
- * resolver falls through to the BYO env chain.
- */
-export interface ManagedCredentialSource {
-	get(cap: Capability): string | undefined;
+export type CredentialSource = 'managed' | 'env' | 'none';
+
+export interface ResolvedCredential {
+	key: string;
+	source: CredentialSource;
 }
 
-let _managed: ManagedCredentialSource | null = null;
+/** Per-capability lookup order within a tier (voice falls back to text). */
+const CAPABILITY_FALLBACKS: Record<Capability, string[]> = {
+	'gemini-voice': ['gemini-voice', 'gemini-text'],
+	'gemini-text': ['gemini-text'],
+};
 
-/**
- * Register (or clear, with `null`) the managed credential source. Called at the
- * composition root when a managed session becomes active. Idempotent.
- */
-export function setManagedCredentialSource(source: ManagedCredentialSource | null): void {
-	_managed = source;
+/** Env-var names per capability slot, in existing-chain order. */
+const ENV_VARS: Record<string, string> = {
+	'gemini-voice': 'GEMINI_VOICE_API_KEY',
+	'gemini-text': 'GEMINI_API_KEY',
+};
+
+export function managedCredentialsPath(): string {
+	return join(resolveWorkspace(), 'state', 'auth', 'managed-credentials.json');
 }
 
-/** The current managed source, or null when none is registered (the default). */
-export function getManagedCredentialSource(): ManagedCredentialSource | null {
-	return _managed;
-}
-
-/**
- * Resolve a capability's credential.
- *
- * Order (first non-empty wins):
- *   1. managed source, when registered (recommended default once connected:
- *      managed = the paid/metered path the user opted into).
- *   2. the BYO env chain, in order (e.g. dedicated key → main key).
- *   3. '' — the caller asserts/degrades exactly as it does today.
- *
- * PRECEDENCE NOTE (G8 owner call #3): managed-first is the recommended default.
- * To make BYO win when both are present, swap the two blocks below — a one-line
- * flip, deliberately isolated here so the decision touches nothing else.
- */
-export function resolveCredential(cap: Capability, envChain: Array<string | undefined>): string {
-	const managed = _managed?.get(cap);
-	if (managed) return managed;
-	for (const v of envChain) {
-		if (v) return v;
+function readManaged(path: string): Record<string, { key?: unknown }> {
+	try {
+		const parsed = JSON.parse(readFileSync(path, 'utf8'));
+		const caps = parsed?.capabilities;
+		return caps && typeof caps === 'object' && !Array.isArray(caps) ? caps : {};
+	} catch {
+		return {};
 	}
-	return '';
+}
+
+export function resolveCredential(
+	capability: Capability,
+	opts?: { managedPath?: string },
+): ResolvedCredential {
+	const slots = CAPABILITY_FALLBACKS[capability];
+	const managed = readManaged(opts?.managedPath ?? managedCredentialsPath());
+	for (const slot of slots) {
+		const key = managed[slot]?.key;
+		if (typeof key === 'string' && key) return { key, source: 'managed' };
+	}
+	for (const slot of slots) {
+		const key = process.env[ENV_VARS[slot]];
+		if (key) return { key, source: 'env' };
+	}
+	return { key: '', source: 'none' };
 }
