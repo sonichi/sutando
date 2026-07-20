@@ -55,6 +55,14 @@ The runner calculates cron slots in each job's declared timezone, catches up the
    - **Human room post — ONLY if `recap_room` is set (and private).** If `recap_room` is configured in this host's `recap.json` — `<workspace>/hosts/<hostname>/recap.json`, per the hosts/<hostname>/ per-host state convention, sibling of `crons.json` (which itself stays a bare job list) and names a private, owner-only room, additionally post the brief to `recap_room` (gateway op:message). No `recap_room`, or a non-private one → skip the post, leave the recap on disk under `data/session-recaps/`.
    Idempotence lives in the recap skill's `state/last-recap-session.txt` stamp — a mid-session `/schedule-crons` re-run finds the previous session already stamped and skips both the write and the post, so this never double-writes or double-posts (same guard philosophy as the dynamic-loop freshness sentinel in step 3).
 
+5.7. **Ensure the backend services are up (owner directive 2026-07-20 — CLI-boot arm).** Like the heartbeat in step 5.5, the service stack (voice-agent :9900, web-client :8080, etc.) is started by `src/startup.sh` — which the CLI boot path never runs, so a core restarted outside the desktop app comes up with every service dark (observed 2026-07-20: post-restart core answered chat while voice/web/dashboard were all down until the owner asked). Probe the two load-bearing ports; if either is dark, run startup.sh with vault keys injected (the voice gate reads env/.env only — a vault-stored `GEMINI_API_KEY` is invisible to it otherwise, the second half of the same incident):
+   ```bash
+   if ! lsof -i :9900 -sTCP:LISTEN >/dev/null 2>&1 || ! lsof -i :8080 -sTCP:LISTEN >/dev/null 2>&1; then
+     python3 skills/secret-vault/secret-vault.py env GEMINI_API_KEY -- bash src/startup.sh > /tmp/sutando-ensure-services.log 2>&1 || bash src/startup.sh > /tmp/sutando-ensure-services.log 2>&1
+   fi
+   ```
+   (The `||` fallback covers a vault with no `GEMINI_API_KEY` — `secret-vault.py env` fails on a missing key, and a keyless boot should still bring up the non-voice services.) Idempotent by construction: startup.sh port-guards every service, so a mid-session re-run with services up is a no-op, and when the desktop app's sidecar supervisor (ag2space-cinny-desktop#174) already owns the services both ports answer and the whole step is skipped — exactly one manager touches the stack per boot path. Do NOT add a pgrep-based guard here (the step-5 wrapper-argv self-match anti-pattern); the port probes are the running-check, same philosophy as step 5.5's mtime-freshness.
+
 6. Confirm what was scheduled — note whether the proactive-loop fallback was triggered (informs operator that crons.json may need a persistent entry).
 
 ## Adding New Crons
