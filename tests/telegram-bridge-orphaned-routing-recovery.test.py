@@ -1,20 +1,38 @@
 #!/usr/bin/env python3
-"""Tests for _recover_orphaned_task_routing() / _gather_pending_task_ids() in
-src/telegram-bridge.py.
+"""Tests for _recover_orphaned_task_routing() / _restore_pending_replies_from_disk()
+in src/telegram-bridge.py.
 
 Bug: pending_replies (task_id -> chat_id) is memory-only, local to main().
 If the bridge process restarts after writing a task but before its result
 arrives, the new process's pending_replies is empty, so the "Check for
 results to send back" loop never sees that task_id again — the result file
 sits in results/ forever, un-delivered and silently orphaned. Same bug class
-already fixed in src/slack-bridge.py (see
-tests/slack-bridge-orphaned-routing-recovery.test.py) — this is the Telegram
-counterpart, found by grepping for the same pattern after that fix landed.
+proposed for src/slack-bridge.py in #2218 (open, not yet merged as of this
+PR) — this is the Telegram counterpart, found by grepping for the same
+`pending_replies = {}` local-dict pattern after that PR was opened.
 
 Fix: chat_id is durable — it's in the task file's own headers from creation
 time (`f"chat_id: {chat_id}\n"` at task-write time) — even though
 pending_replies isn't. _recover_orphaned_task_routing() rebuilds routing for
-any orphaned result by re-reading the original task file.
+any orphaned result by re-reading the original task file — checking BOTH
+live tasks/ (via find_task_file, bare or claimed-core-N) AND the archive
+(via local_task_protocol.find_archived_task: flat tasks/archive/,
+tasks/processed/, and month-partitioned tasks/archive/YYYY-MM/).
+
+The archive check matters: @qingyun-wu's review on this PR measured a real
+host and found that by the time a result exists undelivered in results/, the
+task file has *already* moved to tasks/archive/ in effectively every case
+(0/26 still in tasks/, 24/26 in archive/, 2/26 gone) — most likely
+task-orphan-check classifying the still-undelivered task as "done" on a
+session restart, independent of this bridge's own delivery-triggered
+archival. Recovery scoped to live tasks/ only would have returned {} on
+every real orphan.
+
+_restore_pending_replies_from_disk() runs the recovery ONCE at startup
+(before the poll loop begins), not every tick: an orphan can only exist
+right after a process restart — any task created during a running process's
+own lifetime is registered in pending_replies at creation time, so it can
+never become orphaned while that same process keeps running.
 
 Run: python3 tests/telegram-bridge-orphaned-routing-recovery.test.py
 Exit: 0 on pass, 1 on fail.
@@ -144,15 +162,47 @@ class TestRecoverOrphanedTaskRouting(unittest.TestCase):
         recovered = self.mod._recover_orphaned_task_routing(self.results, self.tasks, set())
         self.assertEqual(recovered, {})
 
+    # --- Archive-lookup coverage (the actual common case per live measurement) ---
 
-class TestGatherPendingTaskIds(unittest.TestCase):
-    """Covers _gather_pending_task_ids() — the actual main()-loop call site:
-    fold recovered orphans into pending_replies (mutated in place, so the
-    caller's dict and the timeout/progress machinery see them too), return
-    the full task_id list for this poll."""
+    def test_task_already_archived_flat_is_still_recovered(self):
+        """The realistic case: by the time a result exists undelivered,
+        the task file has already moved to the flat tasks/archive/ dir
+        (not live tasks/) — measured on a real host, see module docstring."""
+        archive = self.tasks / "archive"
+        archive.mkdir(parents=True)
+        _write_task(archive / "task-1010.txt", id="task-1010", source="telegram", chat_id="303")
+        (self.results / "task-1010.txt").write_text("already archived when orphaned")
+        recovered = self.mod._recover_orphaned_task_routing(self.results, self.tasks, set())
+        self.assertEqual(recovered, {"task-1010": 303})
+
+    def test_task_already_archived_month_partitioned_is_still_recovered(self):
+        """Bridge-written archives use tasks/archive/YYYY-MM/ (see
+        archive_file() in this same module) — both archive shapes exist on
+        a real host and must both be checked."""
+        month_dir = self.tasks / "archive" / "2026-07"
+        month_dir.mkdir(parents=True)
+        _write_task(month_dir / "task-1011.txt", id="task-1011", source="telegram", chat_id="304")
+        (self.results / "task-1011.txt").write_text("archived in a month dir")
+        recovered = self.mod._recover_orphaned_task_routing(self.results, self.tasks, set())
+        self.assertEqual(recovered, {"task-1011": 304})
+
+    def test_task_in_processed_dir_is_still_recovered(self):
+        processed = self.tasks / "processed"
+        processed.mkdir(parents=True)
+        _write_task(processed / "task-1012.txt", id="task-1012", source="telegram", chat_id="305")
+        (self.results / "task-1012.txt").write_text("in processed/")
+        recovered = self.mod._recover_orphaned_task_routing(self.results, self.tasks, set())
+        self.assertEqual(recovered, {"task-1012": 305})
+
+
+class TestRestorePendingRepliesFromDisk(unittest.TestCase):
+    """Covers _restore_pending_replies_from_disk() — the actual main()-startup
+    call site: fold recovered orphans into pending_replies (mutated in place,
+    so main()'s own dict sees them, and so does the timeout/progress
+    machinery downstream)."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="tg-gather-pending-test-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="tg-restore-pending-test-"))
         self.results = self.tmp / "results"
         self.tasks = self.tmp / "tasks"
         self.results.mkdir(parents=True)
@@ -162,26 +212,23 @@ class TestGatherPendingTaskIds(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_no_orphans_returns_known_pending_ids_unchanged(self):
+    def test_no_orphans_leaves_pending_replies_unchanged(self):
         pending = {"task-100": 111}
-        ids = self.mod._gather_pending_task_ids(pending, self.results, self.tasks)
-        self.assertEqual(ids, ["task-100"])
+        self.mod._restore_pending_replies_from_disk(pending, self.results, self.tasks)
         self.assertEqual(pending, {"task-100": 111})
 
     def test_orphan_is_recovered_and_merged_into_pending_replies(self):
         _write_task(self.tasks / "task-200.txt", id="task-200", source="telegram", chat_id="555")
         (self.results / "task-200.txt").write_text("orphaned result")
         pending = {}
-        ids = self.mod._gather_pending_task_ids(pending, self.results, self.tasks)
-        self.assertEqual(ids, ["task-200"])
+        self.mod._restore_pending_replies_from_disk(pending, self.results, self.tasks)
         self.assertEqual(pending, {"task-200": 555})
 
     def test_recovery_leaves_a_second_untouched_pending_entry_alone(self):
         _write_task(self.tasks / "task-400.txt", id="task-400", source="telegram", chat_id="555")
         (self.results / "task-400.txt").write_text("orphaned alongside a live task")
         pending = {"task-300": 999}
-        ids = self.mod._gather_pending_task_ids(pending, self.results, self.tasks)
-        self.assertEqual(set(ids), {"task-300", "task-400"})
+        self.mod._restore_pending_replies_from_disk(pending, self.results, self.tasks)
         self.assertEqual(pending, {"task-300": 999, "task-400": 555})
 
     def test_recovered_entry_never_overrides_a_live_one(self):
@@ -190,14 +237,16 @@ class TestGatherPendingTaskIds(unittest.TestCase):
         _write_task(self.tasks / "task-500.txt", id="task-500", source="telegram", chat_id="555")
         (self.results / "task-500.txt").write_text("orphaned result")
         pending = {"task-500": 111}  # already live with a different chat_id
-        self.mod._gather_pending_task_ids(pending, self.results, self.tasks)
+        self.mod._restore_pending_replies_from_disk(pending, self.results, self.tasks)
         self.assertEqual(pending["task-500"], 111)
 
 
 class TestEndToEndRestartRecovery(unittest.TestCase):
     """Behavioral repro (same rigor requested by review on the sibling
-    src/slack-bridge.py fix, PR #2218): simulate an actual process restart —
-    a second, independent module load with fresh globals — write the result
+    src/slack-bridge.py fix, #2218): simulate an actual process restart — a
+    second, independent module load with fresh globals — with the orphaned
+    task file already sitting in the archive (the realistic case per the
+    live measurement above, not the easy live-tasks/ case), write the result
     only after the "restart", then drive the REAL recovery + REAL
     send_reply() (not a hand-rolled substitute) and confirm delivery,
     stubbing only the Telegram HTTP boundary (api())."""
@@ -224,7 +273,12 @@ class TestEndToEndRestartRecovery(unittest.TestCase):
 
     def test_result_written_after_restart_is_delivered_via_real_send_reply(self):
         task_id = "task-e2e-restart-1"
-        _write_task(self.tasks / f"{task_id}.txt", id=task_id, source="telegram", chat_id="778899")
+        # Task file already archived (flat tasks/archive/) — the realistic
+        # state by the time an orphaned result is found, per the live
+        # measurement in the module docstring above.
+        archive = self.tasks / "archive"
+        archive.mkdir(parents=True)
+        _write_task(archive / f"{task_id}.txt", id=task_id, source="telegram", chat_id="778899")
 
         # --- "Process 1": task enqueued, core still working, no result yet ---
         proc1 = _load_bridge(self.tmp)
@@ -250,10 +304,11 @@ class TestEndToEndRestartRecovery(unittest.TestCase):
 
         proc2.api = _fake_api
 
-        # Drive the REAL functions: recovery, then the real delivery call
-        # (send_reply), exactly as the main()-loop call site does.
-        ids = proc2._gather_pending_task_ids(pending2, proc2.RESULTS_DIR, proc2.TASKS_DIR)
-        self.assertEqual(ids, [task_id])
+        # Drive the REAL functions, in the REAL order main() uses: recovery
+        # once at startup, then the plain pending_replies iteration + real
+        # delivery call (send_reply).
+        proc2._restore_pending_replies_from_disk(pending2, proc2.RESULTS_DIR, proc2.TASKS_DIR)
+        self.assertEqual(list(pending2.keys()), [task_id])
         result_file = proc2.RESULTS_DIR / f"{task_id}.txt"
         reply_text = result_file.read_text().strip()
         self.assertTrue(reply_text)

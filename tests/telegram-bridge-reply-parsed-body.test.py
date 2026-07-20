@@ -31,16 +31,8 @@ class TestTelegramBridgeReplyParsedBody(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def _pending_replies_block(self) -> str:
-        """Return the source of the pending_replies result-polling loop.
-
-        Anchored on the loop's `for` line rather than a bare
-        `pending_replies.keys()` substring: orphaned-task-routing recovery
-        (restart-safety fix mirroring src/slack-bridge.py) introduced
-        `_gather_pending_task_ids()`, which itself contains `pending_replies`
-        references in its own (earlier-in-file) definition — a bare
-        substring search would match there instead of the actual loop.
-        """
-        start = SRC.find("for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):")
+        """Return the source of the pending_replies result-polling loop."""
+        start = SRC.find("pending_replies.keys()")
         self.assertGreater(start, 0, "pending_replies loop not found in telegram-bridge.py")
         # Grab a generous window covering the whole loop body (now includes the
         # per-reply channel.telegram.out obs emit, so the confirmation print sits

@@ -543,6 +543,28 @@ def _clear_progress(task_id: str) -> None:
             pass
 
 
+def _find_task_file_anywhere(tasks_dir: Path, task_id: str) -> Path | None:
+    """Locate task_id's file across live tasks/ (bare or claimed-core-N) AND
+    the archive (flat tasks/archive/, tasks/processed/, and month-partitioned
+    tasks/archive/YYYY-MM/).
+
+    find_task_file() alone only checks live tasks/ — measured on a real host
+    (2026-07-20, per @qingyun-wu's review on this PR): of the result files
+    still sitting undelivered in results/, 0 had their task file still in
+    tasks/ and effectively all had it already in tasks/archive/. Something
+    other than this bridge's own delivery path (which archives task+result
+    together, but only AFTER a successful send) moves task files into the
+    archive independently — most likely task-orphan-check running on a
+    session restart, classifying the still-undelivered task as "done"
+    because its result already exists. Recovery must therefore check the
+    archive too, or it silently no-ops in the actual common case.
+    """
+    found = find_task_file(tasks_dir, task_id)
+    if found:
+        return found
+    return local_task_protocol.find_archived_task(tasks_dir, task_id)
+
+
 def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_task_ids: set) -> dict:
     """Rebuild {task_id: chat_id} for Telegram tasks whose result file exists
     but whose in-memory routing was lost — e.g. this process restarted
@@ -550,8 +572,8 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
     has no counterpart in the NEW process's empty dict, so it sits in
     results/ forever, un-delivered and silently orphaned). chat_id is
     durable — it's in the task file's own headers from creation time — even
-    though pending_replies is memory-only (mirrors src/slack-bridge.py's
-    `_recover_orphaned_task_routing`, same bug class fixed there).
+    though pending_replies is memory-only (mirrors the same bug class
+    proposed for src/slack-bridge.py in #2218, open as of this PR).
 
     Only claims tasks THIS bridge actually wrote (source: telegram), so a
     crashed slack/discord bridge's own stranded results are left alone for
@@ -562,7 +584,7 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
         task_id = result_file.stem
         if task_id in known_task_ids:
             continue
-        task_file = find_task_file(tasks_dir, task_id)
+        task_file = _find_task_file_anywhere(tasks_dir, task_id)
         if not task_file:
             continue
         try:
@@ -574,25 +596,36 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
             continue
         chat_id = headers.get("chat_id")
         if not chat_id:
+            print(f"  [recovery] {task_id}: task file found but no chat_id header — skipping", flush=True)
             continue
         try:
             recovered[task_id] = int(chat_id)
         except ValueError:
+            print(f"  [recovery] {task_id}: chat_id header {chat_id!r} isn't numeric — skipping", flush=True)
             continue
     return recovered
 
 
-def _gather_pending_task_ids(pending_replies: dict, results_dir: Path, tasks_dir: Path) -> list:
+def _restore_pending_replies_from_disk(pending_replies: dict, results_dir: Path, tasks_dir: Path) -> None:
     """Fold any orphaned-by-restart routing recovered from disk into
-    `pending_replies` (mutated in place via setdefault — if the id
-    reappeared through normal means in the meantime, that entry wins), and
-    return the full task_id list for this poll."""
-    known_ids = set(pending_replies)
-    recovered = _recover_orphaned_task_routing(results_dir, tasks_dir, known_ids)
+    `pending_replies` (mutated in place via setdefault — if the id somehow
+    reappeared through normal means first, that entry wins).
+
+    Called ONCE at startup, before the poll loop begins — not every tick.
+    An orphan (a result whose task_id isn't in pending_replies) can only
+    exist right after a process restart: any task created during THIS
+    process's own lifetime is registered in pending_replies at creation
+    time (see the `pending_replies[task_id] = chat_id` write at task-write
+    time), so it can never become orphaned while this same process keeps
+    running. Scanning every result file + reading its task file on every
+    poll tick to catch an event that happens at most once per process
+    lifetime is wasted IO on a busy results/ dir; a one-time pass at
+    startup is both cheaper and provably sufficient.
+    """
+    recovered = _recover_orphaned_task_routing(results_dir, tasks_dir, set(pending_replies))
     for tid, chat_id in recovered.items():
         pending_replies.setdefault(tid, chat_id)
         print(f"  [recovered] {tid} routing from task file (was orphaned after a restart)", flush=True)
-    return list(pending_replies)
 
 
 def poll_progress(pending_replies: dict) -> None:
@@ -693,6 +726,10 @@ def main():  # pragma: no cover
     offset = None
     allowed = load_allowed()
     pending_replies = {}  # task_id -> chat_id
+    # Restart-safety: recover routing for any task whose result already
+    # landed while this process was down. See _restore_pending_replies_from_disk
+    # for why this only needs to run once, here, rather than every poll tick.
+    _restore_pending_replies_from_disk(pending_replies, RESULTS_DIR, TASKS_DIR)
 
     heartbeat_file = REPO / "state" / "telegram-bridge.heartbeat"
     last_heartbeat = 0
@@ -1063,9 +1100,8 @@ def main():  # pragma: no cover
         except Exception as e:
             print(f"[Telegram] poll_progress error: {e}", flush=True)
 
-        # Check for results to send back (includes any orphaned-by-restart
-        # routing recovered from the task files themselves).
-        for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):
+        # Check for results to send back
+        for task_id in list(pending_replies.keys()):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
