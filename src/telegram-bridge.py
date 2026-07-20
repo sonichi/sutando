@@ -543,6 +543,58 @@ def _clear_progress(task_id: str) -> None:
             pass
 
 
+def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_task_ids: set) -> dict:
+    """Rebuild {task_id: chat_id} for Telegram tasks whose result file exists
+    but whose in-memory routing was lost — e.g. this process restarted
+    mid-task (a result written by the OLD process's `pending_replies` entry
+    has no counterpart in the NEW process's empty dict, so it sits in
+    results/ forever, un-delivered and silently orphaned). chat_id is
+    durable — it's in the task file's own headers from creation time — even
+    though pending_replies is memory-only (mirrors src/slack-bridge.py's
+    `_recover_orphaned_task_routing`, same bug class fixed there).
+
+    Only claims tasks THIS bridge actually wrote (source: telegram), so a
+    crashed slack/discord bridge's own stranded results are left alone for
+    them to recover, not silently swallowed here.
+    """
+    recovered = {}
+    for result_file in results_dir.glob("task-*.txt"):
+        task_id = result_file.stem
+        if task_id in known_task_ids:
+            continue
+        task_file = find_task_file(tasks_dir, task_id)
+        if not task_file:
+            continue
+        try:
+            text = task_file.read_text()
+        except OSError:
+            continue
+        headers = local_task_protocol.parse_task_headers(text).headers
+        if headers.get("source") != "telegram":
+            continue
+        chat_id = headers.get("chat_id")
+        if not chat_id:
+            continue
+        try:
+            recovered[task_id] = int(chat_id)
+        except ValueError:
+            continue
+    return recovered
+
+
+def _gather_pending_task_ids(pending_replies: dict, results_dir: Path, tasks_dir: Path) -> list:
+    """Fold any orphaned-by-restart routing recovered from disk into
+    `pending_replies` (mutated in place via setdefault — if the id
+    reappeared through normal means in the meantime, that entry wins), and
+    return the full task_id list for this poll."""
+    known_ids = set(pending_replies)
+    recovered = _recover_orphaned_task_routing(results_dir, tasks_dir, known_ids)
+    for tid, chat_id in recovered.items():
+        pending_replies.setdefault(tid, chat_id)
+        print(f"  [recovered] {tid} routing from task file (was orphaned after a restart)", flush=True)
+    return list(pending_replies)
+
+
 def poll_progress(pending_replies: dict) -> None:
     """One pass of the progress streamer; called once per main-loop tick.
     No-op unless SUTANDO_PROGRESS_STREAM=1."""
@@ -1011,8 +1063,9 @@ def main():  # pragma: no cover
         except Exception as e:
             print(f"[Telegram] poll_progress error: {e}", flush=True)
 
-        # Check for results to send back
-        for task_id in list(pending_replies.keys()):
+        # Check for results to send back (includes any orphaned-by-restart
+        # routing recovered from the task files themselves).
+        for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
