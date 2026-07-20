@@ -80,6 +80,19 @@ class SelfGuardTest(unittest.TestCase):
         self._write_alive(1)
         self.assertEqual(hb.another_heartbeat_alive(), 1)
 
+    def test_unknown_oserror_takes_over(self):
+        # non-ESRCH/EPERM OSError (e.g. EINVAL) — conservative take-over path;
+        # covers the final except arm the real-pid fixtures can't reach.
+        self._write_alive(os.getppid())
+        orig = hb.os.kill
+
+        def fake_kill(pid, sig):
+            raise OSError(22, "Invalid argument")
+
+        hb.os.kill = fake_kill
+        self.addCleanup(lambda: setattr(hb.os, "kill", orig))
+        self.assertIsNone(hb.another_heartbeat_alive())
+
     def test_malformed_payload_takes_over(self):
         target = hb._alive_path()
         target.parent.mkdir(parents=True, exist_ok=True)
