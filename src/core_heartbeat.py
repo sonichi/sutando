@@ -163,8 +163,14 @@ def another_heartbeat_alive(staleness_s: float = 90.0) -> "int | None":
         return None
     try:
         os.kill(pid, 0)
+    except ProcessLookupError:
+        return None  # ESRCH — no such process; take over.
+    except PermissionError:
+        # EPERM — the process EXISTS but we may not signal it (sandboxed or
+        # privilege-separated launcher). That is a live heartbeat: yield.
+        return pid
     except OSError:
-        return None
+        return None  # anything else — treat as dead; staleness readers recover.
     return pid
 
 

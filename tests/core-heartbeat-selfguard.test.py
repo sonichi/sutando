@@ -71,6 +71,15 @@ class SelfGuardTest(unittest.TestCase):
         self._write_alive(os.getppid(), age_s=120.0)
         self.assertIsNone(hb.another_heartbeat_alive())
 
+    def test_eperm_pid_counts_as_live(self):
+        # pid 1 (launchd/init) exists but os.kill(1, 0) raises EPERM for
+        # non-root — the Codex-found case: EXISTS-but-unsignalable must yield,
+        # not take over (a second writer would reintroduce the pid flap).
+        if os.geteuid() == 0:
+            self.skipTest("running as root: kill(1,0) would succeed, fixture invalid")
+        self._write_alive(1)
+        self.assertEqual(hb.another_heartbeat_alive(), 1)
+
     def test_malformed_payload_takes_over(self):
         target = hb._alive_path()
         target.parent.mkdir(parents=True, exist_ok=True)
