@@ -29,7 +29,25 @@ please do — it saves a lot of round-trips.
 - [ ] Single concern per PR — no bundled refactors / drive-by feature additions
 - [ ] Confirmed bug exists on `upstream/main` (or feature isn't already covered)
 - [ ] Test added (or N/A explained below)
+- [ ] **Before/after evidence pasted below** — the actual command output for both states, not a description of it (this is the #1 reason PRs bounce)
+- [ ] Every claim in this PR body is verifiable from the diff or the pasted output — no statement the reviewer can't check
+- [ ] **Live path?** If this touches a bridge, network path, delivery loop, or startup, I included a real post-restart round-trip — unit tests / harnesses alone are not accepted for these
+- [ ] If this PR adds or edits a CI workflow, I confirmed it actually runs on this PR (see the Checks tab — a `branches:` filter can silently exclude a stacked PR)
 - [ ] Doesn't reinvent workspace / home-path resolution — uses the `resolve_workspace` / `resolveWorkspace` / `claude_home_path` helpers (see `CLAUDE.md` "Workspace contract"; enforced by the `lint-workspace-resolution`, `lint-claude-home-path`, and `workspace-leak-check` CI checks)
+
+## Before / after evidence
+
+<!--
+Paste the ACTUAL output, both states — this is what a reviewer looks for first
+and its absence is the most common change-request on this repo.
+
+  Bug fix:   the failing command/test at the parent commit, then passing at HEAD.
+  Live path: a post-restart round trip on the affected host (input → delivery),
+             with timings if latency is the point.
+  Lint/CI:   the finding count / check output before, and at zero/green after.
+
+"N/A — <why>" is fine for pure docs or config with nothing runnable.
+-->
 
 ## Test plan
 

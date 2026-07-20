@@ -48,6 +48,8 @@ and "After opening the PR" sections. The short checklist:
 - Confirm your git author email is GH-mapped — not `*.local` (macOS hostname auto-fill) or `noreply@anthropic.com` (Claude Code default). CLA-Assistant silently leaves the check PENDING on unmappable emails.
 - Single concern per PR; no bundled refactors
 - Confirm the bug exists on `upstream/main` before adding a fix
+- **Paste before/after evidence** — the actual command output at the parent commit and at HEAD, not a description of it. This is the #1 change-request on this repo. Every claim in the body must be checkable from the diff or that output.
+- **Live path (bridge / network / delivery loop / startup)?** Include a real post-restart round trip, not just unit tests — reviewers reject harness-only proof for these.
 - After `update-branch`, CLA-Assistant may not auto-rerun — try `@cla-assistant check` comment or close+reopen if stuck
 
 ### Reviewing a PR

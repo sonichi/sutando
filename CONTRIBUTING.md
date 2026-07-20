@@ -76,7 +76,9 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 - What changed, and why?
 - What files / sections should reviewers look at first?
 - What user behavior or bug does this prove?
+- **Before/after evidence — the single most-requested thing on this repo.** Paste the *actual output* for both states, not a description of it: the failing command/test at the parent commit, then passing at HEAD. "I verified X changes to Y" is not evidence; the pasted command that shows X→Y is. A reviewer should not have to reproduce your result to believe it.
 - What tests did you run? Include commands and results.
+- **Touching a live path (bridge, network, delivery loop, startup)?** A unit test or harness is not sufficient on its own — include a real post-restart round trip on the affected host (input received → reply delivered), with timings when latency is the point. This is the most common reason an otherwise-correct live-path fix is held from approval.
 - **For voice / phone / audio PRs: include a manual test result.** A transcript excerpt (from `data/conversation.sqlite`) showing the live turn/`[Tool]` flow, or a voice recording demonstrating the change. Voice paths are weakly covered by unit tests, so a maintainer needs observable evidence the live session behaves — not just that the code compiles. See the gold-standard example below.
 
   <details>
