@@ -470,6 +470,57 @@ try:
         probe_call_tiers = ct
 except Exception:
     pass
+# ag2space: is this install already enrolled on AG2 Space, and as whom?
+# 'connected' = ENROLLED (the gateway bridge has a task token configured in
+# channels/ag2space/relay-client.env under the brain dir) — deliberately not
+# process-liveness: the consumer is the desktop onboarding dialog, and a
+# momentarily-down bridge must not push the user into re-minting an identity.
+# agent_id comes from state/auth/ag2space.json — the durable per-host identity
+# home (state/auth/ is exempt from transient-state cleanup; relay-client.env is
+# the WRONG home for identity because the bridge regenerates that file and
+# clobbers foreign keys). Written by the connect flow; absent on installs
+# enrolled before it existed -> null, and consumers should treat null as
+# 'enrolled, identity unknown', not 'not enrolled'.
+probe_ag2space = {'connected': False, 'agent_id': None, 'owner': None}
+# Reader fallback (repo convention): relay-client.env is the canonical creds
+# file, but installs enrolled via the OSS path (onboard.sh -> startup.sh) and
+# the AG2 Space desktop launcher (AG2_DEVICE_ENV) write channels/ag2space/.env
+# instead. Try canonical first, then legacy, before concluding not-connected.
+for _envname in ('relay-client.env', '.env'):
+    try:
+        _kv = {}
+        with open(os.path.join(brain, 'channels', 'ag2space', _envname)) as f:
+            for _line in f:
+                _line = _line.strip()
+                if _line and not _line.startswith('#') and '=' in _line:
+                    _k, _, _v = _line.partition('=')
+                    _kv[_k.strip()] = _v.strip()
+        # AG2_REMOTE_TOKEN is the legacy alias for the same enrollment
+        # (startup.sh + health-check.py both recognize it) — either counts.
+        if _kv.get('REMOTE_TASK_TOKEN') or _kv.get('AG2_REMOTE_TOKEN'):
+            probe_ag2space['connected'] = True
+            break
+    except Exception:
+        pass
+try:
+    with open(os.path.join(ws, 'state', 'auth', 'ag2space.json')) as f:
+        _aid = json.load(f).get('agent_id') or ''
+    # only trust a well-formed mxid (@localpart:server)
+    if isinstance(_aid, str) and _aid.startswith('@') and ':' in _aid[1:]:
+        probe_ag2space['agent_id'] = _aid
+except Exception:
+    pass
+# owner: the mxid the core obeys as owner (TOFU enrollment in the gateway
+# bridge's access.json). Lets the dialog render 'you are its owner' vs 'this
+# core belongs to <owner>' when the signed-in user differs — authority itself
+# is enforced at message-processing time (allowFrom/tierMap), this is display.
+try:
+    with open(os.path.join(brain, 'channels', 'ag2space', 'access.json')) as f:
+        _own = json.load(f).get('tofuOwner') or ''
+    if isinstance(_own, str) and _own.startswith('@') and ':' in _own[1:]:
+        probe_ag2space['owner'] = _own
+except Exception:
+    pass
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
 h = {}
 try:
@@ -525,6 +576,13 @@ print(json.dumps({
     # reachable rows, un-greying Direct(Tailscale)/Direct(LAN) when their url is
     # advertised. Runtime-authored via probe_call_tiers above (emit-call-tiers.ts).
     'call_tiers': probe_call_tiers,
+    # ag2space: AG2 Space enrollment of THIS install (probe_ag2space above).
+    # {connected: bool, agent_id: '@…:server'|null}. 'connected' = enrolled
+    # (relay token configured), NOT bridge liveness — consumed by the desktop
+    # onboarding dialog to stop offering identity-minting to an already-
+    # connected core (owner report 2026-07-19). agent_id null on pre-
+    # AG2_AGENT_ID installs: treat as 'enrolled, identity unknown'.
+    'ag2space': probe_ag2space,
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
 }))
