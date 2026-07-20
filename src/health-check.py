@@ -1749,6 +1749,33 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
     return pgrep_status, pids
 
 
+def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Optional[tuple[str, str]]:
+    """Check a bridge's recent log lines for known failure-mode signatures.
+
+    Returns an (status, detail) override, or None if nothing to override.
+    discord-bridge: LoginFailure means the token is revoked/invalid. Always
+      overrides — there is no point restarting with stale code if the token
+      is bad; the token fix is the only path forward.
+    slack-bridge: "60s elapsed" hint means Socket Mode connected but events
+      weren't routing yet at startup (Slack app Event Subscriptions
+      disabled). Only overrides "ok" — stale/dead-inode are higher priority.
+      The hint is a one-time startup message that never clears itself in the
+      log, so it only counts if no event has actually been processed since
+      it last fired (checked via a subsequent "Wrote task-" line) — otherwise
+      Event Subscriptions clearly ARE enabled and it's a stale false alarm.
+    """
+    if name == "discord-bridge":
+        if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
+            return "fail", "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
+    elif name == "slack-bridge" and status == "ok":
+        warn_idxs = [i for i, ln in enumerate(tail) if "60s elapsed with zero events" in ln]
+        if warn_idxs:
+            events_after = any("Wrote task-" in ln for ln in tail[warn_idxs[-1] + 1:])
+            if not events_after:
+                return "warn", "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+    return None
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -2024,23 +2051,12 @@ def run_all_checks() -> list[dict]:
             pass
 
         # Check 6: Log-content health for known failure modes.
-        # discord-bridge: LoginFailure means the token is revoked/invalid.
-        #   Always overrides — there is no point restarting with stale code
-        #   if the token is bad; the token fix is the only path forward.
-        # slack-bridge: "60s elapsed" hint means Socket Mode connected but
-        #   events aren't routing (Slack app Event Subscriptions disabled).
-        #   Only overrides "ok" — stale/dead-inode are higher priority.
         if log_file.exists() and name in ("discord-bridge", "slack-bridge"):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
-                if name == "discord-bridge":
-                    if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
-                        status = "fail"
-                        detail = "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
-                elif name == "slack-bridge" and status == "ok":
-                    if any("60s elapsed with zero events" in ln for ln in tail):
-                        status = "warn"
-                        detail = "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+                override = bridge_log_content_status(name, status, tail)
+                if override is not None:
+                    status, detail = override
             except OSError:
                 pass
 
