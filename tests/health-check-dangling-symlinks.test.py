@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -119,6 +120,29 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         check = self.hc.check_skill_symlinks()
         self.hc.fix_skill_symlinks(check)
         self.assertTrue((real / "keep.txt").exists(), "real dir must survive --fix")
+
+
+    def test_unreadable_destination_dir_does_not_crash_the_tick(self):
+        """The destination sweep walks a directory that can disappear or become
+        unreadable between the earlier exists() check and iteration (races,
+        permissions, an unmounted volume). A health check must degrade to
+        "no orphans found" rather than raise — one bad tick would take down
+        every check after it, which is strictly worse than under-reporting."""
+        self._skill("alpha")
+        (self.dst / "alpha").symlink_to(self.src / "alpha")
+        real_iterdir = Path.iterdir
+
+        def boom(self_path):
+            # Only the destination sweep should blow up; the repo scan above it
+            # must still run, otherwise this proves nothing about the guard.
+            if self_path == self.dst:
+                raise OSError("permission denied")
+            return real_iterdir(self_path)
+
+        with mock.patch.object(Path, "iterdir", boom):
+            r = self.hc.check_skill_symlinks()
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertEqual(r.get("_orphaned", []), [])
 
 
 if __name__ == "__main__":
