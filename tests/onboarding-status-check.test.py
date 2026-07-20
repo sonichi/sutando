@@ -63,6 +63,25 @@ class OnboardingStatusCheckTest(unittest.TestCase):
         out = hc.check_onboarding_status()
         self.assertEqual(out["status"], "ok")
 
+    def test_warn_on_list_payload(self):
+        # Codex P1: a top-level list must degrade to 'unreadable', not raise.
+        self._with_workspace("[]")
+        out = hc.check_onboarding_status()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("unreadable", out["detail"])
+
+    def test_warn_on_list_rows(self):
+        # Codex P1: rows as a list (frontend bug) must also degrade cleanly.
+        self._with_workspace({"updated_at": 0, "rows": []})
+        out = hc.check_onboarding_status()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("unreadable", out["detail"])
+
+    def test_ok_with_null_updated_at(self):
+        self._with_workspace({"updated_at": None, "rows": {"core": {"state": "done"}}})
+        out = hc.check_onboarding_status()
+        self.assertEqual(out["status"], "ok")
+
     def test_warn_on_unreadable(self):
         self._with_workspace("{not json")
         out = hc.check_onboarding_status()
