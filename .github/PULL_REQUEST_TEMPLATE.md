@@ -1,7 +1,7 @@
 <!--
-First-time contributor? Read CONTRIBUTING.md before submitting. The 6 checks
-below mirror the "Before opening any PR" section there. If you haven't run
-them, please do — it saves a lot of round-trips.
+First-time contributor? Read CONTRIBUTING.md before submitting. The checks
+below mirror its "Before starting a PR" section. If you haven't run them,
+please do — it saves a lot of round-trips.
 -->
 
 ## Priority
@@ -29,7 +29,7 @@ them, please do — it saves a lot of round-trips.
 - [ ] Single concern per PR — no bundled refactors / drive-by feature additions
 - [ ] Confirmed bug exists on `upstream/main` (or feature isn't already covered)
 - [ ] Test added (or N/A explained below)
-- [ ] Doesn't touch V1-workspace-hold areas (see `CONTRIBUTING.md` §5): `workspace_default.{py,ts}` / `sync-memory.sh` / `claude_home_path` / `agent-registry` paths
+- [ ] Doesn't reinvent workspace / home-path resolution — uses the `resolve_workspace` / `resolveWorkspace` / `claude_home_path` helpers (see `CLAUDE.md` "Workspace contract"; enforced by the `lint-workspace-resolution`, `lint-claude-home-path`, and `workspace-leak-check` CI checks)
 
 ## Test plan
 

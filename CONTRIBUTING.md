@@ -2,6 +2,8 @@
 
 Thanks for your interest! Sutando is alpha software — the biggest need is **testing and hardening**.
 
+This file is the **canonical process for every contribution**, human or AI-agent. When Sutando's own core agent (Claude Code or Codex) opens or reviews a PR, `CLAUDE.md` / `AGENTS.md` direct it here. Authoring a PR is governed by **["Before starting a PR"](#before-starting-a-pr)**, **["The PR body should answer"](#the-pr-body-should-answer)**, and **["After opening the PR"](#after-opening-the-pr)**; reviewing one by **["Reviewing PRs"](#reviewing-prs)**. Keep those section headings stable — other files link to them by name.
+
 ## Contributor License Agreement (CLA)
 
 Before your first contribution can be merged, you'll be asked to sign the project's CLA — a one-time, web-based "I agree" via the [CLA Assistant](https://cla-assistant.io) bot. The bot will comment on your PR with a link; just click through and sign. The CLA text is in [`CLA.md`](CLA.md). Subsequent PRs are auto-recognized.

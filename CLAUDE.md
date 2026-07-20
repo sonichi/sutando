@@ -38,15 +38,27 @@ Before creating a PR, check `gh pr list --state open` for an existing PR on the 
 
 Never commit directly to main. Always work on a feature branch.
 
-### Before opening any PR or issue
+### Creating a PR or issue
 
-Read `CONTRIBUTING.md` and follow its "Before starting a PR" and "After opening the PR" sections. The short checklist:
+`CONTRIBUTING.md` is the canonical process and you MUST follow it. Before opening
+a PR, read and adhere to its "Before starting a PR", "The PR body should answer",
+and "After opening the PR" sections. The short checklist:
 
 - Search existing open + recently-closed PRs/issues for duplicates (`gh pr list --search "closes #N"`)
 - Confirm your git author email is GH-mapped — not `*.local` (macOS hostname auto-fill) or `noreply@anthropic.com` (Claude Code default). CLA-Assistant silently leaves the check PENDING on unmappable emails.
 - Single concern per PR; no bundled refactors
 - Confirm the bug exists on `upstream/main` before adding a fix
 - After `update-branch`, CLA-Assistant may not auto-rerun — try `@cla-assistant check` comment or close+reopen if stuck
+
+### Reviewing a PR
+
+When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.md`'s
+"Reviewing PRs" section. In short:
+
+- Be evidence-first: cite the commit, file, line, repro, or failing test. If you did not verify a claim, say so explicitly.
+- Distinguish blockers from nits so the author knows what gates merge.
+- Add evidence, not noise — don't stack a bare "LGTM" under an existing approval.
+- APPROVE / REQUEST_CHANGES is a formal GitHub review action (`gh pr review`), not a Discord 👍 or a plain comment.
 
 Skill-PR destination: a skill is **coupled** (PR to `sonichi/sutando`) if it imports from `src/` or another skill, modifies main-repo files, or is tightly bound to a feature there (e.g. `skills/phone-conversation/`). A skill is **standalone** (PR to `sonichi/sutando-skills-community`) if it ships its own scripts/binaries, reads files but doesn't import main-repo modules, and works against any checkout. If unsure, ask in #design.
 
