@@ -4,8 +4,13 @@
 name: bundle-smoke
 
 on:
+  # No branches filter on pull_request: a PR that touches bundle inputs gets the
+  # smoke regardless of its base — including stacked PRs, whose base branch is
+  # exactly where an unexercised test could otherwise slip through (#2208 P1:
+  # base-retarget is an `edited` event this workflow never sees, so "it will run
+  # after retarget" is false without this).
+  workflow_dispatch:
   pull_request:
-    branches: [main, staging-interaction-planes]
     paths:
       - 'src/**'
       - 'skills/phone-conversation/scripts/conversation-server.ts'
