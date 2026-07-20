@@ -110,13 +110,33 @@ class TestOptOutVsNeverConfigured(unittest.TestCase):
         self._write_local({"vault": {"enabled": True, "remote_url": "git@x:y/z.git"}})
         self.assertFalse(hc._resolved_vault()["_explicit_disable"])
 
-    # -- defensive branches (written with the guard, per the coverage gate) -- #
+    # -- defensive branches of the helper itself --------------------------- #
+    #
+    # These call _local_vault_enabled_is_false() DIRECTLY, not through
+    # _resolved_vault(). That is deliberate and load-bearing: _resolved_vault()
+    # runs resolve_vault()/load_config() FIRST, and load_config() raises on a
+    # malformed config — so a malformed-file test routed through _resolved_vault
+    # is caught by its OUTER except and never reaches the helper's own
+    # `except (OSError, ValueError)`. The assertion (returns False) passes
+    # either way; only line-coverage reveals the branch was never run. The
+    # coverage gate caught exactly that on the first push (missing 146-147).
 
-    def test_malformed_local_config_is_not_an_opt_out(self):
-        """Unparseable override must not be read as a deliberate choice."""
+    def test_malformed_local_config_returns_false(self):
+        """Unparseable override → helper's own except branch → False."""
         (self.repo / "sutando.config.local.json").write_text("{not json")
-        self._clear_config_cache()
-        self.assertFalse(hc._resolved_vault()["_explicit_disable"])
+        self.assertFalse(hc._local_vault_enabled_is_false())
+
+    def test_no_local_file_returns_false(self):
+        """Absent override → early `not is_file()` return, no read attempted."""
+        self.assertFalse((self.repo / "sutando.config.local.json").exists())
+        self.assertFalse(hc._local_vault_enabled_is_false())
+
+    def test_helper_reads_authored_false_directly(self):
+        """Authored enabled=false → True, without going through _resolved_vault."""
+        self._write_local({"vault": {"enabled": False}})
+        self.assertTrue(hc._local_vault_enabled_is_false())
+
+    # -- value semantics (via the public path) ----------------------------- #
 
     def test_vault_key_present_but_null(self):
         """`"vault": null` must not raise and must not read as opt-out."""
