@@ -939,6 +939,29 @@ def _record_skip_audit(task_id: str, skip_value: str) -> None:
         pass
 
 
+def _find_task_file_anywhere(tasks_dir: Path, task_id: str) -> Path | None:
+    """Locate task_id's file across live tasks/ (bare or claimed-core-N) AND
+    the archive (flat tasks/archive/, tasks/processed/, and month-partitioned
+    tasks/archive/YYYY-MM/).
+
+    find_task_file() alone only checks live tasks/ — measured on a real host
+    (2026-07-20, @qingyun-wu's review on the Telegram counterpart of this
+    fix, PR #2223): of the result files still sitting undelivered in
+    results/, 0 had their task file still in tasks/ and effectively all had
+    it already in tasks/archive/. Something other than this bridge's own
+    delivery path (which archives task+result together, but only AFTER a
+    successful send) moves task files into the archive independently — most
+    likely task-orphan-check running on a session restart, classifying the
+    still-undelivered task as "done" because its result already exists.
+    Recovery must therefore check the archive too, or it silently no-ops in
+    the actual common case.
+    """
+    found = find_task_file(tasks_dir, task_id)
+    if found:
+        return found
+    return local_task_protocol.find_archived_task(tasks_dir, task_id)
+
+
 def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_task_ids: set) -> dict:
     """Rebuild pending_replies entries for Slack tasks whose result file
     exists but whose in-memory routing was lost — e.g. this process
@@ -957,7 +980,7 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
         task_id = result_file.stem
         if task_id in known_task_ids:
             continue
-        task_file = find_task_file(tasks_dir, task_id)
+        task_file = _find_task_file_anywhere(tasks_dir, task_id)
         if not task_file:
             continue
         try:
@@ -969,6 +992,7 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
             continue
         channel = headers.get("channel_id")
         if not channel:
+            print(f"  [recovery] {task_id}: task file found but no channel_id header — skipping", flush=True)
             continue
         recovered[task_id] = {
             "channel": channel,
@@ -980,22 +1004,31 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
     return recovered
 
 
-def _gather_pending_task_ids() -> list:
-    """Snapshot pending_replies' keys, folding in any orphaned-by-restart
-    routing recovered from disk, and return the full task_id list for this
-    poll. Recovered entries are merged into pending_replies via setdefault —
-    if the id reappeared through normal means in the meantime, that entry
-    wins."""
+def _restore_pending_replies_from_disk() -> None:
+    """Fold any orphaned-by-restart routing recovered from disk into
+    `pending_replies` (merged via setdefault — if the id reappeared through
+    normal means first, that entry wins).
+
+    Called ONCE at result_watcher() startup, before its poll loop begins —
+    not every tick. An orphan (a result whose task_id isn't in
+    pending_replies) can only exist right after a process restart: any task
+    created during THIS process's own lifetime is registered in
+    pending_replies at creation time (see the Slack event handler that
+    writes it), so it can never become orphaned while this same process
+    keeps running. Scanning every result file + reading its task file on
+    every poll tick to catch an event that happens at most once per process
+    lifetime was wasted IO on a busy results/ dir; a one-time pass at
+    startup is both cheaper and provably sufficient.
+    """
     with pending_replies_lock:
-        pending_ids = list(pending_replies.keys())
-    recovered = _recover_orphaned_task_routing(RESULTS_DIR, TASKS_DIR, set(pending_ids))
+        known_ids = set(pending_replies.keys())
+    recovered = _recover_orphaned_task_routing(RESULTS_DIR, TASKS_DIR, known_ids)
     if not recovered:
-        return pending_ids
+        return
     with pending_replies_lock:
         for tid, entry in recovered.items():
             pending_replies.setdefault(tid, entry)
             print(f"  [recovered] {tid} routing from task file (was orphaned after a restart)", flush=True)
-    return list(set(pending_ids) | recovered.keys())
 
 
 def _check_task_timeouts() -> None:
@@ -1055,14 +1088,18 @@ def result_watcher():
     """Background thread: polls results/ for replies + proactive messages."""
     heartbeat_file = REPO / "state" / "slack-bridge.heartbeat"
     last_heartbeat = 0.0
+    # Restart-safety: recover routing for any task whose result already
+    # landed while this process was down. See _restore_pending_replies_from_disk
+    # for why this only needs to run once, here, rather than every poll tick.
+    _restore_pending_replies_from_disk()
     while True:
         try:
             # Surface tasks the core never answered (timeout → visible reply).
             _check_task_timeouts()
 
-            # Replies to pending tasks (includes any orphaned-by-restart
-            # routing recovered from the task files themselves).
-            pending_ids = _gather_pending_task_ids()
+            # Replies to pending tasks
+            with pending_replies_lock:
+                pending_ids = list(pending_replies.keys())
 
             for task_id in pending_ids:
                 result_file = RESULTS_DIR / f"{task_id}.txt"

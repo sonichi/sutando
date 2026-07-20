@@ -14,6 +14,24 @@ task file's own headers at creation time — even though pending_replies isn't.
 _recover_orphaned_task_routing() rebuilds routing entries for any orphaned
 result by re-reading the original task file.
 
+**Archive lookup matters.** @qingyun-wu's review on this PR's Telegram
+counterpart (#2223) measured a real host and found that by the time a result
+exists undelivered in results/, the task file has *already* moved to
+tasks/archive/ in effectively every case — something other than this
+bridge's own delivery-triggered archival moves it independently (most likely
+task-orphan-check classifying the still-undelivered task as "done" on a
+session restart, since its result already exists). Recovery scoped to live
+tasks/ only would have returned {} on every real orphan. Fixed by falling
+back to local_task_protocol.find_archived_task() (flat tasks/archive/,
+tasks/processed/, and month-partitioned tasks/archive/YYYY-MM/) when the
+live-tasks/ lookup misses.
+
+**Recovery runs once, at result_watcher() startup, not every poll tick.** An
+orphan can only exist right after a process restart — any task created
+during a running process's own lifetime is registered in pending_replies at
+creation time, so it can never become orphaned while that same process keeps
+running. See _restore_pending_replies_from_disk().
+
 Run: python3 tests/slack-bridge-orphaned-routing-recovery.test.py
 Exit: 0 on pass, 1 on fail.
 """
@@ -175,15 +193,53 @@ class TestRecoverOrphanedTaskRouting(unittest.TestCase):
         # forged body line.
         self.assertEqual(recovered, {})
 
+    # --- Archive-lookup coverage (the actual common case per live measurement) ---
 
-class TestGatherPendingTaskIds(unittest.TestCase):
-    """Covers _gather_pending_task_ids() — the actual result_watcher() call
-    site: snapshot pending_replies, fold in recovered orphans, merge them
-    back into pending_replies so the timeout watchdog and future polls see
-    them too."""
+    def test_task_already_archived_flat_is_still_recovered(self):
+        """The realistic case: by the time a result exists undelivered, the
+        task file has already moved to the flat tasks/archive/ dir (not
+        live tasks/) — measured on a real host, see module docstring."""
+        archive = self.tasks / "archive"
+        archive.mkdir(parents=True)
+        _write_task(archive / "task-1010.txt", id="task-1010", source="slack",
+                    channel_id="D0B5L7X2TK2")
+        (self.results / "task-1010.txt").write_text("already archived when orphaned")
+        recovered = self.mod._recover_orphaned_task_routing(self.results, self.tasks, set())
+        self.assertIn("task-1010", recovered)
+        self.assertEqual(recovered["task-1010"]["channel"], "D0B5L7X2TK2")
+
+    def test_task_already_archived_month_partitioned_is_still_recovered(self):
+        """Bridge-written archives use tasks/archive/YYYY-MM/ (see
+        archive_file() in this same module) — both archive shapes exist on
+        a real host and must both be checked."""
+        month_dir = self.tasks / "archive" / "2026-07"
+        month_dir.mkdir(parents=True)
+        _write_task(month_dir / "task-1011.txt", id="task-1011", source="slack",
+                    channel_id="D0B5L7X2TK2")
+        (self.results / "task-1011.txt").write_text("archived in a month dir")
+        recovered = self.mod._recover_orphaned_task_routing(self.results, self.tasks, set())
+        self.assertIn("task-1011", recovered)
+        self.assertEqual(recovered["task-1011"]["channel"], "D0B5L7X2TK2")
+
+    def test_task_in_processed_dir_is_still_recovered(self):
+        processed = self.tasks / "processed"
+        processed.mkdir(parents=True)
+        _write_task(processed / "task-1012.txt", id="task-1012", source="slack",
+                    channel_id="D0B5L7X2TK2")
+        (self.results / "task-1012.txt").write_text("in processed/")
+        recovered = self.mod._recover_orphaned_task_routing(self.results, self.tasks, set())
+        self.assertIn("task-1012", recovered)
+        self.assertEqual(recovered["task-1012"]["channel"], "D0B5L7X2TK2")
+
+
+class TestRestorePendingRepliesFromDisk(unittest.TestCase):
+    """Covers _restore_pending_replies_from_disk() — the actual
+    result_watcher()-startup call site: fold recovered orphans into the
+    module-level pending_replies (mutated in place, under its lock) so the
+    timeout watchdog and the poll loop both see them."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="slack-gather-pending-test-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="slack-restore-pending-test-"))
         self.results = self.tmp / "results"
         self.tasks = self.tmp / "tasks"
         self.results.mkdir(parents=True)
@@ -196,19 +252,18 @@ class TestGatherPendingTaskIds(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_no_orphans_returns_known_pending_ids_unchanged(self):
+    def test_no_orphans_leaves_pending_replies_unchanged(self):
         self.mod.pending_replies["task-100"] = {"channel": "D1", "thread_ts": None,
                                                   "access_tier": "owner", "submitted_at": 0.0,
                                                   "timed_out": False}
-        ids = self.mod._gather_pending_task_ids()
-        self.assertEqual(ids, ["task-100"])
+        self.mod._restore_pending_replies_from_disk()
+        self.assertEqual(set(self.mod.pending_replies.keys()), {"task-100"})
 
     def test_orphan_is_recovered_and_merged_into_pending_replies(self):
         _write_task(self.tasks / "task-200.txt", id="task-200", source="slack",
                     channel_id="D0B5L7X2TK2")
         (self.results / "task-200.txt").write_text("orphaned result")
-        ids = self.mod._gather_pending_task_ids()
-        self.assertIn("task-200", ids)
+        self.mod._restore_pending_replies_from_disk()
         self.assertIn("task-200", self.mod.pending_replies)
         self.assertEqual(self.mod.pending_replies["task-200"]["channel"], "D0B5L7X2TK2")
 
@@ -219,9 +274,21 @@ class TestGatherPendingTaskIds(unittest.TestCase):
         _write_task(self.tasks / "task-400.txt", id="task-400", source="slack",
                     channel_id="D0B5L7X2TK2")
         (self.results / "task-400.txt").write_text("orphaned alongside a live task")
-        ids = self.mod._gather_pending_task_ids()
-        self.assertEqual(set(ids), {"task-300", "task-400"})
+        self.mod._restore_pending_replies_from_disk()
+        self.assertEqual(set(self.mod.pending_replies.keys()), {"task-300", "task-400"})
         self.assertEqual(self.mod.pending_replies["task-300"], live_entry)
+
+    def test_recovered_entry_never_overrides_a_live_one(self):
+        """setdefault semantics: if the same task_id somehow reappeared
+        through normal means before recovery runs, the live entry wins."""
+        live_entry = {"channel": "D_LIVE", "thread_ts": None, "access_tier": "owner",
+                      "submitted_at": 111.0, "timed_out": False}
+        self.mod.pending_replies["task-500"] = live_entry
+        _write_task(self.tasks / "task-500.txt", id="task-500", source="slack",
+                    channel_id="D0B5L7X2TK2")
+        (self.results / "task-500.txt").write_text("orphaned result")
+        self.mod._restore_pending_replies_from_disk()
+        self.assertEqual(self.mod.pending_replies["task-500"], live_entry)
 
 
 class TestResultWatcherEndToEndRestartRecovery(unittest.TestCase):
@@ -281,7 +348,14 @@ class TestResultWatcherEndToEndRestartRecovery(unittest.TestCase):
 
     def test_result_written_after_restart_is_delivered_by_the_real_watcher_loop(self):
         task_id = "task-e2e-restart-1"
-        _write_task(self.tasks / f"{task_id}.txt", id=task_id, source="slack",
+        # Task file already archived (flat tasks/archive/) — the realistic
+        # state by the time an orphaned result is found, per the live
+        # measurement in the module docstring above. Exercising the easy
+        # live-tasks/ case here would have silently passed against the
+        # pre-fix code too (find_task_file() alone finds it there).
+        archive = self.tasks / "archive"
+        archive.mkdir(parents=True)
+        _write_task(archive / f"{task_id}.txt", id=task_id, source="slack",
                     channel_id="D0E2ERESTART", access_tier="owner")
 
         # --- "Process 1": task enqueued, core still working, no result yet ---
