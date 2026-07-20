@@ -95,11 +95,18 @@ if printf '%s' "$out" | grep -qE "SUTANDO_NODE is set but invalid|required dist 
   echo "  ✗ SMOKE FAIL: gate fail-closed fired despite valid node + full dist (rc=$rc)"
   printf '%s\n' "$out" | grep -E "set but invalid|artifacts missing" | sed 's/^/    /'
   fail=1
-elif [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
-  echo "  ✗ SMOKE FAIL: no output at all — startup.sh did not run (rc=$rc)"
+elif ! printf '%s' "$out" | grep -q "G1.5 gate passed"; then
+  # Assert the POST-GATE SENTINEL, not merely that some output exists. Without
+  # this the case passed whenever startup.sh produced any bytes and no
+  # fail-closed string — which is equally true when it dies BEFORE the gate for
+  # an unrelated reason. "No failure message" is not evidence the gate ran; the
+  # sentinel (src/startup.sh, printed immediately after the gate) is.
+  echo "  ✗ SMOKE FAIL: never reached the G1.5 post-gate sentinel (rc=$rc)"
+  echo "    expected 'G1.5 gate passed' in output; last lines were:"
+  printf '%s\n' "$out" | tail -5 | sed 's/^/    /'
   fail=1
 else
-  echo "  ✓ gate passed with valid node + full dist (rc=$rc; later CI-environment failures are out of scope)"
+  echo "  ✓ gate passed with valid node + full dist (rc=$rc; sentinel seen; later CI-environment failures are out of scope)"
 fi
 
 if [ "$fail" -ne 0 ]; then
