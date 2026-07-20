@@ -77,6 +77,27 @@ class TestCheckCoreSupervisor(unittest.TestCase):
             for st in ("running", "idle-ready", "blocked-known"):
                 self.assertEqual(self._run(td, json.dumps({"state": st}))["status"], "ok", st)
 
+    def test_default_restart_selects_provider_specific_model_env(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = pathlib.Path(td)
+            script = repo / "src" / "agent" / "start-cli.sh"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/bash\n")
+
+            for runtime, expects_model in (("claude", True), ("codex", False)):
+                captured = {}
+
+                def run(*args, **kwargs):
+                    captured.update(kwargs["env"])
+                    return mock.Mock(returncode=0)
+
+                with mock.patch.object(hc, "REPO_DIR", repo), \
+                     mock.patch.object(hc, "_resolve_launch_env", return_value={"PATH": "/bin"}), \
+                     mock.patch.object(hc, "resolve_core_runtime", return_value=runtime), \
+                     mock.patch.object(hc.subprocess, "run", side_effect=run):
+                    self.assertTrue(hc._default_core_restart(standard_context=True))
+                self.assertEqual(captured.get("SUTANDO_CORE_MODEL") == "opus", expects_model)
+
 
 if __name__ == "__main__":
     unittest.main()

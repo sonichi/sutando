@@ -417,7 +417,7 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     transcription failure must never block task delivery.
     """
     import subprocess
-    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
     if not skill_script.exists():
         return None
     try:
@@ -965,6 +965,8 @@ def result_watcher():
                 if not result_file.exists():
                     continue
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 with pending_replies_lock:
                     target = pending_replies.pop(task_id, None)
                 if not target:

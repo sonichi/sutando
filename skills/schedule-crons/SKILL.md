@@ -19,12 +19,27 @@ Each entry has:
 - `prompt` — the prompt to run (direct text)
 - `prompt_skill` — OR a skill to invoke (e.g. "morning-briefing" → `/morning-briefing`)
 - `loop` (optional, value `"dynamic"`) — declares a **dynamic (self-pacing) loop** using the built-in `/loop` primitive. An entry with **no interval** (no `cron` field) + `loop: "dynamic"` is run by schedule-crons as `/loop` *without an interval* (see step 3) — which is exactly the built-in adaptive mode: the loop self-paces via ScheduleWakeup, deciding each next delay by its own judgment. Optional `loop_hint` (free text) guides that pacing (e.g. "~10 min when owner active, ~40 min quiet"). **Durable** because schedule-crons re-launches it every boot; **adaptive** because that's what `/loop`-no-interval already is. No min/max/signal schema and no custom gate — the built-in does the pacing. Example: `{name:"inbox-score", prompt_skill:"inbox-score", loop:"dynamic", loop_hint:"…"}`.
+- `execution` (optional, value `"codex-task"`) — opt this entry into the durable OS-backed Codex runner instead of session cron registration. Codex entries may also set `timezone` (IANA name, default `America/Los_Angeles`), `delivery: "proactive"`, `retry_minutes` (default 15), `max_attempts` (default 3), and `active_stale_minutes` (default 60). Only explicitly opted-in entries are handled, so Claude session crons are never duplicated.
+- `launchd` (optional bool) — when `true`, the entry is owned by the OS-level cron-runner (`src/cron-runner.py`, installed via `src/install-cron-runner-launchd.sh`), NOT by this session skill. `/schedule-crons` skips these so the two schedulers never double-fire. Use it for daily-deliverable crons that must fire even when no Claude session is idle (the reliability fix for the 2026-07-02 silent 6am-digest miss).
+
+### Durable Codex schedules
+
+Install or reconcile the per-minute launchd runner after adding an `execution: "codex-task"` entry:
+
+```bash
+python3 skills/schedule-crons/scripts/codex-scheduler.py install
+python3 skills/schedule-crons/scripts/codex-scheduler.py health
+```
+
+The runner calculates cron slots in each job's declared timezone, catches up the newest missed slot after sleep, atomically enqueues a deterministic task ID, and uses distinct attempt IDs when an inactive task needs retrying. A queued, claimed, or processed attempt is never duplicated; if it remains active past `active_stale_minutes`, the run fails with a proactive alert so the schedule cannot stall forever. Durable run state lives at `<workspace>/state/schedules/codex-scheduler.json`. Exhausted retries produce a `proactive-schedule-alert-*.txt` result. `health` exits non-zero for a stale scheduler heartbeat or a latest-run failure.
 
 ## On Activation
 
 1. Read `<workspace>/hosts/<hostname>/crons.json` (resolve `<workspace>` via `bash scripts/sutando-config.sh workspace`; `<hostname>` = `bash scripts/sutando-config.sh host-label`). **Transition / self-heal:** if that file is missing, seed it once — from the interim `<workspace>/crons/<hostname>.json` if it still exists (folded-in from the pre-#1717 layout), else the legacy `skills/schedule-crons/crons.json` (one-time migration), else `skills/schedule-crons/crons.example.json` — then read it: `WS="$(bash scripts/sutando-config.sh workspace)"; H="$(bash scripts/sutando-config.sh host-label)"; CF="$WS/hosts/$H/crons.json"; if [ ! -f "$CF" ]; then mkdir -p "$WS/hosts/$H"; SRC="$(ls "$WS/crons/$H.json" 2>/dev/null || ls skills/schedule-crons/crons.json 2>/dev/null || echo skills/schedule-crons/crons.example.json)"; cp "$SRC" "$CF"; fi`
 2. Check existing cron jobs with CronList
 3. For each job in the config:
+   - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
+   - **Skip any entry with `"launchd": true`** — it is owned by the OS-level cron-runner (see "Reliable OS-level crons" below), which emits its task independently. Registering it here too would double-fire (duplicate deliveries — the exact noise class the launchd path was built to avoid).
    - Skip if a job with matching prompt/name already exists
    - Call `CronCreate` with the cron expression and prompt:
      - If `prompt_skill` is set, pass `prompt: "/skill-name"` (the leading slash makes the scheduled cron fire the skill as a slash command at its scheduled time).
@@ -88,3 +103,19 @@ python3 skills/schedule-crons/ensure-cron-room.py \
 | Daily / less-frequent (`X Y * * *`) | **NO** | A skip = function is gone until next day (briefing missed, etc.). M1's no-inline-fire rule already kills the avalanche on registration — gating dailies is over-broad. |
 
 Lucy caught this on PR #1437 (2026-06-03): gating daily crons (morning-briefing 06:57, daily-insight 06:50, obsidian-dream 03:37, learned-skills-scan 07:30) means one queued task at briefing time loses the briefing for the entire day. Pinning the gate to sub-daily crons preserves the defense-in-depth where it matters without the missed-day risk.
+
+## Reliable OS-level crons (`"launchd": true`)
+
+Session `CronCreate` jobs are best-effort: they only fire while the Claude REPL is idle at the fire minute, carry scheduler jitter (recurring fires up to 10% / max 15min late), and die with the session. On 2026-07-02 the 6:02 loop-engineering digest silently never delivered — the owner asked to "make the schedule reliably run".
+
+For a cron that MUST fire regardless of session state, flag it `"launchd": true` and install the OS-level runner once:
+
+```bash
+bash src/install-cron-runner-launchd.sh          # install (idempotent)
+bash src/install-cron-runner-launchd.sh --status # check
+bash src/install-cron-runner-launchd.sh --uninstall
+```
+
+This installs `com.sutando.cron-runner` (launchd, every 60s → `src/cron-runner.py`), which reads the same `crons.json`, decides which `"launchd": true` entries are DUE since their last recorded fire, and emits a task file into `tasks/` for each. The streaming watcher hands it to the session — same OS-level → emit-task → process pipeline as `com.sutando.health-check-fallback`. Missed fires (machine asleep/off) catch up exactly once on the next tick, never a backlog storm.
+
+**Ownership partition (no double-fire):** the launchd runner handles ONLY `"launchd": true` entries; this session skill (step 3) skips those same entries. Exactly one scheduler owns each cron. Leave `main-loop` / `/proactive-loop` session-owned (it drives the session itself — it is not a task and must never be launchd-owned).
