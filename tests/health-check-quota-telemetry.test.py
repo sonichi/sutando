@@ -23,6 +23,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -88,6 +89,22 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "ok")
         self.assertIn("4320m ago", r["detail"])
+
+    def test_stat_failure_still_reports_present(self):
+        """`exists()` true but `stat()` raising is rare (file removed mid-check,
+        permissions changed) — but a health tick must degrade to a less precise
+        detail, never raise. Without this guard one unlucky race takes down the
+        whole check run, which is strictly worse than losing the age string."""
+        self._write_quota()
+        # `exists()` calls stat() internally and swallows OSError by returning
+        # False — patching stat alone would silently exercise the ABSENT branch
+        # instead, so exists() is pinned True to isolate the one being tested.
+        with mock.patch.object(Path, "exists", return_value=True), mock.patch.object(
+            Path, "stat", side_effect=OSError("boom")
+        ):
+            r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["detail"], "quota state present")
 
 
 if __name__ == "__main__":
