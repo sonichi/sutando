@@ -716,7 +716,8 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     unlisted sender `_tier_for` returns LOCAL_TIER, so the single-owner case is
     unchanged. Never trusts the gateway's own claim (it is outside the trust
     boundary) — only the broker-attested user_id keyed against the owner's LOCAL
-    tierMap. Atomic write via tmp+rename; same schema (`ts`, `channel`, `summary`)
+    tierMap. Atomic write via per-PID tmp + os.replace (this file has four
+    concurrent writers; #2222); same schema (`ts`, `channel`, `summary`)
     as discord-bridge.write_owner_activity so the proactive-loop reader is
     transport-agnostic. Best-effort — never blocks task intake."""
     if sender_tier is None:

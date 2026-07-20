@@ -92,9 +92,11 @@ class TestOwnerActivityAtomicWrite(unittest.TestCase):
         )
 
     def test_source_sites_use_perpid_staging(self):
-        """The three bridges must stage OWNER_ACTIVITY_FILE per-PID (#2222)."""
+        """All four owner-activity writers — the three bridges plus the sparrow
+        remote-gateway bridge — must stage OWNER_ACTIVITY_FILE per-PID (#2222)."""
         bridges = ["src/slack-bridge.py", "src/discord-bridge.py",
-                   "src/telegram-bridge.py"]
+                   "src/telegram-bridge.py",
+                   "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"]
         bad = re.compile(r'OWNER_ACTIVITY_FILE\.with_suffix\(\s*["\']\.json\.tmp["\']')
         good = re.compile(r'OWNER_ACTIVITY_FILE\.with_suffix\(\s*f["\']\.json\.\{os\.getpid\(\)\}\.tmp["\']')
         for rel in bridges:
