@@ -1551,23 +1551,58 @@ def check_skill_symlinks() -> dict:
     if not skills_dst.exists():
         return {"name": name, "status": "ok", "detail": "~/.claude/skills/ not found — skipped"}
 
-    unlinked: list[str] = []
+    # A DANGLING symlink (entry present, target gone) is the case the original
+    # condition let through: `exists()` follows the link and is False, but
+    # `is_symlink()` is True, so `not exists and not is_symlink` is False and the
+    # skill counted as linked. Claude Code cannot load it either way, so it was
+    # invisible AND reported healthy. Tracked as #2213.
+    unlinked: list[str] = []   # no entry at all -> symlink_to() works
+    broken: list[str] = []     # dangling link  -> must be unlinked first
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
-        if not dst.exists() and not dst.is_symlink():
+        if dst.is_symlink() and not dst.exists():
+            broken.append(skill_name)
+        elif not dst.exists() and not dst.is_symlink():
             unlinked.append(skill_name)
 
-    if not unlinked:
+    # Dangling links whose skill is NOT in this repo are missed by the loop
+    # above, which only walks repo skills. They are still dead entries that make
+    # a skill silently unloadable, so sweep the destination too. Reported, never
+    # auto-removed: the target may belong to another checkout that is simply
+    # not mounted right now, and deleting someone else's link is not this
+    # check's call.
+    orphaned: list[str] = []
+    try:
+        repo_names = {d.name for d in skills_src.iterdir() if d.is_dir()}
+        for entry in sorted(skills_dst.iterdir()):
+            if entry.name in repo_names:
+                continue
+            if entry.is_symlink() and not entry.exists():
+                orphaned.append(entry.name)
+    except OSError:
+        pass
+
+    if not unlinked and not broken and not orphaned:
         return {"name": name, "status": "ok", "detail": f"all {sum(1 for d in skills_src.iterdir() if d.is_dir())} skills linked"}
+
+    parts = []
+    if broken:
+        parts.append(f"{len(broken)} dangling: {', '.join(broken[:4])}{'...' if len(broken) > 4 else ''}")
+    if unlinked:
+        parts.append(f"{len(unlinked)} unlinked: {', '.join(unlinked[:4])}{'...' if len(unlinked) > 4 else ''}")
+    if orphaned:
+        parts.append(f"{len(orphaned)} dangling not in this repo: {', '.join(orphaned[:4])}{'...' if len(orphaned) > 4 else ''}")
 
     return {
         "name": name,
         "status": "warn",
-        "detail": f"{len(unlinked)} unlinked skill(s): {', '.join(unlinked[:5])}{'...' if len(unlinked) > 5 else ''}",
+        "detail": "; ".join(parts),
         "_unlinked": unlinked,
+        "_broken": broken,
+        "_orphaned": orphaned,
         "_skills_src": str(skills_src),
         "_skills_dst": str(skills_dst),
     }
@@ -1576,14 +1611,21 @@ def check_skill_symlinks() -> dict:
 def fix_skill_symlinks(check: dict) -> dict:
     """Create missing symlinks for unlinked skills (--fix handler)."""
     unlinked = check.get("_unlinked", [])
+    broken = check.get("_broken", [])
     skills_src = Path(check.get("_skills_src", ""))
     skills_dst = Path(check.get("_skills_dst", ""))
     created: list[str] = []
     errors: list[str] = []
-    for skill_name in unlinked:
+    for skill_name in list(broken) + list(unlinked):
         src = skills_src / skill_name
         dst = skills_dst / skill_name
         try:
+            # A dangling link occupies the name: symlink_to() would raise
+            # FileExistsError, so --fix could not repair the very case it was
+            # meant to. Guard on is_symlink() so a real directory is never
+            # removed by a health check.
+            if dst.is_symlink() and not dst.exists():
+                dst.unlink()
             dst.symlink_to(src)
             created.append(skill_name)
         except Exception as e:
@@ -1600,7 +1642,7 @@ def apply_skill_symlink_fixes(checks: list) -> None:
     """--fix dispatch for skill-symlinks: warn-level (excluded from the issues
     loop) but auto-fixable, so it is handled by its own pass over checks."""
     for c in checks:
-        if c["name"] == "skill-symlinks" and c.get("_unlinked"):
+        if c["name"] == "skill-symlinks" and (c.get("_unlinked") or c.get("_broken")):
             result = fix_skill_symlinks(c)
             print(f"  {c['name']}: {result['detail']}")
 
