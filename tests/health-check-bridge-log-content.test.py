@@ -12,8 +12,12 @@ of successful events. The fix only treats it as a live warning when no
 Run: python3 tests/health-check-bridge-log-content.test.py
 """
 import importlib.util
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
@@ -83,6 +87,68 @@ check("discord LoginFailure overrides even non-ok incoming status", result7 is n
 
 result8 = hc.bridge_log_content_status("discord-bridge", "ok", ["Logged in as SutandoBot#1234"])
 check("discord healthy log → no override", result8 is None)
+
+# ── run_all_checks() integration: exercise the actual call site ─────────────
+# The unit tests above cover bridge_log_content_status() in isolation, but the
+# call site inside run_all_checks() (fetching `tail`, invoking the function,
+# applying the override to `status`/`detail`) is separate code that needs its
+# own coverage. Fakes just the slack-bridge pgrep result (a real PID would
+# make Check 4/5's ps/lsof calls meaningfully diverge; a fake one just makes
+# them no-op safely, which is what we want here) and points WORKSPACE_DIR /
+# claude_home_path at a temp tree so the log content is fully controlled.
+
+_orig_subprocess_run = subprocess.run
+
+
+def _fake_pgrep_slack(cmd, *args, **kwargs):
+    if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] == "/usr/bin/pgrep" and "slack-bridge" in cmd[2]:
+        class _Result:
+            returncode = 0
+            stdout = "999999\n"
+        return _Result()
+    return _orig_subprocess_run(cmd, *args, **kwargs)
+
+
+def _run_all_checks_with_slack_log(log_contents: str) -> "dict | None":
+    with tempfile.TemporaryDirectory() as tmpws, tempfile.TemporaryDirectory() as tmphome:
+        tmpws = Path(tmpws)
+        (tmpws / "logs").mkdir(parents=True)
+        (tmpws / "logs" / "slack-bridge.log").write_text(log_contents)
+        channel_dir = Path(tmphome) / "channels" / "slack"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / ".env").write_text("SLACK_BOT_TOKEN=xoxb-test\n")
+
+        _orig_chp = hc.claude_home_path
+
+        def _fake_chp(*sub):
+            if sub and sub[0] == "channels":
+                return Path(tmphome).joinpath(*sub)
+            return _orig_chp(*sub)
+
+        for _k in ("SKIP_TELEGRAM", "SKIP_DISCORD", "SKIP_SLACK"):
+            os.environ.pop(_k, None)
+
+        with patch.object(hc, "WORKSPACE_DIR", tmpws), \
+             patch.object(hc, "claude_home_path", side_effect=_fake_chp), \
+             patch.object(subprocess, "run", side_effect=_fake_pgrep_slack):
+            checks = hc.run_all_checks()
+        return next((c for c in checks if c["name"] == "slack-bridge"), None)
+
+
+_stale_hint_only = (
+    "Slack bridge started. Socket Mode connecting...\n"
+    "⚡️ Bolt app is running!\n"
+    "[Slack] HINT: 60s elapsed with zero events received.\n"
+)
+_hint_with_activity = _stale_hint_only + "  Wrote task-1784555474341 from Slack DM @Bassil Khilo\n"
+
+_check_warn = _run_all_checks_with_slack_log(_stale_hint_only)
+check("run_all_checks: hint-only log → slack-bridge warns",
+      _check_warn is not None and _check_warn["status"] == "warn", str(_check_warn))
+
+_check_ok = _run_all_checks_with_slack_log(_hint_with_activity)
+check("run_all_checks: hint + later activity → slack-bridge stays ok (the fix)",
+      _check_ok is not None and _check_ok["status"] == "ok", str(_check_ok))
 
 if failures:
     sys.exit(1)
