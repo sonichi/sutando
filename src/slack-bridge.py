@@ -432,6 +432,36 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     return None
 
 
+# When a sender ADDRESSES the bot (a DM, or an @mention — every _write_task call
+# is one of those, per handle_mention/handle_message) but isn't on the allowlist,
+# the access gate below drops the message. Historically that drop was silent, so
+# the sender never knew their message wasn't received (owner ask 2026-07-15).
+# Ack once, rate-limited per sender, before dropping. Mirrors discord-bridge.py.
+_NOT_ALLOWLISTED_ACK_COOLDOWN_S = 3600
+_not_allowlisted_ack_at: dict[str, float] = {}
+_NOT_ALLOWLISTED_ACK_TEXT = (
+    "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
+    "can't act on it. Ask the owner to add you. _(automated notice)_"
+)
+
+
+def _ack_not_allowlisted(event: dict, user_id: str) -> None:
+    """One-line 'not on the allowlist' reply so an addressed-but-dropped Slack
+    message isn't silent. Rate-limited per sender (in-memory; resets on restart)."""
+    now = time.time()
+    if now - _not_allowlisted_ack_at.get(user_id, 0.0) < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
+        return  # already acked this sender recently — don't spam / echo
+    _not_allowlisted_ack_at[user_id] = now
+    channel = event.get("channel", "")
+    # in-thread for a channel @mention, top-level for a DM (mirrors _write_task)
+    thread_ts = None if event.get("channel_type") == "im" else (event.get("thread_ts") or event.get("ts"))
+    try:
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=_NOT_ALLOWLISTED_ACK_TEXT)
+        print(f"  [not-allowlisted-ack] sent to {user_id}", flush=True)
+    except Exception as e:
+        print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
+
+
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
@@ -483,8 +513,12 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         # Keep _TOFU_ENROLLMENT_CODE valid for the process lifetime (do NOT clear
         # it) so the gate stays armed if access.json is deleted externally later
         # (#899), instead of falling through to an unguarded tofu_onboard().
+    # Every _write_task call is a DM (handle_message) or an @mention
+    # (handle_mention), so a non-allowlisted sender here DID address the bot —
+    # ack them (rate-limited) before the fail-closed drop so it isn't silent.
     if user_id not in allowed:
         print(f"  Dropped message from non-allowed user {user_id}", flush=True)
+        _ack_not_allowlisted(event, user_id)
         return None
 
     # Download any attached files BEFORE writing the task, so the task body
@@ -592,11 +626,11 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # Inject skill instructions so the agent follows the notify-before-work and
     # transcription protocol even after conversation compaction wipes context.
     # Only injected for owner tasks when the referenced skills are installed.
-    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
-    # the config dir via $CLAUDE_CONFIG_DIR.
-    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
-    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    # Use claude_home_path() — honours $CLAUDE_CONFIG_DIR → $CLAUDE_HOME → ~/.claude
+    # resolution order (inline os.environ.get misses the $CLAUDE_HOME fallback).
+    # Behaviorally covered by tests/bridge-skill-path-resolution.test.py (CLAUDE_CONFIG_DIR resolution).
+    _notify_py = claude_home_path("skills", "task-progress", "scripts", "notify.py")
+    _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")
     skill_hints = ""
     if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
