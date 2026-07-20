@@ -181,8 +181,10 @@ async def _case_owner_id_from_allowlist_scan():
         return cap
 
     async def _fetch_user(uid):
-        # first id is a bot (skipped), second is the human owner
-        return types.SimpleNamespace(bot=(int(uid) == 111), create_dm=_create_dm)
+        # first id raises (exercises the scan's except/continue), second is the owner
+        if int(uid) == 111:
+            raise RuntimeError("fetch boom")
+        return types.SimpleNamespace(bot=False, create_dm=_create_dm)
 
     bridge.client.fetch_user = _fetch_user
     access = WORKSPACE / "access-scan.json"
@@ -209,6 +211,33 @@ async def _case_no_owner_resolvable():
     # Must not raise even when there is nobody to notify.
     await bridge._report_delivery_failure(
         types.SimpleNamespace(id=7), "task-noowner", "team", RuntimeError("x")
+    )
+
+
+async def _case_emit_channel_raises():
+    """The observability emit is best-effort — if _emit_channel raises, the
+    reporter swallows it and still notifies the owner."""
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("emit boom")
+
+    bridge._emit_channel = _raise
+    cap = _CapturingDM()
+    await bridge._report_delivery_failure(cap, "task-emit-raise", "owner", RuntimeError("orig"))
+    assert any(
+        text and "Result delivery failed" in text for text in cap.sent
+    ), "owner was not notified after _emit_channel raised"
+    bridge._emit_channel = lambda *_a, **_k: None
+
+
+async def _case_access_file_unreadable():
+    """A missing/invalid ACCESS_FILE must not crash owner resolution — it falls
+    back to empty access data (then finds no owner and returns quietly)."""
+    bridge.ACCESS_FILE = WORKSPACE / "no-such-dir" / "missing-access.json"
+    bridge.discord_config.resolve_owner_id = lambda _data: None
+    bridge._emit_channel = lambda *_a, **_k: None
+    await bridge._report_delivery_failure(
+        types.SimpleNamespace(id=9), "task-bad-access", "team", RuntimeError("x")
     )
 
 
@@ -249,6 +278,8 @@ def main():
     asyncio.run(_case_nonowner_resolves_owner())
     asyncio.run(_case_owner_id_from_allowlist_scan())
     asyncio.run(_case_no_owner_resolvable())
+    asyncio.run(_case_emit_channel_raises())
+    asyncio.run(_case_access_file_unreadable())
     asyncio.run(_case_notice_send_fails())
 
     print("PASS — Discord attachment failures are visible, audited, and observable")
