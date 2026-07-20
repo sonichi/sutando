@@ -1,6 +1,8 @@
 name: eslint
 
-# CI lint: the general-purpose ESLint baseline over src/ TypeScript.
+# CI lint: the general-purpose ESLint baseline over all first-party sources —
+# TypeScript (src/, skills/, tests/) and plain JavaScript (.js/.mjs build
+# scripts + the Electron overlay app, which tsc never sees).
 #
 # Distinct from the five lint-*.yml workflows, which are targeted greps for
 # architectural rules (workspace resolution, host labels, home-path literals).
@@ -24,7 +26,7 @@ on:
 
 jobs:
   eslint:
-    name: eslint over src/
+    name: eslint over first-party TS + JS
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
