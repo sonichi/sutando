@@ -929,6 +929,16 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             pass
 
 
+def _record_skip_audit(task_id: str, skip_value: str) -> None:
+    """Record §7 audit disposition for a skip-marked result (no_send / deduped)."""
+    try:
+        import result_audit as _ra
+        _disp = "deduped" if skip_value == "deduped" else "no_send"
+        _ra.record(task_id or "", _disp, "slack")
+    except Exception:  # pragma: no cover  (defensive: record() never raises in practice)
+        pass
+
+
 def _check_task_timeouts() -> None:
     """Post a one-time reply for tasks the core never answered in time.
 
@@ -1011,8 +1021,12 @@ def result_watcher():
                 # truth so future skip markers added in result_markers.py
                 # automatically apply here.
                 _skip_parsed = parse_markers(reply_text)
-                if any(a.kind == "skip" for a in _skip_parsed.actions):
+                _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
+                if _skip_action is not None:
                     print(f"  Skipped (marker): {task_id}", flush=True)
+                    # §7 audit ledger: skip-marked results are resolved deliveries
+                    # (no_send / deduped), not silent voids. One line per result.
+                    _record_skip_audit(task_id, _skip_action.value)
                 else:
                     try:
                         _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
