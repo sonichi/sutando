@@ -606,26 +606,35 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
     return recovered
 
 
-def _restore_pending_replies_from_disk(pending_replies: dict, results_dir: Path, tasks_dir: Path) -> None:
+def _gather_pending_task_ids(pending_replies: dict, results_dir: Path, tasks_dir: Path) -> list:
     """Fold any orphaned-by-restart routing recovered from disk into
-    `pending_replies` (mutated in place via setdefault — if the id somehow
-    reappeared through normal means first, that entry wins).
+    `pending_replies` (mutated in place via setdefault — if the id
+    reappeared through normal means in the meantime, that entry wins), and
+    return the full task_id list for this poll.
 
-    Called ONCE at startup, before the poll loop begins — not every tick.
-    An orphan (a result whose task_id isn't in pending_replies) can only
-    exist right after a process restart: any task created during THIS
-    process's own lifetime is registered in pending_replies at creation
-    time (see the `pending_replies[task_id] = chat_id` write at task-write
-    time), so it can never become orphaned while this same process keeps
-    running. Scanning every result file + reading its task file on every
-    poll tick to catch an event that happens at most once per process
-    lifetime is wasted IO on a busy results/ dir; a one-time pass at
-    startup is both cheaper and provably sufficient.
+    Must run every tick, not once at startup (per @qingyun-wu's review,
+    correcting my earlier "run once" design): a task can be created by the
+    OLD process, survive a restart, and have its result land AFTER the new
+    process's startup scan — the core is still processing it at restart
+    time. A one-time startup scan sees no result yet, the task_id is never
+    registered (it wasn't created by *this* process), and nothing ever
+    looks for it again once the scan has passed — the reply is dropped for
+    the life of the process. Confirmed as the exact mechanism behind the
+    26-file live-host measurement in the sibling review.
+
+    This isn't the "full glob every tick" cost it looks like: the outer
+    `results_dir.glob()` is a cheap directory listing, and
+    `_recover_orphaned_task_routing()` only pays the expensive per-file cost
+    (reading task-file headers, checking the archive) for task_ids NOT
+    already in `pending_replies` — on a steady-state tick with no pending
+    restart-orphans, that set is empty and the extra work is zero.
     """
-    recovered = _recover_orphaned_task_routing(results_dir, tasks_dir, set(pending_replies))
+    known_ids = set(pending_replies)
+    recovered = _recover_orphaned_task_routing(results_dir, tasks_dir, known_ids)
     for tid, chat_id in recovered.items():
         pending_replies.setdefault(tid, chat_id)
         print(f"  [recovered] {tid} routing from task file (was orphaned after a restart)", flush=True)
+    return list(pending_replies)
 
 
 def poll_progress(pending_replies: dict) -> None:
@@ -726,10 +735,6 @@ def main():  # pragma: no cover
     offset = None
     allowed = load_allowed()
     pending_replies = {}  # task_id -> chat_id
-    # Restart-safety: recover routing for any task whose result already
-    # landed while this process was down. See _restore_pending_replies_from_disk
-    # for why this only needs to run once, here, rather than every poll tick.
-    _restore_pending_replies_from_disk(pending_replies, RESULTS_DIR, TASKS_DIR)
 
     heartbeat_file = REPO / "state" / "telegram-bridge.heartbeat"
     last_heartbeat = 0
@@ -1100,8 +1105,10 @@ def main():  # pragma: no cover
         except Exception as e:
             print(f"[Telegram] poll_progress error: {e}", flush=True)
 
-        # Check for results to send back
-        for task_id in list(pending_replies.keys()):
+        # Check for results to send back (includes any orphaned-by-restart
+        # routing recovered from the task files themselves — see
+        # _gather_pending_task_ids for why this must run every tick).
+        for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
