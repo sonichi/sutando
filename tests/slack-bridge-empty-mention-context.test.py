@@ -78,6 +78,9 @@ class EmptyMentionContextTest(unittest.TestCase):
         BRIDGE.app.client.conversations_replies = lambda **kwargs: self.fail(
             "nonempty mentions must not fetch thread history"
         )
+        BRIDGE.app.client.conversations_history = lambda **kwargs: self.fail(
+            "nonempty mentions must not fetch channel history"
+        )
         BRIDGE.handle_mention(mention_event("<@UBOT> do the task"), None)
         self.assertEqual(self.captured[0][1:], ("Slack mention", "do the task", "Rui"))
 
@@ -92,7 +95,7 @@ class EmptyMentionContextTest(unittest.TestCase):
         BRIDGE.handle_mention(mention_event(), None)
         self.assertEqual(
             self.captured[0][1:],
-            ("Slack mention (recovered prior thread message)", "Run it now", "Rui"),
+            ("Slack mention (recovered prior message)", "Run it now", "Rui"),
         )
 
     def test_recovered_text_preserves_mentions_inside_the_task(self):
@@ -128,10 +131,37 @@ class EmptyMentionContextTest(unittest.TestCase):
         BRIDGE.handle_mention(mention_event(), None)
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
-    def test_top_level_empty_mention_falls_back_without_history_lookup(self):
+    def test_top_level_empty_mention_recovers_latest_same_sender_message(self):
         BRIDGE.app.client.conversations_replies = lambda **kwargs: self.fail(
-            "top-level mention has no prior thread to inspect"
+            "top-level mention must use channel history"
         )
+        captured = []
+        BRIDGE.app.client.conversations_history = lambda **kwargs: (
+            captured.append(kwargs)
+            or {
+                "messages": [
+                    {"ts": "1700000001.000002", "user": "UOWNER", "text": "Run it now"},
+                    {"ts": "1700000000.000001", "user": "UOTHER", "text": "older"},
+                ]
+            }
+        )
+        BRIDGE.handle_mention(mention_event(thread_ts=None), None)
+        self.assertEqual(
+            captured,
+            [{"channel": "CDEV", "latest": "1700000002.000003", "inclusive": False, "limit": 100}],
+        )
+        self.assertEqual(
+            self.captured[0][1:],
+            ("Slack mention (recovered prior message)", "Run it now", "Rui"),
+        )
+
+    def test_top_level_empty_mention_does_not_cross_another_human(self):
+        BRIDGE.app.client.conversations_history = lambda **kwargs: {
+            "messages": [
+                {"ts": "1700000001.500002", "user": "UOTHER", "text": "intervening"},
+                {"ts": "1700000001.000002", "user": "UOWNER", "text": "delete it"},
+            ]
+        }
         BRIDGE.handle_mention(mention_event(thread_ts=None), None)
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 

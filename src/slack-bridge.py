@@ -738,7 +738,7 @@ def _resolve_username(user_id: str) -> str | None:
 
 _EMPTY_MENTION_CLARIFICATION = (
     "The user mentioned the bot without any task text, and no recoverable "
-    "same-user message was found in the Slack thread. Acknowledge the mention "
+    "same-user message was found in the Slack conversation. Acknowledge the mention "
     "and ask briefly what they would like help with."
 )
 
@@ -760,15 +760,25 @@ def _resolve_mention_text(event: dict, stripped_text: str) -> tuple[str, bool]:
     thread_ts = event.get("thread_ts")
     current_ts = event.get("ts")
     user_id = event.get("user")
-    if channel and thread_ts and current_ts and user_id:
+    if channel and current_ts and user_id:
         try:
-            response = app.client.conversations_replies(
-                channel=channel,
-                ts=thread_ts,
-                limit=100,
-            )
+            if thread_ts:
+                response = app.client.conversations_replies(
+                    channel=channel,
+                    ts=thread_ts,
+                    limit=100,
+                )
+            else:
+                response = app.client.conversations_history(
+                    channel=channel,
+                    latest=current_ts,
+                    inclusive=False,
+                    limit=100,
+                )
             messages = response.get("messages") or []
-            for message in reversed(messages):
+            # replies are oldest-first; channel history is newest-first.
+            newest_first = reversed(messages) if thread_ts else messages
+            for message in newest_first:
                 if message.get("ts", "") >= current_ts:
                     continue
                 if message.get("bot_id"):
@@ -800,7 +810,7 @@ def handle_mention(event, say):
     # Strip the leading <@BOTID> mention from the text body for cleanliness.
     text = re.sub(r"^<@[A-Z0-9]+>\s*", "", raw).strip()
     text, recovered = _resolve_mention_text(event, text)
-    prefix = "Slack mention (recovered prior thread message)" if recovered else "Slack mention"
+    prefix = "Slack mention (recovered prior message)" if recovered else "Slack mention"
     _write_task(event, prefix, text, username)
 
 
