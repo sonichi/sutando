@@ -9,6 +9,7 @@ double-start source it defuses.
 Run: python3 tests/core-heartbeat-selfguard.test.py
 """
 
+import fcntl
 import importlib.util
 import json
 import os
@@ -115,6 +116,91 @@ class SelfGuardTest(unittest.TestCase):
         self.assertEqual(hb.main(["--once"]), 0)
         # --once overwrote the file with OUR beat (forced single write)
         self.assertEqual(json.loads(hb._alive_path().read_text())["pid"], os.getpid())
+
+    def test_flock_makes_acquisition_atomic_within_process_pair(self):
+        # Sequential sanity: first acquire wins, and after the winner beats,
+        # a second acquire attempt in ANOTHER process yields to the winner.
+        self.assertIsNone(hb.try_acquire_ownership())
+        hb.write_beat()
+        code = (
+            "import importlib.util, sys, json, os\n"
+            f"spec = importlib.util.spec_from_file_location('hb', {str(REPO / 'src' / 'core_heartbeat.py')!r})\n"
+            "m = importlib.util.module_from_spec(spec); sys.modules['hb'] = m\n"
+            "spec.loader.exec_module(m)\n"
+            f"m.CORES_DIR = __import__('pathlib').Path({str(hb.CORES_DIR)!r})\n"
+            "print(m.try_acquire_ownership())\n"
+        )
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), str(os.getpid()), out.stderr)
+        self._release_lock()
+
+    def test_concurrent_start_exactly_one_owner(self):
+        """The #2201 review repro, inverted into a regression test: N processes
+        pass a barrier and race try_acquire_ownership + first beat. Exactly one
+        must win; the final .alive must be valid JSON naming the winner."""
+        import multiprocessing as mp
+        ctx = mp.get_context("fork")  # fork so the CORES_DIR monkeypatch propagates
+        n = 5
+        barrier = ctx.Barrier(n)
+        q = ctx.Queue()
+
+        cores_dir = str(hb.CORES_DIR)
+
+        def racer(barrier, q, cores_dir):
+            import importlib.util as ilu
+            from pathlib import Path
+            spec = ilu.spec_from_file_location("hb_child", str(REPO / "src" / "core_heartbeat.py"))
+            m = ilu.module_from_spec(spec)
+            sys.modules["hb_child"] = m
+            spec.loader.exec_module(m)
+            m.CORES_DIR = Path(cores_dir)
+            barrier.wait()  # two-phase: everyone checks at the same instant
+            got = m.try_acquire_ownership()
+            err = ""
+            if got is None:
+                try:
+                    m.write_beat()
+                except Exception as e:  # the shared-tmp collision class
+                    err = f"{type(e).__name__}: {e}"
+            q.put((os.getpid(), got is None, err))
+            if got is None:
+                time.sleep(0.5)  # hold the flock while siblings finish checking
+
+        procs = [ctx.Process(target=racer, args=(barrier, q, cores_dir)) for _ in range(n)]
+        for p in procs:
+            p.start()
+        results = [q.get(timeout=15) for _ in range(n)]
+        for p in procs:
+            p.join(timeout=15)
+
+        owners = [pid for (pid, won, _err) in results if won]
+        errors = [err for (_pid, _won, err) in results if err]
+        self.assertEqual(len(owners), 1, f"expected exactly one owner, got {owners}; results={results}")
+        self.assertEqual(errors, [], f"owner's first beat must not collide: {errors}")
+        payload = json.loads(hb._alive_path().read_text())  # valid JSON or this raises
+        self.assertEqual(payload["pid"], owners[0])
+        # no stray shared-name staging file left behind
+        leftovers = [p.name for p in hb.CORES_DIR.iterdir() if ".tmp" in p.name]
+        self.assertEqual(leftovers, [], f"staging files left behind: {leftovers}")
+
+    def test_usurped_writer_exits_instead_of_flapping(self):
+        # A different live pid legitimately owns the file → run_forever must
+        # exit 0 before writing a single beat (the pre-beat recheck).
+        self._write_alive(os.getppid())
+        target = hb._alive_path()
+        before = target.read_text()
+        self.assertEqual(hb.run_forever(interval=0.05), 0)
+        self.assertEqual(target.read_text(), before, "usurped writer flapped the file")
+
+    def _release_lock(self):
+        # tests share one process; drop the module-held flock between cases
+        if hb._LOCK_FD is not None:
+            try:
+                fcntl.flock(hb._LOCK_FD, fcntl.LOCK_UN)
+                os.close(hb._LOCK_FD)
+            except OSError:
+                pass
+            hb._LOCK_FD = None
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ Runs forever until killed. Exit codes:
 """
 from __future__ import annotations
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -124,9 +125,16 @@ def write_beat(status: str = "running") -> None:
         "locality": _locality(),
         "schema_version": 2,
     }
-    tmp = target.with_suffix(".alive.tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(target)
+    # Per-PROCESS staging file: with a shared name, two concurrent first beats
+    # destroy each other mid-`replace` (one writer's rename removes the other's
+    # staging file → FileNotFoundError, and interleaved writes can leave the
+    # final .alive as invalid JSON — both reproduced in the #2201 review).
+    tmp = target.parent / f"{target.name}.tmp.{os.getpid()}"
+    try:
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(target)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op after a successful replace
 
 
 _STARTED_AT: float = time.time()
@@ -174,6 +182,48 @@ def another_heartbeat_alive(staleness_s: float = 90.0) -> "int | None":
     return pid
 
 
+_LOCK_FD: "int | None" = None
+
+
+def try_acquire_ownership() -> "int | None":
+    """Atomically claim single-writer ownership for this host, or name who to
+    yield to. Returns None on success; a pid (or -1 when the holder is not yet
+    identifiable) when another starter/beater owns the host.
+
+    Check-then-act on the .alive file alone is NOT enough: on a true
+    simultaneous start every process can observe "no fresh owner" before any
+    first beat lands (reproduced with a 5-way forked barrier in the #2201
+    review — all five proceeded as owners). The claim must be atomic, so it
+    rides an flock(LOCK_EX | LOCK_NB) on `<host>.lock`, held open for the
+    process lifetime and released by the kernel on ANY death — no stale-lock
+    recovery needed, which is why it beats O_EXCL lock files here.
+
+    The freshness/pid guard still runs AFTER the flock: a beater from a
+    pre-flock build (or a foreign writer) doesn't hold the lock but is still
+    a legitimate owner — yield to it rather than fight over the file.
+    """
+    global _LOCK_FD
+    CORES_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = CORES_DIR / f"{_hostname()}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        # The holder's pid is only knowable once it has beaten.
+        try:
+            return int(json.loads(_alive_path().read_text())["pid"])
+        except Exception:
+            return -1
+    other = another_heartbeat_alive()
+    if other is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        return other
+    _LOCK_FD = fd  # deliberately held (and leaked) for the process lifetime
+    return None
+
+
 def _handle_signal(signum: int, frame) -> None:
     """Mark shutdown so the loop exits at the top of the next sleep; also
     unlink the .alive file so peers see this core leave immediately rather
@@ -191,6 +241,15 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     while not _SHUTDOWN_REQUESTED:
+        # Re-check ownership before every beat: if a DIFFERENT live pid now
+        # owns the file (e.g. this process wedged long enough to be declared
+        # stale and something else legitimately took over), exit instead of
+        # flapping the file back (#2201 review hardening).
+        usurper = another_heartbeat_alive()
+        if usurper is not None:
+            print(f"core_heartbeat: pid {usurper} took over the host heartbeat — "
+                  "exiting (yield instead of pid-flapping)", flush=True)
+            return 0
         try:
             write_beat(status=status)
         except Exception as e:
@@ -222,9 +281,10 @@ def main(argv: list[str] | None = None) -> int:
         # the self-guard on purpose.
         write_beat(status=args.status)
         return 0
-    other = another_heartbeat_alive()
+    other = try_acquire_ownership()
     if other is not None:
-        print(f"core_heartbeat: pid {other} is already beating for this host — "
+        who = f"pid {other}" if other > 0 else "another starter (lock held, no beat yet)"
+        print(f"core_heartbeat: {who} already owns this host's heartbeat — "
               "exiting (self-guard; the desired single-writer state already holds)",
               flush=True)
         return 0
