@@ -26,11 +26,20 @@ back to local_task_protocol.find_archived_task() (flat tasks/archive/,
 tasks/processed/, and month-partitioned tasks/archive/YYYY-MM/) when the
 live-tasks/ lookup misses.
 
-**Recovery runs once, at result_watcher() startup, not every poll tick.** An
-orphan can only exist right after a process restart — any task created
-during a running process's own lifetime is registered in pending_replies at
-creation time, so it can never become orphaned while that same process keeps
-running. See _restore_pending_replies_from_disk().
+**Recovery must run every tick, not once at startup** (correction from
+@qingyun-wu's follow-up review, which caught a real remaining gap in an
+earlier revision of this fix): a task can be created by the OLD process,
+survive the restart, and have its result land AFTER the new process's
+one-time startup scan — the core is still processing it at restart time.
+A startup-only scan sees no result yet, never registers the task_id (it
+wasn't created by *this* process), and nothing looks for it again once the
+scan has passed. Confirmed as the exact mechanism behind the 26-file
+live-host measurement above: the stranded replies were all tasks the
+*previous* process had created, not new ones. See
+TestResultWatcherEndToEndRestartRecovery below for the exact repro
+qingyun-wu specified: write task, restart, start the real watcher loop
+BEFORE the result exists, THEN write the result — assert delivery still
+happens on a later tick.
 
 Run: python3 tests/slack-bridge-orphaned-routing-recovery.test.py
 Exit: 0 on pass, 1 on fail.
@@ -232,14 +241,14 @@ class TestRecoverOrphanedTaskRouting(unittest.TestCase):
         self.assertEqual(recovered["task-1012"]["channel"], "D0B5L7X2TK2")
 
 
-class TestRestorePendingRepliesFromDisk(unittest.TestCase):
-    """Covers _restore_pending_replies_from_disk() — the actual
-    result_watcher()-startup call site: fold recovered orphans into the
-    module-level pending_replies (mutated in place, under its lock) so the
-    timeout watchdog and the poll loop both see them."""
+class TestGatherPendingTaskIds(unittest.TestCase):
+    """Covers _gather_pending_task_ids() — the actual result_watcher()
+    per-tick call site: snapshot pending_replies, fold in recovered
+    orphans, merge them back into pending_replies so the timeout watchdog
+    and future polls see them too."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="slack-restore-pending-test-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="slack-gather-pending-test-"))
         self.results = self.tmp / "results"
         self.tasks = self.tmp / "tasks"
         self.results.mkdir(parents=True)
@@ -252,18 +261,19 @@ class TestRestorePendingRepliesFromDisk(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_no_orphans_leaves_pending_replies_unchanged(self):
+    def test_no_orphans_returns_known_pending_ids_unchanged(self):
         self.mod.pending_replies["task-100"] = {"channel": "D1", "thread_ts": None,
                                                   "access_tier": "owner", "submitted_at": 0.0,
                                                   "timed_out": False}
-        self.mod._restore_pending_replies_from_disk()
-        self.assertEqual(set(self.mod.pending_replies.keys()), {"task-100"})
+        ids = self.mod._gather_pending_task_ids()
+        self.assertEqual(ids, ["task-100"])
 
     def test_orphan_is_recovered_and_merged_into_pending_replies(self):
         _write_task(self.tasks / "task-200.txt", id="task-200", source="slack",
                     channel_id="D0B5L7X2TK2")
         (self.results / "task-200.txt").write_text("orphaned result")
-        self.mod._restore_pending_replies_from_disk()
+        ids = self.mod._gather_pending_task_ids()
+        self.assertIn("task-200", ids)
         self.assertIn("task-200", self.mod.pending_replies)
         self.assertEqual(self.mod.pending_replies["task-200"]["channel"], "D0B5L7X2TK2")
 
@@ -274,39 +284,47 @@ class TestRestorePendingRepliesFromDisk(unittest.TestCase):
         _write_task(self.tasks / "task-400.txt", id="task-400", source="slack",
                     channel_id="D0B5L7X2TK2")
         (self.results / "task-400.txt").write_text("orphaned alongside a live task")
-        self.mod._restore_pending_replies_from_disk()
-        self.assertEqual(set(self.mod.pending_replies.keys()), {"task-300", "task-400"})
+        ids = self.mod._gather_pending_task_ids()
+        self.assertEqual(set(ids), {"task-300", "task-400"})
         self.assertEqual(self.mod.pending_replies["task-300"], live_entry)
 
-    def test_recovered_entry_never_overrides_a_live_one(self):
-        """setdefault semantics: if the same task_id somehow reappeared
-        through normal means before recovery runs, the live entry wins."""
-        live_entry = {"channel": "D_LIVE", "thread_ts": None, "access_tier": "owner",
-                      "submitted_at": 111.0, "timed_out": False}
-        self.mod.pending_replies["task-500"] = live_entry
-        _write_task(self.tasks / "task-500.txt", id="task-500", source="slack",
+    def test_no_result_yet_recovers_nothing_this_tick(self):
+        """The task exists but its result hasn't landed yet — a tick before
+        the result appears must not fabricate an entry, and must not error."""
+        _write_task(self.tasks / "task-600.txt", id="task-600", source="slack",
                     channel_id="D0B5L7X2TK2")
-        (self.results / "task-500.txt").write_text("orphaned result")
-        self.mod._restore_pending_replies_from_disk()
-        self.assertEqual(self.mod.pending_replies["task-500"], live_entry)
+        ids = self.mod._gather_pending_task_ids()
+        self.assertEqual(ids, [])
+        self.assertNotIn("task-600", self.mod.pending_replies)
+
+    def test_orphan_recovered_on_a_later_tick_once_result_appears(self):
+        """The exact gap @qingyun-wu's follow-up review caught: a task
+        in-flight at restart time, whose result lands on a LATER tick, must
+        still be recovered — not just orphans whose result already existed
+        on the first post-restart tick."""
+        _write_task(self.tasks / "task-700.txt", id="task-700", source="slack",
+                    channel_id="D0B5L7X2TK2")
+        # Tick 1 (right after "restart"): result hasn't landed yet.
+        ids_tick1 = self.mod._gather_pending_task_ids()
+        self.assertEqual(ids_tick1, [])
+        self.assertNotIn("task-700", self.mod.pending_replies)
+        # The core finishes processing sometime later, after that tick.
+        (self.results / "task-700.txt").write_text("finished after the first post-restart tick")
+        # Tick 2: must be recovered now.
+        ids_tick2 = self.mod._gather_pending_task_ids()
+        self.assertEqual(ids_tick2, ["task-700"])
+        self.assertEqual(self.mod.pending_replies["task-700"]["channel"], "D0B5L7X2TK2")
 
 
 class TestResultWatcherEndToEndRestartRecovery(unittest.TestCase):
-    """Behavioral repro for the actual production claim under review: that a
-    result written *after* a mid-flight bridge restart is still delivered to
-    the user. Unlike the unit tests above (which call
-    `_recover_orphaned_task_routing` / `_gather_pending_task_ids` directly),
-    this drives the REAL `result_watcher()` background loop, unmodified, in
-    a daemon thread — the exact function that runs in production — and
-    verifies delivery via a stubbed `chat_postMessage` call.
-
-    A restart is modeled by loading the bridge module a *second* time via
-    `_load_bridge()`: each call does a fresh `importlib` module_from_spec +
-    exec_module, so the second module's globals — including
-    `pending_replies` — start empty, exactly like a new OS process. The
-    task's routing only survives via the durable task-file headers, matching
-    what actually happens on a real restart.
-    """
+    """Behavioral repro for @qingyun-wu's exact specified sequence: write the
+    task, restart (fresh module = fresh pending_replies), start the REAL
+    result_watcher() background loop BEFORE the result exists, THEN write
+    the result — assert delivery still happens on a later tick, via the
+    real send path (stubbed only at the Slack API boundary). This is the
+    ordering an earlier revision of this fix got wrong (writing the result
+    before the recovery pass is the one ordering where a startup-only scan
+    happens to work — see the module docstring)."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="slack-e2e-restart-test-"))
@@ -346,7 +364,7 @@ class TestResultWatcherEndToEndRestartRecovery(unittest.TestCase):
         mod.PRESENTER_SENTINEL = self.tmp / "state" / "presenter-mode.sentinel"
         mod._emit_channel = lambda *a, **k: None
 
-    def test_result_written_after_restart_is_delivered_by_the_real_watcher_loop(self):
+    def test_result_written_after_restart_and_after_watcher_started_is_still_delivered(self):
         task_id = "task-e2e-restart-1"
         # Task file already archived (flat tasks/archive/) — the realistic
         # state by the time an orphaned result is found, per the live
@@ -380,21 +398,29 @@ class TestResultWatcherEndToEndRestartRecovery(unittest.TestCase):
         sent: list[dict] = []
         proc2.app.client.chat_postMessage = lambda **kw: sent.append(kw) or {"ok": True}
 
-        # The result is written only now, AFTER the restart — the case that
-        # was silently dropped before this fix.
-        (self.results / f"{task_id}.txt").write_text("the drafted answer, post-restart")
-
-        # Drive the ACTUAL background loop — result_watcher() itself, not a
-        # hand-rolled substitute — exactly as production runs it.
+        # Start the REAL background loop — result_watcher() itself, not a
+        # hand-rolled substitute — BEFORE the result exists. The core is
+        # still "processing" at this point, exactly the sequence
+        # @qingyun-wu specified.
         watcher_thread = threading.Thread(target=proc2.result_watcher, daemon=True)
         watcher_thread.start()
+
+        # Give it a couple of ticks to prove it does NOT fabricate a
+        # delivery while there's genuinely nothing to deliver yet.
+        time.sleep(1.5)
+        self.assertEqual(len(sent), 0, "must not send before the result exists")
+
+        # The result lands only now — AFTER the restart AND after the
+        # watcher has already been running for a bit.
+        (self.results / f"{task_id}.txt").write_text("the drafted answer, post-restart")
 
         deadline = time.time() + 5
         while time.time() < deadline and not sent:
             time.sleep(0.05)
 
         # AFTER: the real watcher loop, driven only by durable on-disk state,
-        # delivered the reply despite pending_replies having started empty.
+        # delivered the reply despite pending_replies having started empty
+        # and the result having appeared well after the loop was already running.
         self.assertEqual(len(sent), 1, "result_watcher() never delivered the post-restart result")
         self.assertEqual(sent[0]["channel"], "D0E2ERESTART")
         self.assertEqual(sent[0]["text"], "the drafted answer, post-restart")

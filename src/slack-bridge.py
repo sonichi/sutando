@@ -1004,31 +1004,40 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
     return recovered
 
 
-def _restore_pending_replies_from_disk() -> None:
-    """Fold any orphaned-by-restart routing recovered from disk into
-    `pending_replies` (merged via setdefault — if the id reappeared through
-    normal means first, that entry wins).
+def _gather_pending_task_ids() -> list:
+    """Snapshot pending_replies' keys, folding in any orphaned-by-restart
+    routing recovered from disk, and return the full task_id list for this
+    poll. Recovered entries are merged into pending_replies via setdefault —
+    if the id reappeared through normal means in the meantime, that entry
+    wins.
 
-    Called ONCE at result_watcher() startup, before its poll loop begins —
-    not every tick. An orphan (a result whose task_id isn't in
-    pending_replies) can only exist right after a process restart: any task
-    created during THIS process's own lifetime is registered in
-    pending_replies at creation time (see the Slack event handler that
-    writes it), so it can never become orphaned while this same process
-    keeps running. Scanning every result file + reading its task file on
-    every poll tick to catch an event that happens at most once per process
-    lifetime was wasted IO on a busy results/ dir; a one-time pass at
-    startup is both cheaper and provably sufficient.
+    Must run every tick, not once at startup (per @qingyun-wu's review,
+    correcting an earlier "run once" design): a task can be created by the
+    OLD process, survive a restart, and have its result land AFTER the new
+    process's startup scan — the core is still processing it at restart
+    time. A one-time startup scan sees no result yet, the task_id is never
+    registered (it wasn't created by *this* process), and nothing ever
+    looks for it again once the scan has passed — the reply is dropped for
+    the life of the process. Confirmed as the exact mechanism behind the
+    26-file live-host measurement in the sibling review.
+
+    This isn't the "full glob every tick" cost it looks like: the outer
+    `results_dir.glob()` inside `_recover_orphaned_task_routing()` is a
+    cheap directory listing, and the expensive per-file work (reading
+    task-file headers, checking the archive) only happens for task_ids NOT
+    already in `pending_replies` — on a steady-state tick with no pending
+    restart-orphans, that set is empty and the extra work is zero.
     """
     with pending_replies_lock:
-        known_ids = set(pending_replies.keys())
-    recovered = _recover_orphaned_task_routing(RESULTS_DIR, TASKS_DIR, known_ids)
+        pending_ids = list(pending_replies.keys())
+    recovered = _recover_orphaned_task_routing(RESULTS_DIR, TASKS_DIR, set(pending_ids))
     if not recovered:
-        return
+        return pending_ids
     with pending_replies_lock:
         for tid, entry in recovered.items():
             pending_replies.setdefault(tid, entry)
             print(f"  [recovered] {tid} routing from task file (was orphaned after a restart)", flush=True)
+    return list(set(pending_ids) | recovered.keys())
 
 
 def _check_task_timeouts() -> None:
@@ -1088,18 +1097,15 @@ def result_watcher():
     """Background thread: polls results/ for replies + proactive messages."""
     heartbeat_file = REPO / "state" / "slack-bridge.heartbeat"
     last_heartbeat = 0.0
-    # Restart-safety: recover routing for any task whose result already
-    # landed while this process was down. See _restore_pending_replies_from_disk
-    # for why this only needs to run once, here, rather than every poll tick.
-    _restore_pending_replies_from_disk()
     while True:
         try:
             # Surface tasks the core never answered (timeout → visible reply).
             _check_task_timeouts()
 
-            # Replies to pending tasks
-            with pending_replies_lock:
-                pending_ids = list(pending_replies.keys())
+            # Replies to pending tasks (includes any orphaned-by-restart
+            # routing recovered from the task files themselves — see
+            # _gather_pending_task_ids for why this must run every tick).
+            pending_ids = _gather_pending_task_ids()
 
             for task_id in pending_ids:
                 result_file = RESULTS_DIR / f"{task_id}.txt"
