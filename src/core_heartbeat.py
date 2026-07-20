@@ -133,6 +133,47 @@ _STARTED_AT: float = time.time()
 _SHUTDOWN_REQUESTED = False
 
 
+def another_heartbeat_alive(staleness_s: float = 90.0) -> "int | None":
+    """Self-guard: return the pid of an ALREADY-BEATING heartbeat for this
+    host, or None if this process should take over.
+
+    "Already beating" requires ALL of: the .alive file exists, its mtime is
+    younger than `staleness_s` (the documented cross-host liveness threshold),
+    its payload names a pid, that pid is a live process, and it isn't us.
+    Anything else — missing/stale file, malformed payload, dead pid — means
+    the previous owner is gone and we take over (same recoverability stance
+    as the mtime-staleness readers).
+
+    Why: two concurrent heartbeats write the same .alive and flap it between
+    pids — harmless for mtime-liveness, but ambiguous for consumers that use
+    the pid as a control target (the pause/stop-core path, #2198). With this
+    guard a double-start (e.g. startup.sh + the schedule-crons step-5.5
+    backstop landing in the same window, #2199) resolves to exactly one
+    writer, deterministically.
+    """
+    target = _alive_path()
+    try:
+        st = target.stat()
+        if time.time() - st.st_mtime > staleness_s:
+            return None
+        pid = int(json.loads(target.read_text())["pid"])
+    except Exception:
+        return None
+    if pid == os.getpid():
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None  # ESRCH — no such process; take over.
+    except PermissionError:
+        # EPERM — the process EXISTS but we may not signal it (sandboxed or
+        # privilege-separated launcher). That is a live heartbeat: yield.
+        return pid
+    except OSError:
+        return None  # anything else — treat as dead; staleness readers recover.
+    return pid
+
+
 def _handle_signal(signum: int, frame) -> None:
     """Mark shutdown so the loop exits at the top of the next sleep; also
     unlink the .alive file so peers see this core leave immediately rather
@@ -177,7 +218,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.once:
+        # Debug/test escape hatch: --once is a forced single beat, exempt from
+        # the self-guard on purpose.
         write_beat(status=args.status)
+        return 0
+    other = another_heartbeat_alive()
+    if other is not None:
+        print(f"core_heartbeat: pid {other} is already beating for this host — "
+              "exiting (self-guard; the desired single-writer state already holds)",
+              flush=True)
         return 0
     # Anonymous, opt-out product telemetry: one event per real core boot so
     # maintainers can count active installs (OSS + desktop). No-op when opted
