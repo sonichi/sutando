@@ -1102,6 +1102,53 @@ def check_voice_transport(voice_check: dict) -> dict:
     return check
 
 
+def check_quota_telemetry(proxy_status: str) -> dict:
+    """Warn when the credential proxy is up but producing no quota state.
+
+    quota-state.json is written by the proxy from the quota headers on
+    upstream responses, so it only appears if a core actually ROUTES through
+    the proxy. `src/startup.sh` is the only thing that exports
+    ANTHROPIC_BASE_URL=http://localhost:7846 — and a core launched by the
+    desktop supervisor never runs startup.sh. Result on such a host: the
+    proxy is healthy and listening, every check is green, and quota
+    telemetry is silently absent forever. The proactive loop's per-pass
+    budget check reads "unknown" on every pass and nobody is told why.
+
+    The existing credential-proxy check can't catch this: it is a plain
+    TCP-listening probe (correctly so — a forwarding proxy has no liveness
+    endpoint), so "listening" is all it can ever assert.
+
+    Deliberately narrow to stay quiet in the legitimate cases:
+      - proxy not up          -> silent. Not every host routes through it,
+                                 and its own check already says so.
+      - file present          -> ok, with its age. NOT stale-checked: a quiet
+                                 core legitimately writes nothing for a long
+                                 time, so an age threshold would fire on
+                                 healthy idle hosts. Absence is the signal
+                                 that actually distinguishes broken wiring.
+    """
+    check = {"name": "quota-telemetry", "status": "ok"}
+    if proxy_status != "ok":
+        check["detail"] = "credential proxy not running — quota telemetry not expected"
+        return check
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if path.exists():
+        try:
+            age_min = int((time.time() - path.stat().st_mtime) / 60)
+            check["detail"] = f"quota state present (updated {age_min}m ago)"
+        except OSError:
+            check["detail"] = "quota state present"
+        return check
+    check["status"] = "warn"
+    check["detail"] = (
+        "credential proxy is up but has never written quota-state.json — "
+        "nothing is routing through it (ANTHROPIC_BASE_URL unset; set by "
+        "src/startup.sh, which a supervisor-launched core never runs). "
+        "Quota-based budgeting is blind on this host."
+    )
+    return check
+
+
 def check_bodhi_dist() -> dict:
     """Verify the installed bodhi-realtime-agent dist has the Gemini 3.1
     wire-format fixes applied. Greps the Gemini sendAudio/sendFile bodies
@@ -1746,6 +1793,9 @@ def run_all_checks() -> list[dict]:
         proxy_check["status"] = "warn"
         proxy_check["detail"] = "not running (optional)"
     checks.append(proxy_check)
+
+    # Quota telemetry — only meaningful when the proxy is actually up.
+    checks.append(check_quota_telemetry(proxy_check["status"]))
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
