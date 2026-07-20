@@ -18,7 +18,6 @@ import http.server
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 from datetime import datetime
@@ -32,7 +31,7 @@ from urllib.parse import urlparse
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
-from util_paths import personal_path, shared_personal_path  # noqa: E402
+from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
@@ -170,8 +169,15 @@ def get_system_stats() -> dict:
 
     result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
     battery_m = re.search(r'(\d+)%', result.stdout)
-    battery = f"{battery_m.group(1)}%" if battery_m else "?"
-    charging = "charging" in result.stdout.lower() or "ac power" in result.stdout.lower()
+    if battery_m:
+        battery = f"{battery_m.group(1)}%"
+        # \b keeps "discharging" (battery power) from substring-matching "charging".
+        charging = bool(re.search(r'\bcharging\b', result.stdout.lower())) or "ac power" in result.stdout.lower()
+    else:
+        # Battery-less Mac (mini / Studio / Pro): pmset reports "AC Power" with no
+        # percentage line. The old "?" + charging=True combo rendered as "? ⚡".
+        battery = "—"
+        charging = False
 
     return {
         "disk_free": f"{free_gb:.0f}GB",
@@ -336,7 +342,12 @@ def get_schedules() -> list[dict]:
     Source: <workspace>/hosts/<hostname>/crons.json (see skills/schedule-crons).
     Status is 'active' + next run; last-run history isn't tracked on disk.
     """
-    host = socket.gethostname().split(".")[0]
+    # scutil-first canonical label (NOT bare hostname) — must match the WRITER,
+    # schedule-crons, which keys hosts/<host>/crons.json off
+    # `sutando-config.sh host-label` (= util_paths._host_label()). A bare
+    # `hostname` can drift under DHCP and read the wrong hosts/<host>/ dir, so
+    # this panel would show no schedules on a drift machine (#1745).
+    host = _host_label()
     cfg = WORKSPACE_DIR / "hosts" / host / "crons.json"
     if not cfg.exists():
         return []
@@ -385,10 +396,19 @@ def render_dashboard() -> str:
     ok_count = sum(1 for c in services_only if c.get("status") in ("ok", "warn"))
     total_count = len(services_only)
 
-    # Score card
+    # Score card. A missing/unparseable score used to render as a bare "?" —
+    # glyph soup for new installs whose build_log.md has no **Score:** marker
+    # yet. Show a real empty state instead of pretending "?" is a value.
+    if score == "?":
+        score_html = ('<p style="font-size:12px;color:#667;line-height:1.5;margin-top:4px">'
+                      'Nothing scored yet. Use cases appear here once the build log '
+                      'records one (a <code style="color:#889">**Score: …**</code> line in '
+                      '<code style="color:#889">build_log.md</code>).</p>')
+    else:
+        score_html = f'<div class="score">{score}</div>'
     cards = [f"""<div class="card">
 <h2>Use Cases</h2>
-<div class="score">{score}</div>
+{score_html}
 </div>"""]
 
     # System stats

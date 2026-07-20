@@ -1,14 +1,15 @@
 {
   "name": "sutando",
   "version": "0.1.0",
-  "description": "Sutando \u2014 a personal AI agent. Voice interface backed by Claude Code.",
+  "description": "Sutando \u2014 a personal AI agent with a voice interface and selectable Claude Code or Codex CLI core.",
   "type": "module",
   "scripts": {
     "start": "tsx src/voice-agent.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:skills": "tsc -p tsconfig.skills.json",
-    "test": "tsx --test 'tests/**/*.test.ts' && npm run test:py",
-    "test:py": "find tests -name '*.test.py' | sort | while read f; do echo \"--- $f ---\" && python3 \"$f\" || exit 1; done"
+    "test": "tsx --test --test-force-exit 'tests/**/*.test.ts' && npm run test:py",
+    "test:py": "find tests -name '*.test.py' | sort | while read f; do echo \"--- $f ---\" && python3 \"$f\" || exit 1; done",
+    "build:bundle": "node scripts/build-bundle.mjs"
   },
   "dependencies": {
     "@ai-sdk/google": "^1.2.0",
@@ -28,6 +29,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "esbuild": "^0.28.1",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   },

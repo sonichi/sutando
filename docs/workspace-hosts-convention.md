@@ -65,8 +65,16 @@ A single per-host subtree under the workspace:
 <workspace>/hosts/<hostname>/...
 ```
 
-- `<hostname>` = `hostname | sed 's/\..*//'` — the **same host slug** the sync
-  layer uses (so it lines up with the `host/<hostname>/<wsId>` branch).
+- `<hostname>` = `bash scripts/sutando-config.sh host-label` — the **same host slug** the sync
+  layer uses (so it lines up with the `host/<hostname>/<wsId>` branch). That
+  subcommand is the single source of truth: `$SUTANDO_HOST_LABEL` > scutil
+  `LocalHostName` > short `hostname`. Do **not** derive the slug from a bare
+  `hostname | sed 's/\..*//'`: a DHCP lease can drift `hostname` (e.g. a
+  residential lease → `QingyunsMBP2200` / `Chis-MBP`) while the stable Bonjour
+  `LocalHostName` is `Qingyuns-MacBook-Pro-2200` / `Chis-MacBook-Pro`. The two
+  diverge, so the drifty recipe writes per-host files into a ghost
+  `hosts/<wrong-label>/` dir the Python readers (`personal_path()`) never
+  consult — silent per-host data loss (#1745).
 - **Single-writer:** a host writes ONLY its own `hosts/<hostname>/` subtree.
   It never writes a peer's. This is the load-bearing property — it makes
   cross-host merge conflicts **impossible by construction** (the failure the

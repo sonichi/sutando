@@ -298,8 +298,10 @@ def case_o_dedup_within_cooldown() -> list[str]:
         second = json.loads(state_file.read_text())
         if first != second:
             fails.append("o) within-cooldown second call updated state (should be no-op)")
-        if len(first) != 1:
-            fails.append(f"o) first call should write 1 history entry, got {len(first)}")
+        # +1 for the `_last_hash` sentinel (tracks the most-recently-alerted
+        # hash so an unchanged failure set never re-fires on a timer).
+        if len(first) != 2:
+            fails.append(f"o) first call should write 1 history entry + sentinel, got {len(first)}")
     return fails
 
 
@@ -316,8 +318,9 @@ def case_p_different_sets_both_fire() -> list[str]:
             state_file=state_file, notify_cmd=["true"],
         )
         history = json.loads(state_file.read_text())
-        if len(history) != 2:
-            fails.append(f"p) two different sets should produce 2 history entries, got {len(history)}")
+        # +1 for the `_last_hash` sentinel.
+        if len(history) != 3:
+            fails.append(f"p) two different sets should produce 2 history entries + sentinel, got {len(history)}")
     return fails
 
 
@@ -344,6 +347,37 @@ def case_q_separate_state_from_emit() -> list[str]:
     return fails
 
 
+def case_r_same_set_past_cooldown_does_not_renotify() -> list[str]:
+    """Regression (owner complaint 2026-07-01): a persistent, unchanged
+    failure set must not re-fire the macOS notification just because time
+    has passed. Seeds state as if last notified 25h ago (past the old 1h
+    cooldown) and confirms a second call with the SAME set is silent —
+    verified by checking the notify_cmd subprocess is never invoked."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        state_file = Path(td) / "state" / "health-last-notified.json"
+        checks = make_checks(("down", "voice-agent"))
+        set_key = "|".join(sorted(c["name"] for c in checks))
+        hash_key = hc.hashlib.sha256(set_key.encode()).hexdigest()[:16]
+        now_ms = int(time.time() * 1000)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({
+            hash_key: now_ms - (25 * 3600 * 1000),
+            "_last_hash": hash_key,
+        }))
+        # `false` marker file — if invoked, its mtime moves; we instead use a
+        # command that would raise if actually run via a bogus executable,
+        # proving suppression by absence of any exception/side effect.
+        marker = Path(td) / "notify-fired"
+        hc.notify_for_failures(
+            checks, state_file=state_file,
+            notify_cmd=["bash", "-c", f"touch {marker}"],
+        )
+        if marker.exists():
+            fails.append("r) unchanged failure set re-notified after 25h — spam bug regressed")
+    return fails
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -367,6 +401,7 @@ def main() -> int:
         ("o", case_o_dedup_within_cooldown),
         ("p", case_p_different_sets_both_fire),
         ("q", case_q_separate_state_from_emit),
+        ("r", case_r_same_set_past_cooldown_does_not_renotify),
     ]
     all_failures = []
     for label, fn in cases:

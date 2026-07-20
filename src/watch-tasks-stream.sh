@@ -76,7 +76,11 @@ echo "$$" > "$PID_FILE"
 # tmux socket for the wakeup signal. Sutando.app creates the CLI session via
 # this socket. If the socket doesn't exist (different setup), wakeup is a
 # silent no-op thanks to 2>/dev/null || true.
-TMUX_SOCK="${SUTANDO_TMUX_SOCK:-/tmp/sutando-tmux.sock}"
+# Honors SUTANDO_TMUX_SOCKET (the name start-cli.sh + the desktop private-socket
+# runtime use) so the wakeup ping targets the SAME tmux server as the core when
+# a caller overrides the default socket; the legacy SUTANDO_TMUX_SOCK is kept as
+# a one-release fallback so any straggler setter still works.
+TMUX_SOCK="${SUTANDO_TMUX_SOCKET:-${SUTANDO_TMUX_SOCK:-/tmp/sutando-tmux.sock}}"
 TMUX_SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 
 # Wake helper, kept but NOT called on the task paths below. Under the only
@@ -112,8 +116,25 @@ shopt -u nullglob
 #   fswatch subprocess (Mode B fix — #1088). Without this, when the parent
 #   shell exits the watcher reparents to launchd (PPID=1) and runs
 #   indefinitely with no consumer, silently dropping every event.
-cleanup() { rm -f "$PID_FILE"; kill 0 2>/dev/null; }
-trap cleanup EXIT HUP INT TERM
+# - `trap '' TERM HUP INT` right before kill 0: this process IS a member of
+#   its own process group, so `kill 0` re-delivers TERM/HUP/INT to itself —
+#   while already inside a trap handler for one of those same signals. On
+#   some bash/kernel combinations that self-delivery re-enters the trap
+#   before `exit 0` runs, so the process never actually terminates on a
+#   plain signal (only `kill -9` stops it). Ignoring the signals we're about
+#   to re-send to ourselves closes that window; the process is exiting
+#   either way so nothing downstream needs to observe them again.
+cleanup() { rm -f "$PID_FILE"; trap '' TERM HUP INT; kill 0 2>/dev/null; }
+trap cleanup EXIT
+# HUP/INT/TERM must explicitly exit after cleanup — a trap only overrides the
+# signal's default disposition, it doesn't terminate the process on its own.
+# Without the explicit `exit`, `kill <pid>` (plain SIGTERM) ran cleanup() and
+# then let the fswatch read-loop resume, so the process never actually died
+# (confirmed 2026-07-01: had to `kill -9` to stop stragglers that `kill`
+# alone left running). `exit 0` here also re-fires the EXIT trap above, but
+# cleanup() is idempotent (rm -f on an already-removed file, kill 0 on an
+# already-terminating group are both safe no-ops).
+trap 'cleanup; exit 0' HUP INT TERM
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file

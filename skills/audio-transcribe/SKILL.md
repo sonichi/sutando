@@ -1,3 +1,8 @@
+---
+name: audio-transcribe
+description: Transcribes audio files and voice notes to text via Gemini 2.5-flash. Integrates with Slack, Discord, and Telegram bridges so voice clips surface as readable text in tasks.
+---
+
 # audio-transcribe
 
 Transcribes audio files (voice notes, clips) to text via Gemini 2.5-flash.

@@ -17,8 +17,10 @@ the task the agent is processing:
 So serving a private channel can still read that private channel; serving a public
 channel whose contextNotFrom lists the private guild cannot.
 
-Fail-OPEN on any error / unknown serving channel — EXCEPT once a non-empty blacklist
-applies and the target guild can't be resolved, where it fails CLOSED.
+Fail-OPEN for pre-check errors (parsing, tool detection, serving/blacklist lookup) and
+for unknown-serving-channel (interactive/diagnostic reads outside task processing).
+Once a non-empty blacklist is confirmed, any subsequent error is fail-CLOSED — never
+let an exception bypass an active guard.
 
 Deploy: copy to ~/.claude/hooks/ and register under PreToolUse for BOTH the "Bash"
 and "Read" matchers in ~/.claude/settings.json. See hooks/README.md. Config paths are
@@ -218,27 +220,37 @@ def main():
     if not blacklist:
         sys.exit(0)  # serving channel pulls from anywhere
 
-    token = _token()
-    for cid in targets:
-        if str(cid) in blacklist:
-            _deny(f"CONTEXT-SOURCE GUARD: serving channel {serving} forbids pulling from "
-                  f"#{cid} (channel-level contextNotFrom). Blocked before any content was read "
-                  f"into context. [context-source-guard]")
-        guild = _resolve_guild(cid, token)
-        if guild is None:
-            _deny(f"CONTEXT-SOURCE GUARD: serving channel {serving} has a contextNotFrom "
-                  f"blacklist and the guild of #{cid} could not be verified — refusing the read "
-                  f"rather than risk pulling a blacklisted guild (fail-closed). [context-source-guard]")
-        if guild in blacklist:
-            _deny(f"CONTEXT-SOURCE GUARD: serving channel {serving} forbids pulling from guild "
-                  f"{guild} (contextNotFrom); #{cid} is in it. Blocked before any content was read "
-                  f"into context. [context-source-guard]")
-    sys.exit(0)
+    # Non-empty blacklist confirmed — fail-CLOSED on any exception from here.
+    # An exception that escapes the outer try/except would fail-open; we must
+    # not allow that once we know a guard is in effect.
+    try:
+        token = _token()
+        for cid in targets:
+            if str(cid) in blacklist:
+                _deny(f"CONTEXT-SOURCE GUARD: serving channel {serving} forbids pulling from "
+                      f"#{cid} (channel-level contextNotFrom). Blocked before any content was read "
+                      f"into context. [context-source-guard]")
+            guild = _resolve_guild(cid, token)
+            if guild is None:
+                _deny(f"CONTEXT-SOURCE GUARD: serving channel {serving} has a contextNotFrom "
+                      f"blacklist and the guild of #{cid} could not be verified — refusing the read "
+                      f"rather than risk pulling a blacklisted guild (fail-closed). [context-source-guard]")
+            if guild in blacklist:
+                _deny(f"CONTEXT-SOURCE GUARD: serving channel {serving} forbids pulling from guild "
+                      f"{guild} (contextNotFrom); #{cid} is in it. Blocked before any content was read "
+                      f"into context. [context-source-guard]")
+        sys.exit(0)
+    except SystemExit:
+        raise  # let _deny()'s sys.exit(0) and the normal exit propagate
+    except Exception as e:
+        _deny(f"CONTEXT-SOURCE GUARD: internal error while checking channel(s) {targets} against "
+              f"blacklist for serving channel {serving} — refusing the read rather than risk leaking "
+              f"blacklisted content. Error: {type(e).__name__} [context-source-guard]")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:  # fail-open: never wedge normal operation
-        print(f"[context-source-guard] non-fatal error, allowing: {e}", file=sys.stderr)
+    except Exception as e:  # fail-open for pre-check errors (parsing, tool detection, serving lookup)
+        print(f"[context-source-guard] non-fatal pre-check error, allowing: {e}", file=sys.stderr)
         sys.exit(0)

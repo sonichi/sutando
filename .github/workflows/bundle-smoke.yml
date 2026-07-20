@@ -1,0 +1,42 @@
+# Guards `npm run build:bundle`: a new dependency or dynamic import must not
+# break the bundled artifacts at release time. Path-gated to the inputs that can
+# affect the bundle, so doc-only PRs don't pay for it.
+name: bundle-smoke
+
+on:
+  pull_request:
+    branches: [main, staging-interaction-planes]
+    paths:
+      - 'src/**'
+      - 'skills/phone-conversation/scripts/conversation-server.ts'
+      - 'skills/quota-tracker/scripts/credential-proxy.ts'
+      - 'scripts/build-bundle.mjs'
+      - 'scripts/smoke-bundle.sh'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/bundle-smoke.yml'
+  push:
+    branches: [main, staging-interaction-planes]
+    paths:
+      - 'src/**'
+      - 'skills/phone-conversation/scripts/conversation-server.ts'
+      - 'skills/quota-tracker/scripts/credential-proxy.ts'
+      - 'scripts/build-bundle.mjs'
+      - 'scripts/smoke-bundle.sh'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/bundle-smoke.yml'
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # >= 22.5 required at runtime: src/conversation-store.ts uses the
+          # node:sqlite builtin (added 22.5). Matches the bundled node pin.
+          node-version: '22.17.0'
+      - run: npm ci
+      - name: bundle smoke (build + load each artifact under plain node)
+        run: bash scripts/smoke-bundle.sh

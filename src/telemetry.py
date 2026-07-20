@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import urllib.request
@@ -113,29 +114,63 @@ def _distinct_id() -> str:
         return "anonymous"
 
 
+def _install_surface() -> str:
+    """Which Sutando surface this install runs: ``"desktop"`` or ``"oss"``.
+
+    Sutando is open source; the desktop app (Sutando.app) runs the same core.
+    This distinguishes the two so metrics can be broken down by surface.
+
+    Resolution:
+      1. ``$SUTANDO_SURFACE`` (``desktop``/``oss``) — explicit override, wins.
+      2. Otherwise probe for a running ``Sutando`` menu-bar process (the same
+         signal health-check uses to detect the app). Present → desktop; a
+         plain OSS checkout has no app → oss.
+
+    Categorical only; carries no PII. Fail-safe: any error → ``"oss"`` (the
+    conservative default — never over-reports desktop).
+    """
+    env = os.environ.get("SUTANDO_SURFACE", "").strip().lower()
+    if env in ("desktop", "oss"):
+        return env
+    try:
+        r = subprocess.run(
+            ["/usr/bin/pgrep", "-x", "Sutando"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return "desktop"
+    except Exception:
+        pass
+    return "oss"
+
+
 def enabled() -> bool:
     """Telemetry fires only when a key is configured AND not opted out."""
     return bool(_KEY) and not opted_out()
 
 
-def _post(payload: dict) -> None:  # pragma: no cover — real network I/O; mocked in tests
+def _post(payload: dict, timeout: float = 5) -> None:  # pragma: no cover — real network I/O; mocked in tests
     try:
         req = urllib.request.Request(
             f"{_HOST}/capture/",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
-        urllib.request.urlopen(req, timeout=5).read()
+        urllib.request.urlopen(req, timeout=timeout).read()
     except Exception:
         pass  # best-effort: telemetry must never affect the app
 
 
-def capture(event: str, properties: dict | None = None) -> None:
+def capture(event: str, properties: dict | None = None, *, flush: bool = False) -> None:
     """Record one anonymous product event. No-op if opted out or no key.
 
     ``properties`` must be bucketed/categorical only — never task content,
     message text, paths, or PII. The caller owns that discipline; this module
     does not inspect payloads beyond attaching the anonymous distinct id.
+
+    ``flush=True`` uses a bounded synchronous send for short-lived commands
+    that are about to exit. Long-running services should keep the default
+    daemon-thread path so telemetry never delays their work.
     """
     if os.environ.get("SUTANDO_DEBUG_TELEMETRY", "").strip().lower() in _TRUTHY:
         sys.stderr.write(
@@ -144,6 +179,41 @@ def capture(event: str, properties: dict | None = None) -> None:
         )
     if not enabled():
         return
+    _dispatch(event, properties, flush=flush)
+
+
+def task_processed(source: str) -> None:
+    """One anonymous event per task the core accepts, tagged only with the
+    inbound surface (``discord`` / ``slack`` / ``telegram`` / ``voice`` / …).
+
+    This is the activation signal that ``core_started`` alone can't give:
+    whether an install does anything after launching. It carries ONLY the
+    coarse source bucket — never the task text, ids, user, or channel.
+    """
+    capture("task_processed", {"source": str(source)})
+
+
+def feature_used(feature: str, *, flush: bool = False) -> None:
+    """One anonymous event when a named product feature runs, tagged only with
+    the feature's short categorical name (e.g. ``morning_briefing``). Never any
+    task content, arguments, or PII.
+    """
+    capture("feature_used", {"feature": str(feature)}, flush=flush)
+
+
+def _dispatch(event: str, properties: dict | None, *, flush: bool = False) -> None:
+    props = {
+        "$ip": "",
+        "$geoip_disable": True,
+        **(properties or {}),
+    }
+    # Surface (desktop vs OSS) on EVERY event: as an event property (filter /
+    # break down any metric by surface) AND a person property ($set) so the
+    # anonymous install is bucketed into an OSS-vs-desktop cohort. Set after the
+    # caller spread + merged into any existing $set so it's always present.
+    surface = _install_surface()
+    props["surface"] = surface
+    props["$set"] = {**props.get("$set", {}), "surface": surface}
     payload = {
         "api_key": _KEY,
         "event": event,
@@ -153,10 +223,12 @@ def capture(event: str, properties: dict | None = None) -> None:
         # just the anonymous install id. $ip="" + $geoip_disable still stop
         # PostHog from storing or geolocating the request IP (that address is
         # inherent to any HTTPS request; the vendor is told not to keep it).
-        "properties": {
-            "$ip": "",
-            "$geoip_disable": True,
-            **(properties or {}),
-        },
+        "properties": props,
     }
-    threading.Thread(target=_post, args=(payload,), daemon=True).start()
+    if flush:
+        # One-shot feature scripts exit immediately after this call. A daemon
+        # sender is terminated with the interpreter, so give the request a
+        # short bounded window to complete before returning.
+        _post(payload, timeout=1)
+    else:
+        threading.Thread(target=_post, args=(payload,), daemon=True).start()

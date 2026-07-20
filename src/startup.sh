@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sutando startup — starts all services + Claude Code.
+# Sutando startup — starts available services + the selected core CLI.
 # Usage: bash src/startup.sh
 
 set -e
@@ -31,6 +31,24 @@ fi
 # skills/self-diagnose/scripts/gather.sh and any other script that honors
 # $SUTANDO_ROOT.
 export SUTANDO_ROOT="$REPO"
+
+# tsx runner for every TS service start below — resolution is config-resolved
+# via sutando-config.sh (`tsx-bin` / `app-node-dir` are the single source of
+# truth, shared with the launchd wrapper); `npx tsx` only as a last resort. A
+# host may have no homebrew/nvm node/npx at all (the app-bundle runtime ships
+# bare `node` only, no npx — the PATH prepend covers tsx's `#!/usr/bin/env node`
+# re-exec). A raw `npx tsx` call site silently fails to start its service on
+# such hosts (web-client outage 2026-07-17).
+_APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
+[ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
+_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin)"
+run_tsx() {
+  if [ -n "$_TSX_BIN" ]; then
+    "$_TSX_BIN" "$@"
+  else
+    npx tsx "$@"
+  fi
+}
 
 # Export workspace-scoped CLAUDE_CONFIG_DIR before services launch. Without it,
 # init.sh + the bridge-launcher blocks below (L~262 proxy, L~429 telegram,
@@ -173,27 +191,18 @@ git -C "$REPO" config --unset committer.email 2>/dev/null || true
 # failing startup. See skills/plugin-patches/README.md.
 python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
 
-# Fail-fast .env validation BEFORE init.sh. Two reasons must both hold:
+# Load optional .env configuration BEFORE init.sh. Two reasons must both hold:
 #  1) init.sh resolves the workspace via `${SUTANDO_WORKSPACE/#~/$HOME}` with
 #     fallback to `~/.sutando/workspace/`. If .env carries a SUTANDO_WORKSPACE=
 #     override and we haven't sourced .env yet, init.sh seeds dirs and files
 #     in the wrong location, leaving orphan ~/.sutando/workspace/ skeletons
 #     on first-time installs (hosts without a separate .zshenv export).
-#  2) If .env is missing or required keys are unset, the whole startup is
-#     going to bail anyway — better to exit cleanly here than to run init.sh
-#     + the dependency install + the perms checks first and then bail.
-missing=0
-if [ ! -f .env ]; then
-  echo "  ✗ .env not found — cp .env.example .env and add your keys"
-  missing=1
-else
-  set -a; source .env; set +a
-  if [ -z "$GEMINI_API_KEY" ]; then
-    echo "  ✗ GEMINI_API_KEY not set in .env — get one at https://ai.google.dev"
-    missing=1
-  fi
-fi
-if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1; fi
+#  2) Voice needs a Gemini key, but the Codex core, text web UI, dashboard,
+#     API, and configured message bridges do not. Missing voice credentials
+#     disable only the voice service instead of blocking the whole product.
+# shellcheck source=startup-runtime.sh
+source "$REPO/src/startup-runtime.sh"
+configure_startup_runtime
 
 # v0.8 auto-migration helpers (PR #1440 safety hardening — Mini review).
 # Sourced from a sibling file so the four guard functions (_realpath,
@@ -332,6 +341,13 @@ bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 # dark whenever a session restarts without an explicit /schedule-crons invocation.
 bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
 
+# Re-inject PERSONAL_CLAUDE.md after context compaction (SessionStart
+# "compact" matcher). CLAUDE.md + the memory index survive compaction via the
+# system prompt; PERSONAL_CLAUDE.md only enters context via an explicit Read,
+# which compaction summarizes away — so long sessions silently lose per-user
+# rules. Idempotent — safe to run on every start.
+bash "$REPO/scripts/install-personal-claude-hook.sh" 2>&1 || true
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to
@@ -363,14 +379,17 @@ if [ ! -d node_modules ]; then
   fi
 fi
 
-# Check CLI prerequisites. (.env + required keys were already validated
-# above before init.sh; node/npx/python3/claude/fswatch are checked here
-# because they're not needed for init.sh's bootstrap step.)
+# Check CLI prerequisites. node/npx/python3, the selected core runtime, and
+# fswatch are checked here because they are not needed for init.sh bootstrap.
 missing=0
 if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
 if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
 if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; missing=1; fi
-if ! command -v claude > /dev/null 2>&1; then echo "  ✗ claude not found — see https://docs.anthropic.com/en/docs/claude-code/getting-started"; missing=1; fi
+core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)"
+if ! command -v "$core_runtime" > /dev/null 2>&1; then
+  echo "  ✗ $core_runtime CLI not found — required by core.runtime"
+  missing=1
+fi
 if ! command -v fswatch > /dev/null 2>&1; then
   if command -v brew > /dev/null 2>&1; then
     echo "  ⚠ fswatch not found — installing via Homebrew..."
@@ -524,6 +543,17 @@ else
   echo "  ✓ core heartbeat (already running)"
 fi
 
+# Services-status emitter — aggregates sidecar liveness into
+# state/services-status.json for the desktop Settings → Services surface.
+# Single instance per host; ~30s cadence; SIGTERM-clean like the heartbeat.
+if ! pgrep -f "$REPO/src/services_status.py" > /dev/null 2>&1; then
+  echo "  Starting services-status emitter..."
+  python3 "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
+  echo "  ✓ services-status emitter"
+else
+  echo "  ✓ services-status emitter (already running)"
+fi
+
 # 0. Credential proxy for quota tracking (port 7846).
 # Prefer the launchd-supervised job (KeepAlive + ThrottleInterval=10s) so the
 # proxy restarts on crash instead of leaving a proxy-routed core stranded on a
@@ -549,7 +579,8 @@ if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ];
 fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
-  npx tsx "$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)" > /tmp/credential-proxy.log 2>&1 &
+  _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+  run_tsx "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"
@@ -577,7 +608,7 @@ if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
-      npx tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
+      run_tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
     echo "  ✓ obs collector"
   else
     echo "  ✓ obs collector (already running on $OBS_PORT)"
@@ -611,24 +642,81 @@ reap_wedged_listener() {
   return 0
 }
 
-# 1. Voice agent (Gemini Live on port 9900)
-reap_wedged_listener 9900 voice-agent
-if ! lsof -i :9900 > /dev/null 2>&1; then
-  echo "  Starting voice agent (port 9900)..."
-  npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
-  echo "  ✓ voice agent"
+# 1. Voice agent (Gemini Live on port 9900; optional)
+if [ "${SKIP_VOICE:-}" = "1" ]; then
+  echo "  ~ voice agent (disabled — no Gemini voice key)"
 else
-  echo "  ✓ voice agent (already running)"
+  # If a launchd job owns this service, delegate to launchd so the two managers
+  # don't fight over port 9900 (issue #1888 bug 2 — duplicate listeners when
+  # launchd respawns while startup.sh's direct process still holds the port).
+  #
+  # reap_wedged_listener runs BEFORE the launchd ownership check intentionally:
+  # KeepAlive only triggers on process exit, not on hang. A hung process can hold
+  # the port indefinitely — reaping it first frees the port so the subsequent
+  # kickstart (or launchd's own respawn on exit) gets a clean bind.
+  reap_wedged_listener 9900 voice-agent
+  if launchctl print "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1; then
+    if ! lsof -i :9900 > /dev/null 2>&1; then
+      launchctl kickstart "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1 || true
+      # Poll up to 5s — kickstart is known to silently no-op (restart-voice-agent.sh §4)
+      _va_waited=0
+      while [ "$_va_waited" -lt 5 ] && ! lsof -i :9900 > /dev/null 2>&1; do
+        sleep 1; _va_waited=$(( _va_waited + 1 ))
+      done
+      if lsof -i :9900 > /dev/null 2>&1; then
+        echo "  ✓ voice agent (launchd-supervised)"
+      else
+        echo "  ⚠ voice agent (launchd kickstart issued — port 9900 not yet bound)"
+      fi
+    else
+      echo "  ✓ voice agent (launchd-supervised)"
+    fi
+  elif ! lsof -i :9900 > /dev/null 2>&1; then
+    echo "  Starting voice agent (port 9900)..."
+    run_tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
+    echo "  ✓ voice agent"
+  else
+    echo "  ✓ voice agent (already running)"
+  fi
 fi
 
-# 2. Web client (port 8080)
-reap_wedged_listener 8080 web-client
-if ! lsof -i :8080 > /dev/null 2>&1; then
-  echo "  Starting web client (port 8080)..."
-  npx tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
+# 1b. Call-tier advertisement (resident, re-emitting): write state/call-tiers.json
+# so the runtime descriptor advertises which DIRECT call endpoints are reachable
+# now (Track 9 availability-driven call-tier menu). Backgrounded — it probes
+# tailscale with its own short timeout and never blocks the rest of startup;
+# absent file just means the descriptor advertises no direct tiers (client falls
+# back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
+# advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
+# post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
+run_tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+echo "  ✓ call-tiers advertisement (re-emit 60s)"
+
+# 2. Web client (port 8080 by default; CLIENT_PORT may avoid a local conflict)
+WEB_CLIENT_PORT="${CLIENT_PORT:-8080}"
+reap_wedged_listener "$WEB_CLIENT_PORT" web-client
+# Same launchd-deconflict guard as voice-agent above for the launchd-owned
+# default port. A custom CLIENT_PORT remains a directly managed opt-in.
+if [ "$WEB_CLIENT_PORT" = "8080" ] && launchctl print "gui/$(id -u)/com.sutando.web-client" > /dev/null 2>&1; then
+  if ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
+    launchctl kickstart "gui/$(id -u)/com.sutando.web-client" > /dev/null 2>&1 || true
+    _wc_waited=0
+    while [ "$_wc_waited" -lt 5 ] && ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; do
+      sleep 1; _wc_waited=$(( _wc_waited + 1 ))
+    done
+    if lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
+      echo "  ✓ web client (launchd-supervised)"
+    else
+      echo "  ⚠ web client (launchd kickstart issued — port $WEB_CLIENT_PORT not yet bound)"
+    fi
+  else
+    echo "  ✓ web client (launchd-supervised)"
+  fi
+elif ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
+  echo "  Starting web client (port $WEB_CLIENT_PORT)..."
+  run_tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
 else
-  echo "  ✓ web client (already running)"
+  echo "  ✓ web client (already running on $WEB_CLIENT_PORT)"
 fi
 
 # 2b. Tailnet HTTPS front for browser wss:// voice reach (opt-in).
@@ -698,14 +786,14 @@ if [ -d "$REPO/skills/portfolio-research" ]; then
   echo "  ✓ portfolio dashboard (port 8899)"
 fi
 
-# 5b. Sutando context drop app (global hotkey ⌃C)
+# 5b. Sutando context drop app (hotkey configurable via state/hotkeys.json)
 SUT_SRC="$REPO/src/Sutando/main.swift"
 SUT_BIN="$REPO/src/Sutando/Sutando"
 
 # Build the public ax-read CLI if missing or older than any of its source
 # files. Sutando.app's resolveAxReadPath() prefers private personal-deictic
 # when installed; this public binary is the text-only fallback so public-repo
-# users still get the ⌃C selection-drop experience.
+# users still get the context-drop experience.
 #
 # Staleness widened (per Mini's PR #907 review): trigger a rebuild when
 # Package.swift / build.sh / any *.swift under Sources/ is newer than the
@@ -719,7 +807,7 @@ if [ -n "$AXR_NEWEST_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_NEWEST_SRC" -nt 
   echo "  Compiling public ax-read (skills/context-drop)..."
   if ! command -v swift >/dev/null 2>&1; then
     echo "  ⚠ ax-read build skipped: 'swift' not in PATH"
-    echo "    → install Xcode Command Line Tools (xcode-select --install) for ⌃C selection drops on public-repo installs"
+    echo "    → install Xcode Command Line Tools (xcode-select --install) for context drops on public-repo installs"
   elif (cd "$AXR_DIR" && bash build.sh); then
     echo "  ✓ ax-read built at $AXR_BIN"
   else
@@ -738,7 +826,7 @@ if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; 
     # Sync the fresh binary into the .app bundle if one exists, ensure the
     # AppleEvents usage-description key is present, and re-sign so the
     # cdhash matches. Without NSAppleEventsUsageDescription macOS silently
-    # denies AppleEvents — getFinderSelection() returns [] and the ⌃C
+    # denies AppleEvents — getFinderSelection() returns [] and the context
     # drop handler logs "Nothing selected" with no permission prompt.
     SUT_APP="$REPO/src/Sutando/Sutando.app"
     if [ -d "$SUT_APP" ]; then
@@ -787,7 +875,7 @@ if ! pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
   if [ -f "$SUT_BIN" ]; then
     echo "  Starting Sutando..."
     "$SUT_BIN" > /dev/null 2>&1 &
-    echo "  ✓ Sutando (⌃C/⌃V/⌃M)"
+    echo "  ✓ Sutando (hotkeys via state/hotkeys.json)"
   else
     echo "  ⚠ Sutando binary missing — hotkeys disabled"
   fi
@@ -796,6 +884,33 @@ else
 fi
 
 echo ""
+
+# Vault scanner preflight, shared by the three bridges that intercept secrets
+# (telegram, discord, slack — all import src/vault_intercept.py).
+#
+# detect-secrets has been treated as a CI-only test dep, but it is a RUNTIME dep
+# of a shipping feature: without it vault_intercept fails closed and REFUSES
+# every unquoted `vault set KEY VALUE` — which is the form CLAUDE.md documents
+# as the way to store a secret. Quoted values still work, so the degradation is
+# safe but silent: nothing surfaced it until an owner tried to store a secret
+# and got a refusal.
+#
+# This mirrors how discord.py / slack_bolt are handled below — name the missing
+# dep and the exact fix at the startup console, don't auto-install.
+#
+# Checked PER INTERPRETER because each bridge is launched with whichever python
+# had ITS client library, and those are frequently not the same binary.
+_vault_scanner_check() {
+  _vsc_py="$1"; _vsc_who="$2"
+  [ -n "$_vsc_py" ] || return 0
+  if ! "$_vsc_py" -c "import detect_secrets" >/dev/null 2>&1; then
+    echo "  ~ $_vsc_who: detect-secrets missing in $_vsc_py — unquoted \`vault set\` will be REFUSED"
+    # Both plain and --user installs are blocked by PEP 668 on stock
+    # Homebrew/macOS python, so the fallback is named up front rather than
+    # leaving the operator to rediscover it.
+    echo "      fix: $_vsc_py -m pip install detect-secrets   (add --break-system-packages if PEP 668 blocks it)"
+  fi
+}
 
 # 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN, skip with SKIP_TELEGRAM=1)
 if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
@@ -817,6 +932,7 @@ elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
     fi
     "$TGPY" src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
     echo "  ✓ telegram bridge ($TGPY)"
+    _vault_scanner_check "$TGPY" "telegram bridge"
   else
     echo "  ✓ telegram bridge (already running)"
   fi
@@ -863,7 +979,9 @@ fi
 # right one in the first place avoids the wasted process + traceback noise.
 # Probe a fixed list of candidates in priority order; first one with discord.py
 # wins. Same probe is also what's used in the bridge's rescue fallback.
-if _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
+if [ "${SKIP_DISCORD:-}" = "1" ]; then
+  echo "  ~ discord bridge (skipped via SKIP_DISCORD)"
+elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
   PYTHON_WITH_DISCORD=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import discord" 2>/dev/null; then
@@ -889,6 +1007,7 @@ if _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/d
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
     PYTHONUNBUFFERED=1 "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
     echo "  ✓ discord bridge"
+    _vault_scanner_check "$PYTHON_WITH_DISCORD" "discord bridge"
   else
     echo "  ✓ discord bridge (already running)"
   fi
@@ -899,7 +1018,9 @@ fi
 # 7b. Slack bridge (optional — needs SLACK_BOT_TOKEN + SLACK_APP_TOKEN + slack_bolt)
 # Probes the same Python-interpreter candidates as the discord bridge so a
 # fresh-install miniconda env doesn't silently miss slack_bolt.
-if _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
+if [ "${SKIP_SLACK:-}" = "1" ]; then
+  echo "  ~ slack bridge (skipped via SKIP_SLACK)"
+elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
   PYTHON_WITH_SLACK=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
@@ -915,6 +1036,7 @@ if _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/s
     set -a; . "$_SL_ENV"; set +a
     "$PYTHON_WITH_SLACK" src/slack-bridge.py > "$LOGS_DIR/slack-bridge.log" 2>&1 &
     echo "  ✓ slack bridge"
+    _vault_scanner_check "$PYTHON_WITH_SLACK" "slack bridge"
   else
     echo "  ✓ slack bridge (already running)"
   fi
@@ -922,13 +1044,19 @@ else
   echo "  ~ slack bridge (no token — optional)"
 fi
 
-# 8. Phone conversation server + ngrok (optional — needs Twilio creds, skip with SKIP_PHONE=1)
+# 8. Phone conversation server + ngrok (optional — needs Twilio + Gemini credentials)
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
-elif grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+elif ! phone_stack_enabled; then
+  echo "  ~ conversation server (disabled — no Gemini voice key)"
+# Anchored + non-empty value: the unanchored substring form also matched the
+# commented template placeholder (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), starting
+# conversation-server and a PUBLIC ngrok tunnel on hosts with no Twilio at all.
+# Mirrors twilio_configured() in src/health-check.py — keep the two in sync.
+elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
-    npx tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
+    run_tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
     echo "  ✓ conversation server (port 3100)"
   else
     echo "  ✓ conversation server (already running)"
@@ -978,8 +1106,11 @@ echo ""
 # Verify services actually started (wait a moment, then check ports)
 sleep 3
 echo "Verifying services..."
-VERIFY_PORTS="9900:voice-agent 8080:web-client 7844:dashboard 7843:agent-api 7845:screen-capture"
-if [ "${SKIP_PHONE:-}" != "1" ] && grep -q "TWILIO_ACCOUNT_SID=" .env 2>/dev/null; then
+VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api 7845:screen-capture"
+if [ "${SKIP_VOICE:-}" != "1" ]; then
+  VERIFY_PORTS="9900:voice-agent $VERIFY_PORTS"
+fi
+if phone_stack_enabled && grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
 if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
@@ -995,11 +1126,10 @@ for port_name in $VERIFY_PORTS; do
   fi
 done
 echo ""
-open "http://localhost:8080"
+open "http://localhost:$WEB_CLIENT_PORT"
 
-# Delegate to src/agent/claude/cli/start-cli.sh — canonical sutando-core launch
-# command. Single source of truth so Sutando.app's Restart Core menu can invoke
-# the same launch path without duplicating the tmux + claude flags.
+# Delegate to the runtime dispatcher — canonical sutando-core launch command.
+# Sutando.app and health recovery use this same Claude-or-Codex selection.
 #
 # Restore stdout/stderr to the terminal first when the operator is
 # interactive: the tee-redirect at the top of this script makes fd 1 a PIPE,
@@ -1012,4 +1142,4 @@ open "http://localhost:8080"
 if [ -t 0 ]; then
     exec >/dev/tty 2>&1
 fi
-exec bash "$REPO/src/agent/claude/cli/start-cli.sh"
+exec bash "$REPO/src/agent/start-cli.sh"

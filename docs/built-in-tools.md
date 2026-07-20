@@ -99,15 +99,24 @@ Prefer this for any "open X and do Y" task in a native app (Zoom join, Mail comp
 
 **Browser automation** — navigate, read, fill forms, screenshot web pages:
 
-Preferred (interactive): Use **Playwright MCP tools** (`mcp__playwright__*`) or **Chrome plugin** (`mcp__claude-in-chrome__*`). These provide real browser control with live DOM access, screenshots, and form interaction.
+In the ChatGPT/Codex desktop app, prefer its Browser or Chrome plugin. Those
+desktop browser backends are not available to a plain Codex CLI core, even
+when the plugin skill is installed. For the Codex CLI core, use Sutando's
+persistent Playwright profile below.
 
 **Default: navigate within the active tab when the next URL has the same origin (scheme + host + port) as the current tab.** Only spawn a new tab for cross-origin navigation, when an existing tab is the only context that holds the relevant state (a logged-in session, a long-running app), or when the user explicitly asks for a new tab. `localhost:7844` and `localhost:8080` are DIFFERENT origins — same hostname, but different ports → different services → don't share a tab. This keeps the browser tab count bounded during multi-step flows — without it, every `mcp__claude-in-chrome__navigate` opens a fresh tab and the user ends up with dozens of half-used tabs after a research session.
 
-Fallback (non-interactive / headless): `src/browser.mjs` for scripted or background use:
+Codex CLI and non-interactive use: `src/browser.mjs` uses a dedicated persistent
+Chrome profile at `<workspace>/data/browser-profile`. Run setup once, sign in to
+the sites Sutando may operate, and close the setup window. Later commands reuse
+those sessions without accessing the user's everyday Chrome profile:
 ```bash
+node src/browser.mjs setup                                      # one-time visible sign-in
+node src/browser.mjs profile                                    # show profile location
 node src/browser.mjs "https://example.com"                    # get page text
 node src/browser.mjs "https://example.com" screenshot         # full-page screenshot → path
 node src/browser.mjs "https://example.com" "fill:#email:me@x.com" "click:#submit"  # fill + click
+node src/browser.mjs "https://example.com" --headed           # watch automation live
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
 

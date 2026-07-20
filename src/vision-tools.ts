@@ -16,14 +16,18 @@
  * realtime_input.video slot accepts single-frame images.
  */
 
-import { readFileSync, unlinkSync, mkdtempSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { execFile } from 'node:child_process';
+import { join, dirname } from 'node:path';
+import { readCaptureToken } from './util_paths.js';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer, type Server } from 'node:http';
+import { connect } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { resolveWorkspace, statusPath } from './workspace_default.js';
 
 const execFileAsync = promisify(execFile);
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -50,13 +54,91 @@ export interface VisionSource {
 	capture(): Promise<VisionFrame>;
 }
 
+// --- screen-capture-server (:7845) lazy start ----------------------------
+// The screen source grabs frames from the screen-capture-server on :7845. That
+// server is launched by startup.sh (the OSS menu-bar path) — but NOT by
+// start-cli.sh, which is how the bundled desktop app (ag2-space/ag2space-cinny-
+// desktop) launches the core. So in the bundled app the Watch toggle hit a dead
+// :7845 (connection refused) and silently did nothing, even with Screen Recording
+// granted. Rather than depend on every launch path remembering to start :7845,
+// the vision pipeline starts it ON DEMAND here: self-healing, works identically
+// in the OSS app and the bundled Tauri app. (First-run macOS Screen Recording
+// prompting via CGRequestScreenCaptureAccess is a documented follow-up — this
+// change unblocks the already-granted case and stops the silent failure.)
+const SCREEN_CAPTURE_PORT = 7845;
+let _screenCaptureStarting: Promise<void> | null = null;
+
+function _portListening(port: number): Promise<boolean> {
+	return new Promise((resolve) => {
+		const sock = connect({ host: '127.0.0.1', port });
+		const done = (up: boolean) => {
+			sock.destroy();
+			resolve(up);
+		};
+		sock.once('connect', () => done(true));
+		sock.once('error', () => done(false));
+		sock.setTimeout(600, () => done(false));
+	});
+}
+
+/** Ensure the screen-capture-server is up on :7845, spawning it if absent.
+ *  Reuses a running server (startup.sh's, or a prior lazy spawn); memoizes the
+ *  in-flight spawn so concurrent captures don't double-start it. */
+export async function ensureScreenCaptureServer(): Promise<void> {
+	if (await _portListening(SCREEN_CAPTURE_PORT)) return; // reuse a running server
+	if (_screenCaptureStarting) return _screenCaptureStarting; // join an in-flight spawn
+	const start = (async () => {
+		// screen-capture-server.py sits next to this module in src/.
+		const script = join(dirname(fileURLToPath(import.meta.url)), 'screen-capture-server.py');
+		// The bundled .app's voice-agent runs under a MINIMAL launchd PATH (no
+		// /opt/homebrew/bin etc. — same class as the claude-on-PATH gotcha, desktop
+		// PR #50). A bare `python3` would ENOENT there — Watch would still silently
+		// fail, one layer deeper. And screen-capture-server.py itself shells out to
+		// `screencapture` (/usr/sbin). Prepend the standard macOS bin dirs so BOTH
+		// the interpreter and the server's own subprocess resolve regardless of how
+		// the app launched the runtime. (Review: air, bundled-spawn-PATH risk.)
+		const augmentedPath = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/usr/sbin', '/bin', process.env.PATH]
+			.filter(Boolean)
+			.join(':');
+		const child = spawn('python3', [script], {
+			detached: true,
+			stdio: 'ignore',
+			env: { ...process.env, PATH: augmentedPath },
+		});
+		child.unref();
+		for (let i = 0; i < 40; i++) {
+			if (await _portListening(SCREEN_CAPTURE_PORT)) return;
+			await new Promise((r) => setTimeout(r, 200));
+		}
+		throw new Error('screen-capture-server did not come up on :7845 within 8s');
+	})();
+	_screenCaptureStarting = start;
+	try {
+		await start;
+	} finally {
+		// Clear on BOTH success and failure: _screenCaptureStarting exists only to
+		// dedupe a CONCURRENT spawn, not to cache a completed one. Memoizing the
+		// resolved promise would make a later call short-circuit past the spawn even
+		// after the detached server has died/crashed — the port check above would
+		// see :7845 down but this guard would return the stale "up" promise, leaving
+		// Watch connection-refused until the whole voice-agent restarts (review P1 on
+		// 0589a18). Clearing here means the next capture re-checks the port and
+		// re-spawns if the server is gone — true self-healing.
+		_screenCaptureStarting = null;
+	}
+}
+
 const screenSource: VisionSource = {
 	name: 'screen',
 	async capture() {
+		// Self-healing: bring up the screen-capture-server if the current launch
+		// path (e.g. the bundled desktop app's start-cli.sh) didn't start it.
+		await ensureScreenCaptureServer();
 		// silent=true skips the menu-bar flash + macOS notification, which would
 		// otherwise fire on every frame during a stream. format=jpeg keeps
 		// frames small (~50–150KB).
-		const res = await fetch('http://localhost:7845/capture?format=jpeg&silent=true');
+		const _capTok = readCaptureToken();
+		const res = await fetch('http://localhost:7845/capture?format=jpeg&silent=true', _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
 		const data = (await res.json()) as { status: string; path?: string; error?: string };
 		if (data.status !== 'ok' || !data.path) {
 			throw new Error(`screen-capture-server: ${data.error || 'no path'}`);
@@ -172,6 +254,33 @@ export function registerVisionOnContributor(fn: VisionOnContributor): () => void
 /** Visible for tests. */
 export function _getVisionOnContributorCount(): number {
 	return visionOnContributors.length;
+}
+
+// --- Per-frame post-send hook registry ----------------------
+//
+// Skills may register a hook that fires after each push-mode frame is sent.
+// Core provides no AX or Chrome selection logic — that belongs in skills.
+// The hook receives a `sendUserCtx(text)` helper that injects a hidden user
+// turn so the model sees context without triggering audio output. Hooks run
+// synchronously on the tick path so they must be fast (probe with short
+// timeouts or compare against cached state before calling AX).
+
+export type VisionFramePostSendHook = (sendUserCtx: (text: string) => void) => void;
+const visionFrameHooks: VisionFramePostSendHook[] = [];
+
+/** Register a hook called after every push-mode frame is sent. Returns an
+ *  unregister function. Called by skills at module-load time. */
+export function registerVisionFrameHook(fn: VisionFramePostSendHook): () => void {
+	visionFrameHooks.push(fn);
+	return () => {
+		const i = visionFrameHooks.indexOf(fn);
+		if (i >= 0) visionFrameHooks.splice(i, 1);
+	};
+}
+
+/** Visible for tests. */
+export function _getVisionFrameHookCount(): number {
+	return visionFrameHooks.length;
 }
 
 // TODO(roadmap §5 Now: "Define DeviceSession"): Replace this single-session
@@ -453,6 +562,20 @@ async function captureAndSend(source: VisionSource): Promise<{ ok: boolean; erro
 	if (!sendFile) return { ok: false, error: 'no active voice session' };
 	const frame = await source.capture();
 	sendFile(frame.data.toString('base64'), frame.mimeType);
+	// Fire post-send hooks (e.g. screen-companion injects selection text).
+	if (visionFrameHooks.length > 0) {
+		const transport = sessionRef?.transport;
+		if (transport && typeof transport.sendContent === 'function') {
+			const sendUserCtx = (text: string): void => {
+				try { transport.sendContent!([{ role: 'user', text }], false); } catch {}
+			};
+			for (const hook of visionFrameHooks) {
+				try { hook(sendUserCtx); } catch (err) {
+					console.warn(`${ts()} [Vision] frame hook threw: ${(err as Error)?.message}`);
+				}
+			}
+		}
+	}
 	return { ok: true };
 }
 
@@ -708,7 +831,28 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 		console.error(`${ts()} [Vision] control server error: ${err.message}`);
 	});
 	srv.listen(port, '127.0.0.1', () => {
-		console.log(`${ts()} [Vision] control server listening on 127.0.0.1:${port}`);
+		// Record the port the OS ACTUALLY bound, read from srv.address() — not the
+		// `port` parameter, which would echo `0` when the caller requested an
+		// ephemeral port instead of the real assigned one (the whole point of the
+		// runtime-authored state is correctness under a non-default port).
+		const addr = srv.address();
+		const boundPort = (addr && typeof addr === 'object') ? addr.port : port;
+		console.log(`${ts()} [Vision] control server listening on 127.0.0.1:${boundPort}`);
+		// vision-control.json is runtime-authored state recording the ACTUAL bound
+		// control port. `sutando-config.sh runtime` reads it (validated by pid
+		// liveness) so the AgentRuntime descriptor's `vision_control` reports the
+		// port this process really bound — correct for a VISION_CONTROL_PORT
+		// override, not a hardcoded default. Same pattern as voice-agent.ts's
+		// writeVoiceRuntimeState() for voice_ws (#2115); consumed by the desktop
+		// 'Watch' toggle (ag2-space/ag2space-cinny-desktop v0.3.0 Slice-2).
+		try {
+			writeFileSync(
+				statusPath('vision-control.json', resolveWorkspace()),
+				JSON.stringify({ vision_control: `http://127.0.0.1:${boundPort}`, port: boundPort, pid: process.pid, ts: Math.floor(Date.now() / 1000) })
+			);
+		} catch (err) {
+			console.error(`${ts()} [Vision] runtime state write failed:`, err);
+		}
 	});
 	controlServer = srv;
 	return srv;

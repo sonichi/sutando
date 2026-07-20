@@ -99,9 +99,11 @@ def _read_manifest() -> dict:
 # Loose regex — finds candidate `vault set KEY VALUE` matches anywhere in
 # the text (including mid-prose). FP prevention is delegated to detect-secrets
 # (see _replacer): a candidate is only acted on if the VALUE is recognized as
-# a known secret pattern. This trades the regex line-anchor approach for
-# pattern-based validation, eliminating both:
-#   - FP: "the vault set command works fine" → "works" is not a secret → skip
+# a known secret pattern, OR the KEY isn't a single plain lowercase word
+# (see _LOOKS_LIKE_PLAIN_LOWERCASE_WORD below — added for #2074). This trades the regex
+# line-anchor approach for pattern-based validation, eliminating both:
+#   - FP: "the vault set command works fine" → key="command" (not env-shaped),
+#     value="works" (not a secret) → skip, left as prose
 #   - FN: "hey vault set APOLLO_KEY sk-..." mid-prose → "sk-..." is OpenAI → store
 # Key/value separator is whitespace OR `=` (with optional surrounding spaces),
 # so `vault set KEY VALUE`, `vault set KEY=VALUE`, and `vault set KEY = VALUE`
@@ -114,6 +116,39 @@ _VAULT_SET_RE = re.compile(
     r'\bvault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)(?:"([^"]*)"|\'([^\']*)\'|`([^`]*)`|(\S+))(?=\s|$|[.,!?;])',
     re.IGNORECASE,
 )
+
+# #2074: an unquoted value the FP guard doesn't recognize isn't proof of
+# prose — it can be a real secret the classifier missed (a 32-char Discord
+# client secret, a pa-/al-prefixed API key, ...). Used as a second signal
+# alongside scan_secrets(): only treat the match as prose (leave it alone)
+# when the key is a single plain lowercase-ASCII word; fail closed (redact +
+# report failed) for every other key shape, so ordinary sentences that
+# happen to match the loose regex still pass through untouched while any
+# deliberately-named key gets the fail-closed treatment.
+#
+# This is an EXCLUSION test, not an inclusion list: "prose" = the key
+# fullmatches `[a-z]+` and nothing else. Anything that isn't a single plain
+# lowercase word — digits, underscores, dashes, uppercase letters, or ANY
+# other punctuation (periods, slashes, colons, plus signs, @-signs, ...) —
+# counts as a deliberate key. Enumerating "deliberate" characters instead
+# (as the first version of this fix did) is an allowlist that will always
+# miss some real-world key shape; enumerating "prose" is a much smaller,
+# closed set (english words are just letters) so the exclusion is exhaustive
+# by construction.
+#
+# PR #2052 review history:
+# - qingyun-wu (2026-07-12, round 1): the original version only matched
+#   SCREAMING_SNAKE_CASE (`^[A-Z][A-Z0-9_]{1,}$`), so `pr_triage_activity_secret`,
+#   `PrTriageActivitySecret`, and `SOME-KEY` all still leaked.
+# - qingyun-wu (2026-07-12, round 2): the round-1 fix's own docstring said
+#   "deliberate = anything that isn't a single all-lowercase word," but the
+#   regex (`[A-Z0-9_-]`, an inclusion list) didn't actually implement that —
+#   lowercase keys with OTHER punctuation (`apikey.vault`, `apikey/vault`,
+#   `user:id`, `token+name`, `@token`) still slipped through as "prose" and
+#   leaked. This version finally matches the documented rule exactly: prose
+#   is defined as the narrow case (plain lowercase word), everything else
+#   fails closed.
+_LOOKS_LIKE_PLAIN_LOWERCASE_WORD = re.compile(r"[a-z]+")
 
 
 class InterceptResult(NamedTuple):
@@ -173,6 +208,28 @@ def get_vault_key(key: str) -> str:
     return result.stdout.decode().strip()
 
 
+# Keys double as env-var names via the `env` verb / get_vault_key consumers, so
+# the public setter holds them to env-var-safe naming (the chat-interception
+# path has its own, looser matching + FP guards above).
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def set_vault_key(key: str, value: str) -> None:
+    """Store a secret in Keychain + manifest — the public, non-chat write path.
+
+    Same storage as the `vault set` chat interception (`security
+    add-generic-password -a sutando -s KEY -U` + manifest registration), for
+    callers that already hold the value programmatically (CLI `set` verb,
+    desktop Settings' BYO-key entry). Raises ValueError on an invalid key or
+    empty value; RuntimeError when the Keychain write fails.
+    """
+    if not _ENV_KEY_RE.match(key or ""):
+        raise ValueError(f"vault: invalid key name '{key}' (want [A-Za-z_][A-Za-z0-9_]*)")
+    if not value:
+        raise ValueError("vault: refusing to store an empty value")
+    _store_in_keychain(key, value)
+
+
 def intercept_vault_commands(text: str) -> InterceptResult:
     """Detect vault-set commands in `text`, store secrets, return sanitized text.
 
@@ -198,10 +255,11 @@ def intercept_vault_commands(text: str) -> InterceptResult:
             failed.append(key)
             return f"vault set {key} [VAULT-EMPTY-VALUE]"
         # FP guard: validate the VALUE field is actually a known secret pattern
-        # via detect-secrets. This filters out prose matches like
-        # "the vault set command works fine" where regex would otherwise capture
-        # key="command", value="works" — "works" is not a known secret → skip.
-        # Quoted values bypass the guard (user explicitly delimited the value).
+        # via detect-secrets. Genuine prose matches like "the vault set command
+        # works fine" (key="command", value="works") are left alone — see the
+        # _LOOKS_LIKE_PLAIN_LOWERCASE_WORD check below for why "not a known
+        # secret" alone no longer means "assume prose" (#2074). Quoted values bypass the guard
+        # entirely (user explicitly delimited the value).
         is_quoted = m.group(2) is not None or m.group(3) is not None or m.group(4) is not None
         if not is_quoted:
             try:
@@ -221,22 +279,65 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # pip-install (env mutation in a message handler) and no separate task:
                 # the refusal rides the normal task to core, channel context intact.
                 print(
-                    f"vault: detect-secrets not installed — refused unquoted "
-                    f"`vault set {key}` (can't validate). Core will install the dep; "
-                    f"quote the value to store immediately.",
+                    f"vault: detect-secrets not installed in {sys.executable} — refused "
+                    f"unquoted `vault set {key}` (can't validate). Quote the value to "
+                    f"store immediately; see the task text for the install command.",
                     flush=True,
                 )
                 failed.append(key)
+                # The install hint must name THIS interpreter (sys.executable),
+                # not a bare `python3`: the bridges are launched with whichever
+                # interpreter had their client library (see the probes in
+                # src/startup.sh), which is frequently NOT the `python3` first on
+                # PATH. Installing into the wrong one leaves the refusal in place
+                # and looks like the fix silently failed.
+                #
+                # The --break-system-packages fallback is required, not optional
+                # noise: on a stock Homebrew/macOS python both `pip install` AND
+                # `pip install --user` are refused by PEP 668, so the previous
+                # bare `python3 -m pip install detect-secrets` could not succeed
+                # on the most common Sutando host. Verified 2026-07-20.
                 return (
                     f"vault set {key} [vault: REFUSED — detect-secrets not installed, "
                     f"can't validate an unquoted value. AGENT: run "
-                    f"'python3 -m pip install detect-secrets', then tell the owner to "
+                    f"'{sys.executable} -m pip install detect-secrets' — if that fails "
+                    f"with 'externally-managed-environment' (PEP 668), retry the same "
+                    f"command with --break-system-packages. Then tell the owner to "
                     f"re-send this vault set (or quote the value next time). Never echo "
                     f"or ask for the value.]"
                 )
             if not scan_secrets(value):
-                # Not a known secret pattern — assume this is prose, leave it alone.
-                return m.group(0)
+                if _LOOKS_LIKE_PLAIN_LOWERCASE_WORD.fullmatch(key):
+                    # Key is nothing but a plain lowercase word (no digits,
+                    # underscores, dashes, uppercase, or other punctuation) —
+                    # this is almost certainly prose ("the vault set command
+                    # works fine" → key="command"), not a real command. Leave
+                    # it alone; redacting it would mangle ordinary sentences.
+                    # NOTE: this is a .fullmatch() exclusion test ("is the
+                    # WHOLE key just a lowercase word?"), not a .search() for
+                    # qualifying characters — the earlier version enumerated
+                    # "deliberate" characters (digit/underscore/dash/upper)
+                    # and missed lowercase-with-other-punctuation keys like
+                    # "apikey.vault" or "user:id", which still leaked.
+                    return m.group(0)
+                # Key is NOT a plain lowercase word (SCREAMING_SNAKE_CASE,
+                # lowercase snake_case, camelCase, PascalCase, dash-separated,
+                # or any other punctuation-containing shape) but the value
+                # wasn't recognized as a known secret shape. That's a classifier
+                # miss, not proof of prose — issue #2074: a real Discord
+                # client secret and pa-/al-prefixed API keys both slipped
+                # through here as unrecognized-therefore-untouched, leaking
+                # plaintext to disk (same root cause #2052 hit for bare
+                # UUIDs, fixed by widening recognition — but recognition can
+                # never be exhaustive, so THIS branch must fail closed too).
+                # Never store an unvalidated value; redact and surface it so
+                # the owner can resend quoted (which bypasses the guard
+                # entirely) to store it for real.
+                failed.append(key)
+                return (
+                    f"vault set {key} [vault: unrecognized value — NOT stored. "
+                    f"Resend quoted (e.g. vault set {key} \"value\") to store it.]"
+                )
         try:
             _store_in_keychain(key, value)
             stored.append(key)
