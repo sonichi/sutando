@@ -10,8 +10,9 @@ name: eslint
 # — the class of defect tsc does not catch.
 #
 # Config and the rationale for every relaxed rule live in eslint.config.mjs.
-# Errors fail this check; the no-explicit-any findings are warnings by design so
-# the count stays visible without blocking.
+# Errors fail this check. no-explicit-any is an ERROR everywhere except the
+# shrinking allowlist of files that predate the ratchet (see eslint.config.mjs)
+# — those stay warnings so their count is visible without blocking.
 #
 # Runs as its own workflow (rather than a step inside ci.yml) so a lint failure
 # surfaces as a named "eslint" check on the PR instead of being buried in the
