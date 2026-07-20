@@ -22,6 +22,7 @@ Checks:
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -230,6 +231,24 @@ def check_node_runtime() -> dict:
             "name": "node-runtime",
             "status": "down",
             "detail": f"node at {resolved['path']} could not be executed ({exc}) — runtime not runnable",
+        }
+    # Version floor (external review on #2182): bundled services use node:sqlite,
+    # which needs Node >= 22.5 — an older node passes every other probe here but
+    # crashes those services at import. Unparseable versions degrade to warn
+    # (never block on a formatting surprise), too-old is DOWN with the fix named.
+    floor = (22, 5)
+    parsed = re.match(r"v?(\d+)\.(\d+)", version or "")
+    if parsed is None:
+        return {
+            "name": "node-runtime",
+            "status": "warn",
+            "detail": f"node at {resolved['path']} reported unparseable version {version!r} — cannot verify the >=22.5 floor (node:sqlite)",
+        }
+    if (int(parsed.group(1)), int(parsed.group(2))) < floor:
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"{version} via {resolved['source']} is below the 22.5 floor (node:sqlite) — bundled services will crash; upgrade the runtime",
         }
     return {
         "name": "node-runtime",

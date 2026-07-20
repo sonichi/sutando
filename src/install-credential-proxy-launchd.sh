@@ -81,11 +81,17 @@ case "$cmd" in
         echo "  brew bin:  $BREW_BIN"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
+        # SUTANDO_NODE is caller-controlled and lands inside plist XML via sed
+        # (external review on #2182): XML-encode &<> then escape sed's \ & and
+        # the | delimiter so hostile-looking paths can't corrupt the plist.
+        _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
+            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+        _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
         sed \
             -e "s|__REPO__|$REPO|g" \
             -e "s|__WORKSPACE__|$WORKSPACE|g" \
             -e "s|__BREW_BIN__|$BREW_BIN|g" \
-            -e "s|__SUTANDO_NODE__|${SUTANDO_NODE:-}|g" \
+            -e "s|__SUTANDO_NODE__|${_node_sed}|g" \
             -e "s|__HOME__|$HOME|g" \
             "$TEMPLATE" > "$DEST"
         bootout_if_loaded
