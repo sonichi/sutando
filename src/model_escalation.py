@@ -4,8 +4,10 @@ Sutando "auto fable" — escalate the core model to Fable 5 when the same
 problem keeps not getting solved, then restore the prior model once it is.
 
 Usage:
-  python3 src/model_escalation.py --check   # run one detection pass (cron/health-check tick)
-  python3 src/model_escalation.py --status  # print current escalation state as JSON
+  python3 src/model_escalation.py --check    # run one pass: detect + drive the yes/no reply
+  python3 src/model_escalation.py --status   # print current escalation state as JSON
+  python3 src/model_escalation.py --escalate # manual override: switch to Fable 5 now
+  python3 src/model_escalation.py --restore  # manual override: switch back now
 
 Tracking issue: sonichi/sutando#2224.
 
@@ -25,11 +27,19 @@ SUTANDO_CORE_MODEL" pattern):
 Unlike recover_core (which acts autonomously on a wedge), auto-fable is
 owner-gated: stuck-detected sends the owner an ASK ("Switch to Fable 5?") and
 records that the ask is pending. The actual switch happens when the owner
-answers yes (escalate_to_fable), and the switch-back happens when the owner
-answers yes to the "switch back?" prompt (restore_prior_model). The CLI pass
-handles detection + prompting; the yes/no path is driven by the core agent
-reading the owner's reply and calling escalate_to_fable / restore_prior_model
-(exposed for that reason and for tests).
+answers yes, and the switch-back happens when the owner answers yes to the
+"switch back?" prompt.
+
+The `--check` pass IS the state machine: it drives the yes/no automatically,
+no external tool required. When an ask is pending it reads the owner's latest
+message since the ask (`last_ask_at`) and, if it carries an affirmative cue
+(AFFIRM_KEYWORDS), calls escalate_to_fable; a negative cue (DECLINE_KEYWORDS)
+clears the ask (records a decline so it doesn't immediately re-ask); no reply
+leaves the ask pending. Symmetrically, once escalated + a switch-back prompt is
+pending, an affirmative reply calls restore_prior_model and a negative reply
+clears the prompt (stays on Fable). escalate_to_fable / restore_prior_model are
+also exposed as `--escalate` / `--restore` CLI subcommands for a manual
+override / a concrete invocation point, and for tests.
 
 How the switch is performed
 ---------------------------
@@ -123,6 +133,24 @@ RESOLVED_KEYWORDS = [
     "好了", "行了", "解决了", "可以了", "切回来", "换回来", "没问题了",
 ]
 
+# Affirmative cues — an owner "yes" to a pending ASK / switch-back prompt.
+# Matched case-insensitively as substrings, same as the other cue lists.
+AFFIRM_KEYWORDS = [
+    # English
+    "yes", "yeah", "yep", "do it", "go ahead", "switch", "ok", "okay",
+    "sure", "please do",
+    # Chinese
+    "好", "行", "可以", "切", "换", "是", "好的", "切吧",
+]
+
+# Negative cues — an owner "no" to a pending ASK / switch-back prompt.
+DECLINE_KEYWORDS = [
+    # English
+    "no", "nope", "don't", "do not", "not now", "leave it", "stay",
+    # Chinese
+    "不用", "别", "不要", "算了", "先不", "不切", "不换",
+]
+
 # Tokens ignored when comparing two owner messages for "same topic" overlap —
 # stopwords + the frustration/resolution cues themselves (so "PR login still
 # broken" and "login PR again" match on the meaningful tokens, not on "still"
@@ -167,21 +195,33 @@ def _recent_owner_messages(
     """Owner-authored task messages seen in the trailing `window_sec`, newest
     first. Each entry: {"text": str, "ts": float, "resolved": bool} where
     `resolved` is True if a result file for that task id exists (the task got
-    an answer). Scans top-level tasks/*.txt plus tasks/processed/*.txt (the
-    discord/voice consumers archive there once done) so re-asks that already
-    drained are still visible.
+    an answer). Scans top-level tasks/*.txt plus the canonical month-partitioned
+    archive tasks/archive/YYYY-MM/*.txt (the task-bridge archives drained tasks
+    there — see src/health-check.py and src/task-bridge.ts) so re-asks that
+    already drained are still visible.
 
     A task counts as owner-authored when its `access_tier:` is `owner` (the
     bridges tag every task). Non-owner tasks never signal owner frustration, so
-    they're skipped. This mirrors how check_task_queue / recover_core glob the
+    they're skipped. This mirrors how check_task_queue / task-bridge glob the
     same dirs — no new file convention introduced."""
     if tasks_dir is None:
         tasks_dir = WORKSPACE_DIR / "tasks"
     if results_dir is None:
         results_dir = WORKSPACE_DIR / "results"
 
+    # Scan the top-level queue plus each month-partitioned archive subdir
+    # (tasks/archive/YYYY-MM/). Glob the archive month dirs rather than rebuild
+    # YYYY-MM from now, since a task's archive month can differ from the current
+    # one around month boundaries (same reasoning as task-bridge._isVoiceTask).
+    scan_dirs = [tasks_dir]
+    archive_root = tasks_dir / "archive"
+    try:
+        scan_dirs.extend(d for d in archive_root.iterdir() if d.is_dir())
+    except OSError:
+        pass
+
     files: "list[Path]" = []
-    for base in (tasks_dir, tasks_dir / "processed"):
+    for base in scan_dirs:
         try:
             files.extend(p for p in base.glob("*.txt") if p.is_file())
         except OSError:
@@ -361,6 +401,40 @@ def detect_resolved(
     quiet_since = max(escalated_at, last_frustration)
     if now - quiet_since >= RESOLVE_QUIET_SEC:
         return {"reason": "quiet", "quiet_for": int(now - quiet_since)}
+    return None
+
+
+def owner_reply_after(
+    now: float,
+    since: float,
+    messages_fn=None,
+) -> "str | None":
+    """Classify the owner's latest message strictly AFTER `since` (the ask /
+    switch-back prompt timestamp) as an approval decision. Returns:
+      * "yes"  — the latest post-`since` owner message carries an affirmative cue
+      * "no"   — it carries a negative cue
+      * None   — no owner message after `since`, or it's neither cue.
+
+    Only the single newest post-`since` owner message decides — an old "yes" in
+    the window can't retro-approve, and a fresh "no" overrides a stale "yes".
+    Injectable `messages_fn()` (same shape as detect_stuck) keeps it hermetic.
+    An affirmative check runs first so a message that trips both lists (rare —
+    e.g. "no, switch") still reads as the more specific cue order the lists
+    encode; in practice cues are disjoint."""
+    messages_fn = messages_fn or (
+        lambda: _recent_owner_messages(now, STUCK_WINDOW_SEC)
+    )
+    messages = messages_fn()
+    # messages are newest-first; take the first one strictly after `since`.
+    for m in messages:
+        if m["ts"] <= since:
+            continue
+        text = m["text"]
+        if _has_keyword(text, AFFIRM_KEYWORDS):
+            return "yes"
+        if _has_keyword(text, DECLINE_KEYWORDS):
+            return "no"
+        return None
     return None
 
 
@@ -593,13 +667,20 @@ def check_once(
     now: Optional[float] = None,
     stuck_fn=None,
     resolved_fn=None,
+    reply_fn=None,
     sender=None,
+    restart_fn=None,
 ) -> "dict | None":
-    """One detection pass (the `--check` entrypoint). Prompts the owner when
-    stuck-detected (and not already escalated / asked, past cooldown); prompts
-    to switch back when an escalated topic looks resolved. Does NOT perform the
-    switch itself — that waits on the owner's yes via escalate_to_fable /
-    restore_prior_model. All collaborators injectable.
+    """One pass of the state machine (the `--check` entrypoint). Drives the
+    whole flow: prompts the owner when stuck-detected, performs the switch when
+    the owner's post-ask reply is affirmative, prompts to switch back when the
+    escalated topic looks resolved, and switches back when that reply is
+    affirmative. All collaborators injectable.
+
+    `reply_fn(since)` classifies the owner's latest message after `since` as
+    "yes" / "no" / None (defaults to owner_reply_after). `restart_fn` / `sender`
+    are threaded into escalate_to_fable / restore_prior_model so the switch the
+    yes triggers stays hermetic under test.
 
     Runs the load -> decide -> save under the same non-blocking flock as
     recover_core so a manual --check and a cron tick can't both fire the ask."""
@@ -608,65 +689,121 @@ def check_once(
     if state_file is None:
         state_file = WORKSPACE_DIR / "state" / "model-escalation.json"
     send = sender or _default_owner_dm
+    reply = reply_fn or (lambda since: owner_reply_after(now, since))
 
+    # escalate_to_fable / restore_prior_model take the same flock as this pass,
+    # so when the owner's reply commands a switch we decide it inside the lock,
+    # then perform the switch AFTER releasing the lock (below).
     with _locked_state(state_file) as ctx:
         if ctx is None:
             return {"action": "locked"}
         state, save = ctx
 
         if state.get("escalated"):
-            # Watch for resolution -> prompt to switch back (once per episode).
-            resolve = (resolved_fn or (
-                lambda: detect_resolved(now, state.get("topic", ""), state.get("escalated_at", 0.0))
-            ))()
-            if not resolve:
-                return {"action": "escalated_waiting"}
-            if state.get("resolve_prompt_pending"):
-                return {"action": "resolve_already_prompted"}
-            ok = send(
-                f":white_check_mark: Looks like *{state.get('topic', 'that')}* is "
-                "sorted now. Switch the core back from Fable 5? (reply yes to switch back)"
-            )
-            if ok:
-                state["resolve_prompt_pending"] = True
-                save()
-            return {"action": "resolve_prompted", "reason": resolve.get("reason")}
-
-        # Not escalated: look for a stuck topic to ASK about.
-        stuck = (stuck_fn or (lambda: detect_stuck(now)))()
-        if not stuck:
-            # Clear a stale pending-ask so a future topic starts fresh.
             if state.get("ask_pending"):
+                # (never both; defensive) treat as escalated, drop stale ask.
                 state.pop("ask_pending", None)
                 save()
-            return None
 
-        topic = stuck["topic"]
-        last_ask = state.get("last_ask_at") or 0
-        # Cooldown: don't re-ask every tick while the owner is deciding, unless
-        # the topic changed (a genuinely new stuck problem deserves a prompt).
-        if (
-            state.get("ask_pending")
-            and state.get("topic") == topic
-            and last_ask
-            and now - last_ask < ESCALATE_COOLDOWN_SEC
-        ):
-            return {"action": "ask_cooldown", "topic": topic, "since_ask": int(now - last_ask)}
+            if not state.get("resolve_prompt_pending"):
+                # Watch for resolution -> prompt to switch back (once/episode).
+                resolve = (resolved_fn or (
+                    lambda: detect_resolved(now, state.get("topic", ""), state.get("escalated_at", 0.0))
+                ))()
+                if not resolve:
+                    return {"action": "escalated_waiting"}
+                ok = send(
+                    f":white_check_mark: Looks like *{state.get('topic', 'that')}* is "
+                    "sorted now. Switch the core back from Fable 5? (reply yes to switch back)"
+                )
+                if ok:
+                    state["resolve_prompt_pending"] = True
+                    state["resolve_prompt_at"] = now
+                    save()
+                return {"action": "resolve_prompted", "reason": resolve.get("reason")}
 
-        ok = send(
-            f":hourglass_flowing_sand: It looks like *{topic}* keeps not getting "
-            "solved. Switch to Fable 5? (reply yes to switch)"
+            # A switch-back prompt is pending: the owner's reply drives it.
+            decision = reply(state.get("resolve_prompt_at", state.get("escalated_at", 0.0)))
+            if decision == "yes":
+                _pending_switch = "restore"  # perform after the lock releases
+            elif decision == "no":
+                # Owner declined the switch-back: stay on Fable, clear the
+                # prompt so a later resolution can re-prompt.
+                state.pop("resolve_prompt_pending", None)
+                state.pop("resolve_prompt_at", None)
+                save()
+                return {"action": "restore_declined"}
+            else:
+                return {"action": "resolve_reply_pending"}
+        else:
+            # Not escalated. First, if an ASK is pending, the owner's reply to it
+            # drives the escalate (or a decline).
+            if state.get("ask_pending"):
+                decision = reply(state.get("last_ask_at", 0.0))
+                if decision == "yes":
+                    _pending_switch = "escalate"  # perform after the lock
+                elif decision == "no":
+                    # Declined: clear the ask and record the decline so the same
+                    # topic doesn't immediately re-ask this pass.
+                    state.pop("ask_pending", None)
+                    state["declined_topic"] = state.get("topic")
+                    state["declined_at"] = now
+                    save()
+                    return {"action": "ask_declined", "topic": state.get("topic")}
+                else:
+                    _pending_switch = None  # no reply yet — may still re-ask below
+            else:
+                _pending_switch = None
+
+            if _pending_switch is None:
+                # No affirmative reply — look for a stuck topic to ASK about.
+                stuck = (stuck_fn or (lambda: detect_stuck(now)))()
+                if not stuck:
+                    # Clear a stale pending-ask so a future topic starts fresh.
+                    if state.get("ask_pending"):
+                        state.pop("ask_pending", None)
+                        save()
+                    return None
+
+                topic = stuck["topic"]
+                last_ask = state.get("last_ask_at") or 0
+                # Cooldown: don't re-ask every tick while the owner is deciding,
+                # unless the topic changed (a new stuck problem deserves a prompt).
+                if (
+                    state.get("ask_pending")
+                    and state.get("topic") == topic
+                    and last_ask
+                    and now - last_ask < ESCALATE_COOLDOWN_SEC
+                ):
+                    return {"action": "ask_cooldown", "topic": topic, "since_ask": int(now - last_ask)}
+
+                ok = send(
+                    f":hourglass_flowing_sand: It looks like *{topic}* keeps not "
+                    "getting solved. Switch to Fable 5? (reply yes to switch)"
+                )
+                if not ok:
+                    # DM failed — don't record the ask, so the next pass retries.
+                    return {"action": "ask_failed", "topic": topic}
+                state["ask_pending"] = True
+                state["topic"] = topic
+                state["last_ask_at"] = now
+                state["repeat_count"] = stuck["repeat_count"]
+                state["frustrated"] = stuck["frustrated"]
+                save()
+                return {"action": "asked", "topic": topic, "repeat_count": stuck["repeat_count"]}
+
+    # Lock released. Perform the switch the owner's yes commanded.
+    if _pending_switch == "escalate":
+        result = escalate_to_fable(
+            state_file=state_file, now=now, restart_fn=restart_fn, sender=send,
         )
-        if not ok:
-            # DM failed — don't record the ask, so the next pass retries.
-            return {"action": "ask_failed", "topic": topic}
-        state["ask_pending"] = True
-        state["topic"] = topic
-        state["last_ask_at"] = now
-        state["repeat_count"] = stuck["repeat_count"]
-        state["frustrated"] = stuck["frustrated"]
-        save()
-        return {"action": "asked", "topic": topic, "repeat_count": stuck["repeat_count"]}
+        return {"action": "escalate_on_yes", "result": result}
+    if _pending_switch == "restore":
+        result = restore_prior_model(
+            state_file=state_file, now=now, restart_fn=restart_fn, sender=send,
+        )
+        return {"action": "restore_on_yes", "result": result}
+    return None
 
 
 def _read_state(state_file: Optional[Path] = None) -> "dict":
@@ -685,6 +822,16 @@ def main() -> int:
         return 0
     if "--check" in sys.argv:
         result = check_once()
+        print(json.dumps(result if result is not None else {"action": "none"}, indent=2))
+        return 0
+    if "--escalate" in sys.argv:
+        # Manual override / concrete invocation point: switch to Fable 5 now.
+        result = escalate_to_fable()
+        print(json.dumps(result if result is not None else {"action": "none"}, indent=2))
+        return 0
+    if "--restore" in sys.argv:
+        # Manual override: switch back from Fable 5 now.
+        result = restore_prior_model()
         print(json.dumps(result if result is not None else {"action": "none"}, indent=2))
         return 0
     print(__doc__)

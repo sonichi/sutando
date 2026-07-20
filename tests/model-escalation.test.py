@@ -77,7 +77,7 @@ class Harness:
         self.restart_calls.append(model_value)
         return self.restart_ok
 
-    def check(self, now, messages=None, stuck=None, resolved=None):
+    def check(self, now, messages=None, stuck=None, resolved=None, reply=None):
         stuck_fn = None
         resolved_fn = None
         if stuck is not None:
@@ -88,9 +88,14 @@ class Harness:
             resolved_fn = lambda: resolved
         elif messages is not None:
             resolved_fn = lambda: None  # default: not resolved unless provided
+        # `reply` is the owner's yes/no decision to a pending ask / switch-back
+        # prompt. Default to "no reply yet" (None) so a pass that only tests
+        # detection stays hermetic and never touches the real workspace.
+        reply_fn = (lambda since: reply)
         return me.check_once(
             state_file=self.state_file, now=now,
-            stuck_fn=stuck_fn, resolved_fn=resolved_fn, sender=self.sender,
+            stuck_fn=stuck_fn, resolved_fn=resolved_fn, reply_fn=reply_fn,
+            sender=self.sender, restart_fn=self.restart,
         )
 
     def escalate(self, now, env_prior=None):
@@ -418,6 +423,207 @@ def case_p_restart_failure_on_escalate() -> list[str]:
     return fails
 
 
+def case_ac_affirmative_reply_after_ask_escalates() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "esc.json"
+        h = Harness(sf)
+        msgs = [
+            _msg("login PR redirect 还是不行", 1_000_300),
+            _msg("login PR redirect broken", 1_000_200),
+            _msg("login PR redirect", 1_000_100),
+        ]
+        h.check(now=1_000_400, messages=msgs)  # ASK fired, ask_pending recorded
+        h.restart_calls.clear()
+        # Owner replies "yes" after the ask → --check drives the escalate.
+        r = h.check(now=1_000_500, messages=msgs, reply="yes")
+        if not r or r.get("action") != "escalate_on_yes":
+            fails.append(f"ac) affirmative reply after ask should escalate, got {r}")
+        if h.restart_calls != ["fable"]:
+            fails.append(f"ac) escalate must restart with the fable alias, got {h.restart_calls}")
+        st = json.loads(sf.read_text())
+        if not st.get("escalated"):
+            fails.append("ac) state should be marked escalated after yes")
+    return fails
+
+
+def case_ad_negative_reply_after_ask_declines() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "esc.json"
+        h = Harness(sf)
+        msgs = [
+            _msg("login PR redirect 还是不行", 1_000_300),
+            _msg("login PR redirect broken", 1_000_200),
+            _msg("login PR redirect", 1_000_100),
+        ]
+        h.check(now=1_000_400, messages=msgs)  # ASK fired
+        h.restart_calls.clear()
+        r = h.check(now=1_000_500, messages=msgs, reply="no")
+        if not r or r.get("action") != "ask_declined":
+            fails.append(f"ad) negative reply after ask should decline, got {r}")
+        if h.restart_calls:
+            fails.append("ad) declined ask must NOT restart")
+        st = json.loads(sf.read_text())
+        if st.get("escalated"):
+            fails.append("ad) decline must not escalate")
+        if st.get("ask_pending"):
+            fails.append("ad) decline should clear the pending ask")
+    return fails
+
+
+def case_ae_no_reply_after_ask_stays_pending() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "esc.json"
+        h = Harness(sf)
+        msgs = [
+            _msg("login PR redirect 还是不行", 1_000_300),
+            _msg("login PR redirect broken", 1_000_200),
+            _msg("login PR redirect", 1_000_100),
+        ]
+        h.check(now=1_000_400, messages=msgs)  # ASK fired
+        h.restart_calls.clear()
+        # No reply (None) and still within cooldown → stays ask_pending, no switch.
+        r = h.check(now=1_000_500, messages=msgs, reply=None)
+        if not r or r.get("action") != "ask_cooldown":
+            fails.append(f"ae) no reply within cooldown should stay pending (ask_cooldown), got {r}")
+        if h.restart_calls:
+            fails.append("ae) no-reply must not restart")
+        st = json.loads(sf.read_text())
+        if not st.get("ask_pending"):
+            fails.append("ae) ask should remain pending with no reply")
+    return fails
+
+
+def case_af_affirmative_reply_after_switchback_restores() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "esc.json"
+        h = Harness(sf)
+        h.escalate(now=1_000_000, env_prior="opus[1m]")
+        # Fire the switch-back prompt (quiet resolution).
+        h.check(now=1_000_100, resolved={"reason": "quiet", "quiet_for": 2000})
+        h.restart_calls.clear()
+        # Owner replies "yes" to the switch-back → restore fires.
+        r = h.check(now=1_000_200, resolved={"reason": "quiet", "quiet_for": 2100}, reply="yes")
+        if not r or r.get("action") != "restore_on_yes":
+            fails.append(f"af) affirmative reply after switch-back prompt should restore, got {r}")
+        if h.restart_calls != ["opus[1m]"]:
+            fails.append(f"af) restore must restart with the prior model, got {h.restart_calls}")
+        st = json.loads(sf.read_text())
+        if st.get("escalated"):
+            fails.append("af) state should be de-escalated after restore")
+    return fails
+
+
+def case_ag_negative_reply_after_switchback_stays_on_fable() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "esc.json"
+        h = Harness(sf)
+        h.escalate(now=1_000_000, env_prior="opus[1m]")
+        h.check(now=1_000_100, resolved={"reason": "quiet", "quiet_for": 2000})  # prompt
+        h.restart_calls.clear()
+        r = h.check(now=1_000_200, resolved={"reason": "quiet", "quiet_for": 2100}, reply="no")
+        if not r or r.get("action") != "restore_declined":
+            fails.append(f"ag) negative reply after switch-back should decline, got {r}")
+        if h.restart_calls:
+            fails.append("ag) declined switch-back must NOT restart")
+        st = json.loads(sf.read_text())
+        if not st.get("escalated"):
+            fails.append("ag) declined switch-back should stay on Fable (escalated)")
+        if st.get("resolve_prompt_pending"):
+            fails.append("ag) declined switch-back should clear the prompt")
+    return fails
+
+
+def case_ah_owner_reply_after_helper() -> list[str]:
+    fails = []
+    since = 1_000_000.0
+    # Affirmative, newest strictly after `since`.
+    yes = [_msg("好的 切吧", since + 100)]
+    if me.owner_reply_after(since + 200, since, messages_fn=lambda: yes) != "yes":
+        fails.append("ah) affirmative cue after since should be 'yes'")
+    # Negative.
+    no = [_msg("不用了 算了", since + 100)]
+    if me.owner_reply_after(since + 200, since, messages_fn=lambda: no) != "no":
+        fails.append("ah) negative cue after since should be 'no'")
+    # Neither cue.
+    neither = [_msg("what is the status", since + 100)]
+    if me.owner_reply_after(since + 200, since, messages_fn=lambda: neither) is not None:
+        fails.append("ah) non-cue message should be None")
+    # A message at/before `since` must not count (only strictly-after decides).
+    stale = [_msg("yes do it", since - 10)]
+    if me.owner_reply_after(since + 200, since, messages_fn=lambda: stale) is not None:
+        fails.append("ah) message at/before since must not decide")
+    # No messages → None.
+    if me.owner_reply_after(since + 200, since, messages_fn=lambda: []) is not None:
+        fails.append("ah) no messages should be None")
+    return fails
+
+
+def case_ai_escalate_restore_cli_subcommands() -> list[str]:
+    """--escalate / --restore drive the switch through main() (manual override).
+    Point WORKSPACE_DIR at a temp dir and inject nothing — but stub the default
+    restart/DM by pre-seeding state and asserting the printed action JSON."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        saved_ws = me.WORKSPACE_DIR
+        saved_argv = sys.argv[:]
+        saved_restart = me._default_core_restart
+        saved_dm = me._default_owner_dm
+        me.WORKSPACE_DIR = Path(td)
+        # Stub the real side effects so the CLI path never restarts / DMs.
+        me._default_core_restart = lambda mv: True
+        me._default_owner_dm = lambda t: True
+        try:
+            (Path(td) / "state").mkdir(parents=True, exist_ok=True)
+            sys.argv = ["model_escalation.py", "--escalate"]
+            if me.main() != 0:
+                fails.append("ai) main --escalate should return 0")
+            st = me._read_state(Path(td) / "state" / "model-escalation.json")
+            if not st.get("escalated"):
+                fails.append(f"ai) --escalate should mark state escalated, got {st}")
+            sys.argv = ["model_escalation.py", "--restore"]
+            if me.main() != 0:
+                fails.append("ai) main --restore should return 0")
+            st2 = me._read_state(Path(td) / "state" / "model-escalation.json")
+            if st2.get("escalated"):
+                fails.append(f"ai) --restore should de-escalate, got {st2}")
+        finally:
+            sys.argv = saved_argv
+            me.WORKSPACE_DIR = saved_ws
+            me._default_core_restart = saved_restart
+            me._default_owner_dm = saved_dm
+    return fails
+
+
+def case_aj_recent_owner_messages_archive_only() -> list[str]:
+    """_recent_owner_messages reads from tasks/archive/YYYY-MM/ and no longer
+    depends on tasks/processed/ (issue #2 required fix)."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        tasks = base / "tasks"
+        results = base / "results"
+        results.mkdir(parents=True, exist_ok=True)
+        now = 4_000_000.0
+        # A message ONLY in the month-partitioned archive.
+        archive_month = tasks / "archive" / "2026-07"
+        _write_task(archive_month, "task-arch", "archived login ask", "owner", mtime=now - 30)
+        # A message in the (now-dropped) legacy tasks/processed/ location.
+        processed = tasks / "processed"
+        _write_task(processed, "task-proc", "legacy processed ask", "owner", mtime=now - 20)
+        msgs = me._recent_owner_messages(now, 3600, tasks_dir=tasks, results_dir=results)
+        texts = [m["text"] for m in msgs]
+        if "archived login ask" not in texts:
+            fails.append("aj) archive/YYYY-MM/ task should be read")
+        if "legacy processed ask" in texts:
+            fails.append("aj) tasks/processed/ should no longer be scanned")
+    return fails
+
+
 # ---------------------------------------------------------------------------
 # File-based helper coverage — real temp dirs, no injected fakes. These exercise
 # the default implementations of the collaborators the invariant tests inject.
@@ -443,7 +649,9 @@ def case_q_recent_owner_messages_scan() -> list[str]:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         tasks = base / "tasks"
-        processed = tasks / "processed"
+        # Canonical archive layout: tasks/archive/YYYY-MM/<taskId>.txt
+        # (src/health-check.py:992, src/task-bridge.ts:129-144).
+        archive_month = tasks / "archive" / "2026-07"
         results = base / "results"
         results.mkdir(parents=True, exist_ok=True)
         now = 2_000_000.0
@@ -456,8 +664,8 @@ def case_q_recent_owner_messages_scan() -> list[str]:
         _write_task(tasks, "task-3", "some team ask", "team", mtime=now - 10)
         # owner but OUTSIDE the window — filtered by mtime cutoff
         _write_task(tasks, "task-old", "ancient ask", "owner", mtime=now - 99_999)
-        # archived under processed/ — must still be seen
-        _write_task(processed, "task-4", "archived owner ask", "owner", mtime=now - 20)
+        # archived under tasks/archive/YYYY-MM/ — must still be seen
+        _write_task(archive_month, "task-4", "archived owner ask", "owner", mtime=now - 20)
         # owner, in-window, but EMPTY task body → skipped (no meaningful text)
         _write_task(tasks, "task-empty", "", "owner", mtime=now - 5)
 
@@ -470,7 +678,7 @@ def case_q_recent_owner_messages_scan() -> list[str]:
         if "login PR still broken" not in texts:
             fails.append("q) in-window owner task should be included")
         if "archived owner ask" not in texts:
-            fails.append("q) tasks/processed/ archived task should be included")
+            fails.append("q) tasks/archive/YYYY-MM/ archived task should be included")
         # resolved flag
         by_text = {m["text"]: m for m in msgs}
         if not by_text.get("deploy failing", {}).get("resolved"):
@@ -846,6 +1054,14 @@ def main() -> int:
         ("n", case_n_topic_overlap_heuristic),
         ("o", case_o_lock_prevents_concurrent),
         ("p", case_p_restart_failure_on_escalate),
+        ("ac", case_ac_affirmative_reply_after_ask_escalates),
+        ("ad", case_ad_negative_reply_after_ask_declines),
+        ("ae", case_ae_no_reply_after_ask_stays_pending),
+        ("af", case_af_affirmative_reply_after_switchback_restores),
+        ("ag", case_ag_negative_reply_after_switchback_stays_on_fable),
+        ("ah", case_ah_owner_reply_after_helper),
+        ("ai", case_ai_escalate_restore_cli_subcommands),
+        ("aj", case_aj_recent_owner_messages_archive_only),
         ("q", case_q_recent_owner_messages_scan),
         ("r", case_r_parse_task_fields_multiline),
         ("s", case_s_result_exists_shapes),
