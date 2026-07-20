@@ -1117,12 +1117,37 @@ def check_bodhi_dist() -> dict:
 
     Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
+
+    Scans whichever artifact the voice-agent ACTUALLY loads, because that
+    differs by deployment and the node_modules copy is not always the one
+    running:
+
+      - dev checkout  -> node_modules/bodhi-realtime-agent/dist/index.js
+      - bundled app   -> dist/voice-agent.js, an esbuild bundle with bodhi
+                         inlined and NO node_modules on disk at all
+
+    Checking only the node_modules path made this probe useless in exactly
+    the deployment where it matters: a bundled install has an empty
+    node_modules, so the check warned "run `npm install`" on every tick
+    (noise that reads as benign) while giving ZERO coverage of the running
+    bundle. The 1007 regression this was written to catch would have
+    shipped undetected. The body scan below needs no change — it matches
+    the bundled output as-is.
     """
     check = {"name": "bodhi-dist", "status": "ok", "detail": "Gemini 3.1 wire-format fixes present"}
-    dist = REPO_DIR / "node_modules" / "bodhi-realtime-agent" / "dist" / "index.js"
-    if not dist.exists():
+    # Order matters: node_modules first so a dev checkout reports on the
+    # package it actually resolves, bundle second for bundled installs.
+    candidates = [
+        REPO_DIR / "node_modules" / "bodhi-realtime-agent" / "dist" / "index.js",
+        REPO_DIR / "dist" / "voice-agent.js",
+    ]
+    dist = next((c for c in candidates if c.exists()), None)
+    if dist is None:
         check["status"] = "warn"
-        check["detail"] = "bodhi dist not found — run `npm install`"
+        check["detail"] = (
+            "no bodhi artifact found (checked node_modules and dist/voice-agent.js) — "
+            "run `npm install`, or `npm run build` for a bundled install"
+        )
         return check
     try:
         text = dist.read_text(errors="replace")
@@ -1130,13 +1155,14 @@ def check_bodhi_dist() -> dict:
         check["status"] = "warn"
         check["detail"] = f"dist read failed: {e}"
         return check
+    check["detail"] = f"Gemini 3.1 wire-format fixes present ({dist.name})"
     # Isolate the Gemini transport's sendAudio body. The OpenAI realtime
     # transport also defines sendAudio but uses `audio: base64Data` as a
     # flat string — a naive grep would false-positive.
     idx = text.find("sendAudio(base64Data) {")
     if idx < 0:
         check["status"] = "warn"
-        check["detail"] = "could not locate sendAudio in bodhi dist"
+        check["detail"] = f"could not locate sendAudio in {dist.name}"
         return check
     # Find the first two sendAudio definitions; the Gemini one wraps its
     # arg in `this.session.sendRealtimeInput(...)`.
@@ -1707,6 +1733,33 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
     return pgrep_status, pids
 
 
+def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Optional[tuple[str, str]]:
+    """Check a bridge's recent log lines for known failure-mode signatures.
+
+    Returns an (status, detail) override, or None if nothing to override.
+    discord-bridge: LoginFailure means the token is revoked/invalid. Always
+      overrides — there is no point restarting with stale code if the token
+      is bad; the token fix is the only path forward.
+    slack-bridge: "60s elapsed" hint means Socket Mode connected but events
+      weren't routing yet at startup (Slack app Event Subscriptions
+      disabled). Only overrides "ok" — stale/dead-inode are higher priority.
+      The hint is a one-time startup message that never clears itself in the
+      log, so it only counts if no event has actually been processed since
+      it last fired (checked via a subsequent "Wrote task-" line) — otherwise
+      Event Subscriptions clearly ARE enabled and it's a stale false alarm.
+    """
+    if name == "discord-bridge":
+        if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
+            return "fail", "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
+    elif name == "slack-bridge" and status == "ok":
+        warn_idxs = [i for i, ln in enumerate(tail) if "60s elapsed with zero events" in ln]
+        if warn_idxs:
+            events_after = any("Wrote task-" in ln for ln in tail[warn_idxs[-1] + 1:])
+            if not events_after:
+                return "warn", "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+    return None
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -1982,23 +2035,12 @@ def run_all_checks() -> list[dict]:
             pass
 
         # Check 6: Log-content health for known failure modes.
-        # discord-bridge: LoginFailure means the token is revoked/invalid.
-        #   Always overrides — there is no point restarting with stale code
-        #   if the token is bad; the token fix is the only path forward.
-        # slack-bridge: "60s elapsed" hint means Socket Mode connected but
-        #   events aren't routing (Slack app Event Subscriptions disabled).
-        #   Only overrides "ok" — stale/dead-inode are higher priority.
         if log_file.exists() and name in ("discord-bridge", "slack-bridge"):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
-                if name == "discord-bridge":
-                    if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
-                        status = "fail"
-                        detail = "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
-                elif name == "slack-bridge" and status == "ok":
-                    if any("60s elapsed with zero events" in ln for ln in tail):
-                        status = "warn"
-                        detail = "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+                override = bridge_log_content_status(name, status, tail)
+                if override is not None:
+                    status, detail = override
             except OSError:
                 pass
 
