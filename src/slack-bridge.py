@@ -736,6 +736,61 @@ def _resolve_username(user_id: str) -> str | None:
     return name
 
 
+_EMPTY_MENTION_CLARIFICATION = (
+    "The user mentioned the bot without any task text, and no recoverable "
+    "same-user message was found in the Slack thread. Acknowledge the mention "
+    "and ask briefly what they would like help with."
+)
+
+
+def _resolve_mention_text(event: dict, stripped_text: str) -> tuple[str, bool]:
+    """Recover an empty mention from the sender's immediately prior thread turn.
+
+    Slack only emits ``app_mention`` for the second half of a split turn such as
+    ``Run it now`` followed by ``@Sutando``.  Previously the empty mention was
+    dropped by ``_write_task`` and the user saw silence.  Restrict recovery to
+    the same thread and same sender so another participant's text can never be
+    attributed to the mentioning user.  If recovery is unavailable, create a
+    clarification task instead of silently returning.
+    """
+    if stripped_text:
+        return stripped_text, False
+
+    channel = event.get("channel")
+    thread_ts = event.get("thread_ts")
+    current_ts = event.get("ts")
+    user_id = event.get("user")
+    if channel and thread_ts and current_ts and user_id:
+        try:
+            response = app.client.conversations_replies(
+                channel=channel,
+                ts=thread_ts,
+                limit=100,
+            )
+            messages = response.get("messages") or []
+            for message in reversed(messages):
+                if message.get("ts", "") >= current_ts:
+                    continue
+                if message.get("bot_id"):
+                    continue
+                # Do not jump across another human participant and attribute an
+                # older instruction to the current sender.
+                if message.get("user") != user_id:
+                    break
+                candidate = (message.get("text") or "").strip()
+                without_mentions = re.sub(
+                    r"(?:^|\s)<@[A-Z0-9]+>(?=\s|$)",
+                    " ",
+                    candidate,
+                ).strip()
+                if without_mentions:
+                    return candidate, True
+        except Exception as exc:
+            print(f"  [empty-mention] thread context lookup failed: {exc}", flush=True)
+
+    return _EMPTY_MENTION_CLARIFICATION, False
+
+
 @app.event("app_mention")
 def handle_mention(event, say):
     """Channel @mention → task file."""
@@ -744,7 +799,9 @@ def handle_mention(event, say):
     raw = event.get("text", "")
     # Strip the leading <@BOTID> mention from the text body for cleanliness.
     text = re.sub(r"^<@[A-Z0-9]+>\s*", "", raw).strip()
-    _write_task(event, "Slack mention", text, username)
+    text, recovered = _resolve_mention_text(event, text)
+    prefix = "Slack mention (recovered prior thread message)" if recovered else "Slack mention"
+    _write_task(event, prefix, text, username)
 
 
 @app.event("message")
@@ -1191,4 +1248,3 @@ def main():  # pragma: no cover
 
 if __name__ == "__main__":
     main()
-
