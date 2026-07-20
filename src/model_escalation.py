@@ -61,7 +61,7 @@ from typing import Optional
 
 try:
     import fcntl  # POSIX file locking for the escalation critical section
-except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
+except ImportError:  # pragma: no cover — non-POSIX (e.g. Windows), lock no-ops
     fcntl = None
 
 REPO_DIR = Path(__file__).parent.parent
@@ -374,7 +374,7 @@ def _topic_slug(tokens: "set[str]") -> str:
 # The switch — mirror recover_core's restart-with-env pattern
 # ---------------------------------------------------------------------------
 
-def _resolve_launch_env(model_value: Optional[str]) -> dict:
+def _resolve_launch_env(model_value: Optional[str]) -> dict:  # pragma: no cover
     """Environment for the out-of-process core restart. Prepends the same PATH
     dirs recover_core's _resolve_launch_env does (homebrew, ~/.local/bin, the
     app-bundled runtime) so `start-cli.sh --restart` finds tmux / node / claude
@@ -400,7 +400,7 @@ def _resolve_launch_env(model_value: Optional[str]) -> dict:
     return env
 
 
-def _default_core_restart(model_value: Optional[str]) -> bool:
+def _default_core_restart(model_value: Optional[str]) -> bool:  # pragma: no cover
     """Restart the core via `src/agent/start-cli.sh --restart`, injecting
     SUTANDO_CORE_MODEL=<model_value> (or clearing it when model_value is None).
     start-cli.sh reads that env at launch and passes it as `--model`. Returns
@@ -420,7 +420,7 @@ def _default_core_restart(model_value: Optional[str]) -> bool:
         return False
 
 
-def _default_owner_dm(text: str) -> bool:
+def _default_owner_dm(text: str) -> bool:  # pragma: no cover
     """DM the owner via the SAME Slack sender recover_core uses. health-check.py
     is hyphenated so it can't be a normal import; load it by path (the same
     technique tests/health-check-recover-core.test.py uses) and call its

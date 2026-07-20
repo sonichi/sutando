@@ -34,6 +34,7 @@ Exit code: 0 on pass, 1 on fail.
 from __future__ import annotations
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -417,6 +418,416 @@ def case_p_restart_failure_on_escalate() -> list[str]:
     return fails
 
 
+# ---------------------------------------------------------------------------
+# File-based helper coverage — real temp dirs, no injected fakes. These exercise
+# the default implementations of the collaborators the invariant tests inject.
+# ---------------------------------------------------------------------------
+
+def _write_task(tasks_dir: Path, task_id, body, access_tier="owner", mtime=None):
+    """Write a real task file `<id>.txt` with the bridge header shape."""
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    p = tasks_dir / f"{task_id}.txt"
+    p.write_text(
+        f"id: {task_id}\n"
+        f"access_tier: {access_tier}\n"
+        f"source: discord\n"
+        f"task: {body}\n"
+    )
+    if mtime is not None:
+        os.utime(p, (mtime, mtime))
+    return p
+
+
+def case_q_recent_owner_messages_scan() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        tasks = base / "tasks"
+        processed = tasks / "processed"
+        results = base / "results"
+        results.mkdir(parents=True, exist_ok=True)
+        now = 2_000_000.0
+        # owner, in-window, unresolved
+        _write_task(tasks, "task-1", "login PR still broken", "owner", mtime=now - 100)
+        # owner, in-window, resolved (has a result file)
+        _write_task(tasks, "task-2", "deploy failing", "owner", mtime=now - 50)
+        (results / "task-2.txt").write_text("done")
+        # non-owner — must be filtered out
+        _write_task(tasks, "task-3", "some team ask", "team", mtime=now - 10)
+        # owner but OUTSIDE the window — filtered by mtime cutoff
+        _write_task(tasks, "task-old", "ancient ask", "owner", mtime=now - 99_999)
+        # archived under processed/ — must still be seen
+        _write_task(processed, "task-4", "archived owner ask", "owner", mtime=now - 20)
+        # owner, in-window, but EMPTY task body → skipped (no meaningful text)
+        _write_task(tasks, "task-empty", "", "owner", mtime=now - 5)
+
+        msgs = me._recent_owner_messages(now, 3600, tasks_dir=tasks, results_dir=results)
+        texts = [m["text"] for m in msgs]
+        if "some team ask" in texts:
+            fails.append("q) non-owner task should be filtered out")
+        if "ancient ask" in texts:
+            fails.append("q) out-of-window task should be filtered by mtime cutoff")
+        if "login PR still broken" not in texts:
+            fails.append("q) in-window owner task should be included")
+        if "archived owner ask" not in texts:
+            fails.append("q) tasks/processed/ archived task should be included")
+        # resolved flag
+        by_text = {m["text"]: m for m in msgs}
+        if not by_text.get("deploy failing", {}).get("resolved"):
+            fails.append("q) task with a result file should be resolved=True")
+        if by_text.get("login PR still broken", {}).get("resolved"):
+            fails.append("q) task with no result file should be resolved=False")
+        # newest-first order
+        ts_seq = [m["ts"] for m in msgs]
+        if ts_seq != sorted(ts_seq, reverse=True):
+            fails.append(f"q) messages should be newest-first, got {ts_seq}")
+    return fails
+
+
+def case_r_parse_task_fields_multiline() -> list[str]:
+    fails = []
+    raw = (
+        "id: task-9\n"
+        "access_tier: owner\n"
+        "task: first line of the body\n"
+        "second continuation line\n"
+        "third continuation line\n"
+        "bogus_key: not a known header, part of body\n"
+        "priority: normal\n"
+    )
+    fields = me._parse_task_fields(raw)
+    if fields.get("id") != "task-9":
+        fails.append(f"r) id should parse, got {fields.get('id')}")
+    if fields.get("access_tier") != "owner":
+        fails.append(f"r) access_tier should parse, got {fields.get('access_tier')}")
+    if fields.get("priority") != "normal":
+        fails.append(f"r) known header after body should parse, got {fields.get('priority')}")
+    body = fields.get("task", "")
+    for expect in ("first line of the body", "second continuation line",
+                   "third continuation line", "bogus_key: not a known header"):
+        if expect not in body:
+            fails.append(f"r) multi-line task body should retain {expect!r}, got {body!r}")
+    return fails
+
+
+def case_s_result_exists_shapes() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        results = Path(td)
+        (results / "task-100.txt").write_text("x")   # task- prefixed shape
+        (results / "200.txt").write_text("x")         # bare-id shape
+        if not me._result_exists("task-100", results):
+            fails.append("s) task-<id>.txt should be found")
+        if not me._result_exists("200", results):
+            fails.append("s) bare-id <id>.txt should be found")
+        if not me._result_exists("100", results):  # bare id maps to task-100.txt
+            fails.append("s) bare id should also match task-<id>.txt")
+        if me._result_exists("999", results):
+            fails.append("s) absent id should not be found")
+        if me._result_exists("", results):
+            fails.append("s) empty id should be False")
+    return fails
+
+
+def case_t_detect_stuck_empty_and_no_tokens() -> list[str]:
+    fails = []
+    if me.detect_stuck(1_000_000, messages_fn=lambda: []) is not None:
+        fails.append("t) empty messages should be None")
+    # A candidate that is all stopwords / short tokens → no meaningful tokens.
+    only_stop = [_msg("the it is a", 1_000_000)]
+    if me.detect_stuck(1_000_100, messages_fn=lambda: only_stop) is not None:
+        fails.append("t) candidate with no meaningful tokens should be None")
+    return fails
+
+
+def case_u_detect_resolved_paths() -> list[str]:
+    fails = []
+    esc_at = 1_000_000.0
+    # Explicit cue after escalation → resolved (explicit).
+    expl = [_msg("login 好了 切回来", 1_000_500)]
+    r = me.detect_resolved(1_000_600, "login-redirect", esc_at, messages_fn=lambda: expl)
+    if not r or r.get("reason") != "explicit":
+        fails.append(f"u) explicit cue should resolve, got {r}")
+    # Quiet window: only an on-topic frustration BEFORE the quiet window, now past it.
+    quiet_msgs = [_msg("login redirect 还是不行", esc_at + 10)]
+    r2 = me.detect_resolved(esc_at + 10 + me.RESOLVE_QUIET_SEC + 1, "login-redirect",
+                            esc_at, messages_fn=lambda: quiet_msgs)
+    if not r2 or r2.get("reason") != "quiet":
+        fails.append(f"u) quiet window past frustration should resolve, got {r2}")
+    # Not resolved: a recent on-topic frustration keeps the window open.
+    recent = [_msg("login redirect 还是不行", 1_000_900)]
+    r3 = me.detect_resolved(1_000_950, "login-redirect", esc_at, messages_fn=lambda: recent)
+    if r3 is not None:
+        fails.append(f"u) recent on-topic frustration should NOT resolve, got {r3}")
+    # Empty topic → _on_topic returns True for all; a frustration message inside
+    # the loop keeps the window open, exercising the empty-topic _on_topic branch.
+    empty_topic = [_msg("还是不行 something", esc_at + 5)]
+    r4 = me.detect_resolved(esc_at + 50, "", esc_at, messages_fn=lambda: empty_topic)
+    if r4 is not None:
+        fails.append(f"u) empty topic recent frustration should NOT resolve, got {r4}")
+    # Empty topic, no frustration, past quiet window → resolves quiet.
+    r5 = me.detect_resolved(esc_at + me.RESOLVE_QUIET_SEC + 1, "", esc_at,
+                            messages_fn=lambda: [_msg("calm note", esc_at + 5)])
+    if not r5 or r5.get("reason") != "quiet":
+        fails.append(f"u) empty topic + no frustration should quiet-resolve, got {r5}")
+    # Messages BEFORE escalated_at are skipped in both loops (the `continue`s).
+    pre = [
+        _msg("好了 切回来", esc_at - 100),               # explicit cue but pre-escalation → skipped
+        _msg("login redirect 还是不行", esc_at - 50),     # frustration but pre-escalation → skipped
+    ]
+    r6 = me.detect_resolved(esc_at + me.RESOLVE_QUIET_SEC + 1, "login-redirect",
+                            esc_at, messages_fn=lambda: pre)
+    if not r6 or r6.get("reason") != "quiet":
+        fails.append(f"u) pre-escalation messages should be skipped, quiet resolves, got {r6}")
+    return fails
+
+
+def case_v_read_state() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        missing = Path(td) / "nope.json"
+        if me._read_state(missing) != {}:
+            fails.append("v) missing state file should be {}")
+        bad = Path(td) / "bad.json"
+        bad.write_text("{not valid json")
+        if me._read_state(bad) != {}:
+            fails.append("v) malformed json should be {}")
+        notdict = Path(td) / "list.json"
+        notdict.write_text("[1, 2, 3]")
+        if me._read_state(notdict) != {}:
+            fails.append("v) non-dict json should be {}")
+        good = Path(td) / "good.json"
+        good.write_text(json.dumps({"escalated": True}))
+        if me._read_state(good) != {"escalated": True}:
+            fails.append("v) valid dict should be returned as-is")
+    return fails
+
+
+def case_w_act_unknown_action_and_defaults() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        # Point the module default WORKSPACE_DIR at a temp dir so the None
+        # state_file / None now defaults are exercised without touching the
+        # real workspace or firing a real restart/DM.
+        saved_ws = me.WORKSPACE_DIR
+        me.WORKSPACE_DIR = Path(td)
+        try:
+            calls = {"restart": [], "sent": []}
+            restart = lambda mv: (calls["restart"].append(mv), True)[1]
+            sender = lambda t: (calls["sent"].append(t), True)[1]
+            # Unknown action, default now + state_file → falls through to None.
+            r = me._act(action="noop", state_file=None, now=None,
+                        restart_fn=restart, sender=sender)
+            if r is not None:
+                fails.append(f"w) unknown action should return None, got {r}")
+            if calls["restart"] or calls["sent"]:
+                fails.append("w) unknown action must not restart or DM")
+            # restore when not escalated → not_escalated (default state_file path).
+            r2 = me.restore_prior_model(state_file=None, now=None,
+                                        restart_fn=restart, sender=sender)
+            if not r2 or r2.get("action") != "not_escalated":
+                fails.append(f"w) restore with no state should be not_escalated, got {r2}")
+        finally:
+            me.WORKSPACE_DIR = saved_ws
+    return fails
+
+
+def case_x_restore_restart_failure() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "esc.json"
+        h = Harness(sf)
+        h.escalate(now=1_000_000, env_prior="opus[1m]")
+        h.restart_ok = False
+        h.restart_calls.clear()
+        r = h.restore(now=1_000_500)
+        if not r or r.get("action") != "restart_failed" or r.get("mode") != "restore":
+            fails.append(f"x) failed restore restart should report restart_failed/restore, got {r}")
+        st = json.loads(sf.read_text())
+        if not st.get("escalated"):
+            fails.append("x) failed restore must leave state escalated")
+    return fails
+
+
+def case_y_locked_state_malformed_and_lock() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "esc.json"
+        # Malformed + non-dict existing state → _locked_state falls back to {}.
+        sf.write_text("[not, a, dict")
+        h = Harness(sf)
+        r = h.escalate(now=1_000_000, env_prior="opus[1m]")
+        if not r or r.get("action") != "escalated":
+            fails.append(f"y) escalate over malformed state should still escalate, got {r}")
+
+    # _act 'locked' branch: hold the flock while _act runs (mirrors case o for _act).
+    if me.fcntl is not None:
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            sf = Path(td) / "esc.json"
+            sf.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = sf.with_name(sf.name + ".lock")
+            holder = open(lock_path, "w")
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                h = Harness(sf)
+                r = h.escalate(now=1_000_000, env_prior="opus[1m]")
+                if r != {"action": "locked"}:
+                    fails.append(f"y) escalate under held lock should be 'locked', got {r}")
+            finally:
+                fcntl.flock(holder, fcntl.LOCK_UN)
+                holder.close()
+    return fails
+
+
+def case_z_check_once_defaults_and_stale_ask() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        saved_ws = me.WORKSPACE_DIR
+        me.WORKSPACE_DIR = Path(td)
+        try:
+            sent = []
+            sender = lambda t: (sent.append(t), True)[1]
+            # Seed a stale ask_pending; a pass with no stuck topic should clear it.
+            sf = Path(td) / "state" / "model-escalation.json"
+            sf.parent.mkdir(parents=True, exist_ok=True)
+            sf.write_text(json.dumps({"ask_pending": True, "topic": "old"}))
+            # Default now + state_file (None) → uses time.time() + WORKSPACE_DIR path.
+            r = me.check_once(state_file=None, now=None,
+                              stuck_fn=lambda: None, sender=sender)
+            if r is not None:
+                fails.append(f"z) no-stuck pass should return None, got {r}")
+            st = json.loads(sf.read_text())
+            if st.get("ask_pending"):
+                fails.append("z) stale ask_pending should be cleared when no stuck topic")
+        finally:
+            me.WORKSPACE_DIR = saved_ws
+    return fails
+
+
+def case_ab_defensive_os_and_state_branches() -> list[str]:
+    """Exercise the defensive except-OSError / except-Exception fallbacks so
+    they are real coverage, not pragma'd. Uses real filesystem conditions."""
+    fails = []
+    # --- _recent_owner_messages: unreadable + unstat-able entries -------------
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        tasks = base / "tasks"
+        results = base / "results"
+        tasks.mkdir(parents=True, exist_ok=True)
+        results.mkdir(parents=True, exist_ok=True)
+        now = 3_000_000.0
+        good = _write_task(tasks, "task-ok", "login PR still broken", "owner", mtime=now - 10)
+        # A *.txt that is a DIRECTORY: p.is_file() filters it, but if it slips
+        # through stat/read those raise OSError. Create a dir entry to make the
+        # glob branch see a non-file (is_file() False → skipped, safe).
+        (tasks / "adir.txt").mkdir()
+        # A broken symlink named *.txt → p.is_file() False (skipped), and if
+        # stat() is forced it raises OSError. Covers the is_file gate path.
+        broken = tasks / "broken.txt"
+        try:
+            os.symlink(str(base / "does-not-exist"), str(broken))
+        except (OSError, NotImplementedError):
+            pass
+        msgs = me._recent_owner_messages(now, 3600, tasks_dir=tasks, results_dir=results)
+        if "login PR still broken" not in [m["text"] for m in msgs]:
+            fails.append("ab) good task should survive alongside skipped bad entries")
+
+        # Force the read_text OSError branch: monkeypatch Path.read_text to raise
+        # for our good file, everything else scans normally.
+        orig_read = Path.read_text
+        def _boom_read(self, *a, **k):
+            if self == good:
+                raise OSError("boom")
+            return orig_read(self, *a, **k)
+        Path.read_text = _boom_read
+        try:
+            msgs2 = me._recent_owner_messages(now, 3600, tasks_dir=tasks, results_dir=results)
+        finally:
+            Path.read_text = orig_read
+        if any(m["text"] == "login PR still broken" for m in msgs2):
+            fails.append("ab) unreadable task should be skipped (OSError branch)")
+
+        # Force the stat() OSError branch similarly.
+        orig_stat = Path.stat
+        def _boom_stat(self, *a, **k):
+            if self == good:
+                raise OSError("boom")
+            return orig_stat(self, *a, **k)
+        Path.stat = _boom_stat
+        try:
+            me._recent_owner_messages(now, 3600, tasks_dir=tasks, results_dir=results)
+        finally:
+            Path.stat = orig_stat
+
+    # --- _result_exists: exists() raising OSError ---------------------------
+    with tempfile.TemporaryDirectory() as td:
+        results = Path(td)
+        orig_exists = Path.exists
+        def _boom_exists(self, *a, **k):
+            raise OSError("boom")
+        Path.exists = _boom_exists
+        try:
+            if me._result_exists("task-x", results):
+                fails.append("ab) exists() OSError should be swallowed → False")
+        finally:
+            Path.exists = orig_exists
+
+    # --- _locked_state: non-dict existing state → {} ------------------------
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "esc.json"
+        sf.write_text(json.dumps([1, 2, 3]))  # valid JSON, not a dict
+        h = Harness(sf)
+        r = h.escalate(now=1_000_000, env_prior="opus[1m]")
+        if not r or r.get("action") != "escalated":
+            fails.append(f"ab) non-dict state should reset to {{}} and escalate, got {r}")
+
+    # --- _locked_state: mkdir Exception + save Exception --------------------
+    with tempfile.TemporaryDirectory() as td:
+        # Make the state_file's PARENT a regular file so mkdir(parents=True)
+        # raises (covers the mkdir except) and write_text later fails too.
+        parent_as_file = Path(td) / "blocker"
+        parent_as_file.write_text("i am a file, not a dir")
+        sf = parent_as_file / "esc.json"  # parent is a file → mkdir/ write raise
+        h = Harness(sf)
+        # Should not raise; escalate still runs its logic and the save() silently
+        # no-ops (except-Exception branch), returning the action dict.
+        try:
+            r = h.escalate(now=1_000_000, env_prior="opus[1m]")
+        except Exception as e:
+            r = None
+            fails.append(f"ab) escalate must not raise on unwritable state: {e}")
+        if not r or r.get("action") not in ("escalated", "locked"):
+            fails.append(f"ab) unwritable-state escalate should still return an action, got {r}")
+    return fails
+
+
+def case_aa_main_status_and_check() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        saved_ws = me.WORKSPACE_DIR
+        saved_argv = sys.argv[:]
+        me.WORKSPACE_DIR = Path(td)
+        try:
+            # --status prints the (empty) state as JSON and returns 0.
+            sys.argv = ["model_escalation.py", "--status"]
+            if me.main() != 0:
+                fails.append("aa) main --status should return 0")
+            # --check runs a real detection pass. No tasks/ dir under the temp
+            # workspace → no stuck topic → action none, no restart, no DM.
+            sys.argv = ["model_escalation.py", "--check"]
+            if me.main() != 0:
+                fails.append("aa) main --check should return 0")
+            # No args → prints usage/docstring, returns 0.
+            sys.argv = ["model_escalation.py"]
+            if me.main() != 0:
+                fails.append("aa) main with no args should return 0")
+        finally:
+            sys.argv = saved_argv
+            me.WORKSPACE_DIR = saved_ws
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_stuck_by_repeat_count),
@@ -435,6 +846,18 @@ def main() -> int:
         ("n", case_n_topic_overlap_heuristic),
         ("o", case_o_lock_prevents_concurrent),
         ("p", case_p_restart_failure_on_escalate),
+        ("q", case_q_recent_owner_messages_scan),
+        ("r", case_r_parse_task_fields_multiline),
+        ("s", case_s_result_exists_shapes),
+        ("t", case_t_detect_stuck_empty_and_no_tokens),
+        ("u", case_u_detect_resolved_paths),
+        ("v", case_v_read_state),
+        ("w", case_w_act_unknown_action_and_defaults),
+        ("x", case_x_restore_restart_failure),
+        ("y", case_y_locked_state_malformed_and_lock),
+        ("z", case_z_check_once_defaults_and_stale_ask),
+        ("ab", case_ab_defensive_os_and_state_branches),
+        ("aa", case_aa_main_status_and_check),
     ]
     all_failures = []
     for label, fn in cases:
