@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -11,7 +12,7 @@ import { join } from 'node:path';
 // already honor these via parse_markers(). This test locks in parity for the
 // TypeScript voice surface.
 
-const SRC = readFileSync(join(import.meta.dirname ?? new URL('.', import.meta.url).pathname, '..', 'src', 'task-bridge.ts'), 'utf-8');
+const SRC = readFileSync(join(import.meta.dirname ?? fileURLToPath(new URL('.', import.meta.url)), '..', 'src', 'task-bridge.ts'), 'utf-8');
 
 // Helpers — find a block by its unique anchor text, return the source after it.
 function afterBlock(anchor: string): string {
