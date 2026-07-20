@@ -6,6 +6,7 @@ Subcommands:
   get KEY                 Print the value for KEY
   set KEY                 Store a value for KEY, read from stdin (not argv —
                           keeps the secret out of `ps`/shell history)
+  delete KEY              Remove KEY from the Keychain and the manifest
   env KEY [KEY...] -- CMD Run CMD with vault keys injected as environment variables
 
 Examples:
@@ -24,7 +25,7 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from vault_intercept import get_vault_key, list_vault_keys, set_vault_key
+from vault_intercept import delete_vault_key, get_vault_key, list_vault_keys, set_vault_key
 
 
 def cmd_list() -> None:
@@ -58,6 +59,15 @@ def cmd_set(key: str) -> None:
         print(str(e), file=sys.stderr)
         sys.exit(1)
     print(f"stored '{key}'")
+
+
+def cmd_delete(key: str) -> None:
+    try:
+        delete_vault_key(key)
+    except (ValueError, KeyError) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    print(f"deleted '{key}'")
 
 
 def cmd_env(keys: list[str], cmd: list[str]) -> None:
@@ -103,6 +113,12 @@ def main() -> None:
             sys.exit(1)
         cmd_set(args[1])
 
+    elif sub == "delete":
+        if len(args) < 2:
+            print("vault delete: missing KEY", file=sys.stderr)
+            sys.exit(1)
+        cmd_delete(args[1])
+
     elif sub == "env":
         rest = args[1:]
         try:
@@ -114,7 +130,7 @@ def main() -> None:
 
     else:
         print(f"vault: unknown subcommand '{sub}'", file=sys.stderr)
-        print("Usage: vault.py list | get KEY | set KEY | env KEY... -- CMD", file=sys.stderr)
+        print("Usage: vault.py list | get KEY | set KEY | delete KEY | env KEY... -- CMD", file=sys.stderr)
         sys.exit(1)
 
 
