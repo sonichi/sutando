@@ -1164,12 +1164,37 @@ def check_bodhi_dist() -> dict:
 
     Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
+
+    Scans whichever artifact the voice-agent ACTUALLY loads, because that
+    differs by deployment and the node_modules copy is not always the one
+    running:
+
+      - dev checkout  -> node_modules/bodhi-realtime-agent/dist/index.js
+      - bundled app   -> dist/voice-agent.js, an esbuild bundle with bodhi
+                         inlined and NO node_modules on disk at all
+
+    Checking only the node_modules path made this probe useless in exactly
+    the deployment where it matters: a bundled install has an empty
+    node_modules, so the check warned "run `npm install`" on every tick
+    (noise that reads as benign) while giving ZERO coverage of the running
+    bundle. The 1007 regression this was written to catch would have
+    shipped undetected. The body scan below needs no change — it matches
+    the bundled output as-is.
     """
     check = {"name": "bodhi-dist", "status": "ok", "detail": "Gemini 3.1 wire-format fixes present"}
-    dist = REPO_DIR / "node_modules" / "bodhi-realtime-agent" / "dist" / "index.js"
-    if not dist.exists():
+    # Order matters: node_modules first so a dev checkout reports on the
+    # package it actually resolves, bundle second for bundled installs.
+    candidates = [
+        REPO_DIR / "node_modules" / "bodhi-realtime-agent" / "dist" / "index.js",
+        REPO_DIR / "dist" / "voice-agent.js",
+    ]
+    dist = next((c for c in candidates if c.exists()), None)
+    if dist is None:
         check["status"] = "warn"
-        check["detail"] = "bodhi dist not found — run `npm install`"
+        check["detail"] = (
+            "no bodhi artifact found (checked node_modules and dist/voice-agent.js) — "
+            "run `npm install`, or `npm run build` for a bundled install"
+        )
         return check
     try:
         text = dist.read_text(errors="replace")
@@ -1177,13 +1202,14 @@ def check_bodhi_dist() -> dict:
         check["status"] = "warn"
         check["detail"] = f"dist read failed: {e}"
         return check
+    check["detail"] = f"Gemini 3.1 wire-format fixes present ({dist.name})"
     # Isolate the Gemini transport's sendAudio body. The OpenAI realtime
     # transport also defines sendAudio but uses `audio: base64Data` as a
     # flat string — a naive grep would false-positive.
     idx = text.find("sendAudio(base64Data) {")
     if idx < 0:
         check["status"] = "warn"
-        check["detail"] = "could not locate sendAudio in bodhi dist"
+        check["detail"] = f"could not locate sendAudio in {dist.name}"
         return check
     # Find the first two sendAudio definitions; the Gemini one wraps its
     # arg in `this.session.sendRealtimeInput(...)`.
