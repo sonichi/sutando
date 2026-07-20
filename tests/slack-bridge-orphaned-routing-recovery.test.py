@@ -23,6 +23,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -220,6 +222,117 @@ class TestGatherPendingTaskIds(unittest.TestCase):
         ids = self.mod._gather_pending_task_ids()
         self.assertEqual(set(ids), {"task-300", "task-400"})
         self.assertEqual(self.mod.pending_replies["task-300"], live_entry)
+
+
+class TestResultWatcherEndToEndRestartRecovery(unittest.TestCase):
+    """Behavioral repro for the actual production claim under review: that a
+    result written *after* a mid-flight bridge restart is still delivered to
+    the user. Unlike the unit tests above (which call
+    `_recover_orphaned_task_routing` / `_gather_pending_task_ids` directly),
+    this drives the REAL `result_watcher()` background loop, unmodified, in
+    a daemon thread — the exact function that runs in production — and
+    verifies delivery via a stubbed `chat_postMessage` call.
+
+    A restart is modeled by loading the bridge module a *second* time via
+    `_load_bridge()`: each call does a fresh `importlib` module_from_spec +
+    exec_module, so the second module's globals — including
+    `pending_replies` — start empty, exactly like a new OS process. The
+    task's routing only survives via the durable task-file headers, matching
+    what actually happens on a real restart.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="slack-e2e-restart-test-"))
+        self.results = self.tmp / "results"
+        self.tasks = self.tmp / "tasks"
+        self.results.mkdir(parents=True)
+        self.tasks.mkdir(parents=True)
+        # _send_reply()'s local `import result_audit` would otherwise hit
+        # the real audit log at the real workspace path (resolve_workspace()
+        # ignores SUTANDO_WORKSPACE as of v0.8) — stub it so this test can't
+        # write outside its own temp dir. Saved/restored so other test files
+        # sharing a process see the real module again.
+        self._orig_result_audit = sys.modules.get("result_audit")
+        sys.modules["result_audit"] = types.SimpleNamespace(record=lambda *a, **k: None)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self._orig_result_audit is not None:
+            sys.modules["result_audit"] = self._orig_result_audit
+        else:
+            sys.modules.pop("result_audit", None)
+
+    def _sandbox(self, mod):
+        """Point every dir/file the delivery path touches at this test's
+        temp dir. REPO/RESULTS_DIR/TASKS_DIR/ARCHIVE_*/PRESENTER_SENTINEL
+        are all bound once at module-import time from the real
+        resolve_workspace() (which ignores SUTANDO_WORKSPACE) — rebinding
+        them post-load is required to keep the real result_watcher() loop
+        from touching anything outside self.tmp. _emit_channel is neutered
+        for the same reason (it's an observability sink with its own
+        real-path resolution)."""
+        mod.REPO = self.tmp
+        mod.RESULTS_DIR = self.results
+        mod.TASKS_DIR = self.tasks
+        mod.ARCHIVE_TASKS_DIR = self.tasks / "archive"
+        mod.ARCHIVE_RESULTS_DIR = self.results / "archive"
+        mod.PRESENTER_SENTINEL = self.tmp / "state" / "presenter-mode.sentinel"
+        mod._emit_channel = lambda *a, **k: None
+
+    def test_result_written_after_restart_is_delivered_by_the_real_watcher_loop(self):
+        task_id = "task-e2e-restart-1"
+        _write_task(self.tasks / f"{task_id}.txt", id=task_id, source="slack",
+                    channel_id="D0E2ERESTART", access_tier="owner")
+
+        # --- "Process 1": task enqueued, core still working, no result yet ---
+        proc1 = _load_bridge(self.tmp)
+        self._sandbox(proc1)
+        with proc1.pending_replies_lock:
+            proc1.pending_replies[task_id] = {
+                "channel": "D0E2ERESTART", "thread_ts": None, "access_tier": "owner",
+                "submitted_at": time.time(), "timed_out": False,
+            }
+
+        # --- Restart: brand-new module globals, exactly like a new process ---
+        proc2 = _load_bridge(self.tmp)
+        self._sandbox(proc2)
+
+        # BEFORE: confirms the historical bug's precondition is real on this
+        # fresh "process" — its pending_replies has no memory of the task at
+        # all, which is exactly the state that used to drop the reply forever
+        # once a result eventually landed.
+        self.assertEqual(proc2.pending_replies, {}, "sanity: restart wiped in-memory routing")
+
+        sent: list[dict] = []
+        proc2.app.client.chat_postMessage = lambda **kw: sent.append(kw) or {"ok": True}
+
+        # The result is written only now, AFTER the restart — the case that
+        # was silently dropped before this fix.
+        (self.results / f"{task_id}.txt").write_text("the drafted answer, post-restart")
+
+        # Drive the ACTUAL background loop — result_watcher() itself, not a
+        # hand-rolled substitute — exactly as production runs it.
+        watcher_thread = threading.Thread(target=proc2.result_watcher, daemon=True)
+        watcher_thread.start()
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not sent:
+            time.sleep(0.05)
+
+        # AFTER: the real watcher loop, driven only by durable on-disk state,
+        # delivered the reply despite pending_replies having started empty.
+        self.assertEqual(len(sent), 1, "result_watcher() never delivered the post-restart result")
+        self.assertEqual(sent[0]["channel"], "D0E2ERESTART")
+        self.assertEqual(sent[0]["text"], "the drafted answer, post-restart")
+
+        # Delivered means popped + archived, not left to be re-sent forever.
+        deadline = time.time() + 2
+        while time.time() < deadline and task_id in proc2.pending_replies:
+            time.sleep(0.05)
+        self.assertNotIn(task_id, proc2.pending_replies)
+        self.assertFalse((self.results / f"{task_id}.txt").exists())
+        archived = list((self.results / "archive").rglob(f"{task_id}.txt"))
+        self.assertEqual(len(archived), 1, "delivered result was not archived")
 
 
 if __name__ == "__main__":
