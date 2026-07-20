@@ -183,6 +183,33 @@ class SelfGuardTest(unittest.TestCase):
         leftovers = [p.name for p in hb.CORES_DIR.iterdir() if ".tmp" in p.name]
         self.assertEqual(leftovers, [], f"staging files left behind: {leftovers}")
 
+    def test_lock_contention_returns_holder_pid_in_process(self):
+        # flock conflicts even between two fds of the SAME process, so the
+        # contention branch is coverable in-process: first acquire holds the
+        # lock, second attempt must hit the OSError arm. With a beat on disk
+        # the holder's pid is readable; without one it's the -1 sentinel.
+        self.assertIsNone(hb.try_acquire_ownership())
+        try:
+            # no beat yet → holder unknown
+            self.assertEqual(hb.try_acquire_ownership(), -1)
+            hb.write_beat()
+            # after a beat → holder pid comes from the .alive payload
+            self.assertEqual(hb.try_acquire_ownership(), os.getpid())
+        finally:
+            self._release_lock()
+
+    def test_flock_free_but_live_prebeat_owner_yields(self):
+        # A pre-flock-build beater doesn't hold the lock but IS a live owner:
+        # flock succeeds, the freshness/pid guard still yields — and the lock
+        # must be RELEASED on that path (a second acquire attempt after the
+        # yield must not hit the contention arm).
+        self._write_alive(os.getppid())
+        self.assertEqual(hb.try_acquire_ownership(), os.getppid())
+        self.assertIsNone(hb._LOCK_FD, "yield path must not retain the lock fd")
+        # lock was released → the next acquisition conflict-checks cleanly
+        self._write_alive(os.getppid())
+        self.assertEqual(hb.try_acquire_ownership(), os.getppid())
+
     def test_usurped_writer_exits_instead_of_flapping(self):
         # A different live pid legitimately owns the file → run_forever must
         # exit 0 before writing a single beat (the pre-beat recheck).
