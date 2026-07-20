@@ -12,6 +12,7 @@ on:
       - 'skills/quota-tracker/scripts/credential-proxy.ts'
       - 'scripts/build-bundle.mjs'
       - 'scripts/smoke-bundle.sh'
+      - 'scripts/smoke-startup-gate.sh'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/bundle-smoke.yml'
@@ -23,6 +24,7 @@ on:
       - 'skills/quota-tracker/scripts/credential-proxy.ts'
       - 'scripts/build-bundle.mjs'
       - 'scripts/smoke-bundle.sh'
+      - 'scripts/smoke-startup-gate.sh'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/bundle-smoke.yml'
@@ -40,3 +42,5 @@ jobs:
       - run: npm ci
       - name: bundle smoke (build + load each artifact under plain node)
         run: bash scripts/smoke-bundle.sh
+      - name: startup-gate smoke (G1.5 bundled gate fail-closed both ways, #2205)
+        run: SMOKE_GATE_CASE3=1 bash scripts/smoke-startup-gate.sh
