@@ -9,7 +9,37 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from secret_scanner import scan_secrets, redact_secrets, scan_and_redact
+
+# src/secret_scanner.py imports detect-secrets at module scope, so without the
+# package this file dies with ModuleNotFoundError before a single test runs —
+# an import-time crash that reads like a broken suite rather than a missing
+# dev dependency. detect-secrets is a TEST-only dep (the runtime soft-imports
+# it and degrades gracefully), installed in CI by the "Install Python test
+# deps" step, so a local checkout without it is expected and fine.
+#
+# Skip with an actionable message locally; still FAIL under CI, so a silently
+# broken install step can never be mistaken for a clean run.
+try:
+    from secret_scanner import scan_secrets, redact_secrets, scan_and_redact
+
+    _IMPORT_ERROR = None
+except ModuleNotFoundError as exc:  # pragma: no cover — depends on local env
+    if os.environ.get("CI"):
+        raise
+    _IMPORT_ERROR = exc
+    scan_secrets = redact_secrets = scan_and_redact = None
+
+
+if _IMPORT_ERROR is not None:  # pragma: no cover — depends on local env
+    print(
+        f"SKIP tests/secret-scanner.test.py — {_IMPORT_ERROR}.\n"
+        "      Install the test dep to run this suite:\n"
+        f"          {sys.executable} -m pip install 'detect-secrets>=1.5.0'\n"
+        "      (if that fails with 'externally-managed-environment' (PEP 668),\n"
+        "       retry the same command with --break-system-packages)",
+        file=sys.stderr,
+    )
+    raise SystemExit(0)
 
 
 class TestDetection(unittest.TestCase):
