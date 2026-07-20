@@ -396,6 +396,41 @@ def check_memory_sync() -> dict:
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
 
 
+def check_onboarding_status() -> "dict | None":
+    """Read the desktop checklist's agent surface (onboarding v2 spec,
+    ag2space-cinny-desktop#165 S4).
+
+    The desktop Console mirrors its setup-checklist row states into
+    `<workspace>/state/onboarding-status.json` (written by console_status,
+    write-on-change). This check is the core-side half: surface rows the USER
+    still needs (or that regressed from green) so the proactive loop can run
+    the self-heal ladder and, failing that, tell the owner — instead of the
+    Console being the only place onboarding failures are visible.
+
+    Absent file → None (CLI installs and pre-S1 desktop builds have no
+    checklist; nothing to report). Rows in "todo" → warn with the row names.
+    Read-only; never raises.
+    """
+    name = "onboarding-status"
+    path = WORKSPACE_DIR / "state" / "onboarding-status.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        rows = data.get("rows", {})
+        todo = sorted(k for k, v in rows.items() if isinstance(v, dict) and v.get("state") == "todo")
+        age_s = max(0, int(time.time()) - int(data.get("updated_at", 0)))
+    except (ValueError, OSError, TypeError):
+        return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
+    if todo:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"user-facing setup incomplete: {', '.join(todo)} (as of {age_s}s ago)",
+        }
+    return {"name": name, "status": "ok", "detail": f"all checklist rows satisfied ({age_s}s ago)"}
+
+
 def check_host_subtrees() -> dict:
     """Surface per-host subtrees (hosts/<host>/) that have stopped syncing.
 
@@ -1790,6 +1825,9 @@ def run_all_checks() -> list[dict]:
 
     # Per-host subtree freshness (hosts/<host>/ stopped syncing?)
     checks.append(check_host_subtrees())
+    onboarding_check = check_onboarding_status()
+    if onboarding_check is not None:
+        checks.append(onboarding_check)
 
     # Migration/reader path-contract drift (#1543)
     checks.append(check_migrate_reader_contract())
