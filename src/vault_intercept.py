@@ -224,6 +224,16 @@ def delete_vault_key(key: str) -> None:
         capture_output=True,
     )
     keychain_had_it = result.returncode == 0
+    # Only NOT-FOUND (errSecItemNotFound, rc 44) is tolerable drift. Any other
+    # nonzero result (locked Keychain, user denial, other OSStatus) means the
+    # secret may STILL be in the Keychain — deregistering the manifest then
+    # would hide a live credential from `list`. Fail loudly and leave the
+    # manifest intact so the entry stays findable.
+    if not keychain_had_it and result.returncode != 44:
+        raise RuntimeError(
+            f"vault: Keychain delete failed for '{key}' "
+            f"(rc={result.returncode}): {result.stderr.decode(errors='replace').strip()}"
+        )
     manifest_had_it = key in _read_manifest()
     if not keychain_had_it and not manifest_had_it:
         raise KeyError(f"vault: key '{key}' not found")

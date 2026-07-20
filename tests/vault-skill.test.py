@@ -387,7 +387,7 @@ class TestVaultCliEnv(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
 
 
-class TestVaultCliDelete(unittest.TestCase):
+class TestVaultCliDeleteErrorBranches(unittest.TestCase):
     """Error/exit branches of the delete verb (coverage-gate follow-up,
     john-the-dev peer note 2026-07-20): the happy path is covered above;
     these pin the failure contract — exit 1 + the error on stderr."""
@@ -447,6 +447,20 @@ class TestDeleteVaultKeyErrorBranches(unittest.TestCase):
              patch.object(vault_intercept, "_deregister_key") as mock_dereg:
             vault_intercept.delete_vault_key("DRIFTED")
         mock_dereg.assert_called_once_with("DRIFTED")
+
+    def test_real_security_failure_raises_and_keeps_manifest(self):
+        # P1 regression (Codex 2026-07-20): a NON-not-found `security` failure
+        # (locked Keychain, user denial — rc != 44) while the manifest still
+        # holds the key must RAISE and leave the manifest untouched. Anything
+        # else silently hides a live credential from `list`.
+        with patch.object(vault_intercept.subprocess, "run",
+                          return_value=MagicMock(returncode=51, stderr=b"User interaction is not allowed.")), \
+             patch.object(vault_intercept, "_read_manifest",
+                          return_value={"LOCKED": {"stored_at": "x"}}), \
+             patch.object(vault_intercept, "_deregister_key") as mock_dereg:
+            with self.assertRaises(RuntimeError):
+                vault_intercept.delete_vault_key("LOCKED")
+        mock_dereg.assert_not_called()
 
     def test_deregister_missing_key_is_noop(self):
         # _deregister_key early-returns when the key isn't in the manifest —
