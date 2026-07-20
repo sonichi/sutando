@@ -1,10 +1,11 @@
 // Minimal ESLint baseline for the TypeScript sources.
 //
 // Deliberately narrow: the non-type-checked recommended set only. It catches
-// real defects (unused vars, unreachable code, misused promises' obvious cases)
-// without the whole-project type-graph cost of the type-checked presets, and
-// without a formatter — tsc already covers types, and formatting is out of
-// scope for this baseline.
+// real defects (unused vars, unreachable code, dead branches) without the
+// whole-project type-graph cost of the type-checked presets — which is also
+// what promise-misuse rules (no-misused-promises, no-floating-promises) need,
+// so those are NOT covered here. No formatter either — tsc already covers
+// types, and formatting is out of scope for this baseline.
 //
 // Scope is src/ for now. Widen to skills/ and tests/ once src/ is clean.
 
