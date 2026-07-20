@@ -79,6 +79,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import local_task_protocol  # noqa: E402
@@ -571,6 +572,20 @@ def load_channel_config(channel_id):
     except Exception:
         return None
 
+def _channel_role(channel_id):  # pragma: no cover — bridge I/O glue (reads ACCESS_FILE); trivial dict lookup
+    """Return the configured `role` for a channel (e.g. "bot2bot"), or None.
+
+    Kept separate from load_channel_config (which returns the
+    requireMention/allowFrom pair) so the shared-channel addressee gate can
+    special-case bot2bot channels without widening that function's contract.
+    """
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        cfg = data.get("groups", {}).get(str(channel_id))
+    except Exception:
+        return None
+    return cfg.get("role") if isinstance(cfg, dict) else None
+
 def load_channel_allowed(channel_id):
     """Load channel-specific allowlist. Returns None if channel not configured (open to all)."""
     cfg = load_channel_config(channel_id)
@@ -914,7 +929,7 @@ async def _run_codex_subprocess(prompt, model, timeout_s):
     except Exception:
         return ""
     try:
-        argv = ["codex", "exec", "--sandbox", "read-only", "-o", out_path]
+        argv = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-o", out_path]
         if model:
             argv.extend(["-m", model])
         argv.extend(["--", prompt])
@@ -2503,6 +2518,9 @@ async def _handle_discord_message(message, force=False):
             return
 
         bot_mentioned = client.user in message.mentions
+        # role_mentioned counts as "addressed to us" — assumes these roles are held
+        # only by this bot; a role shared across sibling bots re-introduces the
+        # mass-answer this gate exists to prevent.
         role_mentioned = any(role.name.lower() in ("sutando", "sutando bot") or str(client.user.id) in str(role.id) for role in message.role_mentions)
         # Also check if any role mention exists and the bot has that role
         if not role_mentioned and message.role_mentions and message.guild:
@@ -2637,16 +2655,33 @@ async def _handle_discord_message(message, force=False):
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
             return
 
-        # In shared channels (require_mention=False), if there ARE other bot
-        # @mentions but THIS bot isn't mentioned, skip — let the addressed bot handle it.
-        # Exception: reply context auto-adds the replied-to bot as a mention —
-        # don't skip just because the user replied to another bot's message.
-        if not require_mention and message.mentions and not bot_mentioned:
-            # Filter out the replied-to author (auto-added by Discord reply)
-            reply_author_id = message.reference.resolved.author.id if message.reference and hasattr(message.reference, 'resolved') and message.reference.resolved else None
-            explicit_mentions = [m for m in message.mentions if m.bot and m.id != reply_author_id]
-            if explicit_mentions:
-                print(f"  [skip] message addressed to other bot(s): {[str(m) for m in explicit_mentions]}", flush=True)
+        # Shared-channel addressee gate (require_mention=False, non-bot2bot).
+        # Fixes owner-reported 2026-07-18: replies to OTHER agents and other
+        # agents' own chatter (e.g. a sibling bot's "⏳ working…" status) were
+        # processed as if addressed to us. A message here is for us only if it
+        # @-mentions/role-mentions us or replies to one of OUR messages; other
+        # bots' posts and replies-to-others are skipped. bot2bot channels opt
+        # out (role:"bot2bot") — they intentionally want peer messages. The
+        # decision itself is the pure `is_addressed_in_shared_channel` (unit-
+        # tested); here we only resolve the discord objects into its primitives.
+        # (Supersedes the old reply-target filter, which *excluded* the reply-
+        # target from the addressee check — backwards — letting replies-to-
+        # other-agents through.)
+        if not require_mention and _channel_role(str(message.channel.id)) != "bot2bot":  # pragma: no cover — discord-object resolution glue; decision covered in discord_addressee.py
+            _ref = getattr(message, "reference", None)
+            _ref_resolved = getattr(_ref, "resolved", None) if _ref is not None else None
+            _ref_author = getattr(_ref_resolved, "author", None)
+            if not is_addressed_in_shared_channel(
+                author_is_bot=bool(getattr(message.author, "bot", False)),
+                bot_mentioned=bot_mentioned,
+                role_mentioned=role_mentioned,
+                is_reply=_ref is not None,
+                reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
+                self_id=getattr(client.user, "id", None),
+            ):
+                print(f"  [skip] shared channel: not addressed to me "
+                      f"(author_bot={bool(getattr(message.author, 'bot', False))}, "
+                      f"reply={_ref is not None})", flush=True)
                 return
 
         # Strip role mentions only. User mentions (this bot's and other
@@ -3196,7 +3231,7 @@ async def _handle_discord_message(message, force=False):
             "This task is from a TEAM tier sender. Choose ONE of three actions based on the content:\n\n"
             "1. RUN CODEX — for genuine requests (code review, bug report, technical question, analysis).\n"
             "   Two-stage execution to avoid racing the bridge's results-dir poller:\n"
-            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
+            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
             f"   - Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move; bridge only ever sees a complete file).\n"
             f"   - Stage 2 fallback: if codex exits non-zero OR staging file is empty/missing: write 'Sandbox unavailable; refusing non-owner task.' directly to {RESULTS_DIR}/task-{{id}}.txt.\n"
             "   - The `-o` flag writes ONLY the agent's final message to the file (no exec sub-command dumps, no setup banner). Do NOT redirect stdout — codex's stdout includes verbose exec output from internal tool calls (e.g. github plugin reading PR diffs), which floods Discord. Do NOT add commentary.\n\n"
@@ -3691,6 +3726,8 @@ async def poll_results():
             if result_file.exists():
                 import re
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving

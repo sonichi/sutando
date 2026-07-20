@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
 import { readSelection as defaultReadSelection, type SelectionResult } from './scripts/read-selection.js';
-import { registerVisionOnContributor, callUpdateTools, callRestoreTools, captureSendFrame, getFullToolSurface } from '../../src/vision-tools.js';
+import { registerVisionOnContributor, registerVisionFrameHook, callUpdateTools, callRestoreTools, captureSendFrame, getFullToolSurface } from '../../src/vision-tools.js';
 
 function resolveWorkspace(): string {
 	const env = process.env.SUTANDO_WORKSPACE;
@@ -46,6 +46,32 @@ registerVisionOnContributor(() => {
 		`If the goal doesn't match a configured mode, operate normally with screen awareness.`
 	);
 });
+
+// Push-path selection injection.
+// Probes AX/Chrome selection every SELECTION_PROBE_INTERVAL_TICKS frames
+// (~2.1s at 1.4fps). Only injects when selection changes — avoids flooding
+// Gemini with redundant context turns. Uses the injectable _readSelection so
+// tests can override AX without real osascript calls.
+const SELECTION_PROBE_INTERVAL_TICKS = 3;
+let _selectionTickCount = 0;
+let _lastInjectedSelection = '';
+
+export function _frameHook(sendUserCtx: (text: string) => void): void {
+	_selectionTickCount++;
+	if (_selectionTickCount % SELECTION_PROBE_INTERVAL_TICKS !== 0) return;
+	const sel = _readSelection(200); // 200ms timeout — must not stall the tick
+	if (!sel || sel.text === _lastInjectedSelection) return;
+	_lastInjectedSelection = sel.text;
+	sendUserCtx(`[Selected text: ${sel.text}]`);
+}
+
+/** Reset module-level frame hook state between tests. */
+export function _resetFrameHookState(): void {
+	_selectionTickCount = 0;
+	_lastInjectedSelection = '';
+}
+
+registerVisionFrameHook(_frameHook);
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -203,10 +229,10 @@ const deactivateScreenCompanionTool: ToolDefinition = {
 // Gemini Live session. Designed for pull-mode (configs that don't stream).
 
 // Injection seams for tests — production code uses the imported defaults.
-let _readSelection: () => SelectionResult | null = defaultReadSelection;
+let _readSelection: (timeoutMs?: number) => SelectionResult | null = defaultReadSelection;
 let _captureSendFrame: typeof captureSendFrame = captureSendFrame;
 export function _setVisionQueryDeps(deps: {
-	readSelection?: () => SelectionResult | null;
+	readSelection?: (timeoutMs?: number) => SelectionResult | null;
 	captureSendFrame?: typeof captureSendFrame;
 }): void {
 	if (deps.readSelection) _readSelection = deps.readSelection;

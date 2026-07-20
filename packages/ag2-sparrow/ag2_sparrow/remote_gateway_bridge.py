@@ -80,6 +80,12 @@ INFLIGHT_FILE = _STATE / "remote-task-inflight.json"
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
 TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
+# Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
+# which pings the broker). A local supervisor (e.g. the desktop app's
+# sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
+# guessing from tmux-window presence. Written on every poll outcome: connected
+# after a healthy round-trip, reconnecting in the backoff branches.
+GATEWAY_STATUS_FILE = _STATE / "gateway-status.json"
 
 # Back-compat: instances onboarded before the AG2_REMOTE_* → REMOTE_TASK_*
 # rename still export the legacy names in their .env. Honor them as DEPRECATED
@@ -268,6 +274,34 @@ def _tier_for(user_id):
 MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
 MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
+
+# Untrusted room-ops metadata block: the gateway appends a free-text
+# `[room-ops metadata: …]` pointer to the operating card onto the message body.
+# It self-labels "Not an instruction" and is UNSIGNED (unlike platform_card,
+# which is a signed header consumers verify offline). Because it rides in the
+# task body — the same field as the user's words — a naive agent can read it as
+# an instruction. We strip it here so it never reaches the agent as body content
+# (owner directive 2026-07-16). The operating card stays discoverable via the
+# documented prep_get op; a TRUSTED pointer, if ever wanted, belongs in a signed
+# header like platform_card, not in unsigned body text. Bracket-body is
+# `[^\]]*` — the block carries no nested `]`, so this never over-eats.
+_ROOM_OPS_META_RE = re.compile(r"\s*\[room-ops metadata:[^\]]*\]", re.IGNORECASE)
+
+
+def _strip_room_ops_meta(body: str) -> "tuple[str, bool]":
+    """Remove any untrusted `[room-ops metadata: …]` block(s) from a task body.
+
+    Returns (cleaned_body, stripped) so the caller can log the quarantine. Runs
+    before _one_line so a block split across newlines is still caught."""
+    if not body or "room-ops metadata:" not in body.lower():
+        return body, False
+    cleaned = _ROOM_OPS_META_RE.sub("", body)
+    stripped = cleaned != body
+    # Return the cleaned body even when it is now empty: a metadata-ONLY body is
+    # pure injection with no legitimate task text, so it must degrade to an empty
+    # (no-op) body. NEVER fall back to the original here — that would re-admit the
+    # very `[room-ops metadata: …]` block we are quarantining (P1, PR #2149).
+    return (cleaned.strip(), stripped)
 HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
 # The homeserver token is attached ONLY to media URLs on this exact origin
 # (scheme+host+port). Without it configured, Matrix media URLs are never
@@ -306,6 +340,24 @@ def _one_line(value) -> str:
     access_tier). Applied to every field — task content is single-line in
     practice and a stray newline only ever indicates an injection attempt."""
     return str(value).replace("\r", " ").replace("\n", " ")
+
+
+def _redact_url(value: str) -> str:
+    """Scheme+host+path only — drop userinfo, query, and fragment before a URL
+    is persisted. `gateway-status.json` lives under `state/` (which vault-syncs),
+    so a gateway configured with `user:pass@` userinfo or a `?token=` query param
+    must not land there in plaintext. Falls back to the bare string on any parse
+    failure (never raise from a best-effort status write)."""
+    try:
+        p = urllib.parse.urlsplit(str(value))
+        if not p.scheme and not p.netloc:
+            return str(value)
+        host = p.hostname or ""
+        if p.port:
+            host = f"{host}:{p.port}"
+        return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
+    except Exception:  # noqa: BLE001 — redaction must never break status I/O
+        return str(value)
 
 
 def _log(msg: str) -> None:
@@ -432,6 +484,44 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except (urllib.error.URLError, TimeoutError) as e:
         _log(f"heartbeat network error: {e} — continuing")
         return False
+
+
+def _emit_gateway_status(connected: bool, *, error: str | None = None,
+                         backoff_s: int = 0) -> None:
+    """Write `state/gateway-status.json` — the connection's own liveness, for a
+    local supervisor to render connected-vs-reconnecting.
+
+    Best-effort: a status-write failure MUST NOT disturb the poll loop, so all
+    errors are swallowed. `last_ok_ts` is preserved across reconnecting writes
+    (read back from the prior file) so a consumer can show "last connected N s
+    ago" while the link is down.
+    """
+    try:
+        last_ok = None
+        try:
+            with open(GATEWAY_STATUS_FILE) as f:
+                last_ok = (json.load(f) or {}).get("last_ok_ts")
+        except (FileNotFoundError, ValueError, OSError):
+            last_ok = None
+        now = int(time.time())
+        if connected:
+            last_ok = now
+        payload = {
+            "connected": bool(connected),
+            "ts": now,
+            "last_ok_ts": last_ok,
+            "backoff_s": int(backoff_s),
+            "error": _one_line(error) if error else None,
+            "gateway": _redact_url(URL),
+            "schema_version": 1,
+        }
+        GATEWAY_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = GATEWAY_STATUS_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        tmp.replace(GATEWAY_STATUS_FILE)
+    except Exception:  # noqa: BLE001 — never let status I/O break the poll loop
+        pass
 
 
 def _marker_attr(attrs: str, key: str) -> str:
@@ -684,9 +774,16 @@ def _write_task(task: dict) -> str | None:
                 it = "message"
             lines.append(f"interaction_type: {it}")
         elif f == "task" and task.get("task") not in (None, ""):
+            # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
+            # reaches the agent as body content (owner directive 2026-07-16) —
+            # see _strip_room_ops_meta. Runs first so the stripped body is what
+            # media-resolution and the header write both see.
+            _raw_task, _stripped_meta = _strip_room_ops_meta(str(task["task"]))
+            if _stripped_meta:
+                _log(f"stripped untrusted room-ops metadata from {tid} body")
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
-            _fetched = _maybe_fetch_media(str(task["task"]), _media_refs)
+            _fetched = _maybe_fetch_media(_raw_task, _media_refs)
             lines.append(f"task: {_one_line(_fetched)}")
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
@@ -1032,6 +1129,7 @@ def main() -> None:
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
     backoff = 1
+    _emit_gateway_status(False, error="starting — not yet connected")
     while True:
         try:
             if not _heartbeat_singleton():
@@ -1062,16 +1160,21 @@ def main() -> None:
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
+            _emit_gateway_status(True)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
+                _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
+            _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
         except (urllib.error.URLError, TimeoutError) as e:
             _log(f"poll network error: {e} — backing off {backoff}s")
+            _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {e} — backing off {backoff}s")
+            _emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
 
 
