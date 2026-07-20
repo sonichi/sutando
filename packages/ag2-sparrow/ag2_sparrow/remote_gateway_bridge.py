@@ -47,6 +47,7 @@ import json
 import os
 import re
 import signal
+import socket
 import sys
 import tempfile
 import time
@@ -54,6 +55,30 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+# Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
+# publishes AAAA records, but some hosts have IPv6 black-holed at the network
+# (the SYN is silently dropped, not refused). Python's getaddrinfo returns v6
+# first, so each fresh urllib connection — this bridge opens one per long-poll
+# AND one per outbound send, with no keep-alive — hangs on the dead v6 address
+# for the full TCP connect timeout (~26s observed) before falling back to v4,
+# which connects in <1s. That timeout is added to EVERY inbound message and
+# EVERY reply, so the owner sees ~26s each way and messages look dropped. We
+# filter getaddrinfo to A (v4) records for the gateway host so the dead v6 path
+# is never tried; we keep the original result when there is no v4 address, so a
+# genuinely v6-only destination still resolves. Opt out with
+# REMOTE_GATEWAY_ALLOW_IPV6=1 (hosts with working v6 lose nothing either way).
+if os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1":
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _getaddrinfo_prefer_v4(host, *args, **kwargs):
+        infos = _orig_getaddrinfo(host, *args, **kwargs)
+        if host and "ag2.space" in str(host):
+            v4 = [i for i in infos if i[0] == socket.AF_INET]
+            return v4 or infos
+        return infos
+
+    socket.getaddrinfo = _getaddrinfo_prefer_v4
 
 # resolve_workspace lives alongside this file in src/ — put THIS directory on
 # the path (no repo-walking; the old triple-parent form predated the move into
