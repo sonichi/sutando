@@ -106,24 +106,46 @@ def _resolved_vault() -> dict:
     (`sutando_config.resolve_vault`) — the SINGLE source of truth for
     `vault.enabled` and `vault.remote_url`.
 
-    Augments the resolver's dict with `_explicit_disable`: True only when the
-    config file actually carries `vault.enabled=false` (a deliberate opt-out),
-    as opposed to the resolver's default-False for a host with no vault block
-    at all. This lets check_memory_sync distinguish "opted out on purpose" from
+    Augments the resolver's dict with `_explicit_disable`: True only when THIS
+    HOST actually authored `vault.enabled=false` (a deliberate opt-out), as
+    opposed to the resolver's default-False for a host with no vault block at
+    all. This lets check_memory_sync distinguish "opted out on purpose" from
     "never configured" without re-reading config.
+
+    That signal MUST come from the per-clone override file alone. It cannot come
+    from `load_config()`, which deep-merges the repo-shipped `sutando.config.json`
+    — and that file ships `vault.enabled: false` to every clone, so a merged read
+    reports *every* unconfigured host as a deliberate opt-out and leaves
+    check_memory_sync's "not configured" branch unreachable (#2231).
 
     Best-effort: on any error (resolver import failure, malformed config) return
     safe defaults ({"enabled": False, "remote_url": ""}) so a config-helper
     hiccup never masks a real check. Mirrors resolve_vault's own defaults.
     """
     try:
-        from sutando_config import resolve_vault, load_config  # noqa: PLC0415
+        from sutando_config import resolve_vault  # noqa: PLC0415
         vault = dict(resolve_vault(repo_root=REPO_DIR))
-        raw_vault = load_config(repo_root=REPO_DIR).get("vault") or {}
-        vault["_explicit_disable"] = raw_vault.get("enabled") is False
+        vault["_explicit_disable"] = _local_vault_enabled_is_false()
         return vault
     except Exception:
         return {"enabled": False, "remote_url": "", "_explicit_disable": False}
+
+
+def _local_vault_enabled_is_false() -> bool:
+    """True only if `sutando.config.local.json` itself sets vault.enabled=false.
+
+    Reads the per-clone override directly — no defaults merge — so the repo's
+    shipped `vault.enabled: false` can never masquerade as a host's choice.
+    A missing or malformed override file means "this host chose nothing".
+    """
+    local_path = REPO_DIR / "sutando.config.local.json"
+    if not local_path.is_file():
+        return False
+    try:
+        local_cfg = json.loads(local_path.read_text()) or {}
+    except (OSError, ValueError):
+        return False
+    return (local_cfg.get("vault") or {}).get("enabled") is False
 
 
 # ---------------------------------------------------------------------------
