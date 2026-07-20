@@ -172,9 +172,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         }
         if channel_id:
             payload["channel_id"] = str(channel_id)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Per-PID staging name: this file is written by four processes (this
+        # bridge + discord/telegram/sparrow). A shared ".json.tmp" name lets two
+        # concurrent writers truncate and interleave the same temp file, so the
+        # rename can publish torn JSON. A per-PID temp is never shared, and
+        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
 
