@@ -3337,6 +3337,24 @@ async def _handle_discord_message(message, force=False):
         if getattr(message, "reference", None) and message.reference.message_id
         else ""
     )
+    # Also emit the replied-to author as a STRUCTURED header, not just the
+    # opaque parent_message_id. In a multi-bot channel a consumer must be able
+    # to tell WHO the sender was addressing (e.g. a reply aimed at another bot)
+    # without parsing the lossy `[Replying to ...]` body snippet. parent_message_id
+    # alone is an unresolvable id; reply_to_author makes the addressee legible so
+    # the receiving bot can gate on it. (Chi 2026-07-20: "the task file content
+    # needs to be right" — a reply to sutando#9708 reached Pro with no legible
+    # addressee, so Pro acted as if addressed.)
+    _reply_author = (
+        getattr(getattr(message.reference, "resolved", None), "author", None)
+        if getattr(message, "reference", None) else None
+    )
+    if _reply_author is not None:
+        _ra_name = str(_reply_author).replace("\n", " ")
+        parent_msg_line += (
+            f"reply_to_author: {_ra_name}\n"
+            f"reply_to_author_id: {_reply_author.id}\n"
+        )
     # Inject skill instructions for owner tasks so the agent follows the
     # notify-before-work and transcription protocol after compaction.
     # Only injected when the referenced skills are installed on this node.
