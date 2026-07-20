@@ -939,6 +939,65 @@ def _record_skip_audit(task_id: str, skip_value: str) -> None:
         pass
 
 
+def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_task_ids: set) -> dict:
+    """Rebuild pending_replies entries for Slack tasks whose result file
+    exists but whose in-memory routing was lost — e.g. this process
+    restarted mid-task (a result written by the OLD process's `pending_replies`
+    entry has no counterpart in the NEW process's empty dict, so it sits in
+    results/ forever, un-delivered and silently orphaned). channel_id (and
+    thread_ts, once written) are durable — they're in the task file's own
+    headers from creation time — even though pending_replies is memory-only.
+
+    Only claims tasks THIS bridge actually wrote (source: slack), so a
+    crashed discord/telegram bridge's own stranded results are left alone
+    for them to recover, not silently swallowed here.
+    """
+    recovered = {}
+    for result_file in results_dir.glob("task-*.txt"):
+        task_id = result_file.stem
+        if task_id in known_task_ids:
+            continue
+        task_file = find_task_file(tasks_dir, task_id)
+        if not task_file:
+            continue
+        try:
+            text = task_file.read_text()
+        except OSError:
+            continue
+        headers = local_task_protocol.parse_task_headers(text).headers
+        if headers.get("source") != "slack":
+            continue
+        channel = headers.get("channel_id")
+        if not channel:
+            continue
+        recovered[task_id] = {
+            "channel": channel,
+            "thread_ts": headers.get("thread_ts") or None,
+            "access_tier": headers.get("access_tier", "unknown"),
+            "submitted_at": time.time(),
+            "timed_out": False,
+        }
+    return recovered
+
+
+def _gather_pending_task_ids() -> list:
+    """Snapshot pending_replies' keys, folding in any orphaned-by-restart
+    routing recovered from disk, and return the full task_id list for this
+    poll. Recovered entries are merged into pending_replies via setdefault —
+    if the id reappeared through normal means in the meantime, that entry
+    wins."""
+    with pending_replies_lock:
+        pending_ids = list(pending_replies.keys())
+    recovered = _recover_orphaned_task_routing(RESULTS_DIR, TASKS_DIR, set(pending_ids))
+    if not recovered:
+        return pending_ids
+    with pending_replies_lock:
+        for tid, entry in recovered.items():
+            pending_replies.setdefault(tid, entry)
+            print(f"  [recovered] {tid} routing from task file (was orphaned after a restart)", flush=True)
+    return list(set(pending_ids) | recovered.keys())
+
+
 def _check_task_timeouts() -> None:
     """Post a one-time reply for tasks the core never answered in time.
 
@@ -1001,9 +1060,10 @@ def result_watcher():
             # Surface tasks the core never answered (timeout → visible reply).
             _check_task_timeouts()
 
-            # Replies to pending tasks
-            with pending_replies_lock:
-                pending_ids = list(pending_replies.keys())
+            # Replies to pending tasks (includes any orphaned-by-restart
+            # routing recovered from the task files themselves).
+            pending_ids = _gather_pending_task_ids()
+
             for task_id in pending_ids:
                 result_file = RESULTS_DIR / f"{task_id}.txt"
                 if not result_file.exists():
