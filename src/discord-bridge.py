@@ -2403,6 +2403,29 @@ def _write_task_file(task_file: Path, content, username: str,
     return True
 
 
+def _reply_author_header(message) -> str:
+    """Structured ``reply_to_author`` / ``reply_to_author_id`` task-file lines.
+
+    When ``message`` is a Discord reply whose parent author is resolved, return
+    the two metadata lines so a consumer can tell WHO the sender was addressing
+    (e.g. a reply aimed at another bot) without parsing the lossy ``[Replying to
+    ...]`` body snippet. Returns ``""`` when there is no reference, no resolved
+    parent, or no author. The author's ``str()`` is newline-sanitized so a name
+    containing ``\\n`` can't inject a spurious metadata line into the k:v shape.
+    """
+    reply_author = (
+        getattr(getattr(message.reference, "resolved", None), "author", None)
+        if getattr(message, "reference", None) else None
+    )
+    if reply_author is None:
+        return ""
+    ra_name = str(reply_author).replace("\n", " ")
+    return (
+        f"reply_to_author: {ra_name}\n"
+        f"reply_to_author_id: {reply_author.id}\n"
+    )
+
+
 def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     """True iff `sender_id` is listed under the SERVING channel's `collaborators`
     array in access.json.
@@ -3345,16 +3368,7 @@ async def _handle_discord_message(message, force=False):
     # the receiving bot can gate on it. (Chi 2026-07-20: "the task file content
     # needs to be right" — a reply to sutando#9708 reached Pro with no legible
     # addressee, so Pro acted as if addressed.)
-    _reply_author = (
-        getattr(getattr(message.reference, "resolved", None), "author", None)
-        if getattr(message, "reference", None) else None
-    )
-    if _reply_author is not None:
-        _ra_name = str(_reply_author).replace("\n", " ")
-        parent_msg_line += (
-            f"reply_to_author: {_ra_name}\n"
-            f"reply_to_author_id: {_reply_author.id}\n"
-        )
+    parent_msg_line += _reply_author_header(message)
     # Inject skill instructions for owner tasks so the agent follows the
     # notify-before-work and transcription protocol after compaction.
     # Only injected when the referenced skills are installed on this node.
