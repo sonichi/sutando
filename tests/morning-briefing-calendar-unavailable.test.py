@@ -56,6 +56,10 @@ def _open_ok() -> subprocess.CompletedProcess:
 class TestCalendarRetry(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
+        # Force the AppleScript path deterministically: point the Google-calendar
+        # cache at a nonexistent file so get_calendar_events() never short-circuits
+        # on a real workspace state/calendar-today.json left by the agent.
+        self.mod.CALENDAR_CACHE_FILE = Path("/nonexistent/calendar-today.json")
 
     def test_error_then_retry_succeeds(self):
         """First osascript fails (-600) → Calendar launched → retry returns events."""
