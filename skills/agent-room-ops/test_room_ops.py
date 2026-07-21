@@ -443,5 +443,20 @@ class ContentLengthTests(EnvCase):
         self.assertIn("exceeds", res["reason"])
 
 
+class NormalizeReactionsTests(unittest.TestCase):
+    """_normalize must carry the gateway's per-message `reactions` annotation —
+    it's the ONLY surface for the 👀 delivery-ack (reactions never arrive as tasks).
+    Regression: the field was silently dropped, so a worker saw zero reactions."""
+
+    def test_reactions_preserved(self):
+        out = rd._normalize([{"event_id": "$e", "sender": "@a:hs", "body": "hi",
+                              "reactions": [{"key": "\U0001F440", "sender": "@b:hs"}]}])
+        self.assertEqual(out[0]["reactions"], [{"key": "\U0001F440", "sender": "@b:hs"}])
+
+    def test_reactions_default_empty_list(self):
+        out = rd._normalize([{"event_id": "$e", "sender": "@a:hs", "body": "hi"}])
+        self.assertEqual(out[0]["reactions"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
