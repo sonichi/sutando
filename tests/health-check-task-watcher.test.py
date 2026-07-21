@@ -18,6 +18,8 @@ Covers:
   e) core alive, PID alive and argv names the watcher → ok
   f) core alive, sentinel unparseable → warn (not a crash)
   g) the check is registered in run_checks' output
+  h) _proc_argv against real PIDs (live + nonexistent) — the OS-facing half
+  i) _proc_argv swallows a probe failure rather than failing the health check
 
 Run: python3 tests/health-check-task-watcher.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -25,6 +27,7 @@ Exit code: 0 on pass, 1 on fail.
 
 from __future__ import annotations
 import importlib.util
+import os
 import sys
 import tempfile
 import time
@@ -134,6 +137,40 @@ def case_g_registered_in_run_checks() -> list[str]:
     return []
 
 
+def case_h_proc_argv_reads_a_real_process() -> list[str]:
+    """Exercise the real probe, not the stub the cases above patch in.
+
+    This is the half that talks to the OS, so it needs to run against actual
+    PIDs or nothing verifies that `ps -p <pid> -o args=` returns what the
+    caller expects.
+    """
+    fails = []
+    mine = hc._proc_argv(os.getpid())
+    if not mine:
+        fails.append("h) _proc_argv(os.getpid()) returned empty for a live process")
+    elif "python" not in mine.lower():
+        fails.append(f"h) argv for this process should name the interpreter, got {mine[:60]!r}")
+    # A PID that cannot be running: above the platform maximum.
+    gone = hc._proc_argv(4_000_000)
+    if gone != "":
+        fails.append(f"h) a nonexistent PID should give '', got {gone[:40]!r}")
+    return fails
+
+
+def case_i_proc_argv_swallows_probe_failure() -> list[str]:
+    """A broken/absent `ps` must not take the health check down with it —
+    the probe degrades to 'no argv', which the caller reads as 'not running'."""
+    orig = hc.subprocess.run
+    try:
+        hc.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("ps missing"))
+        got = hc._proc_argv(1)
+    finally:
+        hc.subprocess.run = orig
+    if got != "":
+        return [f"i) a raising probe should return '', got {got!r}"]
+    return []
+
+
 def main() -> int:
     cases = [
         ("a", case_a_no_core_is_ok),
@@ -143,6 +180,8 @@ def main() -> int:
         ("e", case_e_live_watcher_is_ok),
         ("f", case_f_unparseable_sentinel_warns),
         ("g", case_g_registered_in_run_checks),
+        ("h", case_h_proc_argv_reads_a_real_process),
+        ("i", case_i_proc_argv_swallows_probe_failure),
     ]
     all_failures = []
     for label, fn in cases:
