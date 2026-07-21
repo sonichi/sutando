@@ -80,6 +80,26 @@ def main():
         "proactive-daily-top-ai-news-1784725200.txt",
     )
 
+    # Content-keyed producers intentionally reuse a filename on a slower
+    # cadence (pending questions re-notify hourly). The short race receipt must
+    # expire so those later deliveries are not suppressed forever.
+    content_keyed = "proactive-pending-q-deadbeef.txt"
+    module.mark_delivered(state, content_keyed)
+    content_receipt = module._receipt_path(state, content_keyed)
+    expired = time.time() - module.RECEIPT_TTL_SECONDS - 1
+    os.utime(content_receipt, (expired, expired))
+    assert not module.was_delivered(state, content_keyed)
+    assert not content_receipt.exists()
+
+    # Marking a new delivery also prunes unrelated expired receipts, bounding
+    # the sentinel directory instead of accumulating one file per ID forever.
+    stale_id = "proactive-old-slot.txt"
+    module.mark_delivered(state, stale_id)
+    stale_receipt = module._receipt_path(state, stale_id)
+    os.utime(stale_receipt, (expired, expired))
+    module.mark_delivered(state, "proactive-current-slot.txt")
+    assert not stale_receipt.exists()
+
     # Receipt paths are hashes, so a malformed filename cannot escape state/.
     hostile = "../../outside.txt"
     module.mark_delivered(state, hostile)
@@ -118,7 +138,7 @@ def main():
     mark_pos = bridge.index("mark_proactive_delivered(STATE_DIR, delivery_id)", send_pos)
     assert check_pos < claim_pos < send_pos < mark_pos
 
-    print("PASS: recreated Slack proactive delivery IDs are suppressed durably")
+    print("PASS: recreated Slack proactive delivery IDs are suppressed within the race window")
 
 
 if __name__ == "__main__":
