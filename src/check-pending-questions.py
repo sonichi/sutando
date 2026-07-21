@@ -148,11 +148,13 @@ def should_notify():
 
 
 def notify_macos(count, titles):
+    """Returns True only if osascript actually accepted the notification."""
     msg = f"{count} pending question{'s' if count > 1 else ''}: {', '.join(titles[:3])}"
-    subprocess.run([
+    r = subprocess.run([
         "osascript", "-e",
         f'display notification "{msg}" with title "Sutando"'
     ], capture_output=True)
+    return r.returncode == 0
 
 
 def questions_key(questions):
@@ -195,6 +197,31 @@ def notify_discord_dm(questions):
     path.write_text("\n".join(lines))
 
 
+# A proactive-*.txt is only a DELIVERY if some bridge drains it. On a host where
+# none is running the file just accumulates, while this script still printed
+# "Notified" -- claiming an outcome it never achieved. Rather than sniff for
+# consumer processes (pgrep -f self-matches; see the watcher notes), use the
+# evidence already on disk: files we wrote earlier that nobody took.
+UNDRAINED_AGE_S = 600
+
+
+def undrained_proactive_files():
+    """Previously-written proactive-*.txt older than UNDRAINED_AGE_S -- i.e. old
+    enough that a live consumer would have drained them."""
+    now = time.time()
+    out = []
+    try:
+        for f in RESULTS_DIR.glob("proactive-*.txt"):
+            try:
+                if now - f.stat().st_mtime > UNDRAINED_AGE_S:
+                    out.append(f.name)
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return sorted(out)
+
+
 def main():
     force = "--force" in sys.argv
     questions = get_waiting_questions()
@@ -213,13 +240,16 @@ def main():
     titles = [q["title"] for q in questions]
 
     # macOS notification
-    notify_macos(count, titles)
+    stale_before = undrained_proactive_files()
+    macos_ok = notify_macos(count, titles)
 
     # Voice result — only when voice is actually connected. When offline, the
     # discord-bridge dm-fallback would deliver question-*.txt as a duplicate
     # of notify_discord_dm below. Skipping cuts the spam in half.
+    voice_ok = False
     if voice_client_connected():
         notify_voice(questions)
+        voice_ok = True
 
     # Discord DM to owner (via discord-bridge poll_proactive)
     notify_discord_dm(questions)
@@ -227,7 +257,21 @@ def main():
     # Update last notify time
     LAST_NOTIFY_FILE.write_text(str(int(time.time())))
 
-    print(f"Notified: {count} pending questions")
+    paths = []
+    paths.append("macos=ok" if macos_ok else "macos=FAILED")
+    paths.append("voice=ok" if voice_ok else "voice=skipped(not connected)")
+    if stale_before:
+        paths.append(f"proactive-file=written but {len(stale_before)} earlier one(s) UNDRAINED")
+    else:
+        paths.append("proactive-file=written")
+    print(f"Notified: {count} pending questions [{', '.join(paths)}]")
+    if stale_before:
+        print(
+            "  WARNING: no consumer is draining results/proactive-*.txt on this host "
+            f"(oldest undrained: {stale_before[0]}). The DM path is NOT reaching the owner; "
+            "only the macOS notification is real here.",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
