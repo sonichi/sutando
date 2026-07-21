@@ -474,8 +474,27 @@ def _download_slack_file(file_dict: dict) -> str | None:
         req = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {BOT_TOKEN}"}
         )
-        with urllib.request.urlopen(req, timeout=30) as resp, open(local_path, "wb") as f:
-            f.write(resp.read())
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+            # When the bot token lacks the files:read scope (or the file is
+            # otherwise unauthorized), Slack does NOT error — it 200s with an
+            # HTML sign-in page. Persisting that page as e.g. a ".m4a" silently
+            # corrupts the attachment: downstream transcription/parsing then
+            # chokes on a login page. Detect it and fail cleanly instead so the
+            # caller surfaces "no attachment" rather than feeding garbage on.
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            looks_html = ctype.startswith("text/html") or data[:64].lstrip()[:14].lower() == b"<!doctype html"
+            if looks_html:
+                print(
+                    f"  [file] download for {name_hint} returned an HTML page, "
+                    f"not the file — the Slack bot token is almost certainly "
+                    f"missing the 'files:read' scope (add it at api.slack.com/apps "
+                    f"→ OAuth & Permissions → Bot Token Scopes, then Reinstall).",
+                    flush=True,
+                )
+                return None
+        with open(local_path, "wb") as f:
+            f.write(data)
         return str(local_path)
     except Exception as e:
         print(f"  [file] download failed for {name_hint}: {e}", flush=True)
