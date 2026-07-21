@@ -541,10 +541,13 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "schema_version": 1,
         }
         GATEWAY_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = GATEWAY_STATUS_FILE.with_suffix(".json.tmp")
+        # Per-PID staging (sonichi/sutando#2222 follow-up): single-writer today,
+        # but a shared temp name collides if a second sparrow instance ever runs;
+        # a per-PID temp is collision-proof for the cost of one getpid().
+        tmp = GATEWAY_STATUS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
         with open(tmp, "w") as f:
             json.dump(payload, f)
-        tmp.replace(GATEWAY_STATUS_FILE)
+        os.replace(tmp, GATEWAY_STATUS_FILE)
     except Exception:  # noqa: BLE001 — never let status I/O break the poll loop
         pass
 
@@ -739,9 +742,15 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         _cid = str(task.get("channel_id") or "").strip()
         if _cid:
             payload["channel_id"] = _cid
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Per-PID staging: last-owner-activity.json is written by FOUR processes
+        # (this sparrow bridge + slack/discord/telegram). A shared ".json.tmp"
+        # name lets two concurrent writers truncate and interleave the same temp
+        # file, so the rename can publish torn JSON to the proactive loop's
+        # presence check. A per-PID temp is never shared; os.replace is an atomic
+        # overwrite — last writer wins, cleanly. (sonichi/sutando#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:  # noqa: BLE001
         _log(f"owner-activity write failed: {e}")
 
@@ -874,9 +883,11 @@ def _save_task_rooms(rooms: dict[str, str]) -> None:
     """Atomically persist the task→room map. Best-effort (never blocks the loop)."""
     try:
         TASK_ROOMS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = TASK_ROOMS_FILE.with_suffix(".json.tmp")
+        # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
+        # second sparrow instance ever runs. os.replace is atomic overwrite.
+        tmp = TASK_ROOMS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(rooms, sort_keys=True))
-        tmp.rename(TASK_ROOMS_FILE)
+        os.replace(tmp, TASK_ROOMS_FILE)
     except Exception as e:  # noqa: BLE001
         _log(f"task-rooms persist failed ({e}) — continuing")
 
@@ -965,9 +976,11 @@ def _save_inflight(inflight: set[str]) -> None:
     """Atomically persist the in-flight set. Best-effort (never blocks the loop)."""
     try:
         INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = INFLIGHT_FILE.with_suffix(".json.tmp")
+        # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
+        # second sparrow instance ever runs. os.replace is atomic overwrite.
+        tmp = INFLIGHT_FILE.with_suffix(f".json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(sorted(inflight)))
-        tmp.rename(INFLIGHT_FILE)
+        os.replace(tmp, INFLIGHT_FILE)
     except Exception as e:  # noqa: BLE001
         _log(f"inflight persist failed ({e}) — continuing")
 
