@@ -559,6 +559,29 @@ def load_policy():
     except Exception:
         return "pairing"
 
+
+def read_access_for_seed(path):
+    """Read access.json for a path that is about to WRITE it back (pairing seed).
+
+    Returns:
+      - the parsed dict when the file is present and valid;
+      - a fresh default dict when the file is genuinely ABSENT (first-run
+        onboarding — seeding a default is correct);
+      - None when the file EXISTS but is unreadable/corrupt — the caller MUST
+        NOT overwrite it. Writing an empty-allowFrom default over a
+        present-but-unparseable access.json turns a transient read glitch into
+        a PERMANENT config wipe: the owner is dropped from allowFrom, so every
+        sender gets a pairing prompt and codes leak into channels. Observed
+        2026-07-21 (the owner was silently de-authorized mid-session). The safe
+        move on corruption is to leave the file untouched and bail.
+    """
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
+    except Exception:
+        return None
+
 def load_channel_config(channel_id):
     """Load channel config. Returns (requireMention, allowFrom set) or None if not configured."""
     try:
@@ -2780,10 +2803,20 @@ async def _handle_discord_message(message, force=False):
     if policy == "pairing" and sender_id not in allowed and not channel_authorized:
         # Generate pairing code — user must approve via /discord:access pair <code>
         import random, string
-        try:
-            access = json.loads(ACCESS_FILE.read_text())
-        except Exception:
-            access = {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
+        access = read_access_for_seed(ACCESS_FILE)
+        if access is None:
+            # access.json EXISTS but is corrupt/unreadable. Do NOT overwrite it
+            # with an empty-allowFrom default — that permanently wipes the real
+            # config (owner dropped from allowFrom → pairing prompts + code leak
+            # to channels; observed 2026-07-21). Bail loudly; leave the file for
+            # the operator to restore from channels/discord/access.json.bak-*.
+            print(
+                f"  [pairing] access.json present but unreadable — NOT overwriting "
+                f"(would wipe allowFrom). Skipping pairing for @{username} ({sender_id}). "
+                f"Restore from a channels/discord/access.json.bak-* backup.",
+                flush=True,
+            )
+            return
         code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         pending = access.get("pending", {})
         # Clean expired codes
