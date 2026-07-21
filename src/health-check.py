@@ -1722,6 +1722,70 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
 
+def _proc_argv(pid: int) -> str:
+    """argv of `pid`, or "" if no such process.
+
+    Deliberately `ps -p <pid>`, NOT `pgrep -f watch-tasks-stream`: pgrep's
+    `-f` matches the search string against full argv, and the calling shell's
+    own argv contains that string — a transient self-match that returns a PID
+    already gone by the next `ps` (the anti-pattern documented in
+    /schedule-crons step 5 and /proactive-loop step 9). Inspecting one known
+    PID cannot self-match.
+    """
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001 — a probe failure must not fail the check
+        return ""
+
+
+def check_task_watcher() -> dict:
+    """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
+
+    The two consequence checks above cannot see a dead watcher on their own:
+    `check_task_queue` needs BOTH >3 tasks AND >300s age, so a watcher that
+    dies against an empty (or small) queue reads green, and a single stranded
+    owner DM never trips the count threshold at all; `check_core_proactive_loop`
+    reads core-status.json, which the proactive loop writes every pass — it is
+    freshest exactly when the loop is alive and the watcher is not. Observed
+    2026-07-21: watcher dead, queue empty, health-check reported 0 failures.
+
+    So this is the direct signal to pair with them, read from the PID sentinel
+    the watcher maintains itself (written at startup, removed by its cleanup
+    trap on clean exit) — present-but-dead therefore means "crashed", absent
+    means "not running".
+
+    Gated on `_any_core_alive()`: with no core running, no watcher is expected
+    and warning here would latch on permanently for anyone not currently
+    running Sutando — a check that is always red carries the same information
+    as one that is always green.
+    """
+    name = "task-watcher"
+    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    if not _any_core_alive():
+        return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
+    if not pid_file.exists():
+        return {"name": name, "status": "warn",
+                "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
+                          "restart via Monitor: bash src/watch-tasks-stream.sh"}
+    try:
+        pid = int(pid_file.read_text().strip())
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "status": "warn",
+                "detail": f"unreadable PID sentinel ({str(e)[:40]}) — restart the watcher"}
+    argv = _proc_argv(pid)
+    if not argv:
+        return {"name": name, "status": "warn",
+                "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
+    if "watch-tasks-stream" not in argv:
+        # PID reuse: the sentinel outlived the watcher and the OS handed the
+        # number to something else. `kill -0` alone would call this alive.
+        return {"name": name, "status": "warn",
+                "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
+    return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
+
+
 def check_notes_split_brain() -> "dict | None":
     """Detect notes/ split-brain (#1266): overlapping .md files in both
     <repo>/notes/ and <workspace>/notes/ — fires only when the two paths differ."""
@@ -2265,6 +2329,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_task_watcher())
     checks.append(check_skill_symlinks())
 
     return checks
