@@ -65,5 +65,41 @@ class TestUndrainedDetection(unittest.TestCase):
             subprocess.run = real
 
 
+
+class TestNotifySummary(unittest.TestCase):
+    """The summary line is the claim. It must not assert delivery that failed."""
+
+    def setUp(self):
+        import tempfile
+        self.m = _load(tempfile.mkdtemp(prefix="cpq-sum-"))
+
+    def test_a_all_paths_healthy(self):
+        s, w = self.m.notify_summary(3, True, True, [])
+        self.assertIn("macos=ok", s)
+        self.assertIn("voice=ok", s)
+        self.assertIn("proactive-file=written", s)
+        self.assertIsNone(w, "no warning when nothing is undrained")
+
+    def test_b_macos_failure_is_not_reported_as_ok(self):
+        s, _ = self.m.notify_summary(3, False, True, [])
+        self.assertIn("macos=FAILED", s)
+        self.assertNotIn("macos=ok", s)
+
+    def test_c_voice_offline_says_skipped_not_ok(self):
+        s, _ = self.m.notify_summary(3, True, False, [])
+        self.assertIn("voice=skipped(not connected)", s)
+
+    def test_d_undrained_produces_an_explicit_warning(self):
+        s, w = self.m.notify_summary(16, True, False, ["proactive-pending-q-old.txt"])
+        self.assertIn("UNDRAINED", s)
+        self.assertIsNotNone(w)
+        self.assertIn("NOT reaching the owner", w)
+        self.assertIn("proactive-pending-q-old.txt", w)
+
+    def test_e_count_is_carried(self):
+        s, _ = self.m.notify_summary(16, True, True, [])
+        self.assertIn("16 pending questions", s)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

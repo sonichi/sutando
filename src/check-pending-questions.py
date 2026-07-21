@@ -222,6 +222,30 @@ def undrained_proactive_files():
     return sorted(out)
 
 
+def notify_summary(count, macos_ok, voice_ok, stale):
+    """Build the per-path summary line, plus a warning when the DM path is dead.
+
+    Pure so the claim itself is testable — the whole point of this change is that
+    the summary must not assert delivery that did not occur."""
+    paths = [
+        "macos=ok" if macos_ok else "macos=FAILED",
+        "voice=ok" if voice_ok else "voice=skipped(not connected)",
+    ]
+    if stale:
+        paths.append(f"proactive-file=written but {len(stale)} earlier one(s) UNDRAINED")
+    else:
+        paths.append("proactive-file=written")
+    summary = f"Notified: {count} pending questions [{', '.join(paths)}]"
+    warning = None
+    if stale:
+        warning = (
+            "  WARNING: no consumer is draining results/proactive-*.txt on this host "
+            f"(oldest undrained: {stale[0]}). The DM path is NOT reaching the owner; "
+            "only the macOS notification is real here."
+        )
+    return summary, warning
+
+
 def main():
     force = "--force" in sys.argv
     questions = get_waiting_questions()
@@ -257,21 +281,10 @@ def main():
     # Update last notify time
     LAST_NOTIFY_FILE.write_text(str(int(time.time())))
 
-    paths = []
-    paths.append("macos=ok" if macos_ok else "macos=FAILED")
-    paths.append("voice=ok" if voice_ok else "voice=skipped(not connected)")
-    if stale_before:
-        paths.append(f"proactive-file=written but {len(stale_before)} earlier one(s) UNDRAINED")
-    else:
-        paths.append("proactive-file=written")
-    print(f"Notified: {count} pending questions [{', '.join(paths)}]")
-    if stale_before:
-        print(
-            "  WARNING: no consumer is draining results/proactive-*.txt on this host "
-            f"(oldest undrained: {stale_before[0]}). The DM path is NOT reaching the owner; "
-            "only the macOS notification is real here.",
-            file=sys.stderr,
-        )
+    summary, warning = notify_summary(count, macos_ok, voice_ok, stale_before)
+    print(summary)
+    if warning:
+        print(warning, file=sys.stderr)
 
 
 if __name__ == "__main__":
