@@ -29,6 +29,9 @@ def _load():
     os.environ.setdefault("REMOTE_TASK_URL", "https://gw.example/relay")
     os.environ.setdefault("REMOTE_TASK_TOKEN", "dummy-secret")
     os.environ["REMOTE_TASK_TIER"] = "owner"   # tierMap-less node → LOCAL_TIER=owner
+    # Repo root is parents[1] from tests/; the package lives under packages/.
+    import sys
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "packages" / "ag2-sparrow"))
     m = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
     m = importlib.reload(m)
     # deterministic fleet directory
