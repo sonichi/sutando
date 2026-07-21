@@ -526,6 +526,27 @@ class MentionBodyTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(len(res["candidates"]), 2)
 
+    def test_post_payload_leads_with_mxid_and_carries_mentions(self):
+        # A resolved mention posts op:message to /v1/room with the mxid LEADING
+        # the body (text trigger) AND a forward-compat `mentions:[mxid]` (activates
+        # structured push once the broker honors it). Both pinned so neither regresses.
+        cap = {}
+
+        def _fake_http_json(method, url, headers, payload):
+            cap["url"], cap["payload"] = url, payload
+            return 200, {"event_id": "$posted"}
+
+        with mock.patch.object(mn, "gateway", return_value=("https://gw/relay", {})), \
+             mock.patch.object(mn, "http_json", side_effect=_fake_http_json):
+            res = mn.mention("qingyun-001", "review #149", ROOM, HS, gate=None, agents=_AGENTS)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["event_id"], "$posted")
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        p = cap["payload"]
+        self.assertEqual(p["op"], "message")
+        self.assertEqual(p["mentions"], ["@sutando-qingyun-001:ag2.space"])
+        self.assertTrue(p["body"].startswith("@sutando-qingyun-001:ag2.space"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

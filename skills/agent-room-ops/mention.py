@@ -66,9 +66,13 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
 
     body = build_body(mxid, message)
     try:
+        # `mentions` is forward-compat: the leading mxid in `body` already
+        # triggers via the broker's localpart text-match, so this is harmlessly
+        # ignored today — but it auto-activates structured push-notifications the
+        # moment the broker honors it (a peer-review ask, ties to broker #151).
         _status, parsed = http_json(
             "POST", f"{base}/v1/room", headers,
-            {"op": "message", "room_id": room_id, "body": body},
+            {"op": "message", "room_id": room_id, "body": body, "mentions": [mxid]},
         )
     except HTTPError as e:
         return _result(False, room_id=room_id, mxid=mxid, reason=degrade_reason(e.code))
