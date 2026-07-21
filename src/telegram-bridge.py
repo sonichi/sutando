@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 import re
 import secrets
 import sys
@@ -194,9 +195,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         }
         if channel_id:
             payload["channel_id"] = str(channel_id)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Per-PID staging name: this file is written by four processes (this
+        # bridge + slack/discord/sparrow). A shared ".json.tmp" name lets two
+        # concurrent writers truncate and interleave the same temp file, so the
+        # rename can publish torn JSON. A per-PID temp is never shared, and
+        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}")
 
@@ -822,11 +828,10 @@ def main():  # pragma: no cover
                 # Inject skill instructions so the agent follows notify-before-work
                 # and transcription protocol even after conversation compaction.
                 # Only injected when the referenced skills are installed on this node.
-                # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
-                # the config dir via $CLAUDE_CONFIG_DIR.
-                _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-                _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
-                _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+                # Use claude_home_path() — honours $CLAUDE_CONFIG_DIR → $CLAUDE_HOME → ~/.claude
+                # resolution order (inline os.environ.get misses the $CLAUDE_HOME fallback).
+                _notify_py = claude_home_path("skills", "task-progress", "scripts", "notify.py")  # pragma: no cover
+                _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")  # pragma: no cover
                 has_audio_attach = attachment_note and any(
                     attachment_note.lower().find(ext) != -1
                     for ext in (".m4a", ".mp3", ".ogg", ".opus", ".oga", ".wav", ".webm", ".aac")

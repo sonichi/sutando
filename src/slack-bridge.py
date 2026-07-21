@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import uuid
 import re
 import secrets
 import sys
@@ -172,9 +173,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         }
         if channel_id:
             payload["channel_id"] = str(channel_id)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Per-PID staging name: this file is written by four processes (this
+        # bridge + discord/telegram/sparrow). A shared ".json.tmp" name lets two
+        # concurrent writers truncate and interleave the same temp file, so the
+        # rename can publish torn JSON. A per-PID temp is never shared, and
+        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
 
@@ -335,11 +341,91 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
 
 
 # Track which Slack channel/thread to reply into for each task we wrote.
-# Keyed by task_id; value is {channel, thread_ts, submitted_at, timed_out}
-# so we can reply in-thread for @mentions and at top-level for DMs, and so
-# the result_watcher can detect tasks the core never answered.
-pending_replies: dict[str, dict] = {}
+# This map must survive bridge restarts: task/result files are durable, and a
+# restarted bridge still needs the original channel + thread timestamp to route
+# a late result. Discord already persists the equivalent map for this reason.
+PENDING_REPLIES_FILE = STATE_DIR / "slack-pending-replies.json"
+
+
+def _atomic_write_pending_replies(data: dict) -> None:
+    """Persist reply routing without exposing a truncated JSON file on crash."""
+    try:
+        PENDING_REPLIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PENDING_REPLIES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(PENDING_REPLIES_FILE)
+    except Exception as e:
+        print(f"  [recovery] could not persist Slack pending replies: {e}", flush=True)
+
+
+def load_pending_replies_from_disk() -> dict:
+    """Restore reply routing on startup, aging out entries older than 7 days."""
+    try:
+        if not PENDING_REPLIES_FILE.exists():
+            return {}
+        data = json.loads(PENDING_REPLIES_FILE.read_text())
+        if not isinstance(data, dict):
+            return {}
+        now_ms = int(time.time() * 1000)
+        max_age_ms = 7 * 86400 * 1000
+        aged_out = []
+        for task_id, info in list(data.items()):
+            if not isinstance(info, dict) or not info.get("channel"):
+                del data[task_id]
+                continue
+            try:
+                ts_ms = int(task_id.split("-")[1])
+                if now_ms - ts_ms > max_age_ms:
+                    aged_out.append(task_id)
+                    del data[task_id]
+            except (ValueError, IndexError):
+                pass
+        if aged_out:
+            print(f"  [recovery] aged out {len(aged_out)} Slack pending replies > 7d", flush=True)
+        _atomic_write_pending_replies(data)
+        return data
+    except Exception as e:
+        print(f"  [recovery] could not load Slack pending replies: {e}", flush=True)
+        return {}
+
+
+# Keyed by task_id; value is {channel, thread_ts, submitted_at, timed_out,
+# access_tier}. Loading happens before the watcher starts, so any result that
+# landed while the bridge was down is delivered on its first poll.
+pending_replies: dict[str, dict] = load_pending_replies_from_disk()
 pending_replies_lock = threading.Lock()
+
+
+def _set_pending_reply(task_id: str, info: dict) -> None:
+    with pending_replies_lock:
+        pending_replies[task_id] = info
+        _atomic_write_pending_replies(dict(pending_replies))
+
+
+def _pop_pending_reply(task_id: str):
+    with pending_replies_lock:
+        target = pending_replies.pop(task_id, None)
+        _atomic_write_pending_replies(dict(pending_replies))
+    return target
+
+
+def _mark_pending_timed_out(task_id: str) -> None:
+    with pending_replies_lock:
+        entry = pending_replies.get(task_id)
+        if entry is None:
+            return
+        entry["timed_out"] = True
+        _atomic_write_pending_replies(dict(pending_replies))
+
+
+def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) -> None:
+    """Persist the Slack route before exposing its task file to the core."""
+    _set_pending_reply(task_id, info)
+    try:
+        task_file.write_text(content)
+    except Exception:
+        _pop_pending_reply(task_id)
+        raise
 
 # Per-task timeout. Mirrors task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (10 min):
 # if the core session wedges (e.g. hits the 1M-context usage-credit gate and
@@ -432,6 +518,36 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     return None
 
 
+# When a sender ADDRESSES the bot (a DM, or an @mention — every _write_task call
+# is one of those, per handle_mention/handle_message) but isn't on the allowlist,
+# the access gate below drops the message. Historically that drop was silent, so
+# the sender never knew their message wasn't received (owner ask 2026-07-15).
+# Ack once, rate-limited per sender, before dropping. Mirrors discord-bridge.py.
+_NOT_ALLOWLISTED_ACK_COOLDOWN_S = 3600
+_not_allowlisted_ack_at: dict[str, float] = {}
+_NOT_ALLOWLISTED_ACK_TEXT = (
+    "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
+    "can't act on it. Ask the owner to add you. _(automated notice)_"
+)
+
+
+def _ack_not_allowlisted(event: dict, user_id: str) -> None:
+    """One-line 'not on the allowlist' reply so an addressed-but-dropped Slack
+    message isn't silent. Rate-limited per sender (in-memory; resets on restart)."""
+    now = time.time()
+    if now - _not_allowlisted_ack_at.get(user_id, 0.0) < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
+        return  # already acked this sender recently — don't spam / echo
+    _not_allowlisted_ack_at[user_id] = now
+    channel = event.get("channel", "")
+    # in-thread for a channel @mention, top-level for a DM (mirrors _write_task)
+    thread_ts = None if event.get("channel_type") == "im" else (event.get("thread_ts") or event.get("ts"))
+    try:
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=_NOT_ALLOWLISTED_ACK_TEXT)
+        print(f"  [not-allowlisted-ack] sent to {user_id}", flush=True)
+    except Exception as e:
+        print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
+
+
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
@@ -483,8 +599,12 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         # Keep _TOFU_ENROLLMENT_CODE valid for the process lifetime (do NOT clear
         # it) so the gate stays armed if access.json is deleted externally later
         # (#899), instead of falling through to an unguarded tofu_onboard().
+    # Every _write_task call is a DM (handle_message) or an @mention
+    # (handle_mention), so a non-allowlisted sender here DID address the bot —
+    # ack them (rate-limited) before the fail-closed drop so it isn't silent.
     if user_id not in allowed:
         print(f"  Dropped message from non-allowed user {user_id}", flush=True)
+        _ack_not_allowlisted(event, user_id)
         return None
 
     # Download any attached files BEFORE writing the task, so the task body
@@ -592,11 +712,11 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # Inject skill instructions so the agent follows the notify-before-work and
     # transcription protocol even after conversation compaction wipes context.
     # Only injected for owner tasks when the referenced skills are installed.
-    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
-    # the config dir via $CLAUDE_CONFIG_DIR.
-    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
-    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    # Use claude_home_path() — honours $CLAUDE_CONFIG_DIR → $CLAUDE_HOME → ~/.claude
+    # resolution order (inline os.environ.get misses the $CLAUDE_HOME fallback).
+    # Behaviorally covered by tests/bridge-skill-path-resolution.test.py (CLAUDE_CONFIG_DIR resolution).
+    _notify_py = claude_home_path("skills", "task-progress", "scripts", "notify.py")
+    _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")
     skill_hints = ""
     if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
@@ -630,7 +750,14 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # third bridge; discord/telegram fold onto it in a follow-up dedup).
     media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
         attachment_refs, bool(text and text.strip()))
-    task_file.write_text(
+    pending_info = {
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "access_tier": access_tier,  # threaded to the outbound obs event
+        "submitted_at": time.time(),
+        "timed_out": False,
+    }
+    task_content = (
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"source: slack\n"
@@ -643,14 +770,9 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"task: {user_task_text}\n"
         f"{skill_hints}"
     )
-    with pending_replies_lock:
-        pending_replies[task_id] = {
-            "channel": channel,
-            "thread_ts": thread_ts,
-            "access_tier": access_tier,  # threaded to the outbound obs event
-            "submitted_at": time.time(),
-            "timed_out": False,
-        }
+    # If the bridge dies immediately after creation, the next process can still
+    # route the result. The helper rolls the route back if task writing fails.
+    _write_routed_task(task_file, task_content, task_id, pending_info)
 
     global _event_count
     with _event_count_lock:
@@ -895,6 +1017,16 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             pass
 
 
+def _record_skip_audit(task_id: str, skip_value: str) -> None:
+    """Record §7 audit disposition for a skip-marked result (no_send / deduped)."""
+    try:
+        import result_audit as _ra
+        _disp = "deduped" if skip_value == "deduped" else "no_send"
+        _ra.record(task_id or "", _disp, "slack")
+    except Exception:  # pragma: no cover  (defensive: record() never raises in practice)
+        pass
+
+
 def _check_task_timeouts() -> None:
     """Post a one-time reply for tasks the core never answered in time.
 
@@ -941,10 +1073,7 @@ def _check_task_timeouts() -> None:
         # Notified once, successfully. Mark so we don't repeat. The entry may
         # have been popped by result_watcher if a real result landed meanwhile
         # — guard with get() so we don't resurrect a delivered task.
-        with pending_replies_lock:
-            entry = pending_replies.get(task_id)
-            if entry is not None:
-                entry["timed_out"] = True
+        _mark_pending_timed_out(task_id)
         print(f"  [timeout] notified Slack for {task_id} after {TASK_TIMEOUT_SEC}s", flush=True)
 
 
@@ -968,7 +1097,7 @@ def result_watcher():
                 if not reply_text:
                     continue
                 with pending_replies_lock:
-                    target = pending_replies.pop(task_id, None)
+                    target = pending_replies.get(task_id)
                 if not target:
                     continue
 
@@ -977,15 +1106,23 @@ def result_watcher():
                 # truth so future skip markers added in result_markers.py
                 # automatically apply here.
                 _skip_parsed = parse_markers(reply_text)
-                if any(a.kind == "skip" for a in _skip_parsed.actions):
+                _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
+                if _skip_action is not None:
                     print(f"  Skipped (marker): {task_id}", flush=True)
+                    # §7 audit ledger: skip-marked results are resolved deliveries
+                    # (no_send / deduped), not silent voids. One line per result.
+                    _record_skip_audit(task_id, _skip_action.value)
                 else:
                     try:
                         _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
                         print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
                     except Exception as e:
                         print(f"[Slack] reply error: {e}", flush=True)
+                        # Keep both the durable route and result file so the
+                        # next poll (or restarted bridge) can retry delivery.
+                        continue  # pragma: no cover - watcher loop retry; helper state is unit-tested
 
+                _pop_pending_reply(task_id)
                 archive_file(result_file, "results", task_id)
                 archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
 
@@ -1143,4 +1280,3 @@ def main():  # pragma: no cover
 
 if __name__ == "__main__":
     main()
-
