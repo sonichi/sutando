@@ -79,6 +79,8 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 - **Before/after evidence — the single most-requested thing on this repo.** Paste the *actual output* for both states, not a description of it: the failing command/test at the parent commit, then passing at HEAD. "I verified X changes to Y" is not evidence; the pasted command that shows X→Y is. A reviewer should not have to reproduce your result to believe it.
 - What tests did you run? Include commands and results.
 - **Touching a live path (bridge, network, delivery loop, startup)?** A unit test or harness is not sufficient on its own — include a real post-restart round trip on the affected host (input received → reply delivered), with timings when latency is the point. This is the most common reason an otherwise-correct live-path fix is held from approval.
+- **Stacked PR?** Name the parent PR and intended merge order. Keep each layer to one concern, and after a parent lands, rebase/update the child and rerun its full checks before asking reviewers to treat it as merge-ready.
+- **Hardcoded-path check.** Scan added lines for host-specific paths (`/Users/<name>`, `/home/<name>`, clone-specific absolute paths, and inline home/config fallbacks). Production code must use the repo's path helpers; test fixtures must be clearly scoped as fixtures rather than silently exempting an entire line from review.
 - **For voice / phone / audio PRs: include a manual test result.** A transcript excerpt (from `data/conversation.sqlite`) showing the live turn/`[Tool]` flow, or a voice recording demonstrating the change. Voice paths are weakly covered by unit tests, so a maintainer needs observable evidence the live session behaves — not just that the code compiles. See the gold-standard example below.
 
   <details>
@@ -145,6 +147,10 @@ If you're reviewing someone else's PR (including a bot's), keep the comment thre
 - **APPROVE / REQUEST_CHANGES is a formal GitHub action.** A Discord "👍" or a `gh pr comment` saying "approved" does NOT register as a review — use `POST /repos/.../pulls/N/reviews` (or `gh pr review --approve`) so the state is recorded.
 - **Be evidence-first.** When you claim something is broken, point at the commit, file, line, repro, or failing test. If you didn't verify, say so explicitly ("not verified — flagging for author to check").
 - **Distinguish blockers from nits.** Mark each comment so the author knows what's gating merge vs what's deferrable.
+- **Review the current head and the right layer.** For a stacked PR, identify the parent and inspect the child-only change as well as the cumulative interaction. After an update/rebase, re-check the head SHA, required checks, and whether prior approvals still apply.
+- **Scan added lines for hardcoded host paths on every review.** Do not rely only on CI: look for `/Users/<name>`, `/home/<name>`, clone-specific absolute paths, and inline workspace/home fallbacks. Keep fixture exclusions token-specific so an allowed fixture on a line cannot hide a real production path on that same line.
+- **Clear stale formal blockers.** When the author pushes a fix, re-review the current head. If the request is genuinely resolved, dismiss/replace the stale REQUEST_CHANGES state; if it remains, cite the exact unresolved line or behavior. Do not leave a resolved change-request blocking merge through automation inertia.
+- **Apply the complete merge gate.** Merge only when the current head is mergeable, required CI and CLA checks are green, and two maintainers have recorded formal approvals. A comment, Discord acknowledgement, bot recommendation, stale approval on an old head, or admin bypass is not a substitute for any gate.
 
 For more detail (verification phases for fix PRs, sign trailers, sonichi-fix POC mechanics), see the `review-pr` skill if it's installed.
 

@@ -32,6 +32,8 @@ please do — it saves a lot of round-trips.
 - [ ] **Before/after evidence pasted below** — the actual command output for both states, not a description of it (this is the #1 reason PRs bounce)
 - [ ] Every claim in this PR body is verifiable from the diff or the pasted output — no statement the reviewer can't check
 - [ ] **Live path?** If this touches a bridge, network path, delivery loop, or startup, I included a real post-restart round-trip — unit tests / harnesses alone are not accepted for these
+- [ ] **Stacked PR?** I named the parent + merge order and will rebase/update + rerun full checks after the parent lands (or N/A)
+- [ ] Scanned added lines for host-specific hardcoded paths and inline home/workspace fallbacks; fixtures are narrowly scoped
 - [ ] If this PR adds or edits a CI workflow, I confirmed it actually runs on this PR (see the Checks tab — a `branches:` filter can silently exclude a stacked PR)
 - [ ] Doesn't reinvent workspace / home-path resolution — uses the `resolve_workspace` / `resolveWorkspace` / `claude_home_path` helpers (see `CLAUDE.md` "Workspace contract"; enforced by the `lint-workspace-resolution`, `lint-claude-home-path`, and `workspace-leak-check` CI checks)
 
