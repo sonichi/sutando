@@ -46,7 +46,7 @@ def main() -> int:
 
     # The access_tier determination block. Find it by the sentinel comment.
     match = re.search(
-        r"# Determine access tier\s*\n([\s\S]{0,2000}?)(?=\n    # Dedup:|\n    # Deterministic tier|\n\ndef |\Z)",
+        r"# Determine access tier\s*\n([\s\S]{0,3000}?)(?=\n    # Dedup:|\n    # Deterministic tier|\n\ndef |\Z)",
         src,
     )
     if not match:
