@@ -22,6 +22,7 @@ Checks:
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -145,6 +146,115 @@ def twilio_configured(env_content: str) -> bool:
         if stripped.startswith("TWILIO_ACCOUNT_SID=") and stripped.split("=", 1)[1].strip():
             return True
     return False
+
+
+def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict:
+    """G1.5 node-bundle: resolve the Node executable the engine's JS services
+    would use, in the same precedence as `sutando-config.sh node-bin`:
+
+      1. $SUTANDO_NODE — exact executable exported by the desktop app.
+      2. $SUTANDO_APP_NODE_DIR/node (or its default app-support home) — the
+         bundled runtime found at rest (launchd jobs without the env var).
+      3. `node` on PATH — dev/OSS hosts.
+
+    Returns {"source": "bundled"|"app-bundle"|"system"|"none", "path": str|None}.
+    Pure over (env, which) for testability.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get("SUTANDO_NODE", "")
+    if explicit:
+        if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return {"source": "bundled", "path": explicit}
+        # Owner review P1-1: SUTANDO_NODE is the desktop's explicit
+        # declaration — set-but-invalid is a packaging error, NOT a case to
+        # silently rescue via PATH. Surface it as its own failure source.
+        return {"source": "invalid-explicit", "path": explicit}
+    app_dir = env.get("SUTANDO_APP_NODE_DIR", "") or os.path.expanduser(
+        "~/Library/Application Support/space.ag2.app/engine/runtime/node/bin"
+    )
+    app_node = os.path.join(app_dir, "node")
+    if os.path.isfile(app_node) and os.access(app_node, os.X_OK):
+        return {"source": "app-bundle", "path": app_node}
+    on_path = which("node")
+    if on_path:
+        # Desktop-managed installs should never end up here (bundled runtime
+        # dir exists but its node is broken/missing) — flag it so the probe
+        # can degrade instead of reporting a false green (owner review).
+        if os.path.isdir(app_dir):
+            return {"source": "system-degraded", "path": on_path}
+        return {"source": "system", "path": on_path}
+    return {"source": "none", "path": None}
+
+
+def check_node_runtime() -> dict:
+    """Surface WHICH node the JS services resolve to — or a loud red line when
+    none exists. The 2026-07-13 outage class: an interactive terminal finding
+    node does NOT mean launchd-/app-spawned services can (credential-proxy sat
+    dead for days on this failure). "none" is a real issue, not a warn: every
+    JS service (voice, phone, proxy, web-client) silently fails to start.
+    """
+    resolved = resolve_node_runtime()
+    if resolved["source"] == "none":
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": "no node found (no SUTANDO_NODE, no app bundle, none on PATH) — JS services cannot start",
+        }
+    if resolved["source"] == "invalid-explicit":
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"SUTANDO_NODE set but not executable: {resolved['path']} — desktop packaging error (fail-closed, no PATH fallback)",
+        }
+    if resolved["source"] == "system-degraded":
+        return {
+            "name": "node-runtime",
+            "status": "warn",
+            "detail": f"bundled runtime dir present but its node is unusable — running on system node {resolved['path']} (pinned-runtime guarantee NOT in effect)",
+        }
+    # Executable permission alone doesn't prove the runtime can launch the
+    # bundled services (Codex re-review F3): a --version that errors or fails
+    # to run means every JS service dies at spawn — that is DOWN, not ok.
+    try:
+        out = subprocess.run(
+            [resolved["path"], "--version"], capture_output=True, text=True, timeout=5
+        )
+        if out.returncode != 0:
+            return {
+                "name": "node-runtime",
+                "status": "down",
+                "detail": f"node at {resolved['path']} failed --version (rc={out.returncode}) — runtime not runnable",
+            }
+        version = out.stdout.strip()
+    except Exception as exc:
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"node at {resolved['path']} could not be executed ({exc}) — runtime not runnable",
+        }
+    # Version floor (external review on #2182): bundled services use node:sqlite,
+    # which needs Node >= 22.5 — an older node passes every other probe here but
+    # crashes those services at import. Unparseable versions degrade to warn
+    # (never block on a formatting surprise), too-old is DOWN with the fix named.
+    floor = (22, 5)
+    parsed = re.match(r"v?(\d+)\.(\d+)", version or "")
+    if parsed is None:
+        return {
+            "name": "node-runtime",
+            "status": "warn",
+            "detail": f"node at {resolved['path']} reported unparseable version {version!r} — cannot verify the >=22.5 floor (node:sqlite)",
+        }
+    if (int(parsed.group(1)), int(parsed.group(2))) < floor:
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"{version} via {resolved['source']} is below the 22.5 floor (node:sqlite) — bundled services will crash; upgrade the runtime",
+        }
+    return {
+        "name": "node-runtime",
+        "status": "ok",
+        "detail": f"{version} via {resolved['source']} ({resolved['path']})",
+    }
 
 
 def check_port(port: int, name: str, probe: bool = False) -> dict:
@@ -1927,6 +2037,10 @@ def run_all_checks() -> list[dict]:
         proxy_check["status"] = "warn"
         proxy_check["detail"] = "not running (optional)"
     checks.append(proxy_check)
+
+    # G1.5: which Node would JS services resolve to (bundled/app-bundle/
+    # system), red when none — the silent-dead-services failure class.
+    checks.append(check_node_runtime())
 
     # Quota telemetry — only meaningful when the proxy is actually up.
     checks.append(check_quota_telemetry(proxy_check["status"]))
