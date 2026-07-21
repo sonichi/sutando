@@ -734,6 +734,37 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     return MEDIA_MARKER_RE.sub(lambda _m: f"[{label}: {path}]", body, count=1)
 
 
+# Fleet-agent directory cache — peer agents (in the broker's /v1/agents) are
+# NEVER the human owner, so their messages must not set owner-presence. Only the
+# PRESENCE gate consults this; task authority (_tier_for) is deliberately left
+# untouched, so peer-to-peer delegation keeps its access_tier (a peer agent still
+# resolves to owner tier on a tierMap-less node and can still act — the two
+# consumers of _tier_for are decoupled here on purpose).
+_FLEET_AGENTS_TTL_S = 300.0
+_fleet_agents_cache: dict = {"ts": 0.0, "ids": set()}
+
+
+def _fleet_agent_ids() -> set[str]:
+    """Broker-attested set of fleet agent mxids (from GET /v1/agents), cached
+    ~5 min. FAIL-OPEN: on any fetch/parse error keep (and return) the last good
+    set — never an empty set that would mistake a real peer for the owner. Before
+    the first successful fetch the set is empty, so behavior is exactly today's
+    (record) until the directory is known — presence must never SWALLOW genuine
+    owner activity, only decline to record a KNOWN peer."""
+    now = time.time()
+    if now - _fleet_agents_cache["ts"] < _FLEET_AGENTS_TTL_S and _fleet_agents_cache["ids"]:
+        return _fleet_agents_cache["ids"]
+    try:
+        resp = _req("GET", "/v1/agents")
+        ids = {a.get("id") for a in (resp.get("agents") or []) if isinstance(a, dict) and a.get("id")}
+        if ids:
+            _fleet_agents_cache["ts"] = now
+            _fleet_agents_cache["ids"] = ids
+    except Exception:
+        pass  # keep the prior good set (fail-open)
+    return _fleet_agents_cache["ids"]
+
+
 def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     """Record that the owner was active on this transport right now — but only
     when THIS node resolves the SENDER to owner tier. Gated on the sender's
@@ -754,6 +785,16 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     if sender_tier is None:
         sender_tier = _tier_for(task.get("user_id"))
     if sender_tier != "owner":
+        return
+    # A peer FLEET agent resolves to owner tier on a tierMap-less node (LOCAL_TIER
+    # fallthrough), but it is never the HUMAN owner — recording its post as
+    # owner-presence poisons the proactive-loop's engagement signal and the
+    # core-supervisor escalation target. Gate PRESENCE ONLY here; the task's
+    # access_tier (the other _tier_for consumer) stays owner so peer delegation
+    # is unaffected. Broker-attested user_id only — the /v1/agents directory is
+    # the authoritative peer set (the human owner is not in it).
+    _uid = (task.get("user_id") or "").strip()
+    if _uid and _uid in _fleet_agent_ids():
         return
     try:
         OWNER_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
