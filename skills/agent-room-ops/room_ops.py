@@ -28,6 +28,8 @@ import read as _read       # noqa: E402
 import media as _media     # noqa: E402
 import react as _react     # noqa: E402
 import join as _join       # noqa: E402
+import resolve as _resolve # noqa: E402
+import mention as _mention # noqa: E402
 
 
 def _main(argv):
@@ -74,6 +76,15 @@ def _main(argv):
         g.add_argument("--ack", choices=sorted(_react.ACK))
         p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    p = sub.add_parser("resolve", help="resolve a friendly handle -> agent mxid (via /v1/agents)")
+    p.add_argument("handle")
+
+    p = sub.add_parser("mention", help="@-mention an agent by handle (resolve + post a triggering message)")
+    p.add_argument("handle")
+    p.add_argument("message")
+    p.add_argument("room_id")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
     a = ap.parse_args(argv)
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before)
@@ -103,6 +114,10 @@ def _main(argv):
                 res = _doc.doc_rm(a.room, a.name, folder=a.folder, agent_mxid=a.agent)
     elif a.cmd == "join":
         res = _join.join_room(a.room_id, a.agent_mxid)
+    elif a.cmd == "resolve":
+        res = _resolve.resolve_user(a.handle)
+    elif a.cmd == "mention":
+        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid)
     else:  # react / unreact
         key = a.key or _react.ACK[a.ack]
         fn = _react.react if a.cmd == "react" else _react.unreact
