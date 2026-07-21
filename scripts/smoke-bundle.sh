@@ -99,6 +99,40 @@ if [ -f dist/web-client.js ]; then
   fi
 fi
 
+# ── entrypoint guard under a SPACED path ────────────────────────────────────
+# The bundled install lives under "~/Library/Application Support/…"; every dev
+# checkout does not. An entrypoint guard comparing `import.meta.url` (which
+# percent-encodes) against a raw argv path is therefore false ONLY in
+# production, and the process exits 0 with no output — it has shipped three
+# times that way. This runs the real artifact from a directory whose name
+# contains a space and asserts the OBSERVABLE effect, not the source text: a
+# source-shape assertion passes for any guard that merely looks plausible.
+#
+# CI-only, same reason as smoke-startup-gate.sh case 3: a passing guard means
+# the entrypoint actually runs, which for emit-call-tiers means writing into a
+# workspace. Gated so it never fires against a developer's live install.
+if [ "${SMOKE_SPACED_ENTRYPOINT:-0}" = "1" ] && [ -f dist/emit-call-tiers.js ]; then
+  echo "── entrypoint guard: spaced path (CI-only) ──"
+  _sp_root="$(mktemp -d)"
+  _sp_dir="$_sp_root/Application Support"
+  mkdir -p "$_sp_dir"
+  cp dist/emit-call-tiers.js "$_sp_dir/"
+  # Redirect the workspace so the run cannot touch anything real. The resolver
+  # honours SUTANDO_WORKSPACE only under SUTANDO_TEST_MODE=1.
+  _sp_ws="$_sp_root/ws"; mkdir -p "$_sp_ws/state"
+  ( cd "$_sp_dir" && SUTANDO_WORKSPACE="$_sp_ws" SUTANDO_TEST_MODE=1 node ./emit-call-tiers.js ) \
+    > "$_sp_root/out.log" 2>&1 || true
+  if [ -s "$_sp_root/out.log" ] && grep -q "call-tiers written" "$_sp_root/out.log"; then
+    echo "  ✓ entrypoint ran from a path containing a space"
+  else
+    echo "  ✗ SMOKE FAIL: entrypoint did NOT run from a spaced path (guard is false in production)"
+    echo "    expected 'call-tiers written' on stdout; got:"
+    sed 's/^/      /' "$_sp_root/out.log" | head -5
+    fail=1
+  fi
+  rm -rf "$_sp_root"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "bundle smoke FAILED — an artifact breaks at load. A dependency or dynamic import likely can't be bundled."
   exit 1

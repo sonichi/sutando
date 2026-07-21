@@ -39,4 +39,4 @@ jobs:
           node-version: '22.17.0'
       - run: npm ci
       - name: bundle smoke (build + load each artifact under plain node)
-        run: bash scripts/smoke-bundle.sh
+        run: SMOKE_SPACED_ENTRYPOINT=1 bash scripts/smoke-bundle.sh
