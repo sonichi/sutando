@@ -134,29 +134,32 @@ class TestDeliver(unittest.TestCase):
     def test_a_voice_connected_reports_ok(self):
         self.m.notify_macos = lambda c, t: True
         self.m.voice_client_connected = lambda: True
-        s, w = self.m.deliver([{"title": "q"}], 1, ["q"])
+        s = self.m.deliver([{"title": "q"}], 1, ["q"])
         self.assertIn("voice=ok", s)
-        self.assertIsNone(w)
 
     def test_b_voice_offline_reports_skipped(self):
         self.m.notify_macos = lambda c, t: True
         self.m.voice_client_connected = lambda: False
-        s, _ = self.m.deliver([{"title": "q"}], 1, ["q"])
+        s = self.m.deliver([{"title": "q"}], 1, ["q"])
         self.assertIn("voice=skipped", s)
 
     def test_c_macos_failure_surfaces(self):
         self.m.notify_macos = lambda c, t: False
         self.m.voice_client_connected = lambda: False
-        s, _ = self.m.deliver([{"title": "q"}], 1, ["q"])
+        s = self.m.deliver([{"title": "q"}], 1, ["q"])
         self.assertIn("macos=FAILED", s)
 
     def test_d_undrained_backlog_produces_warning(self):
         self.m.notify_macos = lambda c, t: True
         self.m.voice_client_connected = lambda: False
         self.m.undrained_proactive_files = lambda: ["proactive-old.txt"]
-        s, w = self.m.deliver([{"title": "q"}], 1, ["q"])
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            s = self.m.deliver([{"title": "q"}], 1, ["q"])
         self.assertIn("UNDRAINED", s)
-        self.assertIn("NOT reaching the owner", w)
+        self.assertIn("NOT reaching the owner", err.getvalue(),
+                      "the warning must reach stderr, not just be returned")
 
 
 if __name__ == "__main__":

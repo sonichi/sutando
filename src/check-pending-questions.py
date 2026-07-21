@@ -260,7 +260,10 @@ def deliver(questions, count, titles):
         notify_voice(questions)
         voice_ok = True
     notify_discord_dm(questions)
-    return notify_summary(count, macos_ok, voice_ok, stale)
+    summary, warning = notify_summary(count, macos_ok, voice_ok, stale)
+    if warning:
+        print(warning, file=sys.stderr)
+    return summary
 
 
 def main():
@@ -280,11 +283,8 @@ def main():
     count = len(questions)
     titles = [q["title"] for q in questions]
 
-    summary, warning = deliver(questions, count, titles)
     LAST_NOTIFY_FILE.write_text(str(int(time.time())))
-    print(summary)
-    if warning:
-        print(warning, file=sys.stderr)
+    print(deliver(questions, count, titles))
 
 
 if __name__ == "__main__":
