@@ -191,6 +191,20 @@ class TestReviewFindings(unittest.TestCase):
         self.assertFalse(stamp.exists(),
                          "a failed delivery must NOT put the next hour on cooldown")
 
+    def test_a2_cooldown_IS_stamped_when_delivery_succeeds(self):
+        """The positive half. Testing only the failure case let the stamp be
+        deleted outright without any test failing — which would notify on every
+        run forever. A guard needs both directions or it pins nothing."""
+        import tempfile, pathlib
+        stamp = pathlib.Path(tempfile.mkdtemp()) / "last-notify"
+        self.m.LAST_NOTIFY_FILE = stamp
+        self.m.deliver = lambda *a, **k: "Notified: 1 pending questions [ok]"
+        self.m.get_waiting_questions = lambda: [{"title": "q"}]
+        self.m.should_notify = lambda *a, **k: True
+        self.m.main()
+        self.assertTrue(stamp.exists(), "a successful delivery MUST set the cooldown")
+        self.assertGreater(int(stamp.read_text()), 0)
+
     # --- finding 2: only THIS notifier's files are evidence ---
     def test_b_unrelated_stale_proactive_file_is_ignored(self):
         self._age("proactive-schedule-alert-cron.txt", self.m.UNDRAINED_AGE_S + 60)
