@@ -88,6 +88,7 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
 # Generic plugin message-hook loader. The bridge stays a THIN, plugin-AGNOSTIC
@@ -2465,6 +2466,8 @@ async def _handle_discord_message(message, force=False):
     sender_id = str(message.author.id)
     username = str(message.author)
     text = message.content or ""
+    initial_secret_filter = filter_chat_secrets(text)
+    detected_secret_types = set(initial_secret_filter.secret_types)
     is_dm = isinstance(message.channel, discord.DMChannel)
     channel_name = getattr(message.channel, 'name', 'DM')
 
@@ -2480,10 +2483,12 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    print(f"  [msg] #{channel_name} @{username}: {redact_vault_commands(text)[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
+    safe_log_text = redact_vault_commands(initial_secret_filter.text)
+    print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
-        print(f"  [debug] message_snapshots: {message.message_snapshots}", flush=True)
+        safe_snapshots = filter_chat_secrets(str(message.message_snapshots)).text  # pragma: no cover
+        print(f"  [debug] message_snapshots: {safe_snapshots}", flush=True)  # pragma: no cover
     if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
         print(f"  [debug] non-default message type: {message.type}", flush=True)
 
@@ -2837,7 +2842,7 @@ async def _handle_discord_message(message, force=False):
             if parts:
                 fwd_text = "\n".join(parts)
                 text = (text + "\n" + fwd_text).strip() if text else fwd_text.strip()
-                print(f"  [forward] extracted: {text[:100]}", flush=True)
+                print(f"  [forward] extracted: {filter_chat_secrets(text).text[:100]}", flush=True)  # pragma: no cover
 
     # Handle embeds (link previews, rich content, pasted images)
     embed_text = ""
@@ -3002,7 +3007,10 @@ async def _handle_discord_message(message, force=False):
     # raw print lands the secret in discord-bridge.log even though the intercept
     # below (L~2939) would store/redact it — a plaintext-secret leak to the log.
     # (2026-06-23 incident: an owner's telegram bot token leaked here.)
-    print(f"  @{username}: {redact_vault_commands(text)}{attachment_note}")
+    safe_detail_log = filter_chat_secrets(
+        f"{redact_vault_commands(text)}{attachment_note}"
+    ).text
+    print(f"  @{username}: {safe_detail_log}")
 
     # Determine access tier
     access_tier = "other"
@@ -3018,7 +3026,8 @@ async def _handle_discord_message(message, force=False):
     if sender_id in allowed:
         access_tier = "owner"
         # Record owner activity for status-aware-pivot in proactive loop
-        write_owner_activity("discord", text, channel_id=getattr(message.channel, "id", None))
+        write_owner_activity("discord", filter_chat_secrets(text).text,
+                             channel_id=getattr(message.channel, "id", None))
     else:
         # Check if team member (from channel allowlists)
         try:
@@ -3109,6 +3118,20 @@ async def _handle_discord_message(message, force=False):
         else:
             text = redact_vault_commands(text)
 
+    # Redact ordinary pasted tokens after explicit vault interception so named
+    # `vault set` values can still be stored. Include reply context and voice
+    # transcripts: both are user-derived and both are persisted in the task.
+    filtered_text = filter_chat_secrets(text)
+    filtered_attachment = filter_chat_secrets(attachment_note)
+    filtered_reply_context = filter_chat_secrets(reply_context)
+    text = filtered_text.text
+    attachment_note = filtered_attachment.text
+    reply_context = filtered_reply_context.text
+    detected_secret_types.update(filtered_text.secret_types)
+    detected_secret_types.update(filtered_attachment.secret_types)
+    detected_secret_types.update(filtered_reply_context.secret_types)
+    secret_notice = secret_handling_instruction("Discord", detected_secret_types)
+
     # Inject tier-specific in-band instructions so the core agent cannot
     # accidentally process a non-owner task with full capabilities.
     # See CLAUDE.md "Discord access control" section for the policy.
@@ -3192,6 +3215,10 @@ async def _handle_discord_message(message, force=False):
             # `===SUTANDO SYSTEM INSTRUCTIONS===` content that lands in the task
             # file header verbatim. confine_user_content is idempotent so the
             # already-ZWSP-prefixed original user_task_text is unaffected.
+            filtered_enriched = filter_chat_secrets(enriched)  # pragma: no cover
+            detected_secret_types.update(filtered_enriched.secret_types)  # pragma: no cover
+            secret_notice = secret_handling_instruction("Discord", detected_secret_types)  # pragma: no cover
+            enriched = filtered_enriched.text  # pragma: no cover
             user_task_text = confine_user_content(enriched)
             # Rewrite the prompt file with the enriched body. quoted_task
             # already points to `"$(cat {prompt_path})"` — keep the heredoc
@@ -3447,6 +3474,7 @@ async def _handle_discord_message(message, force=False):
             f"task: {user_task_text}\n"
             f"{tier_instructions.get(rulebook_key, tier_instructions['other'])}"
             f"{discord_skill_hints}"
+            f"{secret_notice}"
         )
 
     if not _write_task_file(task_file, _build_task_content, username, channel_name,

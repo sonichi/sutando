@@ -74,6 +74,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -628,7 +629,17 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not text and not attachment_note:
         return None
 
-    write_owner_activity("slack", text or attachment_note, channel_id=event.get("channel"))
+    # Owner-activity state is persisted before tier/vault handling below. Use a
+    # redacted preview so an ordinary pasted token never lands in state JSON.
+    initial_secret_filter = filter_chat_secrets(text)
+    detected_secret_types = set(initial_secret_filter.secret_types)
+    safe_attachment = filter_chat_secrets(attachment_note)
+    detected_secret_types.update(safe_attachment.secret_types)
+    write_owner_activity(
+        "slack",
+        initial_secret_filter.text or safe_attachment.text,
+        channel_id=event.get("channel"),
+    )
 
     channel = event.get("channel", "")
     # Reply in-thread for channel @mentions, top-level for DMs. parens for
@@ -677,6 +688,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
                 print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
         else:
             text = redact_vault_commands(text)
+
+    # Generic chat-secret detection is deliberately AFTER explicit vault
+    # interception: named `vault set` values still reach Keychain, while any
+    # other pasted token is redacted before task/prompt persistence.
+    filtered_text = filter_chat_secrets(text)
+    text = filtered_text.text
+    detected_secret_types.update(filtered_text.secret_types)
+    attachment_note = safe_attachment.text
+    secret_notice = secret_handling_instruction("Slack", detected_secret_types)
 
     # Prepend an in-band system instruction for non-owner tiers so the
     # core agent cannot accidentally process a downgraded task with full
@@ -769,6 +789,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"priority: {priority}\n"
         f"task: {user_task_text}\n"
         f"{skill_hints}"
+        f"{secret_notice}"
     )
     # If the bridge dies immediately after creation, the next process can still
     # route the result. The helper rolls the route back if task writing fails.
