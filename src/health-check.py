@@ -3011,6 +3011,24 @@ def recover_core_if_wedged(
             lock_fh.close()
 
 
+def summary_line(checks) -> str:
+    """The no-failures summary. Warnings are deliberately NOT issues — they must
+    not fail the exit code or wake the launchd notifier, and that is unchanged.
+    But the unqualified "All systems operational." printed directly under a
+    `⚠ core degraded` row contradicts the screen, and anything summarising this
+    tool by its last line (a human skimming, a grepped status check) then reports
+    healthy while a warning stands. Name them instead.
+
+    Pure and importable on purpose, so a regression test exercises THIS code
+    rather than a copy of it.
+    """
+    warns = [c for c in checks if c.get("status") == "warn"]
+    if not warns:
+        return "All systems operational."
+    return (f"No failures — {len(warns)} warning(s): "
+            + ", ".join(c["name"] for c in warns))
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -3095,7 +3113,7 @@ def main():
         print()
     if not issues:
         if not quiet:
-            print("All systems operational.")
+            print(summary_line(checks))
     else:
         print(f"{len(issues)} issue(s) found:")
         for c in issues:
