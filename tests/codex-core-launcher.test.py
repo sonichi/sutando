@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import select
 import subprocess
 import tempfile
 import time
@@ -110,14 +111,28 @@ exit 0
             )
             os.close(slave)
             slave = -1
-            returncode = process.wait(timeout=5)
             os.set_blocking(master, False)
             output = b""
+            deadline = time.monotonic() + 5
             while True:
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    process.wait()
+                    raise subprocess.TimeoutExpired(process.args, 5)
+                readable, _, _ = select.select([master], [], [], 0.05)
+                if not readable:
+                    if process.poll() is not None:
+                        break
+                    continue
                 try:
-                    output += os.read(master, 4096)
-                except (BlockingIOError, OSError):
+                    chunk = os.read(master, 4096)
+                except OSError:
                     break
+                if chunk:
+                    output += chunk
+                elif process.poll() is not None:
+                    break
+            returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
             return subprocess.CompletedProcess(process.args, returncode, output.decode(errors="replace"), "")
         finally:
             os.close(master)
