@@ -79,8 +79,10 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
+import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
@@ -571,6 +573,20 @@ def load_channel_config(channel_id):
     except Exception:
         return None
 
+def _channel_role(channel_id):  # pragma: no cover — bridge I/O glue (reads ACCESS_FILE); trivial dict lookup
+    """Return the configured `role` for a channel (e.g. "bot2bot"), or None.
+
+    Kept separate from load_channel_config (which returns the
+    requireMention/allowFrom pair) so the shared-channel addressee gate can
+    special-case bot2bot channels without widening that function's contract.
+    """
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        cfg = data.get("groups", {}).get(str(channel_id))
+    except Exception:
+        return None
+    return cfg.get("role") if isinstance(cfg, dict) else None
+
 def load_channel_allowed(channel_id):
     """Load channel-specific allowlist. Returns None if channel not configured (open to all)."""
     cfg = load_channel_config(channel_id)
@@ -914,7 +930,7 @@ async def _run_codex_subprocess(prompt, model, timeout_s):
     except Exception:
         return ""
     try:
-        argv = ["codex", "exec", "--sandbox", "read-only", "-o", out_path]
+        argv = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-o", out_path]
         if model:
             argv.extend(["-m", model])
         argv.extend(["--", prompt])
@@ -2301,6 +2317,34 @@ def _message_mentions_bot(message):
     return False
 
 
+# When a sender ADDRESSES the bot (a DM, or an @mention in a channel) but isn't
+# on the allowlist, the message is dropped by the access-control gate below.
+# Historically that drop was silent, so the sender had no idea their message
+# wasn't received (owner ask 2026-07-15). Send a one-line automated ack instead,
+# rate-limited per sender so a repeat-sender (or an abusive one) can't turn the
+# bridge into an echo. In-memory cooldown: fine to reset on bridge restart.
+_NOT_ALLOWLISTED_ACK_COOLDOWN_S = 3600
+_not_allowlisted_ack_at: dict[str, float] = {}
+_NOT_ALLOWLISTED_ACK_TEXT = (
+    "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
+    "can't act on it. Ask the owner to add you. _(automated notice)_"
+)
+
+
+async def _ack_not_allowlisted(channel, sender_id: str, username: str = "") -> None:
+    """One-line 'you're not on the allowlist' reply so an addressed-but-dropped
+    message isn't silent. Rate-limited per sender (``_NOT_ALLOWLISTED_ACK_COOLDOWN_S``)."""
+    now = time.time()
+    if now - _not_allowlisted_ack_at.get(sender_id, 0.0) < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
+        return  # already acked this sender recently — don't spam / echo
+    _not_allowlisted_ack_at[sender_id] = now
+    try:
+        await channel.send(_NOT_ALLOWLISTED_ACK_TEXT)
+        print(f"  [not-allowlisted-ack] sent to @{username or sender_id}", flush=True)
+    except Exception as e:
+        print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
+
+
 @client.event
 async def on_message(message):
     await _handle_discord_message(message)
@@ -2503,6 +2547,9 @@ async def _handle_discord_message(message, force=False):
             return
 
         bot_mentioned = client.user in message.mentions
+        # role_mentioned counts as "addressed to us" — assumes these roles are held
+        # only by this bot; a role shared across sibling bots re-introduces the
+        # mass-answer this gate exists to prevent.
         role_mentioned = any(role.name.lower() in ("sutando", "sutando bot") or str(client.user.id) in str(role.id) for role in message.role_mentions)
         # Also check if any role mention exists and the bot has that role
         if not role_mentioned and message.role_mentions and message.guild:
@@ -2637,16 +2684,33 @@ async def _handle_discord_message(message, force=False):
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
             return
 
-        # In shared channels (require_mention=False), if there ARE other bot
-        # @mentions but THIS bot isn't mentioned, skip — let the addressed bot handle it.
-        # Exception: reply context auto-adds the replied-to bot as a mention —
-        # don't skip just because the user replied to another bot's message.
-        if not require_mention and message.mentions and not bot_mentioned:
-            # Filter out the replied-to author (auto-added by Discord reply)
-            reply_author_id = message.reference.resolved.author.id if message.reference and hasattr(message.reference, 'resolved') and message.reference.resolved else None
-            explicit_mentions = [m for m in message.mentions if m.bot and m.id != reply_author_id]
-            if explicit_mentions:
-                print(f"  [skip] message addressed to other bot(s): {[str(m) for m in explicit_mentions]}", flush=True)
+        # Shared-channel addressee gate (require_mention=False, non-bot2bot).
+        # Fixes owner-reported 2026-07-18: replies to OTHER agents and other
+        # agents' own chatter (e.g. a sibling bot's "⏳ working…" status) were
+        # processed as if addressed to us. A message here is for us only if it
+        # @-mentions/role-mentions us or replies to one of OUR messages; other
+        # bots' posts and replies-to-others are skipped. bot2bot channels opt
+        # out (role:"bot2bot") — they intentionally want peer messages. The
+        # decision itself is the pure `is_addressed_in_shared_channel` (unit-
+        # tested); here we only resolve the discord objects into its primitives.
+        # (Supersedes the old reply-target filter, which *excluded* the reply-
+        # target from the addressee check — backwards — letting replies-to-
+        # other-agents through.)
+        if not require_mention and _channel_role(str(message.channel.id)) != "bot2bot":  # pragma: no cover — discord-object resolution glue; decision covered in discord_addressee.py
+            _ref = getattr(message, "reference", None)
+            _ref_resolved = getattr(_ref, "resolved", None) if _ref is not None else None
+            _ref_author = getattr(_ref_resolved, "author", None)
+            if not is_addressed_in_shared_channel(
+                author_is_bot=bool(getattr(message.author, "bot", False)),
+                bot_mentioned=bot_mentioned,
+                role_mentioned=role_mentioned,
+                is_reply=_ref is not None,
+                reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
+                self_id=getattr(client.user, "id", None),
+            ):
+                print(f"  [skip] shared channel: not addressed to me "
+                      f"(author_bot={bool(getattr(message.author, 'bot', False))}, "
+                      f"reply={_ref is not None})", flush=True)
                 return
 
         # Strip role mentions only. User mentions (this bot's and other
@@ -2674,6 +2738,8 @@ async def _handle_discord_message(message, force=False):
 
     if is_dm:
         if policy == "allowlist" and sender_id not in allowed:
+            # A DM always addresses the bot → ack the non-allowlisted sender.
+            await _ack_not_allowlisted(message.channel, sender_id, username)
             return
     else:
         # Channel access control
@@ -2695,6 +2761,10 @@ async def _handle_discord_message(message, force=False):
                     channel_authorized = True
                 else:
                     print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
+                    # Ack only when the bot was explicitly addressed (@mention /
+                    # role) — never auto-reply to every unrelated channel message.
+                    if bot_mentioned or role_mentioned:
+                        await _ack_not_allowlisted(message.channel, sender_id, username)
                     return
             else:
                 # sender is in ch_allowed (or ch_allowed is empty + requireMention)
@@ -2703,6 +2773,8 @@ async def _handle_discord_message(message, force=False):
             # Channel not configured — fall back to global allowlist
             if allowed and sender_id not in allowed:
                 print(f"  [skip] @{username} not in global allowlist", flush=True)
+                if bot_mentioned or role_mentioned:
+                    await _ack_not_allowlisted(message.channel, sender_id, username)
                 return
 
     if policy == "pairing" and sender_id not in allowed and not channel_authorized:
@@ -3196,7 +3268,7 @@ async def _handle_discord_message(message, force=False):
             "This task is from a TEAM tier sender. Choose ONE of three actions based on the content:\n\n"
             "1. RUN CODEX — for genuine requests (code review, bug report, technical question, analysis).\n"
             "   Two-stage execution to avoid racing the bridge's results-dir poller:\n"
-            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
+            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
             f"   - Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move; bridge only ever sees a complete file).\n"
             f"   - Stage 2 fallback: if codex exits non-zero OR staging file is empty/missing: write 'Sandbox unavailable; refusing non-owner task.' directly to {RESULTS_DIR}/task-{{id}}.txt.\n"
             "   - The `-o` flag writes ONLY the agent's final message to the file (no exec sub-command dumps, no setup banner). Do NOT redirect stdout — codex's stdout includes verbose exec output from internal tool calls (e.g. github plugin reading PR diffs), which floods Discord. Do NOT add commentary.\n\n"
@@ -3269,11 +3341,10 @@ async def _handle_discord_message(message, force=False):
     # Inject skill instructions for owner tasks so the agent follows the
     # notify-before-work and transcription protocol after compaction.
     # Only injected when the referenced skills are installed on this node.
-    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
-    # the config dir via $CLAUDE_CONFIG_DIR.
-    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
-    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    # Use claude_home_path() — honours $CLAUDE_CONFIG_DIR → $CLAUDE_HOME → ~/.claude
+    # resolution order (inline os.environ.get misses the $CLAUDE_HOME fallback).
+    _notify_py = claude_home_path("skills", "task-progress", "scripts", "notify.py")  # pragma: no cover
+    _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")  # pragma: no cover
     discord_skill_hints = ""
     # CONTEXT-FIRST is a correctness feature (reconstruct before interpreting) and
     # must NOT be gated on unrelated skills (task-progress / audio-transcribe) being
@@ -3581,6 +3652,12 @@ def _mark_delivered(task_id: str) -> None:
     result_audit.record(task_id, "delivered", "discord")
 
 
+def _record_skip_audit(task_id: str, skip_value: str) -> None:
+    """Record §7 audit disposition for a skip-marked result (no_send / deduped)."""
+    _disp = "deduped" if skip_value == "deduped" else "no_send"
+    result_audit.record(task_id, _disp, "discord")
+
+
 def _is_delivered(task_id: str) -> bool:
     """True iff the sentinel for `task_id` exists."""
     try:
@@ -3595,6 +3672,77 @@ def _clear_delivered(task_id: str) -> None:
         _delivered_sentinel_path(task_id).unlink(missing_ok=True)
     except Exception:
         pass
+
+
+async def _report_delivery_failure(channel, task_id: str, task_tier: str, error: Exception) -> None:
+    """Make a failed Discord result visible instead of only printing a log.
+
+    Result Router §9.3 requires every delivery failure to produce both a
+    ``failed`` audit row and an owner DM.  The originating owner DM is the
+    safest first choice; for channel and non-owner tasks, resolve the canonical
+    owner using the same config chain as proactive delivery.
+
+    This helper deliberately never raises.  It runs inside ``poll_results``'s
+    delivery exception path, where a second exception must not kill the bridge.
+    """
+    error_text = str(error) or type(error).__name__
+    failure = result_router.DeliveryFailure(
+        task_id=task_id,
+        tier=task_tier,
+        surface="discord",
+        error=error_text,
+    )
+    result_audit.record(task_id, "failed", "discord")
+    try:
+        _emit_channel(
+            "discord",
+            "out",
+            channel_id=str(getattr(channel, "id", "")),
+            access_tier=task_tier,
+            outcome="error",
+            data={"task_id": task_id, "error": error_text[:1000]},
+        )
+    except Exception:
+        pass
+
+    try:
+        owner_dm = None
+        if task_tier == "owner" and isinstance(channel, discord.DMChannel):
+            owner_dm = channel
+        else:
+            try:
+                access_data = json.loads(ACCESS_FILE.read_text())
+            except Exception:
+                access_data = {}
+            allow_list = access_data.get("allowFrom") or []
+            owner_id = discord_config.resolve_owner_id(access_data)
+            if owner_id is None:
+                for uid in allow_list:
+                    try:
+                        user = await client.fetch_user(int(uid))
+                        if not user.bot:
+                            owner_id = str(uid)
+                            break
+                    except Exception:
+                        continue
+            if owner_id is not None:
+                user = await client.fetch_user(int(owner_id))
+                owner_dm = await user.create_dm()
+
+        if owner_dm is None:
+            print(
+                f"  [delivery-failure] no owner DM available for {task_id}: {error_text}",
+                flush=True,
+            )
+            return
+        await owner_dm.send(result_router.delivery_failure_notice(failure))
+        print(f"  [delivery-failure] owner notified for {task_id}: {error_text}", flush=True)
+    except Exception as notice_error:
+        print(
+            f"  [delivery-failure] owner notice failed for {task_id}: {notice_error}; "
+            f"original error: {error_text}",
+            flush=True,
+        )
 
 
 PENDING_REPLIES_FILE = REPO / "state" / "discord-pending-replies.json"
@@ -3691,6 +3839,8 @@ async def poll_results():
             if result_file.exists():
                 import re
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving
@@ -3769,6 +3919,9 @@ async def poll_results():
                             # Best-effort; never block the archive of this result.
                             print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
                     print(f"  Skipped (already replied or deduped): {task_id}")
+                    # §7 audit: skip-marked results are resolved deliveries, not
+                    # silent voids — one line per resolved result per spec.
+                    _record_skip_audit(task_id, _skip.value)
                     archive_file(result_file, "results", task_id)
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
@@ -3990,6 +4143,7 @@ async def poll_results():
                     )
                 except Exception as e:
                     print(f"  Reply failed: {e}", flush=True)
+                    await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"

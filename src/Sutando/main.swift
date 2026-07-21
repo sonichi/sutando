@@ -558,8 +558,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // apart, so the throttle never gated. Flood-protection is now solely
         // the watcherKeystrokesQueued() check above + the Timer interval.)
 
-        // If Claude Code is running inside the `sutando-core` tmux session
-        // (launch via src/agent/claude/cli/start-cli.sh), send the word `watcher` to
+        // If the core CLI is running inside the `sutando-core` tmux session
+        // (launch via src/agent/start-cli.sh), send the word `watcher` to
         // its pane as if Chi typed it. The CLI parses that as a restart
         // prompt and starts the watcher via its own run_in_background Bash
         // — so the watcher's stdout routes through the task-notification
@@ -573,7 +573,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Fallback: Claude Code isn't in the expected tmux session.
         // Notify so Chi can restart manually.
-        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via src/agent/claude/cli/start-cli.sh)")
+        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via src/agent/start-cli.sh)")
         logToFile("watcher dead; notification fired (tmux session not found)")
     }
 
@@ -2397,8 +2397,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Restart the Claude Code core session (sutando-core tmux session).
-    /// Invokes src/agent/claude/cli/start-cli.sh --restart which kills any existing
+    /// Restart the selected core CLI session (sutando-core tmux session).
+    /// Invokes src/agent/start-cli.sh --restart which kills any existing
     /// session and starts fresh detached. User can re-attach via
     /// "Open Core CLI" in the menu (or `tmux -S /tmp/sutando-tmux.sock
     /// attach -t sutando-core` from a terminal).
@@ -2412,10 +2412,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// self-invocation is not.
     ///
     /// Per Chi 2026-05-05: voice-agent restart explicitly excluded —
-    /// this only restarts the Claude Code CLI session.
+    /// this only restarts the selected core CLI session.
     @objc func restartCore() {
         notify("Sutando", "Restarting Core CLI…")
-        let script = repoRoot + "/src/agent/claude/cli/start-cli.sh"
+        let script = repoRoot + "/src/agent/start-cli.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script, "--restart"]

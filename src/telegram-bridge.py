@@ -359,7 +359,7 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     Errors are swallowed; transcription failure must never block task delivery.
     """
     import subprocess
-    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
     if not skill_script.exists():
         return None
     try:
@@ -822,11 +822,10 @@ def main():  # pragma: no cover
                 # Inject skill instructions so the agent follows notify-before-work
                 # and transcription protocol even after conversation compaction.
                 # Only injected when the referenced skills are installed on this node.
-                # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
-                # the config dir via $CLAUDE_CONFIG_DIR.
-                _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-                _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
-                _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+                # Use claude_home_path() — honours $CLAUDE_CONFIG_DIR → $CLAUDE_HOME → ~/.claude
+                # resolution order (inline os.environ.get misses the $CLAUDE_HOME fallback).
+                _notify_py = claude_home_path("skills", "task-progress", "scripts", "notify.py")  # pragma: no cover
+                _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")  # pragma: no cover
                 has_audio_attach = attachment_note and any(
                     attachment_note.lower().find(ext) != -1
                     for ext in (".m4a", ".mp3", ".ogg", ".opus", ".oga", ".wav", ".webm", ".aac")
@@ -1017,6 +1016,8 @@ def main():  # pragma: no cover
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
                 # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,

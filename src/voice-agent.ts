@@ -11,9 +11,9 @@
  *   4. Open http://localhost:8080 in Chrome and click Connect
  *
  * Environment:
- *   GEMINI_API_KEY       — Required: Google AI Studio API key (text LLM + vision + STT fallback)
- *   GEMINI_VOICE_API_KEY — Optional: separate key for the Gemini Live voice session.
- *                          Falls back to GEMINI_API_KEY. Useful for isolating voice
+ *   GEMINI_API_KEY       — Google AI Studio API key used as the default voice key.
+ *   GEMINI_VOICE_API_KEY — Optional dedicated key for the Gemini Live voice session.
+ *                          Takes precedence over GEMINI_API_KEY. Useful for isolating voice
  *                          (free-tier eligible) from paid-tier spend on a single key.
  *   ANTHROPIC_API_KEY   — Optional: only needed if not using claude CLI subscription auth
  *   (workspace)         — Per-user workspace dir resolved via `resolveWorkspace()`
@@ -89,15 +89,14 @@ function assertGeminiKey(name: string, value: string): void {
 }
 
 import { voiceApiKey } from './voice-key.js';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
-assertGeminiKey('GEMINI_API_KEY', GEMINI_API_KEY);
 // Voice surfaces use the shared GEMINI_VOICE_API_KEY → GEMINI_API_KEY chain
 // via voiceApiKey() (src/voice-key.ts). The VOICE-key fallback path isolates
 // voice billing onto a paid-tier key when set; unset still works.
 const GEMINI_VOICE_API_KEY = voiceApiKey();
-if (process.env.GEMINI_VOICE_API_KEY) {
-	assertGeminiKey('GEMINI_VOICE_API_KEY', process.env.GEMINI_VOICE_API_KEY);
-}
+assertGeminiKey(
+	process.env.GEMINI_VOICE_API_KEY ? 'GEMINI_VOICE_API_KEY' : 'GEMINI_API_KEY',
+	GEMINI_VOICE_API_KEY,
+);
 
 const PORT = Number(process.env.PORT) || 9900;
 // Loopback by default: the voice WS has no auth, so it must NOT be reachable
