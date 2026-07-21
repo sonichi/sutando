@@ -2,7 +2,13 @@
 """Regression tests for recreated proactive-result delivery IDs."""
 
 import importlib.util
+import json
+import os
+import sys
 import tempfile
+import threading
+import time
+import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -12,6 +18,50 @@ spec = importlib.util.spec_from_file_location(
 )
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+
+class _RecordingClient:
+    def __init__(self):
+        self.calls = []
+
+    def conversations_open(self, **kwargs):
+        return {"channel": {"id": "D-OWNER"}}
+
+    def chat_postMessage(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"ok": True}
+
+
+class _FakeApp:
+    def __init__(self, token=None):
+        self.client = _RecordingClient()
+
+    def _decorator(self, *args, **kwargs):
+        return lambda fn: fn
+
+    event = message = command = action = shortcut = view = _decorator
+
+
+def _load_bridge():
+    bolt = types.ModuleType("slack_bolt")
+    bolt.App = _FakeApp
+    sys.modules["slack_bolt"] = bolt
+    sys.modules["slack_bolt.adapter"] = types.ModuleType("slack_bolt.adapter")
+    socket = types.ModuleType("slack_bolt.adapter.socket_mode")
+    socket.SocketModeHandler = type("SocketModeHandler", (), {})
+    sys.modules["slack_bolt.adapter.socket_mode"] = socket
+
+    os.environ["SUTANDO_WORKSPACE"] = tempfile.mkdtemp(prefix="sutando-slack-dedupe-bridge-")
+    os.environ["SUTANDO_TEST_MODE"] = "1"
+    os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-not-real"
+    os.environ["SLACK_APP_TOKEN"] = "xapp-test-not-real"
+    bridge_spec = importlib.util.spec_from_file_location(
+        "slackbridge_dedupe_test",
+        REPO / "src" / "slack-bridge.py",
+    )
+    bridge = importlib.util.module_from_spec(bridge_spec)
+    bridge_spec.loader.exec_module(bridge)
+    return bridge
 
 
 def main():
@@ -35,6 +85,31 @@ def main():
     module.mark_delivered(state, hostile)
     assert module.was_delivered(state, hostile)
     assert not (state.parent / "outside.txt").exists()
+
+    # Receipt I/O is deliberately best-effort and must never break delivery.
+    original_receipt_path = module._receipt_path
+    module._receipt_path = lambda *_args: (_ for _ in ()).throw(OSError("read-only"))
+    assert module.was_delivered(state, "unreadable") is False
+    module.mark_delivered(state, "unwritable")
+    module._receipt_path = original_receipt_path
+
+    # Exercise the actual watcher twice with one deterministic filename.
+    bridge = _load_bridge()
+    access_file = Path(os.environ["SUTANDO_WORKSPACE"]) / "access.json"
+    bridge.ACCESS_FILE = access_file
+    access_file.write_text(json.dumps({"allowFrom": ["owner-id"]}))
+    proactive = bridge.RESULTS_DIR / "proactive-same-slot.txt"
+    proactive.write_text("first body")
+    watcher = threading.Thread(target=bridge.result_watcher, daemon=True)
+    watcher.start()
+    time.sleep(0.3)
+    assert len(bridge.app.client.calls) == 1
+    proactive.write_text("recreated body")
+    time.sleep(1.2)
+    assert len(bridge.app.client.calls) == 1
+    assert not proactive.exists()
+    audit = bridge.STATE_DIR / "result-audit.log"
+    assert "\tproactive-same-slot.txt\tdeduped\tslack" in audit.read_text()
 
     bridge = (REPO / "src" / "slack-bridge.py").read_text()
     check_pos = bridge.index("proactive_was_delivered(STATE_DIR, delivery_id)")
