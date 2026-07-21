@@ -92,8 +92,10 @@ class TestOwnerActivityAtomicWrite(unittest.TestCase):
         )
 
     def test_source_sites_use_perpid_staging(self):
-        """All four owner-activity writers — the three bridges plus the sparrow
-        remote-gateway bridge — must stage OWNER_ACTIVITY_FILE per-PID (#2222)."""
+        """All FIVE owner-activity writers — the three bridges, the sparrow
+        remote-gateway bridge (Python), and the task-bridge (TypeScript) — must
+        stage OWNER_ACTIVITY_FILE per-PID (#2222). The census is complete: any
+        new writer of the shared target must appear here or the guard is a lie."""
         bridges = ["src/slack-bridge.py", "src/discord-bridge.py",
                    "src/telegram-bridge.py",
                    "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"]
@@ -109,6 +111,22 @@ class TestOwnerActivityAtomicWrite(unittest.TestCase):
                 good.search(src),
                 f"{rel} does not use the per-PID staging name",
             )
+
+        # The 5th writer is TypeScript (src/task-bridge.ts) with different syntax:
+        # a shared `OWNER_ACTIVITY_FILE + '.tmp'` vs a per-PID template literal
+        # `${OWNER_ACTIVITY_FILE}.${process.pid}.tmp`.
+        ts_rel = "src/task-bridge.ts"
+        ts_src = (REPO / ts_rel).read_text()
+        ts_bad = re.compile(r"OWNER_ACTIVITY_FILE\s*\+\s*['\"]\.tmp['\"]")
+        ts_good = re.compile(r"\$\{OWNER_ACTIVITY_FILE\}\.\$\{process\.pid\}\.tmp")
+        self.assertIsNone(
+            ts_bad.search(ts_src),
+            f"{ts_rel} still stages OWNER_ACTIVITY_FILE under a shared .tmp",
+        )
+        self.assertIsNotNone(
+            ts_good.search(ts_src),
+            f"{ts_rel} does not use the per-PID staging name",
+        )
 
 
 # Self-check (not part of the suite): demonstrate the OLD pattern CAN tear, so
