@@ -13,13 +13,14 @@
  * Regenerate (deliberately): ANCHOR_UPDATE=1 npx tsx tests/phone-behavior-anchors.test.ts
  * Run: npx tsx --test tests/phone-behavior-anchors.test.ts
  */
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const REPO = join(new URL('.', import.meta.url).pathname, '..');
+const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const FIXTURE = join(REPO, 'tests', 'fixtures', 'phone-behavior-anchors.json');
 const UPDATE = process.env.ANCHOR_UPDATE === '1';
 
