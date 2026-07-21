@@ -36,6 +36,7 @@ Runs forever until killed. Exit codes:
 """
 from __future__ import annotations
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -124,13 +125,103 @@ def write_beat(status: str = "running") -> None:
         "locality": _locality(),
         "schema_version": 2,
     }
-    tmp = target.with_suffix(".alive.tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(target)
+    # Per-PROCESS staging file: with a shared name, two concurrent first beats
+    # destroy each other mid-`replace` (one writer's rename removes the other's
+    # staging file → FileNotFoundError, and interleaved writes can leave the
+    # final .alive as invalid JSON — both reproduced in the #2201 review).
+    tmp = target.parent / f"{target.name}.tmp.{os.getpid()}"
+    try:
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(target)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op after a successful replace
 
 
 _STARTED_AT: float = time.time()
 _SHUTDOWN_REQUESTED = False
+
+
+def another_heartbeat_alive(staleness_s: float = 90.0) -> "int | None":
+    """Self-guard: return the pid of an ALREADY-BEATING heartbeat for this
+    host, or None if this process should take over.
+
+    "Already beating" requires ALL of: the .alive file exists, its mtime is
+    younger than `staleness_s` (the documented cross-host liveness threshold),
+    its payload names a pid, that pid is a live process, and it isn't us.
+    Anything else — missing/stale file, malformed payload, dead pid — means
+    the previous owner is gone and we take over (same recoverability stance
+    as the mtime-staleness readers).
+
+    Why: two concurrent heartbeats write the same .alive and flap it between
+    pids — harmless for mtime-liveness, but ambiguous for consumers that use
+    the pid as a control target (the pause/stop-core path, #2198). With this
+    guard a double-start (e.g. startup.sh + the schedule-crons step-5.5
+    backstop landing in the same window, #2199) resolves to exactly one
+    writer, deterministically.
+    """
+    target = _alive_path()
+    try:
+        st = target.stat()
+        if time.time() - st.st_mtime > staleness_s:
+            return None
+        pid = int(json.loads(target.read_text())["pid"])
+    except Exception:
+        return None
+    if pid == os.getpid():
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None  # ESRCH — no such process; take over.
+    except PermissionError:
+        # EPERM — the process EXISTS but we may not signal it (sandboxed or
+        # privilege-separated launcher). That is a live heartbeat: yield.
+        return pid
+    except OSError:
+        return None  # anything else — treat as dead; staleness readers recover.
+    return pid
+
+
+_LOCK_FD: "int | None" = None
+
+
+def try_acquire_ownership() -> "int | None":
+    """Atomically claim single-writer ownership for this host, or name who to
+    yield to. Returns None on success; a pid (or -1 when the holder is not yet
+    identifiable) when another starter/beater owns the host.
+
+    Check-then-act on the .alive file alone is NOT enough: on a true
+    simultaneous start every process can observe "no fresh owner" before any
+    first beat lands (reproduced with a 5-way forked barrier in the #2201
+    review — all five proceeded as owners). The claim must be atomic, so it
+    rides an flock(LOCK_EX | LOCK_NB) on `<host>.lock`, held open for the
+    process lifetime and released by the kernel on ANY death — no stale-lock
+    recovery needed, which is why it beats O_EXCL lock files here.
+
+    The freshness/pid guard still runs AFTER the flock: a beater from a
+    pre-flock build (or a foreign writer) doesn't hold the lock but is still
+    a legitimate owner — yield to it rather than fight over the file.
+    """
+    global _LOCK_FD
+    CORES_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = CORES_DIR / f"{_hostname()}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        # The holder's pid is only knowable once it has beaten.
+        try:
+            return int(json.loads(_alive_path().read_text())["pid"])
+        except Exception:
+            return -1
+    other = another_heartbeat_alive()
+    if other is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        return other
+    _LOCK_FD = fd  # deliberately held (and leaked) for the process lifetime
+    return None
 
 
 def _handle_signal(signum: int, frame) -> None:
@@ -150,6 +241,15 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     while not _SHUTDOWN_REQUESTED:
+        # Re-check ownership before every beat: if a DIFFERENT live pid now
+        # owns the file (e.g. this process wedged long enough to be declared
+        # stale and something else legitimately took over), exit instead of
+        # flapping the file back (#2201 review hardening).
+        usurper = another_heartbeat_alive()
+        if usurper is not None:
+            print(f"core_heartbeat: pid {usurper} took over the host heartbeat — "
+                  "exiting (yield instead of pid-flapping)", flush=True)
+            return 0
         try:
             write_beat(status=status)
         except Exception as e:
@@ -177,7 +277,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.once:
+        # Debug/test escape hatch: --once is a forced single beat, exempt from
+        # the self-guard on purpose.
         write_beat(status=args.status)
+        return 0
+    other = try_acquire_ownership()
+    if other is not None:
+        who = f"pid {other}" if other > 0 else "another starter (lock held, no beat yet)"
+        print(f"core_heartbeat: {who} already owns this host's heartbeat — "
+              "exiting (self-guard; the desired single-writer state already holds)",
+              flush=True)
         return 0
     # Anonymous, opt-out product telemetry: one event per real core boot so
     # maintainers can count active installs (OSS + desktop). No-op when opted
