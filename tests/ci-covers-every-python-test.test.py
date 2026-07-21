@@ -57,11 +57,20 @@ def test_looking_files():
     return keep
 
 
+def orphans_in(all_files, discovered, named):
+    """The actual rule, extracted so a synthetic case can pin it.
+
+    Inlined, this was un-pinnable: gutting it to `orphans = []` passed the whole
+    suite, because the only other test exercised set arithmetic in isolation
+    rather than the code path the real assertion uses."""
+    return sorted(set(all_files) - set(discovered) - set(named))
+
+
 class TestCICoversEveryPythonTest(unittest.TestCase):
     def test_no_python_test_is_invisible_to_ci(self):
         import os
         os.chdir(REPO)
-        orphans = sorted(test_looking_files() - discovered_by_find() - named_in_workflows())
+        orphans = orphans_in(test_looking_files(), discovered_by_find(), named_in_workflows())
         self.assertEqual(
             orphans, [],
             "these test files are never executed by CI — either move them to "
@@ -70,10 +79,21 @@ class TestCICoversEveryPythonTest(unittest.TestCase):
         )
 
     def test_the_guard_can_actually_fail(self):
-        """A guard that cannot fire is the bug it exists to catch."""
-        fake = {"packages/somewhere/tests/test_invented.py"}
-        self.assertTrue(fake - discovered_by_find() - named_in_workflows(),
-                        "an out-of-tree file must register as an orphan")
+        """A guard that cannot fire is the bug it exists to catch.
+
+        Exercises orphans_in() — the same function the real assertion calls — so
+        stubbing that computation breaks this case too. Testing the set algebra
+        inline instead left the real check gutted-and-green."""
+        self.assertEqual(
+            orphans_in({"packages/somewhere/tests/test_invented.py"}, set(), set()),
+            ["packages/somewhere/tests/test_invented.py"],
+            "an out-of-tree file must register as an orphan")
+
+    def test_a_discovered_file_is_not_an_orphan(self):
+        self.assertEqual(orphans_in({"tests/x.test.py"}, {"tests/x.test.py"}, set()), [])
+
+    def test_a_workflow_named_file_is_not_an_orphan(self):
+        self.assertEqual(orphans_in({"scripts/y.py"}, set(), {"scripts/y.py"}), [])
 
 
 if __name__ == "__main__":
