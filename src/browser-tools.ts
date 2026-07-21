@@ -10,6 +10,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
+import { resolveCredential } from './credential-resolver.js';
 import { readCaptureToken } from './util_paths.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -362,7 +363,8 @@ export const openUrlTool: ToolDefinition = {
 async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
 	// Prefer free-tier voice key (gemini-3.1-flash-lite-preview is free-tier eligible on REST
 	// generateContent — verified 2026-05-14). Falls back to paid GEMINI_API_KEY if voice key absent.
-	const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+	// Via the G8 resolver: managed tier (if provisioned) → GEMINI_VOICE_API_KEY → GEMINI_API_KEY.
+	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
 		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
@@ -536,7 +538,8 @@ export const pointAtTool: ToolDefinition = {
 		const { query } = args as { query: string };
 		// Free-tier eligible voice key preferred (the POC proved gemini-3-flash-preview
 		// works on it); falls back to the paid key. Same precedence as describe_screen.
-		const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+		// Via the G8 resolver: managed tier (if provisioned) → GEMINI_VOICE_API_KEY → GEMINI_API_KEY.
+		const apiKey = resolveCredential('gemini-voice').key;
 		if (!apiKey) return { error: 'point_at unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)' };
 		if (!query?.trim()) return { error: 'point_at needs a query (what to point at)' };
 		try {
