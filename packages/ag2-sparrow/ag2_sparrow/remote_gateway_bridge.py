@@ -117,7 +117,12 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 HEARTBEAT_INTERVAL = 60
-_ack_disabled = False
+# When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
+# instead of hammering it — but only for this cooldown, then retry. A permanent
+# latch would mean a broker that GAINS the endpoint (e.g. a deploy) is never
+# picked up until the worker restarts; time-gating makes it self-healing.
+ACK_UNSUPPORTED_COOLDOWN = int(os.environ.get("REMOTE_ACK_RETRY_COOLDOWN") or "300")
+_ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipped
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
@@ -383,17 +388,23 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35)
 
 def _post_task_ack(tid: str) -> bool:
     """Tell the gateway a task made it safely into the local queue."""
-    global _ack_disabled
-    if _ack_disabled or not _valid_tid(tid):
+    global _ack_disabled_until
+    if not _valid_tid(tid):
         return False
+    if _ack_disabled_until and time.time() < _ack_disabled_until:
+        return False  # gateway recently 404'd /ack — retry after the cooldown
     try:
         safe_tid = urllib.parse.quote(tid, safe="")
         _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": tid}, timeout=10)
+        _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
-            _ack_disabled = True
-            _log("gateway does not support task ack — continuing without")
+            # Not permanent: a broker that later deploys /ack should be picked up
+            # without a worker restart, so back off for a cooldown and retry.
+            _ack_disabled_until = time.time() + ACK_UNSUPPORTED_COOLDOWN
+            _log(f"gateway does not support task ack — retrying in "
+                 f"{ACK_UNSUPPORTED_COOLDOWN}s")
             return False
         if e.code in (401, 403):
             raise
