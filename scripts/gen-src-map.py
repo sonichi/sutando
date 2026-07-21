@@ -210,7 +210,11 @@ def render(rows: list[tuple[str, str]]) -> str:
 
 
 def main() -> int:
-    rendered = render(collect())
+    # Keep the collected rows: the write path needs the count for its summary
+    # line, and re-calling collect() would re-walk src/ and re-read every
+    # header a second time for a number we already have.
+    rows = collect()
+    rendered = render(rows)
     check = "--check" in sys.argv[1:]
 
     if check:
@@ -228,7 +232,7 @@ def main() -> int:
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(rendered, encoding="utf-8")
-    print(f"gen-src-map: wrote {OUT.relative_to(REPO)} ({len(collect())} modules)")
+    print(f"gen-src-map: wrote {OUT.relative_to(REPO)} ({len(rows)} modules)")
     return 0
 
 
