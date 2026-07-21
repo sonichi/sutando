@@ -25,8 +25,10 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -42,7 +44,18 @@ def _write_shared(target: Path, payload: dict) -> None:
 
 
 def _write_perpid(target: Path, payload: dict) -> None:
-    tmp = target.with_suffix(f".json.{os.getpid()}.tmp")  # the fix
+    # PID-only staging: unique ACROSS processes but SHARED across threads in one
+    # process — insufficient for a multi-threaded writer (e.g. Slack Bolt's
+    # listener ThreadPoolExecutor). Two threads collide on this exact temp path.
+    tmp = target.with_suffix(f".json.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, target)
+
+
+def _write_perinvocation(target: Path, payload: dict) -> None:
+    # Per-invocation staging (PID + uuid4): unique across BOTH processes and
+    # same-process threads. This is the fix the bridges use.
+    tmp = target.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(payload))
     os.replace(tmp, target)
 
@@ -91,6 +104,60 @@ class TestOwnerActivityAtomicWrite(unittest.TestCase):
             f"per-PID staging produced {self._torn} torn reads — must be 0",
         )
 
+    def _run_threads(self, writer, n_threads=16, writes=400) -> int:
+        """Run `n_threads` writer threads IN ONE PROCESS (all sharing this PID),
+        sampling the target for torn JSON while they race. Returns torn count.
+        This is the case per-PID staging CANNOT cover — every thread has the same
+        os.getpid(), so a PID-only temp name is shared across them."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="oa-2222-thr-"))
+        target = tmpdir / "last-owner-activity.json"
+        target.write_text(json.dumps({"ts": 0, "seed": True}))
+
+        def work():
+            for i in range(writes):
+                try:
+                    writer(target, {"ts": int(time.time()),
+                                    "tid": threading.get_ident(), "i": i})
+                except (FileNotFoundError, OSError):
+                    pass  # a shared-temp collision — the very race under test
+
+        ts = [threading.Thread(target=work) for _ in range(n_threads)]
+        for t in ts:
+            t.start()
+        torn = 0
+        while any(t.is_alive() for t in ts):
+            try:
+                json.loads(target.read_text())
+            except (ValueError, OSError):
+                torn += 1
+        for t in ts:
+            t.join(10)
+        json.loads(target.read_text())  # final state always valid (rename is atomic)
+        return torn
+
+    def test_perinvocation_never_tears_same_process_threads(self):
+        """The fix must be safe for MULTI-THREADED writers in a single process —
+        Slack Bolt runs listeners on a thread pool, so two owner-activity writes
+        can race inside one PID. Per-invocation (PID+uuid) staging → 0 torn."""
+        torn = self._run_threads(_write_perinvocation)
+        self.assertEqual(
+            torn, 0,
+            f"per-invocation staging tore {torn} times under same-process threads — must be 0",
+        )
+
+    def test_perpid_does_tear_same_process_threads(self):
+        """Regression witness: PID-only staging (the earlier, insufficient fix)
+        DOES tear when writers share a PID across threads — the exact collision
+        per-invocation staging removes. If this ever stops tearing, the test above
+        no longer proves anything, so it must fail loudly. High concurrency makes
+        it deterministic in practice (qingyun-001's repro: 8 threads → 1,216 torn)."""
+        torn = self._run_threads(_write_perpid)
+        self.assertGreater(
+            torn, 0,
+            "PID-only staging did not tear same-process — the per-invocation test "
+            "can then no longer demonstrate it fixes a real race",
+        )
+
     def test_source_sites_use_perpid_staging(self):
         """All FIVE owner-activity writers — the three bridges, the sparrow
         remote-gateway bridge (Python), and the task-bridge (TypeScript) — must
@@ -99,8 +166,11 @@ class TestOwnerActivityAtomicWrite(unittest.TestCase):
         bridges = ["src/slack-bridge.py", "src/discord-bridge.py",
                    "src/telegram-bridge.py",
                    "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"]
-        bad = re.compile(r'OWNER_ACTIVITY_FILE\.with_suffix\(\s*["\']\.json\.tmp["\']')
-        good = re.compile(r'OWNER_ACTIVITY_FILE\.with_suffix\(\s*f["\']\.json\.\{os\.getpid\(\)\}\.tmp["\']')
+        # bad = a SHARED '.json.tmp' OR a PID-only '.json.{os.getpid()}.tmp'
+        # (the latter still collides across threads in one process). good = the
+        # per-invocation PID+uuid name, unique across processes AND threads.
+        bad = re.compile(r'OWNER_ACTIVITY_FILE\.with_suffix\(\s*f?["\']\.json(\.\{os\.getpid\(\)\})?\.tmp["\']')
+        good = re.compile(r'OWNER_ACTIVITY_FILE\.with_suffix\(\s*f["\']\.json\.\{os\.getpid\(\)\}\.\{uuid\.uuid4\(\)\.hex\}\.tmp["\']')
         for rel in bridges:
             src = (REPO / rel).read_text()
             self.assertIsNone(

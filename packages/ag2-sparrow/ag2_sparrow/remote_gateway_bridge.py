@@ -45,6 +45,7 @@ import atexit
 import base64
 import json
 import os
+import uuid
 import re
 import signal
 import socket
@@ -749,7 +750,7 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         # file, so the rename can publish torn JSON to the proactive loop's
         # presence check. A per-PID temp is never shared; os.replace is an atomic
         # overwrite — last writer wins, cleanly. (sonichi/sutando#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:  # noqa: BLE001

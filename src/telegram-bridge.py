@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 import re
 import secrets
 import sys
@@ -199,7 +200,7 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         # concurrent writers truncate and interleave the same temp file, so the
         # rename can publish torn JSON. A per-PID temp is never shared, and
         # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
