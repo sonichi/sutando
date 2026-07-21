@@ -19,8 +19,8 @@ plus a structural guard that the pairing branch actually bails on None instead
 of regressing to the destructive bare-except write.
 """
 from pathlib import Path
+import ast
 import json
-import re
 import sys
 import tempfile
 import unittest
@@ -31,15 +31,19 @@ BRIDGE = REPO / "src" / "discord-bridge.py"
 
 def _load_read_access_for_seed():
     """Extract + exec ONLY read_access_for_seed (avoids the heavy discord.py
-    import the full module does)."""
+    import the full module does). Compile its original AST node with the
+    production filename/line numbers so coverage measures the shipped helper,
+    not a synthetic copy inside this test."""
     src = BRIDGE.read_text()
-    m = re.search(
-        r"\ndef read_access_for_seed\(path\):.*?\n    except Exception:\n        return None\n",
-        src, re.S,
+    tree = ast.parse(src, filename=str(BRIDGE))
+    fn_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "read_access_for_seed"
     )
-    assert m, "could not locate read_access_for_seed source in discord-bridge.py"
     ns = {"json": json}
-    exec(m.group(0), ns)
+    module = ast.Module(body=[fn_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, str(BRIDGE), "exec"), ns)
     return ns["read_access_for_seed"]
 
 

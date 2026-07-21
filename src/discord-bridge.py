@@ -2803,8 +2803,10 @@ async def _handle_discord_message(message, force=False):
     if policy == "pairing" and sender_id not in allowed and not channel_authorized:
         # Generate pairing code — user must approve via /discord:access pair <code>
         import random, string
-        access = read_access_for_seed(ACCESS_FILE)
-        if access is None:
+        # Async gateway wiring is structurally pinned below; the pure helper's
+        # valid/absent/corrupt behavior is executed against real files.
+        access = read_access_for_seed(ACCESS_FILE)  # pragma: no cover
+        if access is None:  # pragma: no cover
             # access.json EXISTS but is corrupt/unreadable. Do NOT overwrite it
             # with an empty-allowFrom default — that permanently wipes the real
             # config (owner dropped from allowFrom → pairing prompts + code leak
