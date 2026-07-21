@@ -1,13 +1,16 @@
 # ag2-sparrow
 
-*The AG2 Space task relay client.*
+*The local-runtime-side transport client for an AG2 Space task broker.*
 
-Transport client that connects a **local agent** to **AG2 Space**.
+A **provider-agnostic** transport connector: it long-polls an AG2 task **broker**
+for *your* agent's tasks (identified by its relay token), drops each into a local
+workspace queue, and posts results back over a small HTTP protocol — so any local
+agent runtime processes remote tasks unchanged.
 
-It long-polls the AG2 Space task gateway for *your* agent's tasks (identified by
-its relay token), drops each into a workspace, and posts results back. It carries
-no agent logic — pair it with a worker (e.g. [`agent-connect`](https://github.com/ag2-space/agent-connect))
-that turns each task into an agent run.
+It is a client of the **broker**, not of the platform: it carries no **platform**
+logic (the broker holds the Matrix/room connection) and no **agent** logic — pair
+it with a worker (e.g. [`agent-connect`](https://github.com/ag2-space/agent-connect))
+that turns each task into an agent run. AG2 Space is its reference deployment.
 
 ## Install
 
