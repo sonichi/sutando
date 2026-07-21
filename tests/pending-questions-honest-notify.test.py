@@ -49,9 +49,30 @@ class TestUndrainedDetection(unittest.TestCase):
         self.assertEqual(self.m.undrained_proactive_files(), [],
                          "a stale task result is a different thing entirely")
 
-    def test_d_missing_dir_does_not_raise(self):
-        self.m.RESULTS_DIR = Path("/nonexistent/definitely/not/here")
+    def test_d_glob_raising_oserror_is_swallowed(self):
+        """The outer handler. A missing dir does NOT raise from glob() — it
+        yields nothing — so the earlier version of this test passed without ever
+        reaching the except it was named for."""
+        class Boom:
+            def glob(self, _pat):
+                raise OSError("boom")
+        self.m.RESULTS_DIR = Boom()
         self.assertEqual(self.m.undrained_proactive_files(), [])
+
+    def test_d2_stat_raising_oserror_skips_that_file(self):
+        """The inner handler: one unstattable entry must not lose the others."""
+        good = self._write("proactive-good.txt", self.m.UNDRAINED_AGE_S + 60)
+
+        class Bad:
+            name = "proactive-bad.txt"
+            def stat(self):
+                raise OSError("nope")
+
+        class Dir:
+            def glob(self, _pat):
+                return [Bad(), good]
+        self.m.RESULTS_DIR = Dir()
+        self.assertEqual(self.m.undrained_proactive_files(), ["proactive-good.txt"])
 
     def test_e_notify_macos_reports_failure(self):
         import subprocess
@@ -99,6 +120,43 @@ class TestNotifySummary(unittest.TestCase):
     def test_e_count_is_carried(self):
         s, _ = self.m.notify_summary(16, True, True, [])
         self.assertIn("16 pending questions", s)
+
+
+class TestDeliver(unittest.TestCase):
+    """deliver() must report per-path truth, not a blanket success."""
+
+    def setUp(self):
+        import tempfile
+        self.m = _load(tempfile.mkdtemp(prefix="cpq-del-"))
+        self.m.notify_discord_dm = lambda q: None
+        self.m.notify_voice = lambda q: None
+
+    def test_a_voice_connected_reports_ok(self):
+        self.m.notify_macos = lambda c, t: True
+        self.m.voice_client_connected = lambda: True
+        s, w = self.m.deliver([{"title": "q"}], 1, ["q"])
+        self.assertIn("voice=ok", s)
+        self.assertIsNone(w)
+
+    def test_b_voice_offline_reports_skipped(self):
+        self.m.notify_macos = lambda c, t: True
+        self.m.voice_client_connected = lambda: False
+        s, _ = self.m.deliver([{"title": "q"}], 1, ["q"])
+        self.assertIn("voice=skipped", s)
+
+    def test_c_macos_failure_surfaces(self):
+        self.m.notify_macos = lambda c, t: False
+        self.m.voice_client_connected = lambda: False
+        s, _ = self.m.deliver([{"title": "q"}], 1, ["q"])
+        self.assertIn("macos=FAILED", s)
+
+    def test_d_undrained_backlog_produces_warning(self):
+        self.m.notify_macos = lambda c, t: True
+        self.m.voice_client_connected = lambda: False
+        self.m.undrained_proactive_files = lambda: ["proactive-old.txt"]
+        s, w = self.m.deliver([{"title": "q"}], 1, ["q"])
+        self.assertIn("UNDRAINED", s)
+        self.assertIn("NOT reaching the owner", w)
 
 
 if __name__ == "__main__":

@@ -246,6 +246,23 @@ def notify_summary(count, macos_ok, voice_ok, stale):
     return summary, warning
 
 
+def deliver(questions, count, titles):
+    """Fire every notification path and report what actually happened.
+
+    Separated from main() so the delivery decisions are testable; main() is left
+    as argument parsing plus printing. Voice is skipped when disconnected because
+    the DM fallback would otherwise deliver question-*.txt as a duplicate.
+    """
+    stale = undrained_proactive_files()
+    macos_ok = notify_macos(count, titles)
+    voice_ok = False
+    if voice_client_connected():
+        notify_voice(questions)
+        voice_ok = True
+    notify_discord_dm(questions)
+    return notify_summary(count, macos_ok, voice_ok, stale)
+
+
 def main():
     force = "--force" in sys.argv
     questions = get_waiting_questions()
@@ -263,25 +280,8 @@ def main():
     count = len(questions)
     titles = [q["title"] for q in questions]
 
-    # macOS notification
-    stale_before = undrained_proactive_files()
-    macos_ok = notify_macos(count, titles)
-
-    # Voice result — only when voice is actually connected. When offline, the
-    # discord-bridge dm-fallback would deliver question-*.txt as a duplicate
-    # of notify_discord_dm below. Skipping cuts the spam in half.
-    voice_ok = False
-    if voice_client_connected():
-        notify_voice(questions)
-        voice_ok = True
-
-    # Discord DM to owner (via discord-bridge poll_proactive)
-    notify_discord_dm(questions)
-
-    # Update last notify time
+    summary, warning = deliver(questions, count, titles)
     LAST_NOTIFY_FILE.write_text(str(int(time.time())))
-
-    summary, warning = notify_summary(count, macos_ok, voice_ok, stale_before)
     print(summary)
     if warning:
         print(warning, file=sys.stderr)
