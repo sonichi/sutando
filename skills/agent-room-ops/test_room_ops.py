@@ -458,5 +458,95 @@ class NormalizeReactionsTests(unittest.TestCase):
         self.assertEqual(out[0]["reactions"], [])
 
 
+import resolve as rs  # noqa: E402
+import mention as mn  # noqa: E402
+
+_AGENTS = [
+    {"id": "@sutando-qingyun-001:ag2.space", "label": "Air MBP"},
+    {"id": "@sutando-qingyun-mini:ag2.space", "label": "Mini"},
+    {"id": "@qingyun-air.agent:ag2.space", "label": "core"},
+]
+
+
+class ResolveTests(unittest.TestCase):
+    def test_exact_localpart(self):
+        r = rs.match_agent("sutando-qingyun-001", _AGENTS)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@sutando-qingyun-001:ag2.space")
+
+    def test_substring_unique(self):
+        r = rs.match_agent("001", _AGENTS)  # only qingyun-001's localpart contains it
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@sutando-qingyun-001:ag2.space")
+
+    def test_full_mxid_passthrough(self):
+        r = rs.match_agent("@whoever:ag2.space", _AGENTS)  # already an mxid → trust it
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@whoever:ag2.space")
+
+    def test_ambiguous_reports_candidates_and_does_not_resolve(self):
+        r = rs.match_agent("sutando-qingyun", _AGENTS)  # substring of BOTH 001 and mini
+        self.assertFalse(r["ok"])
+        self.assertEqual(len(r["candidates"]), 2)
+        self.assertIsNone(r["mxid"])
+
+    def test_no_match(self):
+        r = rs.match_agent("nobody", _AGENTS)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["candidates"], [])
+
+    def test_exact_beats_substring(self):
+        agents = [{"id": "@mini:hs", "label": ""}, {"id": "@mini-helper:hs", "label": ""}]
+        r = rs.match_agent("mini", agents)  # exact localpart wins over the substring one
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@mini:hs")
+
+    def test_label_exact_match(self):
+        r = rs.match_agent("Mini", _AGENTS)  # case-insensitive label hit
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@sutando-qingyun-mini:ag2.space")
+
+    def test_empty_query(self):
+        self.assertFalse(rs.match_agent("", _AGENTS)["ok"])
+
+
+class MentionBodyTests(unittest.TestCase):
+    def test_leads_with_mxid(self):
+        b = mn.build_body("@sutando-qingyun-001:ag2.space", "review #149")
+        self.assertTrue(b.startswith("@sutando-qingyun-001:ag2.space"))
+        self.assertIn("review #149", b)
+
+    def test_empty_message_is_bare_mxid(self):
+        self.assertEqual(mn.build_body("@x:hs", ""), "@x:hs")
+
+    def test_ambiguous_handle_does_not_post(self):
+        # mention() must refuse to post on an ambiguous handle (never mention the
+        # wrong agent) — returns ok:false + candidates, no network touched.
+        res = mn.mention("sutando-qingyun", "hi", ROOM, HS, gate=None, agents=_AGENTS)
+        self.assertFalse(res["ok"])
+        self.assertEqual(len(res["candidates"]), 2)
+
+    def test_post_payload_leads_with_mxid_and_carries_mentions(self):
+        # A resolved mention posts op:message to /v1/room with the mxid LEADING
+        # the body (text trigger) AND a forward-compat `mentions:[mxid]` (activates
+        # structured push once the broker honors it). Both pinned so neither regresses.
+        cap = {}
+
+        def _fake_http_json(method, url, headers, payload):
+            cap["url"], cap["payload"] = url, payload
+            return 200, {"event_id": "$posted"}
+
+        with mock.patch.object(mn, "gateway", return_value=("https://gw/relay", {})), \
+             mock.patch.object(mn, "http_json", side_effect=_fake_http_json):
+            res = mn.mention("qingyun-001", "review #149", ROOM, HS, gate=None, agents=_AGENTS)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["event_id"], "$posted")
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        p = cap["payload"]
+        self.assertEqual(p["op"], "message")
+        self.assertEqual(p["mentions"], ["@sutando-qingyun-001:ag2.space"])
+        self.assertTrue(p["body"].startswith("@sutando-qingyun-001:ag2.space"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
