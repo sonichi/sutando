@@ -103,6 +103,38 @@ def test_write_task_is_idempotent_under_redelivery():
         print("PASS test_write_task_is_idempotent_under_redelivery")
 
 
+def test_write_task_does_not_reexecute_a_completed_task():
+    """v1 freeze gate item 3: same task_id never starts two local executions.
+    The broker re-serves a task on lease expiry; if the worker already handled it,
+    `_write_task` must NOT re-queue it (no second run for the watcher to pick up) —
+    it drops a `[no-send]` result so the drain re-acks it upstream instead."""
+    # (a) the task was already processed + archived
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        tid = "task-1784500000010"
+        arch = m.TASKS_DIR / "archive"
+        arch.mkdir(parents=True, exist_ok=True)
+        (arch / f"{tid}.txt").write_text(f"id: {tid}\ntask: handled earlier\n")
+        assert m._write_task(_task(tid)) == tid
+        # NOT re-queued — nothing live for the watcher to execute a second time.
+        assert list(m.TASKS_DIR.glob("task-*.txt")) == []
+        rfile = m.RESULTS_DIR / f"{tid}.txt"
+        assert rfile.exists() and rfile.read_text().startswith("[no-send]")
+        print("PASS test_write_task_does_not_reexecute_a_completed_task (archived task)")
+
+    # (b) the reply was already delivered + archived (result archive, ts-suffixed)
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        tid = "task-1784500000011"
+        m.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (m.ARCHIVE_RESULTS_DIR / f"{tid}-1784500000999.txt").write_text("earlier reply\n")
+        assert m._write_task(_task(tid)) == tid
+        assert list(m.TASKS_DIR.glob("task-*.txt")) == []
+        rfile = m.RESULTS_DIR / f"{tid}.txt"
+        assert rfile.exists() and rfile.read_text().startswith("[no-send]")
+        print("PASS test_write_task_does_not_reexecute_a_completed_task (archived result)")
+
+
 def test_write_task_drops_unsafe_and_idless():
     with tempfile.TemporaryDirectory() as d:
         base = pathlib.Path(d)
@@ -117,5 +149,6 @@ if __name__ == "__main__":
     test_write_task_publishes_atomically_and_completely()
     test_write_task_never_leaves_partial_file_on_publish_crash()
     test_write_task_is_idempotent_under_redelivery()
+    test_write_task_does_not_reexecute_a_completed_task()
     test_write_task_drops_unsafe_and_idless()
     print("ALL PASS test_write_task_atomic")
