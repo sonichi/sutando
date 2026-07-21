@@ -108,11 +108,9 @@ def main():
     assert bridge.app.client.opened_for == "rui-owner"
     assert len(bridge.app.client.calls) == 1
 
-    # No eligible owner must take the explicit skip path, never a team DM.
-    access_file.write_text(json.dumps({
-        "allowFrom": ["team-only"],
-        "tierMap": {"team-only": "team"},
-    }))
+    # An unreadable/malformed access file must take the explicit no-owner skip
+    # path, never guess a team recipient or crash the watcher.
+    access_file.write_text("{not-json")
     (bridge.RESULTS_DIR / "proactive-no-owner-test.txt").write_text("must not send")
     time.sleep(1.2)
     assert len(bridge.app.client.calls) == 1
