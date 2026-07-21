@@ -73,7 +73,7 @@ for _root in (
 # module-level config (tier fail-closed parsing, URL/TOKEN, dirs) must
 # re-evaluate on EVERY load of this file — the mock-gateway test harness loads
 # it repeatedly under different env — and attribute reads/writes
-# (``rtc._ack_disabled = False``) must hit the same namespace the running code
+# (``rtc._ack_disabled_until = 0.0``) must hit the same namespace the running code
 # uses. A cached ``import ag2_sparrow.remote_gateway_bridge`` gives neither.
 _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
