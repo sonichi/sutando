@@ -229,8 +229,8 @@ def case_m_absent_sentinel_with_live_orphan() -> list[str]:
 
 
 def case_n_trees_group_a_process_chain() -> list[str]:
-    """The grouping algorithm itself: wrapper -> script -> subshell is ONE
-    watcher, not three. Counting matching processes would say three."""
+    """The grouping algorithm: script + subshell is ONE watcher, not two.
+    Counting matching processes would double it."""
     ps = (
         "  100     1 /bin/zsh -c eval 'bash src/watch-tasks-stream.sh'\n"
         "  101   100 bash src/watch-tasks-stream.sh\n"
@@ -242,18 +242,37 @@ def case_n_trees_group_a_process_chain() -> list[str]:
     trees = hc._watcher_trees(ps)
     fails = []
     if len(trees) != 2:
-        fails.append(f"n) expected 2 trees from 5 matching procs, got {len(trees)}: {trees}")
-    if "100" in trees and "101" not in trees["100"]:
-        fails.append("n) the script pid must be grouped under its wrapper root")
+        fails.append(f"n) expected 2 trees, got {len(trees)}: {trees}")
+    if "101" in trees and "102" not in trees["101"]:
+        fails.append("n) the subshell must be grouped under its script root")
     if any("999" in members for members in trees.values()):
         fails.append("n) a non-watcher process leaked into a tree")
+    return fails
+
+
+def case_n2_mentioning_the_script_is_not_running_it() -> list[str]:
+    """The observer trap: a substring test counts any shell whose command line
+    contains the script name — including the one running the query. Observed
+    2026-07-21: a loose match reported 3 trees where 2 were real."""
+    ps = (
+        "  101     1 bash src/watch-tasks-stream.sh\n"
+        "  300     1 grep watch-tasks-stream\n"
+        "  301     1 /bin/zsh -c ps -Ao pid,args | grep watch-tasks-stream.sh\n"
+        "  302     1 /bin/zsh -c source /tmp/snap.sh && eval 'bash src/watch-tasks-stream.sh'\n"
+    )
+    trees = hc._watcher_trees(ps)
+    fails = []
+    if len(trees) != 1:
+        fails.append(f"n2) only pid 101 is running the script; got {len(trees)} trees: {trees}")
+    if "101" not in trees:
+        fails.append(f"n2) the real watcher must be found, got {sorted(trees)}")
     return fails
 
 
 def case_o_trees_excludes_our_own_pid() -> list[str]:
     """Guards the self-match trap: a caller whose argv happens to contain the
     search string must not count itself as a watcher."""
-    ps = f"  {os.getpid()}     1 bash -c grep watch-tasks-stream\n"
+    ps = f"  {os.getpid()}     1 bash src/watch-tasks-stream.sh\n"
     trees = hc._watcher_trees(ps)
     if trees:
         return [f"o) our own pid must be excluded, got {trees}"]
@@ -304,6 +323,7 @@ def main() -> int:
         ("l", case_l_dead_sentinel_with_live_orphan),
         ("m", case_m_absent_sentinel_with_live_orphan),
         ("n", case_n_trees_group_a_process_chain),
+        ("n2", case_n2_mentioning_the_script_is_not_running_it),
         ("o", case_o_trees_excludes_our_own_pid),
         ("p", case_p_trees_runs_real_ps),
         ("q", case_q_trees_swallows_probe_failure),

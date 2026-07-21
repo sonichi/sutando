@@ -1740,6 +1740,26 @@ def _proc_argv(pid: int) -> str:
         return ""
 
 
+# The argv must BE the script invocation, not merely mention it. A substring
+# test counts the observer: any shell whose command line contains the name —
+# a `ps | grep watch-tasks-stream`, or the wrapper running this very check —
+# matches, and each one reads as another watcher. Observed 2026-07-21: a loose
+# match reported 3 trees where 2 were real, the phantom being the shell that
+# ran the query. Same family as the pgrep self-match noted in _proc_argv; the
+# fix is to anchor on the whole command rather than search inside it.
+_WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
+
+
+def _is_watcher_argv(argv: str) -> bool:
+    """True only for `<shell> <path>/watch-tasks-stream.sh` and nothing more."""
+    parts = argv.split()
+    if len(parts) != 2:
+        return False
+    exe, script = parts
+    return (exe.rsplit("/", 1)[-1] in _WATCHER_SHELLS
+            and script.endswith("watch-tasks-stream.sh"))
+
+
 def _watcher_trees(ps_output: "str | None" = None) -> dict:
     """Map root PID -> set of PIDs for each distinct watcher TREE running.
 
@@ -1764,9 +1784,9 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
     parent = {}
     for line in ps_output.splitlines():
         parts = line.split(None, 2)
-        if len(parts) < 3 or "watch-tasks-stream" not in parts[2]:
+        if len(parts) < 3 or parts[0] == me:
             continue
-        if parts[0] == me:
+        if not _is_watcher_argv(parts[2]):
             continue
         parent[parts[0]] = parts[1]
     trees: dict = {}
