@@ -3524,20 +3524,6 @@ async def _handle_discord_message(message, force=False):
         await asyncio.sleep(0.5)
 
 
-def save_to_allowlist(sender_id):
-    """Add sender to access.json allowFrom."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-    except Exception:
-        data = {"dmPolicy": "pairing", "allowFrom": [], "groups": {}, "pending": {}}
-
-    if sender_id not in data.get("allowFrom", []):
-        data.setdefault("allowFrom", []).append(sender_id)
-        ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_FILE.write_text(json.dumps(data, indent=2))
-        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
-
-
 async def poll_approved():
     """Poll approved/ dir and send 'you're in' confirmations."""
     approved_dir = ACCESS_FILE.parent / "approved"

@@ -131,6 +131,23 @@ class TestPairingBranchBailsOnCorruption(unittest.TestCase):
             self.src,
         )
 
+    def test_dead_destructive_allowlist_writer_removed(self):
+        """save_to_allowlist() carried the IDENTICAL bare-except → empty-default →
+        write pattern this PR removes from the pairing branch: on a corrupt read it
+        would persist an allowFrom containing only the just-approved sender, wiping
+        every other authorized user (same wipe class). It was dead code (zero callers
+        repo-wide; the live approval path is poll_approved + the /discord:access
+        skill), i.e. a copy-paste landmine sitting beside the fixed path. Deleting it
+        (flagged by qingyun-wu on #2260) keeps the pattern from being revived into a
+        live path."""
+        self.assertNotIn("def save_to_allowlist", self.src,
+                         "dead destructive save_to_allowlist() must stay deleted — do not revive")
+        self.assertNotIn(
+            '{"dmPolicy": "pairing", "allowFrom": [], "groups": {}, "pending": {}}',
+            self.src,
+            "the save_to_allowlist bare-except empty default must not reappear",
+        )
+
 
 if __name__ == "__main__":
     _r = unittest.main(exit=False)
