@@ -117,8 +117,17 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 HEARTBEAT_INTERVAL = 60
-_ack_disabled = False
-_heartbeat_disabled = False
+# Capability re-probe (2026-07-21): when the gateway 404/405s an OPTIONAL
+# capability (task-ack, heartbeat), disable it only until this epoch, then
+# re-probe — so a capability that goes LIVE mid-run (e.g. the broker gains
+# POST /v1/tasks/<id>/ack after this client already started) is picked up
+# automatically, without a restart. A permanent latch here silently suppressed
+# `received` (acknowledged_ts) for a whole session: the bridge started ~1.5h
+# before the /ack route deployed, latched ack off, and never re-tried.
+# 0.0 / a past epoch = enabled; a future epoch = in cooldown.
+CAPABILITY_REPROBE_S = int(os.environ.get("REMOTE_CAPABILITY_REPROBE_S") or "300")
+_ack_disabled_until = 0.0
+_heartbeat_disabled_until = 0.0
 _last_heartbeat_at = 0.0
 
 _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
@@ -383,17 +392,18 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35)
 
 def _post_task_ack(tid: str) -> bool:
     """Tell the gateway a task made it safely into the local queue."""
-    global _ack_disabled
-    if _ack_disabled or not _valid_tid(tid):
+    global _ack_disabled_until
+    if not _valid_tid(tid) or time.time() < _ack_disabled_until:
         return False
     try:
         safe_tid = urllib.parse.quote(tid, safe="")
         _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": tid}, timeout=10)
+        _ack_disabled_until = 0.0  # succeeded → capability is live; stay enabled
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
-            _ack_disabled = True
-            _log("gateway does not support task ack — continuing without")
+            _ack_disabled_until = time.time() + CAPABILITY_REPROBE_S
+            _log(f"gateway does not support task ack — re-probing in {CAPABILITY_REPROBE_S}s")
             return False
         if e.code in (401, 403):
             raise
@@ -446,10 +456,10 @@ def _read_core_status() -> tuple[str | None, str | None]:
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
-    global _heartbeat_disabled, _last_heartbeat_at
-    if _heartbeat_disabled:
-        return False
+    global _heartbeat_disabled_until, _last_heartbeat_at
     now = time.time()
+    if now < _heartbeat_disabled_until:
+        return False
     if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
@@ -471,11 +481,12 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         if _step is not None:
             payload["step"] = _step
         _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _heartbeat_disabled_until = 0.0  # succeeded → capability is live
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
-            _heartbeat_disabled = True
-            _log("gateway does not support heartbeat — continuing without")
+            _heartbeat_disabled_until = time.time() + CAPABILITY_REPROBE_S
+            _log(f"gateway does not support heartbeat — re-probing in {CAPABILITY_REPROBE_S}s")
             return False
         if e.code in (401, 403):
             raise

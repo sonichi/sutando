@@ -241,18 +241,30 @@ def main() -> int:
     check("status" not in hb3 and "step" not in hb3,
           "malformed core-status → heartbeat omits status/step (liveness-only)")
 
-    # Backwards compatibility: old gateways that only implement pull/results can
-    # 404 optional protocol extensions; the client disables them and continues.
+    # Backwards compatibility + capability RE-PROBE (2026-07-21): a 404 on an
+    # optional extension disables it only until a future epoch, then the client
+    # re-probes — so a capability that goes LIVE mid-run is picked up without a
+    # restart (the `received`/acknowledged_ts regression: the bridge had latched
+    # ack off before the /ack route deployed and never re-tried).
+    # 0.0 = enabled; a future epoch = in cooldown.
     STATE["force_ack_404"] = True
-    rtc._ack_disabled = False
-    check(not rtc._post_task_ack("task-OLD") and rtc._ack_disabled,
-          "task ack 404 disables ack support")
+    rtc._ack_disabled_until = 0.0
+    check(not rtc._post_task_ack("task-OLD") and rtc._ack_disabled_until > 0,
+          "task ack 404 → disabled until a future epoch (cooldown, NOT a permanent latch)")
+    # Cooldown elapsed + capability now live → re-probe succeeds and re-enables.
     STATE["force_ack_404"] = False
+    rtc._ack_disabled_until = 1.0  # epoch 1970 → cooldown already elapsed
+    check(rtc._post_task_ack("task-NEW") and rtc._ack_disabled_until == 0.0,
+          "after cooldown, ack re-probes; success re-enables it (no restart needed)")
+
     STATE["force_heartbeat_404"] = True
-    rtc._heartbeat_disabled = False
-    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_disabled,
-          "heartbeat 404 disables heartbeat support")
+    rtc._heartbeat_disabled_until = 0.0; rtc._last_heartbeat_at = 0.0
+    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_disabled_until > 0,
+          "heartbeat 404 → disabled until a future epoch (cooldown)")
     STATE["force_heartbeat_404"] = False
+    rtc._heartbeat_disabled_until = 1.0; rtc._last_heartbeat_at = 0.0
+    check(rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_disabled_until == 0.0,
+          "after cooldown, heartbeat re-probes; success re-enables it")
 
     # SECURITY (review 2026-06-13)
     # Blocker 1 — unsafe task ids are rejected (path traversal write side)
