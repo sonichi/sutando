@@ -179,7 +179,7 @@ def notify_discord_dm(questions):
     """Write a proactive-*.txt file so discord-bridge DMs the owner.
     Owner asked (2026-04-09, while traveling) to receive pending-question
     pings as DMs instead of just macOS notifications."""
-    path = RESULTS_DIR / f"proactive-pending-q-{questions_key(questions)}.txt"
+    path = RESULTS_DIR / f"{PROACTIVE_PREFIX}{questions_key(questions)}.txt"
     lines = [
         f"⚠️ {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting:",
         "",
@@ -203,6 +203,11 @@ def notify_discord_dm(questions):
 # consumer processes (pgrep -f self-matches; see the watcher notes), use the
 # evidence already on disk: files we wrote earlier that nobody took.
 UNDRAINED_AGE_S = 600
+# Only OUR files are evidence about OUR delivery path. results/proactive-*.txt is
+# a shared namespace — morning-briefing and the durable scheduler write there too
+# (see notes/proactive-delivery-void-inventory.md). One unrelated stale file would
+# otherwise produce a confident, wrong "the DM path is not reaching the owner".
+PROACTIVE_PREFIX = "proactive-pending-q-"
 
 
 def undrained_proactive_files():
@@ -211,7 +216,7 @@ def undrained_proactive_files():
     now = time.time()
     out = []
     try:
-        for f in RESULTS_DIR.glob("proactive-*.txt"):
+        for f in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt"):
             try:
                 if now - f.stat().st_mtime > UNDRAINED_AGE_S:
                     out.append(f.name)
@@ -283,8 +288,13 @@ def main():
     count = len(questions)
     titles = [q["title"] for q in questions]
 
+    # Cooldown is stamped only AFTER delivery returns. Stamping first meant a
+    # raising delivery path still suppressed the next hour's notification — the
+    # exact "claimed an outcome it never achieved" failure this script exists to
+    # remove, reproduced in its own control flow.
+    summary = deliver(questions, count, titles)
     LAST_NOTIFY_FILE.write_text(str(int(time.time())))
-    print(deliver(questions, count, titles))
+    print(summary)
 
 
 if __name__ == "__main__":

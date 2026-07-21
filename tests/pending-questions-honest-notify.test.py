@@ -162,5 +162,53 @@ class TestDeliver(unittest.TestCase):
                       "the warning must reach stderr, not just be returned")
 
 
+class TestReviewFindings(unittest.TestCase):
+    """Both cases john-the-dev flagged: the suite passed without exercising either."""
+
+    def setUp(self):
+        import tempfile
+        self.d = __import__("pathlib").Path(tempfile.mkdtemp(prefix="cpq-rev-"))
+        self.m = _load(self.d)
+
+    def _age(self, name, secs):
+        import os
+        p = self.d / name
+        p.write_text("x")
+        t = __import__("time").time() - secs
+        os.utime(p, (t, t))
+        return p
+
+    # --- finding 1: cooldown must not be stamped when delivery raises ---
+    def test_a_cooldown_not_stamped_when_delivery_raises(self):
+        import tempfile, pathlib
+        stamp = pathlib.Path(tempfile.mkdtemp()) / "last-notify"
+        self.m.LAST_NOTIFY_FILE = stamp
+        self.m.deliver = lambda *a, **k: (_ for _ in ()).throw(OSError("delivery blew up"))
+        self.m.get_waiting_questions = lambda: [{"title": "q"}]
+        self.m.should_notify = lambda *a, **k: True
+        with self.assertRaises(OSError):
+            self.m.main()
+        self.assertFalse(stamp.exists(),
+                         "a failed delivery must NOT put the next hour on cooldown")
+
+    # --- finding 2: only THIS notifier's files are evidence ---
+    def test_b_unrelated_stale_proactive_file_is_ignored(self):
+        self._age("proactive-schedule-alert-cron.txt", self.m.UNDRAINED_AGE_S + 60)
+        self._age("proactive-morning-brief.txt", self.m.UNDRAINED_AGE_S + 60)
+        self.assertEqual(self.m.undrained_proactive_files(), [],
+                         "another producer's stale file must not diagnose OUR path as dead")
+
+    def test_c_our_own_stale_file_is_still_detected(self):
+        self._age(f"{self.m.PROACTIVE_PREFIX}abc.txt", self.m.UNDRAINED_AGE_S + 60)
+        self.assertEqual(self.m.undrained_proactive_files(),
+                         [f"{self.m.PROACTIVE_PREFIX}abc.txt"])
+
+    def test_d_written_name_matches_the_scanned_prefix(self):
+        """Writer and detector must agree, or the check silently never fires."""
+        src = (REPO / "src" / "check-pending-questions.py").read_text()
+        self.assertIn('RESULTS_DIR / f"{PROACTIVE_PREFIX}', src)
+        self.assertIn('RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}', src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
