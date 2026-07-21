@@ -396,6 +396,45 @@ def check_memory_sync() -> dict:
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
 
 
+def check_onboarding_status() -> "dict | None":
+    """Read the desktop checklist's agent surface (onboarding v2 spec,
+    ag2space-cinny-desktop#165 S4).
+
+    The desktop Console mirrors its setup-checklist row states into
+    `<workspace>/state/onboarding-status.json` (written by console_status,
+    write-on-change). This check is the core-side half: surface rows the USER
+    still needs (or that regressed from green) so the proactive loop can run
+    the self-heal ladder and, failing that, tell the owner — instead of the
+    Console being the only place onboarding failures are visible.
+
+    Absent file → None (CLI installs and pre-S1 desktop builds have no
+    checklist; nothing to report). Rows in "todo" → warn with the row names.
+    Read-only; never raises.
+    """
+    name = "onboarding-status"
+    path = WORKSPACE_DIR / "state" / "onboarding-status.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        # Shape-guard (Codex P1): a frontend bug could write [] or {"rows": []}
+        # — non-dict shapes must degrade to 'unreadable', never raise.
+        if not isinstance(data, dict) or not isinstance(data.get("rows"), dict):
+            return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
+        rows = data["rows"]
+        todo = sorted(k for k, v in rows.items() if isinstance(v, dict) and v.get("state") == "todo")
+        age_s = max(0, int(time.time()) - int(data.get("updated_at", 0) or 0))
+    except (ValueError, OSError, TypeError):
+        return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
+    if todo:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"user-facing setup incomplete: {', '.join(todo)} (as of {age_s}s ago)",
+        }
+    return {"name": name, "status": "ok", "detail": f"all checklist rows satisfied ({age_s}s ago)"}
+
+
 def check_host_subtrees() -> dict:
     """Surface per-host subtrees (hosts/<host>/) that have stopped syncing.
 
@@ -1102,6 +1141,53 @@ def check_voice_transport(voice_check: dict) -> dict:
     return check
 
 
+def check_quota_telemetry(proxy_status: str) -> dict:
+    """Warn when the credential proxy is up but producing no quota state.
+
+    quota-state.json is written by the proxy from the quota headers on
+    upstream responses, so it only appears if a core actually ROUTES through
+    the proxy. `src/startup.sh` is the only thing that exports
+    ANTHROPIC_BASE_URL=http://localhost:7846 — and a core launched by the
+    desktop supervisor never runs startup.sh. Result on such a host: the
+    proxy is healthy and listening, every check is green, and quota
+    telemetry is silently absent forever. The proactive loop's per-pass
+    budget check reads "unknown" on every pass and nobody is told why.
+
+    The existing credential-proxy check can't catch this: it is a plain
+    TCP-listening probe (correctly so — a forwarding proxy has no liveness
+    endpoint), so "listening" is all it can ever assert.
+
+    Deliberately narrow to stay quiet in the legitimate cases:
+      - proxy not up          -> silent. Not every host routes through it,
+                                 and its own check already says so.
+      - file present          -> ok, with its age. NOT stale-checked: a quiet
+                                 core legitimately writes nothing for a long
+                                 time, so an age threshold would fire on
+                                 healthy idle hosts. Absence is the signal
+                                 that actually distinguishes broken wiring.
+    """
+    check = {"name": "quota-telemetry", "status": "ok"}
+    if proxy_status != "ok":
+        check["detail"] = "credential proxy not running — quota telemetry not expected"
+        return check
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if path.exists():
+        try:
+            age_min = int((time.time() - path.stat().st_mtime) / 60)
+            check["detail"] = f"quota state present (updated {age_min}m ago)"
+        except OSError:
+            check["detail"] = "quota state present"
+        return check
+    check["status"] = "warn"
+    check["detail"] = (
+        "credential proxy is up but has never written quota-state.json — "
+        "nothing is routing through it (ANTHROPIC_BASE_URL unset; set by "
+        "src/startup.sh, which a supervisor-launched core never runs). "
+        "Quota-based budgeting is blind on this host."
+    )
+    return check
+
+
 def check_bodhi_dist() -> dict:
     """Verify the installed bodhi-realtime-agent dist has the Gemini 3.1
     wire-format fixes applied. Greps the Gemini sendAudio/sendFile bodies
@@ -1117,12 +1203,37 @@ def check_bodhi_dist() -> dict:
 
     Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
+
+    Scans whichever artifact the voice-agent ACTUALLY loads, because that
+    differs by deployment and the node_modules copy is not always the one
+    running:
+
+      - dev checkout  -> node_modules/bodhi-realtime-agent/dist/index.js
+      - bundled app   -> dist/voice-agent.js, an esbuild bundle with bodhi
+                         inlined and NO node_modules on disk at all
+
+    Checking only the node_modules path made this probe useless in exactly
+    the deployment where it matters: a bundled install has an empty
+    node_modules, so the check warned "run `npm install`" on every tick
+    (noise that reads as benign) while giving ZERO coverage of the running
+    bundle. The 1007 regression this was written to catch would have
+    shipped undetected. The body scan below needs no change — it matches
+    the bundled output as-is.
     """
     check = {"name": "bodhi-dist", "status": "ok", "detail": "Gemini 3.1 wire-format fixes present"}
-    dist = REPO_DIR / "node_modules" / "bodhi-realtime-agent" / "dist" / "index.js"
-    if not dist.exists():
+    # Order matters: node_modules first so a dev checkout reports on the
+    # package it actually resolves, bundle second for bundled installs.
+    candidates = [
+        REPO_DIR / "node_modules" / "bodhi-realtime-agent" / "dist" / "index.js",
+        REPO_DIR / "dist" / "voice-agent.js",
+    ]
+    dist = next((c for c in candidates if c.exists()), None)
+    if dist is None:
         check["status"] = "warn"
-        check["detail"] = "bodhi dist not found — run `npm install`"
+        check["detail"] = (
+            "no bodhi artifact found (checked node_modules and dist/voice-agent.js) — "
+            "run `npm install`, or `npm run build` for a bundled install"
+        )
         return check
     try:
         text = dist.read_text(errors="replace")
@@ -1130,13 +1241,14 @@ def check_bodhi_dist() -> dict:
         check["status"] = "warn"
         check["detail"] = f"dist read failed: {e}"
         return check
+    check["detail"] = f"Gemini 3.1 wire-format fixes present ({dist.name})"
     # Isolate the Gemini transport's sendAudio body. The OpenAI realtime
     # transport also defines sendAudio but uses `audio: base64Data` as a
     # flat string — a naive grep would false-positive.
     idx = text.find("sendAudio(base64Data) {")
     if idx < 0:
         check["status"] = "warn"
-        check["detail"] = "could not locate sendAudio in bodhi dist"
+        check["detail"] = f"could not locate sendAudio in {dist.name}"
         return check
     # Find the first two sendAudio definitions; the Gemini one wraps its
     # arg in `this.session.sendRealtimeInput(...)`.
@@ -1486,23 +1598,58 @@ def check_skill_symlinks() -> dict:
     if not skills_dst.exists():
         return {"name": name, "status": "ok", "detail": "~/.claude/skills/ not found — skipped"}
 
-    unlinked: list[str] = []
+    # A DANGLING symlink (entry present, target gone) is the case the original
+    # condition let through: `exists()` follows the link and is False, but
+    # `is_symlink()` is True, so `not exists and not is_symlink` is False and the
+    # skill counted as linked. Claude Code cannot load it either way, so it was
+    # invisible AND reported healthy. Tracked as #2213.
+    unlinked: list[str] = []   # no entry at all -> symlink_to() works
+    broken: list[str] = []     # dangling link  -> must be unlinked first
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
-        if not dst.exists() and not dst.is_symlink():
+        if dst.is_symlink() and not dst.exists():
+            broken.append(skill_name)
+        elif not dst.exists() and not dst.is_symlink():
             unlinked.append(skill_name)
 
-    if not unlinked:
+    # Dangling links whose skill is NOT in this repo are missed by the loop
+    # above, which only walks repo skills. They are still dead entries that make
+    # a skill silently unloadable, so sweep the destination too. Reported, never
+    # auto-removed: the target may belong to another checkout that is simply
+    # not mounted right now, and deleting someone else's link is not this
+    # check's call.
+    orphaned: list[str] = []
+    try:
+        repo_names = {d.name for d in skills_src.iterdir() if d.is_dir()}
+        for entry in sorted(skills_dst.iterdir()):
+            if entry.name in repo_names:
+                continue
+            if entry.is_symlink() and not entry.exists():
+                orphaned.append(entry.name)
+    except OSError:
+        pass
+
+    if not unlinked and not broken and not orphaned:
         return {"name": name, "status": "ok", "detail": f"all {sum(1 for d in skills_src.iterdir() if d.is_dir())} skills linked"}
+
+    parts = []
+    if broken:
+        parts.append(f"{len(broken)} dangling: {', '.join(broken[:4])}{'...' if len(broken) > 4 else ''}")
+    if unlinked:
+        parts.append(f"{len(unlinked)} unlinked: {', '.join(unlinked[:4])}{'...' if len(unlinked) > 4 else ''}")
+    if orphaned:
+        parts.append(f"{len(orphaned)} dangling not in this repo: {', '.join(orphaned[:4])}{'...' if len(orphaned) > 4 else ''}")
 
     return {
         "name": name,
         "status": "warn",
-        "detail": f"{len(unlinked)} unlinked skill(s): {', '.join(unlinked[:5])}{'...' if len(unlinked) > 5 else ''}",
+        "detail": "; ".join(parts),
         "_unlinked": unlinked,
+        "_broken": broken,
+        "_orphaned": orphaned,
         "_skills_src": str(skills_src),
         "_skills_dst": str(skills_dst),
     }
@@ -1511,14 +1658,21 @@ def check_skill_symlinks() -> dict:
 def fix_skill_symlinks(check: dict) -> dict:
     """Create missing symlinks for unlinked skills (--fix handler)."""
     unlinked = check.get("_unlinked", [])
+    broken = check.get("_broken", [])
     skills_src = Path(check.get("_skills_src", ""))
     skills_dst = Path(check.get("_skills_dst", ""))
     created: list[str] = []
     errors: list[str] = []
-    for skill_name in unlinked:
+    for skill_name in list(broken) + list(unlinked):
         src = skills_src / skill_name
         dst = skills_dst / skill_name
         try:
+            # A dangling link occupies the name: symlink_to() would raise
+            # FileExistsError, so --fix could not repair the very case it was
+            # meant to. Guard on is_symlink() so a real directory is never
+            # removed by a health check.
+            if dst.is_symlink() and not dst.exists():
+                dst.unlink()
             dst.symlink_to(src)
             created.append(skill_name)
         except Exception as e:
@@ -1535,7 +1689,7 @@ def apply_skill_symlink_fixes(checks: list) -> None:
     """--fix dispatch for skill-symlinks: warn-level (excluded from the issues
     loop) but auto-fixable, so it is handled by its own pass over checks."""
     for c in checks:
-        if c["name"] == "skill-symlinks" and c.get("_unlinked"):
+        if c["name"] == "skill-symlinks" and (c.get("_unlinked") or c.get("_broken")):
             result = fix_skill_symlinks(c)
             print(f"  {c['name']}: {result['detail']}")
 
@@ -1735,6 +1889,33 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
     return pgrep_status, pids
 
 
+def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Optional[tuple[str, str]]:
+    """Check a bridge's recent log lines for known failure-mode signatures.
+
+    Returns an (status, detail) override, or None if nothing to override.
+    discord-bridge: LoginFailure means the token is revoked/invalid. Always
+      overrides — there is no point restarting with stale code if the token
+      is bad; the token fix is the only path forward.
+    slack-bridge: "60s elapsed" hint means Socket Mode connected but events
+      weren't routing yet at startup (Slack app Event Subscriptions
+      disabled). Only overrides "ok" — stale/dead-inode are higher priority.
+      The hint is a one-time startup message that never clears itself in the
+      log, so it only counts if no event has actually been processed since
+      it last fired (checked via a subsequent "Wrote task-" line) — otherwise
+      Event Subscriptions clearly ARE enabled and it's a stale false alarm.
+    """
+    if name == "discord-bridge":
+        if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
+            return "fail", "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
+    elif name == "slack-bridge" and status == "ok":
+        warn_idxs = [i for i, ln in enumerate(tail) if "60s elapsed with zero events" in ln]
+        if warn_idxs:
+            events_after = any("Wrote task-" in ln for ln in tail[warn_idxs[-1] + 1:])
+            if not events_after:
+                return "warn", "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+    return None
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -1774,6 +1955,9 @@ def run_all_checks() -> list[dict]:
         proxy_check["status"] = "warn"
         proxy_check["detail"] = "not running (optional)"
     checks.append(proxy_check)
+
+    # Quota telemetry — only meaningful when the proxy is actually up.
+    checks.append(check_quota_telemetry(proxy_check["status"]))
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -1818,6 +2002,9 @@ def run_all_checks() -> list[dict]:
 
     # Per-host subtree freshness (hosts/<host>/ stopped syncing?)
     checks.append(check_host_subtrees())
+    onboarding_check = check_onboarding_status()
+    if onboarding_check is not None:
+        checks.append(onboarding_check)
 
     # Migration/reader path-contract drift (#1543)
     checks.append(check_migrate_reader_contract())
@@ -2021,14 +2208,9 @@ def run_all_checks() -> list[dict]:
                 and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
-                if name == "discord-bridge":
-                    if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
-                        status = "fail"
-                        detail = "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
-                elif name == "slack-bridge" and status == "ok":
-                    if any("60s elapsed with zero events" in ln for ln in tail):
-                        status = "warn"
-                        detail = "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+                override = bridge_log_content_status(name, status, tail)
+                if override is not None:
+                    status, detail = override
             except OSError:
                 pass
 
