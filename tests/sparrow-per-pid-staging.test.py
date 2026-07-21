@@ -43,13 +43,29 @@ class TestSparrowPerPidStaging(unittest.TestCase):
 
     def test_all_four_state_files_use_per_pid(self):
         code = SPARROW_PY.read_text()
-        for var in ("OWNER_ACTIVITY_FILE", "GATEWAY_STATUS_FILE",
-                    "TASK_ROOMS_FILE", "INFLIGHT_FILE"):
+        # The three single-writer state files (gateway-status / task-rooms /
+        # inflight) are written only by the single-threaded poll loop, so a
+        # per-PID temp name is sufficient.
+        for var in ("GATEWAY_STATUS_FILE", "TASK_ROOMS_FILE", "INFLIGHT_FILE"):
             pat = rf'{var}\.with_suffix\(\s*f["\']\.json\.\{{os\.getpid\(\)\}}\.tmp["\']'
             self.assertRegex(
                 code, pat,
                 f"{var} does not stage under a per-PID temp name",
             )
+        # OWNER_ACTIVITY_FILE is written by FIVE processes AND (for Slack Bolt)
+        # multiple threads within one process, so PID-only is NOT enough — it must
+        # stage per-INVOCATION (PID + uuid4), unique across processes and threads.
+        # See tests/owner-activity-atomic-write.test.py for the concurrency proof.
+        self.assertRegex(
+            code,
+            r'OWNER_ACTIVITY_FILE\.with_suffix\(\s*f["\']\.json\.\{os\.getpid\(\)\}\.\{uuid\.uuid4\(\)\.hex\}\.tmp["\']',
+            "OWNER_ACTIVITY_FILE must stage per-invocation (PID + uuid), not PID-only",
+        )
+        self.assertNotRegex(
+            code,
+            r'OWNER_ACTIVITY_FILE\.with_suffix\(\s*f["\']\.json\.\{os\.getpid\(\)\}\.tmp["\']',
+            "OWNER_ACTIVITY_FILE still uses the thread-unsafe PID-only staging",
+        )
 
     # -- behavioral: the live gateway-status write stages a pid-suffixed temp -- #
 
