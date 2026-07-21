@@ -2831,8 +2831,21 @@ async def _handle_discord_message(message, force=False):
             "expiresAt": now_ms + 3600000,  # 1 hour
         }
         access["pending"] = pending
-        ACCESS_FILE.write_text(json.dumps(access, indent=2))
-        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
+        # Atomic tmp+rename. A bare write_text truncates-then-writes, exposing a
+        # window where a concurrent reader (every message hits load_channel_config,
+        # which re-reads access.json) sees a partial/empty file → json parse fail.
+        # THIS truncate-in-place write was the TRIGGER of the 2026-07-21 corrupt
+        # read: before the no-clobber guard above, that failed read fell to the
+        # bare-except default and permanently wiped allowFrom → pairing-code leak
+        # into DMs and #dev. The no-clobber guard stops the amplification; writing
+        # atomically here closes the window that produced the corrupt read at all
+        # (and the lost-update race with the `/discord:access` read-modify-write).
+        # Same pattern the thread-engage seed already uses. chmod the tmp before
+        # replace so the final file is never briefly 0644 (it holds owner IDs).
+        tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')  # pragma: no cover — async pairing branch; atomicity asserted structurally
+        tmp_path.write_text(json.dumps(access, indent=2))  # pragma: no cover
+        os.chmod(tmp_path, 0o600)  # pragma: no cover
+        os.replace(tmp_path, ACCESS_FILE)  # pragma: no cover
         await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
         print(f"  Pairing requested: @{username} ({sender_id}) code={code}")
         return
