@@ -56,20 +56,22 @@ def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
     return td
 
 
-def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None) -> dict:
+def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None,
+              trees: dict | None = None) -> dict:
     """Call check_task_watcher against a temp WORKSPACE_DIR. `argv` patches
     the _proc_argv probe: None = leave the real one (only used where no PID
     is read), "" = process gone, any string = that process's argv."""
     with tempfile.TemporaryDirectory() as td:
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
-        orig_ws, orig_probe = hc.WORKSPACE_DIR, hc._proc_argv
+        orig_ws, orig_probe, orig_trees = hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees
         try:
             hc.WORKSPACE_DIR = Path(td)
             if argv is not None:
                 hc._proc_argv = lambda pid: argv
+            hc._watcher_trees = lambda *a, **k: (trees or {})
             return hc.check_task_watcher()
         finally:
-            hc.WORKSPACE_DIR, hc._proc_argv = orig_ws, orig_probe
+            hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees = orig_ws, orig_probe, orig_trees
 
 
 def case_a_no_core_is_ok() -> list[str]:
@@ -171,6 +173,121 @@ def case_i_proc_argv_swallows_probe_failure() -> list[str]:
     return []
 
 
+
+def case_j_extra_tree_warns() -> list[str]:
+    """A live sentinel does not mean a healthy watcher layer: an orphan from an
+    earlier start keeps draining tasks/ too, so every task is processed twice.
+    Observed 2026-07-21 — two monitors reported the same TASK_FILE."""
+    r = run_check(core_alive=True, pid_text="4242",
+                  argv="bash src/watch-tasks-stream.sh",
+                  trees={"4200": {"4200", "4242"}, "9000": {"9000", "9001"}})
+    fails = []
+    if r["status"] != "warn":
+        fails.append(f"j) an untracked extra tree should warn, got {r['status']}")
+    if "9000" not in r["detail"]:
+        fails.append(f"j) detail must name the untracked root, got {r['detail']!r}")
+    if "4200" in r["detail"]:
+        fails.append("j) must NOT list the sentinel's own tree as an extra")
+    return fails
+
+
+def case_k_sentinels_own_tree_is_not_an_extra() -> list[str]:
+    """The sentinel records the SCRIPT's pid, not its shell wrapper's, so the
+    tree containing it must be recognised as the tracked one — otherwise the
+    check tells the operator to kill the watcher it just told them to keep."""
+    r = run_check(core_alive=True, pid_text="4242",
+                  argv="bash src/watch-tasks-stream.sh",
+                  trees={"4200": {"4200", "4242", "4243"}})
+    if r["status"] != "ok":
+        return [f"k) sole tree owning the sentinel should be ok, got {r['status']} ({r['detail']})"]
+    return []
+
+
+def case_l_dead_sentinel_with_live_orphan() -> list[str]:
+    """Saying 'not running' here would be false — tasks ARE being drained, and
+    restarting on that basis is what creates the duplicates."""
+    r = run_check(core_alive=True, pid_text="424242", argv="",
+                  trees={"9000": {"9000", "9001"}})
+    fails = []
+    if r["status"] != "warn":
+        fails.append(f"l) expected warn, got {r['status']}")
+    if "orphaned" not in r["detail"]:
+        fails.append(f"l) detail should name the orphan, got {r['detail']!r}")
+    if "IS being drained" not in r["detail"]:
+        fails.append("l) must not claim tasks/ is unattended when a watcher runs")
+    return fails
+
+
+def case_m_absent_sentinel_with_live_orphan() -> list[str]:
+    r = run_check(core_alive=True, pid_text=None, trees={"9000": {"9000"}})
+    fails = []
+    if r["status"] != "warn":
+        fails.append(f"m) expected warn, got {r['status']}")
+    if "orphaned" not in r["detail"]:
+        fails.append(f"m) detail should name the orphan, got {r['detail']!r}")
+    return fails
+
+
+def case_n_trees_group_a_process_chain() -> list[str]:
+    """The grouping algorithm itself: wrapper -> script -> subshell is ONE
+    watcher, not three. Counting matching processes would say three."""
+    ps = (
+        "  100     1 /bin/zsh -c eval 'bash src/watch-tasks-stream.sh'\n"
+        "  101   100 bash src/watch-tasks-stream.sh\n"
+        "  102   101 bash src/watch-tasks-stream.sh\n"
+        "  200     1 /bin/zsh -c eval 'bash src/watch-tasks-stream.sh'\n"
+        "  201   200 bash src/watch-tasks-stream.sh\n"
+        "  999     1 python3 src/health-check.py\n"
+    )
+    trees = hc._watcher_trees(ps)
+    fails = []
+    if len(trees) != 2:
+        fails.append(f"n) expected 2 trees from 5 matching procs, got {len(trees)}: {trees}")
+    if "100" in trees and "101" not in trees["100"]:
+        fails.append("n) the script pid must be grouped under its wrapper root")
+    if any("999" in members for members in trees.values()):
+        fails.append("n) a non-watcher process leaked into a tree")
+    return fails
+
+
+def case_o_trees_excludes_our_own_pid() -> list[str]:
+    """Guards the self-match trap: a caller whose argv happens to contain the
+    search string must not count itself as a watcher."""
+    ps = f"  {os.getpid()}     1 bash -c grep watch-tasks-stream\n"
+    trees = hc._watcher_trees(ps)
+    if trees:
+        return [f"o) our own pid must be excluded, got {trees}"]
+    return []
+
+
+
+def case_p_trees_runs_real_ps() -> list[str]:
+    """Exercise the OS-facing half — the cases above all inject ps output, so
+    without this the actual subprocess call ships untested (the same gap the
+    coverage gate caught for _proc_argv)."""
+    trees = hc._watcher_trees()
+    if not isinstance(trees, dict):
+        return [f"p) expected a dict from the real probe, got {type(trees).__name__}"]
+    for root, members in trees.items():
+        if not isinstance(members, set) or root not in members and not members:
+            return [f"p) malformed tree entry {root!r}: {members!r}"]
+    return []
+
+
+def case_q_trees_swallows_probe_failure() -> list[str]:
+    """A broken/absent ps must degrade to 'no watchers seen', not raise into
+    the health check."""
+    orig = hc.subprocess.run
+    try:
+        hc.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("ps missing"))
+        got = hc._watcher_trees()
+    finally:
+        hc.subprocess.run = orig
+    if got != {}:
+        return [f"q) a raising probe should return {{}}, got {got!r}"]
+    return []
+
+
 def main() -> int:
     cases = [
         ("a", case_a_no_core_is_ok),
@@ -182,6 +299,14 @@ def main() -> int:
         ("g", case_g_registered_in_run_checks),
         ("h", case_h_proc_argv_reads_a_real_process),
         ("i", case_i_proc_argv_swallows_probe_failure),
+        ("j", case_j_extra_tree_warns),
+        ("k", case_k_sentinels_own_tree_is_not_an_extra),
+        ("l", case_l_dead_sentinel_with_live_orphan),
+        ("m", case_m_absent_sentinel_with_live_orphan),
+        ("n", case_n_trees_group_a_process_chain),
+        ("o", case_o_trees_excludes_our_own_pid),
+        ("p", case_p_trees_runs_real_ps),
+        ("q", case_q_trees_swallows_probe_failure),
     ]
     all_failures = []
     for label, fn in cases:

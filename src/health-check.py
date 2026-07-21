@@ -1740,6 +1740,45 @@ def _proc_argv(pid: int) -> str:
         return ""
 
 
+def _watcher_trees(ps_output: "str | None" = None) -> dict:
+    """Map root PID -> set of PIDs for each distinct watcher TREE running.
+
+    Each watcher is several processes (a shell wrapper, the script, a
+    subshell), so counting matching lines overcounts. A "root" is a match
+    whose parent is not itself a match — one per independent watcher. Callers
+    need the whole tree, not just the root, to tell which tree owns the
+    sentinel PID (the sentinel records the script's PID, not the wrapper's).
+
+    `ps -Ao` + filtering here rather than `pgrep -f watch-tasks-stream`, for
+    the reason in _proc_argv: pgrep would match the caller. Our own argv is
+    the health-check invocation, but we drop it explicitly anyway.
+    """
+    if ps_output is None:
+        try:
+            ps_output = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                                       capture_output=True, text=True,
+                                       timeout=5).stdout
+        except Exception:  # noqa: BLE001
+            return {}
+    me = str(os.getpid())
+    parent = {}
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or "watch-tasks-stream" not in parts[2]:
+            continue
+        if parts[0] == me:
+            continue
+        parent[parts[0]] = parts[1]
+    trees: dict = {}
+    for pid in parent:
+        root, seen = pid, set()
+        while parent.get(root) in parent and root not in seen:
+            seen.add(root)
+            root = parent[root]
+        trees.setdefault(root, set()).add(pid)
+    return trees
+
+
 def check_task_watcher() -> dict:
     """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
 
@@ -1765,7 +1804,18 @@ def check_task_watcher() -> dict:
     pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
     if not _any_core_alive():
         return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
+    trees = _watcher_trees()
+    roots = sorted(trees)
     if not pid_file.exists():
+        if roots:
+            # Sentinel gone but watchers alive: they are draining tasks/ but
+            # nothing supervises them, and each new start adds another (observed
+            # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
+            # duplicate processing, not a stalled queue).
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
+                              f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
+                              "stop them and restart one cleanly"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}
@@ -1776,6 +1826,16 @@ def check_task_watcher() -> dict:
                 "detail": f"unreadable PID sentinel ({str(e)[:40]}) — restart the watcher"}
     argv = _proc_argv(pid)
     if not argv:
+        if roots:
+            # The sentinel tracks only the MOST RECENT start (the script writes
+            # $$ at startup), so a dead sentinel does NOT mean nothing is
+            # draining tasks/ — an older watcher can still be running. Saying
+            # "not running" here would be false, and restarting on that basis is
+            # what produces the duplicates in the first place.
+            return {"name": name, "status": "warn",
+                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
+                              f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
+                              "stop them and restart one cleanly"}
         return {"name": name, "status": "warn",
                 "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
     if "watch-tasks-stream" not in argv:
@@ -1783,6 +1843,12 @@ def check_task_watcher() -> dict:
         # number to something else. `kill -0` alone would call this alive.
         return {"name": name, "status": "warn",
                 "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
+    extras = sorted(r for r, members in trees.items() if str(pid) not in members)
+    if extras:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by the "
+                          f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
+                          f"more than once. Keep the sentinel's ({pid}), stop the rest"}
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 
