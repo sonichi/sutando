@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src/health-check.py")
@@ -24,5 +25,8 @@ with tempfile.TemporaryDirectory() as td:
     assert health_check._bridge_log_belongs_to_process(log, now)
 
     assert health_check._bridge_log_belongs_to_process(log, None)
+
+    with mock.patch.object(Path, "stat", side_effect=OSError("log disappeared")):
+        assert health_check._bridge_log_belongs_to_process(log, now)
 
 print("PASS: stale bridge logs cannot override a newer live process")
