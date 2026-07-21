@@ -105,6 +105,41 @@ def _boot_bridge():
     return rtc, srv
 
 
+def drive_poll(rtc, tasks):
+    """Run ONE iteration of the bridge's task-handling block, exactly as
+    ``remote_gateway_bridge.main()`` runs it.
+
+    Every phase must go through this. The earlier revision hand-called
+    ``_write_task`` and then jumped straight to ``_post_ready_results`` on the
+    redelivery leg, skipping inflight-add, persist, and ack — so it measured a
+    control flow the bridge never executes and published ``acks=1`` where the
+    real loop produces ``acks=2``. A faithful E2E has to drive the loop, not a
+    convenient subset of it.
+
+    Mirrors main() line-for-line: note that ``pending_ack.append`` sits OUTSIDE
+    the ``tid not in inflight`` guard, so an already-handled redelivery is still
+    acked upstream — that is deliberate (``_write_task`` returns the id for work
+    it deduped, precisely so the broker gets its ack and stops replaying).
+    """
+    inflight = rtc._load_inflight()
+    added = False
+    pending_ack = []
+    for task in tasks:
+        tid = rtc._write_task(task)
+        if tid:
+            if tid not in inflight:
+                inflight.add(tid)
+                added = True
+            pending_ack.append(tid)
+    if added:
+        rtc._save_inflight(inflight)
+    # Ack only after task file + in-flight state are durable (main()'s ordering).
+    for tid in pending_ack:
+        rtc._post_task_ack(tid)
+    rtc._post_ready_results(inflight)
+    return pending_ack
+
+
 def main() -> int:
     rtc, srv = _boot_bridge()
     print("=== ag2-sparrow integration E2E (real bridge module ↔ mock gateway) ===\n")
@@ -119,12 +154,11 @@ def main() -> int:
 
     # ── 2. inbound task written ONCE + acked ────────────────────────────────
     print("\n2. INBOUND — write the task locally, ack it")
-    wid = rtc._write_task(served[0])
-    rtc._save_inflight({wid})
-    acked = rtc._post_task_ack(wid)
+    pending = drive_poll(rtc, served)             # same loop body as main()
+    wid = pending[0] if pending else None
     tfiles = list((rtc.TASKS_DIR).glob("task-E2E1*.txt"))
     check(wid == "task-E2E1" and len(tfiles) == 1, "task written exactly once to tasks/")
-    check(acked and STATE["acks"] == ["/v1/tasks/task-E2E1/ack"], "task acked exactly once")
+    check(STATE["acks"] == ["/v1/tasks/task-E2E1/ack"], "task acked exactly once")
     check(rtc._load_inflight() == {"task-E2E1"}, "task recorded in persisted inflight")
     log("task-bridge", f"wrote {tfiles[0].name}; inflight={sorted(rtc._load_inflight())}")
     log("gateway", f"POST /v1/tasks/task-E2E1/ack → 200  (acks={len(STATE['acks'])})")
@@ -152,18 +186,25 @@ def main() -> int:
     resp2 = rtc._req("GET", "/v1/tasks?wait=0")   # reconnect poll → same task again
     redelivered = resp2.get("tasks", [])
     log("gateway", f"reconnect GET /v1/tasks → 200, tasks=[{redelivered[0]['id']}]  (REDELIVERED)")
-    rid = rtc._write_task(redelivered[0])         # bridge must dedup, not re-queue
+    acks_before = len(STATE["acks"])
 
     # ── 5. inflight recovery — NO dup, NO loss ──────────────────────────────
     print("\n5. RECOVERY — the redelivery must dedup: no second task, no duplicate result")
+    # Drive the SAME loop body main() runs — write → inflight → persist → ack →
+    # drain. Hand-calling _write_task here (the earlier revision) skipped the ack
+    # and under-reported the real tally by one.
+    pending2 = drive_poll(rtc, redelivered)
+    rid = pending2[0] if pending2 else None
     tasks_after = len(list((rtc.TASKS_DIR).glob("task-E2E1*.txt")))
     check(rid == "task-E2E1", "redelivered id returned (so the drain re-acks it upstream)")
     check(tasks_after == tasks_before == 0,
           "redelivery did NOT re-queue a local task file (deduped against archive)")
-    nosend = (rtc.RESULTS_DIR / "task-E2E1.txt")
-    check(nosend.exists() and nosend.read_text().startswith("[no-send]"),
-          "dedup dropped a [no-send] result so the drain re-acks (no reprocessing)")
-    rtc._post_ready_results({"task-E2E1"})        # drain the [no-send]: archived, NOT POSTed
+    # The ack is the point of returning the id: the broker must learn the work is
+    # handled or it replays forever. main() acks every pending id, redelivery
+    # included — so the faithful tally is 2, not 1.
+    check(len(STATE["acks"]) == acks_before + 1 == 2
+          and STATE["acks"] == ["/v1/tasks/task-E2E1/ack"] * 2,
+          "redelivery RE-ACKED upstream (acks=2) — matches main()'s pending_ack loop")
     real_after = [r for r in STATE["results"] if not str(r.get("body", "")).startswith("[no-send]")]
     check(len(real_after) == 1 and len(STATE["results"]) == results_before,
           "exactly ONE real result across the whole cycle — no duplicate delivery")
