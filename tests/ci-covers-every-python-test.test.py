@@ -34,13 +34,27 @@ def named_in_workflows():
 
 
 def test_looking_files():
-    out = set()
-    for pat in ("**/*.test.py", "**/test_*.py", "**/*_test.py"):
-        for p in glob.glob(pat, recursive=True):
-            if "node_modules" in p or p.startswith(".git/"):
-                continue
-            out.add(str(Path(p)))
-    return out
+    """Git-TRACKED test-looking files only.
+
+    A bare glob also sees transient files that other suites create while running
+    (temp fixtures written inside the tree), which made this guard fail in one CI
+    step and pass in another within the same job — order-dependent, and a flaky
+    guard is worse than none. Only committed files are part of the repo's test
+    surface, so ask git rather than the filesystem."""
+    import subprocess
+    out = subprocess.run(["git", "ls-files", "-z"], capture_output=True)
+    if out.returncode != 0:
+        raise unittest.SkipTest("not a git checkout — this guard is about committed files")
+    files = [f for f in out.stdout.decode().split("\0") if f]
+    keep = set()
+    for f in files:
+        base = Path(f).name
+        if "node_modules" in f:
+            continue
+        if base.endswith(".test.py") or base.startswith("test_") and base.endswith(".py") \
+           or base.endswith("_test.py"):
+            keep.add(str(Path(f)))
+    return keep
 
 
 class TestCICoversEveryPythonTest(unittest.TestCase):
