@@ -34,7 +34,8 @@ SESSION="sutando-core"
 # branches via `new-session -e` (below) since tmux runs the command under the
 # server's environment, not necessarily this shell's.
 export SUTANDO_CORE_SESSION=1
-CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1)
+export SUTANDO_CORE_RUNTIME=claude
+CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
