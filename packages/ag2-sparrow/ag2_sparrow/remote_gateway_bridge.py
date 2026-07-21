@@ -386,6 +386,15 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35)
         return json.loads(raw) if raw else {}
 
 
+def _http_error_body(e) -> str:
+    """Best-effort read of an HTTPError's response body, for content-sniffing a
+    per-task answer vs an endpoint-unsupported one. Never raises."""
+    try:
+        return (e.read() or b"").decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _post_task_ack(tid: str) -> bool:
     """Tell the gateway a task made it safely into the local queue."""
     global _ack_disabled_until
@@ -400,8 +409,18 @@ def _post_task_ack(tid: str) -> bool:
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
-            # Not permanent: a broker that later deploys /ack should be picked up
-            # without a worker restart, so back off for a cooldown and retry.
+            # A 404/405 is ambiguous. The pre-/ack broker returns a bare no-route
+            # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
+            # later, so a broker that deploys /ack afterward is picked up without a
+            # restart. But the DEPLOYED broker returns a PER-TASK
+            # 404 {"error":"not leased to you"} when THIS task's lease expired /
+            # was re-served / isn't ours — routine under churn. That must NOT
+            # disable acking for every OTHER task (one stale lease would blind the
+            # whole host's `received` state), so treat it as a single-task negative
+            # ack: skip this one, leave global acking enabled. (Per qingyun-001,
+            # broker-half author — the deployed 404 is per-task, not "no route".)
+            if e.code == 404 and "not leased" in _http_error_body(e).lower():
+                return False   # per-task lease gone — keep acking the rest
             _ack_disabled_until = time.time() + ACK_UNSUPPORTED_COOLDOWN
             _log(f"gateway does not support task ack — retrying in "
                  f"{ACK_UNSUPPORTED_COOLDOWN}s")
