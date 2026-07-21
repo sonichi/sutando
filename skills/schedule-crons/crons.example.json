@@ -33,5 +33,12 @@
     "name": "learned-skills-scan",
     "cron": "30 7 * * *",
     "prompt": "Run python3 skills/learned-skills/scripts/detect-learned-skills.py to scan recent task archives for repeated workflow patterns and propose candidate learned skills. Gated on state/learned-skills-enabled.sentinel (toggled from Settings → Skills → Behavior); the script exits early when the gate is off."
+  },
+  {
+    "name": "agent-landscape-digest",
+    "cron": "4 6 * * 1,4",
+    "launchd": true,
+    "_comment": "Cadence caveat: a true 'every 3 days' is NOT expressible in 5-field cron. `*/3` in the day-of-month field steps 1,4,7,...,31 and then RESETS at the start of each month (so the gap across a month boundary is 1-2 days, not 3 — and Feb/short months skew it further). To stay honest we approximate a ~2x/week cadence with a stable, correctly-expressible expression: DOW 1,4 (Mon & Thu) at 6:04 local. If you truly need fixed 3-day spacing, gate the prompt on an interval check (e.g. a state-file timestamp) rather than relying on the cron field.",
+    "prompt": "Agent-landscape digest (Mon & Thu). Use web search to find the latest progress across personal / autonomous AI agents — Claude (Claude Code), Codex, OpenClaw, Hermes Agent (Nous), and other rising agents/frameworks. Compare each against Sutando and suggest 2-3 concrete features Sutando should adopt (be specific: which existing Sutando component it extends, and why it's worth it). Deliver as a Discord DM to the owner: python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py --source discord --channel-id 1512996282140987452 --message \"<digest text>\". Keep it under ~1800 chars. Fires at 6:04 local Pacific (off-minute from the 6:02 daily loop-engineering digest) on Mon & Thu and tracks PST/PDT automatically. `\"launchd\": true` routes this through the reliable OS-level cron-runner so it fires regardless of session state."
   }
 ]

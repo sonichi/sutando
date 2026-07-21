@@ -353,6 +353,7 @@ _GUARDED_PY_WRITERS = {
     "src/slack-bridge.py",
     "src/github-webhook.py",
     "src/agent-api.py",
+    "src/cron-runner.py",
 }
 
 _TASK_FIELD_PATTERN = 'f"task: {'
