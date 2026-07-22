@@ -45,8 +45,13 @@ DIFF="$(gh pr diff "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff $PR\` 
 # (/nonexistent, /usr/fake, /tmp/, example.com) and comment lines. Tracks the
 # new-file line number from @@ hunk headers so hits report as file:line. No deps.
 scan_hardcoded_paths() {
-    awk '
-    /^\+\+\+ / { f=$2; sub(/^b\//,"",f); next }
+    # awk program lives in a temp file written by a quoted-heredoc REDIRECT (not a
+    # $(...) command substitution — that mis-balances the ' and " inside the regex
+    # and breaks the whole script). Keeps the regexes readable and unescaped.
+    local awkf
+    awkf="$(mktemp -t scanpaths.XXXXXX)"
+    cat > "$awkf" <<'AWK'
+    /^\+\+\+ / { f=$0; sub(/^\+\+\+ [ab]\//,"",f); next }   # whole path — filenames with spaces survive ($2 truncated them)
     /^@@ / { m=$0; sub(/^@@ [^+]*\+/,"",m); sub(/[, ].*$/,"",m); ln=m-1; next }
     /^-/    { next }                 # removed line: no new-file line number
     /^[^+]/ { ln++; next }           # context line advances the new-file counter
@@ -54,14 +59,27 @@ scan_hardcoded_paths() {
         ln++
         line=substr($0,2)            # strip the leading +
         t=line; sub(/^[ \t]*/,"",t)  # left-trimmed copy for comment detection
-        if (t ~ /^(#|\/\/|\*)/) next
-        if (line ~ /\/nonexistent|\/usr\/fake|\/tmp\/|example\.com/) next
-        if (line ~ /\/Users\/|\/home\/[A-Za-z]|~\/\.claude|~\/\.sutando|["'"'"']\/(Users|home|opt|usr|private)\//) {
+        if (t ~ /^(#|\/\/)/) next    # skip # and // comments; NOT bare * (it swallowed real paths in C-pointer / markdown-bullet lines)
+        # Walk each matched path token; exclude a token only if the token ITSELF is
+        # a fixture/system path — a whole-line exclusion hid a real /Users/ path that
+        # merely shared a line with example.com or /tmp/.
+        rest=line
+        hit=0
+        while (match(rest, /["']\/(Users|home|opt|usr|private)\/[^ "']*|\/Users\/[^ "']*|\/home\/[A-Za-z][^ "']*|~\/\.claude[^ "']*|~\/\.sutando[^ "']*/)) {
+            tok=substr(rest, RSTART, RLENGTH)
+            rest=substr(rest, RSTART + RLENGTH)
+            cand=tok; sub(/^["']/,"",cand)   # drop a leading quote from the quoted variant
+            if (cand ~ /^\/nonexistent/ || cand ~ /^\/usr\/fake/ || cand ~ /^\/tmp\// || cand ~ /example\.com/) continue
+            hit=1
+        }
+        if (hit) {
             s=t; if (length(s) > 160) s=substr(s,1,160) "…"
             print f ":" ln ": " s
         }
     }
-    '
+AWK
+    awk -f "$awkf"
+    rm -f "$awkf"
 }
 PATH_HITS="$(printf '%s\n' "$DIFF" | scan_hardcoded_paths)"
 if [[ -n "$PATH_HITS" ]]; then
