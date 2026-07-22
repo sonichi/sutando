@@ -54,6 +54,25 @@ R_FORBIDDEN = "FORBIDDEN"
 
 _ALLOW_DECISIONS = frozenset({AUTO_ALLOW, LEGACY_ALLOW})
 
+# The HTTP status a given decision MUST arrive with (contract: auto-allow -> 2xx,
+# approval_required -> 202, forbidden -> 403). A decision/status pair that disagrees is a
+# malformed/inconsistent response (a buggy endpoint, a proxy error page, or tampering); the
+# client fails closed rather than honor it — critically, an `auto-allow` on a non-2xx status
+# must NOT yield an allowed outcome just because the body claims it did.
+def _status_ok(decision, http_status) -> bool:
+    if decision == AUTO_ALLOW:
+        return isinstance(http_status, int) and 200 <= http_status < 300
+    if decision == APPROVAL_REQUIRED:
+        return http_status == 202
+    if decision == FORBIDDEN:
+        return http_status == 403
+    return False  # unknown decision — caller fails closed regardless
+
+
+# The recognized decisions that carry a status contract (unknown decisions are handled by the
+# fail-closed default at the end of `classify`, so they are deliberately excluded here).
+_EXPECTED_STATUS_DECISIONS = frozenset({AUTO_ALLOW, APPROVAL_REQUIRED, FORBIDDEN})
+
 
 class AuthzOutcome:
     """Normalized result of one `/v1/room` op response. `decision` is the source of truth;
@@ -122,9 +141,10 @@ class ApprovalRequired(Exception):
 def classify(http_status, body) -> AuthzOutcome:
     """Turn a `/v1/room` op response `(http_status, parsed_json_body)` into an `AuthzOutcome`.
 
-    Fails closed: an unrecognized `decision` string, or a non-2xx response with no envelope,
-    is reported as `forbidden` rather than allowed. A 2xx response with no envelope is
-    `LEGACY_ALLOW` (pre-wiring server; the op already ran)."""
+    Fails closed: an unrecognized `decision` string, a non-2xx response with no envelope, or an
+    envelope whose `decision` disagrees with the HTTP status (e.g. `auto-allow` on a 403/500 —
+    see `_status_ok`) is reported as `forbidden` rather than allowed. A 2xx response with no
+    envelope is `LEGACY_ALLOW` (pre-wiring server; the op already ran)."""
     body = body if isinstance(body, dict) else {}
     authz = body.get("authz")
 
@@ -147,6 +167,13 @@ def classify(http_status, body) -> AuthzOutcome:
         policy=details.get("policy"),
         raw=body,
     )
+
+    # Envelope decision and HTTP status must agree (see `_status_ok`). A recognized decision
+    # arriving with an incompatible status is fail-closed to FORBIDDEN — otherwise an
+    # `auto-allow` body on a 403/500 would be handed back as a successful op.
+    if decision in _EXPECTED_STATUS_DECISIONS and not _status_ok(decision, http_status):
+        return AuthzOutcome(FORBIDDEN, ok=False,
+                            **{**common, "policy": "status_mismatch"})
 
     if decision == AUTO_ALLOW:
         return AuthzOutcome(AUTO_ALLOW, ok=True, result=body, **common)

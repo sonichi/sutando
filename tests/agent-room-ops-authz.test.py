@@ -99,6 +99,44 @@ def test_approval_without_id_is_still_approval():
           "approval_required w/o approval_id -> still needs_approval, id None")
 
 
+def test_auto_allow_on_non_2xx_fails_closed():
+    # THE reported fail-open: an auto-allow envelope on a status that says the op did NOT
+    # succeed must never yield an allowed outcome. Both 403 and 500 fail closed.
+    for status in (403, 500, 401, 0):
+        o = A.classify(status, _envelope(A.AUTO_ALLOW))
+        check(o.forbidden and not o.allowed,
+              f"auto-allow + {status} -> forbidden (fail closed, not a false allow)")
+        check(o.policy == "status_mismatch", f"auto-allow + {status} -> policy status_mismatch")
+
+
+def test_decision_status_compatible_pairs_pass():
+    # Contract-matching pairs are honored unchanged (regression guard against over-failing).
+    check(A.classify(200, _envelope(A.AUTO_ALLOW)).allowed, "auto-allow + 200 -> allowed")
+    check(A.classify(202, _envelope(A.APPROVAL_REQUIRED, approval_id="a")).needs_approval,
+          "approval_required + 202 -> needs_approval")
+    check(A.classify(403, _envelope(A.FORBIDDEN, reason_code=A.R_FORBIDDEN)).forbidden,
+          "forbidden + 403 -> forbidden")
+
+
+def test_other_mismatched_pairs_fail_closed():
+    # approval_required and forbidden on the wrong status also fail closed. Neither can produce
+    # an allowed outcome, but a status-inconsistent envelope is malformed -> forbidden.
+    o1 = A.classify(500, _envelope(A.APPROVAL_REQUIRED, approval_id="a"))
+    check(o1.forbidden and o1.policy == "status_mismatch",
+          "approval_required + 500 -> forbidden/status_mismatch (fail closed)")
+    o2 = A.classify(200, _envelope(A.APPROVAL_REQUIRED, approval_id="a"))
+    check(o2.forbidden and not o2.needs_approval,
+          "approval_required + 200 -> forbidden (not offered on inconsistent status)")
+    o3 = A.classify(200, _envelope(A.FORBIDDEN, reason_code=A.R_FORBIDDEN))
+    check(o3.forbidden and o3.policy == "status_mismatch",
+          "forbidden + 200 -> forbidden/status_mismatch (still a deny)")
+
+
+def test_status_ok_unknown_decision_defensive_false():
+    # _status_ok's defensive default: an unknown decision has no compatible status.
+    check(A._status_ok("teleport", 200) is False, "_status_ok(unknown) -> False (defensive)")
+
+
 def test_non_dict_body_fails_closed():
     o = A.classify(200, None)
     check(o.decision == A.LEGACY_ALLOW, "None body + 200 -> legacy-allow (empty result)")
