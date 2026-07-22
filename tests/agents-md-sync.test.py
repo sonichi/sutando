@@ -6,7 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = next(p for p in Path(__file__).resolve().parents if (p / "src" / "vault_intercept.py").is_file())
 CLAUDE = (REPO / "CLAUDE.md").read_text()
 AGENTS = (REPO / "AGENTS.md").read_text()
 
