@@ -123,12 +123,66 @@ def case_d_no_channels_ok() -> list[str]:
     return []
 
 
+def case_e_unresolvable_home_ok() -> list[str]:
+    """claude_home_path raising must degrade to ok, never crash the run."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            def _boom(*_a):
+                raise RuntimeError("no home")
+            hc.claude_home_path = _boom
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "ok" or "resolvable" not in r["detail"]:
+        return [f"e) unresolvable claude-home should be ok, got {r}"]
+    return []
+
+
+def case_f_channels_dir_but_no_access_ok() -> list[str]:
+    """channels/ exists but holds no access.json → nothing to back up → ok."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            (h.home / "channels" / "discord").mkdir(parents=True)  # no access.json
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "ok" or "no channel access.json" not in r["detail"]:
+        return [f"f) channels dir with no access.json should be ok, got {r}"]
+    return []
+
+
+def case_g_unreadable_carrier_warn() -> list[str]:
+    """A carrier that can't be read (here: a directory in its place) → warn."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            h.write_live("discord", b'{"allowFrom":["123"]}')
+            # carrier path exists but is a directory → read_bytes raises OSError
+            (h.ws / "hosts" / "TestHost" / "channels" / "discord" / "access.json").mkdir(parents=True)
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "warn" or "unreadable backup" not in r["detail"]:
+        return [f"g) unreadable carrier should warn 'unreadable backup', got {r}"]
+    return []
+
+
+def case_h_unreadable_live_skipped_ok() -> list[str]:
+    """A live access.json that can't be read (a directory) is skipped, not fatal."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            # live path is a directory → read_bytes raises → that entry is skipped
+            (h.home / "channels" / "discord" / "access.json").mkdir(parents=True)
+            r = hc.check_per_host_config_backup()
+    # skipped → nothing checked → ok (no channel access.json to back up)
+    if r["status"] != "ok":
+        return [f"h) unreadable live entry should be skipped (ok), got {r}"]
+    return []
+
+
 def main() -> int:
     cases = [
         ("a", case_a_identical_ok),
         ("b", case_b_diff_warn),
         ("c", case_c_missing_warn),
         ("d", case_d_no_channels_ok),
+        ("e", case_e_unresolvable_home_ok),
+        ("f", case_f_channels_dir_but_no_access_ok),
+        ("g", case_g_unreadable_carrier_warn),
+        ("h", case_h_unreadable_live_skipped_ok),
     ]
     failures = []
     for label, fn in cases:
