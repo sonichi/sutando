@@ -35,7 +35,12 @@ function writeOwnerActivity(channel: string, summary: string): void {
 			channel,
 			summary: summary.slice(0, 80),
 		};
-		const tmp = OWNER_ACTIVITY_FILE + '.tmp';
+		// Per-PID staging: last-owner-activity.json is written by five processes
+		// (this task-bridge + the sparrow/discord/slack/telegram bridges). A shared
+		// '.tmp' name lets two concurrent writers truncate and interleave the same
+		// temp file, so the rename can publish torn JSON. A per-PID temp is never
+		// shared; renameSync maps to an atomic rename(2). (sonichi/sutando#2222)
+		const tmp = `${OWNER_ACTIVITY_FILE}.${process.pid}.tmp`;
 		writeFileSync(tmp, JSON.stringify(payload));
 		renameSync(tmp, OWNER_ACTIVITY_FILE);
 	} catch (e) {

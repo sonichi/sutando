@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import uuid
 import re
 import secrets
 import sys
@@ -73,6 +74,8 @@ from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from slack_proactive_receipts import mark_delivered as mark_proactive_delivered  # noqa: E402
+from slack_proactive_receipts import was_delivered as proactive_was_delivered  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -172,9 +175,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         }
         if channel_id:
             payload["channel_id"] = str(channel_id)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Per-PID staging name: this file is written by four processes (this
+        # bridge + discord/telegram/sparrow). A shared ".json.tmp" name lets two
+        # concurrent writers truncate and interleave the same temp file, so the
+        # rename can publish torn JSON. A per-PID temp is never shared, and
+        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
 
@@ -1125,6 +1133,16 @@ def result_watcher():
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
                         continue
+                    delivery_id = f.name
+                    # A producer may recreate the same deterministic result
+                    # filename after the watcher successfully sends and removes
+                    # it. Keep a durable receipt so that file-existence checks or
+                    # retries cannot turn one schedule fire into duplicate DMs.
+                    if proactive_was_delivered(STATE_DIR, delivery_id):
+                        print(f"  [proactive] duplicate suppressed: {delivery_id}", flush=True)
+                        _record_skip_audit(delivery_id, "deduped")
+                        f.unlink(missing_ok=True)
+                        continue
                     # Peek before claiming: skip Discord-targeted proactive files.
                     # [channel: <17-20 digit snowflake>] is a Discord-only marker;
                     # claiming it here dumps the literal text to Slack DM instead.
@@ -1153,6 +1171,7 @@ def result_watcher():
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
                             _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
+                            mark_proactive_delivered(STATE_DIR, delivery_id)
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                         except Exception as e:
                             print(f"  [proactive] failed: {e}", flush=True)
