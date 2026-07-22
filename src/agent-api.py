@@ -37,8 +37,10 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -374,7 +376,46 @@ def delegation_submit_task(data: dict):
     )
     if not task_file_str.startswith(task_dir_real + os.sep):
         return 400, {"error": "task path escapes task directory"}
-    Path(task_file_str).write_text(content)
+    # Do not reopen the validated pathname: a local process could swap in a
+    # symlink between the realpath check above and write_text().  Write a
+    # private temporary entry through an already-open directory descriptor,
+    # then atomically replace the final directory entry.  os.replace replaces
+    # a raced symlink itself instead of following it to an outside target.
+    task_name = os.path.basename(task_file_str)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    task_dir_fd = os.open(task_dir_real, dir_flags)
+    temp_name = f".{task_name}.{secrets.token_hex(8)}.tmp"
+    try:
+        try:
+            existing = os.stat(task_name, dir_fd=task_dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            return 400, {"error": "task path escapes task directory"}
+
+        open_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                      | getattr(os, "O_NOFOLLOW", 0)
+                      | getattr(os, "O_CLOEXEC", 0))
+        temp_fd = os.open(temp_name, open_flags, 0o600, dir_fd=task_dir_fd)
+        try:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+        except Exception:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+            raise
+        os.replace(temp_name, task_name,
+                   src_dir_fd=task_dir_fd, dst_dir_fd=task_dir_fd)
+        temp_name = ""
+    finally:
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=task_dir_fd)
+            except FileNotFoundError:
+                pass
+        os.close(task_dir_fd)
     return 200, {"ok": True, "task_id": tid}
 
 

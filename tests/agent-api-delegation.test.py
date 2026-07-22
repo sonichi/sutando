@@ -204,6 +204,37 @@ else:
     })
     check("direct submit rejects symlink escape",
           code == 400 and outside.read_text() == "do not overwrite\n")
+
+# Race the final task entry into a symlink after validation but immediately
+# before the atomic publish.  The submit must replace the directory entry,
+# never follow it and overwrite the outside target.
+race_outside = tmp / "outside-task-race.txt"
+race_outside.write_text("race sentinel\n")
+race_name = "task-symlink-race.txt"
+race_content = DIRECT_CONTENT.replace("task-direct-1", "task-symlink-race")
+real_replace = api.os.replace
+
+
+def _race_replace(src, dst, *args, **kwargs):
+    raced = api.TASK_DIR / dst
+    try:
+        raced.symlink_to(race_outside)
+    except OSError:
+        pass
+    return real_replace(src, dst, *args, **kwargs)
+
+
+api.os.replace = _race_replace
+try:
+    code, _ = api.delegation_submit_task({
+        "id": "task-symlink-race", "content": race_content,
+    })
+finally:
+    api.os.replace = real_replace
+check("direct submit is safe against symlink swap race",
+      code == 200 and race_outside.read_text() == "race sentinel\n"
+      and (api.TASK_DIR / race_name).read_text() == race_content
+      and not (api.TASK_DIR / race_name).is_symlink())
 (api.RESULT_DIR / "task-direct-1.txt").write_text("direct answer\n")
 code, data = api.delegation_list_results()
 check("direct list", code == 200 and "task-direct-1.txt" in data["files"])
