@@ -28,6 +28,18 @@ class TestChatSecretFilter(unittest.TestCase):
         self.assertNotIn(token, result.text)
         self.assertIn("OpenAI Token", result.secret_types)
 
+    def test_matrix_access_token_is_redacted(self):
+        token = "syt_" + "matrixSyntheticValue" * 2
+        result = filter_chat_secrets(f"TASKROOM_MATRIX_TOKEN={token}")
+        self.assertNotIn(token, result.text)
+        self.assertIn("Matrix Access Token", result.secret_types)
+
+    def test_combined_remote_task_token_is_redacted(self):
+        token = "https://gateway.example.test|" + "remoteSyntheticSecret" * 2
+        result = filter_chat_secrets(f"REMOTE_TASK_TOKEN={token}")
+        self.assertNotIn(token, result.text)
+        self.assertIn("Remote Task Token", result.secret_types)
+
     def test_unhandled_detector_hit_redacts_the_whole_line(self):
         class Hit:
             secret_type = "High Entropy Secret"

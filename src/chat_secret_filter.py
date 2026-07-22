@@ -16,6 +16,10 @@ from typing import Iterable, Tuple
 _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     ("AWS Access Key", re.compile(r"AKIA[A-Z0-9]{16}")),
     ("GitHub Token", re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}")),
+    ("Matrix Access Token", re.compile(r"syt_[A-Za-z0-9_-]{20,}")),
+    ("Remote Task Token", re.compile(
+        r"https?://[^\s|]+\|[A-Za-z0-9_+/=-]{20,}"
+    )),
     ("JSON Web Token", re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
     ("Slack Token", re.compile(r"xox[abps]-[A-Za-z0-9-]+")),
     ("OpenAI Token", re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
