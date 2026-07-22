@@ -103,6 +103,14 @@ if [ -n "${SUTANDO_NODE:-}" ]; then
   _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
   case ":$PATH:" in *":$_SUTANDO_NODE_DIR:"*) ;; *) PATH="$_SUTANDO_NODE_DIR:$PATH"; export PATH ;; esac
 fi
+# G1.5 post-gate sentinel. Every exit above this line is a fail-closed refusal;
+# reaching here means node resolved AND (in bundled mode) every dist artifact
+# was present. Printed unconditionally and deliberately so a test can assert the
+# gate was PASSED rather than infer it from the absence of a failure message —
+# absence-of-failure is also what an unrelated early crash looks like. Also
+# useful when reading a boot log: it marks exactly where packaging validation
+# ended. Grepped by scripts/smoke-startup-gate.sh case 3; keep the string stable.
+echo "✓ G1.5 gate passed (mode=$([ "$BUNDLED_MODE" = "1" ] && echo bundled || echo dev))"
 run_node_service() {
   # $1 = dist basename (build-bundle artifact), $2 = ts entry (as run_tsx
   # expects it today — relative or absolute), rest = service args.
