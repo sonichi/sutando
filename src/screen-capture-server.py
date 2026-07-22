@@ -318,7 +318,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         except Exception:
                             pass
 
-                    wd = threading.Timer(MAX_RECORDING_SECONDS, _auto_stop)
+                    # ?max=<seconds> raises the safety cap for known-long sessions
+                    # (meeting-link auto-record needs meeting-length clips; the
+                    # 600s default ate a 41-min meeting on 2026-07-22). Bounded
+                    # at 4h so a typo can't disable the watchdog entirely.
+                    max_raw = query.get("max", [None])[0]
+                    cap = MAX_RECORDING_SECONDS
+                    if max_raw and max_raw.isdigit():
+                        cap = min(int(max_raw), 4 * 3600)
+                    wd = threading.Timer(cap, _auto_stop)
                     wd.daemon = True
                     wd.start()
                     _active_recording = {"proc": proc, "path": path, "watchdog": wd}
@@ -326,6 +334,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "recording", "path": path}).encode())
+                return
+
+            # action=status — recording state for UI indicators. Added with the
+            # meeting-link auto-record flow (Susan 2026-07-22: the Drop Video
+            # Clip row must show 🔴 even when the recording was started by the
+            # watcher over HTTP, which the app cannot see locally). Read-only.
+            if action == "status":
+                with _recording_lock:
+                    rec = _active_recording
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "recording": bool(rec),
+                    "path": rec["path"] if rec else None,
+                }).encode())
                 return
 
             # Toggle-only: /capture-video needs action=start|stop. (The old
