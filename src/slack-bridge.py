@@ -74,6 +74,10 @@ from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
+from slack_owner import resolve_proactive_owner_id  # noqa: E402
+from slack_proactive_receipts import mark_delivered as mark_proactive_delivered  # noqa: E402
+from slack_proactive_receipts import was_delivered as proactive_was_delivered  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -647,7 +651,17 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not text and not attachment_note:
         return None
 
-    write_owner_activity("slack", text or attachment_note, channel_id=event.get("channel"))
+    # Owner-activity state is persisted before tier/vault handling below. Use a
+    # redacted preview so an ordinary pasted token never lands in state JSON.
+    initial_secret_filter = filter_chat_secrets(text)
+    detected_secret_types = set(initial_secret_filter.secret_types)
+    safe_attachment = filter_chat_secrets(attachment_note)
+    detected_secret_types.update(safe_attachment.secret_types)
+    write_owner_activity(
+        "slack",
+        initial_secret_filter.text or safe_attachment.text,
+        channel_id=event.get("channel"),
+    )
 
     channel = event.get("channel", "")
     # Reply in-thread for channel @mentions, top-level for DMs. parens for
@@ -696,6 +710,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
                 print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
         else:
             text = redact_vault_commands(text)
+
+    # Generic chat-secret detection is deliberately AFTER explicit vault
+    # interception: named `vault set` values still reach Keychain, while any
+    # other pasted token is redacted before task/prompt persistence.
+    filtered_text = filter_chat_secrets(text)
+    text = filtered_text.text
+    detected_secret_types.update(filtered_text.secret_types)
+    attachment_note = safe_attachment.text
+    secret_notice = secret_handling_instruction("Slack", detected_secret_types)
 
     # Prepend an in-band system instruction for non-owner tiers so the
     # core agent cannot accidentally process a downgraded task with full
@@ -788,6 +811,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"priority: {priority}\n"
         f"task: {user_task_text}\n"
         f"{skill_hints}"
+        f"{secret_notice}"
     )
     # If the bridge dies immediately after creation, the next process can still
     # route the result. The helper rolls the route back if task writing fails.
@@ -1150,6 +1174,16 @@ def result_watcher():
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
                         continue
+                    delivery_id = f.name
+                    # A producer may recreate the same deterministic result
+                    # filename after the watcher successfully sends and removes
+                    # it. Keep a durable receipt so that file-existence checks or
+                    # retries cannot turn one schedule fire into duplicate DMs.
+                    if proactive_was_delivered(STATE_DIR, delivery_id):
+                        print(f"  [proactive] duplicate suppressed: {delivery_id}", flush=True)
+                        _record_skip_audit(delivery_id, "deduped")
+                        f.unlink(missing_ok=True)
+                        continue
                     # Peek before claiming: skip Discord-targeted proactive files.
                     # [channel: <17-20 digit snowflake>] is a Discord-only marker;
                     # claiming it here dumps the literal text to Slack DM instead.
@@ -1170,17 +1204,23 @@ def result_watcher():
                     if not text:
                         claim.unlink(missing_ok=True)
                         continue
-                    owner_ids = load_allowed()
-                    if owner_ids:
-                        owner_id = next(iter(owner_ids))
+                    try:
+                        access_data = json.loads(ACCESS_FILE.read_text())
+                    except Exception:
+                        access_data = {}
+                    owner_id = resolve_proactive_owner_id(access_data)
+                    if owner_id is not None:
                         # Open a DM channel to the owner (idempotent).
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
                             _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
+                            mark_proactive_delivered(STATE_DIR, delivery_id)
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                         except Exception as e:
                             print(f"  [proactive] failed: {e}", flush=True)
+                    else:
+                        print(f"  [proactive] no owner in allowFrom, skipping {claim.name}", flush=True)
                     claim.unlink(missing_ok=True)
 
             # Heartbeat (used by health-check.py)
