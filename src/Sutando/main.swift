@@ -236,23 +236,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Poll /capture-video?action=status and mirror it onto the menu row.
-    /// Read-only; failures leave the indicator untouched (server down ≠ off,
-    /// but flipping to off on error would lie during transient hiccups —
-    /// the next successful poll corrects either way within 2s).
-    func syncRecordingIndicator() {
-        guard let url = URL(string: "http://localhost:7845/capture-video?action=status") else { return }
-        var req = URLRequest(url: url, timeoutInterval: 1.0)
-        let tokenPath = NSString(string: "~/.config/sutando/screen-capture-token").expandingTildeInPath
-        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
-            req.setValue(token, forHTTPHeaderField: "X-Sutando-Capture-Token")
-        }
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let data = data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let on = obj["recording"] as? Bool else { return }
-            self?.setRecordingIndicator(on)
-        }.resume()
+    /// Darwin-notification observers for recording state (push, not poll).
+    /// The capture server posts com.sutando.recording.on/.off via notifyutil
+    /// whenever recording starts or stops, whoever started it.
+    func registerRecordingStateObservers() {
+        let dn = CFNotificationCenterGetDarwinNotifyCenter()
+        let me = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(dn, me, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            Unmanaged<AppDelegate>.fromOpaque(observer).takeUnretainedValue().setRecordingIndicator(true)
+        }, "com.sutando.recording.on" as CFString, nil, .deliverImmediately)
+        CFNotificationCenterAddObserver(dn, me, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            Unmanaged<AppDelegate>.fromOpaque(observer).takeUnretainedValue().setRecordingIndicator(false)
+        }, "com.sutando.recording.off" as CFString, nil, .deliverImmediately)
     }
 
     func setupMenuBar() {
@@ -371,13 +368,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.checkWatcher()
         }
 
-        // Recording-indicator sync (Susan 2026-07-22): the Drop Video Clip 🔴
-        // must also reflect recordings started OUTSIDE the app — the
-        // meeting-link watcher starts them over HTTP, which local toggle state
-        // cannot see. Poll the capture server's read-only status action.
-        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.syncRecordingIndicator()
-        }
+        // Recording-indicator sync (Susan 2026-07-22, push not poll): the
+        // capture server Darwin-notifies com.sutando.recording.on/.off on
+        // every state change (⌃R, watcher-started sessions, watchdog
+        // auto-stop) — observe those and mirror onto the Drop Video Clip row.
+        registerRecordingStateObservers()
 
         // Contextual chips: every 120s, refresh contextual-chips.json from
         // cheap mechanical sources (open PRs, top pending question, recent

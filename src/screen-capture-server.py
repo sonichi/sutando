@@ -85,6 +85,18 @@ _recording_lock = threading.Lock()
 MAX_RECORDING_SECONDS = 600  # safety cap for a recording nobody stopped
 
 
+def _post_recording_state(on: bool):
+    """Darwin-notify recording state so Sutando.app can flip the Drop Video
+    Clip 🔴 without polling (Susan 2026-07-22: the server KNOWS when recording
+    starts/stops — push, don't poll). Covers ⌃R toggles, watcher-started
+    sessions, and the watchdog auto-stop uniformly. Fire-and-forget."""
+    try:
+        subprocess.Popen(["notifyutil", "-p",
+                          "com.sutando.recording." + ("on" if on else "off")])
+    except Exception:
+        pass
+
+
 def _signal_seeing_blocking():
     try:
         req = urllib.request.Request(WEB_CLIENT_STATE_URL, method="GET")
@@ -250,6 +262,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     rec["proc"].send_signal(signal.SIGINT)  # -v finalizes on SIGINT
                     rec["proc"].wait(timeout=30)
                     path = rec["path"]
+                    _post_recording_state(False)
                     if not (os.path.exists(path) and os.path.getsize(path) > 0):
                         raise RuntimeError("recording produced no file")
                     if query.get("silent", ["false"])[0] != "true":
@@ -312,6 +325,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         with _recording_lock:
                             if _active_recording and _active_recording.get("proc") is p:
                                 _active_recording = None
+                        _post_recording_state(False)
                         try:
                             p.send_signal(signal.SIGINT)
                             p.wait(timeout=30)
@@ -330,26 +344,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     wd.daemon = True
                     wd.start()
                     _active_recording = {"proc": proc, "path": path, "watchdog": wd}
+                _post_recording_state(True)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "recording", "path": path}).encode())
-                return
-
-            # action=status — recording state for UI indicators. Added with the
-            # meeting-link auto-record flow (Susan 2026-07-22: the Drop Video
-            # Clip row must show 🔴 even when the recording was started by the
-            # watcher over HTTP, which the app cannot see locally). Read-only.
-            if action == "status":
-                with _recording_lock:
-                    rec = _active_recording
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({
-                    "recording": bool(rec),
-                    "path": rec["path"] if rec else None,
-                }).encode())
                 return
 
             # Toggle-only: /capture-video needs action=start|stop. (The old
