@@ -928,11 +928,10 @@ export function startRecordingNarration(session: any): void {
 			return;
 		}
 		// Inject the pre-captured description
-		let desc = nextDescRef.value!;
+		const desc = nextDescRef.value!;
 		nextDescRef.value = null;
 		lastDesc = desc;
 		previousDescs.push(desc);
-		const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 		const lastSaid = lastSpokenRef.value || '(first description)';
 		narrationSpeakingRef.value = true;
 		lastPushTime = Date.now();

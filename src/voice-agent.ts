@@ -30,26 +30,24 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
+import { inlineTools } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
-import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordToolCall } from './conversation-store.js';
-import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
-import { personalPath, sharedPersonalPath, memoryDirEnv, claudeHomePath } from './util_paths.js';
+import { sharedPersonalPath, claudeHomePath } from './util_paths.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -121,10 +119,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
 const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
-const DEFAULT_THREAD_KEY = 'sutando_main';
 const SESSION_ID = `session_${Date.now()}`;
-const PHONE_PORT = Number(process.env.PHONE_PORT) || 3100;
-const PHONE_SERVER_URL = `http://localhost:${PHONE_PORT}`;
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
 /** Single-instance lock for this workspace.
@@ -475,6 +470,9 @@ let userHasInterrupted = false;
 // the next reconnect.
 let sessionEnding = false;
 
+// Intentionally unused: kept out of the tool list on purpose — see the
+// "endSession intentionally NOT in the tool list" note at the tools: field below.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const endSession: ToolDefinition = {
 	name: 'end_session',
 	description: 'End the voice session gracefully. Call when the user explicitly says goodbye or bye.',
