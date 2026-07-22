@@ -40,6 +40,7 @@ import os
 import uuid
 import re
 import secrets
+import shlex
 import sys
 import threading
 import time
@@ -717,13 +718,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # Behaviorally covered by tests/bridge-skill-path-resolution.test.py (CLAUDE_CONFIG_DIR resolution).
     _notify_py = claude_home_path("skills", "task-progress", "scripts", "notify.py")
     _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")
+    _claude_config_dir = claude_home_path()
     skill_hints = ""
     if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
         if _notify_py.exists():
             notify_cmd = (
-                f"python3 {_notify_py}"
+                f"env CLAUDE_CONFIG_DIR={shlex.quote(str(_claude_config_dir))} "
+                f"python3 {shlex.quote(str(_notify_py))}"
                 f" --source slack --channel-id {channel}"
                 f' --message "On it — back in a moment."'
             )
