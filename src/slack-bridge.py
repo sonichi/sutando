@@ -75,6 +75,8 @@ from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from slack_proactive_receipts import mark_delivered as mark_proactive_delivered  # noqa: E402
+from slack_proactive_receipts import was_delivered as proactive_was_delivered  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -1134,6 +1136,16 @@ def result_watcher():
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
                         continue
+                    delivery_id = f.name
+                    # A producer may recreate the same deterministic result
+                    # filename after the watcher successfully sends and removes
+                    # it. Keep a durable receipt so that file-existence checks or
+                    # retries cannot turn one schedule fire into duplicate DMs.
+                    if proactive_was_delivered(STATE_DIR, delivery_id):
+                        print(f"  [proactive] duplicate suppressed: {delivery_id}", flush=True)
+                        _record_skip_audit(delivery_id, "deduped")
+                        f.unlink(missing_ok=True)
+                        continue
                     # Peek before claiming: skip Discord-targeted proactive files.
                     # [channel: <17-20 digit snowflake>] is a Discord-only marker;
                     # claiming it here dumps the literal text to Slack DM instead.
@@ -1162,6 +1174,7 @@ def result_watcher():
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
                             _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
+                            mark_proactive_delivered(STATE_DIR, delivery_id)
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                         except Exception as e:
                             print(f"  [proactive] failed: {e}", flush=True)
