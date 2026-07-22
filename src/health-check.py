@@ -861,6 +861,56 @@ def check_host_subtrees() -> dict:
     return {"name": name, "status": "ok", "detail": f"{fresh} host subtree(s), all synced <{stale_days:.0f}d"}
 
 
+def check_per_host_config_backup() -> dict:
+    """Warn when a channel's access.json vault backup has drifted from live.
+
+    sync-workspace's `_snapshot_per_host_config` copies each live
+    <claude-home>/channels/<svc>/access.json into
+    hosts/<host>/channels/<svc>/access.json — a pure backup carried by the vault
+    (nothing reads the carrier live, so there's no read/write skew). If that
+    snapshot silently stops refreshing, the vault copy drifts stale: the owner's
+    allowlist LOOKS synced but recent changes never reach the vault. Observed
+    2026-07-22 — a discord access.json backup 6 weeks stale while live had
+    changed, so the owner asking "is my access.json synced?" got a misleading
+    "there's a committed copy" when that copy was long out of date. This probe
+    makes the drift a first-class, glanceable signal. Read-only: content compare,
+    warn on divergence; never mutates either file.
+    """
+    name = "per-host-config-backup"
+    try:
+        channels_dir = Path(claude_home_path("channels"))
+    except Exception:
+        return {"name": name, "status": "ok", "detail": "no channels dir resolvable"}
+    if not channels_dir.is_dir():
+        return {"name": name, "status": "ok", "detail": "no channels configured"}
+    carrier_base = WORKSPACE_DIR / "hosts" / _host_label() / "channels"
+    drift, checked = [], 0
+    for live in sorted(channels_dir.glob("*/access.json")):
+        svc = live.parent.name
+        try:
+            live_bytes = live.read_bytes()
+        except OSError:
+            continue
+        checked += 1
+        carrier = carrier_base / svc / "access.json"
+        if not carrier.exists():
+            drift.append(f"{svc} (no backup)")
+            continue
+        try:
+            if carrier.read_bytes() != live_bytes:
+                drift.append(f"{svc} (stale)")
+        except OSError:
+            drift.append(f"{svc} (unreadable backup)")
+    if checked == 0:
+        return {"name": name, "status": "ok", "detail": "no channel access.json to back up"}
+    if drift:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(drift)} channel access.json backup(s) drifted from live: "
+                          f"{', '.join(drift)} — vault copy stale; a full sync-workspace "
+                          f"(_snapshot_per_host_config) should refresh it"}
+    return {"name": name, "status": "ok", "detail": f"{checked} channel access.json backup(s) current"}
+
+
 def check_migrate_reader_contract() -> dict:
     """Verify migration CLASS_RULES are compatible with reader resolution chains (issue #1543).
 
@@ -3010,6 +3060,8 @@ def run_all_checks() -> list[dict]:
 
     # Per-host subtree freshness (hosts/<host>/ stopped syncing?)
     checks.append(check_host_subtrees())
+    # Per-host channel access.json backup drift (live vs vault-carried copy)
+    checks.append(check_per_host_config_backup())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
