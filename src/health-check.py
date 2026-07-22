@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import socket
 import subprocess
 import sys
@@ -1690,6 +1691,44 @@ def check_gateway_bridge() -> "dict | None":
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
+# Free-space thresholds. A full volume is not a slow degradation — it is a hard
+# stop: task/result writes fail with ENOSPC, so the bridge silently stops
+# delivering and the core looks alive while doing nothing. Observed 2026-07-21,
+# when the volume hit 100% and this script still reported "All systems
+# operational" because nothing here looked at disk at all.
+DISK_WARN_GIB = 10.0
+DISK_FAIL_GIB = 2.0
+
+
+def check_disk_space() -> dict:
+    """Free space on the volume(s) the core actually writes to.
+
+    Checks the workspace and the temp dir, reporting the WORST of the two —
+    they are usually the same volume, but a separate /tmp must not hide a full
+    workspace (or the reverse). Reports absolute GiB rather than percentage:
+    5% of a 460G disk is 23G (fine) while 5% of a 20G disk is 1G (dead), so a
+    percentage threshold would mean different things on different hosts.
+    """
+    name = "disk-space"
+    targets = {}
+    for label, path in (("workspace", WORKSPACE_DIR), ("tmp", Path(tempfile.gettempdir()))):
+        try:
+            st = os.statvfs(str(path))
+        except OSError as e:
+            return {"name": name, "status": "error", "detail": f"cannot stat {label} ({path}): {e}"}
+        # Key by device so the same volume isn't reported twice.
+        targets[st.f_fsid or label] = (label, path, st.f_bavail * st.f_frsize / (1024 ** 3))
+
+    worst_label, worst_path, worst_free = min(targets.values(), key=lambda t: t[2])
+    where = f"{worst_free:.1f} GiB free on {worst_label} ({worst_path})"
+    if worst_free < DISK_FAIL_GIB:
+        return {"name": name, "status": "fail",
+                "detail": f"{where} — writes will fail with ENOSPC; free space now"}
+    if worst_free < DISK_WARN_GIB:
+        return {"name": name, "status": "warn", "detail": f"{where} — below {DISK_WARN_GIB:.0f} GiB"}
+    return {"name": name, "status": "ok", "detail": where}
+
+
 def check_skill_symlinks() -> dict:
     """Detect skills in the OSS repo checkout that are not symlinked into
     ~/.claude/skills/. A missing symlink means Claude Code never loads the
@@ -2380,6 +2419,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_skill_symlinks())
+    checks.append(check_disk_space())
 
     return checks
 
