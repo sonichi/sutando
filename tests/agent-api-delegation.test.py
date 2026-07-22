@@ -235,6 +235,76 @@ check("direct submit is safe against symlink swap race",
       code == 200 and race_outside.read_text() == "race sentinel\n"
       and (api.TASK_DIR / race_name).read_text() == race_content
       and not (api.TASK_DIR / race_name).is_symlink())
+
+# A pre-positioned symlink whose target stays inside TASK_DIR passes the
+# realpath containment gate, so the descriptor-level no-symlink check must
+# still reject it.
+inside_target = api.TASK_DIR / "inside-target.txt"
+inside_target.write_text("inside sentinel\n")
+inside_link = api.TASK_DIR / "task-inside-symlink.txt"
+try:
+    inside_link.symlink_to(inside_target)
+except OSError:
+    pass
+else:
+    inside_content = DIRECT_CONTENT.replace("task-direct-1", "task-inside-symlink")
+    code, _ = api.delegation_submit_task({
+        "id": "task-inside-symlink", "content": inside_content,
+    })
+    check("direct submit rejects in-directory symlink",
+          code == 400 and inside_target.read_text() == "inside sentinel\n")
+
+# If wrapping/writing the private descriptor fails, the descriptor and hidden
+# temporary entry are both cleaned up before the error propagates.
+real_fdopen = api.os.fdopen
+
+
+def _failing_fdopen(fd, *args, **kwargs):
+    api.os.close(fd)
+    raise OSError("injected fdopen failure")
+
+
+api.os.fdopen = _failing_fdopen
+try:
+    try:
+        api.delegation_submit_task({
+            "id": "task-write-failure",
+            "content": DIRECT_CONTENT.replace("task-direct-1", "task-write-failure"),
+        })
+    except OSError as exc:
+        write_failed = "injected fdopen failure" in str(exc)
+    else:
+        write_failed = False
+finally:
+    api.os.fdopen = real_fdopen
+check("failed task write removes private temp entry",
+      write_failed and not list(api.TASK_DIR.glob(".task-write-failure.txt.*.tmp")))
+
+# If publication fails after another process has already removed the temp
+# entry, the cleanup path tolerates the missing name while preserving the
+# original publish error.
+real_replace = api.os.replace
+
+
+def _remove_temp_then_fail(src, dst, *args, **kwargs):
+    api.os.unlink(src, dir_fd=kwargs["src_dir_fd"])
+    raise OSError("injected publish failure")
+
+
+api.os.replace = _remove_temp_then_fail
+try:
+    try:
+        api.delegation_submit_task({
+            "id": "task-publish-failure",
+            "content": DIRECT_CONTENT.replace("task-direct-1", "task-publish-failure"),
+        })
+    except OSError as exc:
+        publish_failed = "injected publish failure" in str(exc)
+    else:
+        publish_failed = False
+finally:
+    api.os.replace = real_replace
+check("missing temp during failed publish cleanup is harmless", publish_failed)
 (api.RESULT_DIR / "task-direct-1.txt").write_text("direct answer\n")
 code, data = api.delegation_list_results()
 check("direct list", code == 200 and "task-direct-1.txt" in data["files"])

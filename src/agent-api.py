@@ -381,7 +381,7 @@ def delegation_submit_task(data: dict):
     # private temporary entry through an already-open directory descriptor,
     # then atomically replace the final directory entry.  os.replace replaces
     # a raced symlink itself instead of following it to an outside target.
-    task_name = os.path.basename(task_file_str)
+    task_name = f"{tid}.txt"
     dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     task_dir_fd = os.open(task_dir_real, dir_flags)
     temp_name = f".{task_name}.{secrets.token_hex(8)}.tmp"
