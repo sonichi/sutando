@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 import socket
 import subprocess
 import sys
@@ -1580,6 +1581,44 @@ def check_gateway_bridge() -> "dict | None":
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
+# Free-space thresholds. A full volume is not a slow degradation — it is a hard
+# stop: task/result writes fail with ENOSPC, so the bridge silently stops
+# delivering and the core looks alive while doing nothing. Observed 2026-07-21,
+# when the volume hit 100% and this script still reported "All systems
+# operational" because nothing here looked at disk at all.
+DISK_WARN_GIB = 10.0
+DISK_FAIL_GIB = 2.0
+
+
+def check_disk_space() -> dict:
+    """Free space on the volume(s) the core actually writes to.
+
+    Checks the workspace and the temp dir, reporting the WORST of the two —
+    they are usually the same volume, but a separate /tmp must not hide a full
+    workspace (or the reverse). Reports absolute GiB rather than percentage:
+    5% of a 460G disk is 23G (fine) while 5% of a 20G disk is 1G (dead), so a
+    percentage threshold would mean different things on different hosts.
+    """
+    name = "disk-space"
+    targets = {}
+    for label, path in (("workspace", WORKSPACE_DIR), ("tmp", Path(tempfile.gettempdir()))):
+        try:
+            st = os.statvfs(str(path))
+        except OSError as e:
+            return {"name": name, "status": "error", "detail": f"cannot stat {label} ({path}): {e}"}
+        # Key by device so the same volume isn't reported twice.
+        targets[st.f_fsid or label] = (label, path, st.f_bavail * st.f_frsize / (1024 ** 3))
+
+    worst_label, worst_path, worst_free = min(targets.values(), key=lambda t: t[2])
+    where = f"{worst_free:.1f} GiB free on {worst_label} ({worst_path})"
+    if worst_free < DISK_FAIL_GIB:
+        return {"name": name, "status": "fail",
+                "detail": f"{where} — writes will fail with ENOSPC; free space now"}
+    if worst_free < DISK_WARN_GIB:
+        return {"name": name, "status": "warn", "detail": f"{where} — below {DISK_WARN_GIB:.0f} GiB"}
+    return {"name": name, "status": "ok", "detail": where}
+
+
 def check_skill_symlinks() -> dict:
     """Detect skills in the OSS repo checkout that are not symlinked into
     ~/.claude/skills/. A missing symlink means Claude Code never loads the
@@ -1720,6 +1759,156 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
             "detail": f"{len(files)} tasks queued, oldest {oldest_age}s — watcher or core may be stuck",
         }
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
+
+
+def _proc_argv(pid: int) -> str:
+    """argv of `pid`, or "" if no such process.
+
+    Deliberately `ps -p <pid>`, NOT `pgrep -f watch-tasks-stream`: pgrep's
+    `-f` matches the search string against full argv, and the calling shell's
+    own argv contains that string — a transient self-match that returns a PID
+    already gone by the next `ps` (the anti-pattern documented in
+    /schedule-crons step 5 and /proactive-loop step 9). Inspecting one known
+    PID cannot self-match.
+    """
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001 — a probe failure must not fail the check
+        return ""
+
+
+# The argv must BE the script invocation, not merely mention it. A substring
+# test counts the observer: any shell whose command line contains the name —
+# a `ps | grep watch-tasks-stream`, or the wrapper running this very check —
+# matches, and each one reads as another watcher. Observed 2026-07-21: a loose
+# match reported 3 trees where 2 were real, the phantom being the shell that
+# ran the query. Same family as the pgrep self-match noted in _proc_argv; the
+# fix is to anchor on the whole command rather than search inside it.
+_WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
+
+
+def _is_watcher_argv(argv: str) -> bool:
+    """True only for `<shell> <path>/watch-tasks-stream.sh` and nothing more."""
+    parts = argv.split()
+    if len(parts) != 2:
+        return False
+    exe, script = parts
+    return (exe.rsplit("/", 1)[-1] in _WATCHER_SHELLS
+            and script.endswith("watch-tasks-stream.sh"))
+
+
+def _watcher_trees(ps_output: "str | None" = None) -> dict:
+    """Map root PID -> set of PIDs for each distinct watcher TREE running.
+
+    Each watcher is several processes (a shell wrapper, the script, a
+    subshell), so counting matching lines overcounts. A "root" is a match
+    whose parent is not itself a match — one per independent watcher. Callers
+    need the whole tree, not just the root, to tell which tree owns the
+    sentinel PID (the sentinel records the script's PID, not the wrapper's).
+
+    `ps -Ao` + filtering here rather than `pgrep -f watch-tasks-stream`, for
+    the reason in _proc_argv: pgrep would match the caller. Our own argv is
+    the health-check invocation, but we drop it explicitly anyway.
+    """
+    if ps_output is None:
+        try:
+            ps_output = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                                       capture_output=True, text=True,
+                                       timeout=5).stdout
+        except Exception:  # noqa: BLE001
+            return {}
+    me = str(os.getpid())
+    parent = {}
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] == me:
+            continue
+        if not _is_watcher_argv(parts[2]):
+            continue
+        parent[parts[0]] = parts[1]
+    trees: dict = {}
+    for pid in parent:
+        root, seen = pid, set()
+        while parent.get(root) in parent and root not in seen:
+            seen.add(root)
+            root = parent[root]
+        trees.setdefault(root, set()).add(pid)
+    return trees
+
+
+def check_task_watcher() -> dict:
+    """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
+
+    The two consequence checks above cannot see a dead watcher on their own:
+    `check_task_queue` needs BOTH >3 tasks AND >300s age, so a watcher that
+    dies against an empty (or small) queue reads green, and a single stranded
+    owner DM never trips the count threshold at all; `check_core_proactive_loop`
+    reads core-status.json, which the proactive loop writes every pass — it is
+    freshest exactly when the loop is alive and the watcher is not. Observed
+    2026-07-21: watcher dead, queue empty, health-check reported 0 failures.
+
+    So this is the direct signal to pair with them, read from the PID sentinel
+    the watcher maintains itself (written at startup, removed by its cleanup
+    trap on clean exit) — present-but-dead therefore means "crashed", absent
+    means "not running".
+
+    Gated on `_any_core_alive()`: with no core running, no watcher is expected
+    and warning here would latch on permanently for anyone not currently
+    running Sutando — a check that is always red carries the same information
+    as one that is always green.
+    """
+    name = "task-watcher"
+    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    if not _any_core_alive():
+        return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
+    trees = _watcher_trees()
+    roots = sorted(trees)
+    if not pid_file.exists():
+        if roots:
+            # Sentinel gone but watchers alive: they are draining tasks/ but
+            # nothing supervises them, and each new start adds another (observed
+            # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
+            # duplicate processing, not a stalled queue).
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
+                              f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
+                              "stop them and restart one cleanly"}
+        return {"name": name, "status": "warn",
+                "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
+                          "restart via Monitor: bash src/watch-tasks-stream.sh"}
+    try:
+        pid = int(pid_file.read_text().strip())
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "status": "warn",
+                "detail": f"unreadable PID sentinel ({str(e)[:40]}) — restart the watcher"}
+    argv = _proc_argv(pid)
+    if not argv:
+        if roots:
+            # The sentinel tracks only the MOST RECENT start (the script writes
+            # $$ at startup), so a dead sentinel does NOT mean nothing is
+            # draining tasks/ — an older watcher can still be running. Saying
+            # "not running" here would be false, and restarting on that basis is
+            # what produces the duplicates in the first place.
+            return {"name": name, "status": "warn",
+                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
+                              f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
+                              "stop them and restart one cleanly"}
+        return {"name": name, "status": "warn",
+                "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
+    if "watch-tasks-stream" not in argv:
+        # PID reuse: the sentinel outlived the watcher and the OS handed the
+        # number to something else. `kill -0` alone would call this alive.
+        return {"name": name, "status": "warn",
+                "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
+    extras = sorted(r for r, members in trees.items() if str(pid) not in members)
+    if extras:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by the "
+                          f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
+                          f"more than once. Keep the sentinel's ({pid}), stop the rest"}
+    return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 
 def check_notes_split_brain() -> "dict | None":
@@ -2265,7 +2454,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_task_watcher())
     checks.append(check_skill_symlinks())
+    checks.append(check_disk_space())
 
     return checks
 
@@ -3011,6 +3202,24 @@ def recover_core_if_wedged(
             lock_fh.close()
 
 
+def summary_line(checks) -> str:
+    """The no-failures summary. Warnings are deliberately NOT issues — they must
+    not fail the exit code or wake the launchd notifier, and that is unchanged.
+    But the unqualified "All systems operational." printed directly under a
+    `⚠ core degraded` row contradicts the screen, and anything summarising this
+    tool by its last line (a human skimming, a grepped status check) then reports
+    healthy while a warning stands. Name them instead.
+
+    Pure and importable on purpose, so a regression test exercises THIS code
+    rather than a copy of it.
+    """
+    warns = [c for c in checks if c.get("status") == "warn"]
+    if not warns:
+        return "All systems operational."
+    return (f"No failures — {len(warns)} warning(s): "
+            + ", ".join(c["name"] for c in warns))
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -3095,7 +3304,7 @@ def main():
         print()
     if not issues:
         if not quiet:
-            print("All systems operational.")
+            print(summary_line(checks))
     else:
         print(f"{len(issues)} issue(s) found:")
         for c in issues:

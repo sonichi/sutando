@@ -148,11 +148,13 @@ def should_notify():
 
 
 def notify_macos(count, titles):
+    """Returns True only if osascript actually accepted the notification."""
     msg = f"{count} pending question{'s' if count > 1 else ''}: {', '.join(titles[:3])}"
-    subprocess.run([
+    r = subprocess.run([
         "osascript", "-e",
         f'display notification "{msg}" with title "Sutando"'
     ], capture_output=True)
+    return r.returncode == 0
 
 
 def questions_key(questions):
@@ -177,7 +179,7 @@ def notify_discord_dm(questions):
     """Write a proactive-*.txt file so discord-bridge DMs the owner.
     Owner asked (2026-04-09, while traveling) to receive pending-question
     pings as DMs instead of just macOS notifications."""
-    path = RESULTS_DIR / f"proactive-pending-q-{questions_key(questions)}.txt"
+    path = RESULTS_DIR / f"{PROACTIVE_PREFIX}{questions_key(questions)}.txt"
     lines = [
         f"⚠️ {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting:",
         "",
@@ -193,6 +195,80 @@ def notify_discord_dm(questions):
         f"Reply here or edit pending-questions.md on {socket.gethostname().split('.')[0]} to resolve."
     )
     path.write_text("\n".join(lines))
+
+
+# A proactive-*.txt is only a DELIVERY if some bridge drains it. On a host where
+# none is running the file just accumulates, while this script still printed
+# "Notified" -- claiming an outcome it never achieved. Rather than sniff for
+# consumer processes (pgrep -f self-matches; see the watcher notes), use the
+# evidence already on disk: files we wrote earlier that nobody took.
+UNDRAINED_AGE_S = 600
+# Only OUR files are evidence about OUR delivery path. results/proactive-*.txt is
+# a shared namespace — morning-briefing and the durable scheduler write there too
+# (see notes/proactive-delivery-void-inventory.md). One unrelated stale file would
+# otherwise produce a confident, wrong "the DM path is not reaching the owner".
+PROACTIVE_PREFIX = "proactive-pending-q-"
+
+
+def undrained_proactive_files():
+    """Previously-written proactive-*.txt older than UNDRAINED_AGE_S -- i.e. old
+    enough that a live consumer would have drained them."""
+    now = time.time()
+    out = []
+    try:
+        for f in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt"):
+            try:
+                if now - f.stat().st_mtime > UNDRAINED_AGE_S:
+                    out.append(f.name)
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return sorted(out)
+
+
+def notify_summary(count, macos_ok, voice_ok, stale):
+    """Build the per-path summary line, plus a warning when the DM path is dead.
+
+    Pure so the claim itself is testable — the whole point of this change is that
+    the summary must not assert delivery that did not occur."""
+    paths = [
+        "macos=ok" if macos_ok else "macos=FAILED",
+        "voice=ok" if voice_ok else "voice=skipped(not connected)",
+    ]
+    if stale:
+        paths.append(f"proactive-file=written but {len(stale)} earlier one(s) UNDRAINED")
+    else:
+        paths.append("proactive-file=written")
+    summary = f"Notified: {count} pending questions [{', '.join(paths)}]"
+    warning = None
+    if stale:
+        warning = (
+            "  WARNING: no consumer is draining results/proactive-*.txt on this host "
+            f"(oldest undrained: {stale[0]}). The DM path is NOT reaching the owner; "
+            "only the macOS notification is real here."
+        )
+    return summary, warning
+
+
+def deliver(questions, count, titles):
+    """Fire every notification path and report what actually happened.
+
+    Separated from main() so the delivery decisions are testable; main() is left
+    as argument parsing plus printing. Voice is skipped when disconnected because
+    the DM fallback would otherwise deliver question-*.txt as a duplicate.
+    """
+    stale = undrained_proactive_files()
+    macos_ok = notify_macos(count, titles)
+    voice_ok = False
+    if voice_client_connected():
+        notify_voice(questions)
+        voice_ok = True
+    notify_discord_dm(questions)
+    summary, warning = notify_summary(count, macos_ok, voice_ok, stale)
+    if warning:
+        print(warning, file=sys.stderr)
+    return summary
 
 
 def main():
@@ -212,22 +288,13 @@ def main():
     count = len(questions)
     titles = [q["title"] for q in questions]
 
-    # macOS notification
-    notify_macos(count, titles)
-
-    # Voice result — only when voice is actually connected. When offline, the
-    # discord-bridge dm-fallback would deliver question-*.txt as a duplicate
-    # of notify_discord_dm below. Skipping cuts the spam in half.
-    if voice_client_connected():
-        notify_voice(questions)
-
-    # Discord DM to owner (via discord-bridge poll_proactive)
-    notify_discord_dm(questions)
-
-    # Update last notify time
+    # Cooldown is stamped only AFTER delivery returns. Stamping first meant a
+    # raising delivery path still suppressed the next hour's notification — the
+    # exact "claimed an outcome it never achieved" failure this script exists to
+    # remove, reproduced in its own control flow.
+    summary = deliver(questions, count, titles)
     LAST_NOTIFY_FILE.write_text(str(int(time.time())))
-
-    print(f"Notified: {count} pending questions")
+    print(summary)
 
 
 if __name__ == "__main__":
