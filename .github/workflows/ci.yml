@@ -75,6 +75,24 @@ jobs:
           python3 scripts/lint-skill.test.py
           python3 scripts/lint-skill.py --all --strict
 
+      # Python tests that live OUTSIDE tests/ and so are invisible to the
+      # `find tests -name '*.test.py'` step below. Same reason the skill-manifest
+      # test above is wired by hand. Without this they run only when someone
+      # remembers to run them locally, which is indistinguishable from passing.
+      # Notably src/remote-gateway-bridge.test.py — the suite the transport
+      # change process requires for ANY package change — and tools/test_no_drift.py,
+      # which is the guard against src/ and the package silently diverging.
+      - name: Run out-of-tree Python tests
+        run: |
+          python3 src/remote-gateway-bridge.test.py
+          python3 packages/ag2-sparrow/tests/test_gateway_status.py
+          python3 packages/ag2-sparrow/tests/test_ack_retry.py
+          python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
+          python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
+          python3 packages/ag2-sparrow/tools/test_no_drift.py
+          python3 skills/agent-room-ops/test_room_ops.py
+          python3 skills/make-viral-video/scripts/test_source_tag.py
+
       - name: Run tests
         run: npm test
         if: hashFiles('tests/**/*.test.ts') != ''
