@@ -293,7 +293,11 @@ print(_host_label(), end='')
     # pins, and the ONLY tsx on a host with no homebrew/nvm/volta node at all),
     # then the usual global locations. Prints the resolved path, or nothing —
     # the caller falls back to `npx tsx` on empty output.
-    _nvm_tsx="$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/tsx"
+    # `|| true` inside the substitution: on a host with no ~/.nvm the `ls`
+    # fails, and under `set -euo pipefail` that pipeline status would kill the
+    # whole script BEFORE the candidate loop — startup.sh then dies silently at
+    # its `_TSX_BIN=$(...)` line even though node_modules/.bin/tsx exists.
+    _nvm_tsx="$HOME/.nvm/versions/node/$( (ls "$HOME/.nvm/versions/node/" 2>/dev/null || true) | sort -V | tail -1)/bin/tsx"
     for _p in \
       "$REPO_ROOT/node_modules/.bin/tsx" \
       /opt/homebrew/bin/tsx \
@@ -302,6 +306,10 @@ print(_host_label(), end='')
       "$HOME/.volta/bin/tsx"; do
       [ -x "$_p" ] && { printf '%s' "$_p"; break; }
     done
+    # The contract is "print the path, or nothing" — exit 0 either way. Without
+    # this, a no-match run exits with the last [ -x ] test's failure status and
+    # set -e callers die instead of falling back to `npx tsx`.
+    true
     ;;
 
   dump)
