@@ -2435,10 +2435,10 @@ def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
 def resolve_collaborator_purposes(access_data, sender_id, serving_channel_id):
     """Return an optional tuple of owner-configured purposes for a collaborator.
 
-    ``None`` means the optional restriction is not configured, preserving the
-    existing collaborator behavior. A tuple means the restriction is active;
-    an empty tuple is an intentional deny-all result used for malformed or empty
-    configured entries. Scope is the serving channel and sender, matching
+    This deliberately has three states: ``None`` means unrestricted/backward-
+    compatible, ``()`` means an active deny-all instruction, and a populated
+    tuple means an active allowlist instruction. Scope is the serving channel
+    and sender, matching
     ``resolve_is_collaborator``.
 
     access.json shape::
@@ -2477,7 +2477,11 @@ def resolve_collaborator_purposes(access_data, sender_id, serving_channel_id):
 
 
 def collaborator_purpose_instruction(purposes):
-    """Build the trusted, fail-closed task instruction for an active restriction."""
+    """Build trusted guidance for an active purpose restriction.
+
+    This is an agent-enforced instruction, not a structural sandbox boundary;
+    the existing team/other tiers remain the hard read-only enforcement layer.
+    """
     if purposes is None:
         return ""
     if purposes:

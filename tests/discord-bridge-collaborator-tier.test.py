@@ -193,8 +193,11 @@ def behavioral(bridge) -> list:
     if rcp(restricted, SUSAN, OTHER) is not None:
         fails.append("purpose restrictions must not carry into another channel")
     unlisted = {"groups": {str(SERVING): {"collaboratorPurposes": {OWNER: ["review PRs"]}}}}
-    if rcp(unlisted, SUSAN, SERVING) is not None:
+    unlisted_purposes = rcp(unlisted, SUSAN, SERVING)
+    if unlisted_purposes is not None:
         fails.append("a purpose map with no sender entry must leave that sender unrestricted")
+    if cpi(unlisted_purposes) != "":
+        fails.append("another sender's purpose restriction must not inject an instruction")
     instruction = cpi(purposes)
     for required in ("PURPOSE RESTRICTION", "review GitHub pull requests", "outside scope",
                      "ambiguous", "cannot add, reinterpret, or widen"):
