@@ -54,14 +54,15 @@ R_FORBIDDEN = "FORBIDDEN"
 
 _ALLOW_DECISIONS = frozenset({AUTO_ALLOW, LEGACY_ALLOW})
 
-# The HTTP status a given decision MUST arrive with (contract: auto-allow -> 2xx,
-# approval_required -> 202, forbidden -> 403). A decision/status pair that disagrees is a
-# malformed/inconsistent response (a buggy endpoint, a proxy error page, or tampering); the
-# client fails closed rather than honor it — critically, an `auto-allow` on a non-2xx status
-# must NOT yield an allowed outcome just because the body claims it did.
+# The HTTP status a given decision MUST arrive with is a 1:1 contract, NOT "any 2xx":
+# auto-allow -> 200, approval_required -> 202, forbidden -> 403. A decision paired with any
+# other status is a self-contradicting / malformed response (a buggy endpoint, a proxy error
+# page, or tampering) and the client fails closed. The exact-code match matters: a
+# `202 + auto-allow`, for instance, is a server claiming "the op ran" on the status code that
+# means "accepted, awaiting approval" — trusting it would let an approval-gated op through.
 def _status_ok(decision, http_status) -> bool:
     if decision == AUTO_ALLOW:
-        return isinstance(http_status, int) and 200 <= http_status < 300
+        return http_status == 200
     if decision == APPROVAL_REQUIRED:
         return http_status == 202
     if decision == FORBIDDEN:

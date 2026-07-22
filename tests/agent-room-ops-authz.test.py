@@ -109,6 +109,16 @@ def test_auto_allow_on_non_2xx_fails_closed():
         check(o.policy == "status_mismatch", f"auto-allow + {status} -> policy status_mismatch")
 
 
+def test_auto_allow_requires_exactly_200():
+    # 1:1 contract, NOT "any 2xx": auto-allow must arrive with 200. A 202 (approval's code) or
+    # any other 2xx paired with auto-allow is a self-contradicting envelope -> fail closed.
+    for status in (202, 201, 204, 299):
+        o = A.classify(status, _envelope(A.AUTO_ALLOW))
+        check(o.forbidden and not o.allowed,
+              f"auto-allow + {status} (2xx but not 200) -> forbidden (fail closed)")
+        check(o.policy == "status_mismatch", f"auto-allow + {status} -> policy status_mismatch")
+
+
 def test_decision_status_compatible_pairs_pass():
     # Contract-matching pairs are honored unchanged (regression guard against over-failing).
     check(A.classify(200, _envelope(A.AUTO_ALLOW)).allowed, "auto-allow + 200 -> allowed")
