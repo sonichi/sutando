@@ -297,6 +297,22 @@ def case_m3_completed_tasks_excluded_from_recovery() -> list[str]:
     return fails
 
 
+def case_m3b_archived_results_excluded_from_recovery() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tasks = root / "tasks"
+        results = root / "results"
+        archive = results / "archive" / "2026-07"
+        tasks.mkdir()
+        archive.mkdir(parents=True)
+        task = write_task(tasks, "task-complete.txt", age_sec=600)
+        (archive / task.name).write_text("complete")
+        if hc._oldest_pending_task(time.time(), tasks) is not None:
+            fails.append("m3b) archived result triggered core-recovery wedge detection")
+    return fails
+
+
 def case_m4_task_scan_error_fails_open() -> list[str]:
     fails = []
     with mock.patch.object(Path, "glob", side_effect=OSError("scan failed")):
@@ -441,6 +457,7 @@ def main() -> int:
         ("m", case_m_archive_excluded),
         ("m2", case_m2_completed_tasks_excluded),
         ("m3", case_m3_completed_tasks_excluded_from_recovery),
+        ("m3b", case_m3b_archived_results_excluded_from_recovery),
         ("m4", case_m4_task_scan_error_fails_open),
         ("n", case_n_notify_empty_no_call),
         ("o", case_o_dedup_within_cooldown),

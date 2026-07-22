@@ -14,6 +14,14 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 
+has_result() {
+  local filename="$1"
+  [ -f "$RESULTS_DIR/$filename" ] && return 0
+  [ -d "$RESULTS_DIR/archive" ] || return 1
+  find "$RESULTS_DIR/archive" -mindepth 2 -maxdepth 2 -type f -name "$filename" -print -quit 2>/dev/null \
+    | grep -q .
+}
+
 submit_task() {
   local filename="$1" wait_for_result="${2:-0}" prompt started
   case "$filename" in
@@ -22,7 +30,7 @@ submit_task() {
   # The stream watcher deliberately sweeps pre-existing task files after a
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
-  [ -f "$RESULTS_DIR/$filename" ] && return 0
+  has_result "$filename" && return 0
   prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
@@ -44,7 +52,7 @@ submit_task() {
   # fire-and-forget diagnostic hook.
   if [ "$wait_for_result" = "1" ]; then
     started="$(date +%s)"
-    while [ ! -f "$RESULTS_DIR/$filename" ]; do
+    while ! has_result "$filename"; do
       session_exists=0
       tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null && session_exists=1
       [ "$session_exists" = "1" ] || return 0

@@ -1695,13 +1695,20 @@ def apply_skill_symlink_fixes(checks: list) -> None:
 
 
 def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> list[Path]:
-    """Top-level task files that have not produced their canonical result."""
+    """Top-level task files that have not produced or archived a result."""
     if results_dir is None:
         results_dir = tasks_dir.parent / "results"
     try:
+        archived_names = {
+            path.name
+            for path in (results_dir / "archive").glob("*/*.txt")
+            if path.is_file()
+        }
         return [
             path for path in tasks_dir.glob("*.txt")
-            if path.is_file() and not (results_dir / path.name).is_file()
+            if path.is_file()
+            and not (results_dir / path.name).is_file()
+            and path.name not in archived_names
         ]
     except OSError:
         return []
