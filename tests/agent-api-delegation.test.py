@@ -186,6 +186,24 @@ check("submit rejects id/body divergence",
       api.delegation_submit_task({"id": "task-direct-9", "content": DIRECT_CONTENT})[0] == 400)
 check("direct submit rejects bad id", api.delegation_submit_task({"id": "../x", "content": "y"})[0] == 400)
 check("direct submit rejects empty content", api.delegation_submit_task({"id": "task-d2", "content": ""})[0] == 400)
+# A filename-safe task id can still escape through a pre-positioned symlink.
+# The HTTP-controlled submit path must reject it rather than overwrite the
+# symlink target outside tasks/.
+outside = tmp / "outside-task.txt"
+outside.write_text("do not overwrite\n")
+escape_link = api.TASK_DIR / "task-symlink-escape.txt"
+try:
+    escape_link.symlink_to(outside)
+except OSError:
+    # Windows/non-privileged environments may not permit symlink creation.
+    pass
+else:
+    escape_content = DIRECT_CONTENT.replace("task-direct-1", "task-symlink-escape")
+    code, _ = api.delegation_submit_task({
+        "id": "task-symlink-escape", "content": escape_content,
+    })
+    check("direct submit rejects symlink escape",
+          code == 400 and outside.read_text() == "do not overwrite\n")
 (api.RESULT_DIR / "task-direct-1.txt").write_text("direct answer\n")
 code, data = api.delegation_list_results()
 check("direct list", code == 200 and "task-direct-1.txt" in data["files"])
@@ -212,6 +230,39 @@ check("direct archive bad tid", api.delegation_archive_result(
 (api.RESULT_DIR / "task-foreign.txt").write_text("someone else's\n")
 check("archive rejects name/tid mismatch", api.delegation_archive_result(
     {"name": "task-foreign.txt", "task_id": "task-direct-1"})[0] == 400)
+# Both archive paths are confined after resolving symlinks. A relay client
+# cannot make the archive endpoint inspect or move a result outside results/,
+# or replace a destination outside the month archive directory.
+outside_result = tmp / "outside-result.txt"
+outside_result.write_text("outside result\n")
+source_escape = api.RESULT_DIR / "task-source-escape.txt"
+try:
+    source_escape.symlink_to(outside_result)
+except OSError:
+    pass
+else:
+    code, _ = api.delegation_archive_result({
+        "name": "task-source-escape.txt", "task_id": "task-source-escape",
+    })
+    check("archive rejects source symlink escape",
+          code == 400 and outside_result.read_text() == "outside result\n")
+
+(api.RESULT_DIR / "task-dest-escape.txt").write_text("inside result\n")
+archive_month = api.local_task_protocol.archive_month_dir(
+    api.RESULT_DIR, api.datetime.now().isoformat())
+archive_month.mkdir(parents=True, exist_ok=True)
+dest_escape = archive_month / "task-dest-escape.txt"
+try:
+    dest_escape.symlink_to(outside_result)
+except OSError:
+    pass
+else:
+    code, _ = api.delegation_archive_result({
+        "name": "task-dest-escape.txt", "task_id": "task-dest-escape",
+    })
+    check("archive rejects destination symlink escape",
+          code == 400 and outside_result.read_text() == "outside result\n"
+          and (api.RESULT_DIR / "task-dest-escape.txt").exists())
 # No-clobber (Codex P1): an occupied archive slot gets an epoch-suffixed name.
 (api.RESULT_DIR / "task-direct-1.txt").write_text("second result\n")
 code, _ = api.delegation_archive_result({"name": "task-direct-1.txt", "task_id": "task-direct-1"})

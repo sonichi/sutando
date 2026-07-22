@@ -364,7 +364,17 @@ def delegation_submit_task(data: dict):
     if embedded != tid:
         return 400, {"error": f"body id header ({embedded!r}) does not match request id"}
     TASK_DIR.mkdir(parents=True, exist_ok=True)
-    (TASK_DIR / f"{tid}.txt").write_text(content)
+    # Keep the containment check in this function so CodeQL can follow the
+    # tainted HTTP value through normalization to the filesystem sink.  The
+    # task-id regex alone prevents lexical traversal, but not an existing
+    # `<task-id>.txt` symlink that points outside TASK_DIR.
+    task_dir_real = os.path.realpath(TASK_DIR)
+    task_file_str = os.path.realpath(
+        os.path.join(task_dir_real, f"{tid}.txt")
+    )
+    if not task_file_str.startswith(task_dir_real + os.sep):
+        return 400, {"error": "task path escapes task directory"}
+    Path(task_file_str).write_text(content)
     return 200, {"ok": True, "task_id": tid}
 
 
@@ -372,13 +382,22 @@ def delegation_archive_result(data: dict):
     name = str(data.get("name", ""))
     tid = str(data.get("task_id", ""))
     stem = name[:-4] if name.endswith(".txt") else name
-    src = _safe_path(RESULT_DIR, stem)
     # Identity coherence (Codex P1 on #1956): a relay client may only archive
     # ITS OWN result — the source name must be exactly <task_id>.txt. Without
     # this, any safe name could be filed under any valid id, hijacking other
     # consumers' results into a foreign archive slot.
-    if src is None or not local_task_protocol.valid_task_id(tid) or stem != tid:
+    if not local_task_protocol.valid_task_id(tid) or stem != tid:
         return 400, {"error": "invalid name/task id, or name does not match task id"}
+    # Inline the CodeQL-modeled normalization + prefix guard at both the
+    # source and destination sinks.  `_safe_path` enforces the same policy,
+    # but CodeQL does not propagate that sanitizer through the helper return.
+    result_dir_real = os.path.realpath(RESULT_DIR)
+    src_str = os.path.realpath(
+        os.path.join(result_dir_real, f"{stem}.txt")
+    )
+    if not src_str.startswith(result_dir_real + os.sep):
+        return 400, {"error": "result path escapes result directory"}
+    src = Path(src_str)
     if not os.path.exists(src):
         return 200, {"ok": True, "note": "already gone"}
     # Same destination scheme as task-bridge's archiveFile():
@@ -388,9 +407,20 @@ def delegation_archive_result(data: dict):
     dest_dir = local_task_protocol.archive_month_dir(
         RESULT_DIR, datetime.now().isoformat())
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{tid}.txt"
+    dest_dir_real = os.path.realpath(dest_dir)
+    dest_str = os.path.realpath(
+        os.path.join(dest_dir_real, f"{tid}.txt")
+    )
+    if not dest_str.startswith(dest_dir_real + os.sep):
+        return 400, {"error": "archive path escapes archive directory"}
+    dest = Path(dest_str)
     if dest.exists():
-        dest = dest_dir / f"{tid}-{int(datetime.now().timestamp())}.txt"
+        dest_str = os.path.realpath(os.path.join(
+            dest_dir_real, f"{tid}-{int(datetime.now().timestamp())}.txt"
+        ))
+        if not dest_str.startswith(dest_dir_real + os.sep):
+            return 400, {"error": "archive path escapes archive directory"}
+        dest = Path(dest_str)
     os.replace(src, dest)
     return 200, {"ok": True}
 
