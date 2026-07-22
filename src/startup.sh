@@ -1139,7 +1139,11 @@ open "http://localhost:$WEB_CLIENT_PORT"
 # stdin is untouched by the tee exec, so `-t 0` still tells the truth;
 # launchd / Sutando.app runs have non-TTY stdin and keep the detached path.
 # The startup log keeps everything except the interactive session itself.
-if [ -t 0 ]; then
+# A startup launched from a tmux pane (notably the self-upgrade service pane)
+# must stay detached. Restoring /dev/tty there makes the runtime launcher try
+# to attach to sutando-core from inside tmux, which blocks startup forever and
+# leaves the old core running without completing recovery.
+if [ -t 0 ] && [ -z "${TMUX:-}" ]; then
     exec >/dev/tty 2>&1
 fi
 exec bash "$REPO/src/agent/start-cli.sh"

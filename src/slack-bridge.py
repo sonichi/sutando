@@ -75,6 +75,7 @@ from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
+from slack_owner import resolve_proactive_owner_id  # noqa: E402
 from slack_proactive_receipts import mark_delivered as mark_proactive_delivered  # noqa: E402
 from slack_proactive_receipts import was_delivered as proactive_was_delivered  # noqa: E402
 
@@ -1184,9 +1185,12 @@ def result_watcher():
                     if not text:
                         claim.unlink(missing_ok=True)
                         continue
-                    owner_ids = load_allowed()
-                    if owner_ids:
-                        owner_id = next(iter(owner_ids))
+                    try:
+                        access_data = json.loads(ACCESS_FILE.read_text())
+                    except Exception:
+                        access_data = {}
+                    owner_id = resolve_proactive_owner_id(access_data)
+                    if owner_id is not None:
                         # Open a DM channel to the owner (idempotent).
                         try:
                             resp = app.client.conversations_open(users=owner_id)
@@ -1196,6 +1200,8 @@ def result_watcher():
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                         except Exception as e:
                             print(f"  [proactive] failed: {e}", flush=True)
+                    else:
+                        print(f"  [proactive] no owner in allowFrom, skipping {claim.name}", flush=True)
                     claim.unlink(missing_ok=True)
 
             # Heartbeat (used by health-check.py)
