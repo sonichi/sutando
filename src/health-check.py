@@ -22,6 +22,7 @@ Checks:
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -1699,11 +1700,18 @@ def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> 
     if results_dir is None:
         results_dir = tasks_dir.parent / "results"
     try:
-        archived_names = {
-            path.name
-            for path in (results_dir / "archive").glob("*/*.txt")
-            if path.is_file()
-        }
+        archive_dir = results_dir / "archive"
+        archived_names = set()
+        for path in archive_dir.glob("*/*.txt"):
+            if path.is_file():
+                archived_names.add(path.name)
+        for path in archive_dir.glob("*.txt"):
+            if not path.is_file():
+                continue
+            archived_names.add(path.name)
+            renamed = re.match(r"^(.+)-[0-9]+\.txt$", path.name)
+            if renamed:
+                archived_names.add(f"{renamed.group(1)}.txt")
         return [
             path for path in tasks_dir.glob("*.txt")
             if path.is_file()

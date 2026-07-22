@@ -15,10 +15,14 @@ POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 
 has_result() {
-  local filename="$1"
+  local filename="$1" stem
   [ -f "$RESULTS_DIR/$filename" ] && return 0
   [ -d "$RESULTS_DIR/archive" ] || return 1
-  find "$RESULTS_DIR/archive" -mindepth 2 -maxdepth 2 -type f -name "$filename" -print -quit 2>/dev/null \
+  stem="${filename%.txt}"
+  # Local bridges archive as archive/YYYY-MM/<task>.txt. The remote gateway
+  # archives as archive/<task>-<epoch>.txt. Both are completed deliveries.
+  find "$RESULTS_DIR/archive" -mindepth 1 -maxdepth 2 -type f \
+    \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
     | grep -q .
 }
 

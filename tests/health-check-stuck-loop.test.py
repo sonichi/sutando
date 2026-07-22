@@ -313,6 +313,21 @@ def case_m3b_archived_results_excluded_from_recovery() -> list[str]:
     return fails
 
 
+def case_m3c_gateway_archived_results_excluded_from_recovery() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tasks = root / "tasks"
+        archive = root / "results" / "archive"
+        tasks.mkdir()
+        archive.mkdir(parents=True)
+        task = write_task(tasks, "task-complete.txt", age_sec=600)
+        (archive / "task-complete-1784690000.txt").write_text("complete")
+        if hc._oldest_pending_task(time.time(), tasks) is not None:
+            fails.append("m3c) gateway-archived result triggered recovery detection")
+    return fails
+
+
 def case_m4_task_scan_error_fails_open() -> list[str]:
     fails = []
     with mock.patch.object(Path, "glob", side_effect=OSError("scan failed")):
@@ -458,6 +473,7 @@ def main() -> int:
         ("m2", case_m2_completed_tasks_excluded),
         ("m3", case_m3_completed_tasks_excluded_from_recovery),
         ("m3b", case_m3b_archived_results_excluded_from_recovery),
+        ("m3c", case_m3c_gateway_archived_results_excluded_from_recovery),
         ("m4", case_m4_task_scan_error_fails_open),
         ("n", case_n_notify_empty_no_call),
         ("o", case_o_dedup_within_cooldown),
