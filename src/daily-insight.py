@@ -128,6 +128,25 @@ def analyze_note_activity():
     return {"total": len(notes), "recent_7d": len(recent), "top_tags": tags.most_common(5)}
 
 
+def _git_author_identity(repo_root):
+    """The local git identity (email, else name) — the "you" this insight speaks
+    to. Used to count only the owner's own commits so a pull of upstream work
+    doesn't inflate "you shipped N" (CR #2257). Returns "" if none is set or git
+    is unavailable, in which case the caller declines to make a personal claim."""
+    for key in ("user.email", "user.name"):
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(repo_root), "config", "--get", key],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        v = r.stdout.strip()
+        if r.returncode == 0 and v:
+            return v
+    return ""
+
+
 def analyze_dev_activity(repo_root=SRC_DIR, now=None):
     """Real code output in the last 24h, straight from git.
 
@@ -139,12 +158,21 @@ def analyze_dev_activity(repo_root=SRC_DIR, now=None):
 
     Returns ``{"commits_24h": int, "top_dirs": [(dir, n), ...]}`` or None when
     git isn't available / it's not a repo. Deliberately local + deterministic
-    (a single ``git log`` — no ``gh`` network call) so a cron run never hangs.
+    (git only — no ``gh`` network call) so a cron run never hangs.
+
+    Counts only the LOCAL git identity's own commits (``--author``). Without
+    this filter, a ``git pull`` that lands other contributors' work would report
+    their commits as "you shipped N", the exact misleading personal metric this
+    insight exists to avoid (CR #2257, qingyun-wu). If no identity resolves, we
+    return None rather than attribute someone else's commits to the owner.
     """
+    author = _git_author_identity(repo_root)
+    if not author:
+        return None
     try:
         out = subprocess.run(
             ["git", "-C", str(repo_root), "log", "--since=24 hours ago",
-             "--pretty=format:C:%H", "--name-only"],
+             f"--author={author}", "--pretty=format:C:%H", "--name-only"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):

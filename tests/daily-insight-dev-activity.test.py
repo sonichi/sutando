@@ -47,9 +47,24 @@ class TestAnalyzeDevActivity(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
 
+    def _run_with(self, identity="me@example.com", log_out=GIT_OUT, log_rc=0):
+        """analyze_dev_activity now calls git TWICE: config (identity) then log.
+        Returns (result, list-of-run-call-arg-lists) so callers can assert the
+        commands git was invoked with."""
+        calls = []
+        cfg = _git(identity + "\n" if identity else "",
+                   returncode=0 if identity else 1)
+        log = _git(log_out, returncode=log_rc)
+
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            return cfg if ("config" in cmd) else log
+
+        with patch.object(self.mod.subprocess, "run", side_effect=fake_run):
+            return self.mod.analyze_dev_activity(), calls
+
     def test_counts_commits_and_dirs(self):
-        with patch.object(self.mod.subprocess, "run", return_value=_git(GIT_OUT)):
-            dev = self.mod.analyze_dev_activity()
+        dev, calls = self._run_with()
         self.assertEqual(dev["commits_24h"], 2)
         top = dict(dev["top_dirs"])
         self.assertEqual(top.get("src"), 2)
@@ -57,16 +72,43 @@ class TestAnalyzeDevActivity(unittest.TestCase):
         # A top-level file (README.md, no "/") is not counted as a dir.
         self.assertNotIn("README.md", top)
 
+    def test_log_is_scoped_to_local_identity(self):
+        # The fix (CR #2257): the git log MUST be filtered to the local identity
+        # so a pulled-in contributor's commits aren't reported as "you shipped".
+        _, calls = self._run_with(identity="me@example.com")
+        log_cmd = next(c for c in calls if "log" in c)
+        self.assertIn("--author=me@example.com", log_cmd)
+
+    def test_no_identity_returns_none(self):
+        # No git identity → can't attribute commits to the owner → no claim.
+        result, calls = self._run_with(identity="")
+        self.assertIsNone(result)
+        # And we never even ran the log when identity is unknown.
+        self.assertFalse(any("log" in c for c in calls))
+
     def test_no_commits_returns_none(self):
-        with patch.object(self.mod.subprocess, "run", return_value=_git("")):
-            self.assertIsNone(self.mod.analyze_dev_activity())
+        result, _ = self._run_with(log_out="")
+        self.assertIsNone(result)
 
     def test_git_failure_returns_none(self):
-        with patch.object(self.mod.subprocess, "run", return_value=_git("", returncode=128)):
-            self.assertIsNone(self.mod.analyze_dev_activity())
+        result, _ = self._run_with(log_rc=128)
+        self.assertIsNone(result)
 
     def test_git_missing_returns_none(self):
         with patch.object(self.mod.subprocess, "run", side_effect=OSError("no git")):
+            self.assertIsNone(self.mod.analyze_dev_activity())
+
+    def test_log_call_error_returns_none(self):
+        # Identity resolves, but the git LOG call then errors → None (the log
+        # subprocess is fenced separately from the identity lookup).
+        cfg = _git("me@example.com\n")
+
+        def fake_run(cmd, *a, **k):
+            if "config" in cmd:
+                return cfg
+            raise OSError("git log blew up")
+
+        with patch.object(self.mod.subprocess, "run", side_effect=fake_run):
             self.assertIsNone(self.mod.analyze_dev_activity())
 
     def test_timeout_returns_none(self):
