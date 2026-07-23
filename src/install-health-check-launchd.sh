@@ -13,16 +13,17 @@
 #     ~/Library/LaunchAgents/com.sutando.health-check-fallback.plist
 #   - Loads it via `launchctl bootstrap gui/$UID` (the modern Sequoia idiom).
 #   - Result: macOS runs `python3 src/health-check.py --emit-task
-#     --notify-on-fail --notify-slack --recover-core --quiet` every 5min,
+#     --notify-on-fail --notify-slack --quiet` every 5min,
 #     independent of any other Sutando process. Failures surface as tasks (for
 #     the agent to act on), macOS notifications (so the human sees them even if
 #     all of Sutando is dead), AND a direct Slack DM to the owner (remote-visible
 #     self-report for outages — fires even when the core loop is wedged). The
 #     Slack DM no-ops if no token / owner is configured.
-#   - --recover-core additionally self-heals an alive-but-wedged core (the
-#     2026-06-02 1M usage-credit-gate loop) by restarting it via start-cli.sh,
-#     guarded by a confirm window + cooldown + 3/hr give-up cap. No-op when
-#     healthy; keeps 1M on the first restart, degrades to 200K only if it recurs.
+#   - NOTE (#2246): the --recover-core destructive auto-restart was REMOVED from
+#     the default args. It decided "wedged" from core-status.json ts freshness
+#     alone and false-positived on a busy-but-healthy core, restart-looping and
+#     killing in-flight tasks. Alerting is kept; auto-restart stays off until a
+#     durable 2-independent-signal fix lands (#2246).
 #
 # What the user sees first time they install:
 #   - One macOS "Background Item Added" notification banner (Apple's own UX,

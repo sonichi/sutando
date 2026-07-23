@@ -1,8 +1,5 @@
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 /**
  * Tests for the session-boundary trimming logic added in PR #257
@@ -17,8 +14,6 @@ import { join } from 'node:path';
  * tests avoid the same way (see twilio-signature.test.ts,
  * end-session-gate.test.ts).
  */
-
-type ReadFile = (path: string) => string;
 
 function parseRecentConversation(content: string, count: number): string {
 	const allLines = content.trim().split('\n');

@@ -24,6 +24,9 @@ Covers:
     k) small queue, all old → ok (age alone shouldn't alarm)
     l) large queue with old oldest → warn
     m) archive subdir is excluded from the count
+    m2) completed tasks with canonical results are excluded from the count
+    m3) completed tasks are excluded from core-recovery wedge detection
+    m4) task scan errors fail open as an empty pending queue
 
   Notification dedup — `notify_for_failures`
     n) empty failures → no notification
@@ -43,6 +46,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -264,6 +268,75 @@ def case_m_archive_excluded() -> list[str]:
     return fails
 
 
+def case_m2_completed_tasks_excluded() -> list[str]:
+    fails = []
+    def setup(d):
+        results = d.parent / "results"
+        results.mkdir()
+        for i in range(8):
+            task = write_task(d, f"task-{i}.txt", age_sec=600)
+            (results / task.name).write_text("complete")
+    r = with_tasks_override(setup)
+    if r["status"] != "ok" or "empty" not in r["detail"]:
+        fails.append(f"m2) completed tasks counted as pending: {r['detail']}")
+    return fails
+
+
+def case_m3_completed_tasks_excluded_from_recovery() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tasks = root / "tasks"
+        results = root / "results"
+        tasks.mkdir()
+        results.mkdir()
+        task = write_task(tasks, "task-complete.txt", age_sec=600)
+        (results / task.name).write_text("complete")
+        if hc._oldest_pending_task(time.time(), tasks) is not None:
+            fails.append("m3) completed task triggered core-recovery wedge detection")
+    return fails
+
+
+def case_m3b_archived_results_excluded_from_recovery() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tasks = root / "tasks"
+        results = root / "results"
+        archive = results / "archive" / "2026-07"
+        tasks.mkdir()
+        archive.mkdir(parents=True)
+        task = write_task(tasks, "task-complete.txt", age_sec=600)
+        (archive / task.name).write_text("complete")
+        if hc._oldest_pending_task(time.time(), tasks) is not None:
+            fails.append("m3b) archived result triggered core-recovery wedge detection")
+    return fails
+
+
+def case_m3c_gateway_archived_results_excluded_from_recovery() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tasks = root / "tasks"
+        archive = root / "results" / "archive"
+        tasks.mkdir()
+        archive.mkdir(parents=True)
+        task = write_task(tasks, "task-complete.txt", age_sec=600)
+        (archive / "task-complete-1784690000.txt").write_text("complete")
+        if hc._oldest_pending_task(time.time(), tasks) is not None:
+            fails.append("m3c) gateway-archived result triggered recovery detection")
+    return fails
+
+
+def case_m4_task_scan_error_fails_open() -> list[str]:
+    fails = []
+    with mock.patch.object(Path, "glob", side_effect=OSError("scan failed")):
+        pending = hc._pending_task_files(Path("/unreadable/tasks"))
+    if pending != []:
+        fails.append(f"m4) task scan error should return an empty queue, got {pending}")
+    return fails
+
+
 # ---------------------------------------------------------------------------
 # Notify-on-fail dedup — notify_for_failures
 # ---------------------------------------------------------------------------
@@ -397,6 +470,11 @@ def main() -> int:
         ("k", case_k_small_old_queue),
         ("l", case_l_pileup),
         ("m", case_m_archive_excluded),
+        ("m2", case_m2_completed_tasks_excluded),
+        ("m3", case_m3_completed_tasks_excluded_from_recovery),
+        ("m3b", case_m3b_archived_results_excluded_from_recovery),
+        ("m3c", case_m3c_gateway_archived_results_excluded_from_recovery),
+        ("m4", case_m4_task_scan_error_fails_open),
         ("n", case_n_notify_empty_no_call),
         ("o", case_o_dedup_within_cooldown),
         ("p", case_p_different_sets_both_fire),

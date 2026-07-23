@@ -242,11 +242,13 @@ def main() -> int:
           "malformed core-status → heartbeat omits status/step (liveness-only)")
 
     # Backwards compatibility: old gateways that only implement pull/results can
-    # 404 optional protocol extensions; the client disables them and continues.
+    # 404 optional protocol extensions; the client backs off (time-gated, so a
+    # gateway that later deploys /ack is picked up without a restart) and continues.
     STATE["force_ack_404"] = True
-    rtc._ack_disabled = False
-    check(not rtc._post_task_ack("task-OLD") and rtc._ack_disabled,
-          "task ack 404 disables ack support")
+    rtc._ack_disabled_until = 0.0
+    check(not rtc._post_task_ack("task-OLD") and rtc._ack_disabled_until > 0,
+          "task ack 404 backs off ack support (retryable)")
+    rtc._ack_disabled_until = 0.0   # clear so later calls aren't skipped
     STATE["force_ack_404"] = False
     STATE["force_heartbeat_404"] = True
     rtc._heartbeat_disabled = False
@@ -440,7 +442,7 @@ def main() -> int:
     # 6e. malformed media URLs never crash task intake (drop-in-safe)
     #     (re-review 2026-07-03: `.port` raises ValueError at ACCESS time)
     rtc._download_bytes = lambda url, headers, cap: b"X"
-    for bad in (f"https://127.0.0.1:bad/media/p", "https://hs.example:bad/_matrix/media/v3/download/hs/id",
+    for bad in ("https://127.0.0.1:bad/media/p", "https://hs.example:bad/_matrix/media/v3/download/hs/id",
                 "https://[broken/media/p"):
         try:
             out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {bad} name=x.bin]")

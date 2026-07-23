@@ -26,7 +26,12 @@ Deploy: copy to ~/.claude/hooks/ and register under PreToolUse for BOTH the "Bas
 and "Read" matchers in ~/.claude/settings.json. See hooks/README.md. Config paths are
 env-overridable (SUTANDO_DISCORD_ACCESS_FILE / SUTANDO_DISCORD_ENV_FILE) for testing.
 """
-import sys, json, os, re, time, urllib.request
+import sys
+import json
+import os
+import re
+import time
+import urllib.request
 
 # Resolve the Claude config dir via $CLAUDE_CONFIG_DIR (set by Claude Code),
 # matching read_discord_channel.py/discord-bridge's claude_home_path — NOT a
