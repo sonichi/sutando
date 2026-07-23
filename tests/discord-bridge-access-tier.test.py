@@ -89,10 +89,10 @@ def main() -> int:
         return 1
 
     print("PASS: discord-bridge.py access_tier classification looks correct.")
-    print(f"  - defaults to 'other'")
-    print(f"  - global allowFrom → owner")
-    print(f"  - channel-level allowFrom union → team (fallback)")
-    print(f"  - ordering enforced (owner check before team check)")
+    print("  - defaults to 'other'")
+    print("  - global allowFrom → owner")
+    print("  - channel-level allowFrom union → team (fallback)")
+    print("  - ordering enforced (owner check before team check)")
     return 0
 
 

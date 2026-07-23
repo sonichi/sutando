@@ -532,7 +532,7 @@ def render_dashboard() -> str:
         )
 
     # Quick links
-    cards.append(f"""<div class="card full">
+    cards.append("""<div class="card full">
 <h2>Quick Links</h2>
 <div class="quick-links">
 <a href="http://localhost:8080" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Voice UI :8080</a>

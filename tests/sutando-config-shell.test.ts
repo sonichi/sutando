@@ -31,22 +31,6 @@ function runShell(subcmd: string, ws: string): string {
 	return proc.stdout;
 }
 
-function runPyResolve(ws: string): string {
-	const proc = spawnSync(
-		'python3',
-		['-c', 'import sys; sys.path.insert(0, ".."); from importlib import import_module; m = import_module("src.sutando_config"); print(m.resolve_workspace(), end="")'],
-		{
-			cwd: REPO_ROOT,
-			env: { ...process.env, SUTANDO_WORKSPACE: ws, SUTANDO_TEST_MODE: '1' },
-			encoding: 'utf-8',
-		},
-	);
-	if (proc.status !== 0) {
-		throw new Error(`py resolve_workspace exit ${proc.status}: stderr=${proc.stderr}`);
-	}
-	return proc.stdout;
-}
-
 let scratch: string;
 
 beforeEach(() => {
