@@ -90,7 +90,6 @@ describe('task-bridge.ts — [no-send]/[REPLIED] skip-marker handling (#1381)', 
 		// other result files that could have marker-like content. Without this guard
 		// a proactive-result file beginning with [no-send] would be swallowed here
 		// instead of reaching discord-bridge's poll_proactive delivery path.
-		const afterSkip = afterBlock('has skip marker');
 		// Look backward from the log line to find the enclosing if-condition.
 		const beforeSkip = SRC.slice(0, SRC.indexOf('has skip marker'));
 		const lastIfBeforeSkip = beforeSkip.lastIndexOf('if (');
