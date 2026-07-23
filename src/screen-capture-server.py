@@ -338,12 +338,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # at 4h so a typo can't disable the watchdog entirely.
                     max_raw = query.get("max", [None])[0]
                     cap = MAX_RECORDING_SECONDS
-                    if max_raw and max_raw.isdigit():
+                    if max_raw and max_raw.isdigit() and int(max_raw) > 0:
                         cap = min(int(max_raw), 4 * 3600)
                     wd = threading.Timer(cap, _auto_stop)
                     wd.daemon = True
-                    wd.start()
+                    # Register the active recording BEFORE arming the watchdog: a
+                    # tiny cap could fire _auto_stop almost immediately, and it must
+                    # see _active_recording already set (both run under
+                    # _recording_lock, so the callback blocks until this returns).
                     _active_recording = {"proc": proc, "path": path, "watchdog": wd}
+                    wd.start()
                 _post_recording_state(True)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

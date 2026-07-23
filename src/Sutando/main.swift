@@ -226,6 +226,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// enough — a missed notification left no way to tell whether the
     /// recorder was still rolling.
     func setRecordingIndicator(_ on: Bool) {
+        // Keep the ⌃R toggle state in lockstep with the indicator so a recording
+        // started/stopped externally (observed via the Darwin notification) also
+        // updates behavioral state — otherwise the next ⌃R mis-computes `starting`
+        // and needs a double-press to stop. (CR: john-the-dev)
+        isRecordingVideo = on
         DispatchQueue.main.async {
             guard let item = self.videoClipMenuItem else { return }
             let glyph = (item.representedObject as? String) ?? ""

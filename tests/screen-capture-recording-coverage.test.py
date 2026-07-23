@@ -126,6 +126,20 @@ class RecordingCoverage(unittest.TestCase):
             self.assertEqual(r.status, 200)
         self.assertEqual(CaptureTimer.captured[-1].interval, 4 * 3600)
 
+    def test_max_zero_rejected_falls_back_to_default(self):
+        # ?max=0 passes isdigit() but must be rejected (non-positive): otherwise
+        # Timer(0) would fire before _active_recording is registered and race the
+        # watchdog against the start path. It must fall back to the default cap and
+        # leave a live active recording. (CR: john-the-dev)
+        url = f"http://127.0.0.1:{self.port}/capture-video?action=start&max=0&silent=true"
+        req = urllib.request.Request(url, headers={"X-Sutando-Capture-Token": "test-capture-token"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+        self.assertEqual(CaptureTimer.captured[-1].interval, self.mod.MAX_RECORDING_SECONDS,
+                         "?max=0 must fall back to the default cap, never arm Timer(0)")
+        self.assertIsNotNone(self.mod._active_recording,
+                             "start must register the active recording, not leave it None")
+
     def test_request_stop_posts_notify_off(self):
         # Start, then explicit action=stop -> covers line 265 (_post_recording_state(False)
         # on the request-stop path). FakePopen wrote the clip file so the size check passes.
