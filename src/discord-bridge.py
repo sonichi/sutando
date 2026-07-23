@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 import re
 import shlex
 import subprocess
@@ -87,6 +88,7 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
 # Generic plugin message-hook loader. The bridge stays a THIN, plugin-AGNOSTIC
@@ -328,9 +330,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         }
         if channel_id:
             payload["channel_id"] = str(channel_id)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Per-PID staging name: this file is written by four processes (this
+        # bridge + slack/telegram/sparrow). A shared ".json.tmp" name lets two
+        # concurrent writers truncate and interleave the same temp file, so the
+        # rename can publish torn JSON. A per-PID temp is never shared, and
+        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
 
@@ -558,6 +565,29 @@ def load_policy():
         return data.get("dmPolicy", "pairing")
     except Exception:
         return "pairing"
+
+
+def read_access_for_seed(path):
+    """Read access.json for a path that is about to WRITE it back (pairing seed).
+
+    Returns:
+      - the parsed dict when the file is present and valid;
+      - a fresh default dict when the file is genuinely ABSENT (first-run
+        onboarding — seeding a default is correct);
+      - None when the file EXISTS but is unreadable/corrupt — the caller MUST
+        NOT overwrite it. Writing an empty-allowFrom default over a
+        present-but-unparseable access.json turns a transient read glitch into
+        a PERMANENT config wipe: the owner is dropped from allowFrom, so every
+        sender gets a pairing prompt and codes leak into channels. Observed
+        2026-07-21 (the owner was silently de-authorized mid-session). The safe
+        move on corruption is to leave the file untouched and bail.
+    """
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
+    except Exception:
+        return None
 
 def load_channel_config(channel_id):
     """Load channel config. Returns (requireMention, allowFrom set) or None if not configured."""
@@ -2404,6 +2434,29 @@ def _write_task_file(task_file: Path, content, username: str,
     return True
 
 
+def _reply_author_header(message) -> str:
+    """Structured ``reply_to_author`` / ``reply_to_author_id`` task-file lines.
+
+    When ``message`` is a Discord reply whose parent author is resolved, return
+    the two metadata lines so a consumer can tell WHO the sender was addressing
+    (e.g. a reply aimed at another bot) without parsing the lossy ``[Replying to
+    ...]`` body snippet. Returns ``""`` when there is no reference, no resolved
+    parent, or no author. The author's ``str()`` is newline-sanitized so a name
+    containing ``\\n`` can't inject a spurious metadata line into the k:v shape.
+    """
+    reply_author = (
+        getattr(getattr(message.reference, "resolved", None), "author", None)
+        if getattr(message, "reference", None) else None
+    )
+    if reply_author is None:
+        return ""
+    ra_name = str(reply_author).replace("\n", " ")
+    return (
+        f"reply_to_author: {ra_name}\n"
+        f"reply_to_author_id: {reply_author.id}\n"
+    )
+
+
 def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     """True iff `sender_id` is listed under the SERVING channel's `collaborators`
     array in access.json.
@@ -2459,6 +2512,8 @@ async def _handle_discord_message(message, force=False):
     sender_id = str(message.author.id)
     username = str(message.author)
     text = message.content or ""
+    initial_secret_filter = filter_chat_secrets(text)
+    detected_secret_types = set(initial_secret_filter.secret_types)
     is_dm = isinstance(message.channel, discord.DMChannel)
     channel_name = getattr(message.channel, 'name', 'DM')
 
@@ -2474,10 +2529,12 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    print(f"  [msg] #{channel_name} @{username}: {redact_vault_commands(text)[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
+    safe_log_text = redact_vault_commands(initial_secret_filter.text)
+    print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
-        print(f"  [debug] message_snapshots: {message.message_snapshots}", flush=True)
+        safe_snapshots = filter_chat_secrets(str(message.message_snapshots)).text  # pragma: no cover
+        print(f"  [debug] message_snapshots: {safe_snapshots}", flush=True)  # pragma: no cover
     if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
         print(f"  [debug] non-default message type: {message.type}", flush=True)
 
@@ -2780,10 +2837,22 @@ async def _handle_discord_message(message, force=False):
     if policy == "pairing" and sender_id not in allowed and not channel_authorized:
         # Generate pairing code — user must approve via /discord:access pair <code>
         import random, string
-        try:
-            access = json.loads(ACCESS_FILE.read_text())
-        except Exception:
-            access = {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
+        # Async gateway wiring is structurally pinned below; the pure helper's
+        # valid/absent/corrupt behavior is executed against real files.
+        access = read_access_for_seed(ACCESS_FILE)  # pragma: no cover
+        if access is None:  # pragma: no cover
+            # access.json EXISTS but is corrupt/unreadable. Do NOT overwrite it
+            # with an empty-allowFrom default — that permanently wipes the real
+            # config (owner dropped from allowFrom → pairing prompts + code leak
+            # to channels; observed 2026-07-21). Bail loudly; leave the file for
+            # the operator to restore from channels/discord/access.json.bak-*.
+            print(
+                f"  [pairing] access.json present but unreadable — NOT overwriting "
+                f"(would wipe allowFrom). Skipping pairing for @{username} ({sender_id}). "
+                f"Restore from a channels/discord/access.json.bak-* backup.",
+                flush=True,
+            )
+            return
         code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         pending = access.get("pending", {})
         # Clean expired codes
@@ -2796,8 +2865,21 @@ async def _handle_discord_message(message, force=False):
             "expiresAt": now_ms + 3600000,  # 1 hour
         }
         access["pending"] = pending
-        ACCESS_FILE.write_text(json.dumps(access, indent=2))
-        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
+        # Atomic tmp+rename. A bare write_text truncates-then-writes, exposing a
+        # window where a concurrent reader (every message hits load_channel_config,
+        # which re-reads access.json) sees a partial/empty file → json parse fail.
+        # THIS truncate-in-place write was the TRIGGER of the 2026-07-21 corrupt
+        # read: before the no-clobber guard above, that failed read fell to the
+        # bare-except default and permanently wiped allowFrom → pairing-code leak
+        # into DMs and #dev. The no-clobber guard stops the amplification; writing
+        # atomically here closes the window that produced the corrupt read at all
+        # (and the lost-update race with the `/discord:access` read-modify-write).
+        # Same pattern the thread-engage seed already uses. chmod the tmp before
+        # replace so the final file is never briefly 0644 (it holds owner IDs).
+        tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')  # pragma: no cover — async pairing branch; atomicity asserted structurally
+        tmp_path.write_text(json.dumps(access, indent=2))  # pragma: no cover
+        os.chmod(tmp_path, 0o600)  # pragma: no cover
+        os.replace(tmp_path, ACCESS_FILE)  # pragma: no cover
         await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
         print(f"  Pairing requested: @{username} ({sender_id}) code={code}")
         return
@@ -2831,7 +2913,7 @@ async def _handle_discord_message(message, force=False):
             if parts:
                 fwd_text = "\n".join(parts)
                 text = (text + "\n" + fwd_text).strip() if text else fwd_text.strip()
-                print(f"  [forward] extracted: {text[:100]}", flush=True)
+                print(f"  [forward] extracted: {filter_chat_secrets(text).text[:100]}", flush=True)  # pragma: no cover
 
     # Handle embeds (link previews, rich content, pasted images)
     embed_text = ""
@@ -2996,7 +3078,10 @@ async def _handle_discord_message(message, force=False):
     # raw print lands the secret in discord-bridge.log even though the intercept
     # below (L~2939) would store/redact it — a plaintext-secret leak to the log.
     # (2026-06-23 incident: an owner's telegram bot token leaked here.)
-    print(f"  @{username}: {redact_vault_commands(text)}{attachment_note}")
+    safe_detail_log = filter_chat_secrets(
+        f"{redact_vault_commands(text)}{attachment_note}"
+    ).text
+    print(f"  @{username}: {safe_detail_log}")
 
     # Determine access tier
     access_tier = "other"
@@ -3012,7 +3097,8 @@ async def _handle_discord_message(message, force=False):
     if sender_id in allowed:
         access_tier = "owner"
         # Record owner activity for status-aware-pivot in proactive loop
-        write_owner_activity("discord", text, channel_id=getattr(message.channel, "id", None))
+        write_owner_activity("discord", filter_chat_secrets(text).text,
+                             channel_id=getattr(message.channel, "id", None))
     else:
         # Check if team member (from channel allowlists)
         try:
@@ -3103,6 +3189,20 @@ async def _handle_discord_message(message, force=False):
         else:
             text = redact_vault_commands(text)
 
+    # Redact ordinary pasted tokens after explicit vault interception so named
+    # `vault set` values can still be stored. Include reply context and voice
+    # transcripts: both are user-derived and both are persisted in the task.
+    filtered_text = filter_chat_secrets(text)
+    filtered_attachment = filter_chat_secrets(attachment_note)
+    filtered_reply_context = filter_chat_secrets(reply_context)
+    text = filtered_text.text
+    attachment_note = filtered_attachment.text
+    reply_context = filtered_reply_context.text
+    detected_secret_types.update(filtered_text.secret_types)
+    detected_secret_types.update(filtered_attachment.secret_types)
+    detected_secret_types.update(filtered_reply_context.secret_types)
+    secret_notice = secret_handling_instruction("Discord", detected_secret_types)
+
     # Inject tier-specific in-band instructions so the core agent cannot
     # accidentally process a non-owner task with full capabilities.
     # See CLAUDE.md "Discord access control" section for the policy.
@@ -3186,6 +3286,10 @@ async def _handle_discord_message(message, force=False):
             # `===SUTANDO SYSTEM INSTRUCTIONS===` content that lands in the task
             # file header verbatim. confine_user_content is idempotent so the
             # already-ZWSP-prefixed original user_task_text is unaffected.
+            filtered_enriched = filter_chat_secrets(enriched)  # pragma: no cover
+            detected_secret_types.update(filtered_enriched.secret_types)  # pragma: no cover
+            secret_notice = secret_handling_instruction("Discord", detected_secret_types)  # pragma: no cover
+            enriched = filtered_enriched.text  # pragma: no cover
             user_task_text = confine_user_content(enriched)
             # Rewrite the prompt file with the enriched body. quoted_task
             # already points to `"$(cat {prompt_path})"` — keep the heredoc
@@ -3338,6 +3442,15 @@ async def _handle_discord_message(message, force=False):
         if getattr(message, "reference", None) and message.reference.message_id
         else ""
     )
+    # Also emit the replied-to author as a STRUCTURED header, not just the
+    # opaque parent_message_id. In a multi-bot channel a consumer must be able
+    # to tell WHO the sender was addressing (e.g. a reply aimed at another bot)
+    # without parsing the lossy `[Replying to ...]` body snippet. parent_message_id
+    # alone is an unresolvable id; reply_to_author makes the addressee legible so
+    # the receiving bot can gate on it. (Chi 2026-07-20: "the task file content
+    # needs to be right" — a reply to sutando#9708 reached Pro with no legible
+    # addressee, so Pro acted as if addressed.)
+    parent_msg_line += _reply_author_header(message)
     # Inject skill instructions for owner tasks so the agent follows the
     # notify-before-work and transcription protocol after compaction.
     # Only injected when the referenced skills are installed on this node.
@@ -3441,6 +3554,7 @@ async def _handle_discord_message(message, force=False):
             f"task: {user_task_text}\n"
             f"{tier_instructions.get(rulebook_key, tier_instructions['other'])}"
             f"{discord_skill_hints}"
+            f"{secret_notice}"
         )
 
     if not _write_task_file(task_file, _build_task_content, username, channel_name,
@@ -3474,20 +3588,6 @@ async def _handle_discord_message(message, force=False):
     # Typing indicator
     async with message.channel.typing():
         await asyncio.sleep(0.5)
-
-
-def save_to_allowlist(sender_id):
-    """Add sender to access.json allowFrom."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-    except Exception:
-        data = {"dmPolicy": "pairing", "allowFrom": [], "groups": {}, "pending": {}}
-
-    if sender_id not in data.get("allowFrom", []):
-        data.setdefault("allowFrom", []).append(sender_id)
-        ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_FILE.write_text(json.dumps(data, indent=2))
-        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
 
 
 async def poll_approved():

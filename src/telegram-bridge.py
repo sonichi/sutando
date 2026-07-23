@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 import re
 import secrets
 import sys
@@ -60,6 +61,7 @@ from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -194,9 +196,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         }
         if channel_id:
             payload["channel_id"] = str(channel_id)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Per-PID staging name: this file is written by four processes (this
+        # bridge + slack/discord/sparrow). A shared ".json.tmp" name lets two
+        # concurrent writers truncate and interleave the same temp file, so the
+        # rename can publish torn JSON. A per-PID temp is never shared, and
+        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}")
 
@@ -774,7 +781,10 @@ def main():  # pragma: no cover
 
                 forward_note = extract_forward_note(msg)
 
-                print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
+                safe_detail_log = filter_chat_secrets(
+                    f"{redact_vault_commands(text)}{attachment_note}"
+                ).text
+                print(f"  @{username}{forward_note}: {safe_detail_log}")
 
                 # Reply/parent context. Telegram embeds the full replied-to
                 # message when this is a reply — capture it (+ message ids) so a
@@ -818,6 +828,19 @@ def main():  # pragma: no cover
                         print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
                     if vault_result.failed:
                         print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+
+                filtered_text = filter_chat_secrets(text)
+                filtered_attachment = filter_chat_secrets(attachment_note)
+                filtered_reply = filter_chat_secrets(reply_note)
+                text = filtered_text.text
+                attachment_note = filtered_attachment.text
+                reply_note = filtered_reply.text
+                detected_secret_types = set(filtered_text.secret_types)
+                detected_secret_types.update(filtered_attachment.secret_types)
+                detected_secret_types.update(filtered_reply.secret_types)
+                secret_notice = secret_handling_instruction(
+                    "Telegram", detected_secret_types
+                )
 
                 # Inject skill instructions so the agent follows notify-before-work
                 # and transcription protocol even after conversation compaction.
@@ -889,6 +912,7 @@ def main():  # pragma: no cover
                     f"priority: {priority}\n"
                     f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"{tg_skill_hints}"
+                    f"{secret_notice}"
                 )
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming

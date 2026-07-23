@@ -38,4 +38,16 @@ else
 fi
 grep -q 'sutando-config.sh" app-node-dir' "$WRAP" && say "PASS wrapper config-resolves app-node-dir" || { say "FAIL wrapper missing app-node-dir call"; fail=1; }
 
+# --- tsx-bin on a host with NO ~/.nvm (regression: pipefail killed the script) ---
+# The _nvm_tsx candidate assignment pipes `ls ~/.nvm/versions/node/` into
+# sort|tail; under set -euo pipefail a missing ~/.nvm made that pipeline's
+# status fatal BEFORE the candidate loop, so tsx-bin exited 1 with no output
+# and startup.sh died silently at its `_TSX_BIN=$(...)` line. The old
+# assertions above never caught this: empty output landed in the SKIP branch.
+_fake_home="$(mktemp -d)"
+out="$(HOME="$_fake_home" bash "$CFG" tsx-bin)"; rc=$?
+rmdir "$_fake_home"
+[ "$rc" -eq 0 ] && say "PASS tsx-bin exits 0 with no ~/.nvm" || { say "FAIL tsx-bin exit $rc with no ~/.nvm (pipefail regression)"; fail=1; }
+case "$out" in */node_modules/.bin/tsx) say "PASS repo tsx still resolved with no ~/.nvm";; *) say "FAIL no-nvm resolution: '$out'"; fail=1;; esac
+
 [ "$fail" -eq 0 ] && echo "PASS — tsx/app-node resolution centralized + config-resolved (startup + launchd)" || { echo "FAIL"; exit 1; }
