@@ -2351,25 +2351,77 @@ def _message_mentions_bot(message):
 # on the allowlist, the message is dropped by the access-control gate below.
 # Historically that drop was silent, so the sender had no idea their message
 # wasn't received (owner ask 2026-07-15). Send a one-line automated ack instead,
-# rate-limited per sender so a repeat-sender (or an abusive one) can't turn the
-# bridge into an echo. In-memory cooldown: fine to reset on bridge restart.
-_NOT_ALLOWLISTED_ACK_COOLDOWN_S = 3600
+# rate-limited per channel so several non-allowlisted bots in one shared channel
+# cannot each produce the same notice. Persist the seven-day cooldown so bridge
+# restarts and upgrades do not reset it (owner ask 2026-07-23).
+_NOT_ALLOWLISTED_ACK_COOLDOWN_S = 7 * 24 * 60 * 60
 _not_allowlisted_ack_at: dict[str, float] = {}
+_NOT_ALLOWLISTED_ACK_STATE_FILE = STATE_DIR / "discord-not-allowlisted-ack.json"
 _NOT_ALLOWLISTED_ACK_TEXT = (
     "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
     "can't act on it. Ask the owner to add you. _(automated notice)_"
 )
 
 
+def _not_allowlisted_ack_state() -> dict[str, float]:
+    """Read valid per-channel send timestamps; malformed state fails open."""
+    try:
+        raw = json.loads(_NOT_ALLOWLISTED_ACK_STATE_FILE.read_text())
+        entries = raw.get("sent_at_by_channel", {})
+        if not isinstance(entries, dict):
+            return {}
+        return {
+            str(channel_id): float(sent_at)
+            for channel_id, sent_at in entries.items()
+            if isinstance(sent_at, (int, float))
+        }
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _save_not_allowlisted_ack_state(entries: dict[str, float], now: float) -> None:
+    """Atomically persist live cooldown entries; delivery never depends on it."""
+    live = {
+        channel_id: sent_at
+        for channel_id, sent_at in entries.items()
+        if now - sent_at < _NOT_ALLOWLISTED_ACK_COOLDOWN_S
+    }
+    temp = _NOT_ALLOWLISTED_ACK_STATE_FILE.with_name(
+        f".{_NOT_ALLOWLISTED_ACK_STATE_FILE.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        temp.write_text(json.dumps({
+            "schema_version": 1,
+            "sent_at_by_channel": live,
+        }, sort_keys=True))
+        os.replace(temp, _NOT_ALLOWLISTED_ACK_STATE_FILE)
+    except OSError as e:
+        print(f"  [not-allowlisted-ack] state write failed: {e}", flush=True)
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+
 async def _ack_not_allowlisted(channel, sender_id: str, username: str = "") -> None:
     """One-line 'you're not on the allowlist' reply so an addressed-but-dropped
-    message isn't silent. Rate-limited per sender (``_NOT_ALLOWLISTED_ACK_COOLDOWN_S``)."""
+    message isn't silent. Rate-limited per channel across bridge restarts."""
     now = time.time()
-    if now - _not_allowlisted_ack_at.get(sender_id, 0.0) < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
-        return  # already acked this sender recently — don't spam / echo
-    _not_allowlisted_ack_at[sender_id] = now
+    channel_id = str(getattr(channel, "id", "") or f"sender:{sender_id}")
+    persisted = _not_allowlisted_ack_state()
+    last_sent = max(
+        _not_allowlisted_ack_at.get(channel_id, 0.0),
+        persisted.get(channel_id, 0.0),
+    )
+    if now - last_sent < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
+        return  # this channel already received the notice recently
     try:
         await channel.send(_NOT_ALLOWLISTED_ACK_TEXT)
+        _not_allowlisted_ack_at[channel_id] = now
+        persisted[channel_id] = now
+        _save_not_allowlisted_ack_state(persisted, now)
         print(f"  [not-allowlisted-ack] sent to @{username or sender_id}", flush=True)
     except Exception as e:
         print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)

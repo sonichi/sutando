@@ -4,10 +4,8 @@
 When a sender ADDRESSES the bot (a DM, or an @mention) but isn't on the
 allowlist, the access gate drops the message — historically silently. These
 tests exercise the REAL `_ack_not_allowlisted` in each bridge (transport
-stubbed) and assert: (1) an addressed-but-dropped sender gets exactly one ack,
-(2) a repeat from the same sender is rate-limited (no echo), (3) a different
-sender is not rate-limited, and (4) the Slack `_write_task` drop path fires the
-ack and writes no task.
+stubbed) and assert Discord's durable per-channel seven-day cooldown plus
+Slack's existing per-sender cooldown and drop-path wiring.
 
 Run: python3 tests/bridge-not-allowlisted-ack.test.py   (exit 0 pass / 1 fail)
 """
@@ -64,7 +62,7 @@ def _load_discord():
 
 
 class _FakeChannel:
-    def __init__(self): self.sent = []
+    def __init__(self, channel_id=123): self.id = channel_id; self.sent = []
     async def send(self, text, **kw): self.sent.append(text)
 
 
@@ -76,15 +74,56 @@ def test_discord():
     # global, so reassigning it fully isolates the test. (Regression guard: an
     # earlier version wrote placeholder allowlists straight to the live file.)
     db.ACCESS_FILE = Path(tempfile.mkdtemp(prefix="sutando-ack-dtest-")) / "access.json"
+    db._NOT_ALLOWLISTED_ACK_STATE_FILE = db.ACCESS_FILE.parent / "ack-state.json"
+    db.STATE_DIR = db.ACCESS_FILE.parent
     db._not_allowlisted_ack_at.clear()
     ch = _FakeChannel()
     asyncio.run(db._ack_not_allowlisted(ch, "U_A", "alice"))
     check("discord: addressed non-allowlisted sender gets one ack", len(ch.sent) == 1, str(ch.sent))
     check("discord: ack text names the allowlist", "allowlist" in (ch.sent[0] if ch.sent else ""))
     asyncio.run(db._ack_not_allowlisted(ch, "U_A", "alice"))
-    check("discord: repeat from same sender is rate-limited (no echo)", len(ch.sent) == 1, str(ch.sent))
+    check("discord: repeat in the same channel is rate-limited", len(ch.sent) == 1, str(ch.sent))
     asyncio.run(db._ack_not_allowlisted(ch, "U_B", "bob"))
-    check("discord: a different sender is not rate-limited", len(ch.sent) == 2, str(ch.sent))
+    check("discord: a different sender cannot repeat the channel notice", len(ch.sent) == 1, str(ch.sent))
+
+    # Simulate a bridge restart: clearing memory must not reset the durable
+    # channel cooldown. A different channel still receives its own first notice.
+    db._not_allowlisted_ack_at.clear()
+    asyncio.run(db._ack_not_allowlisted(ch, "U_C", "carol"))
+    check("discord: durable cooldown survives bridge restart", len(ch.sent) == 1, str(ch.sent))
+    other = _FakeChannel(channel_id=456)
+    asyncio.run(db._ack_not_allowlisted(other, "U_C", "carol"))
+    check("discord: another channel receives its own notice", len(other.sent) == 1, str(other.sent))
+
+    # An entry older than seven days is expired and replaced by a fresh send.
+    db._NOT_ALLOWLISTED_ACK_STATE_FILE.write_text(json.dumps({
+        "schema_version": 1,
+        "sent_at_by_channel": {
+            str(ch.id): db.time.time() - db._NOT_ALLOWLISTED_ACK_COOLDOWN_S - 1,
+        },
+    }))
+    db._not_allowlisted_ack_at.clear()
+    asyncio.run(db._ack_not_allowlisted(ch, "U_D", "dana"))
+    check("discord: channel notice is eligible again after seven days", len(ch.sent) == 2, str(ch.sent))
+
+    # Corrupt/unwritable state must fail open: the sender still gets the notice
+    # and an inability to persist the cooldown never breaks message handling.
+    corrupt = _FakeChannel(channel_id=789)
+    db._NOT_ALLOWLISTED_ACK_STATE_FILE.write_text("{")
+    asyncio.run(db._ack_not_allowlisted(corrupt, "U_E", "erin"))
+    check("discord: malformed cooldown state fails open", len(corrupt.sent) == 1, str(corrupt.sent))
+    blocked_parent = db.ACCESS_FILE.parent / "not-a-directory"
+    blocked_parent.write_text("fixture")
+    db._NOT_ALLOWLISTED_ACK_STATE_FILE = blocked_parent / "ack-state.json"
+    db.STATE_DIR = blocked_parent
+    unwritable = _FakeChannel(channel_id=790)
+    try:
+        asyncio.run(db._ack_not_allowlisted(unwritable, "U_F", "frank"))
+        check("discord: state write failure does not block the notice", len(unwritable.sent) == 1, str(unwritable.sent))
+    except Exception as e:
+        check("discord: state write failure does not block the notice", False, repr(e))
+    db.STATE_DIR = db.ACCESS_FILE.parent
+    db._NOT_ALLOWLISTED_ACK_STATE_FILE = db.STATE_DIR / "ack-state.json"
 
     # Integration: drive the real _handle_discord_message DM path so a
     # non-allowlisted DM reaches the drop AND fires the ack (covers the wiring).
