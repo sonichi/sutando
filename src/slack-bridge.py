@@ -776,7 +776,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
                 attached_path = ap.replace("[File attached: ", "").rstrip("]")
                 if _notify_py.exists():
                     hints_lines.append(
-                        f'   Update notify message to: --message "Got your voice message, give me a moment."'
+                        '   Update notify message to: --message "Got your voice message, give me a moment."'
                     )
                 hints_lines.append(
                     f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'"
@@ -1325,10 +1325,10 @@ def main():  # pragma: no cover
     if not ACCESS_FILE.exists():
         _TOFU_ENROLLMENT_CODE = secrets.token_hex(3)  # 6-char hex, 16M combinations
         print("", flush=True)
-        print(f"  *** TOFU enrollment required ***", flush=True)
+        print("  *** TOFU enrollment required ***", flush=True)
         print(f"  Enrollment code: {_TOFU_ENROLLMENT_CODE}", flush=True)
-        print(f"  Send this code in your first DM to register as owner.", flush=True)
-        print(f"  Anyone who sends this code first becomes owner — keep it private.", flush=True)
+        print("  Send this code in your first DM to register as owner.", flush=True)
+        print("  Anyone who sends this code first becomes owner — keep it private.", flush=True)
         print("", flush=True)
 
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()

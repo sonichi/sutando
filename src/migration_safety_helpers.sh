@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # PR #1440 — auto-migration safety helpers (Mini review).
 #
 # Sourced by src/startup.sh's v0.8 SUTANDO_WORKSPACE auto-migration block and
