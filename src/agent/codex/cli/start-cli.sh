@@ -137,7 +137,7 @@ if session_exists "$SESSION"; then
   apply_tmux_defaults
   ensure_task_notifier
   ensure_core_monitor
-  if [ -t 1 ]; then
+  if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
   fi
@@ -164,7 +164,7 @@ if ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n 
     >> "$ws/state/session-starts.log"
 fi
 
-if [ -t 1 ]; then
+if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   ensure_task_notifier
   ensure_core_monitor

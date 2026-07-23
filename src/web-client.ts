@@ -3240,7 +3240,6 @@ function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
 		return { running: false, step: '', stale: true };
 	}
 }
-function coreIsRunning(): boolean { return readCoreStatus().running; }
 
 const VOICE_STATE_STALE_SECONDS = 120;
 function readVoiceState(): boolean | null {
@@ -3313,7 +3312,6 @@ function renderSubscriptionsHtml(rawJson: string): string {
 	let data: any;
 	try { data = JSON.parse(rawJson); } catch (e: any) { data = { last_scan: null, subscriptions: [], scan_history: [], _parse_error: e?.message }; }
 	const lastScan = data.last_scan ? new Date(data.last_scan).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '— never scanned —';
-	const lastDiff = (data.scan_history && data.scan_history.length) ? data.scan_history[data.scan_history.length - 1] : { added: [], removed: [], amount_changed: [] };
 	const dataJson = JSON.stringify(data).replace(/</g, '\\u003c');
 
 	return /* html */ `<!DOCTYPE html>
@@ -3846,7 +3844,7 @@ const server = createServer((req, res) => {
 				const text = await r.text();
 				res.writeHead(r.status, { 'Content-Type': 'application/json' });
 				res.end(text);
-			} catch (err) {
+			} catch {
 				const fallback = url.pathname === '/vision/state'
 					? { streaming: false, source: null, fps: 0, frames: 0, durationMs: 0, sessionReady: false }
 					: { status: 'failed', error: 'voice-agent not reachable' };
@@ -3913,7 +3911,7 @@ const server = createServer((req, res) => {
 	// port to state/overlay-control.json; we forward same-origin requests so
 	// the browser needs no CORS or port discovery.
 	if (url.pathname === '/api/overlays' || url.pathname.startsWith('/api/overlays/')) {
-		let disc: { host?: string; port?: number } | null = null;
+		let disc: { host?: string; port?: number } | null;
 		try {
 			disc = JSON.parse(readFileSync(join(STATE_DIR, 'overlay-control.json'), 'utf-8'));
 		} catch {

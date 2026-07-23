@@ -37,8 +37,10 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -60,7 +62,9 @@ def validate_twilio_signature(handler, body: str) -> bool:
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     if not auth_token:
         return False
-    import hmac, hashlib, base64
+    import hmac
+    import hashlib
+    import base64
     from urllib.parse import parse_qs
 
     signature = handler.headers.get("X-Twilio-Signature", "")
@@ -364,7 +368,56 @@ def delegation_submit_task(data: dict):
     if embedded != tid:
         return 400, {"error": f"body id header ({embedded!r}) does not match request id"}
     TASK_DIR.mkdir(parents=True, exist_ok=True)
-    (TASK_DIR / f"{tid}.txt").write_text(content)
+    # Keep the containment check in this function so CodeQL can follow the
+    # tainted HTTP value through normalization to the filesystem sink.  The
+    # task-id regex alone prevents lexical traversal, but not an existing
+    # `<task-id>.txt` symlink that points outside TASK_DIR.
+    task_dir_real = os.path.realpath(TASK_DIR)
+    task_file_str = os.path.realpath(
+        os.path.join(task_dir_real, f"{tid}.txt")
+    )
+    if not task_file_str.startswith(task_dir_real + os.sep):
+        return 400, {"error": "task path escapes task directory"}
+    # Do not reopen the validated pathname: a local process could swap in a
+    # symlink between the realpath check above and write_text().  Write a
+    # private temporary entry through an already-open directory descriptor,
+    # then atomically replace the final directory entry.  os.replace replaces
+    # a raced symlink itself instead of following it to an outside target.
+    task_name = f"{tid}.txt"
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    task_dir_fd = os.open(task_dir_real, dir_flags)
+    temp_name = f".{task_name}.{secrets.token_hex(8)}.tmp"
+    try:
+        try:
+            existing = os.stat(task_name, dir_fd=task_dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            return 400, {"error": "task path escapes task directory"}
+
+        open_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                      | getattr(os, "O_NOFOLLOW", 0)
+                      | getattr(os, "O_CLOEXEC", 0))
+        temp_fd = os.open(temp_name, open_flags, 0o600, dir_fd=task_dir_fd)
+        try:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+        except Exception:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+            raise
+        os.replace(temp_name, task_name,
+                   src_dir_fd=task_dir_fd, dst_dir_fd=task_dir_fd)
+        temp_name = ""
+    finally:
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=task_dir_fd)
+            except FileNotFoundError:
+                pass
+        os.close(task_dir_fd)
     return 200, {"ok": True, "task_id": tid}
 
 
@@ -372,13 +425,22 @@ def delegation_archive_result(data: dict):
     name = str(data.get("name", ""))
     tid = str(data.get("task_id", ""))
     stem = name[:-4] if name.endswith(".txt") else name
-    src = _safe_path(RESULT_DIR, stem)
     # Identity coherence (Codex P1 on #1956): a relay client may only archive
     # ITS OWN result — the source name must be exactly <task_id>.txt. Without
     # this, any safe name could be filed under any valid id, hijacking other
     # consumers' results into a foreign archive slot.
-    if src is None or not local_task_protocol.valid_task_id(tid) or stem != tid:
+    if not local_task_protocol.valid_task_id(tid) or stem != tid:
         return 400, {"error": "invalid name/task id, or name does not match task id"}
+    # Inline the CodeQL-modeled normalization + prefix guard at both the
+    # source and destination sinks.  `_safe_path` enforces the same policy,
+    # but CodeQL does not propagate that sanitizer through the helper return.
+    result_dir_real = os.path.realpath(RESULT_DIR)
+    src_str = os.path.realpath(
+        os.path.join(result_dir_real, f"{stem}.txt")
+    )
+    if not src_str.startswith(result_dir_real + os.sep):
+        return 400, {"error": "result path escapes result directory"}
+    src = Path(src_str)
     if not os.path.exists(src):
         return 200, {"ok": True, "note": "already gone"}
     # Same destination scheme as task-bridge's archiveFile():
@@ -388,9 +450,20 @@ def delegation_archive_result(data: dict):
     dest_dir = local_task_protocol.archive_month_dir(
         RESULT_DIR, datetime.now().isoformat())
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{tid}.txt"
+    dest_dir_real = os.path.realpath(dest_dir)
+    dest_str = os.path.realpath(
+        os.path.join(dest_dir_real, f"{tid}.txt")
+    )
+    if not dest_str.startswith(dest_dir_real + os.sep):
+        return 400, {"error": "archive path escapes archive directory"}
+    dest = Path(dest_str)
     if dest.exists():
-        dest = dest_dir / f"{tid}-{int(datetime.now().timestamp())}.txt"
+        dest_str = os.path.realpath(os.path.join(
+            dest_dir_real, f"{tid}-{int(datetime.now().timestamp())}.txt"
+        ))
+        if not dest_str.startswith(dest_dir_real + os.sep):
+            return 400, {"error": "archive path escapes archive directory"}
+        dest = Path(dest_str)
     os.replace(src, dest)
     return 200, {"ok": True}
 
@@ -826,7 +899,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             '<Say voice="alice">Hello, you\'ve reached Sutando. '
             "Please leave a message after the tone and I will get back to you.</Say>"
             '<Record maxLength="120" transcribe="true" '
-            f'transcribeCallback="/twilio/transcription"/>'
+            'transcribeCallback="/twilio/transcription"/>'
             '<Say voice="alice">Thank you. Goodbye.</Say>'
             "</Response>"
         )
@@ -1187,11 +1260,11 @@ if __name__ == "__main__":
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
-    print(f"  POST /task  — submit a task")
-    print(f"  GET  /status — health + capabilities")
-    print(f"  GET  /ping   — alive check")
+    print("  POST /task  — submit a task")
+    print("  GET  /status — health + capabilities")
+    print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
-        print(f"  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+        print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

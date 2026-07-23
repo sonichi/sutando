@@ -38,15 +38,35 @@ Before creating a PR, check `gh pr list --state open` for an existing PR on the 
 
 Never commit directly to main. Always work on a feature branch.
 
-### Before opening any PR or issue
+### Creating a PR or issue
 
-Read `CONTRIBUTING.md` and follow its "Before opening any PR or issue" section. The short checklist:
+`CONTRIBUTING.md` is the canonical process and you MUST follow it. Before opening
+a PR, read and adhere to its "Before starting a PR", "The PR body should answer",
+and "After opening the PR" sections. The short checklist:
 
 - Search existing open + recently-closed PRs/issues for duplicates (`gh pr list --search "closes #N"`)
 - Confirm your git author email is GH-mapped — not `*.local` (macOS hostname auto-fill) or `noreply@anthropic.com` (Claude Code default). CLA-Assistant silently leaves the check PENDING on unmappable emails.
 - Single concern per PR; no bundled refactors
 - Confirm the bug exists on `upstream/main` before adding a fix
+- **Paste before/after evidence** — the actual command output at the parent commit and at HEAD, not a description of it. This is the #1 change-request on this repo. Every claim in the body must be checkable from the diff or that output.
+- **Live path (bridge / network / delivery loop / startup)?** Include a real post-restart round trip, not just unit tests — reviewers reject harness-only proof for these.
+- **Stacked PR?** Name the parent and merge order; after the parent lands, rebase/update the child and rerun its full checks.
+- Scan added lines for hardcoded host paths and inline path fallbacks; production code must use the repo's path helpers.
 - After `update-branch`, CLA-Assistant may not auto-rerun — try `@cla-assistant check` comment or close+reopen if stuck
+
+### Reviewing a PR
+
+When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.md`'s
+"Reviewing PRs" section. In short:
+
+- Be evidence-first: cite the commit, file, line, repro, or failing test. If you did not verify a claim, say so explicitly.
+- Distinguish blockers from nits so the author knows what gates merge.
+- Add evidence, not noise — don't stack a bare "LGTM" under an existing approval.
+- APPROVE / REQUEST_CHANGES is a formal GitHub review action (`gh pr review`), not a Discord 👍 or a plain comment.
+- Review the current head and, for a stack, the child-only layer plus cumulative interaction. Re-check CI and approval freshness after every update/rebase.
+- Scan added lines for hardcoded host paths on every review; keep fixture exclusions token-specific so they cannot hide another real path on the same line.
+- Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
+- Merge only when the current head is mergeable, required CI + CLA are green, and two maintainers have recorded formal approvals. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
 
 Skill-PR destination: a skill is **coupled** (PR to `sonichi/sutando`) if it imports from `src/` or another skill, modifies main-repo files, or is tightly bound to a feature there (e.g. `skills/phone-conversation/`). A skill is **standalone** (PR to `sonichi/sutando-skills-community`) if it ships its own scripts/binaries, reads files but doesn't import main-repo modules, and works against any checkout. If unsure, ask in #design.
 
@@ -132,13 +152,17 @@ unlinked so peers see a graceful shutdown immediately.
 
 Payload schema:
 ```json
-{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "schema_version": 1}
+{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "locality": {"kind": "local|cloud", "host": "..."}, "schema_version": 2}
 ```
 
 This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
 cleaner liveness probe than scanning `pgrep -f claude`.
+
+`locality` is the core's self-reported {kind: local|cloud, host} (Track 10) —
+additive and informational; mtime remains the liveness signal, so readers that
+don't know the field are unaffected.
 
 `socket` records the tmux socket the core launched on (its own
 `${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}`). It's the **runtime-authored**
@@ -263,7 +287,7 @@ Use the `task-progress` skill for any task involving research, code changes, PRs
 analysis, or anything likely to take more than ~60 seconds:
 
 ```bash
-python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
+python3 skills/task-progress/scripts/notify.py \
   --source <source> --channel-id <channel_id> \
   --message "On it — looking into that now. Back in a minute."
 ```
@@ -281,6 +305,14 @@ immediate one-sentence answers that require no tool calls.
 - Voice agent: `src/voice-agent.ts`
 - Task bridge: `src/task-bridge.ts`
 - Skills: `skills/`
+
+**Looking for where an existing module lives?** [`docs/src-map.md`](docs/src-map.md)
+indexes every agent-facing source module under `src/` with a one-line purpose
+taken from its own header comment. Consult it BEFORE grepping the tree — it is a
+lookup, deliberately not loaded into every session (context budget), and it
+answers "what is this file for", which grep cannot. If an entry reads wrong the
+file's header comment is wrong: fix the header, then re-run
+`python3 scripts/gen-src-map.py`.
 
 ## Task bridge
 
@@ -342,6 +374,14 @@ Secrets passed via Slack/Discord (`vault set KEY VALUE`) are intercepted by the 
 **When writing any integration that needs an API key, token, or password — always use vault:**
 
 ```python
+import sys
+from pathlib import Path
+
+# Make the repo's src/ importable from any script stored inside this checkout.
+repo = next(p for p in Path(__file__).resolve().parents
+            if (p / "src" / "vault_intercept.py").is_file())
+sys.path.insert(0, str(repo / "src"))
+
 from vault_intercept import get_vault_key, list_vault_keys
 
 keys = list_vault_keys()  # returns list of stored key names
@@ -392,8 +432,8 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 
 ## Skills
 
-Use skills installed in `$CLAUDE_CONFIG_DIR/skills/` when available. Prefer existing skills over writing new code from scratch.
+Use skills available to the active runtime and under this repo's `skills/` directory when available. Prefer existing skills over writing new code from scratch.
 
-**Updating a skill mid-session.** Skills install as symlinks into `~/.claude/skills/` (`skills/install.sh`), so a `git pull` updates the files on disk — but Claude Code's skill live-watcher does NOT follow symlinks, so the *running* session keeps the stale skill (verified 2026-05-07; [[reference_skill_update_needs_restart_when_manifest_loaded]]). To make a pulled skill update live in the current session **without a restart**, run `bash skills/refresh-skill.sh <name>` (or `--all`) — it does the cp-then-swap that forces the watcher to re-read it. (Manifest-loaded `config`/`tools` and `src/` agent code instead need a service restart via `src/restart.sh`; SKILL.md/slash-command changes use refresh-skill.sh.)
+**Updating a skill mid-session.** Runtime behavior differs. For the Claude runtime, `skills/install.sh` places symlinks under its configured skills directory; after `git pull`, run `bash skills/refresh-skill.sh <name>` (or `--all`) to force its live watcher to re-read them. For the Codex runtime, `refresh-skill.sh` does not update Codex's skill cache; restart the core with `bash src/agent/start-cli.sh --restart` so Codex reloads its configured skill directories. Manifest-loaded `config`/`tools` and `src/` agent code require a service restart via `src/restart.sh`.
 
 **Skill manifests.** Skills come in two shapes: most are invoked via the slash-command surface (`/skill-name`) or as standalone scripts; a subset are **manifest-loaded** — a `manifest.json` (+ optional `tools.ts`) that contributes inline tools directly into the voice/phone agent tool table at startup (`loadSkillManifestTools()` in `src/inline-tools.ts`). See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the manifest schema, how tools are loaded and who consumes them, and how to add one. Current manifest-loaded skills carry a per-skill `manifest.json` (e.g. `skills/zoom/`, `skills/screen-companion/`, `skills/gws-gmail-voice/`, `skills/obsidian-vault/`).

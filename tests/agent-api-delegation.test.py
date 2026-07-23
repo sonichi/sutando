@@ -186,6 +186,125 @@ check("submit rejects id/body divergence",
       api.delegation_submit_task({"id": "task-direct-9", "content": DIRECT_CONTENT})[0] == 400)
 check("direct submit rejects bad id", api.delegation_submit_task({"id": "../x", "content": "y"})[0] == 400)
 check("direct submit rejects empty content", api.delegation_submit_task({"id": "task-d2", "content": ""})[0] == 400)
+# A filename-safe task id can still escape through a pre-positioned symlink.
+# The HTTP-controlled submit path must reject it rather than overwrite the
+# symlink target outside tasks/.
+outside = tmp / "outside-task.txt"
+outside.write_text("do not overwrite\n")
+escape_link = api.TASK_DIR / "task-symlink-escape.txt"
+try:
+    escape_link.symlink_to(outside)
+except OSError:
+    # Windows/non-privileged environments may not permit symlink creation.
+    pass
+else:
+    escape_content = DIRECT_CONTENT.replace("task-direct-1", "task-symlink-escape")
+    code, _ = api.delegation_submit_task({
+        "id": "task-symlink-escape", "content": escape_content,
+    })
+    check("direct submit rejects symlink escape",
+          code == 400 and outside.read_text() == "do not overwrite\n")
+
+# Race the final task entry into a symlink after validation but immediately
+# before the atomic publish.  The submit must replace the directory entry,
+# never follow it and overwrite the outside target.
+race_outside = tmp / "outside-task-race.txt"
+race_outside.write_text("race sentinel\n")
+race_name = "task-symlink-race.txt"
+race_content = DIRECT_CONTENT.replace("task-direct-1", "task-symlink-race")
+real_replace = api.os.replace
+
+
+def _race_replace(src, dst, *args, **kwargs):
+    raced = api.TASK_DIR / dst
+    try:
+        raced.symlink_to(race_outside)
+    except OSError:
+        pass
+    return real_replace(src, dst, *args, **kwargs)
+
+
+api.os.replace = _race_replace
+try:
+    code, _ = api.delegation_submit_task({
+        "id": "task-symlink-race", "content": race_content,
+    })
+finally:
+    api.os.replace = real_replace
+check("direct submit is safe against symlink swap race",
+      code == 200 and race_outside.read_text() == "race sentinel\n"
+      and (api.TASK_DIR / race_name).read_text() == race_content
+      and not (api.TASK_DIR / race_name).is_symlink())
+
+# A pre-positioned symlink whose target stays inside TASK_DIR passes the
+# realpath containment gate, so the descriptor-level no-symlink check must
+# still reject it.
+inside_target = api.TASK_DIR / "inside-target.txt"
+inside_target.write_text("inside sentinel\n")
+inside_link = api.TASK_DIR / "task-inside-symlink.txt"
+try:
+    inside_link.symlink_to(inside_target)
+except OSError:
+    pass
+else:
+    inside_content = DIRECT_CONTENT.replace("task-direct-1", "task-inside-symlink")
+    code, _ = api.delegation_submit_task({
+        "id": "task-inside-symlink", "content": inside_content,
+    })
+    check("direct submit rejects in-directory symlink",
+          code == 400 and inside_target.read_text() == "inside sentinel\n")
+
+# If wrapping/writing the private descriptor fails, the descriptor and hidden
+# temporary entry are both cleaned up before the error propagates.
+real_fdopen = api.os.fdopen
+
+
+def _failing_fdopen(fd, *args, **kwargs):
+    api.os.close(fd)
+    raise OSError("injected fdopen failure")
+
+
+api.os.fdopen = _failing_fdopen
+try:
+    try:
+        api.delegation_submit_task({
+            "id": "task-write-failure",
+            "content": DIRECT_CONTENT.replace("task-direct-1", "task-write-failure"),
+        })
+    except OSError as exc:
+        write_failed = "injected fdopen failure" in str(exc)
+    else:
+        write_failed = False
+finally:
+    api.os.fdopen = real_fdopen
+check("failed task write removes private temp entry",
+      write_failed and not list(api.TASK_DIR.glob(".task-write-failure.txt.*.tmp")))
+
+# If publication fails after another process has already removed the temp
+# entry, the cleanup path tolerates the missing name while preserving the
+# original publish error.
+real_replace = api.os.replace
+
+
+def _remove_temp_then_fail(src, dst, *args, **kwargs):
+    api.os.unlink(src, dir_fd=kwargs["src_dir_fd"])
+    raise OSError("injected publish failure")
+
+
+api.os.replace = _remove_temp_then_fail
+try:
+    try:
+        api.delegation_submit_task({
+            "id": "task-publish-failure",
+            "content": DIRECT_CONTENT.replace("task-direct-1", "task-publish-failure"),
+        })
+    except OSError as exc:
+        publish_failed = "injected publish failure" in str(exc)
+    else:
+        publish_failed = False
+finally:
+    api.os.replace = real_replace
+check("missing temp during failed publish cleanup is harmless", publish_failed)
 (api.RESULT_DIR / "task-direct-1.txt").write_text("direct answer\n")
 code, data = api.delegation_list_results()
 check("direct list", code == 200 and "task-direct-1.txt" in data["files"])
@@ -212,6 +331,39 @@ check("direct archive bad tid", api.delegation_archive_result(
 (api.RESULT_DIR / "task-foreign.txt").write_text("someone else's\n")
 check("archive rejects name/tid mismatch", api.delegation_archive_result(
     {"name": "task-foreign.txt", "task_id": "task-direct-1"})[0] == 400)
+# Both archive paths are confined after resolving symlinks. A relay client
+# cannot make the archive endpoint inspect or move a result outside results/,
+# or replace a destination outside the month archive directory.
+outside_result = tmp / "outside-result.txt"
+outside_result.write_text("outside result\n")
+source_escape = api.RESULT_DIR / "task-source-escape.txt"
+try:
+    source_escape.symlink_to(outside_result)
+except OSError:
+    pass
+else:
+    code, _ = api.delegation_archive_result({
+        "name": "task-source-escape.txt", "task_id": "task-source-escape",
+    })
+    check("archive rejects source symlink escape",
+          code == 400 and outside_result.read_text() == "outside result\n")
+
+(api.RESULT_DIR / "task-dest-escape.txt").write_text("inside result\n")
+archive_month = api.local_task_protocol.archive_month_dir(
+    api.RESULT_DIR, api.datetime.now().isoformat())
+archive_month.mkdir(parents=True, exist_ok=True)
+dest_escape = archive_month / "task-dest-escape.txt"
+try:
+    dest_escape.symlink_to(outside_result)
+except OSError:
+    pass
+else:
+    code, _ = api.delegation_archive_result({
+        "name": "task-dest-escape.txt", "task_id": "task-dest-escape",
+    })
+    check("archive rejects destination symlink escape",
+          code == 400 and outside_result.read_text() == "outside result\n"
+          and (api.RESULT_DIR / "task-dest-escape.txt").exists())
 # No-clobber (Codex P1): an occupied archive slot gets an epoch-suffixed name.
 (api.RESULT_DIR / "task-direct-1.txt").write_text("second result\n")
 code, _ = api.delegation_archive_result({"name": "task-direct-1.txt", "task_id": "task-direct-1"})
