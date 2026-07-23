@@ -863,8 +863,12 @@ def _resolve_mention_text(event: dict, stripped_text: str) -> tuple[str, bool]:
             for message in newest_first:
                 if message.get("ts", "") >= current_ts:
                     continue
+                # A bot reply is a conversation boundary: it means the sender's
+                # prior turn was already answered. Stop here rather than skipping
+                # past it — otherwise a bare `@Sutando` after "delete X" → bot
+                # "done" would recover and re-run "delete X" (CR #2230, qingyun-wu).
                 if message.get("bot_id"):
-                    continue
+                    break
                 # Do not jump across another human participant and attribute an
                 # older instruction to the current sender.
                 if message.get("user") != user_id:

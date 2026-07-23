@@ -123,6 +123,39 @@ class EmptyMentionContextTest(unittest.TestCase):
         self.assertEqual(self.captured[0][1], "Slack mention")
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
+    def test_bot_reply_is_a_boundary_not_crossed(self):
+        # CR #2230: owner "delete X" → bot "done" → bare @Sutando must NOT recover
+        # and re-run "delete X". The bot reply is a conversation boundary proving
+        # the prior owner turn was already answered → clarification, not re-run.
+        BRIDGE.app.client.conversations_replies = lambda **kwargs: {
+            "messages": [
+                {"ts": "1700000000.000001", "user": "UOWNER", "text": "delete the prod database"},
+                {"ts": "1700000001.000002", "bot_id": "B1", "text": "Done — deleted it."},
+                {"ts": "1700000002.000003", "user": "UOWNER", "text": "<@UBOT>"},
+            ]
+        }
+        BRIDGE.handle_mention(mention_event(), None)
+        self.assertEqual(self.captured[0][1], "Slack mention")
+        self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
+
+    def test_split_turn_still_recovers_when_no_bot_between(self):
+        # The legitimate split turn (owner instruction immediately before the
+        # mention, no bot reply between) MUST still recover — the fix only stops
+        # at a bot boundary, it does not disable recovery. An older bot message
+        # before the instruction is never reached.
+        BRIDGE.app.client.conversations_replies = lambda **kwargs: {
+            "messages": [
+                {"ts": "1700000000.000001", "bot_id": "B0", "text": "earlier unrelated bot msg"},
+                {"ts": "1700000001.000002", "user": "UOWNER", "text": "Run it now"},
+                {"ts": "1700000002.000003", "user": "UOWNER", "text": "<@UBOT>"},
+            ]
+        }
+        BRIDGE.handle_mention(mention_event(), None)
+        self.assertEqual(
+            self.captured[0][1:],
+            ("Slack mention (recovered prior message)", "Run it now", "Rui"),
+        )
+
     def test_history_error_falls_back_to_clarification(self):
         def fail(**kwargs):
             raise RuntimeError("Slack unavailable")
