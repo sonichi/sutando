@@ -30,7 +30,13 @@ Token: resolved from $GATEWAY_TOKEN / $REMOTE_TASK_TOKEN / $AG2_REMOTE_TOKEN
 Owner mxid: --owner, else $AG2_OWNER_MXID, else the token's own account is not
 discoverable here so we require one of those when creating.
 """
-import argparse, json, os, sys, time, urllib.request, urllib.error
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
 
 
 def resolve_token(repo):

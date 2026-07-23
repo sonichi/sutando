@@ -28,6 +28,11 @@ def _normalize(items):
             "ts": m.get("ts") or m.get("timestamp"),
             "body": m.get("body") or m.get("text") or m.get("message"),
             "event_id": m.get("event_id") or m.get("id"),
+            # The gateway annotates each message with its reactions (key + sender);
+            # without carrying it through, a worker can't see the 👀 delivery-ack on
+            # its own messages (reactions are never pushed as tasks — read is the
+            # only surface). Always a list so consumers need no None-check.
+            "reactions": m.get("reactions") or [],
         })
     return out
 

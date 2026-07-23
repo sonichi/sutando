@@ -17,7 +17,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 
 const SRC_PATH = resolve('src/task-bridge.ts');
 const SRC = readFileSync(SRC_PATH, 'utf8');

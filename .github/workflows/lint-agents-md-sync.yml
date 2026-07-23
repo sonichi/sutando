@@ -1,0 +1,37 @@
+name: lint-agents-md-sync
+
+# CI lint: refuse PRs that leave AGENTS.md stale relative to CLAUDE.md.
+#
+# AGENTS.md is GENERATED — `scripts/agents-md-sync.sh` derives it from CLAUDE.md
+# via a fixed substitution list (Claude Code -> Codex, CLAUDE.md -> AGENTS.md,
+# …). The script has shipped since #1455 with a `--check` mode, but nothing ever
+# ran it, so the two files silently diverged: AGENTS.md was missing whole
+# sections that CLAUDE.md had gained (Task progress notifications, the vault
+# section, the Discord contextNotFrom gate) and carried a stale core-heartbeat
+# payload schema.
+#
+# That divergence is not cosmetic. A Codex-runtime agent reads AGENTS.md as its
+# operating instructions, so a missing section is a capability or a guardrail it
+# simply does not know about — the contextNotFrom gate being the sharpest
+# example, since that one governs what it may read into context.
+#
+# This workflow closes the loop: edit CLAUDE.md, run the script, commit both.
+
+on:
+  pull_request:
+    branches: [main, staging-interaction-planes]
+  push:
+    branches: [main, staging-interaction-planes]
+
+jobs:
+  lint-agents-md-sync:
+    name: refuse AGENTS.md stale vs CLAUDE.md
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify AGENTS.md is in sync
+        run: bash scripts/agents-md-sync.sh --check

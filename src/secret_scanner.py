@@ -21,13 +21,11 @@ suffix exposed in the bridge's task file. `redact_secrets` re-runs the
 per-type pattern against the source line and replaces the full secret span.
 """
 
-import os
 import re
-import tempfile
 from dataclasses import dataclass
 from typing import Iterable
 
-from detect_secrets import SecretsCollection
+from detect_secrets.core.scan import _process_line_based_plugins
 from detect_secrets.settings import transient_settings
 
 
@@ -123,20 +121,18 @@ def scan_secrets(text: str) -> list[SecretHit]:
     line number where the secret was found so `redact_secrets` can rewrite
     precisely that line without disturbing the rest of the message.
     """
+    # Use the same line-processing pipeline as scan_file, but feed it in-memory
+    # lines. The public scan_line() enables eager search and flags ordinary
+    # words such as "works" as entropy secrets; this pipeline preserves the
+    # production filters without writing raw chat text to a temporary file.
     with transient_settings({"plugins_used": _PLUGINS_CONFIG}):
-        sc = SecretsCollection()
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write(text)
-            fname = f.name
-        try:
-            sc.scan_file(fname)
-            hits = [
-                SecretHit(secret_type=s.type, line_number=s.line_number)
-                for fileset in sc.data.values()
-                for s in fileset
-            ]
-        finally:
-            os.unlink(fname)
+        hits = [
+            SecretHit(secret_type=secret.type, line_number=secret.line_number)
+            for secret in _process_line_based_plugins(
+                lines=list(enumerate(text.split("\n"), start=1)),
+                filename="adhoc-string-scan",
+            )
+        ]
 
     for stype, pattern in _WHOLE_LINE_PATTERNS.items():
         for i, line in enumerate(text.split("\n"), start=1):

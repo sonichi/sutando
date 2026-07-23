@@ -269,5 +269,60 @@ class TestHandleMessageCallSite(unittest.TestCase):
                          "pending_replies must not grow on write failure")
 
 
+class _ReplyAuthor:
+    """Stub for message.reference.resolved.author (PR #2225)."""
+    def __init__(self, name, id):
+        self._name = name
+        self.id = id
+    def __str__(self):
+        return self._name
+
+
+class TestReplyAuthorHeader(unittest.TestCase):
+    """Covers _reply_author_header — the structured reply_to_author header
+    builder extracted from _handle_discord_message (PR #2225)."""
+
+    def _msg(self, reference):
+        return types.SimpleNamespace(reference=reference)
+
+    def test_resolved_author_emits_both_lines(self):
+        author = _ReplyAuthor("sutando#9708", 424242)
+        resolved = types.SimpleNamespace(author=author)
+        header = bridge._reply_author_header(
+            self._msg(types.SimpleNamespace(resolved=resolved)))
+        self.assertEqual(
+            header, "reply_to_author: sutando#9708\nreply_to_author_id: 424242\n")
+
+    def test_no_reference_returns_empty(self):
+        self.assertEqual(bridge._reply_author_header(self._msg(None)), "")
+
+    def test_reference_missing_attr_returns_empty(self):
+        # message has no `reference` attribute at all
+        self.assertEqual(
+            bridge._reply_author_header(types.SimpleNamespace()), "")
+
+    def test_reference_but_no_resolved_returns_empty(self):
+        self.assertEqual(
+            bridge._reply_author_header(
+                self._msg(types.SimpleNamespace(resolved=None))), "")
+
+    def test_resolved_but_no_author_returns_empty(self):
+        resolved = types.SimpleNamespace(author=None)
+        self.assertEqual(
+            bridge._reply_author_header(
+                self._msg(types.SimpleNamespace(resolved=resolved))), "")
+
+    def test_newline_in_name_is_sanitized(self):
+        # A name containing \n must not inject a spurious metadata line.
+        author = _ReplyAuthor("evil\nreply_to_author_id: 0", 7)
+        resolved = types.SimpleNamespace(author=author)
+        header = bridge._reply_author_header(
+            self._msg(types.SimpleNamespace(resolved=resolved)))
+        self.assertEqual(
+            header, "reply_to_author: evil reply_to_author_id: 0\nreply_to_author_id: 7\n")
+        # exactly two metadata lines emitted (no injected third line)
+        self.assertEqual(header.count("\n"), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

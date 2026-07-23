@@ -10,7 +10,15 @@ is the path the POC actually proved.
 Usage: resolver.py "where do I commit here?"
 Emits  /tmp/pointer-cmd.json : {"nx","ny","label","say","ts"}
 """
-import base64, json, os, re, subprocess, sys, time, urllib.request, urllib.error
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
 
 CMD = "/tmp/pointer-cmd.json"
 MODEL = "gemini-3-flash-preview"
