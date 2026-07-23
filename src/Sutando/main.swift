@@ -229,9 +229,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Keep the ⌃R toggle state in lockstep with the indicator so a recording
         // started/stopped externally (observed via the Darwin notification) also
         // updates behavioral state — otherwise the next ⌃R mis-computes `starting`
-        // and needs a double-press to stop. (CR: john-the-dev)
-        isRecordingVideo = on
+        // and needs a double-press to stop. Written on the main queue alongside the
+        // menu update so notification callbacks never touch it off-main. (CR: john-the-dev)
         DispatchQueue.main.async {
+            self.isRecordingVideo = on
             guard let item = self.videoClipMenuItem else { return }
             let glyph = (item.representedObject as? String) ?? ""
             // Same leading-marker convention as the Mode rows (● = active):
@@ -1760,7 +1761,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if starting {
                 // Recording began — flip state; nothing to drop until stop.
                 if status == "recording" || status == "already_recording" {
-                    isRecordingVideo = true
                     setRecordingIndicator(true)
                     appendLog(logFile, "[\(timestamp)] dropVideoClip: recording started")
                 } else {
@@ -1770,7 +1770,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             // Stopping — flip state and drop the produced clip.
-            isRecordingVideo = false
             setRecordingIndicator(false)
             guard status == "ok", let path = json["path"] as? String else {
                 notify("Sutando", "Recording stopped, no clip (\(status))")
