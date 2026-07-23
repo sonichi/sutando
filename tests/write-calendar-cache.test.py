@@ -11,6 +11,7 @@ Run: python3 tests/write-calendar-cache.test.py   (exit 0 pass / 1 fail)
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -109,12 +110,57 @@ def test_cli_empty_flag() -> None:
         ok("CLI --empty: exit 0, verified-empty written", rc == 0 and data.get("events") == [], f"rc={rc}")
 
 
+def test_cli_events_json_flag() -> None:
+    """--events-json path: the agent hands the pulled Google events straight in."""
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "state" / "calendar-today.json"
+        with unittest.mock.patch.object(wcc, "cache_path", lambda: cache):
+            rc = wcc.main(["--events-json",
+                           json.dumps([{"raw": "9am Standup", "calendar": "work"}, "3pm Review"])])
+        data = json.loads(cache.read_text())
+        ok("CLI --events-json: exit 0, mixed string+dict written in schema",
+           rc == 0 and data.get("events") == [{"raw": "9am Standup", "calendar": "work"},
+                                              {"raw": "3pm Review", "calendar": ""}],
+           f"rc={rc} data={data}")
+
+
+def test_cli_stdin_events() -> None:
+    """No flag → read the JSON array from stdin (the piped-from-connector path)."""
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "state" / "calendar-today.json"
+        with unittest.mock.patch.object(wcc, "cache_path", lambda: cache), \
+             unittest.mock.patch.object(sys, "stdin", io.StringIO('[{"raw": "10am 1:1 w/ Sam"}]')):
+            rc = wcc.main([])
+        data = json.loads(cache.read_text())
+        ok("CLI stdin: reads events array from stdin",
+           rc == 0 and data.get("events") == [{"raw": "10am 1:1 w/ Sam", "calendar": ""}], f"rc={rc}")
+
+
+def test_cli_error_paths() -> None:
+    """Every bad-input branch returns 2 and writes nothing (never a blank cache)."""
+    with unittest.mock.patch.object(sys, "stdin", io.StringIO("   ")):
+        ok("CLI empty stdin → rc 2 (use --empty for a real empty day)", wcc.main([]) == 2)
+    ok("CLI invalid JSON → rc 2", wcc.main(["--events-json", "{not json"]) == 2)
+    ok("CLI non-list JSON → rc 2", wcc.main(["--events-json", '{"raw": "x"}']) == 2)
+
+
+def test_cache_path_default_location() -> None:
+    """The real (un-mocked) cache_path resolves under <workspace>/state/."""
+    p = wcc.cache_path()
+    ok("cache_path → <workspace>/state/calendar-today.json",
+       p.name == "calendar-today.json" and p.parent.name == "state", str(p))
+
+
 test_normalize_mixed_shapes()
 test_write_schema_and_atomic()
 test_empty_is_verified_empty()
 test_producer_feeds_reader_roundtrip()
 test_stale_cache_ignored()
 test_cli_empty_flag()
+test_cli_events_json_flag()
+test_cli_stdin_events()
+test_cli_error_paths()
+test_cache_path_default_location()
 
 print()
 if _failed:
