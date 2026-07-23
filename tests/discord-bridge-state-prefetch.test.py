@@ -327,10 +327,10 @@ def case_i_no_refs_returns_none():
         fails.append(f"i) no-refs body should return None, got {type(enriched).__name__}")
     enriched_empty = asyncio.run(bridge._prefetch_discord_state_refs(""))
     if enriched_empty is not None:
-        fails.append(f"i2) empty body should return None")
+        fails.append("i2) empty body should return None")
     enriched_none = asyncio.run(bridge._prefetch_discord_state_refs(None))
     if enriched_none is not None:
-        fails.append(f"i3) None body should return None")
+        fails.append("i3) None body should return None")
     return fails
 
 
@@ -347,7 +347,7 @@ def case_j_unexpected_exception_silent_fail():
         fails.append(f"j) unexpected exception leaked out of prefetch: {type(e).__name__}: {e}")
         return fails
     if enriched is not None:
-        fails.append(f"j) unexpected exception should return None, got enriched body")
+        fails.append("j) unexpected exception should return None, got enriched body")
     return fails
 
 

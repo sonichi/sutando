@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 import re
 import shlex
 import subprocess
@@ -79,12 +80,15 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
+import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
 # Generic plugin message-hook loader. The bridge stays a THIN, plugin-AGNOSTIC
@@ -326,9 +330,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         }
         if channel_id:
             payload["channel_id"] = str(channel_id)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Per-PID staging name: this file is written by four processes (this
+        # bridge + slack/telegram/sparrow). A shared ".json.tmp" name lets two
+        # concurrent writers truncate and interleave the same temp file, so the
+        # rename can publish torn JSON. A per-PID temp is never shared, and
+        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
 
@@ -557,6 +566,29 @@ def load_policy():
     except Exception:
         return "pairing"
 
+
+def read_access_for_seed(path):
+    """Read access.json for a path that is about to WRITE it back (pairing seed).
+
+    Returns:
+      - the parsed dict when the file is present and valid;
+      - a fresh default dict when the file is genuinely ABSENT (first-run
+        onboarding — seeding a default is correct);
+      - None when the file EXISTS but is unreadable/corrupt — the caller MUST
+        NOT overwrite it. Writing an empty-allowFrom default over a
+        present-but-unparseable access.json turns a transient read glitch into
+        a PERMANENT config wipe: the owner is dropped from allowFrom, so every
+        sender gets a pairing prompt and codes leak into channels. Observed
+        2026-07-21 (the owner was silently de-authorized mid-session). The safe
+        move on corruption is to leave the file untouched and bail.
+    """
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
+    except Exception:
+        return None
+
 def load_channel_config(channel_id):
     """Load channel config. Returns (requireMention, allowFrom set) or None if not configured."""
     try:
@@ -570,6 +602,20 @@ def load_channel_config(channel_id):
         return None  # not configured
     except Exception:
         return None
+
+def _channel_role(channel_id):  # pragma: no cover — bridge I/O glue (reads ACCESS_FILE); trivial dict lookup
+    """Return the configured `role` for a channel (e.g. "bot2bot"), or None.
+
+    Kept separate from load_channel_config (which returns the
+    requireMention/allowFrom pair) so the shared-channel addressee gate can
+    special-case bot2bot channels without widening that function's contract.
+    """
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        cfg = data.get("groups", {}).get(str(channel_id))
+    except Exception:
+        return None
+    return cfg.get("role") if isinstance(cfg, dict) else None
 
 def load_channel_allowed(channel_id):
     """Load channel-specific allowlist. Returns None if channel not configured (open to all)."""
@@ -2301,6 +2347,34 @@ def _message_mentions_bot(message):
     return False
 
 
+# When a sender ADDRESSES the bot (a DM, or an @mention in a channel) but isn't
+# on the allowlist, the message is dropped by the access-control gate below.
+# Historically that drop was silent, so the sender had no idea their message
+# wasn't received (owner ask 2026-07-15). Send a one-line automated ack instead,
+# rate-limited per sender so a repeat-sender (or an abusive one) can't turn the
+# bridge into an echo. In-memory cooldown: fine to reset on bridge restart.
+_NOT_ALLOWLISTED_ACK_COOLDOWN_S = 3600
+_not_allowlisted_ack_at: dict[str, float] = {}
+_NOT_ALLOWLISTED_ACK_TEXT = (
+    "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
+    "can't act on it. Ask the owner to add you. _(automated notice)_"
+)
+
+
+async def _ack_not_allowlisted(channel, sender_id: str, username: str = "") -> None:
+    """One-line 'you're not on the allowlist' reply so an addressed-but-dropped
+    message isn't silent. Rate-limited per sender (``_NOT_ALLOWLISTED_ACK_COOLDOWN_S``)."""
+    now = time.time()
+    if now - _not_allowlisted_ack_at.get(sender_id, 0.0) < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
+        return  # already acked this sender recently — don't spam / echo
+    _not_allowlisted_ack_at[sender_id] = now
+    try:
+        await channel.send(_NOT_ALLOWLISTED_ACK_TEXT)
+        print(f"  [not-allowlisted-ack] sent to @{username or sender_id}", flush=True)
+    except Exception as e:
+        print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
+
+
 @client.event
 async def on_message(message):
     await _handle_discord_message(message)
@@ -2360,6 +2434,29 @@ def _write_task_file(task_file: Path, content, username: str,
     return True
 
 
+def _reply_author_header(message) -> str:
+    """Structured ``reply_to_author`` / ``reply_to_author_id`` task-file lines.
+
+    When ``message`` is a Discord reply whose parent author is resolved, return
+    the two metadata lines so a consumer can tell WHO the sender was addressing
+    (e.g. a reply aimed at another bot) without parsing the lossy ``[Replying to
+    ...]`` body snippet. Returns ``""`` when there is no reference, no resolved
+    parent, or no author. The author's ``str()`` is newline-sanitized so a name
+    containing ``\\n`` can't inject a spurious metadata line into the k:v shape.
+    """
+    reply_author = (
+        getattr(getattr(message.reference, "resolved", None), "author", None)
+        if getattr(message, "reference", None) else None
+    )
+    if reply_author is None:
+        return ""
+    ra_name = str(reply_author).replace("\n", " ")
+    return (
+        f"reply_to_author: {ra_name}\n"
+        f"reply_to_author_id: {reply_author.id}\n"
+    )
+
+
 def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     """True iff `sender_id` is listed under the SERVING channel's `collaborators`
     array in access.json.
@@ -2415,6 +2512,8 @@ async def _handle_discord_message(message, force=False):
     sender_id = str(message.author.id)
     username = str(message.author)
     text = message.content or ""
+    initial_secret_filter = filter_chat_secrets(text)
+    detected_secret_types = set(initial_secret_filter.secret_types)
     is_dm = isinstance(message.channel, discord.DMChannel)
     channel_name = getattr(message.channel, 'name', 'DM')
 
@@ -2430,10 +2529,12 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    print(f"  [msg] #{channel_name} @{username}: {redact_vault_commands(text)[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
+    safe_log_text = redact_vault_commands(initial_secret_filter.text)
+    print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
-        print(f"  [debug] message_snapshots: {message.message_snapshots}", flush=True)
+        safe_snapshots = filter_chat_secrets(str(message.message_snapshots)).text  # pragma: no cover
+        print(f"  [debug] message_snapshots: {safe_snapshots}", flush=True)  # pragma: no cover
     if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
         print(f"  [debug] non-default message type: {message.type}", flush=True)
 
@@ -2503,6 +2604,9 @@ async def _handle_discord_message(message, force=False):
             return
 
         bot_mentioned = client.user in message.mentions
+        # role_mentioned counts as "addressed to us" — assumes these roles are held
+        # only by this bot; a role shared across sibling bots re-introduces the
+        # mass-answer this gate exists to prevent.
         role_mentioned = any(role.name.lower() in ("sutando", "sutando bot") or str(client.user.id) in str(role.id) for role in message.role_mentions)
         # Also check if any role mention exists and the bot has that role
         if not role_mentioned and message.role_mentions and message.guild:
@@ -2637,16 +2741,33 @@ async def _handle_discord_message(message, force=False):
             print(f"  [skip] not mentioned (requireMention=true)", flush=True)
             return
 
-        # In shared channels (require_mention=False), if there ARE other bot
-        # @mentions but THIS bot isn't mentioned, skip — let the addressed bot handle it.
-        # Exception: reply context auto-adds the replied-to bot as a mention —
-        # don't skip just because the user replied to another bot's message.
-        if not require_mention and message.mentions and not bot_mentioned:
-            # Filter out the replied-to author (auto-added by Discord reply)
-            reply_author_id = message.reference.resolved.author.id if message.reference and hasattr(message.reference, 'resolved') and message.reference.resolved else None
-            explicit_mentions = [m for m in message.mentions if m.bot and m.id != reply_author_id]
-            if explicit_mentions:
-                print(f"  [skip] message addressed to other bot(s): {[str(m) for m in explicit_mentions]}", flush=True)
+        # Shared-channel addressee gate (require_mention=False, non-bot2bot).
+        # Fixes owner-reported 2026-07-18: replies to OTHER agents and other
+        # agents' own chatter (e.g. a sibling bot's "⏳ working…" status) were
+        # processed as if addressed to us. A message here is for us only if it
+        # @-mentions/role-mentions us or replies to one of OUR messages; other
+        # bots' posts and replies-to-others are skipped. bot2bot channels opt
+        # out (role:"bot2bot") — they intentionally want peer messages. The
+        # decision itself is the pure `is_addressed_in_shared_channel` (unit-
+        # tested); here we only resolve the discord objects into its primitives.
+        # (Supersedes the old reply-target filter, which *excluded* the reply-
+        # target from the addressee check — backwards — letting replies-to-
+        # other-agents through.)
+        if not require_mention and _channel_role(str(message.channel.id)) != "bot2bot":  # pragma: no cover — discord-object resolution glue; decision covered in discord_addressee.py
+            _ref = getattr(message, "reference", None)
+            _ref_resolved = getattr(_ref, "resolved", None) if _ref is not None else None
+            _ref_author = getattr(_ref_resolved, "author", None)
+            if not is_addressed_in_shared_channel(
+                author_is_bot=bool(getattr(message.author, "bot", False)),
+                bot_mentioned=bot_mentioned,
+                role_mentioned=role_mentioned,
+                is_reply=_ref is not None,
+                reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
+                self_id=getattr(client.user, "id", None),
+            ):
+                print(f"  [skip] shared channel: not addressed to me "
+                      f"(author_bot={bool(getattr(message.author, 'bot', False))}, "
+                      f"reply={_ref is not None})", flush=True)
                 return
 
         # Strip role mentions only. User mentions (this bot's and other
@@ -2674,6 +2795,8 @@ async def _handle_discord_message(message, force=False):
 
     if is_dm:
         if policy == "allowlist" and sender_id not in allowed:
+            # A DM always addresses the bot → ack the non-allowlisted sender.
+            await _ack_not_allowlisted(message.channel, sender_id, username)
             return
     else:
         # Channel access control
@@ -2695,6 +2818,10 @@ async def _handle_discord_message(message, force=False):
                     channel_authorized = True
                 else:
                     print(f"  [skip] @{username} (id={sender_id}) not in channel allowlist", flush=True)
+                    # Ack only when the bot was explicitly addressed (@mention /
+                    # role) — never auto-reply to every unrelated channel message.
+                    if bot_mentioned or role_mentioned:
+                        await _ack_not_allowlisted(message.channel, sender_id, username)
                     return
             else:
                 # sender is in ch_allowed (or ch_allowed is empty + requireMention)
@@ -2703,15 +2830,29 @@ async def _handle_discord_message(message, force=False):
             # Channel not configured — fall back to global allowlist
             if allowed and sender_id not in allowed:
                 print(f"  [skip] @{username} not in global allowlist", flush=True)
+                if bot_mentioned or role_mentioned:
+                    await _ack_not_allowlisted(message.channel, sender_id, username)
                 return
 
     if policy == "pairing" and sender_id not in allowed and not channel_authorized:
         # Generate pairing code — user must approve via /discord:access pair <code>
         import random, string
-        try:
-            access = json.loads(ACCESS_FILE.read_text())
-        except Exception:
-            access = {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
+        # Async gateway wiring is structurally pinned below; the pure helper's
+        # valid/absent/corrupt behavior is executed against real files.
+        access = read_access_for_seed(ACCESS_FILE)  # pragma: no cover
+        if access is None:  # pragma: no cover
+            # access.json EXISTS but is corrupt/unreadable. Do NOT overwrite it
+            # with an empty-allowFrom default — that permanently wipes the real
+            # config (owner dropped from allowFrom → pairing prompts + code leak
+            # to channels; observed 2026-07-21). Bail loudly; leave the file for
+            # the operator to restore from channels/discord/access.json.bak-*.
+            print(
+                f"  [pairing] access.json present but unreadable — NOT overwriting "
+                f"(would wipe allowFrom). Skipping pairing for @{username} ({sender_id}). "
+                f"Restore from a channels/discord/access.json.bak-* backup.",
+                flush=True,
+            )
+            return
         code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         pending = access.get("pending", {})
         # Clean expired codes
@@ -2724,8 +2865,21 @@ async def _handle_discord_message(message, force=False):
             "expiresAt": now_ms + 3600000,  # 1 hour
         }
         access["pending"] = pending
-        ACCESS_FILE.write_text(json.dumps(access, indent=2))
-        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
+        # Atomic tmp+rename. A bare write_text truncates-then-writes, exposing a
+        # window where a concurrent reader (every message hits load_channel_config,
+        # which re-reads access.json) sees a partial/empty file → json parse fail.
+        # THIS truncate-in-place write was the TRIGGER of the 2026-07-21 corrupt
+        # read: before the no-clobber guard above, that failed read fell to the
+        # bare-except default and permanently wiped allowFrom → pairing-code leak
+        # into DMs and #dev. The no-clobber guard stops the amplification; writing
+        # atomically here closes the window that produced the corrupt read at all
+        # (and the lost-update race with the `/discord:access` read-modify-write).
+        # Same pattern the thread-engage seed already uses. chmod the tmp before
+        # replace so the final file is never briefly 0644 (it holds owner IDs).
+        tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')  # pragma: no cover — async pairing branch; atomicity asserted structurally
+        tmp_path.write_text(json.dumps(access, indent=2))  # pragma: no cover
+        os.chmod(tmp_path, 0o600)  # pragma: no cover
+        os.replace(tmp_path, ACCESS_FILE)  # pragma: no cover
         await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
         print(f"  Pairing requested: @{username} ({sender_id}) code={code}")
         return
@@ -2759,7 +2913,7 @@ async def _handle_discord_message(message, force=False):
             if parts:
                 fwd_text = "\n".join(parts)
                 text = (text + "\n" + fwd_text).strip() if text else fwd_text.strip()
-                print(f"  [forward] extracted: {text[:100]}", flush=True)
+                print(f"  [forward] extracted: {filter_chat_secrets(text).text[:100]}", flush=True)  # pragma: no cover
 
     # Handle embeds (link previews, rich content, pasted images)
     embed_text = ""
@@ -2924,7 +3078,10 @@ async def _handle_discord_message(message, force=False):
     # raw print lands the secret in discord-bridge.log even though the intercept
     # below (L~2939) would store/redact it — a plaintext-secret leak to the log.
     # (2026-06-23 incident: an owner's telegram bot token leaked here.)
-    print(f"  @{username}: {redact_vault_commands(text)}{attachment_note}")
+    safe_detail_log = filter_chat_secrets(
+        f"{redact_vault_commands(text)}{attachment_note}"
+    ).text
+    print(f"  @{username}: {safe_detail_log}")
 
     # Determine access tier
     access_tier = "other"
@@ -2940,7 +3097,8 @@ async def _handle_discord_message(message, force=False):
     if sender_id in allowed:
         access_tier = "owner"
         # Record owner activity for status-aware-pivot in proactive loop
-        write_owner_activity("discord", text, channel_id=getattr(message.channel, "id", None))
+        write_owner_activity("discord", filter_chat_secrets(text).text,
+                             channel_id=getattr(message.channel, "id", None))
     else:
         # Check if team member (from channel allowlists)
         try:
@@ -3031,6 +3189,20 @@ async def _handle_discord_message(message, force=False):
         else:
             text = redact_vault_commands(text)
 
+    # Redact ordinary pasted tokens after explicit vault interception so named
+    # `vault set` values can still be stored. Include reply context and voice
+    # transcripts: both are user-derived and both are persisted in the task.
+    filtered_text = filter_chat_secrets(text)
+    filtered_attachment = filter_chat_secrets(attachment_note)
+    filtered_reply_context = filter_chat_secrets(reply_context)
+    text = filtered_text.text
+    attachment_note = filtered_attachment.text
+    reply_context = filtered_reply_context.text
+    detected_secret_types.update(filtered_text.secret_types)
+    detected_secret_types.update(filtered_attachment.secret_types)
+    detected_secret_types.update(filtered_reply_context.secret_types)
+    secret_notice = secret_handling_instruction("Discord", detected_secret_types)
+
     # Inject tier-specific in-band instructions so the core agent cannot
     # accidentally process a non-owner task with full capabilities.
     # See CLAUDE.md "Discord access control" section for the policy.
@@ -3114,6 +3286,10 @@ async def _handle_discord_message(message, force=False):
             # `===SUTANDO SYSTEM INSTRUCTIONS===` content that lands in the task
             # file header verbatim. confine_user_content is idempotent so the
             # already-ZWSP-prefixed original user_task_text is unaffected.
+            filtered_enriched = filter_chat_secrets(enriched)  # pragma: no cover
+            detected_secret_types.update(filtered_enriched.secret_types)  # pragma: no cover
+            secret_notice = secret_handling_instruction("Discord", detected_secret_types)  # pragma: no cover
+            enriched = filtered_enriched.text  # pragma: no cover
             user_task_text = confine_user_content(enriched)
             # Rewrite the prompt file with the enriched body. quoted_task
             # already points to `"$(cat {prompt_path})"` — keep the heredoc
@@ -3266,14 +3442,22 @@ async def _handle_discord_message(message, force=False):
         if getattr(message, "reference", None) and message.reference.message_id
         else ""
     )
+    # Also emit the replied-to author as a STRUCTURED header, not just the
+    # opaque parent_message_id. In a multi-bot channel a consumer must be able
+    # to tell WHO the sender was addressing (e.g. a reply aimed at another bot)
+    # without parsing the lossy `[Replying to ...]` body snippet. parent_message_id
+    # alone is an unresolvable id; reply_to_author makes the addressee legible so
+    # the receiving bot can gate on it. (Chi 2026-07-20: "the task file content
+    # needs to be right" — a reply to sutando#9708 reached Pro with no legible
+    # addressee, so Pro acted as if addressed.)
+    parent_msg_line += _reply_author_header(message)
     # Inject skill instructions for owner tasks so the agent follows the
     # notify-before-work and transcription protocol after compaction.
     # Only injected when the referenced skills are installed on this node.
-    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
-    # the config dir via $CLAUDE_CONFIG_DIR.
-    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
-    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    # Use claude_home_path() — honours $CLAUDE_CONFIG_DIR → $CLAUDE_HOME → ~/.claude
+    # resolution order (inline os.environ.get misses the $CLAUDE_HOME fallback).
+    _notify_py = claude_home_path("skills", "task-progress", "scripts", "notify.py")  # pragma: no cover
+    _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")  # pragma: no cover
     discord_skill_hints = ""
     # CONTEXT-FIRST is a correctness feature (reconstruct before interpreting) and
     # must NOT be gated on unrelated skills (task-progress / audio-transcribe) being
@@ -3370,6 +3554,7 @@ async def _handle_discord_message(message, force=False):
             f"task: {user_task_text}\n"
             f"{tier_instructions.get(rulebook_key, tier_instructions['other'])}"
             f"{discord_skill_hints}"
+            f"{secret_notice}"
         )
 
     if not _write_task_file(task_file, _build_task_content, username, channel_name,
@@ -3403,20 +3588,6 @@ async def _handle_discord_message(message, force=False):
     # Typing indicator
     async with message.channel.typing():
         await asyncio.sleep(0.5)
-
-
-def save_to_allowlist(sender_id):
-    """Add sender to access.json allowFrom."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-    except Exception:
-        data = {"dmPolicy": "pairing", "allowFrom": [], "groups": {}, "pending": {}}
-
-    if sender_id not in data.get("allowFrom", []):
-        data.setdefault("allowFrom", []).append(sender_id)
-        ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_FILE.write_text(json.dumps(data, indent=2))
-        os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Discord user IDs
 
 
 async def poll_approved():
@@ -3581,6 +3752,12 @@ def _mark_delivered(task_id: str) -> None:
     result_audit.record(task_id, "delivered", "discord")
 
 
+def _record_skip_audit(task_id: str, skip_value: str) -> None:
+    """Record §7 audit disposition for a skip-marked result (no_send / deduped)."""
+    _disp = "deduped" if skip_value == "deduped" else "no_send"
+    result_audit.record(task_id, _disp, "discord")
+
+
 def _is_delivered(task_id: str) -> bool:
     """True iff the sentinel for `task_id` exists."""
     try:
@@ -3595,6 +3772,77 @@ def _clear_delivered(task_id: str) -> None:
         _delivered_sentinel_path(task_id).unlink(missing_ok=True)
     except Exception:
         pass
+
+
+async def _report_delivery_failure(channel, task_id: str, task_tier: str, error: Exception) -> None:
+    """Make a failed Discord result visible instead of only printing a log.
+
+    Result Router §9.3 requires every delivery failure to produce both a
+    ``failed`` audit row and an owner DM.  The originating owner DM is the
+    safest first choice; for channel and non-owner tasks, resolve the canonical
+    owner using the same config chain as proactive delivery.
+
+    This helper deliberately never raises.  It runs inside ``poll_results``'s
+    delivery exception path, where a second exception must not kill the bridge.
+    """
+    error_text = str(error) or type(error).__name__
+    failure = result_router.DeliveryFailure(
+        task_id=task_id,
+        tier=task_tier,
+        surface="discord",
+        error=error_text,
+    )
+    result_audit.record(task_id, "failed", "discord")
+    try:
+        _emit_channel(
+            "discord",
+            "out",
+            channel_id=str(getattr(channel, "id", "")),
+            access_tier=task_tier,
+            outcome="error",
+            data={"task_id": task_id, "error": error_text[:1000]},
+        )
+    except Exception:
+        pass
+
+    try:
+        owner_dm = None
+        if task_tier == "owner" and isinstance(channel, discord.DMChannel):
+            owner_dm = channel
+        else:
+            try:
+                access_data = json.loads(ACCESS_FILE.read_text())
+            except Exception:
+                access_data = {}
+            allow_list = access_data.get("allowFrom") or []
+            owner_id = discord_config.resolve_owner_id(access_data)
+            if owner_id is None:
+                for uid in allow_list:
+                    try:
+                        user = await client.fetch_user(int(uid))
+                        if not user.bot:
+                            owner_id = str(uid)
+                            break
+                    except Exception:
+                        continue
+            if owner_id is not None:
+                user = await client.fetch_user(int(owner_id))
+                owner_dm = await user.create_dm()
+
+        if owner_dm is None:
+            print(
+                f"  [delivery-failure] no owner DM available for {task_id}: {error_text}",
+                flush=True,
+            )
+            return
+        await owner_dm.send(result_router.delivery_failure_notice(failure))
+        print(f"  [delivery-failure] owner notified for {task_id}: {error_text}", flush=True)
+    except Exception as notice_error:
+        print(
+            f"  [delivery-failure] owner notice failed for {task_id}: {notice_error}; "
+            f"original error: {error_text}",
+            flush=True,
+        )
 
 
 PENDING_REPLIES_FILE = REPO / "state" / "discord-pending-replies.json"
@@ -3771,6 +4019,9 @@ async def poll_results():
                             # Best-effort; never block the archive of this result.
                             print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
                     print(f"  Skipped (already replied or deduped): {task_id}")
+                    # §7 audit: skip-marked results are resolved deliveries, not
+                    # silent voids — one line per resolved result per spec.
+                    _record_skip_audit(task_id, _skip.value)
                     archive_file(result_file, "results", task_id)
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
@@ -3992,6 +4243,7 @@ async def poll_results():
                     )
                 except Exception as e:
                     print(f"  Reply failed: {e}", flush=True)
+                    await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"

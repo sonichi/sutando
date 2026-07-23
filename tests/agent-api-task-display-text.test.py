@@ -21,6 +21,7 @@ import tempfile
 import threading
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -204,11 +205,18 @@ def test_http_dispatch_paths():
         finally:
             done.set()
 
+    def run_probe(args, **kwargs):
+        if args[0] == "/usr/bin/pgrep":
+            return type("Result", (), {"returncode": 0})()
+        raise OSError("tmux probe failed")
+
     t = threading.Thread(target=worker)
-    t.start()
-    while not done.is_set():
-        server.handle_request()
-    t.join(timeout=5)
+    with mock.patch.object(api.shutil, "which", return_value="/usr/bin/tmux"), \
+         mock.patch.object(api.subprocess, "run", side_effect=run_probe):
+        t.start()
+        while not done.is_set():
+            server.handle_request()
+        t.join(timeout=5)
     server.server_close()
 
     assert "error" not in out, out.get("error")
