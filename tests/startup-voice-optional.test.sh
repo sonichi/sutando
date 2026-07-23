@@ -32,6 +32,30 @@ if grep -q 'voice agent disabled' <<<"$with_voice_key"; then
   exit 1
 fi
 
+# G8 managed tier: a minted managed-credentials.json (desktop-provisioned, no
+# env keys) must enable voice too — the resolver reads it at runtime, so the
+# startup gate may not skip the service. Fixture uses the default in-repo
+# workspace location the helper falls back to.
+MANAGED_DIR="$TMP/managed"
+mkdir -p "$MANAGED_DIR/workspace/state/auth"
+printf '{"version":1,"capabilities":{"gemini-voice":{"key":"managed-test-token"}}}\n' \
+  > "$MANAGED_DIR/workspace/state/auth/managed-credentials.json"
+with_managed="$(env -i PATH="/usr/bin:/bin" \
+  bash -c 'cd "$1"; source "$2/src/startup-runtime.sh"; configure_startup_runtime; printf "SKIP_VOICE=%s\n" "${SKIP_VOICE:-0}"' \
+  _ "$MANAGED_DIR" "$REPO")"
+grep -q 'SKIP_VOICE=0' <<<"$with_managed"
+grep -q 'voice credential: managed' <<<"$with_managed"
+
+# A managed file whose capabilities carry no usable key must NOT enable voice —
+# presence of the file alone is not a credential.
+printf '{"version":1,"capabilities":{"gemini-voice":{"key":""}}}\n' \
+  > "$MANAGED_DIR/workspace/state/auth/managed-credentials.json"
+managed_keyless="$(env -i PATH="/usr/bin:/bin" \
+  bash -c 'cd "$1"; source "$2/src/startup-runtime.sh"; configure_startup_runtime; printf "SKIP_VOICE=%s\n" "${SKIP_VOICE:-0}"' \
+  _ "$MANAGED_DIR" "$REPO")"
+grep -q 'SKIP_VOICE=1' <<<"$managed_keyless"
+grep -q 'voice agent disabled' <<<"$managed_keyless"
+
 # The phone stack shares the Gemini voice session and must stay down when
 # credential-free startup sets SKIP_VOICE, even if Twilio is configured.
 phone_gate="$(env -i PATH="/usr/bin:/bin" bash -c '
