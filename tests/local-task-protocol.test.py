@@ -280,8 +280,8 @@ if (corpus / "archive").is_dir():
         except Exception:
             bad += 1
     check(f"live corpus: {n} files parse without throwing", bad == 0, f"{bad} threw")
-    check(f"live corpus: id recoverable everywhere", no_id == 0, f"{no_id} lacked ids")
-    check(f"live corpus: trusted-body fidelity (no non-header line lost)",
+    check("live corpus: id recoverable everywhere", no_id == 0, f"{no_id} lacked ids")
+    check("live corpus: trusted-body fidelity (no non-header line lost)",
           infidel == 0, f"{infidel} files lost lines")
 else:
     print("  (live corpus sweep skipped — no workspace archive)")
@@ -341,4 +341,4 @@ if _os.getuid() != 0:
 
 if failures:
     sys.exit(1)
-print(f"PASS — local_task_protocol read-side golden tests")
+print("PASS — local_task_protocol read-side golden tests")

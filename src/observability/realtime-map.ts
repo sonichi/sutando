@@ -21,7 +21,7 @@
  */
 
 import type { ObsEvent, Actor, AccessTier, UsageAdvisory } from './events.js';
-import type { UsageRecord, UsageAttrs } from './usage.js';
+import type { UsageRecord } from './usage.js';
 
 // --- raw payloads (what the client POSTs to /ingest/realtime) ----------------
 

@@ -50,7 +50,8 @@ def main() -> int:
     # branch routes the SAME behavior through the canonical Python resolver
     # (_resolved_vault → sutando_config.resolve_vault). These tests now assert
     # the resolver-backed behavior, which is the point of the extraction.
-    import os, time as _time
+    import os
+    import time as _time
 
     def _vault(enabled=None, remote_url="", explicit_disable=False):
         return {"enabled": enabled, "remote_url": remote_url,
