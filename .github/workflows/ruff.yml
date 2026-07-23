@@ -1,0 +1,41 @@
+name: ruff
+
+# CI lint: the Python baseline, mirroring what eslint.yml does for TypeScript.
+#
+# Python is the largest untyped surface in the repo — 341 files across src/,
+# skills/, tests/, scripts/, hooks/ and packages/ — and before this it had no
+# linter at all. There is no `tsc` equivalent here, so a syntax error, a broken
+# .format() call, or an undefined name in a rarely-exercised branch could reach
+# main with nothing to catch it.
+#
+# Rule selection and every deliberate exclusion are documented in ruff.toml.
+#
+# Ruff is PINNED. Linters gain rules between releases, so an unpinned install
+# turns an unrelated PR red when a new check ships. Bump deliberately.
+
+on:
+  pull_request:
+    branches: [main, staging-interaction-planes]
+  push:
+    branches: [main, staging-interaction-planes]
+
+jobs:
+  ruff:
+    name: ruff over Python sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ruff (pinned)
+        run: python3 -m pip install 'ruff==0.15.22'
+
+      - name: Run ruff
+        run: ruff check --output-format=github .
