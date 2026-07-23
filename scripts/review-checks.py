@@ -60,6 +60,11 @@ def main():
             continue
         if raw.startswith("-"):
             continue
+        if raw.startswith(" "):
+            # Context lines exist in both old and new files, so they advance the
+            # new-file line counter just like additions do.
+            ln += 1
+            continue
         if raw.startswith("+"):
             if skip:
                 continue

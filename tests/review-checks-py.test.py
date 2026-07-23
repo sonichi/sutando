@@ -63,6 +63,16 @@ ok("allowed: unrelated token not allowed", rc.allowed("/Users/alice") is False)
 code, out = scan('+++ b/src/app.ts\n@@ -1,0 +5,1 @@\n+const p = "/Users/a/b";')
 ok("positive: /Users flagged with file:line", code == 0 and "src/app.ts:5:" in out and "/Users/a/b" in out)
 
+code, out = scan(
+    '+++ b/src/app.ts\n'
+    '@@ -10,2 +10,3 @@\n'
+    ' existing_line_one = 1\n'
+    ' existing_line_two = 2\n'
+    '+path = "/Users/a/b"'
+)
+ok("context lines advance the reported new-file line",
+   code == 0 and "src/app.ts:12:" in out and "/Users/a/b" in out)
+
 code, out = scan('+++ b/src/c.py\n@@ -1,0 +1,2 @@\n+# note /Users/x\n+  // note /home/y')
 ok("comment lines (# and //) skipped", out.strip() == "")
 
