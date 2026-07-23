@@ -150,9 +150,9 @@ def main():
         lines.append('set p to item 1 of results')
         if phone:
             lines.append('-- Remove existing phones and add new one')
-            lines.append(f'repeat while (count of phones of p) > 0')
-            lines.append(f'    delete (item 1 of phones of p)')
-            lines.append(f'end repeat')
+            lines.append('repeat while (count of phones of p) > 0')
+            lines.append('    delete (item 1 of phones of p)')
+            lines.append('end repeat')
             lines.append(f'make new phone at end of phones of p with properties {{label:"mobile", value:"{phone}"}}')
         if email:
             lines.append('repeat while (count of emails of p) > 0')
