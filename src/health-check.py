@@ -861,6 +861,29 @@ def check_host_subtrees() -> dict:
     return {"name": name, "status": "ok", "detail": f"{fresh} host subtree(s), all synced <{stale_days:.0f}d"}
 
 
+def _durable_access_bytes(raw: bytes) -> "bytes | None":
+    """Normalized, comparable view of an access.json for backup-drift detection.
+
+    Drops the volatile ``pending`` block — short-lived pairing codes created on
+    any non-owner DM that expire ~1h later (see #2260). Live grows and ages
+    these out constantly, so a byte-for-byte compare would flag a perfectly
+    healthy backup as "stale" on nearly every run. Comparing only the durable
+    keys (``allowFrom`` / ``tierMap`` / …) makes the probe fire on real
+    allowlist/tier drift, not pairing-code churn.
+
+    Returns stable-sorted JSON bytes of the durable keys, or ``None`` when the
+    payload is not parseable JSON — the caller then falls back to a raw byte
+    compare (can't normalize, so stay conservative and flag any difference).
+    """
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict):
+        data = {k: v for k, v in data.items() if k != "pending"}
+    return json.dumps(data, sort_keys=True).encode()
+
+
 def check_per_host_config_backup() -> dict:
     """Warn when a channel's access.json vault backup has drifted from live.
 
@@ -897,10 +920,21 @@ def check_per_host_config_backup() -> dict:
             drift.append(f"{svc} (no backup)")
             continue
         try:
-            if carrier.read_bytes() != live_bytes:
-                drift.append(f"{svc} (stale)")
+            carrier_bytes = carrier.read_bytes()
         except OSError:
             drift.append(f"{svc} (unreadable backup)")
+            continue
+        # Compare only the durable config — the volatile `pending` pairing-code
+        # block churns ~hourly and would otherwise flag every healthy backup
+        # (john, #2277 review). Raw-byte fallback when either side is malformed.
+        live_norm = _durable_access_bytes(live_bytes)
+        carrier_norm = _durable_access_bytes(carrier_bytes)
+        if live_norm is None or carrier_norm is None:
+            if carrier_bytes != live_bytes:
+                drift.append(f"{svc} (stale)")
+        elif live_norm != carrier_norm:
+            drift.append(f"{svc} (stale)")
+        # else: durable config matches — any pending-only diff is healthy churn.
     if checked == 0:
         return {"name": name, "status": "ok", "detail": "no channel access.json to back up"}
     if drift:

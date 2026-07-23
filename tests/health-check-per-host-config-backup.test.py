@@ -14,10 +14,14 @@ Root cause it was built for (observed 2026-07-22): a discord access.json backup
 copied a stale ~/.claude copy instead of the live workspace one.
 
 Covers:
-  a) backup byte-identical to live  → ok
-  b) backup content differs         → warn (stale)
-  c) backup file missing            → warn (no backup)
-  d) no channels dir at all         → ok (nothing to back up)
+  a) backup byte-identical to live      → ok
+  b) durable backup content differs     → warn (stale)
+  c) backup file missing                → warn (no backup)
+  d) no channels dir at all             → ok (nothing to back up)
+  i) only volatile `pending` differs    → ok (durable config matches; #2277 review)
+  j) durable drift + pending differs    → warn (pending doesn't mask real drift)
+  k) malformed JSON, bytes differ       → warn (raw-byte fallback)
+  l) malformed JSON, bytes identical    → ok (raw-byte fallback)
 
 Run: python3 tests/health-check-per-host-config-backup.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -173,6 +177,62 @@ def case_h_unreadable_live_skipped_ok() -> list[str]:
     return []
 
 
+def case_i_pending_only_diff_ok() -> list[str]:
+    """Volatile `pending` pairing codes differ but durable config matches → ok.
+
+    Regression for the #2277 review: pending codes churn ~hourly, so a raw byte
+    compare flagged healthy backups. Normalizing out `pending` must treat this
+    as current, not drift.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            h.write_live("discord", b'{"allowFrom":["123"],"pending":{"s6288g":1784600000}}')
+            h.write_carrier("discord", b'{"allowFrom":["123"],"pending":{"eo0355":1784500000}}')
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "ok":
+        return [f"i) pending-only difference should be ok (durable config matches), got {r}"]
+    return []
+
+
+def case_j_durable_drift_despite_pending_warn() -> list[str]:
+    """Durable allowlist drift must still warn even when pending also differs —
+    normalizing pending must not mask a real allowlist/tier change."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            h.write_live("discord", b'{"allowFrom":["123","789"],"pending":{"s6288g":1784600000}}')
+            h.write_carrier("discord", b'{"allowFrom":["123"],"pending":{"eo0355":1784500000}}')
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "warn" or "stale" not in r["detail"]:
+        return [f"j) durable allowlist drift should warn 'stale' despite pending diff, got {r}"]
+    return []
+
+
+def case_k_malformed_json_raw_fallback_warn() -> list[str]:
+    """When a side isn't parseable JSON, fall back to a raw byte compare and
+    flag any difference (can't isolate durable config → stay conservative)."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            h.write_live("discord", b'{"allowFrom":["123"]}')
+            h.write_carrier("discord", b'{not valid json')  # malformed → raw compare
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "warn" or "stale" not in r["detail"]:
+        return [f"k) malformed backup should warn 'stale' via raw fallback, got {r}"]
+    return []
+
+
+def case_l_malformed_but_byte_identical_ok() -> list[str]:
+    """Malformed JSON on both sides but byte-identical → raw fallback sees no
+    diff → ok (a garbled-but-matching backup isn't drift)."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            h.write_live("discord", b'{not valid json')
+            h.write_carrier("discord", b'{not valid json')
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "ok":
+        return [f"l) byte-identical malformed pair should be ok via raw fallback, got {r}"]
+    return []
+
+
 def main() -> int:
     cases = [
         ("a", case_a_identical_ok),
@@ -183,6 +243,10 @@ def main() -> int:
         ("f", case_f_channels_dir_but_no_access_ok),
         ("g", case_g_unreadable_carrier_warn),
         ("h", case_h_unreadable_live_skipped_ok),
+        ("i", case_i_pending_only_diff_ok),
+        ("j", case_j_durable_drift_despite_pending_warn),
+        ("k", case_k_malformed_json_raw_fallback_warn),
+        ("l", case_l_malformed_but_byte_identical_ok),
     ]
     failures = []
     for label, fn in cases:
