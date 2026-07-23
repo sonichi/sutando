@@ -173,9 +173,9 @@ def case_h_partial_config():
     if cfg["escalation_channel"] != 555:
         fails.append(f"h) partial config: escalation_channel should be 555, got {cfg['escalation_channel']}")
     if cfg["escalation_ccs"] != ():
-        fails.append(f"h) partial config: missing ccs should default to ()")
+        fails.append("h) partial config: missing ccs should default to ()")
     if cfg["redirect_channel_jobs"] is not None:
-        fails.append(f"h) partial config: missing redirect should default to None")
+        fails.append("h) partial config: missing redirect should default to None")
     return fails
 
 
