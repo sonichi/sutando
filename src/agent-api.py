@@ -60,7 +60,9 @@ def validate_twilio_signature(handler, body: str) -> bool:
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     if not auth_token:
         return False
-    import hmac, hashlib, base64
+    import hmac
+    import hashlib
+    import base64
     from urllib.parse import parse_qs
 
     signature = handler.headers.get("X-Twilio-Signature", "")
@@ -826,7 +828,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             '<Say voice="alice">Hello, you\'ve reached Sutando. '
             "Please leave a message after the tone and I will get back to you.</Say>"
             '<Record maxLength="120" transcribe="true" '
-            f'transcribeCallback="/twilio/transcription"/>'
+            'transcribeCallback="/twilio/transcription"/>'
             '<Say voice="alice">Thank you. Goodbye.</Say>'
             "</Response>"
         )
@@ -1187,11 +1189,11 @@ if __name__ == "__main__":
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
-    print(f"  POST /task  — submit a task")
-    print(f"  GET  /status — health + capabilities")
-    print(f"  GET  /ping   — alive check")
+    print("  POST /task  — submit a task")
+    print("  GET  /status — health + capabilities")
+    print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
-        print(f"  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+        print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
