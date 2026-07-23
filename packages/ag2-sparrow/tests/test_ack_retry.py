@@ -5,7 +5,12 @@ When the broker lacks the endpoint it 404s; the worker must back off — but NOT
 permanently, or a broker that later *deploys* the endpoint is never picked up
 until the worker restarts. This pins the time-gated retry (self-heal on deploy).
 """
-import os, io, importlib, sys, pathlib, tempfile
+import os
+import io
+import importlib
+import sys
+import pathlib
+import tempfile
 import urllib.error
 
 

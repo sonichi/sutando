@@ -61,7 +61,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`message_chunking.py`** — Shared message chunking — one fence-aware chunker for every outbound surface.
 - **`migrate-plists-to-logs-dir.sh`** — Migrate ~/Library/LaunchAgents/com.sutando.*.plist StandardOutPath / StandardErrorPath entries from /Desktop/sutando/src/*.log to /Desktop/sutando/logs/*.log, matching PR #251's runtime-artifacts refactor.
 - **`migrate.sh`** — Sutando Migration Script — bundle current machine state for transfer to new Mac
-- **`migration_safety_helpers.sh`** — PR #1440 — auto-migration safety helpers (Mini review).
+- **`migration_safety_helpers.sh`** — shellcheck shell=bash PR #1440 — auto-migration safety helpers (Mini review).
 - **`morning-briefing.py`** — Morning briefing for Sutando.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.

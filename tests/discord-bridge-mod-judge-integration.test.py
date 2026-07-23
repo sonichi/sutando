@@ -177,7 +177,7 @@ def case_b_batch_retained_on_empty_verdicts():
     try:
         asyncio.run(bridge._flush_mod_buffer())
         if len(bridge._mod_buffer) != 1:
-            fails.append(f"b) batch should remain in buffer when codex returns []")
+            fails.append("b) batch should remain in buffer when codex returns []")
     finally:
         bridge._codex_judge_batch = orig
         bridge._mod_buffer.clear()

@@ -1,7 +1,7 @@
 {
   "name": "sutando",
   "version": "0.1.0",
-  "description": "Sutando \u2014 a personal AI agent with a voice interface and selectable Claude Code or Codex CLI core.",
+  "description": "Sutando — a personal AI agent with a voice interface and selectable Claude Code or Codex CLI core.",
   "type": "module",
   "scripts": {
     "start": "tsx src/voice-agent.ts",
@@ -34,6 +34,7 @@
     "@types/node": "^22.0.0",
     "esbuild": "^0.28.1",
     "eslint": "^10.7.0",
+    "globals": "^17.7.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "typescript-eslint": "^8.64.0"
