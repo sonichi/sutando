@@ -97,8 +97,9 @@ def main() -> int:
         results.append(check(r and "discord/access.json" in r["detail"], "case5 names discord/access.json"))
         results.append(check(r and "telegram/.env" not in r["detail"], "case5 does NOT flag migrated telegram"))
 
-    # 6. Legacy channels dir present but unreadable → iterdir raises OSError,
-    #    degrades to ok "unreadable" (never propagates).
+    # 6. Legacy channels dir present but unreadable → iterdir raises OSError.
+    #    The check cannot establish config is un-stranded, so it must WARN
+    #    (not false-green ok), never propagate.
     import stat as _stat
     with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as ccd:
         chan = Path(home) / ".claude" / "channels"
@@ -108,8 +109,8 @@ def main() -> int:
         try:
             r = _call(mod, home=home, ccd=ccd)
             results.append(check(
-                r and r["status"] == "ok" and "unreadable" in r["detail"],
-                "case6 degrades to ok when legacy channels dir unreadable"))
+                r and r["status"] == "warn" and "unreadable" in r["detail"],
+                "case6 warns (not false-green) when legacy channels dir unreadable"))
         finally:
             chan.chmod(_stat.S_IRWXU)  # restore so TemporaryDirectory cleanup works
 

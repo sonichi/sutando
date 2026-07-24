@@ -546,8 +546,18 @@ def check_stranded_channel_config() -> "dict | None":
             for mf in marker_files:
                 if (ch_dir / mf).exists() and not (active_base / "channels" / ch_dir.name / mf).exists():
                     stranded.append(f"{ch_dir.name}/{mf}")
-    except OSError:
-        return {"name": name, "status": "ok", "detail": "legacy channels dir unreadable"}
+    except OSError as e:
+        # Couldn't inspect the legacy dir → we CANNOT establish that config is
+        # not stranded. Reporting ok here would hide exactly the condition this
+        # diagnostic exists to surface, so warn with the unreadable detail.
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"legacy channels dir {legacy_channels} unreadable ({e}) — cannot "
+                f"verify channel config is migrated forward; inspect manually"
+            ),
+        }
     if not stranded:
         return {"name": name, "status": "ok", "detail": "all channel config present under CLAUDE_CONFIG_DIR"}
     remedy = " && ".join(
