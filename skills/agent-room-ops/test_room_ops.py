@@ -855,6 +855,40 @@ class StreamWithResumeTests(EnvCase):
         self.assertEqual(cur, 13)
 
 
+    def test_save_cursor_fsyncs_file_then_directory(self):
+        # Review P1 (both reviewers): the COLD-START anchor's directory entry
+        # must be durable — save_cursor asserts data-fsync → rename →
+        # dir-fsync, same contract as task promotion. Losing a later cursor
+        # merely replays; losing the first-ever anchor loses the held batch.
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")
+        events_seen = []
+        real_fsync, real_replace, real_open_fd = os.fsync, os.replace, os.open
+        fd_paths = {}
+
+        def spy_open(path, flags, *a, **k):
+            fd = real_open_fd(path, flags, *a, **k)
+            fd_paths[fd] = path
+            return fd
+
+        def spy_fsync(fd):
+            events_seen.append(("fsync", "dir" if fd_paths.get(fd) == d else "file"))
+            return real_fsync(fd)
+
+        def spy_replace(src, dst):
+            events_seen.append(("rename", dst))
+            return real_replace(src, dst)
+
+        try:
+            os.open, os.fsync, os.replace = spy_open, spy_fsync, spy_replace
+            ev.save_cursor(cf, 130)
+        finally:
+            os.open, os.fsync, os.replace = real_open_fd, real_fsync, real_replace
+        self.assertEqual([k for k, _ in events_seen], ["fsync", "rename", "fsync"])
+        self.assertEqual(events_seen[0][1], "file")  # temp-file data first
+        self.assertEqual(events_seen[2][1], "dir")   # then the directory entry
+        self.assertEqual(ev.load_cursor(cf), 130)
+
     def test_cold_start_seeds_replay_anchor_before_withheld_batch(self):
         # Review P1 (cold-start half): NO cursor file + a batching consumer
         # that withholds persistence. The first delivered event must seed

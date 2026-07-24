@@ -297,15 +297,25 @@ def load_cursor(path):
 
 
 def save_cursor(path, cursor):
-    """write → fsync → atomic rename. This file is the client's at-least-once
-    dedup anchor (#184): a torn write would silently reset replay or wedge
-    resume, so the value must be durable AND never observable half-written."""
+    """write → fsync → atomic rename → DIRECTORY fsync. This file is the
+    client's at-least-once dedup anchor (#184): a torn write would silently
+    reset replay or wedge resume, so the value must be durable AND never
+    observable half-written. The directory fsync is load-bearing for the
+    COLD-START anchor (review P1): losing a later cursor update to a crash
+    merely replays, but losing the first-ever anchor's directory entry leaves
+    no cursor file at all — restart sends no Last-Event-ID, the server
+    resumes new-events-only, and a withheld batch is lost permanently."""
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
         f.write(str(int(cursor)))
         f.flush()
-        os.fsync(f.fileno())
+        os.fsync(f.fileno())                 # data durable before the rename
     os.replace(tmp, path)
+    dfd = os.open(os.path.dirname(os.path.abspath(path)) or ".", os.O_RDONLY)
+    try:
+        os.fsync(dfd)                        # rename itself durable
+    finally:
+        os.close(dfd)
 
 
 def stream_with_resume(cursor_file, on_event, keepalive_cb=None, *, stop=None,
