@@ -100,7 +100,11 @@ class EventChannel:
                     event = json.loads(payload)
                 except ValueError:
                     continue  # one garbled frame never kills the stream
-                if sse_id is not None and isinstance(event, dict) and "cursor" not in event:
+                if not isinstance(event, dict):
+                    continue  # valid JSON but not an event object (e.g. `data: []`)
+                    # — skipping keeps the stream alive; inserting would raise,
+                    # reconnect from the SAME cursor, and replay the bad frame forever.
+                if sse_id is not None and "cursor" not in event:
                     try:
                         event["cursor"] = int(sse_id)
                     except (TypeError, ValueError):
@@ -120,6 +124,10 @@ class EventChannel:
                 resp.close()
             except OSError:
                 pass
+        if self.health["status"] == "connected":
+            # Clean EOF: the stream is over. Without this, run()'s backoff sleep
+            # happens while gateway-status still advertises events "connected".
+            self._set(status="reconnecting", error="stream EOF")
         return True  # EOF / drop / handled error → reconnect
 
     def run(self, stop=lambda: False) -> None:

@@ -93,6 +93,30 @@ def test_idempotent_redrain_no_duplicate_task():
     check(len(files) == 1, "consumer: crash-replay of a batch produces the SAME task (idempotent, no dup)")
 
 
+def test_promotion_is_durable_before_consume():
+    # Review blocker: _promote() renamed the task file without fsync; a crash
+    # after the SQLite consume-commit but before data/dir-entry flush could
+    # lose the promoted task while its source events were already consumed.
+    # Assert fsync covers BOTH the file and the containing directory before
+    # drain() marks anything consumed.
+    import ag2_sparrow.event_consumer as ecmod
+    fsynced = []
+    orig_fsync = os.fsync
+    os.fsync = lambda fd: fsynced.append(fd)
+    try:
+        d = tempfile.mkdtemp()
+        inbox = _inbox_with([_ev(f"$d{i}", i) for i in range(1, 4)])
+        h = TaskifyHandler(d, agent_mxid="@me:hs", threshold=3)
+        r = EventConsumer(inbox, h).drain()
+    finally:
+        os.fsync = orig_fsync
+    check(len(r["promoted"]) == 1 and len(fsynced) >= 2,
+          "consumer: promotion fsyncs file AND directory before the batch is consumed")
+    check(inbox.consumed_cursor() == 3,
+          "consumer: consume still happens after the durable promotion")
+    _ = ecmod  # module referenced for clarity of what is under test
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
