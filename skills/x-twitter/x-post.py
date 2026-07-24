@@ -92,7 +92,8 @@ def _bearer_get(url):
     read_tweet() when X_BEARER_TOKEN is set, so a bearer-only environment
     doesn't need `requests` / `requests_oauthlib`.
     """
-    import urllib.request, urllib.error
+    import urllib.request
+    import urllib.error
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {BEARER_TOKEN}"})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:

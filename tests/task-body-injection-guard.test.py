@@ -5,7 +5,8 @@ fences (instruction injection) once embedded in a `key: value` task file.
 
 Run: python3 tests/task-body-injection-guard.test.py
 """
-import sys, unittest
+import sys
+import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))

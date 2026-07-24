@@ -8,7 +8,11 @@ contained: a fixture access.json + a temp workspace are pointed at via env
 so no live Discord is touched. All ids are FICTITIOUS. Run:
   python3 tests/context-source-guard.test.py
 """
-import json, os, subprocess, tempfile, sys
+import json
+import os
+import subprocess
+import tempfile
+import sys
 from pathlib import Path
 
 HOOK = str(Path(__file__).resolve().parent.parent / "hooks" / "context-source-guard.py")

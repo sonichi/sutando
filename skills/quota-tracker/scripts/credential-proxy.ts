@@ -12,10 +12,10 @@
  *   ANTHROPIC_BASE_URL=http://localhost:7846 claude ...  # route Claude through proxy
  */
 
-import { createServer, request as httpRequest, type RequestOptions } from 'node:http';
+import { createServer, type RequestOptions } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { statusPath } from '../../../src/workspace_default.js';
