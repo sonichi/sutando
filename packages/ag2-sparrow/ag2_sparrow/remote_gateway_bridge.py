@@ -1279,7 +1279,9 @@ def _maybe_start_event_channel() -> None:
             handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
             if ha_room:
                 poster = CardPoster(store, URL, {"Authorization": f"Bearer {TOKEN}"},
-                                    ha_room, log=_log)
+                                    ha_room, log=_log,
+                                    include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
+                                    .strip().lower() in ("1", "true", "yes", "on"))
         consumer = EventConsumer(inbox, handler)
 
         def _drain_loop():

@@ -30,11 +30,13 @@ untouched.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import time
 import urllib.request
+import uuid
 
 _KEYCAP = {f"{i}️⃣": i for i in range(1, 10)}  # 1️⃣..9️⃣ → 1..9
 _ANSWER_RE = re.compile(r"\banswer\s+(ha_[0-9a-f]{6,})\s+([0-9][0-9,\s]*)", re.IGNORECASE)
@@ -97,30 +99,60 @@ class ActionStore:
                 out.append(rec)
         return out
 
+    def _lock_path(self, action_id: str) -> str:
+        return os.path.join(self.dir, action_id + ".lock")
+
+    def transition_lock(self, action_id: str):
+        """flock-guarded critical section shared by EVERY writer of an action
+        file (this resolver AND the hook's timeout path — same protocol, same
+        lock file). Serializes read→check→write so exactly one terminal
+        transition can win (review: CAS race between resolver and expiry)."""
+        lock_file = open(self._lock_path(action_id), "a+")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        return lock_file
+
     def update(self, rec: dict) -> None:
+        """Durable atomic write: unique temp name (the hook's timeout writer
+        may run concurrently — a fixed name could be clobbered mid-write),
+        fsync the data before rename and the directory entry after, so a
+        crash can never lose an acknowledged decision (review blocker)."""
         path = self._path(rec["action_id"])
-        tmp = path + ".tmp"
+        tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
         with open(tmp, "w") as f:
             json.dump(rec, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        dfd = os.open(self.dir, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     def resolve(self, action_id: str, answers: dict, resolved_by: str) -> bool:
         """Write a decision iff the action is still pending (terminal states
-        immutable). Returns True when the decision landed."""
+        immutable). Runs read→check→write under the shared transition lock so
+        a concurrent expiry writer cannot interleave. Returns True when the
+        decision landed — and only then is the answer event safe to consume."""
+        lk = self.transition_lock(action_id)
         try:
-            with open(self._path(action_id)) as f:
-                rec = json.load(f)
-        except (OSError, ValueError):
-            return False
-        if rec.get("status") != "pending":
-            return False
-        rec["status"] = "resolved"
-        rec["decision"] = {"answers": answers}
-        rec["resolved_by"] = resolved_by
-        rec.setdefault("audit", []).append(
-            {"at": time.time(), "event": "resolved", "by": resolved_by})
-        self.update(rec)
-        return True
+            try:
+                with open(self._path(action_id)) as f:
+                    rec = json.load(f)
+            except (OSError, ValueError):
+                return False
+            if rec.get("status") != "pending":
+                return False
+            rec["status"] = "resolved"
+            rec["decision"] = {"answers": answers}
+            rec["resolved_by"] = resolved_by
+            rec.setdefault("audit", []).append(
+                {"at": time.time(), "event": "resolved", "by": resolved_by})
+            self.update(rec)
+            return True
+        finally:
+            fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
+            lk.close()
 
 
 class CardPoster:
@@ -128,12 +160,22 @@ class CardPoster:
     action (posted_card stamp), best-effort — a failed post retries next sweep."""
 
     def __init__(self, store: ActionStore, base_url: str, headers: dict,
-                 room_id: str, log=print):
+                 room_id: str, log=print, include_a2ui: bool = False):
         self._store = store
         self._url = base_url.rstrip("/")
-        self._headers = headers
+        # Cloudflare rejects urllib's default UA with 403 (same edge rule the
+        # bridge's gateway path documents) — without an explicit client UA the
+        # card post would retry forever on the real gateway (review blocker).
+        self._headers = {**headers}
+        self._headers.setdefault("User-Agent", "sutando-gateway-client/1.0")
         self._room = room_id
         self._log = log
+        # A2UI block is OPT-IN: the deployed web client does not render
+        # space.ag2.a2ui yet — it shows an unclickable "Room App" chip AND
+        # hides the text fallback (observed live 2026-07-24), which is worse
+        # than plain text. Flip on (SPARROW_HA_A2UI) once the client renderer
+        # (backend repo a2ui/a2ui-renderer.js — client-integration lane) ships.
+        self._a2ui = bool(include_a2ui)
 
     def _render(self, rec: dict) -> str:
         # Markdown text = the fallback (renders in any client); the fenced
@@ -151,6 +193,8 @@ class CardPoster:
             lines.append("")
         lines.append(f"React with the option number, or reply "
                      f"`answer {rec['action_id']} <n>`.")
+        if not self._a2ui:
+            return "\n".join(lines)
         first_q = (rec.get("questions") or [{}])[0]
         card = {
             "version": "0.9",
@@ -235,14 +279,57 @@ class DecisionHandler:
             self._log(f"human-action: non-owner {event.get('actor_id')} tried to "
                       f"resolve {rec['action_id']} — ignored")
             return "unauthorized", None  # claimed (so taskify won't batch it), no decision
-        answers = {}
-        for q, num in zip(rec.get("questions") or [], choice_nums):
-            opts = q.get("options") or []
-            if 1 <= num <= len(opts):
-                answers[q.get("question", "?")] = opts[num - 1].get("label", "?")
-        if not answers:
-            return None
+        answers = self._complete_answers(rec, choice_nums, etype)
+        if answers is None:
+            # Matched the action but the answer set is incomplete/invalid
+            # (review: a single reaction must not terminally resolve a
+            # multi-question action with only Q1 answered). Claim the event so
+            # taskify never batches it, but leave the action PENDING so the
+            # owner can retry with the full `answer ha_x n1,n2,...` form.
+            self._log(f"human-action: incomplete/invalid answer for "
+                      f"{rec['action_id']} ({choice_nums}) — action stays pending")
+            return "unauthorized", None
         return rec, answers
+
+    def _complete_answers(self, rec: dict, nums: list, etype: str) -> "dict | None":
+        """Map choice numbers to a COMPLETE, valid answer set — or None.
+        Rules (review: preserve AskUserQuestion multi-select semantics):
+        - one question, single-select: exactly one in-range number.
+        - one question, multiSelect: every number in range; labels joined.
+          Reaction/bare-number forms stay valid only for the single pick.
+        - multiple questions: only the explicit answer-command form, one number
+          per question in order (count must equal len(questions)); multiSelect
+          inside a multi-question set can't be expressed by numbers → never
+          resolved by this router (surface stays pending for a typed answer).
+        """
+        questions = rec.get("questions") or []
+        if not questions:
+            return None
+        if len(questions) == 1:
+            q = questions[0]
+            opts = q.get("options") or []
+            if any(n < 1 or n > len(opts) for n in nums):
+                return None
+            if q.get("multiSelect"):
+                labels = [opts[n - 1].get("label", "?") for n in dict.fromkeys(nums)]
+                return {q.get("question", "?"): ", ".join(labels)}
+            if len(nums) != 1:
+                return None
+            return {q.get("question", "?"): opts[nums[0] - 1].get("label", "?")}
+        # multi-question: require the full ordered vector, no multiSelect
+        if etype == "reaction.added":
+            return None
+        if len(nums) != len(questions):
+            return None
+        if any(q.get("multiSelect") for q in questions):
+            return None
+        answers = {}
+        for q, num in zip(questions, nums):
+            opts = q.get("options") or []
+            if not (1 <= num <= len(opts)):
+                return None
+            answers[q.get("question", "?")] = opts[num - 1].get("label", "?")
+        return answers
 
     def claims(self, event: dict) -> bool:
         return self._match(event) is not None

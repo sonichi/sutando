@@ -160,6 +160,80 @@ def test_chain_routes_decisions_away_from_taskify():
     check(inbox.unconsumed() == [], "chain: all events settled")
 
 
+def _two_q_store():
+    d = tempfile.mkdtemp()
+    store = ha.ActionStore(d)
+    rec = {"action_id": "ha_aaa111bbb222", "kind": "clarification",
+           "status": "pending", "card_event_id": "$card2",
+           "questions": [
+               {"question": "Q1?", "options": [{"label": "A1"}, {"label": "B1"}]},
+               {"question": "Q2?", "options": [{"label": "A2"}, {"label": "B2"}]}],
+           "decision": None, "created_at": time.time(),
+           "expires_at": time.time() + 300, "audit": []}
+    Path(d, rec["action_id"] + ".json").write_text(json.dumps(rec))
+    return store, rec
+
+
+def test_multi_question_partial_never_resolves():
+    # Review blocker: a single reaction/bare number must not terminally resolve
+    # a multi-question action with only Q1 answered.
+    store, rec = _two_q_store()
+    h = ha.DecisionHandler(store, OWNER, log=lambda *_: None)
+    settled = h.offer(_reaction("1️⃣", relates="$card2", eid="$pr"))
+    got = json.loads(Path(store.dir, rec["action_id"] + ".json").read_text())
+    check(got["status"] == "pending" and settled == ["$pr"],
+          "multi-q: a reaction NEVER partially resolves (claimed, action stays pending)")
+    h.offer(_message("answer ha_aaa111bbb222 1", eid="$pm"))
+    got = json.loads(Path(store.dir, rec["action_id"] + ".json").read_text())
+    check(got["status"] == "pending",
+          "multi-q: an under-count answer vector does not resolve")
+    h.offer(_message("answer ha_aaa111bbb222 9,1", eid="$pi"))
+    got = json.loads(Path(store.dir, rec["action_id"] + ".json").read_text())
+    check(got["status"] == "pending",
+          "multi-q: an out-of-range option never resolves")
+    h.offer(_message("answer ha_aaa111bbb222 2,1", eid="$pf"))
+    got = json.loads(Path(store.dir, rec["action_id"] + ".json").read_text())
+    check(got["status"] == "resolved"
+          and got["decision"]["answers"] == {"Q1?": "B1", "Q2?": "A2"},
+          "multi-q: the FULL ordered vector resolves every question")
+
+
+def test_multiselect_single_question_joins_labels():
+    d = tempfile.mkdtemp()
+    store = ha.ActionStore(d)
+    rec = {"action_id": "ha_ccc333ddd444", "kind": "clarification",
+           "status": "pending", "card_event_id": "$card3",
+           "questions": [{"question": "Pick several", "multiSelect": True,
+                          "options": [{"label": "A"}, {"label": "B"}, {"label": "C"}]}],
+           "decision": None, "created_at": time.time(),
+           "expires_at": time.time() + 300, "audit": []}
+    Path(d, rec["action_id"] + ".json").write_text(json.dumps(rec))
+    h = ha.DecisionHandler(store, OWNER, log=lambda *_: None)
+    h.offer(_message("answer ha_ccc333ddd444 1,3"))
+    got = json.loads(Path(d, rec["action_id"] + ".json").read_text())
+    check(got["status"] == "resolved"
+          and got["decision"]["answers"] == {"Pick several": "A, C"},
+          "multiSelect single-q: every selected option is preserved (review fix)")
+
+
+def test_update_is_durable_and_uniquely_named():
+    # Review blocker: decision writes must be fsync-durable (file + dir) with a
+    # unique temp name (the hook's timeout writer may run concurrently).
+    store, rec = _store_with_action()
+    fsynced, replaced = [], []
+    orig_fsync, orig_replace = os.fsync, os.replace
+    os.fsync = lambda fd: fsynced.append(fd)
+    os.replace = lambda a, b: (replaced.append(a), orig_replace(a, b))[1]
+    try:
+        store.resolve(rec["action_id"], {"Ship v1 or wait?": "Ship v1"}, OWNER)
+    finally:
+        os.fsync, os.replace = orig_fsync, orig_replace
+    check(len(fsynced) >= 2,
+          "store: decision write fsyncs the file AND the directory entry")
+    check(replaced and str(os.getpid()) in replaced[0] and not replaced[0].endswith("json.tmp"),
+          "store: temp name is unique per writer (no fixed .tmp collision)")
+
+
 def test_card_poster_posts_once():
     store, rec = _store_with_action(card_event_id=None)
     calls = []
@@ -172,7 +246,7 @@ def test_card_poster_posts_once():
     ha.urllib.request.urlopen = fake_open
     try:
         poster = ha.CardPoster(store, "https://gw", {"Authorization": "Bearer x"},
-                               "!room:hs", log=lambda *_: None)
+                               "!room:hs", log=lambda *_: None, include_a2ui=True)
         n1 = poster.sweep()
         n2 = poster.sweep()
     finally:
@@ -193,6 +267,32 @@ def test_card_poster_posts_once():
     check(got["card_event_id"] == "$newcard",
           "poster: card_event_id recorded (correlation anchor)")
     check(got["audit"][-1]["event"] == "card_posted", "poster: post is audited")
+
+
+def test_card_poster_default_omits_a2ui_and_sends_ua():
+    # Deployed client shows an unclickable "Room App" for a2ui content and
+    # hides the fallback text — so the block is OPT-IN (default off), and the
+    # request must carry the gateway client UA (Cloudflare 403s urllib's
+    # default — review blocker).
+    store, rec = _store_with_action(card_event_id=None)
+    seen = {}
+
+    def fake_open(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())["body"]
+        seen["ua"] = req.headers.get("User-agent")
+        return io.BytesIO(json.dumps({"event_id": "$c"}).encode())
+
+    orig = ha.urllib.request.urlopen
+    ha.urllib.request.urlopen = fake_open
+    try:
+        ha.CardPoster(store, "https://gw", {"Authorization": "Bearer x"},
+                      "!room:hs", log=lambda *_: None).sweep()
+    finally:
+        ha.urllib.request.urlopen = orig
+    check("```a2ui" not in seen["body"] and "Ship v1" in seen["body"],
+          "poster default: plain text card, NO a2ui block (client can't render it yet)")
+    check(seen["ua"] == "sutando-gateway-client/1.0",
+          "poster: explicit gateway UA header present (review fix)")
 
 
 def test_card_poster_failure_retries():
