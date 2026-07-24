@@ -316,6 +316,49 @@ def test_channel_non_dict_frame_does_not_poison_stream():
           "channel: stream continues PAST non-dict frames — later events land")
 
 
+def test_inbox_duplicate_leaves_no_open_transaction():
+    # Review P1: a plain INSERT raising IntegrityError left the shared
+    # connection inside an open write transaction — and duplicate replay is
+    # the NORMAL at-least-once path on every reconnect, so one replay locked
+    # the WAL db for every other connection. INSERT OR IGNORE + commit must
+    # leave the connection clean and the db writable cross-connection.
+    import sqlite3
+    db = _tmpdb()
+    inbox = EventInbox(db)
+    inbox.insert(_ev("$dup", 1))
+    check(inbox.insert(_ev("$dup", 1)) is False, "duplicate still reports False")
+    check(inbox._db.in_transaction is False,
+          "TRANSACTION-CLEAN — duplicate replay leaves no open transaction")
+    other = sqlite3.connect(db, timeout=2)
+    other.execute("INSERT INTO event_inbox(event_id,cursor,payload,received_at)"
+                  " VALUES ('$x2',2,'{}',0)")
+    other.commit(); other.close()
+    check(inbox.durable_cursor() == 2,
+          "cross-connection write succeeds after a duplicate (no WAL lock held)")
+
+
+def test_channel_sends_gateway_user_agent():
+    # Review P1: Cloudflare 403s urllib's default UA and the channel treats
+    # 403 as FATAL — without an explicit client UA the channel would stop
+    # permanently on first real-gateway connect.
+    inbox = EventInbox(_tmpdb())
+    ch = ec.EventChannel(inbox, "https://gw", {"Authorization": "Bearer x"})
+    seen = {}
+    orig = ec.urllib.request.urlopen
+
+    def fake_open(req, timeout=None):
+        seen["ua"] = req.headers.get("User-agent")
+        return _sse_resp("")
+
+    ec.urllib.request.urlopen = fake_open
+    try:
+        ch._consume_once()
+    finally:
+        ec.urllib.request.urlopen = orig
+    check(seen.get("ua") == "sutando-gateway-client/1.0",
+          "channel: SSE request carries the explicit gateway client UA")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -63,18 +63,25 @@ class EventInbox:
         cur = event.get("cursor")
         if not eid or not isinstance(cur, int):
             return False  # unusable envelope — never advance the cursor past it
-        try:
-            with self._lock:
-                self._db.execute(
-                    "INSERT INTO event_inbox(event_id, cursor, type, room_id, payload, received_at)"
+        with self._lock:
+            try:
+                # INSERT OR IGNORE keeps the dedup path TRANSACTION-CLEAN: a
+                # plain INSERT raising IntegrityError left the shared
+                # connection inside an open write transaction (review P1 —
+                # duplicate replay is the NORMAL at-least-once path on every
+                # reconnect, and the leak locked the WAL db for every other
+                # connection until an incidental commit).
+                c = self._db.execute(
+                    "INSERT OR IGNORE INTO event_inbox(event_id, cursor, type, room_id, payload, received_at)"
                     " VALUES (?,?,?,?,?,?)",
                     (eid, cur, event.get("type"), event.get("room_id"),
                      json.dumps(event, ensure_ascii=False), time.time()),
                 )
                 self._db.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False  # event_id UNIQUE violation = duplicate → at-least-once dedup
+                return c.rowcount > 0
+            except sqlite3.Error:
+                self._db.rollback()  # never leave an open transaction behind
+                raise
 
     def durable_cursor(self) -> "int | None":
         """The SSE resume anchor: the highest cursor durably written. Reconnect
