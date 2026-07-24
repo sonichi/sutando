@@ -14,11 +14,13 @@ criteria: adding a lesson or a check is a PR to *this* file, **not** a code chan
 the review tooling. Another repo ships its own root `REVIEW.md`; the tooling is generic
 and loads whichever repo it reviews.
 
-> **Note on the local `/code-review` command:** the in-session `/code-review` reads
-> `CLAUDE.md` but **not** `REVIEW.md` (only the managed GitHub App reads this file).
-> So the same lessons are mirrored into `CLAUDE.md` ("Reviewing a PR") to cover
-> in-session reviews. Keep the two prose copies in sync; the `checks:` block below
-> lives here only.
+> **Single source of truth.** These lessons live here in `REVIEW.md` only — they are
+> **not** duplicated in `CLAUDE.md`. They reach reviewers three ways: `review-preflight.py`
+> reads this file and prints the criteria on every pre-review run (for the core agent);
+> `scripts/review-checks.sh` runs the machine `checks:` block below in CI; and Claude Code's
+> managed GitHub-App reviewer reads this file directly. (The in-session `/code-review` reads
+> only `CLAUDE.md`, not this file — but it is not part of our review flow.) Add or edit a
+> lesson in one place: here.
 
 ## Lessons (criteria for reviewers)
 
