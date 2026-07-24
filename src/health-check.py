@@ -149,6 +149,63 @@ def twilio_configured(env_content: str) -> bool:
     return False
 
 
+def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict:
+    """G1.5 node-bundle: resolve the Node executable the engine's JS services
+    would use, in the same precedence as `sutando-config.sh node-bin`:
+
+      1. $SUTANDO_NODE — exact executable exported by the desktop app.
+      2. $SUTANDO_APP_NODE_DIR/node (or its default app-support home) — the
+         bundled runtime found at rest (launchd jobs without the env var).
+      3. `node` on PATH — dev/OSS hosts.
+
+    Returns {"source": "bundled"|"app-bundle"|"system"|"none", "path": str|None}.
+    Pure over (env, which) for testability.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get("SUTANDO_NODE", "")
+    if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+        return {"source": "bundled", "path": explicit}
+    app_dir = env.get("SUTANDO_APP_NODE_DIR", "") or os.path.expanduser(
+        "~/Library/Application Support/space.ag2.app/engine/runtime/node/bin"
+    )
+    app_node = os.path.join(app_dir, "node")
+    if os.path.isfile(app_node) and os.access(app_node, os.X_OK):
+        return {"source": "app-bundle", "path": app_node}
+    on_path = which("node")
+    if on_path:
+        return {"source": "system", "path": on_path}
+    return {"source": "none", "path": None}
+
+
+def check_node_runtime() -> dict:
+    """Surface WHICH node the JS services resolve to — or a loud red line when
+    none exists. The 2026-07-13 outage class: an interactive terminal finding
+    node does NOT mean launchd-/app-spawned services can (credential-proxy sat
+    dead for days on this failure). "none" is a real issue, not a warn: every
+    JS service (voice, phone, proxy, web-client) silently fails to start.
+    """
+    resolved = resolve_node_runtime()
+    if resolved["source"] == "none":
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": "no node found (no SUTANDO_NODE, no app bundle, none on PATH) — JS services cannot start",
+        }
+    version = ""
+    try:
+        out = subprocess.run(
+            [resolved["path"], "--version"], capture_output=True, text=True, timeout=5
+        )
+        version = out.stdout.strip()
+    except Exception:
+        version = "version probe failed"
+    return {
+        "name": "node-runtime",
+        "status": "ok",
+        "detail": f"{version} via {resolved['source']} ({resolved['path']})",
+    }
+
+
 def check_port(port: int, name: str, probe: bool = False) -> dict:
     """Check if a port is listening, optionally probing for a live response.
 
@@ -2162,6 +2219,10 @@ def run_all_checks() -> list[dict]:
 
     # Quota telemetry — only meaningful when the proxy is actually up.
     checks.append(check_quota_telemetry(proxy_check["status"]))
+
+    # G1.5: which Node would JS services resolve to (bundled/app-bundle/
+    # system), red when none — the silent-dead-services failure class.
+    checks.append(check_node_runtime())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
