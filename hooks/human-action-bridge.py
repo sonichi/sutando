@@ -63,15 +63,23 @@ TIMEOUT_REASON = (
 )
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
-
-
 def _workspace() -> Path:
-    """Resolve the workspace via the M0 helper (never hardcode)."""
-    sys.path.insert(0, str(_repo_root() / "src"))
-    from workspace_default import resolve_workspace  # noqa: PLC0415
-    return Path(resolve_workspace())
+    """Derive the workspace from CLAUDE_CONFIG_DIR — the Claude Code project
+    tree lives at `<workspace>/.claude-sutando` per the workspace contract, so
+    the nearest `.claude-sutando` ancestor's parent IS the workspace. Same
+    pattern as context-source-guard.py: no subprocess (hooks are hot-path) and
+    no __file__ walk (the bundled-symlink anti-pattern; also keeps this hook
+    standalone-deployable). Falls back to the system's canonical last-ditch
+    default, ~/sutando-workspace."""
+    p = os.path.normpath(os.environ.get("CLAUDE_CONFIG_DIR")
+                         or os.path.expanduser("~/.claude"))
+    while True:
+        if os.path.basename(p) == ".claude-sutando":
+            return Path(os.path.dirname(p))
+        parent = os.path.dirname(p)
+        if parent == p:  # filesystem root — no `.claude-sutando` ancestor
+            return Path(os.path.expanduser("~/sutando-workspace"))
+        p = parent
 
 
 def _store_dir() -> Path:
