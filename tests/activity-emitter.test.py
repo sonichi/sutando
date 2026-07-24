@@ -79,6 +79,21 @@ def test_no_raw_command_leaks():
           "command-only Bash input reduces to kind alone (no display)")
 
 
+def test_url_hints_strip_query_and_fragment():
+    # Codex P1: URLs routinely carry bearer tokens / presigned sigs / OAuth
+    # codes in query or fragment — only scheme+host+path may reach the journal.
+    d = tempfile.mkdtemp()
+    _run({"hook_event_name": "PreToolUse", "session_id": "s",
+          "tool_name": "WebFetch",
+          "tool_input": {"url": "https://files.example/download?token=sk-SECRET&sig=abc#frag"}}, d)
+    rows = _journal(d)
+    dumped = json.dumps(rows)
+    check("sk-SECRET" not in dumped and "sig=abc" not in dumped and "#frag" not in dumped,
+          "URL SECRET HYGIENE — query + fragment never reach the journal")
+    check(rows[0]["tool"]["display"] == "https://files.example/download",
+          "URL hint keeps scheme+host+path (still useful display)")
+
+
 def test_binding_attribution():
     ws = Path(tempfile.mkdtemp())
     (ws / "state" / "bindings").mkdir(parents=True)

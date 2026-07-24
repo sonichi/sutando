@@ -52,6 +52,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -106,7 +107,15 @@ def _tool_summary(data: dict) -> dict:
     # NOTE: deliberately NOT ti["command"] — raw command lines are the
     # likeliest secret carriers; Bash calls surface via their description.
     hint = (ti.get("description") or ti.get("file_path") or ti.get("path")
-            or ti.get("pattern") or ti.get("url") or "")
+            or ti.get("pattern") or "")
+    if not hint and ti.get("url"):
+        # URLs carry tokens in query strings/fragments (presigned sigs, OAuth
+        # codes — Codex review, reproduced) — journal scheme+host+path ONLY.
+        try:
+            u = urllib.parse.urlsplit(str(ti["url"]))
+            hint = urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, "", ""))
+        except ValueError:
+            hint = ""
     hint = str(hint).splitlines()[0][:_SUMMARY_LIMIT] if hint else ""
     return {"tool": {"kind": name, **({"display": hint} if hint else {})}}
 
