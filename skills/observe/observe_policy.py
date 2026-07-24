@@ -40,6 +40,12 @@ MODES = frozenset({"observe", "record", "notify", "taskify"})
 STANDING_MODES = frozenset({"observe", "record", "notify"})  # taskify = explicit card
 DEFAULT_EVALS_PER_DAY = 2
 _EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_.-]{2,63}$")
+# policy_id is LLM-adjacent input (a compiled draft can carry one, and the
+# decision grammar echoes them back) — it is ALSO a filename component, so the
+# accepted shape is exactly what we generate: obs_ + hex. Anything else is
+# discarded/refused before it can touch a path (review P1: `../core-status`
+# escaped state/observe/ and could overwrite arbitrary workspace JSON).
+_POLICY_ID_RE = re.compile(r"^obs_[0-9a-f]{8,32}$")
 
 
 def validate_draft(draft: dict) -> "tuple[dict, list[str]]":
@@ -61,12 +67,23 @@ def validate_draft(draft: dict) -> "tuple[dict, list[str]]":
     if mode not in MODES:
         errors.append(f"mode must be one of {sorted(MODES)}")
     cap = draft.get("cost_cap") or {}
+    if not isinstance(cap, dict):
+        # LLM output like cost_cap: "cheap" must produce a validation error,
+        # not an AttributeError (review P1) — normalized to the default cap.
+        errors.append('cost_cap must be an object like {"evals_per_day": n}')
+        cap = {}
     evals = cap.get("evals_per_day", DEFAULT_EVALS_PER_DAY)
     if not isinstance(evals, int) or evals < 0:
         errors.append("cost_cap.evals_per_day must be a non-negative int")
         evals = DEFAULT_EVALS_PER_DAY
+    # Keep a provided id ONLY when it already has the generated shape (edit
+    # flow round-trips ids we minted); anything else gets a fresh id — an id
+    # is infrastructure, not user intent, so no error, just never trusted.
+    pid = str(draft.get("policy_id") or "")
+    if not _POLICY_ID_RE.match(pid):
+        pid = f"obs_{uuid.uuid4().hex[:12]}"
     normalized = {
-        "policy_id": str(draft.get("policy_id") or f"obs_{uuid.uuid4().hex[:12]}"),
+        "policy_id": pid,
         "room_id": room_id,
         "event_types": [str(t) for t in types],
         "mode": mode,
@@ -111,7 +128,18 @@ class SubscriptionStore:
         self.dir = store_dir
 
     def _path(self, policy_id: str) -> str:
-        return os.path.join(self.dir, policy_id + ".json")
+        # DEFENSE IN DEPTH at the filesystem boundary: even if a caller skips
+        # validate_draft, an id outside the generated shape never becomes a
+        # path (review P1 traversal), and the resolved path must stay inside
+        # the store dir (belt for symlink/normalization surprises).
+        pid = str(policy_id)
+        if not _POLICY_ID_RE.match(pid):
+            raise ValueError(f"invalid policy id shape: {pid!r}")
+        path = os.path.join(self.dir, pid + ".json")
+        base = os.path.realpath(self.dir)
+        if os.path.dirname(os.path.realpath(path)) != base:
+            raise ValueError(f"policy path escapes the store: {pid!r}")
+        return path
 
     def save(self, rec: dict) -> str:
         os.makedirs(self.dir, exist_ok=True)

@@ -124,6 +124,45 @@ def test_store_transitions_and_immutability():
           "empty/absent store lists nothing")
 
 
+def test_policy_id_traversal_locked():
+    # Review P1: policy_id is LLM-adjacent AND a filename component —
+    # `../core-status` passed validation and escaped state/observe/.
+    d = tempfile.mkdtemp()
+    store = op.SubscriptionStore(d)
+    rec, errs = op.validate_draft(_draft(policy_id="../core-status"))
+    check(errs == [] and op._POLICY_ID_RE.match(rec["policy_id"]) is not None,
+          "validator regenerates any id outside the obs_<hex> shape")
+    rec2, _ = op.validate_draft(_draft(policy_id=rec["policy_id"]))
+    check(rec2["policy_id"] == rec["policy_id"],
+          "validator round-trips a well-shaped id (edit flow unaffected)")
+    try:
+        store.save({"policy_id": "../core-status", "status": "draft"})
+        check(False, "save with traversal id must raise, not write")
+    except ValueError:
+        check(True, "save with traversal id raises (never touches disk)")
+    check(store.get("../../etc/passwd") is None,
+          "get with traversal id resolves to nothing")
+    check(store.transition("../core-status", "active") is False,
+          "transition with traversal id transitions nothing")
+    check(not os.path.exists(os.path.join(os.path.dirname(d), "core-status.json")),
+          "nothing escaped the store directory")
+
+
+def test_cost_cap_non_dict_is_validation_error():
+    # Review P1: cost_cap "cheap" crashed validate_draft (.get on a str) —
+    # malformed LLM output must come back as a validation ERROR, normalized
+    # to the default cap, never an exception.
+    rec, errs = op.validate_draft(_draft(cost_cap="cheap"))
+    check(any("cost_cap" in e for e in errs),
+          "non-dict cost_cap → validation error (no AttributeError)")
+    check(rec["cost_cap"] == {"evals_per_day": op.DEFAULT_EVALS_PER_DAY},
+          "non-dict cost_cap normalizes to the default cap")
+    rec2, errs2 = op.validate_draft(_draft(cost_cap=[3]))
+    check(any("cost_cap" in e for e in errs2)
+          and rec2["cost_cap"] == {"evals_per_day": op.DEFAULT_EVALS_PER_DAY},
+          "list cost_cap handled the same way")
+
+
 def test_render_card_confirm_and_auto():
     rec, _ = op.validate_draft(_draft())
     confirm = op.render_card(rec)
