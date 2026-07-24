@@ -79,7 +79,9 @@ def _drive_main(*, sentinel_present: bool) -> str:
     """Run main() against stubbed collaborators and a temp workspace, returning
     stdout. Exercises the two print sites themselves — asserting on
     `completion_line` alone would leave main() free to print anything."""
-    import io, tempfile, contextlib
+    import io
+    import tempfile
+    import contextlib
     from datetime import datetime
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)

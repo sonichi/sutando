@@ -49,7 +49,7 @@ def verify(video_path: Path, expected_duration_s: float = None):
     try:
         probe = ffprobe(video_path)
     except subprocess.CalledProcessError as e:
-        return {"valid": False, "reason": f"ffprobe_failed", "stderr": e.stderr}
+        return {"valid": False, "reason": "ffprobe_failed", "stderr": e.stderr}
     except Exception as e:
         return {"valid": False, "reason": f"ffprobe_exception: {type(e).__name__}: {e}"}
 

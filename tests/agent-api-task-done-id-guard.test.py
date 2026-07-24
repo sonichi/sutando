@@ -93,4 +93,4 @@ if errors:
     print(f"\nFAILED: {errors} check(s) failed", file=sys.stderr)
     sys.exit(1)
 else:
-    print(f"\nPASSED: /task-done id guard present and correctly ordered")
+    print("\nPASSED: /task-done id guard present and correctly ordered")

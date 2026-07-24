@@ -75,7 +75,7 @@ class TestCICoversEveryPythonTest(unittest.TestCase):
             orphans, [],
             "these test files are never executed by CI — either move them to "
             "tests/<name>.test.py (auto-discovered) or name them explicitly in "
-            f"a workflow:\n  " + "\n  ".join(orphans),
+            "a workflow:\n  " + "\n  ".join(orphans),
         )
 
     def test_the_guard_can_actually_fail(self):

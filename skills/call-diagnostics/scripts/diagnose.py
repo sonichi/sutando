@@ -863,9 +863,9 @@ def generate_tracker_html(calls, output_path, source_type="phone"):
 
     last_cd = call_data[-1] if call_data else {}
     parts = [
-        f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>TRACKER_TITLE_PLACEHOLDER</title>',
+        '<!DOCTYPE html><html><head><meta charset="utf-8"><title>TRACKER_TITLE_PLACEHOLDER</title>',
         f'<style>{_CSS}</style></head><body>',
-        f'<h1>TRACKER_TITLE_PLACEHOLDER</h1>',
+        '<h1>TRACKER_TITLE_PLACEHOLDER</h1>',
         f'<div class="summary"><strong>{len(calls)} calls total</strong> | Showing last 5 | '
         f'Issues in view: {len(table_cats)} | Last call: {last_cd.get("date","")} {last_cd.get("time","")}</div>',
     ]

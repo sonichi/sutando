@@ -88,6 +88,7 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
 # Generic plugin message-hook loader. The bridge stays a THIN, plugin-AGNOSTIC
@@ -565,6 +566,73 @@ def load_policy():
     except Exception:
         return "pairing"
 
+
+def load_tier_map() -> dict:
+    """Per-user-id -> tier ("owner"|"team"|"other") from access.json `tierMap`.
+    Empty dict if absent. Mirrors slack-bridge.load_tier_map so the two
+    bridges share one access-control model."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        tier_map = data.get("tierMap")
+        return tier_map if isinstance(tier_map, dict) else {}
+    except Exception:
+        return {}
+
+
+def ensure_tier_map_seeded() -> bool:
+    """One-time migration (owner request 2026-07-17: allowlist default =
+    read-only). If access.json has a populated global allowFrom but no
+    tierMap, seed tierMap = {existing -> owner} once and persist. Existing
+    members are grandfathered as owner; any NEW allowFrom addition is then
+    missing from tierMap and resolves to team (read-only, sandboxed) instead
+    of the previous unconditional owner. Idempotent once a tierMap exists.
+
+    Returns True when a tierMap is reliably in place afterward (already
+    present, just persisted, or nothing to seed); False when a seed was
+    needed but could NOT be persisted/read. On False the caller MUST fail
+    closed — never grant owner off an empty/unconfirmed map (#2161 CR:
+    a transient read/write error must not silently escalate every
+    allowlisted sender to owner)."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception as e:
+        print(f"  [tier-map] WARNING: access.json unreadable ({e}); allowlisted senders resolve read-only (team) until the tierMap can be read", flush=True)
+        return False
+    allow = data.get("allowFrom") or []
+    # Test key PRESENCE, not truthiness. An explicitly-empty tierMap ({}) is a
+    # deliberate "nobody is owner via tierMap" state — treating it as falsy
+    # here would re-seed every allowFrom member as owner, escalating read-only
+    # users (#2161 CR: {"allowFrom":["U"],"tierMap":{}} must NOT become
+    # {"U":"owner"}). Only a genuinely ABSENT key (never-seeded legacy file)
+    # triggers first-run grandfathering below. A present-but-empty map returns
+    # here, so the allowlisted user is missing from the map and resolves team.
+    if "tierMap" in data:
+        return True
+    if not allow:
+        return True  # nothing to grandfather — an empty map is legitimate here
+    data["tierMap"] = {uid: "owner" for uid in allow}
+    # Atomic write: a bare ACCESS_FILE.write_text() truncates the live
+    # access-control file BEFORE writing, so a disk-full / interrupt / partial
+    # write can destroy allowFrom — and with fail-closed tier resolution that
+    # locks legitimate owners out against a corrupt file, at bridge startup.
+    # Write a sibling temp, chmod it, then os.replace() atomically (mirrors the
+    # pairing path + the #2222 owner-activity fix). The pid+uuid suffix avoids
+    # colliding with a concurrent pairing-path .tmp; on any failure the original
+    # access.json bytes are left intact and the orphan temp is removed.
+    tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ACCESS_FILE)
+        print(f"  [tier-map] grandfathered {len(allow)} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
+        return True
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        print(f"  [tier-map] WARNING: failed to persist grandfather tierMap ({e}); allowlisted senders resolve read-only (team) until seeded", flush=True)
+        return False
 
 def read_access_for_seed(path):
     """Read access.json for a path that is about to WRITE it back (pairing seed).
@@ -2301,6 +2369,15 @@ async def on_ready():
         discord_config.auto_seed_if_missing(_initial_access)
     except Exception as _seed_exc:
         print(f"  [discord-config] auto-seed failed (non-fatal): {_seed_exc}")
+    # Seed the tier-map grandfather snapshot at STARTUP, before any message is
+    # processed — otherwise a fresh (pre-migration) install where the owner
+    # adds a NEW allowFrom id would grandfather that new id as owner the first
+    # time it messages (the seed runs on-demand and captures whoever is in
+    # allowFrom at that moment). Seeding at boot pins the snapshot to the
+    # allowFrom present at upgrade, so post-upgrade additions default read-only
+    # (owner CR #2161). Idempotent: no-op once a tierMap exists, so firing on
+    # every reconnect is harmless.
+    ensure_tier_map_seeded()  # pragma: no cover — startup call-site glue in on_ready; the seed fn is unit-tested (bridges-allowlist-default-readonly.test.py) and already swallows its own FS errors internally
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loops start. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
@@ -2511,6 +2588,8 @@ async def _handle_discord_message(message, force=False):
     sender_id = str(message.author.id)
     username = str(message.author)
     text = message.content or ""
+    initial_secret_filter = filter_chat_secrets(text)
+    detected_secret_types = set(initial_secret_filter.secret_types)
     is_dm = isinstance(message.channel, discord.DMChannel)
     channel_name = getattr(message.channel, 'name', 'DM')
 
@@ -2526,10 +2605,12 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
-    print(f"  [msg] #{channel_name} @{username}: {redact_vault_commands(text)[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
+    safe_log_text = redact_vault_commands(initial_secret_filter.text)
+    print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
     if hasattr(message, 'message_snapshots') and message.message_snapshots:
-        print(f"  [debug] message_snapshots: {message.message_snapshots}", flush=True)
+        safe_snapshots = filter_chat_secrets(str(message.message_snapshots)).text  # pragma: no cover
+        print(f"  [debug] message_snapshots: {safe_snapshots}", flush=True)  # pragma: no cover
     if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
         print(f"  [debug] non-default message type: {message.type}", flush=True)
 
@@ -2908,7 +2989,7 @@ async def _handle_discord_message(message, force=False):
             if parts:
                 fwd_text = "\n".join(parts)
                 text = (text + "\n" + fwd_text).strip() if text else fwd_text.strip()
-                print(f"  [forward] extracted: {text[:100]}", flush=True)
+                print(f"  [forward] extracted: {filter_chat_secrets(text).text[:100]}", flush=True)  # pragma: no cover
 
     # Handle embeds (link previews, rich content, pasted images)
     embed_text = ""
@@ -3073,7 +3154,10 @@ async def _handle_discord_message(message, force=False):
     # raw print lands the secret in discord-bridge.log even though the intercept
     # below (L~2939) would store/redact it — a plaintext-secret leak to the log.
     # (2026-06-23 incident: an owner's telegram bot token leaked here.)
-    print(f"  @{username}: {redact_vault_commands(text)}{attachment_note}")
+    safe_detail_log = filter_chat_secrets(
+        f"{redact_vault_commands(text)}{attachment_note}"
+    ).text
+    print(f"  @{username}: {safe_detail_log}")
 
     # Determine access tier
     access_tier = "other"
@@ -3087,9 +3171,26 @@ async def _handle_discord_message(message, force=False):
     # owner. Scope is strictly per-channel (keyed on the serving channel_id).
     is_collaborator = False
     if sender_id in allowed:
-        access_tier = "owner"
-        # Record owner activity for status-aware-pivot in proactive loop
-        write_owner_activity("discord", text, channel_id=getattr(message.channel, "id", None))
+        # Global-allowlist members are owner ONLY if a successfully-persisted
+        # tierMap says so. Seed-on-first-run grandfathers everyone currently
+        # trusted; any newly-added allowFrom id is missing from tierMap and
+        # resolves to "team" (read-only, sandboxed) — the owner-requested
+        # default. Owner comes strictly from map MEMBERSHIP: if the seed could
+        # not persist/read (empty/unconfirmed map), fail CLOSED to team rather
+        # than granting owner off the empty map (#2161 CR — a transient error
+        # must not silently escalate every allowlisted sender to owner).
+        seeded_ok = ensure_tier_map_seeded()
+        _tier_map = load_tier_map()
+        if sender_id in _tier_map:
+            access_tier = _tier_map[sender_id]
+        else:  # pragma: no cover — fail-closed branch inside the async handler mega-function; the seed-failure→team resolution logic is unit-tested in tests/bridges-allowlist-default-readonly.test.py
+            access_tier = "team"
+            if not seeded_ok and not _tier_map:
+                print(f"  [tier-map] WARNING: grandfather seed unavailable; @{username} resolved read-only (team), not owner", flush=True)
+        if access_tier == "owner":
+            # Record owner activity for status-aware-pivot in proactive loop
+            write_owner_activity("discord", filter_chat_secrets(text).text,
+                                 channel_id=getattr(message.channel, "id", None))
     else:
         # Check if team member (from channel allowlists)
         try:
@@ -3180,6 +3281,20 @@ async def _handle_discord_message(message, force=False):
         else:
             text = redact_vault_commands(text)
 
+    # Redact ordinary pasted tokens after explicit vault interception so named
+    # `vault set` values can still be stored. Include reply context and voice
+    # transcripts: both are user-derived and both are persisted in the task.
+    filtered_text = filter_chat_secrets(text)
+    filtered_attachment = filter_chat_secrets(attachment_note)
+    filtered_reply_context = filter_chat_secrets(reply_context)
+    text = filtered_text.text
+    attachment_note = filtered_attachment.text
+    reply_context = filtered_reply_context.text
+    detected_secret_types.update(filtered_text.secret_types)
+    detected_secret_types.update(filtered_attachment.secret_types)
+    detected_secret_types.update(filtered_reply_context.secret_types)
+    secret_notice = secret_handling_instruction("Discord", detected_secret_types)
+
     # Inject tier-specific in-band instructions so the core agent cannot
     # accidentally process a non-owner task with full capabilities.
     # See CLAUDE.md "Discord access control" section for the policy.
@@ -3263,6 +3378,10 @@ async def _handle_discord_message(message, force=False):
             # `===SUTANDO SYSTEM INSTRUCTIONS===` content that lands in the task
             # file header verbatim. confine_user_content is idempotent so the
             # already-ZWSP-prefixed original user_task_text is unaffected.
+            filtered_enriched = filter_chat_secrets(enriched)  # pragma: no cover
+            detected_secret_types.update(filtered_enriched.secret_types)  # pragma: no cover
+            secret_notice = secret_handling_instruction("Discord", detected_secret_types)  # pragma: no cover
+            enriched = filtered_enriched.text  # pragma: no cover
             user_task_text = confine_user_content(enriched)
             # Rewrite the prompt file with the enriched body. quoted_task
             # already points to `"$(cat {prompt_path})"` — keep the heredoc
@@ -3527,6 +3646,7 @@ async def _handle_discord_message(message, force=False):
             f"task: {user_task_text}\n"
             f"{tier_instructions.get(rulebook_key, tier_instructions['other'])}"
             f"{discord_skill_hints}"
+            f"{secret_notice}"
         )
 
     if not _write_task_file(task_file, _build_task_content, username, channel_name,
