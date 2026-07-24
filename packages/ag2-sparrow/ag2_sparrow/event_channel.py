@@ -57,6 +57,11 @@ class EventChannel:
         self._inbox = inbox
         self._base = base_url.rstrip("/")
         self._headers = dict(headers)
+        # Cloudflare rejects urllib's default UA with 403 — which _consume_once
+        # classifies as FATAL, so without this the channel would stop
+        # permanently on first real-gateway connect (review P1). Same explicit
+        # client UA the bridge's request path sets.
+        self._headers.setdefault("User-Agent", "sutando-gateway-client/1.0")
         self._log = log
         self._max_backoff = max_backoff
         self.health = {"status": "init", "last_cursor": inbox.durable_cursor(),

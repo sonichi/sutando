@@ -52,8 +52,12 @@ class TaskifyHandler:
         self.agent_mxid = agent_mxid
         self.threshold = max(1, int(threshold))
         self._log = log
-        self._batch: list = []
-        self._seen: set = set()          # event_ids in the un-flushed batch (re-drain dedup)
+        # Batches are PARTITIONED BY ROOM (review P1: one global batch mixed
+        # rooms into a single task, attributing a private room's events to the
+        # last room seen — a provenance/context boundary crossing). Each room
+        # gets its own pending list + seen set and promotes independently.
+        self._batch: dict = {}           # room_id -> list[event]
+        self._seen: dict = {}            # room_id -> set[event_id]
         self.last_path: "str | None" = None
 
     def offer(self, event: dict) -> list:
@@ -68,26 +72,46 @@ class TaskifyHandler:
             return [eid] if eid else []          # noise → settled, skip
         if self.agent_mxid and event.get("actor_id") == self.agent_mxid:
             return [eid] if eid else []          # self-echo → settled, never wakes Core
-        if not eid or eid in self._seen:
-            return []                            # re-drained held event → already batched
-        self._batch.append(event)
-        self._seen.add(eid)
-        if len(self._batch) < self.threshold:
+        room = str(event.get("room_id") or "?")
+        batch = self._batch.setdefault(room, [])
+        seen = self._seen.setdefault(room, set())
+        if not eid or eid in seen:
+            # Re-drained held event. If this room's batch is threshold-ready,
+            # RETRY the flush — a previously failed promotion (transient disk/
+            # permission error) would otherwise never retry until some new
+            # event arrived (review P1: seen-before-promote swallowed retries).
+            if len(batch) >= self.threshold:
+                return self._try_flush(room)
+            return []
+        batch.append(event)
+        seen.add(eid)
+        if len(batch) < self.threshold:
             return []                            # HELD — not yet safe to consume
-        settled = list(self._seen)
-        self.last_path = self._promote()
-        self._batch = []
-        self._seen = set()
+        return self._try_flush(room)
+
+    def _try_flush(self, room: str) -> list:
+        """Promote one room's threshold-ready batch. On failure the batch and
+        seen set are KEPT (events stay unconsumed, re-drained, retried here) —
+        nothing settles until the task file is durably on disk."""
+        try:
+            self.last_path = self._promote(room)
+        except Exception as e:  # noqa: BLE001 — isolated; retried on re-drain
+            self._log(f"event-consumer: promotion failed for {room} "
+                      f"(kept for retry): {e}")
+            return []
+        settled = list(self._seen.get(room) or ())
+        self._batch[room] = []
+        self._seen[room] = set()
         return settled                           # whole flushed batch now durable → settle
 
     def has_pending(self) -> bool:
-        return bool(self._batch)
+        return any(self._batch.values())
 
-    def _promote(self) -> str:
-        ids = [str(e.get("event_id")) for e in self._batch]
-        cursors = [e.get("cursor") for e in self._batch if isinstance(e.get("cursor"), int)]
-        room = self._batch[-1].get("room_id") or "?"
-        n = len(self._batch)
+    def _promote(self, room: str) -> str:
+        batch = self._batch.get(room) or []
+        ids = [str(e.get("event_id")) for e in batch]
+        cursors = [e.get("cursor") for e in batch if isinstance(e.get("cursor"), int)]
+        n = len(batch)
         digest = hashlib.sha1("\n".join(ids).encode()).hexdigest()[:16]
         task_id = f"task-taskify-{digest}"          # deterministic → idempotent re-drain
         os.makedirs(self.task_dir, exist_ok=True)
@@ -97,6 +121,17 @@ class TaskifyHandler:
         provenance = {"source_event_ids": ids,
                       "promotion_reason": f"threshold {self.threshold} meaningful events",
                       "cursor_range": [cursors[0], cursors[-1]] if cursors else [None, None]}
+        # Bounded, explicitly UNTRUSTED per-event summaries: without them the
+        # task said "review and act" but carried nothing to review (review P1).
+        # type + actor + first line (120 chars) of text; room-controlled
+        # content — the in-band block reiterates observation-not-instruction.
+        summaries = []
+        for ev in batch[:20]:
+            content = ev.get("content") or {}
+            text = str(content.get("body") or content.get("text") or "")
+            text = text.splitlines()[0][:120] if text else ""
+            summaries.append(f"- [{ev.get('type')}] {ev.get('actor_id') or '?'}"
+                             + (f": {text}" if text else ""))
         body = "\n".join([
             f"id: {task_id}",
             "timestamp: " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -107,6 +142,9 @@ class TaskifyHandler:
             "priority: low",
             "model_hint: efficient",
             "access_tier: ambient",
+            "",
+            "events (UNTRUSTED, observed verbatim):",
+            *summaries,
             "",
             "provenance: " + json.dumps(provenance, ensure_ascii=False),
             "",

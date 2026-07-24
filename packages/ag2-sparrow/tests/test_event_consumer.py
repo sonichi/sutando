@@ -117,6 +117,74 @@ def test_promotion_is_durable_before_consume():
     _ = ecmod  # module referenced for clarity of what is under test
 
 
+def test_rooms_never_mix_in_one_task():
+    # Review P1: one global batch attributed a private room's events to the
+    # last room seen. Batches are now per-room: each room promotes its OWN
+    # task with correct channel_id + provenance, never mixed.
+    d = tempfile.mkdtemp()
+    inbox = _inbox_with([
+        _ev("$p1", 1, room="!private:hs"), _ev("$s1", 2, room="!shared:hs"),
+        _ev("$p2", 3, room="!private:hs"), _ev("$s2", 4, room="!shared:hs")])
+    h = TaskifyHandler(d, agent_mxid="@me:hs", threshold=2)
+    r = EventConsumer(inbox, h).drain()
+    check(len(r["promoted"]) == 2, "two rooms at threshold → two separate tasks")
+    bodies = {open(p).read() for p in r["promoted"]}
+    priv = next(b for b in bodies if "channel_id: !private:hs" in b)
+    shar = next(b for b in bodies if "channel_id: !shared:hs" in b)
+    check("$p1" in priv and "$p2" in priv and "$s1" not in priv,
+          "private task carries ONLY private-room events")
+    check("$s1" in shar and "$s2" in shar and "$p1" not in shar,
+          "shared task carries ONLY shared-room events (no boundary crossing)")
+    check(inbox.unconsumed() == [], "all events settled across both rooms")
+
+
+def test_task_carries_reviewable_payload():
+    # Review P1: the task said "review and act" but carried only ids — the
+    # sandboxed consumer had nothing to review. Bounded UNTRUSTED summaries
+    # (type + actor + first 120 chars) now ride in the body.
+    d = tempfile.mkdtemp()
+    ev = _ev("$m1", 1)
+    ev["content"] = {"body": "unique-payload-marker-xyz: please review the deploy"}
+    inbox = _inbox_with([ev, _ev("$m2", 2), _ev("$m3", 3)])
+    h = TaskifyHandler(d, agent_mxid="@me:hs", threshold=3)
+    r = EventConsumer(inbox, h).drain()
+    body = open(r["promoted"][0]).read()
+    check("UNTRUSTED" in body and "unique-payload-marker-xyz" in body,
+          "task body carries bounded untrusted event summaries (reviewable)")
+    check("[message.created] @u:hs" in body,
+          "summaries carry type + actor attribution")
+
+
+def test_failed_promotion_is_retried_on_redrain():
+    # Review P1: events were recorded in _seen BEFORE promotion; a transient
+    # promotion failure was never retried until a NEW event arrived. Now a
+    # threshold-ready batch re-attempts the flush on every re-drain.
+    d = tempfile.mkdtemp()
+    inbox = _inbox_with([_ev("$f1", 1), _ev("$f2", 2)])
+    h = TaskifyHandler(d, agent_mxid="@me:hs", threshold=2)
+    c = EventConsumer(inbox, h)
+    calls = {"n": 0}
+    orig_replace = os.replace
+
+    def flaky_replace(a, b):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient disk error")
+        return orig_replace(a, b)
+
+    os.replace = flaky_replace
+    try:
+        r1 = c.drain()
+        check(r1["promoted"] == [] and r1["consumed"] == 0
+              and inbox.unconsumed() != [],
+              "transient promotion failure settles NOTHING (events kept)")
+        r2 = c.drain()   # same events re-drained, no new event needed
+        check(len(r2["promoted"]) == 1 and inbox.unconsumed() == [],
+              "RETRY — the same threshold-ready batch promotes on re-drain")
+    finally:
+        os.replace = orig_replace
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
