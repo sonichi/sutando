@@ -1262,8 +1262,22 @@ def _maybe_start_event_channel() -> None:
         ch = EventChannel(inbox, URL, {"Authorization": f"Bearer {TOKEN}"}, log=_log)
         threading.Thread(target=ch.run, name="sparrow-event-channel", daemon=True).start()
         _EVENT_CHANNEL = ch
-        _log("event channel started (SPARROW_EVENTS enabled) — isolated daemon thread, "
-             "task delivery unaffected")
+        # P1: drain the inbox into the Core's attention (taskify → tasks/) on a
+        # timer, in ITS OWN daemon thread, fully guarded — task delivery unaffected.
+        from .event_consumer import EventConsumer, TaskifyHandler
+        handler = TaskifyHandler(str(TASKS_DIR), os.environ.get("AGENT_MXID"), log=_log)
+        consumer = EventConsumer(inbox, handler)
+
+        def _drain_loop():
+            while True:
+                try:
+                    consumer.drain()
+                except Exception as e:  # noqa: BLE001 — drain must never break anything
+                    _log(f"event drain error (isolated): {e}")
+                time.sleep(2.0)
+        threading.Thread(target=_drain_loop, name="sparrow-event-drain", daemon=True).start()
+        _log("event channel + consumer started (SPARROW_EVENTS enabled) — isolated "
+             "daemon threads, task delivery unaffected")
     except Exception as e:  # noqa: BLE001 — event startup must NEVER break tasks
         _log(f"event channel start failed (task delivery unaffected): {e}")
 
