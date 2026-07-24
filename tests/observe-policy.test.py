@@ -161,6 +161,18 @@ def test_cost_cap_non_dict_is_validation_error():
     check(any("cost_cap" in e for e in errs2)
           and rec2["cost_cap"] == {"evals_per_day": op.DEFAULT_EVALS_PER_DAY},
           "list cost_cap handled the same way")
+    # Review follow-up: `or {}` silently blessed FALSY non-dicts — cost_cap=[]
+    # produced no errors and standing approval then auto-activated the policy.
+    # Present-but-malformed must error (forcing the explicit card); absent/None
+    # stay error-free defaults.
+    for falsy in ([], "", 0, False):
+        _, e = op.validate_draft(_draft(cost_cap=falsy))
+        check(any("cost_cap" in x for x in e),
+              f"falsy non-dict cost_cap {falsy!r} → validation error, not silent default")
+    _, e_absent = op.validate_draft(_draft())
+    _, e_none = op.validate_draft(_draft(cost_cap=None))
+    check(e_absent == [] and e_none == [],
+          "absent/None cost_cap stays a clean default (no error)")
 
 
 def test_render_card_confirm_and_auto():

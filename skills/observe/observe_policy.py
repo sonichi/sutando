@@ -66,10 +66,16 @@ def validate_draft(draft: dict) -> "tuple[dict, list[str]]":
     mode = str(draft.get("mode") or "observe")
     if mode not in MODES:
         errors.append(f"mode must be one of {sorted(MODES)}")
-    cap = draft.get("cost_cap") or {}
-    if not isinstance(cap, dict):
-        # LLM output like cost_cap: "cheap" must produce a validation error,
-        # not an AttributeError (review P1) — normalized to the default cap.
+    # Absent/None mean "no cap requested" (default applies, no error). Any
+    # PRESENT non-dict — INCLUDING falsy ones like [] or "" — is malformed LLM
+    # output and must surface as a validation error: `or {}` silently blessed
+    # cost_cap=[] into a default-cap draft that standing approval then
+    # auto-activated (review P1 follow-up — malformed output must force
+    # explicit confirmation, never widen the standing-approval boundary).
+    cap = draft.get("cost_cap")
+    if cap is None:
+        cap = {}
+    elif not isinstance(cap, dict):
         errors.append('cost_cap must be an object like {"evals_per_day": n}')
         cap = {}
     evals = cap.get("evals_per_day", DEFAULT_EVALS_PER_DAY)
