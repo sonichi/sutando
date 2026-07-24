@@ -111,7 +111,14 @@ class TaskifyHandler:
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
             f.write(body)
+            f.flush()
+            os.fsync(f.fileno())                     # data durable before the rename
         os.replace(tmp, path)                        # atomic — watcher never sees a torn file
+        dfd = os.open(self.task_dir, os.O_RDONLY)    # directory entry durable too:
+        try:                                         # a crash between consume-commit and
+            os.fsync(dfd)                            # dir-entry flush would lose the batch
+        finally:                                     # (events consumed, task file gone).
+            os.close(dfd)
         self._log(f"event-consumer: promoted {n} events → {task_id} (ambient)")
         return path
 

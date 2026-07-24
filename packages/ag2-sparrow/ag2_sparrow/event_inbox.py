@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 
 _SCHEMA = """
@@ -40,8 +41,13 @@ CREATE INDEX IF NOT EXISTS idx_inbox_unconsumed ON event_inbox(consumed_at) WHER
 
 class EventInbox:
     def __init__(self, path: str):
-        # check_same_thread=False: the channel thread writes, the consumer reads.
-        # WAL + a short busy timeout make that concurrency safe without app locks.
+        # One connection shared by the channel (writer) and consumer (reader)
+        # threads. check_same_thread=False only disables Python's affinity
+        # check — a sqlite3.Connection is NOT safe for concurrent use, so every
+        # operation is serialized under self._lock (review: concurrent
+        # insert+read probes segfaulted without it). WAL + busy timeout handle
+        # cross-PROCESS concurrency; the lock handles cross-THREAD.
+        self._lock = threading.Lock()
         self._db = sqlite3.connect(path, check_same_thread=False, timeout=10)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
@@ -58,13 +64,14 @@ class EventInbox:
         if not eid or not isinstance(cur, int):
             return False  # unusable envelope — never advance the cursor past it
         try:
-            self._db.execute(
-                "INSERT INTO event_inbox(event_id, cursor, type, room_id, payload, received_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (eid, cur, event.get("type"), event.get("room_id"),
-                 json.dumps(event, ensure_ascii=False), time.time()),
-            )
-            self._db.commit()
+            with self._lock:
+                self._db.execute(
+                    "INSERT INTO event_inbox(event_id, cursor, type, room_id, payload, received_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (eid, cur, event.get("type"), event.get("room_id"),
+                     json.dumps(event, ensure_ascii=False), time.time()),
+                )
+                self._db.commit()
             return True
         except sqlite3.IntegrityError:
             return False  # event_id UNIQUE violation = duplicate → at-least-once dedup
@@ -72,15 +79,17 @@ class EventInbox:
     def durable_cursor(self) -> "int | None":
         """The SSE resume anchor: the highest cursor durably written. Reconnect
         with Last-Event-ID = this so a crash never advances past unwritten events."""
-        row = self._db.execute("SELECT MAX(cursor) FROM event_inbox").fetchone()
+        with self._lock:
+            row = self._db.execute("SELECT MAX(cursor) FROM event_inbox").fetchone()
         return row[0] if row and row[0] is not None else None
 
     # -- read side (Core attention consumer) --------------------------------- #
     def unconsumed(self, limit: int = 100) -> "list[dict]":
         """Oldest-first batch the Core hasn't processed yet."""
-        rows = self._db.execute(
-            "SELECT payload FROM event_inbox WHERE consumed_at IS NULL"
-            " ORDER BY cursor ASC LIMIT ?", (limit,)).fetchall()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT payload FROM event_inbox WHERE consumed_at IS NULL"
+                " ORDER BY cursor ASC LIMIT ?", (limit,)).fetchall()
         return [json.loads(r[0]) for r in rows]
 
     def mark_consumed(self, event_ids: "list[str]") -> int:
@@ -88,15 +97,17 @@ class EventInbox:
         if not event_ids:
             return 0
         now = time.time()
-        cur = self._db.executemany(
-            "UPDATE event_inbox SET consumed_at=? WHERE event_id=? AND consumed_at IS NULL",
-            [(now, e) for e in event_ids])
-        self._db.commit()
+        with self._lock:
+            cur = self._db.executemany(
+                "UPDATE event_inbox SET consumed_at=? WHERE event_id=? AND consumed_at IS NULL",
+                [(now, e) for e in event_ids])
+            self._db.commit()
         return cur.rowcount
 
     def consumed_cursor(self) -> "int | None":
-        row = self._db.execute(
-            "SELECT MAX(cursor) FROM event_inbox WHERE consumed_at IS NOT NULL").fetchone()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT MAX(cursor) FROM event_inbox WHERE consumed_at IS NOT NULL").fetchone()
         return row[0] if row and row[0] is not None else None
 
     # -- retention ----------------------------------------------------------- #
@@ -105,15 +116,17 @@ class EventInbox:
         recent `keep_last` rows regardless (mirrors the server EventLog policy).
         Never prunes unconsumed events — the Core must see them first."""
         cutoff = time.time() - max_age_s
-        cur = self._db.execute(
-            "DELETE FROM event_inbox WHERE consumed_at IS NOT NULL AND consumed_at < ?"
-            " AND cursor NOT IN (SELECT cursor FROM event_inbox ORDER BY cursor DESC LIMIT ?)",
-            (cutoff, keep_last))
-        self._db.commit()
+        with self._lock:
+            cur = self._db.execute(
+                "DELETE FROM event_inbox WHERE consumed_at IS NOT NULL AND consumed_at < ?"
+                " AND cursor NOT IN (SELECT cursor FROM event_inbox ORDER BY cursor DESC LIMIT ?)",
+                (cutoff, keep_last))
+            self._db.commit()
         return cur.rowcount
 
     def close(self) -> None:
         try:
-            self._db.close()
+            with self._lock:
+                self._db.close()
         except sqlite3.Error:
             pass

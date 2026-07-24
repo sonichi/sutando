@@ -99,8 +99,8 @@ def test_channel_consumes_to_inbox():
     check(inbox.durable_cursor() == 8, "channel: cursor advanced via sticky id (7→8)")
     ids = [e["event_id"] for e in inbox.unconsumed()]
     check(ids == ["$e7", "$e8"], "channel: both events durably in inbox (keepalive ignored)")
-    check(ch.health["status"] == "connected" and ch.health["last_cursor"] == 8,
-          "channel: health reports connected + last_cursor")
+    check(ch.health["status"] == "reconnecting" and ch.health["last_cursor"] == 8,
+          "channel: after EOF health reports reconnecting (review fix) + last_cursor kept")
 
 
 def test_channel_dedup_on_replay():
@@ -239,8 +239,8 @@ def test_channel_nonnumeric_id_and_close_error_swallowed():
     # non-numeric SSE id → int(sse_id) raises → the cursor-derive is skipped, not fatal
     body = 'id: notanumber\ndata: {"event_id":"$z","type":"message.created"}\n\n'
     ch, retry = _run_once(inbox, _Resp(body))
-    check(retry is True and ch.health["status"] == "connected",
-          "channel: non-numeric id + close() OSError both swallowed → still retryable")
+    check(retry is True and ch.health["status"] == "reconnecting",
+          "channel: non-numeric id + close() OSError swallowed → retryable, EOF→reconnecting")
 
 
 def test_channel_generic_error_mid_stream_isolated():
@@ -253,6 +253,67 @@ def test_channel_generic_error_mid_stream_isolated():
     ch, retry = _run_once(inbox, _sse_resp(body))
     check(retry is True and ch.health["status"] == "reconnecting",
           "channel: a generic mid-stream error is swallowed (isolation) → reconnect")
+
+
+def test_inbox_concurrent_threads_safe():
+    # Review blocker: one sqlite3.Connection shared by the channel (writer)
+    # thread and the drain (reader) thread segfaulted/corrupted without app
+    # locks. This is the PR's own opt-in topology — writer inserting while the
+    # consumer reads + marks. Must complete with no exception and full counts.
+    import threading
+    inbox = EventInbox(_tmpdb())
+    N = 300
+    errs = []
+
+    def writer():
+        try:
+            for i in range(1, N + 1):
+                inbox.insert(_ev(f"$w{i}", i))
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"writer: {e}")
+
+    def reader():
+        try:
+            for _ in range(200):
+                batch = inbox.unconsumed(20)
+                inbox.mark_consumed([e["event_id"] for e in batch])
+                inbox.durable_cursor(); inbox.consumed_cursor()
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"reader: {e}")
+
+    threads = [threading.Thread(target=writer)] + \
+              [threading.Thread(target=reader) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(errs == [], f"inbox: concurrent writer+readers raise nothing ({errs[:1]})")
+    check(inbox.durable_cursor() == N,
+          "inbox: all concurrent inserts landed (no lost writes)")
+
+
+def test_channel_clean_eof_reports_reconnecting():
+    # Review blocker: after a clean EOF, health stayed "connected" while run()
+    # slept in backoff — supervisors showed a dead stream as healthy.
+    inbox = EventInbox(_tmpdb())
+    ch, retry = _run_once(inbox, _sse_resp(""))   # zero-byte stream = clean EOF
+    check(retry is True and ch.health["status"] == "reconnecting",
+          "channel: clean EOF flips health to reconnecting (never 'connected' in backoff)")
+
+
+def test_channel_non_dict_frame_does_not_poison_stream():
+    # Review blocker: `data: []` is valid JSON but not an event object; it used
+    # to reach insert(), raise, close the stream, and REPLAY from the same
+    # cursor forever — blocking every later valid event.
+    inbox = EventInbox(_tmpdb())
+    body = ('data: []\n\n'
+            'data: 42\n\n'
+            'id: 6\ndata: {"event_id":"$after","type":"message.created"}\n\n')
+    ch, retry = _run_once(inbox, _sse_resp(body))
+    check(retry is True, "channel: non-dict frames are retryable, not fatal")
+    check(inbox.durable_cursor() == 6
+          and [e["event_id"] for e in inbox.unconsumed()] == ["$after"],
+          "channel: stream continues PAST non-dict frames — later events land")
 
 
 def main():
