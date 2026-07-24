@@ -91,12 +91,18 @@ class EventInbox:
         return row[0] if row and row[0] is not None else None
 
     # -- read side (Core attention consumer) --------------------------------- #
-    def unconsumed(self, limit: int = 100) -> "list[dict]":
-        """Oldest-first batch the Core hasn't processed yet."""
+    def unconsumed(self, limit: int = 100, after: "int | None" = None) -> "list[dict]":
+        """Oldest-first page the Core hasn't processed yet. `after` (a cursor)
+        pages PAST rows the consumer is deliberately holding un-consumed
+        (sub-threshold batches): without it, a full window of held rows pins
+        the oldest page forever and newer events starve (review P1). The
+        schema guarantees cursor is a NOT-NULL int, so `cursor > ?` never
+        hides a row."""
         with self._lock:
             rows = self._db.execute(
                 "SELECT payload FROM event_inbox WHERE consumed_at IS NULL"
-                " ORDER BY cursor ASC LIMIT ?", (limit,)).fetchall()
+                " AND cursor > ? ORDER BY cursor ASC LIMIT ?",
+                (-1 if after is None else after, limit)).fetchall()
         return [json.loads(r[0]) for r in rows]
 
     def mark_consumed(self, event_ids: "list[str]") -> int:

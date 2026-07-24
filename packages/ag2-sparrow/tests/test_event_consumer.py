@@ -185,6 +185,32 @@ def test_failed_promotion_is_retried_on_redrain():
         os.replace = orig_replace
 
 
+def test_full_page_of_held_rooms_never_starves_newer_events():
+    # Review P1 repro: MORE held sub-threshold rows than one read page. 120
+    # distinct rooms each hold 1 event (threshold 3, never flush), then room
+    # "!hot:hs" gets 3 events at the END of the backlog. With a fixed
+    # oldest-first window the first 100 held rows pin the page and the hot
+    # room's events are never even SEEN — drain makes zero progress forever.
+    # Cursor pagination must reach and promote them in ONE drain call.
+    events = [_ev(f"$cold{i}", i, room=f"!cold{i}:hs") for i in range(1, 121)]
+    events += [_ev(f"$hot{i}", 120 + i, room="!hot:hs") for i in range(1, 4)]
+    inbox = _inbox_with(events)
+    d = tempfile.mkdtemp()
+    h = TaskifyHandler(d, agent_mxid="@me:hs", threshold=3)
+    c = EventConsumer(inbox, h, batch=100)  # page smaller than the held set
+    r = c.drain()
+    check(r["seen"] == 123, "starvation: one drain pages past held rows (sees ALL 123)")
+    check(len(r["promoted"]) == 1 and "!hot:hs" in open(r["promoted"][0]).read(),
+          "starvation: hot room BEYOND the first page still promotes")
+    held = [e["event_id"] for e in inbox.unconsumed(limit=500)]
+    check(len(held) == 120 and "$hot1" not in held,
+          "starvation: hot batch consumed; cold held rows stay for crash recovery")
+    # a re-drain is a no-op (held rows deduped, nothing new) — but still sees all
+    r2 = c.drain()
+    check(r2["promoted"] == [] and r2["consumed"] == 0,
+          "starvation: re-drain of held-only backlog stays a safe no-op")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
