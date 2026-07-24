@@ -75,13 +75,20 @@ _NODE_BIN="$(bash "$REPO/scripts/sutando-config.sh" node-bin)" || {
 # (Codex finding #3).
 _APP_ENGINE_ROOT="${_APP_NODE_DIR%/node/bin}"
 _APP_ENGINE_ROOT="${_APP_ENGINE_ROOT%/runtime}"
+# Mode comes from the MANAGED-RUNTIME SIGNAL ALONE (Codex re-review F2):
+# explicit SUTANDO_NODE, or the at-rest runtime discovered while running AS
+# the packaged engine copy. Artifact presence is then VALIDATED separately —
+# a managed runtime with missing dist is a packaging error that fails closed,
+# never a silent slide into dev/npm/tsx.
 BUNDLED_MODE=0
-if [ -f "$REPO/dist/web-client.js" ]; then
-  if [ -n "${SUTANDO_NODE:-}" ]; then
-    BUNDLED_MODE=1
-  elif [ -x "$_APP_NODE_DIR/node" ] && [ "${REPO#"$_APP_ENGINE_ROOT"/}" != "$REPO" ]; then
-    BUNDLED_MODE=1
-  fi
+if [ -n "${SUTANDO_NODE:-}" ]; then
+  BUNDLED_MODE=1
+elif [ -x "$_APP_NODE_DIR/node" ] && [ "${REPO#"$_APP_ENGINE_ROOT"/}" != "$REPO" ]; then
+  BUNDLED_MODE=1
+fi
+if [ "$BUNDLED_MODE" = "1" ] && [ ! -f "$REPO/dist/web-client.js" ]; then
+  echo "✗ bundled mode: required dist artifacts missing ($REPO/dist/web-client.js) — desktop packaging error; refusing dev fallback (G1.5 fail-closed)"
+  exit 1
 fi
 if [ -n "${SUTANDO_NODE:-}" ]; then
   _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
@@ -632,10 +639,18 @@ fi
 _PROXY_LABEL="com.sutando.credential-proxy"
 _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
 if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
-  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1; then
-    echo "  ✓ credential proxy (launchd-supervised, already loaded)"
+  # Upgrade path (Codex re-review F1): an already-loaded job may carry a plist
+  # generated BEFORE SUTANDO_NODE existed (or with a different runtime) — a
+  # KeepAlive restart would then lose the pinned runtime. Compare the loaded
+  # plist's managed runtime to the current one and reinstall on drift (the
+  # installer bootout_if_loaded+bootstraps, so re-running over a live job is
+  # safe).
+  _PROXY_PLIST_DEST="$HOME/Library/LaunchAgents/$_PROXY_LABEL.plist"
+  _PROXY_PLIST_NODE="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:SUTANDO_NODE" "$_PROXY_PLIST_DEST" 2>/dev/null || true)"
+  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1 && [ "$_PROXY_PLIST_NODE" = "${SUTANDO_NODE:-}" ]; then
+    echo "  ✓ credential proxy (launchd-supervised, already loaded, runtime current)"
   else
-    echo "  Installing launchd-supervised credential proxy..."
+    echo "  Installing launchd-supervised credential proxy (fresh or runtime drift)..."
     if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
       # Wait for the supervised proxy to bind before the legacy-launch guard.
       for _ in $(seq 1 10); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
