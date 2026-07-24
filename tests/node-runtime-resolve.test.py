@@ -1,7 +1,8 @@
 """G1.5 node-bundle: resolve_node_runtime precedence + check_node_runtime shape.
 
-Covers the resolver's four outcomes (bundled / app-bundle / system / none) and
-the check's ok/down mapping, using temp executables so no host state leaks in.
+Covers the resolver's six outcomes (bundled / invalid-explicit / app-bundle /
+system / system-degraded / none) and the check's ok/warn/down mapping, using
+temp executables so no host state leaks in.
 """
 
 import importlib.util
