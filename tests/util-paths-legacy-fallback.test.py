@@ -107,9 +107,66 @@ def main() -> int:
         results.append(check(_resolved(out) == legacy_path, "case4 still resolves to legacy when suppressed"))
         results.append(check("not found under" not in err, "case4 warning suppressed"))
 
+    results.extend(_in_process_coverage())
+
     passed = sum(1 for r in results if r)
     print(f"\n{passed}/{len(results)} checks passed")
     return 0 if passed == len(results) else 1
+
+
+def _in_process_coverage():
+    """Exercise claude_home_path()'s fallback branches IN-PROCESS so the
+    coverage gate (scripts/coverage-gate.sh runs each test under `coverage run`)
+    counts the added src/util_paths.py lines. The subprocess probes above are
+    the behavioral contract; these direct calls are what the coverage tool can
+    see (a child `python3 -c` is not instrumented)."""
+    print("\n[in-process coverage]")
+    sys.path.insert(0, str(SRC))
+    import util_paths as up
+    out = []
+    saved = {k: os.environ.get(k) for k in
+             ("HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_HOME",
+              "SUTANDO_SUPPRESS_CLAUDE_HOME_LEGACY_FALLBACK")}
+    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as ccd:
+        try:
+            os.environ["HOME"] = home
+            os.environ["CLAUDE_CONFIG_DIR"] = ccd
+            os.environ.pop("CLAUDE_HOME", None)
+            os.environ.pop("SUTANDO_SUPPRESS_CLAUDE_HOME_LEGACY_FALLBACK", None)
+            up._CLAUDE_HOME_LEGACY_FALLBACK_WARNED.clear()
+
+            legacy = Path(home) / ".claude" / Path(*SUB)
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_text("legacy\n")
+
+            # (a) primary missing + legacy present -> warn + return legacy
+            out.append(check(str(up.claude_home_path(*SUB)) == str(legacy),
+                             "in-proc: fallback resolves to legacy + warns"))
+            # (b) same subpath again -> dedup branch of the warning helper
+            out.append(check(str(up.claude_home_path(*SUB)) == str(legacy),
+                             "in-proc: dedup branch (no re-warn)"))
+            # (c) suppressed -> suppression branch of the warning helper
+            up._CLAUDE_HOME_LEGACY_FALLBACK_WARNED.clear()
+            os.environ["SUTANDO_SUPPRESS_CLAUDE_HOME_LEGACY_FALLBACK"] = "1"
+            out.append(check(str(up.claude_home_path(*SUB)) == str(legacy),
+                             "in-proc: suppressed fallback still resolves"))
+            os.environ.pop("SUTANDO_SUPPRESS_CLAUDE_HOME_LEGACY_FALLBACK", None)
+            # (d) primary present -> return primary (no fallback)
+            prim = Path(ccd) / Path(*SUB)
+            prim.parent.mkdir(parents=True, exist_ok=True)
+            prim.write_text("primary\n")
+            out.append(check(str(up.claude_home_path(*SUB)) == str(prim),
+                             "in-proc: primary present -> primary"))
+            # (e) no subpath -> base returned directly
+            out.append(check(str(up.claude_home_path()) == ccd,
+                             "in-proc: base returned when no subpath"))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    return out
 
 
 if __name__ == "__main__":
