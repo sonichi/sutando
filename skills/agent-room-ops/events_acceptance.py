@@ -20,6 +20,7 @@ window is the at-least-once proof.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -144,13 +145,20 @@ class EventAccumulator:
             "cursor_range": [cursors[0], cursors[-1]] if cursors else [None, None],
         }
         os.makedirs(self.task_dir, exist_ok=True)
-        ts_ms = int(time.time() * 1000)
-        while True:
-            task_id = f"task-{ts_ms}"
-            path = os.path.join(self.task_dir, task_id + ".txt")
-            if not os.path.exists(path):
-                break
-            ts_ms += 1  # same-ms double promotion (bursts/tests) — never overwrite
+        # DETERMINISTIC task id, keyed on the batch's source event_ids (#2292
+        # P1-2, duplicate half): the id is a pure function of WHICH events were
+        # promoted, so a crash between the task-file rename and the cursor save
+        # replays the same events → the same id → the same path. We then treat a
+        # pre-existing path as "already promoted" and return it WITHOUT
+        # rewriting — idempotent, so restart can neither lose (should_persist
+        # holds the cursor) nor duplicate (this key) a promotion. event_ids are
+        # globally-unique Matrix ids, so distinct batches never collide.
+        digest = hashlib.sha1(
+            "\n".join(provenance["source_event_ids"]).encode()).hexdigest()[:16]
+        task_id = f"task-taskify-{digest}"
+        path = os.path.join(self.task_dir, task_id + ".txt")
+        if os.path.exists(path):
+            return path  # replay of an already-promoted batch — do not duplicate
         # The [taskify] marker + `source: events-promotion` make the origin
         # explicit at a glance: this is an event-promotion, NOT a direct human
         # ask. priority stays `low` so ambient promotions never outrank direct

@@ -959,8 +959,30 @@ class EventAccumulatorTests(unittest.TestCase):
         p1 = acc.offer(1, self._env("$x", "@u:hs"))
         p2 = acc.offer(2, self._env("$y", "@u:hs"))
         self.assertTrue(p1 and p2)
-        self.assertNotEqual(p1, p2)  # same-ms collision guard: distinct files
+        # Distinct batches ($x vs $y) → distinct deterministic ids → distinct
+        # files (the id is keyed on source event_ids, not a timestamp).
+        self.assertNotEqual(p1, p2)
         self.assertIn("1 message", open(p1).read())
+
+    def test_replayed_batch_is_idempotent_no_duplicate(self):
+        # P1-2 duplicate half (#2292 review): a crash after _promote() renames
+        # the task file but before the cursor advances replays the SAME events
+        # into a fresh accumulator (empty _seen_ids). The deterministic id keyed
+        # on source event_ids means the replay resolves to the SAME path and is
+        # skipped — no second time-based task. Simulates restart via a new acc
+        # over the same task_dir.
+        d = tempfile.mkdtemp()
+        acc1 = ea.EventAccumulator(ROOM, HS, 2, d)
+        acc1.offer(1, self._env("$a", "@u:hs"))
+        p1 = acc1.offer(2, self._env("$b", "@u:hs"))          # promote
+        self.assertTrue(p1)
+        # "restart": fresh accumulator, fresh dedup, same task_dir; same events
+        # replay (cursor did not advance past them).
+        acc2 = ea.EventAccumulator(ROOM, HS, 2, d)
+        acc2.offer(1, self._env("$a", "@u:hs"))
+        p2 = acc2.offer(2, self._env("$b", "@u:hs"))          # replay → same id
+        self.assertEqual(p1, p2)                               # same path, idempotent
+        self.assertEqual(len([f for f in os.listdir(d) if f.endswith(".txt")]), 1)
 
     def test_has_pending_tracks_unflushed_batch(self):
         # P1-2 cursor-hold hinges on this: pending while events accumulate,
