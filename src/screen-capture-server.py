@@ -262,7 +262,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     rec["proc"].send_signal(signal.SIGINT)  # -v finalizes on SIGINT
                     rec["proc"].wait(timeout=30)
                     path = rec["path"]
-                    _post_recording_state(False)
+                    # Only publish OFF if no NEW recording started during this
+                    # finalization (SIGINT+wait released the lock). Otherwise the
+                    # stale stop would stomp the new recording's ON state, leaving
+                    # the app's isRecordingVideo=false while it records. (CR: qingyun-wu)
+                    with _recording_lock:
+                        if _active_recording is None:
+                            _post_recording_state(False)
                     if not (os.path.exists(path) and os.path.getsize(path) > 0):
                         raise RuntimeError("recording produced no file")
                     if query.get("silent", ["false"])[0] != "true":
@@ -322,10 +328,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                     def _auto_stop(p=proc):
                         global _active_recording
+                        # Publish OFF only if this watchdog still OWNS the active
+                        # recording, atomically under the lock — a stale watchdog
+                        # (its proc already replaced by a newer recording) must not
+                        # stomp the newer recording's ON state. (CR: qingyun-wu)
                         with _recording_lock:
                             if _active_recording and _active_recording.get("proc") is p:
                                 _active_recording = None
-                        _post_recording_state(False)
+                                _post_recording_state(False)
                         try:
                             p.send_signal(signal.SIGINT)
                             p.wait(timeout=30)

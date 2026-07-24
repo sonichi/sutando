@@ -34,6 +34,7 @@ def load_module():
 class FakePopen:
     """Records every command; for screencapture, writes a dummy output file."""
     calls: list = []
+    wait_hook = None  # optional callable fired inside wait() to simulate a concurrent event
 
     def __init__(self, cmd, *a, **k):
         FakePopen.calls.append(list(cmd))
@@ -46,6 +47,8 @@ class FakePopen:
         pass
 
     def wait(self, *a, **k):
+        if FakePopen.wait_hook:
+            FakePopen.wait_hook()
         return 0
 
 
@@ -75,6 +78,7 @@ class RecordingCoverage(unittest.TestCase):
         self.mod = load_module()
         self.mod.CAPTURE_TOKEN = "test-capture-token"
         FakePopen.calls = []
+        FakePopen.wait_hook = None
         CaptureTimer.captured = []
         self.pp = mock.patch.object(self.mod.subprocess, "Popen", FakePopen)
         self.pt = mock.patch.object(self.mod.threading, "Timer", CaptureTimer)
@@ -160,6 +164,45 @@ class RecordingCoverage(unittest.TestCase):
             raise OSError("notifyutil not found")
         with mock.patch.object(self.mod.subprocess, "Popen", boom):
             self.mod._post_recording_state(True)  # must not raise
+
+    def test_stale_watchdog_does_not_publish_off(self):
+        # A watchdog whose recording was already replaced by a newer one must NOT
+        # publish recording-off — that would stomp the newer recording's on-state
+        # (app isRecordingVideo=false while recording). (CR: qingyun-wu)
+        hdr = {"X-Sutando-Capture-Token": "test-capture-token"}
+        base = f"http://127.0.0.1:{self.port}/capture-video"
+        with urllib.request.urlopen(urllib.request.Request(base + "?action=start&max=5&silent=true", headers=hdr), timeout=5) as r:
+            self.assertEqual(r.status, 200)
+        stale_wd = CaptureTimer.captured[-1]          # recording A's watchdog
+        newB = {"proc": object(), "path": "/tmp/b.mov", "watchdog": None}
+        self.mod._active_recording = newB             # a newer recording takes over
+        FakePopen.calls = []
+        # also make the old proc's wait() raise, so _auto_stop's fire-and-forget
+        # SIGINT/wait cleanup (except: pass) is exercised — it must stay swallowed.
+        def _boom():
+            raise OSError("proc already gone")
+        FakePopen.wait_hook = _boom
+        stale_wd.fn()                                 # fire A's now-stale watchdog
+        self.assertFalse(any("com.sutando.recording.off" in n for n in _notifies(FakePopen.calls)),
+                         "stale watchdog must not publish off over a newer recording")
+        self.assertIs(self.mod._active_recording, newB,
+                      "stale watchdog must not clear the newer recording")
+
+    def test_stop_does_not_publish_off_when_new_recording_started(self):
+        # If a new recording starts during the stop's SIGINT+wait finalization, the
+        # stop must NOT publish off — the new recording owns the on-state. (CR: qingyun-wu)
+        hdr = {"X-Sutando-Capture-Token": "test-capture-token"}
+        base = f"http://127.0.0.1:{self.port}/capture-video"
+        with urllib.request.urlopen(urllib.request.Request(base + "?action=start&silent=true", headers=hdr), timeout=5) as r:
+            self.assertEqual(r.status, 200)
+        newB = {"proc": object(), "path": "/tmp/b.mov", "watchdog": None}
+        FakePopen.wait_hook = lambda: setattr(self.mod, "_active_recording", newB)
+        FakePopen.calls = []
+        with urllib.request.urlopen(urllib.request.Request(base + "?action=stop&silent=true", headers=hdr), timeout=5) as r:
+            self.assertEqual(r.status, 200)
+        self.assertFalse(any("com.sutando.recording.off" in n for n in _notifies(FakePopen.calls)),
+                         "stop must not publish off when a new recording started during finalization")
+        self.assertIs(self.mod._active_recording, newB, "the new recording must remain active")
 
 
 if __name__ == "__main__":
