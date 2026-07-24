@@ -1266,12 +1266,28 @@ def _maybe_start_event_channel() -> None:
         # timer, in ITS OWN daemon thread, fully guarded — task delivery unaffected.
         from .event_consumer import EventConsumer, TaskifyHandler
         handler = TaskifyHandler(str(TASKS_DIR), os.environ.get("AGENT_MXID"), log=_log)
+        # Human-action bridge (v1 steps 2+3): when an owner + room are configured,
+        # route the owner's answers to pending actions BEFORE taskify sees them,
+        # and sweep-post question cards for actions the hook created. Both are
+        # additive — unset env leaves the plain taskify path exactly as before.
+        poster = None
+        ha_owner = os.environ.get("SPARROW_HA_OWNER")
+        ha_room = os.environ.get("SPARROW_HA_ROOM")
+        if ha_owner:
+            from .human_action import ActionStore, CardPoster, DecisionHandler, HandlerChain
+            store = ActionStore(str(_STATE / "human-actions"))
+            handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
+            if ha_room:
+                poster = CardPoster(store, URL, {"Authorization": f"Bearer {TOKEN}"},
+                                    ha_room, log=_log)
         consumer = EventConsumer(inbox, handler)
 
         def _drain_loop():
             while True:
                 try:
                     consumer.drain()
+                    if poster is not None:
+                        poster.sweep()
                 except Exception as e:  # noqa: BLE001 — drain must never break anything
                     _log(f"event drain error (isolated): {e}")
                 time.sleep(2.0)
