@@ -7,7 +7,7 @@ events client (push-observation + durable-cursor replay).
 
 Modes:
   react    (default) on each `message.created` in --room from someone OTHER
-           than self (AGENT_MXID), immediately add a 🔭 reaction to that
+           than self (AGENT_MXID), immediately add a 👀 reaction to that
            message's event id (`content.message_id`) via the existing react
            verb, and print a JSON status line — the observe→act round-trip.
   print    print every delivered envelope as a JSON line (passive observation).
@@ -37,13 +37,13 @@ MEANINGFUL_TYPES = frozenset({
 })
 ALL_TYPES = MEANINGFUL_TYPES | {"room.state_changed"}
 
-# React-mode reaction key. 🔭 (telescope = ambient observation), NOT 👀: the
-# task-processing ack already uses 👀 (the bridge's existing received-ack
-# convention, see react.ACK), and the owner found the two visually
-# indistinguishable in a room during live acceptance. Keeping the keys distinct
-# means a glance tells "the agent OBSERVED this event" apart from "the agent is
-# PROCESSING this as a task".
-OBSERVE_REACTION = "\U0001F52D"  # 🔭
+# React-mode reaction key. 👀 = "the agent OBSERVED this event" — the owner's
+# finalized convention (👀 observed / 🫡 task-acknowledged). This was held as 🔭
+# earlier ONLY to dodge a collision: the task-intake ack was also 👀 back then.
+# That collision is gone — the broker now emits 🫡 for task intake server-side
+# (ag2space-backend#188, deployed), so 👀 is free to mean observation. A glance
+# still separates the two states, now via the owner's chosen glyphs.
+OBSERVE_REACTION = "\U0001F440"  # 👀
 
 
 class EventAccumulator:
@@ -69,6 +69,15 @@ class EventAccumulator:
         self.meaningful_types = frozenset(meaningful_types)
         self._batch = []        # [{event_id, cursor, type}] pending promotion
         self._seen_ids = set()  # replay/duplicate guard across the whole run
+
+    def has_pending(self):
+        """True while events sit accumulated-but-not-yet-promoted. The cursor
+        gate (stream_with_resume should_persist) must HOLD while this is True:
+        the pending events live only in memory, so persisting a cursor past them
+        would drop them on the next restart (#2292 P1-2). Empty batch = the last
+        promotion (or a skip with nothing pending) durably covered everything up
+        to here, so the cursor is safe to advance."""
+        return bool(self._batch)
 
     def offer(self, cursor, envelope):
         """Feed one delivered envelope. Returns the written task-file path when
@@ -131,6 +140,18 @@ class EventAccumulator:
         # ask. priority stays `low` so ambient promotions never outrank direct
         # human tasks; `model_hint: efficient` tells the core this task is
         # suitable for a cheaper/faster model.
+        #
+        # access_tier is `ambient`, NEVER `owner` (#2292 P1-1, the trust
+        # boundary): a promoted task inherits the ROOM's trust, not owner-
+        # instruction trust. Its text is an OBSERVATION object — anyone in the
+        # room could have produced it — so it must not authorize privileged
+        # ops. The [taskify]/priority/model_hint fields are metadata, not an
+        # authorization boundary; only the tier is. `ambient` is not `owner`,
+        # so the core's own rule ("only owner or no-tier gets full processing")
+        # fails it closed to the sandboxed path — and the core should map
+        # `ambient` explicitly alongside team/other. It is derived from the
+        # source, not the sender: even an owner message observed ambiently is an
+        # observation, not an instruction.
         body = "\n".join([
             f"id: {task_id}",
             "timestamp: " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -140,7 +161,7 @@ class EventAccumulator:
             f"channel_id: {self.room_id}",
             "priority: low",
             "model_hint: efficient",
-            "access_tier: owner",
+            "access_tier: ambient",
             "",
             "provenance: " + json.dumps(provenance, ensure_ascii=False),
             "",
@@ -176,6 +197,14 @@ def _main(argv):
 
     if a.mode == "taskify" and not a.task_dir:
         ap.error("--task-dir is required for --mode taskify")
+
+    # Acting modes (react emits reactions, taskify writes tasks) key self-echo
+    # suppression off the agent's own mxid: without it, actor_id == self can
+    # never be detected, so the runner reacts to / promotes its OWN events —
+    # a feedback loop (#2292 P2-2). print mode is passive, so it stays optional.
+    if a.mode in ("react", "taskify") and not a.agent_mxid:
+        ap.error(f"--agent (or AGENT_MXID env) is required for --mode {a.mode}: "
+                 "self-echo suppression needs the agent's own mxid")
 
     # Make sure delivery actually flows before streaming: subscribe to the
     # types this mode consumes (re-subscribing is the server's idempotency
@@ -223,8 +252,14 @@ def _main(argv):
             status.update(action="skip")
         _print_line(status)
 
+    # taskify batches in memory, so the durable cursor must NOT advance past
+    # events still pending promotion (#2292 P1-2). Gate persistence on an empty
+    # batch. Other modes are stateless per event → persist every time (None).
+    should_persist = (lambda cur, env: not acc.has_pending()) if acc else None
     try:
-        cur = events.stream_with_resume(a.cursor_file, on_event, max_events=a.max_events)
+        cur = events.stream_with_resume(a.cursor_file, on_event,
+                                        max_events=a.max_events,
+                                        should_persist=should_persist)
         out = {"phase": "done", "ok": True, "cursor": cur}
     except KeyboardInterrupt:
         out = {"phase": "done", "ok": True, "reason": "interrupted"}

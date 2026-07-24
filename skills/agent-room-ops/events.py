@@ -92,7 +92,14 @@ def subscribe(room_id, event_types, filters=None, agent_mxid=None, *, gate=None)
     res = _op_call("events_subscribe", room_id, agent_mxid, gate, extra)
     if res.get("ok") is False:
         return res
-    return _result(True, room_id=room_id, subscription_id=res.get("subscription_id"))
+    # #184 contract: the op answers {"subscription": {subscription_id, ...}} —
+    # the id is nested, NOT top-level. Read it from that object; fall back to a
+    # top-level field only for forward-compat if the server ever flattens it.
+    sub_obj = res.get("subscription")
+    sub_id = sub_obj.get("subscription_id") if isinstance(sub_obj, dict) else None
+    if sub_id is None:
+        sub_id = res.get("subscription_id")
+    return _result(True, room_id=room_id, subscription_id=sub_id)
 
 
 def unsubscribe(room_id, agent_mxid=None, *, gate=None):
@@ -302,7 +309,7 @@ def save_cursor(path, cursor):
 
 
 def stream_with_resume(cursor_file, on_event, keepalive_cb=None, *, stop=None,
-                       max_events=None, max_backoff=30.0):
+                       max_events=None, max_backoff=30.0, should_persist=None):
     """stream() forever with a durable cursor.
 
     Loads the cursor from `cursor_file`, persists it AFTER each delivered event
@@ -311,12 +318,24 @@ def stream_with_resume(cursor_file, on_event, keepalive_cb=None, *, stop=None,
     job), and reconnects on disconnect with 1s, 2s, 4s, … max_backoff backoff
     (reset once events flow again). Runs until KeyboardInterrupt, stop()
     truthy, or max_events total deliveries. Returns the last cursor.
+
+    `should_persist(cur, envelope) -> bool` (optional) gates cursor persistence.
+    A BATCHING consumer (e.g. taskify) accumulates events in memory and only
+    commits them durably at a flush; until then the persisted cursor must NOT
+    advance past those pending events, or a restart resumes beyond them and they
+    are lost forever (#2292 P1-2). Such a consumer passes a predicate that
+    returns True only when nothing is pending in its batch. Default None =
+    persist after every event (correct for stateless react/print consumers).
     """
     state = {"cursor": load_cursor(cursor_file), "count": 0, "got": False}
 
     def _deliver(cur, envelope):
         on_event(cur, envelope)
-        if cur is not None:
+        # Hold the cursor while the consumer has un-flushed in-memory state:
+        # advancing past accumulated-but-not-yet-committed events drops them on
+        # the next restart. `should_persist` is evaluated AFTER on_event, so it
+        # sees the post-callback batch state.
+        if cur is not None and (should_persist is None or should_persist(cur, envelope)):
             save_cursor(cursor_file, cur)
             state["cursor"] = cur
         state["count"] += 1

@@ -593,7 +593,9 @@ class EventsSubscribeTests(EnvCase):
     def test_subscribe_envelope(self):
         os.environ["RELAY_URL"] = "https://r"
         cap = {}
-        fake = {"ok": True, "subscription_id": "sub-1"}
+        # #184 contract shape: the id is NESTED under "subscription", not
+        # top-level. Guards the P2-1 fix — client must read the nested id.
+        fake = {"ok": True, "subscription": {"subscription_id": "sub-1", "room_id": ROOM}}
         with mock.patch.object(ev, "http_json",
                                side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
             res = ev.subscribe(ROOM, ["message.created", "reaction.added"],
@@ -825,6 +827,33 @@ class StreamWithResumeTests(EnvCase):
         self.assertEqual(calls["n"], 2)
         self.assertEqual(naps, [1.0])  # the ladder starts at 1s
 
+    def test_should_persist_holds_cursor_for_pending_batch(self):
+        # P1-2: a batching consumer HOLDS cursor persistence while events sit
+        # un-flushed. Events 11,12 are "pending" (gate False); 13 "flushes"
+        # (gate True) — only 13's cursor may reach the durable file, so a
+        # restart replays 11,12 instead of skipping past them.
+        os.environ["RELAY_URL"] = "https://r"
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")
+        ev.save_cursor(cf, 10)
+        body = ('id: 11\ndata: {"event_id":"$a","cursor":11}\n\n'
+                'id: 12\ndata: {"event_id":"$b","cursor":12}\n\n'
+                'id: 13\ndata: {"event_id":"$c","cursor":13}\n\n')
+        persisted = []
+        real_save = ev.save_cursor
+
+        def spy_save(path, cur):
+            persisted.append(cur)
+            real_save(path, cur)
+
+        with mock.patch.object(ev, "_open_stream", side_effect=lambda url, headers: _sse_resp(body)), \
+             mock.patch.object(ev, "save_cursor", side_effect=spy_save):
+            cur = ev.stream_with_resume(cf, lambda c, e: None, max_events=3,
+                                        should_persist=lambda c, e: c == 13)
+        self.assertEqual(persisted, [13])       # 11,12 held; only the flush committed
+        self.assertEqual(ev.load_cursor(cf), 13)
+        self.assertEqual(cur, 13)
+
 
 # ----- events CLI ----- #
 class EventsCliTests(EnvCase):
@@ -856,12 +885,14 @@ class EventsCliTests(EnvCase):
 
 # ----- acceptance runner (events_acceptance) ----- #
 class ObserveReactionKeyTests(unittest.TestCase):
-    def test_observe_key_is_telescope_not_task_ack(self):
-        # Owner UX finding (live acceptance): observation reacts must be
-        # visually distinct from the bridge's 👀 task-processing ack — a room
-        # glance has to tell "observed" apart from "processing as a task".
-        self.assertEqual(ea.OBSERVE_REACTION, "\U0001F52D")  # 🔭
-        self.assertNotEqual(ea.OBSERVE_REACTION, rc.ACK["received"])  # 👀 stays task-ack
+    def test_observe_key_is_eyes_and_distinct_from_task_ack(self):
+        # Owner-finalized convention: 👀 = event OBSERVED, 🫡 = task acknowledged.
+        # The earlier 🔭 hold is retired now that the task-ack glyph moved to 🫡
+        # (broker server-side #188 + this skill's ACK["received"]), so a room
+        # glance still tells "observed" (👀) apart from "acknowledged" (🫡).
+        self.assertEqual(ea.OBSERVE_REACTION, "\U0001F440")   # 👀
+        self.assertEqual(rc.ACK["received"], "\U0001FAE1")    # 🫡
+        self.assertNotEqual(ea.OBSERVE_REACTION, rc.ACK["received"])
 
 
 # ----- taskify accumulator (events_acceptance) ----- #
@@ -899,7 +930,7 @@ class EventAccumulatorTests(unittest.TestCase):
         self.assertEqual(lines[4], f"channel_id: {ROOM}")
         self.assertEqual(lines[5], "priority: low")          # never outranks humans
         self.assertEqual(lines[6], "model_hint: efficient")  # cheap-model eligible
-        self.assertEqual(lines[7], "access_tier: owner")
+        self.assertEqual(lines[7], "access_tier: ambient")  # trust boundary: never owner
         self.assertEqual(lines[8], "")
         prov = json.loads(lines[9].split("provenance: ", 1)[1])
         self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])
@@ -920,6 +951,37 @@ class EventAccumulatorTests(unittest.TestCase):
         self.assertTrue(p1 and p2)
         self.assertNotEqual(p1, p2)  # same-ms collision guard: distinct files
         self.assertIn("1 message", open(p1).read())
+
+    def test_has_pending_tracks_unflushed_batch(self):
+        # P1-2 cursor-hold hinges on this: pending while events accumulate,
+        # clear the instant a promotion flushes the batch.
+        d = tempfile.mkdtemp()
+        acc = ea.EventAccumulator(ROOM, HS, 3, d)
+        self.assertFalse(acc.has_pending())                 # empty
+        acc.offer(1, self._env("$a", "@u:hs"))
+        self.assertTrue(acc.has_pending())                  # 1 accumulated
+        acc.offer(2, self._env("$self", HS))               # self → skipped, no change
+        self.assertTrue(acc.has_pending())                  # still pending $a
+        acc.offer(3, self._env("$b", "@u:hs"))
+        p = acc.offer(4, self._env("$c", "@u:hs"))         # 3rd meaningful → promote
+        self.assertTrue(p)
+        self.assertFalse(acc.has_pending())                 # flushed → cursor safe
+
+
+# ----- acceptance runner arg guards (events_acceptance) ----- #
+class AcceptanceRunnerArgTests(EnvCase):
+    def test_acting_modes_require_agent(self):
+        # P2-2: react/taskify ACT (emit reactions / write tasks) and rely on the
+        # agent's own mxid to suppress self-echo — argparse must reject them when
+        # neither --agent nor AGENT_MXID is present, or the runner acts on its
+        # own events in a feedback loop.
+        os.environ.pop("AGENT_MXID", None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                ea._main(["--room", ROOM, "--cursor-file", "/tmp/c", "--mode", "react"])
+            with self.assertRaises(SystemExit):
+                ea._main(["--room", ROOM, "--cursor-file", "/tmp/c",
+                          "--mode", "taskify", "--task-dir", "/tmp/t"])
 
 
 if __name__ == "__main__":
