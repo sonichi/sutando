@@ -81,6 +81,13 @@ class ActionStore:
     def _path(self, action_id: str) -> str:
         return os.path.join(self.dir, action_id + ".json")
 
+    def get(self, action_id: str) -> "dict | None":
+        try:
+            with open(self._path(action_id)) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
     def pending(self) -> list:
         out = []
         try:
@@ -227,11 +234,29 @@ class CardPoster:
                 self._log(f"human-action: card post failed (will retry): {e}")
                 continue
             event_id = reply.get("event_id") or (reply.get("result") or {}).get("event_id")
-            rec["card_event_id"] = event_id
-            rec.setdefault("audit", []).append(
-                {"at": time.time(), "event": "card_posted", "card_event_id": event_id})
-            self._store.update(rec)
-            posted += 1
+            # Record the card on the CURRENT record under the shared transition
+            # lock — the action can resolve/expire while the POST is in flight,
+            # and writing the pre-POST snapshot back would RESURRECT a terminal
+            # action to pending with a stale card id (review P1, twice
+            # verified). Re-read under the lock; only a still-pending action
+            # accepts the card stamp — terminal states are never touched.
+            lk = self._store.transition_lock(rec["action_id"])
+            try:
+                current = self._store.get(rec["action_id"])
+                if current and current.get("status") == "pending":
+                    current["card_event_id"] = event_id
+                    current.setdefault("audit", []).append(
+                        {"at": time.time(), "event": "card_posted",
+                         "card_event_id": event_id})
+                    self._store.update(current)
+                    posted += 1
+                else:
+                    self._log(f"human-action: {rec['action_id']} reached a "
+                              f"terminal state during card post — card stamp "
+                              f"skipped (no resurrect)")
+            finally:
+                fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
+                lk.close()
         return posted
 
 

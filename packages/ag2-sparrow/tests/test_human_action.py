@@ -295,6 +295,34 @@ def test_card_poster_default_omits_a2ui_and_sends_ua():
           "poster: explicit gateway UA header present (review fix)")
 
 
+def test_card_poster_never_resurrects_terminal_action():
+    # Review P1 (verified twice): sweep() read a pending rec, did the blocking
+    # POST, then wrote the STALE rec back — resurrecting an action that
+    # resolved/expired mid-POST. The stamp now happens on the re-read CURRENT
+    # record under the shared transition lock, and only while still pending.
+    store, rec = _store_with_action(card_event_id=None)
+
+    def expire_during_post(req, timeout=None):
+        cur = json.loads(Path(store.dir, rec["action_id"] + ".json").read_text())
+        cur["status"] = "expired"
+        cur.setdefault("audit", []).append({"event": "expired"})
+        Path(store.dir, rec["action_id"] + ".json").write_text(json.dumps(cur))
+        return io.BytesIO(json.dumps({"event_id": "$card-race"}).encode())
+
+    orig = ha.urllib.request.urlopen
+    ha.urllib.request.urlopen = expire_during_post
+    try:
+        n = ha.CardPoster(store, "https://gw", {}, "!room:hs",
+                          log=lambda *_: None).sweep()
+    finally:
+        ha.urllib.request.urlopen = orig
+    got = json.loads(Path(store.dir, rec["action_id"] + ".json").read_text())
+    check(n == 0 and got["status"] == "expired",
+          "TERMINAL IMMUTABILITY — a mid-POST expiry is never overwritten back to pending")
+    check(got.get("card_event_id") is None,
+          "no stale card id is stamped onto a terminal action")
+
+
 def test_card_poster_failure_retries():
     store, rec = _store_with_action(card_event_id=None)
 
