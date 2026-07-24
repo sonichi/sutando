@@ -918,21 +918,22 @@ class EventAccumulatorTests(unittest.TestCase):
 
         base = os.path.basename(paths[0])
         self.assertTrue(base.startswith("task-") and base.endswith(".txt"))
+        # Format is the SPARROW promotion format now — the accumulator is a
+        # thin adapter over ag2_sparrow TaskifyHandler (one implementation).
         lines = open(paths[0]).read().split("\n")
         self.assertEqual(lines[0], f"id: {base[:-4]}")
         self.assertTrue(lines[1].startswith("timestamp: ") and lines[1].endswith("Z"))
         # Origin must be explicit at a glance: the [taskify] marker leads the
         # task line and the promoted-from suffix names the room.
         self.assertTrue(lines[2].startswith("task: [taskify] "))
-        self.assertIn("2 messages, 1 reaction", lines[2])
         self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[2])
         self.assertEqual(lines[3], "source: events-promotion")
         self.assertEqual(lines[4], f"channel_id: {ROOM}")
         self.assertEqual(lines[5], "priority: low")          # never outranks humans
         self.assertEqual(lines[6], "model_hint: efficient")  # cheap-model eligible
         self.assertEqual(lines[7], "access_tier: ambient")  # trust boundary: never owner
-        self.assertEqual(lines[8], "")
-        prov = json.loads(lines[9].split("provenance: ", 1)[1])
+        prov_line = next(ln for ln in lines if ln.startswith("provenance: "))
+        prov = json.loads(prov_line.split("provenance: ", 1)[1])
         self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])
         self.assertEqual(prov["promotion_reason"], "threshold 3 meaningful events")
         self.assertEqual(prov["cursor_range"], [2, 6])
@@ -962,7 +963,7 @@ class EventAccumulatorTests(unittest.TestCase):
         # Distinct batches ($x vs $y) → distinct deterministic ids → distinct
         # files (the id is keyed on source event_ids, not a timestamp).
         self.assertNotEqual(p1, p2)
-        self.assertIn("1 message", open(p1).read())
+        self.assertIn("1 room events", open(p1).read())  # sparrow format
 
     def test_replayed_batch_is_idempotent_no_duplicate(self):
         # P1-2 duplicate half (#2292 review): a crash after _promote() renames
