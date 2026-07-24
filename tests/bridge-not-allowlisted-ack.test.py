@@ -119,7 +119,6 @@ def test_discord():
     ))
     check("discord: concurrent handlers send one notice per channel", len(same.sent) == 1, str(same.sent))
     db._not_allowlisted_ack_at.clear()
-    db._not_allowlisted_ack_lock = asyncio.Lock()
     left = _YieldingChannel(channel_id=601)
     right = _YieldingChannel(channel_id=602)
     asyncio.run(_run_concurrently(

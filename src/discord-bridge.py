@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import time
+import weakref
 from pathlib import Path
 
 # startup.sh redirects stdout to a log file, which makes CPython block-buffer
@@ -2356,12 +2357,29 @@ def _message_mentions_bot(message):
 # restarts and upgrades do not reset it (owner ask 2026-07-23).
 _NOT_ALLOWLISTED_ACK_COOLDOWN_S = 7 * 24 * 60 * 60
 _not_allowlisted_ack_at: dict[str, float] = {}
-_not_allowlisted_ack_lock = asyncio.Lock()
+_not_allowlisted_ack_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _NOT_ALLOWLISTED_ACK_STATE_FILE = STATE_DIR / "discord-not-allowlisted-ack.json"
 _NOT_ALLOWLISTED_ACK_TEXT = (
     "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
     "can't act on it. Ask the owner to add you. _(automated notice)_"
 )
+
+
+def _not_allowlisted_ack_lock() -> asyncio.Lock:
+    """Return a serializer bound to the current event loop.
+
+    Production Discord delivery runs on one loop, so all handlers share one
+    lock. Keeping locks per loop also supports the macOS Python 3.9 runtime and
+    focused callers that invoke the helper through separate ``asyncio.run``
+    loops; an asyncio primitive bound by contention on one loop cannot be
+    awaited safely from another.
+    """
+    loop = asyncio.get_running_loop()
+    lock = _not_allowlisted_ack_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _not_allowlisted_ack_locks[loop] = lock
+    return lock
 
 
 def _not_allowlisted_ack_state() -> dict[str, float]:
@@ -2409,7 +2427,7 @@ def _save_not_allowlisted_ack_state(entries: dict[str, float], now: float) -> No
 async def _ack_not_allowlisted(channel, sender_id: str, username: str = "") -> None:
     """One-line 'you're not on the allowlist' reply so an addressed-but-dropped
     message isn't silent. Rate-limited per channel across bridge restarts."""
-    async with _not_allowlisted_ack_lock:
+    async with _not_allowlisted_ack_lock():
         now = time.time()
         channel_id = str(getattr(channel, "id", "") or f"sender:{sender_id}")
         persisted = _not_allowlisted_ack_state()
