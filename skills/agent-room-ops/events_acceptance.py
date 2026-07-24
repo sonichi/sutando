@@ -193,11 +193,22 @@ class EventAccumulator:
             AMBIENT_INBAND_BLOCK,
         ])
         # tmp + rename: the task watcher globs task-*.txt and must never see a
-        # half-written file (same atomicity rule as the cursor file).
+        # half-written file (same atomicity rule as the cursor file). BOTH the
+        # file data and the directory entry are fsynced before we return —
+        # should_persist advances the durable cursor past these events on the
+        # strength of this path existing, so an unflushed rename + host crash
+        # would lose the batch permanently (cursor moved, task file gone).
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
             f.write(body)
+            f.flush()
+            os.fsync(f.fileno())                 # data durable before the rename
         os.replace(tmp, path)
+        dfd = os.open(self.task_dir, os.O_RDONLY)
+        try:
+            os.fsync(dfd)                        # rename itself durable
+        finally:
+            os.close(dfd)
         return path
 
 

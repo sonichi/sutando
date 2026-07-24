@@ -984,6 +984,48 @@ class EventAccumulatorTests(unittest.TestCase):
         self.assertEqual(p1, p2)                               # same path, idempotent
         self.assertEqual(len([f for f in os.listdir(d) if f.endswith(".txt")]), 1)
 
+    def test_promotion_fsyncs_file_then_directory_before_return(self):
+        # Review merge-gate 1: should_persist advances the durable cursor on
+        # the strength of the task path existing, so BOTH the file data and
+        # the directory entry must be fsynced BEFORE _promote returns — an
+        # unflushed rename + host crash loses the batch permanently (cursor
+        # moved, file gone). Asserts the ORDER: data fsync → rename → dir fsync.
+        d = tempfile.mkdtemp()
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+        fd_paths = {}
+        real_open_fd = os.open
+
+        def spy_open(path, flags, *a, **k):
+            fd = real_open_fd(path, flags, *a, **k)
+            fd_paths[fd] = path
+            return fd
+
+        def spy_fsync(fd):
+            # dir-fsync arrives on an os.open() fd we recorded (the task_dir);
+            # the data fsync arrives on the write-handle's fd (not via os.open).
+            events.append(("fsync", "dir" if fd_paths.get(fd) == d else "file"))
+            return real_fsync(fd)
+
+        def spy_replace(src, dst):
+            events.append(("rename", dst))
+            return real_replace(src, dst)
+
+        acc = ea.EventAccumulator(ROOM, HS, 1, d)
+        try:
+            os.open = spy_open
+            os.fsync = spy_fsync
+            os.replace = spy_replace
+            path = acc.offer(1, self._env("$dur", "@u:hs"))
+        finally:
+            os.open, os.fsync, os.replace = real_open_fd, real_fsync, real_replace
+        self.assertTrue(path and os.path.exists(path))
+        kinds = [k for k, _ in events]
+        self.assertEqual(kinds, ["fsync", "rename", "fsync"],
+                         f"durability order must be data-fsync → rename → dir-fsync, got {events}")
+        self.assertEqual(events[0][1], "file")   # first fsync is the temp file's data
+        self.assertEqual(events[2][1], "dir")    # last fsync is the tasks directory entry
+
     def test_has_pending_tracks_unflushed_batch(self):
         # P1-2 cursor-hold hinges on this: pending while events accumulate,
         # clear the instant a promotion flushes the batch.
