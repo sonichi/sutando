@@ -854,6 +854,16 @@ class EventsCliTests(EnvCase):
         self.assertIn("no gateway", out["reason"])
 
 
+# ----- acceptance runner (events_acceptance) ----- #
+class ObserveReactionKeyTests(unittest.TestCase):
+    def test_observe_key_is_telescope_not_task_ack(self):
+        # Owner UX finding (live acceptance): observation reacts must be
+        # visually distinct from the bridge's 👀 task-processing ack — a room
+        # glance has to tell "observed" apart from "processing as a task".
+        self.assertEqual(ea.OBSERVE_REACTION, "\U0001F52D")  # 🔭
+        self.assertNotEqual(ea.OBSERVE_REACTION, rc.ACK["received"])  # 👀 stays task-ack
+
+
 # ----- taskify accumulator (events_acceptance) ----- #
 class EventAccumulatorTests(unittest.TestCase):
     @staticmethod

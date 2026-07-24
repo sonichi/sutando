@@ -7,7 +7,7 @@ events client (push-observation + durable-cursor replay).
 
 Modes:
   react    (default) on each `message.created` in --room from someone OTHER
-           than self (AGENT_MXID), immediately add a 👀 reaction to that
+           than self (AGENT_MXID), immediately add a 🔭 reaction to that
            message's event id (`content.message_id`) via the existing react
            verb, and print a JSON status line — the observe→act round-trip.
   print    print every delivered envelope as a JSON line (passive observation).
@@ -36,6 +36,14 @@ MEANINGFUL_TYPES = frozenset({
     "member.joined", "member.left",
 })
 ALL_TYPES = MEANINGFUL_TYPES | {"room.state_changed"}
+
+# React-mode reaction key. 🔭 (telescope = ambient observation), NOT 👀: the
+# task-processing ack already uses 👀 (the bridge's existing received-ack
+# convention, see react.ACK), and the owner found the two visually
+# indistinguishable in a room during live acceptance. Keeping the keys distinct
+# means a glance tells "the agent OBSERVED this event" apart from "the agent is
+# PROCESSING this as a task".
+OBSERVE_REACTION = "\U0001F52D"  # 🔭
 
 
 class EventAccumulator:
@@ -206,7 +214,7 @@ def _main(argv):
             # envelope's own event_id names the delivery, not the message.
             msg_id = (env.get("content") or {}).get("message_id")
             if msg_id:
-                res = _react.react(a.room, msg_id, "\U0001F440", a.agent_mxid)
+                res = _react.react(a.room, msg_id, OBSERVE_REACTION, a.agent_mxid)
                 status.update(action="react", target=msg_id,
                               ok=res.get("ok"), reason=res.get("reason"))
             else:
