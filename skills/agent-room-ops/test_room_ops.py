@@ -855,6 +855,46 @@ class StreamWithResumeTests(EnvCase):
         self.assertEqual(cur, 13)
 
 
+    def test_cold_start_seeds_replay_anchor_before_withheld_batch(self):
+        # Review P1 (cold-start half): NO cursor file + a batching consumer
+        # that withholds persistence. The first delivered event must seed
+        # `cur - 1` as a durable pre-batch anchor BEFORE it can sit in a
+        # withheld batch — otherwise a hard kill leaves no cursor file, the
+        # restart sends no Last-Event-ID, the server defaults to new-events-
+        # only, and the held event is lost forever (not at-least-once).
+        os.environ["RELAY_URL"] = "https://r"
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")           # absent — true cold start
+        body = ('id: 131\ndata: {"event_id":"$a","cursor":131}\n\n'
+                'id: 132\ndata: {"event_id":"$b","cursor":132}\n\n')
+        with mock.patch.object(ev, "_open_stream",
+                               side_effect=lambda url, headers: _sse_resp(body)):
+            ev.stream_with_resume(cf, lambda c, e: None, max_events=2,
+                                  should_persist=lambda c, e: False)  # batch never flushes
+        # "hard kill with the batch pending": the file must already anchor
+        # replay at 130 so a restart re-delivers 131 (and 132).
+        self.assertEqual(ev.load_cursor(cf), 130)
+        cap = {"resume": None}
+
+        def fake_open2(url, headers):
+            cap["resume"] = headers.get("Last-Event-ID")
+            return _sse_resp(body)
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open2):
+            ev.stream_with_resume(cf, lambda c, e: None, max_events=2,
+                                  should_persist=lambda c, e: False)
+        self.assertEqual(cap["resume"], "130")   # restart REPLAYS the held events
+        self.assertEqual(ev.load_cursor(cf), 130)  # anchor still held (no flush)
+        # a warm start (existing cursor) never rewrites the anchor backwards:
+        ev.save_cursor(cf, 200)
+        with mock.patch.object(ev, "_open_stream",
+                               side_effect=lambda url, headers: _sse_resp(
+                                   'id: 300\ndata: {"event_id":"$z","cursor":300}\n\n')):
+            ev.stream_with_resume(cf, lambda c, e: None, max_events=1,
+                                  should_persist=lambda c, e: False)
+        self.assertEqual(ev.load_cursor(cf), 200)  # loaded cursor wins; no 299 seed
+
+
 # ----- events CLI ----- #
 class EventsCliTests(EnvCase):
     def test_rooms_exits_zero(self):

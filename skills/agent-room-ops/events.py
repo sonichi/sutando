@@ -330,6 +330,16 @@ def stream_with_resume(cursor_file, on_event, keepalive_cb=None, *, stop=None,
     state = {"cursor": load_cursor(cursor_file), "count": 0, "got": False}
 
     def _deliver(cur, envelope):
+        # COLD-START REPLAY ANCHOR (review P1): with no cursor file, a restart
+        # sends no Last-Event-ID and the server defaults to NEW EVENTS ONLY —
+        # so any event a batching consumer was holding in memory when the run
+        # died would never be replayed (lost, not at-least-once). Before the
+        # FIRST delivered event can enter a withheld batch, persist `cur - 1`
+        # as the pre-batch anchor: a crash any time after this replays from
+        # this event onward. Stateless consumers overwrite it one line later.
+        if cur is not None and state["cursor"] is None and not state["got"]:
+            save_cursor(cursor_file, cur - 1)
+            state["cursor"] = cur - 1
         on_event(cur, envelope)
         # Hold the cursor while the consumer has un-flushed in-memory state:
         # advancing past accumulated-but-not-yet-committed events drops them on
