@@ -275,7 +275,25 @@ def claude_home_path(*subpath: str) -> Path:
         base = Path.home() / ".claude"
     if not subpath:
         return base
-    return base.joinpath(*subpath)
+    primary = base.joinpath(*subpath)
+    # Legacy reader-fallback (M1 30-day transition policy — see CLAUDE.md
+    # "Migration transition window"). When CLAUDE_CONFIG_DIR / CLAUDE_HOME points
+    # somewhere other than ~/.claude and the requested file is ABSENT there but
+    # PRESENT under the legacy ~/.claude/ home, resolve to the legacy copy and
+    # warn once. This bridges config that predates the config-home migration and
+    # was never copied forward (channels/, hooks/, skills/) — without it a
+    # stranded bot token is silently invisible and the bridge exits "no token"
+    # (the exact Telegram + Discord outage seen 2026-07-24). Pure fallback: it
+    # only fires when primary is MISSING and legacy EXISTS, so an already-migrated
+    # install is unaffected, and a brand-new write (neither exists) still lands at
+    # primary. Suppress with SUTANDO_SUPPRESS_CLAUDE_HOME_LEGACY_FALLBACK=1.
+    legacy_home = Path.home() / ".claude"
+    if base != legacy_home and not primary.exists():
+        legacy = legacy_home.joinpath(*subpath)
+        if legacy.exists():
+            _emit_claude_home_legacy_fallback_warning_once(subpath)
+            return legacy
+    return primary
 
 
 def channel_access_path(source: str) -> Path:
@@ -340,5 +358,29 @@ def _emit_claude_home_fallback_banner_once() -> None:
         "shell function and src/startup.sh set it; ad-hoc launches must too) so "
         "channels/skills/hooks/sessions resolve to the workspace-scoped per-runtime "
         "location post-#1454. Suppress with SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1.",
+        file=sys.stderr,
+    )
+
+
+# Deduped per (subpath) so a bridge that resolves the same stranded file every
+# poll doesn't spam stderr. Distinct from the CCD-unset banner above: this fires
+# when CCD *is* set correctly but a specific file was never migrated forward from
+# ~/.claude/, so it names the file and the copy-forward remedy.
+_CLAUDE_HOME_LEGACY_FALLBACK_WARNED: set = set()
+
+
+def _emit_claude_home_legacy_fallback_warning_once(subpath: tuple) -> None:
+    if os.environ.get("SUTANDO_SUPPRESS_CLAUDE_HOME_LEGACY_FALLBACK") == "1":
+        return
+    if subpath in _CLAUDE_HOME_LEGACY_FALLBACK_WARNED:
+        return
+    _CLAUDE_HOME_LEGACY_FALLBACK_WARNED.add(subpath)
+    rel = "/".join(subpath)
+    print(
+        f"claude_home_path: '{rel}' not found under $CLAUDE_CONFIG_DIR — using the "
+        f"legacy ~/.claude/{rel} copy. This config predates the config-home migration "
+        f"and was never copied forward; copy it into $CLAUDE_CONFIG_DIR to silence "
+        f"this (e.g. `cp -p ~/.claude/{rel} \"$CLAUDE_CONFIG_DIR/{rel}\"`). "
+        f"Suppress with SUTANDO_SUPPRESS_CLAUDE_HOME_LEGACY_FALLBACK=1.",
         file=sys.stderr,
     )
