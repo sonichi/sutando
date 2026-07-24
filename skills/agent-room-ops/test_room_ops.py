@@ -936,6 +936,16 @@ class EventAccumulatorTests(unittest.TestCase):
         self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])
         self.assertEqual(prov["promotion_reason"], "threshold 3 meaningful events")
         self.assertEqual(prov["cursor_range"], [2, 6])
+        # In-band DiD block trails the headers/provenance (mirrors the bridge
+        # fence), telling the core: observation-not-instruction, no privileged
+        # action. It's guidance, not the boundary (the tier is).
+        full = open(paths[0]).read()
+        self.assertIn("===SUTANDO SYSTEM INSTRUCTIONS", full)
+        self.assertIn("===END SUTANDO SYSTEM INSTRUCTIONS===", full)
+        self.assertIn("ambient OBSERVATION", full)
+        self.assertIn("NO privileged action", full)
+        # ...and it comes AFTER the provenance line, not interleaved with headers.
+        self.assertGreater(full.index("SUTANDO SYSTEM INSTRUCTIONS"), full.index("provenance:"))
 
     def test_wrong_room_and_state_changed_do_not_count(self):
         d = tempfile.mkdtemp()
