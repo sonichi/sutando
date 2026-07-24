@@ -82,6 +82,18 @@ def test_standing_approval_scope_lock():
               f"FAIL-CLOSED outside scope: {needle}")
 
 
+def test_standing_approval_self_contained_boundary():
+    # 001 review: the evaluator must deny — not crash — on an UNVALIDATED
+    # draft (missing/malformed cost_cap). The boundary assumes nothing.
+    raw = {"created_by": OWNER, "room_id": ROOMS[0], "mode": "observe"}
+    ok, why = op.evaluate_standing_approval(raw, owner_mxid=OWNER, owner_rooms=ROOMS)
+    check(ok is False and "cost cap" in why,
+          "missing cost_cap → DENY (self-contained boundary, no KeyError)")
+    raw["cost_cap"] = {"evals_per_day": "two"}
+    ok, _ = op.evaluate_standing_approval(raw, owner_mxid=OWNER, owner_rooms=ROOMS)
+    check(ok is False, "malformed cap type → DENY")
+
+
 def test_store_transitions_and_immutability():
     d = tempfile.mkdtemp()
     store = op.SubscriptionStore(d)

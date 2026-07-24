@@ -27,8 +27,13 @@ decisions: `workspace notes/observe-mvp-slice-design.md`.
 2. **Validate:** `observe_policy.validate_draft(draft)` — errors go back to the
    user verbatim; do not "fix" a draft silently.
 3. **Standing approval:** `evaluate_standing_approval(rec, owner_mxid=…,
-   owner_rooms=…)`. `owner_rooms` = rooms this core serves for the owner (the
-   master room + rooms from owner-created tasks). True → save + `transition(id,
+   owner_rooms=…)`. `owner_rooms` = rooms the owner OWNS — created by the owner or where the
+   owner holds PL≥50 (checked via the room state the core already has; when
+   ownership is unknown, the room is NOT in scope). Familiarity — "the owner
+   sent a task from here" — is NOT ownership: a shared room must never enter
+   standing-approval scope (001 review; the server's four-way authz still
+   gates the subscribe, but the standing-approval semantic is stricter by
+   design). True → save + `transition(id,
    "active")` + subscribe + post the AUTO-ACTIVATED card (visibility is
    mandatory — never activate silently). False → save draft + post the CONFIRM
    card and wait for the decision.

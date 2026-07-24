@@ -94,8 +94,12 @@ def evaluate_standing_approval(draft: dict, *, owner_mxid: str,
         return False, "room is not in the owner's scoped rooms"
     if draft.get("mode") not in STANDING_MODES:
         return False, f"mode {draft.get('mode')!r} requires explicit confirmation"
-    if draft["cost_cap"]["evals_per_day"] > DEFAULT_EVALS_PER_DAY:
-        return False, "cost cap above the default requires explicit confirmation"
+    cap = (draft.get("cost_cap") or {}).get("evals_per_day")
+    if not isinstance(cap, int) or cap > DEFAULT_EVALS_PER_DAY:
+        # missing/malformed cap on an UNVALIDATED draft must deny, not crash —
+        # the boundary is self-contained (001 review), it never assumes the
+        # caller ran validate_draft first.
+        return False, "cost cap missing or above the default — explicit confirmation required"
     return True, "within standing approval (self + scoped room + notify-only + default cap)"
 
 
