@@ -512,6 +512,60 @@ def check_migrate_reader_contract() -> dict:
         return {"name": name, "status": "error", "detail": str(e)}
 
 
+def check_stranded_channel_config() -> "dict | None":
+    """Detect channel config that lives ONLY at the legacy ~/.claude/channels/
+    home while the active CLAUDE_CONFIG_DIR has none.
+
+    This is the silent config-home mismatch that took Telegram + Discord offline
+    on 2026-07-24: a supervisor-launched core's channels/ config was never copied
+    forward into CLAUDE_CONFIG_DIR, so each bridge resolved a non-existent token
+    path and exited "no token" with nothing loud. `claude_home_path()` grew a
+    reader-fallback so the bridge still boots, but relying on the fallback forever
+    hides the un-migrated state — this check makes it visible + actionable.
+
+    Deliberately reads the ACTIVE CLAUDE_CONFIG_DIR directly rather than through
+    claude_home_path(), because that helper's legacy-fallback would mask the very
+    stranding we want to surface.
+
+    Returns None when CLAUDE_CONFIG_DIR is unset (the active home *is* ~/.claude —
+    nothing can be stranded). Read-only; never raises.
+    """
+    name = "channel-config-home"
+    ccd = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
+    if not ccd:
+        return None
+    active_base = Path(os.path.expanduser(ccd))
+    legacy_channels = Path.home() / ".claude" / "channels"
+    if active_base == Path.home() / ".claude" or not legacy_channels.is_dir():
+        return {"name": name, "status": "ok", "detail": "no legacy channel config to migrate"}
+    # The two files that actually gate a bridge boot / access decision.
+    marker_files = (".env", "access.json")
+    stranded = []
+    try:
+        for ch_dir in sorted(p for p in legacy_channels.iterdir() if p.is_dir()):
+            for mf in marker_files:
+                if (ch_dir / mf).exists() and not (active_base / "channels" / ch_dir.name / mf).exists():
+                    stranded.append(f"{ch_dir.name}/{mf}")
+    except OSError:
+        return {"name": name, "status": "ok", "detail": "legacy channels dir unreadable"}
+    if not stranded:
+        return {"name": name, "status": "ok", "detail": "all channel config present under CLAUDE_CONFIG_DIR"}
+    remedy = " && ".join(
+        f'mkdir -p "$CLAUDE_CONFIG_DIR/channels/{s.split("/")[0]}" '
+        f'&& cp -p ~/.claude/channels/{s} "$CLAUDE_CONFIG_DIR/channels/{s}"'
+        for s in stranded
+    )
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (
+            f"channel config stranded at legacy ~/.claude/channels/ (absent under "
+            f"CLAUDE_CONFIG_DIR): {', '.join(stranded)} — affected bridges exit "
+            f"'no token' and never come up. Migrate: {remedy}"
+        ),
+    }
+
+
 def check_tcc_documents_access() -> dict:
     """Detect macOS TCC denial of Documents-folder access (issue #709).
 
@@ -2212,6 +2266,11 @@ def run_all_checks() -> list[dict]:
 
     # Migration/reader path-contract drift (#1543)
     checks.append(check_migrate_reader_contract())
+
+    # Channel config stranded at legacy ~/.claude/channels/ (2026-07-24 outage)
+    stranded_check = check_stranded_channel_config()
+    if stranded_check is not None:
+        checks.append(stranded_check)
 
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
     env_path = _resolve_dotenv()  # pragma: no cover — call-site in untested mega-function
