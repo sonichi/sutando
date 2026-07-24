@@ -494,22 +494,44 @@ probe_ag2space = {'connected': False, 'agent_id': None, 'owner': None}
 # file, but installs enrolled via the OSS path (onboard.sh -> startup.sh) and
 # the AG2 Space desktop launcher (AG2_DEVICE_ENV) write channels/ag2space/.env
 # instead. Try canonical first, then legacy, before concluding not-connected.
-for _envname in ('relay-client.env', '.env'):
-    try:
-        _kv = {}
-        with open(os.path.join(brain, 'channels', 'ag2space', _envname)) as f:
-            for _line in f:
-                _line = _line.strip()
-                if _line and not _line.startswith('#') and '=' in _line:
-                    _k, _, _v = _line.partition('=')
-                    _kv[_k.strip()] = _v.strip()
-        # AG2_REMOTE_TOKEN is the legacy alias for the same enrollment
-        # (startup.sh + health-check.py both recognize it) — either counts.
-        if _kv.get('REMOTE_TASK_TOKEN') or _kv.get('AG2_REMOTE_TOKEN'):
-            probe_ag2space['connected'] = True
-            break
-    except Exception:
-        pass
+#
+# Two BASE dirs, brain first then the desktop app-support dir: the desktop
+# connect-flow writes the token under app_data_dir()/channels/ag2space/ (Rust
+# lib.rs, for the AG2_DEVICE_ENV hand-off + gateway-keepalive) -- NOT under the
+# brain this probe defaults to. Without the app-support base, a genuinely
+# connected desktop core reads back connected=false (and, gated on it, owner
+# null) -- the desktop dialog then shows 'not paired yet' for a paired agent.
+# Prefer the exact file the desktop passes via AG2_DEVICE_ENV when present;
+# otherwise fall back to the canonical macOS app-support location for the
+# space.ag2.app bundle. HOME-relative so it stays correct per-user.
+_ag2_bases = [os.path.join(brain, 'channels', 'ag2space')]
+_device_env = os.environ.get('AG2_DEVICE_ENV')
+if _device_env:
+    _ag2_bases.append(os.path.dirname(_device_env))
+_ag2_bases.append(os.path.join(
+    os.path.expanduser('~'), 'Library', 'Application Support',
+    'space.ag2.app', 'channels', 'ag2space'))
+_found_token = False
+for _base in _ag2_bases:
+    if _found_token:
+        break
+    for _envname in ('relay-client.env', '.env'):
+        try:
+            _kv = {}
+            with open(os.path.join(_base, _envname)) as f:
+                for _line in f:
+                    _line = _line.strip()
+                    if _line and not _line.startswith('#') and '=' in _line:
+                        _k, _, _v = _line.partition('=')
+                        _kv[_k.strip()] = _v.strip()
+            # AG2_REMOTE_TOKEN is the legacy alias for the same enrollment
+            # (startup.sh + health-check.py both recognize it) -- either counts.
+            if _kv.get('REMOTE_TASK_TOKEN') or _kv.get('AG2_REMOTE_TOKEN'):
+                probe_ag2space['connected'] = True
+                _found_token = True
+                break
+        except Exception:
+            pass
 try:
     with open(os.path.join(ws, 'state', 'auth', 'ag2space.json')) as f:
         _aid = json.load(f).get('agent_id') or ''
@@ -529,6 +551,16 @@ try:
         probe_ag2space['owner'] = _own
 except Exception:
     pass
+# NOTE: earlier this fell back to agent_id when tofuOwner was empty. That was
+# wrong: the dialog compares owner to the signed-in HUMAN, so an agent-id owner
+# read as owned-by-someone-else (agent != human) -> the other branch, which hides
+# the pair-as-owner button entirely. Owner must be the HUMAN mxid, which only the
+# webview knows; it records it via the write_ag2space_owner Tauri command on
+# pairing, and the tofuOwner read above picks it up. When no human owner is
+# recorded yet, owner stays null -> the dialog correctly shows unpaired and offers
+# to pair. (connected still resolves independently, above.)
+# Keep this comment free of double-quotes, backticks and dollar signs -- the whole
+# probe is inside a double-quoted python3 -c shell string.
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
 h = {}
 try:
