@@ -61,6 +61,24 @@ Test: `python3 tests/skip-ask-user-question.test.py` (hook) and
 Config paths are env-overridable for testing: `SUTANDO_DISCORD_ACCESS_FILE`,
 `SUTANDO_DISCORD_ENV_FILE`, `SUTANDO_WORKSPACE`. Test: `python3 tests/context-source-guard.test.py`.
 
+## `activity-emitter.py`
+
+Journals the core's activity as AWP activity objects (Activity outbox Phase 2,
+step 1). Async command hook for SessionStart / UserPromptSubmit / PreToolUse /
+PostToolUse / PostToolUseFailure / Notification / Stop / SessionEnd — each fires
+this emitter, which normalizes the hook JSON to an activity object and appends
+it to `<workspace>/state/activity-journal/YYYY-MM-DD.jsonl`. Attribution rides
+in from the Execution Binding Registry when present. Secret hygiene: tool input
+reduces to a display hint (description/file_path/pattern/url — deliberately
+never the raw `command`). Fail-OPEN + fast; register every entry with
+`"async": true`. Upstream HTTP delivery is a later step (broker `/v1/activities`);
+until then the journal is the local activity feed.
+
+Not yet auto-registered. Manual registration: async command-hook entries for the
+events above, argv[1] = hook name as a stdin fallback. Test:
+`python3 tests/activity-emitter.test.py`. Test-only env override:
+`SUTANDO_ACTIVITY_DIR`.
+
 ## `gmail-write-guard.py`
 
 Denies the **claude.ai Gmail MCP connector's WRITE-scoped tools** (create_draft,
