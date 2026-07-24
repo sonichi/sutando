@@ -586,8 +586,10 @@ def main() -> int:
     # from clean tasks. access_tier must still parse as the LAST header line.
     check("SUTANDO SECURITY NOTICE" in _sec_body,
           "security notice appended when a secret was redacted")
+    rtc._write_task({**TASK, "id": "task-CLEANBODY",
+                     "task": "[AG2Space @qingyun] plain request, nothing secret"})
     check("SUTANDO SECURITY NOTICE" not in
-          (rtc.TASKS_DIR / "task-MOCK1.txt").read_text(),
+          (rtc.TASKS_DIR / "task-CLEANBODY.txt").read_text(),
           "no security notice on clean tasks")
     _hdrs = [ln for ln in _sec_body.split("\n") if ln.startswith("access_tier: ")]
     check(len(_hdrs) == 1, "notice introduces no second access_tier line")
