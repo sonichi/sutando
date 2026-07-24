@@ -10,10 +10,14 @@ Two pieces, both offline-first and fail-open:
 1. **`hooks/log-usage.py`** — a `PostToolUse` hook on the `Skill` tool.
    Appends `{"slug","ts"}` to `<workspace>/state/skill-usage-log.jsonl` on
    every skill invocation. Never blocks, never fails the invocation.
-   Registered in `~/.claude/settings.json`:
+   Registered in `~/.claude/settings.json` with `"async": true` — this is a
+   fire-and-forget usage logger, so it must run off the Skill critical path
+   (async keeps interpreter startup + file I/O out of every skill invocation's
+   latency):
 
    ```json
    {"PostToolUse": [{"matcher": "Skill", "hooks": [{"type": "command",
+     "async": true,
      "command": "python3 '<repo>/skills/skill-usage-report/hooks/log-usage.py'"}]}]}
    ```
 
