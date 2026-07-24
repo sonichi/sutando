@@ -47,15 +47,22 @@ def main() -> int:
     log = ws / "state" / "skill-usage-log.jsonl"
     pending = log.with_suffix(".jsonl.reporting")
 
-    # Recover a previously claimed log (failed or crashed mid-report), then
-    # claim the current one. A crash between rename and fold-back leaves ONLY
-    # the .reporting file — handle pending-with-no-active by plain rename.
+    # Recover a previously claimed log (failed or crashed mid-report) by
+    # folding it back INTO the active log — the same append direction as
+    # fold_back below, and the direction that is safe against concurrent
+    # async hook appends. The previous sequence (read active → unlink active
+    # → rename pending over it) destroyed any hook append that landed between
+    # the read and the unlink, and clobbered a fresh log created after the
+    # unlink (review race — real once the hook went async). Here the ACTIVE
+    # log is never unlinked or renamed-over: hook appends and this fold both
+    # use O_APPEND line writes, so they interleave without loss. open("a")
+    # creates the log if absent (the pending-with-no-active crash case). A
+    # crash between the append and the unlink re-folds the same events next
+    # run — at-least-once; duplicate usage counts are preferred to loss.
     if pending.exists():
-        if log.exists():
-            with pending.open("a", encoding="utf-8") as out, log.open("r", encoding="utf-8") as cur:
-                out.write(cur.read())
-            log.unlink()
-        pending.rename(log)
+        with log.open("a", encoding="utf-8") as out, pending.open("r", encoding="utf-8") as old:
+            out.write(old.read())
+        pending.unlink()
     if not log.exists() or log.stat().st_size == 0:
         print("usage-report: nothing to report")
         return 0

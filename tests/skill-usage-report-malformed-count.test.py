@@ -206,6 +206,37 @@ check("retry after fold_back: exit 0, aggregate intact (a:2, b:1)",
 rc, _ = run_case(None, no_log=True, ws_fallback=True)
 check("workspace fallback: exit 0, no POST", rc == 0 and not urlopen.posted)
 
+# 11. RACE regression (async-hook era): a hook append landing at the most
+# adversarial recovery moment — just as the stale claim is being released —
+# must survive and be reported. The old read→unlink→rename recovery destroyed
+# such appends (or clobbered a fresh log); the append-into-active direction
+# never unlinks/renames the active log, so the raced record stays. Under the
+# old code this patch fires at final claim-release instead and the raced
+# record misses the report — the case discriminates the two behaviors.
+import pathlib
+
+_real_unlink = pathlib.Path.unlink
+_race = {"fired": False}
+
+
+def _racing_unlink(self, *a, **k):
+    if self.name.endswith(".reporting") and not _race["fired"]:
+        _race["fired"] = True
+        with (self.parent / "skill-usage-log.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"slug": "raced", "ts": 999}) + "\n")
+    return _real_unlink(self, *a, **k)
+
+
+pathlib.Path.unlink = _racing_unlink
+try:
+    rc, ws = run_case([{"slug": "fresh", "ts": 300}], pre_pending=[{"slug": "stale", "ts": 100}])
+finally:
+    pathlib.Path.unlink = _real_unlink
+check("recovery race: exit 0", rc == 0, f"rc={rc}")
+check("recovery race: concurrent hook append SURVIVES recovery and is reported",
+      set(events_by_slug()) >= {"raced", "stale", "fresh"}, f"got {set(events_by_slug())}")
+check("recovery race: claim released, log drained", not claim(ws) and not active(ws))
+
 print()
 if failures:
     print(f"FAIL — {len(failures)} check(s): {failures}")
