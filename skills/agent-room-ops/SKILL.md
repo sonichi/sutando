@@ -48,22 +48,28 @@ layer (its CLAUDE.md equivalent) at connect time.
 **Addressing & delivery**
 - Address people/agents by **full mxid** (`@qingyun:ag2.space`), never a bare
   name ("001", "@qingyun"). Only a real `m.mention` notifies; plain text does
-  not. The relay auto-mentions room-member mxids found in your text and
-  auto-pings the asker of the task you're answering — but writing the full
-  mxid remains the convention (it's also what the auto-mention detects).
+  not. The platform relay auto-mentions room-member mxids found in your text
+  and auto-pings the asker of the task you're answering (server-side behavior)
+  — but writing the full mxid remains the convention (it's also what the
+  auto-mention detects).
 - **One reply path.** Answer a task EITHER via its result file OR via a direct
   `op:message` — never both (double delivery). If you already posted via
   op:message, put `[no-send]` in the result body.
 - Replies to a task go to its originating room by default. Redirect only with
   an explicit `[channel: <room-id>]` first line, and only when the reply truly
   belongs elsewhere.
+- The result-body markers above (`[no-send]`, `[REPLIED]`, `[channel: …]`) are
+  parsed by the task relay's marker module (`result_markers.parse_markers`,
+  consumed by the gateway task bridge) — they act on the RESULT-FILE path, not
+  on room ops; a direct `op:message` never needs them.
 
 **Formatting**
 - Message bodies render **markdown** — including tables, headers, bold, code —
   via `formatted_body`. Use a table for status reports/comparisons instead of
-  a wall of text. For interactive UI, attach an `a2ui` block (see
-  A2UI-CONTRACT.md). There is no separate "embed" primitive; markdown IS the
-  rich format.
+  a wall of text. For interactive UI, attach an `a2ui` block — the block
+  schema is defined by the platform's published A2UI contract (server-side
+  documentation; not shipped in this skill). There is no separate "embed"
+  primitive; markdown IS the rich format.
 - Discord-style 2000-char anxiety doesn't apply here (relay chunks at 4000),
   but keep posts scannable: lead with the conclusion.
 
@@ -87,8 +93,10 @@ layer (its CLAUDE.md equivalent) at connect time.
   with backoff (~3 tries over ~10s), then report the outage instead of
   spinning. Task intake (`/v1/tasks`) and room ops fail independently — a
   room-op outage doesn't mean your tasks stopped.
-- `create`/`invite` may be slow: use `joined_rooms` (room-list) to check
-  before creating — list-before-create is the idempotence rule.
+- `create`/`invite` may be slow. List-before-create is the idempotence rule;
+  the `rooms` (room-list) verb that enables it ships with the events-client
+  companion PR — until that lands, record created room ids immediately (e.g.
+  in your cron/config entry) and treat that record as the only handle.
 
 Every tool prints a structured JSON result and **exits 0** for any structured
 result (a graceful `ok:false` "no context / no-op" is not a failed task); usage
