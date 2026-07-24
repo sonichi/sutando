@@ -112,6 +112,36 @@ class CheckNodeRuntimeTest(unittest.TestCase):
         self.assertIn("v99.0.0", out["detail"])
         self.assertIn("bundled", out["detail"])
 
+    def test_down_when_version_below_floor(self):
+        # External review on #2182: node < 22.5 lacks node:sqlite — every other
+        # probe passes but bundled services crash at import. Must be DOWN.
+        with tempfile.TemporaryDirectory() as td:
+            node = Path(td) / "node"
+            node.write_text("#!/bin/sh\necho v20.11.0\n")
+            node.chmod(node.stat().st_mode | stat.S_IXUSR)
+            orig = hc.resolve_node_runtime
+            hc.resolve_node_runtime = lambda: {"source": "system", "path": str(node)}
+            try:
+                out = hc.check_node_runtime()
+            finally:
+                hc.resolve_node_runtime = orig
+        self.assertEqual(out["status"], "down")
+        self.assertIn("22.5 floor", out["detail"])
+
+    def test_warn_when_version_unparseable(self):
+        with tempfile.TemporaryDirectory() as td:
+            node = Path(td) / "node"
+            node.write_text("#!/bin/sh\necho weird-build\n")
+            node.chmod(node.stat().st_mode | stat.S_IXUSR)
+            orig = hc.resolve_node_runtime
+            hc.resolve_node_runtime = lambda: {"source": "system", "path": str(node)}
+            try:
+                out = hc.check_node_runtime()
+            finally:
+                hc.resolve_node_runtime = orig
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("unparseable", out["detail"])
+
     def test_down_when_version_probe_fails(self):
         # Codex re-review F3: a resolvable-but-broken binary means every JS
         # service dies at spawn — that is DOWN, not ok-with-a-note.

@@ -86,9 +86,18 @@ if [ -n "${SUTANDO_NODE:-}" ]; then
 elif [ -x "$_APP_NODE_DIR/node" ] && [ "${REPO#"$_APP_ENGINE_ROOT"/}" != "$REPO" ]; then
   BUNDLED_MODE=1
 fi
-if [ "$BUNDLED_MODE" = "1" ] && [ ! -f "$REPO/dist/web-client.js" ]; then
-  echo "✗ bundled mode: required dist artifacts missing ($REPO/dist/web-client.js) — desktop packaging error; refusing dev fallback (G1.5 fail-closed)"
-  exit 1
+if [ "$BUNDLED_MODE" = "1" ]; then
+  # Validate EVERY artifact of the build:bundle contract, not a representative
+  # one (external review on #2182): a missing voice/proxy/etc artifact would
+  # otherwise fail inside a background job while boot still prints ✓.
+  _MISSING_DIST=""
+  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers; do
+    [ -f "$REPO/dist/$_artifact.js" ] || _MISSING_DIST="$_MISSING_DIST $_artifact.js"
+  done
+  if [ -n "$_MISSING_DIST" ]; then
+    echo "✗ bundled mode: required dist artifacts missing ($REPO/dist:$_MISSING_DIST) — desktop packaging error; refusing dev fallback (G1.5 fail-closed)"
+    exit 1
+  fi
 fi
 if [ -n "${SUTANDO_NODE:-}" ]; then
   _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
