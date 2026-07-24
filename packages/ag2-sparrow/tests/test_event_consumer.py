@@ -55,6 +55,8 @@ def test_held_events_not_consumed():
     r1 = c.drain()
     check(r1["promoted"] == [] and r1["consumed"] == 0,
           "consumer: sub-threshold batch promotes nothing AND consumes nothing (held)")
+    check(h.has_pending() is True,
+          "consumer: handler reports a pending (un-flushed) batch")
     check([e["event_id"] for e in inbox.unconsumed()] == ["$a", "$b"],
           "consumer: held events stay unconsumed (survive restart)")
     inbox.insert(_ev("$c", 3))

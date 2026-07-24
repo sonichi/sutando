@@ -157,6 +157,104 @@ def test_channel_resumes_from_durable_cursor():
           "channel: resumes with Last-Event-ID = durable_cursor (offline replay)")
 
 
+def test_inbox_prune_and_close():
+    inbox = EventInbox(_tmpdb())
+    for i in range(1, 6):
+        inbox.insert(_ev(f"$c{i}", i))
+    inbox.mark_consumed(["$c1", "$c2", "$c3"])
+    # max_age_s=-1 → every consumed row counts as "old"; keep_last=1 keeps only
+    # the most-recent cursor, so the 3 consumed rows below it get pruned.
+    pruned = inbox.prune(max_age_s=-1, keep_last=1)
+    check(pruned == 3, "inbox: prune drops old CONSUMED events")
+    check([e["event_id"] for e in inbox.unconsumed()] == ["$c4", "$c5"],
+          "inbox: prune NEVER removes unconsumed events")
+    inbox.close()
+    check(True, "inbox: close() is clean")
+
+
+def test_channel_connect_error_is_retryable():
+    inbox = EventInbox(_tmpdb())
+    ch, retry = _run_once(inbox, open_error=urllib.error.URLError("boom"))
+    check(retry is True and ch.health["status"] == "reconnecting",
+          "channel: a connect URLError is retryable (reconnect, not fatal)")
+    ch2, retry2 = _run_once(inbox, open_error=urllib.error.HTTPError("u", 500, "x", {}, None))
+    check(retry2 is True and ch2.health["status"] == "reconnecting",
+          "channel: a non-fatal HTTP (500) is retryable")
+
+
+def test_channel_stream_drop_is_retryable():
+    inbox = EventInbox(_tmpdb())
+
+    class _BadStream:
+        def __iter__(self):
+            raise urllib.error.URLError("mid-stream drop")
+        def close(self):
+            pass
+    ch, retry = _run_once(inbox, _BadStream())
+    check(retry is True and ch.health["status"] == "reconnecting",
+          "channel: a mid-stream drop is retryable")
+
+
+def test_channel_run_loop_reconnects_then_stops():
+    inbox = EventInbox(_tmpdb())
+    ch = ec.EventChannel(inbox, "https://gw", {}, max_backoff=0.01)
+    calls = {"n": 0}
+
+    def _fake():
+        calls["n"] += 1
+        ch._set(last_cursor=calls["n"])   # progress each round → resets backoff ladder
+        return True
+    ch._consume_once = _fake
+    orig_sleep = ec.time.sleep
+    ec.time.sleep = lambda s: None
+    try:
+        ch.run(stop=lambda: calls["n"] >= 2)   # stop after 2 reconnect rounds
+    finally:
+        ec.time.sleep = orig_sleep
+    check(calls["n"] >= 2, "channel: run() loops + reconnects until stop()")
+    check(ch.health["status"] == "stopped" and ch.health["retry_count"] >= 1,
+          "channel: run() sets stopped + counts retries")
+
+
+def test_channel_run_stops_on_fatal():
+    inbox = EventInbox(_tmpdb())
+    ch = ec.EventChannel(inbox, "https://gw", {})
+    ch._consume_once = lambda: False   # fatal
+    ch.run(stop=lambda: False)
+    check(ch.health["status"] != "stopped",
+          "channel: run() returns immediately on fatal (does not spin to 'stopped')")
+
+
+def test_channel_nonnumeric_id_and_close_error_swallowed():
+    inbox = EventInbox(_tmpdb())
+
+    class _Resp:
+        def __init__(self, data):
+            self._b = io.BytesIO(data.encode())
+        def __iter__(self):
+            return iter(self._b)
+        def close(self):
+            raise OSError("close blew up")   # exercises the finally-except
+
+    # non-numeric SSE id → int(sse_id) raises → the cursor-derive is skipped, not fatal
+    body = 'id: notanumber\ndata: {"event_id":"$z","type":"message.created"}\n\n'
+    ch, retry = _run_once(inbox, _Resp(body))
+    check(retry is True and ch.health["status"] == "connected",
+          "channel: non-numeric id + close() OSError both swallowed → still retryable")
+
+
+def test_channel_generic_error_mid_stream_isolated():
+    inbox = EventInbox(_tmpdb())
+
+    def _boom(_ev):
+        raise RuntimeError("insert kaboom")   # a NON-URLError, mid-stream
+    inbox.insert = _boom
+    body = 'id: 4\ndata: {"event_id":"$q","type":"message.created"}\n\n'
+    ch, retry = _run_once(inbox, _sse_resp(body))
+    check(retry is True and ch.health["status"] == "reconnecting",
+          "channel: a generic mid-stream error is swallowed (isolation) → reconnect")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
