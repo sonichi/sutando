@@ -151,14 +151,14 @@ describe('parseTmuxPane', () => {
 	});
 
 	it('undefined input → idle (defensive)', () => {
-		// @ts-expect-error
+		// @ts-expect-error - deliberately passing undefined to test the defensive guard
 		const r = parseTmuxPane(undefined);
 		assert.equal(r.state, 'idle');
 		assert.equal(r.label, '');
 	});
 
 	it('non-string input → idle (defensive)', () => {
-		// @ts-expect-error
+		// @ts-expect-error - deliberately passing a non-string to test the defensive guard
 		const r = parseTmuxPane(42);
 		assert.equal(r.state, 'idle');
 		assert.equal(r.label, '');

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +27,12 @@ def transcripts_dir() -> Path:
     ws = subprocess.run(
         ["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
         capture_output=True, text=True, check=True).stdout.strip()
-    slug = str(REPO).replace("/", "-")
+    # Claude Code slugs the project path by dashing every non-alphanumeric
+    # character, not just "/" — e.g. ".../Application Support/space.ag2.app/..."
+    # becomes "...-Application-Support-space-ag2-app-...". Matching only "/"
+    # resolves to a nonexistent dir on any checkout path containing spaces
+    # or dots (observed 2026-07-20 on a desktop-bundled engine checkout).
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(REPO))
     return Path(ws) / ".claude-sutando" / "projects" / slug
 
 

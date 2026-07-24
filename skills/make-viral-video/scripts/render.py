@@ -469,12 +469,12 @@ def kenburns_clip(frame_path: Path, duration_s: float, clip_idx: int, clip_path:
     even = clip_idx % 2 == 0
 
     if even:
-        zoom_expr = f"min(zoom+0.0008,1.08)"
+        zoom_expr = "min(zoom+0.0008,1.08)"
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
     else:
         # zoom-out: start zoomed at 1.08, end at 1.00
-        zoom_expr = f"if(eq(on,0),1.08,max(zoom-0.0008,1.00))"
+        zoom_expr = "if(eq(on,0),1.08,max(zoom-0.0008,1.00))"
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
 
@@ -738,7 +738,7 @@ def main():
     if narrated_words_total > 0 and narration_dur > 0:
         for i in range(narration_frame_count):
             durations[i] = narration_dur * (frame_words[i] / narrated_words_total)
-        print(f"[render] word-share durations: " +
+        print("[render] word-share durations: " +
               " ".join(f"{frame_words[i]}w→{durations[i]:.1f}s" for i in range(narration_frame_count)),
               file=sys.stderr)
     else:

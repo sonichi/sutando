@@ -250,7 +250,54 @@ def _pgrep(pattern):
         return False
 
 
-def gateway_alive(app_data):
+# A healthy bridge rewrites gateway-status.json after every successful poll
+# round-trip, and its long-poll is REMOTE_TASK_POLL_WAIT (default 25s) with a
+# +10s request timeout — so ~35s is the worst-case gap between writes on a
+# working connection. 90s leaves room for a slow round-trip without letting a
+# genuinely stalled bridge read as alive.
+GATEWAY_STATUS_MAX_AGE_S = 90.0
+
+
+def _gateway_status(state_dir):
+    """Read the bridge's own liveness sidecar. Returns True/False if the file
+    is present and fresh, else None (meaning: no opinion, fall back to pgrep).
+    """
+    if not state_dir:
+        return None
+    try:
+        p = os.path.join(state_dir, "gateway-status.json")
+        with open(p) as fh:
+            data = json.load(fh)
+        ts = data.get("ts")
+        if not isinstance(ts, (int, float)):
+            return None
+        if time.time() - ts > GATEWAY_STATUS_MAX_AGE_S:
+            return None      # stale — the bridge may be wedged; let pgrep answer
+        return bool(data.get("connected"))
+    except Exception:
+        return None
+
+
+def gateway_alive(app_data, state_dir=None):
+    """Whether the relay gateway is up.
+
+    Prefer the bridge's OWN status sidecar (state/gateway-status.json), which
+    remote_gateway_bridge rewrites on every poll outcome. It reports whether the
+    connection is *serving*; the pgrep paths below only ever answered "is there a
+    process whose argv looks right", which is a proxy for the wrong thing.
+
+    That proxy was also wrong in practice: on a bundled install the pattern is the
+    app-data interpreter, so a bridge started under system python (as startup.sh
+    does with a bare `python3`) matched nothing. Observed 2026-07-21 — the bridge
+    was connected and writing a 3s-old status file while the supervisor pinned the
+    core at `gateway-down`, which surfaces as a standing health-check warning.
+
+    Falls back to the pgrep probes when the sidecar is missing or stale, so hosts
+    running a bridge too old to emit it keep their previous behavior.
+    """
+    verdict = _gateway_status(state_dir)
+    if verdict is not None:
+        return verdict
     # The bundled gateway runs from the app-data interpreter (see console_status:
     # keepalive cd's into $ENGINE so the argv is relative — match the app-unique
     # runtime-python dir, which uniquely scopes to THIS app's gateway). Gateway
@@ -308,7 +355,8 @@ def main():
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         state, detail, prompt, kind = compose_state(
-            pane or "", base.get("health", "unknown"), gateway_alive(a.app_data))
+            pane or "", base.get("health", "unknown"),
+            gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))))
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).

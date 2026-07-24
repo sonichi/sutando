@@ -115,7 +115,13 @@ COMMON_ENV=(
 )
 
 SYNC="$FIXTURE_REPO/scripts/sync-workspace.sh"
-HOST=$(hostname | sed 's/\..*//')
+# Must match sync-workspace.sh's own _host() precedence (scutil LocalHostName
+# before raw `hostname`, #1745) — not the naive `hostname | sed` recipe, which
+# can diverge from it on this exact machine and make this assertion fail
+# against a script that's actually behaving correctly. Resolved via the real
+# repo (not $FIXTURE_REPO, which doesn't carry src/util_paths.py) since this
+# is a fact about the machine, not the fixture.
+HOST=$(bash "$REPO/scripts/sutando-config.sh" host-label)
 # Post-wsId branch shape (`host/<hostname>/<wsId>`). WS_ID matches the override
 # set in COMMON_ENV above, so test assertions know the exact ref.
 WS_ID=t01ws1
