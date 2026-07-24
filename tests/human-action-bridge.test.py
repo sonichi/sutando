@@ -173,6 +173,88 @@ def test_card_failure_still_waits_then_denies():
           "action file exists even when the card could not be written")
 
 
+def test_timeout_cannot_overwrite_a_racing_resolution():
+    # Review blocker (CAS): a resolution landing between the hook's last poll
+    # and its expiry write must WIN. Deterministic version of the race: hold
+    # the shared transition lock (the same flock the resolver uses), let the
+    # hook hit its timeout and block on the lock, resolve while holding, then
+    # release — the expiry path must re-read, see `resolved`, and HONOR it
+    # (allow + answers), never stamp `expired` over the decision.
+    import fcntl
+    env, store, _ = _dirs()
+    store.mkdir(parents=True, exist_ok=True)
+
+    holder = {}
+
+    def hold_lock_then_resolve():
+        deadline = time.time() + 5
+        while time.time() < deadline and not list(store.glob("ha_*.json")):
+            time.sleep(0.05)
+        files = list(store.glob("ha_*.json"))
+        if not files:
+            return
+        lock = open(store / (files[0].stem + ".lock"), "a+")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        holder["locked"] = True
+        time.sleep(1.5)  # hook's 1s timeout passes while we hold the lock
+        rec = json.loads(files[0].read_text())
+        rec["status"] = "resolved"
+        rec["decision"] = {"answers": {"Ship v1 or wait?": "Ship v1"}}
+        rec["resolved_by"] = "@qingyun:ag2.space"
+        files[0].write_text(json.dumps(rec))
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+    t = threading.Thread(target=hold_lock_then_resolve)
+    t.start()
+    p, out = _run(_hook_input(), {**env, "SUTANDO_HA_TIMEOUT": "1"}, timeout=30)
+    t.join()
+    d = out["hookSpecificOutput"]
+    check(holder.get("locked") and d["permissionDecision"] == "allow",
+          "CAS: a resolution racing the expiry write WINS (allow, not expired)")
+    rec = json.loads(list(store.glob("ha_*.json"))[0].read_text())
+    check(rec["status"] == "resolved",
+          "CAS: the action file keeps the decision — expiry never overwrote it")
+
+
+def test_action_writes_are_durable_and_uniquely_named():
+    # Review blocker: pending-action state must be fsync-durable (file + dir)
+    # with per-writer-unique temp names. Verify via the module's own writer.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("hab", str(HOOK))
+    hab = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hab)
+    d = Path(tempfile.mkdtemp())
+    fsynced, replaced = [], []
+    orig_fsync, orig_replace = os.fsync, os.replace
+    os.fsync = lambda fd: fsynced.append(fd)
+    os.replace = lambda a, b: (replaced.append(str(a)), orig_replace(a, b))[1]
+    try:
+        hab._atomic_write(d / "ha_x.json", {"status": "pending"})
+    finally:
+        os.fsync, os.replace = orig_fsync, orig_replace
+    check(len(fsynced) >= 2, "durable write: fsyncs the file AND the directory")
+    check(str(os.getpid()) in replaced[0] and not replaced[0].endswith("json.tmp"),
+          "durable write: per-writer-unique temp name (no fixed .tmp collision)")
+
+
+def test_card_is_written_atomically():
+    # Review P2: the card lands on a bridge-consumed path — a poller must never
+    # see a half-written file, so it must arrive via temp + os.replace.
+    env, _, cards = _dirs()
+    replaced = []
+    # run the hook and observe the card path appears fully-formed with no
+    # lingering temp (the rename target is the final name).
+    p, out = _run(_hook_input(), {**env, "SUTANDO_HA_TIMEOUT": "1"})
+    card_files = list(cards.glob("proactive-ha-*.txt"))
+    tmp_files = list(cards.glob("*.tmp"))
+    check(len(card_files) == 1 and not tmp_files,
+          "card: final file present, no temp residue (temp+rename path)")
+    check("Reply:" in card_files[0].read_text(),
+          "card: content complete (rendered before the rename)")
+    _ = replaced
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

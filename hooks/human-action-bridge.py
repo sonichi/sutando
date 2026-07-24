@@ -41,11 +41,13 @@ tests/human-action-bridge.test.py): SUTANDO_HA_DIR (action-store dir),
 SUTANDO_HA_CARD_DIR (card dir), SUTANDO_HA_TIMEOUT (seconds, default 120),
 SUTANDO_HA_POLL (seconds, default 2).
 """
+import fcntl
 import hashlib
 import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 TOOL = "AskUserQuestion"
@@ -93,9 +95,32 @@ def _card_dir() -> Path:
 
 
 def _atomic_write(path: Path, payload: dict) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1))
+    """Durable atomic write: unique per-writer temp (the resolver may write the
+    same action concurrently — a fixed name could be clobbered mid-write),
+    fsync the data before rename and the directory entry after, so a crash can
+    never lose pending-action state (review blocker)."""
+    tmp = path.parent / f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(payload, ensure_ascii=False, indent=1))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    dfd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _transition_lock(path: Path):
+    """flock shared by EVERY writer of an action file — this hook's expiry path
+    AND the sparrow resolver (ActionStore.transition_lock uses the same
+    `<action_id>.lock` file). Serializes read→check→write so exactly one
+    terminal transition wins (review blocker: the timeout could overwrite a
+    decision that landed between its read and its write)."""
+    lock_file = open(path.parent / (path.stem + ".lock"), "a+")
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    return lock_file
 
 
 def _new_action(data: dict) -> dict:
@@ -153,17 +178,23 @@ def _poll_for_decision(path: Path, action: dict) -> "dict | None":
             if current.get("status") in ("cancelled", "expired"):
                 return None
         time.sleep(poll)
-    # Timeout: stamp expired IF still pending (a racing resolver keeps its win —
-    # re-read inside the same best-effort write).
+    # Timeout: expire ONLY if still pending, with read→check→write under the
+    # shared transition lock — a resolver landing in the gap keeps its win, and
+    # a late resolver can never overwrite `expired` (terminal immutability).
     try:
-        current = json.loads(path.read_text())
-        if current.get("status") == "pending":
-            current["status"] = "expired"
-            current.setdefault("audit", []).append({"at": time.time(), "event": "expired"})
-            _atomic_write(path, current)
-            return None
-        if current.get("status") == "resolved" and current.get("decision"):
-            return current  # resolved in the final poll gap — honor it
+        lk = _transition_lock(path)
+        try:
+            current = json.loads(path.read_text())
+            if current.get("status") == "pending":
+                current["status"] = "expired"
+                current.setdefault("audit", []).append({"at": time.time(), "event": "expired"})
+                _atomic_write(path, current)
+                return None
+            if current.get("status") == "resolved" and current.get("decision"):
+                return current  # resolved in the final poll gap — honor it
+        finally:
+            fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
+            lk.close()
     except (OSError, ValueError):
         pass
     return None
@@ -191,7 +222,11 @@ def main() -> None:
     try:
         card = _card_dir() / f"proactive-ha-{action['action_id']}.txt"
         card.parent.mkdir(parents=True, exist_ok=True)
-        card.write_text(_render_card(action))
+        # the proactive path is consumed by a bridge poller — write via temp +
+        # rename so it can never observe a half-written card (review P2)
+        card_tmp = card.parent / f"{card.name}.{os.getpid()}.tmp"
+        card_tmp.write_text(_render_card(action))
+        os.replace(card_tmp, card)
     except OSError as e:
         print(f"[human-action-bridge] card write failed (still waiting): {e}",
               file=sys.stderr)
