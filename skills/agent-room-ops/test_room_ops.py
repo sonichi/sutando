@@ -548,5 +548,369 @@ class MentionBodyTests(unittest.TestCase):
         self.assertTrue(p["body"].startswith("@sutando-qingyun-001:ag2.space"))
 
 
+import events as ev  # noqa: E402
+import rooms as rm  # noqa: E402
+import events_acceptance as ea  # noqa: E402
+
+
+# ----- rooms (#184 client half) ----- #
+class RoomsTests(EnvCase):
+    def test_no_gateway(self):
+        self.assertIn("no gateway", rm.joined_rooms(HS)["reason"])
+
+    def test_result_shape_and_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"ok": True, "rooms": [ROOM], "rooms_detailed": [{"room_id": ROOM, "name": "A"}]}
+        with mock.patch.object(rm, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
+            res = rm.joined_rooms(HS)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["rooms"], [ROOM])
+        self.assertEqual(res["rooms_detailed"][0]["room_id"], ROOM)
+        self.assertIsNone(res["reason"])
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        self.assertEqual(cap["payload"], {"op": "joined_rooms"})
+
+    def test_403_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(rm, "http_json", side_effect=err):
+            self.assertIn("not a joined member", rm.joined_rooms(HS)["reason"])
+
+
+# ----- events: subscription ops (#184) ----- #
+class EventsSubscribeTests(EnvCase):
+    def test_no_gateway(self):
+        self.assertIn("no gateway", ev.subscribe(ROOM, ["message.created"],
+                                                 agent_mxid=HS, gate=None)["reason"])
+
+    def test_gate_deny(self):
+        os.environ["RELAY_URL"] = "https://r"
+        self.assertIn("gate denied",
+                      ev.subscribe(ROOM, ["message.created"], agent_mxid=HS, gate={})["reason"])
+
+    def test_subscribe_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"ok": True, "subscription_id": "sub-1"}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
+            res = ev.subscribe(ROOM, ["message.created", "reaction.added"],
+                               filters={"actor": "@x:hs"}, agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["subscription_id"], "sub-1")
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        self.assertEqual(cap["payload"], {"op": "events_subscribe", "room_id": ROOM,
+                                          "event_types": ["message.created", "reaction.added"],
+                                          "filters": {"actor": "@x:hs"}})
+
+    def test_subscribe_omits_absent_filters(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {"ok": True}))[1]):
+            ev.subscribe(ROOM, ["message.created"], agent_mxid=HS, gate=None)
+        self.assertNotIn("filters", cap["payload"])
+
+    def test_unsubscribe_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {"ok": True}))[1]):
+            res = ev.unsubscribe(ROOM, agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"], {"op": "events_unsubscribe", "room_id": ROOM})
+
+    def test_subscriptions_no_room_no_gate(self):
+        # `events_subscriptions` has no room target → the per-room gate must
+        # NOT be consulted (an empty gate would otherwise deny everything).
+        os.environ["RELAY_URL"] = "https://r"
+        os.environ["ROOM_OPS_GATE"] = "/nonexistent/but-empty-would-deny.json"
+        cap = {}
+        fake = {"ok": True, "subscriptions": [{"room_id": ROOM, "subscription_id": "sub-1"}]}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, fake))[1]):
+            res = ev.subscriptions(HS)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["subscriptions"][0]["subscription_id"], "sub-1")
+        self.assertEqual(cap["payload"], {"op": "events_subscriptions"})
+
+    def test_403_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(ev, "http_json", side_effect=err):
+            self.assertIn("not a joined member",
+                          ev.subscribe(ROOM, ["message.created"], agent_mxid=HS, gate=None)["reason"])
+
+
+# ----- events: long-poll pull ----- #
+class EventsPullTests(EnvCase):
+    def test_no_gateway(self):
+        res = ev.pull(cursor=3)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["cursor"], 3)  # cursor passes through unchanged
+
+    def test_pull_url_and_timeout(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"ok": True, "events": [], "cursor": 7}
+        with mock.patch.object(ev, "_http_get_json",
+                               side_effect=lambda u, h, t: (cap.update(url=u, headers=h, timeout=t), fake)[1]):
+            res = ev.pull(cursor=7, wait=5)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["cursor"], 7)
+        self.assertIn("/v1/events?", cap["url"])
+        self.assertIn("cursor=7", cap["url"])
+        self.assertIn("wait=5", cap["url"])
+        # Socket timeout must OUTLIVE the server's hold window (wait) or every
+        # quiet poll dies mid-hold instead of returning empty events.
+        self.assertGreater(cap["timeout"], 5)
+        # Contract: User-Agent required on every request, like everything else.
+        self.assertIn("User-Agent", cap["headers"])
+
+    def test_404_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 404, "nf", {}, None)
+        with mock.patch.object(ev, "_http_get_json", side_effect=err):
+            self.assertIn("unimplemented", ev.pull()["reason"])
+
+
+# ----- events: SSE frame parser ----- #
+class SSEFrameTests(unittest.TestCase):
+    def _frames(self, text):
+        return list(ev.sse_frames(text.split("\n")))
+
+    def test_id_data_blank_dispatch(self):
+        fr = self._frames('id: 5\ndata: {"a":1}\n\n')
+        self.assertEqual(fr, [("event", "5", '{"a":1}')])
+
+    def test_multiline_data_accumulates(self):
+        fr = self._frames("id: 6\ndata: line1\ndata: line2\n\n")
+        self.assertEqual(fr, [("event", "6", "line1\nline2")])
+
+    def test_keepalive_comment(self):
+        fr = self._frames(": ping\n\n")
+        self.assertEqual(fr, [("comment", None, "ping")])
+
+    def test_no_dispatch_without_blank_line(self):
+        # A frame is only dispatched by its terminating blank line — a torn
+        # tail at disconnect must NOT surface as a (partial) event.
+        self.assertEqual(self._frames('data: {"a":1}'), [])
+
+    def test_id_is_sticky_across_frames(self):
+        fr = self._frames("id: 9\ndata: a\n\ndata: b\n\n")
+        self.assertEqual(fr[1], ("event", "9", "b"))
+
+    def test_unknown_fields_ignored(self):
+        fr = self._frames("event: message\nretry: 100\nid: 3\ndata: x\n\n")
+        self.assertEqual(fr, [("event", "3", "x")])
+
+
+# ----- events: stream ----- #
+def _sse_resp(text):
+    return io.BytesIO(text.encode())
+
+
+class EventsStreamTests(EnvCase):
+    def test_no_gateway_raises_runtimeerror(self):
+        with self.assertRaises(RuntimeError):
+            ev.stream(on_event=lambda c, e: None)
+
+    def test_last_event_id_header_and_delivery(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap, got = {}, []
+        body = 'id: 7\ndata: {"event_id":"$e","cursor":7,"type":"message.created"}\n\n'
+
+        def fake_open(url, headers):
+            cap.update(url=url, headers=headers)
+            return _sse_resp(body)
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open):
+            cur = ev.stream(cursor=42, on_event=lambda c, e: got.append((c, e)), max_events=1)
+        self.assertEqual(cap["headers"]["Last-Event-ID"], "42")
+        self.assertEqual(cap["headers"]["Accept"], "text/event-stream")
+        self.assertTrue(cap["url"].endswith("/v1/events/stream"))
+        self.assertEqual(got[0][0], 7)
+        self.assertEqual(got[0][1]["event_id"], "$e")
+        self.assertEqual(cur, 7)
+
+    def test_no_cursor_no_header(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+
+        def fake_open(url, headers):
+            cap.update(headers=headers)
+            return _sse_resp('id: 1\ndata: {"cursor":1}\n\n')
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open):
+            ev.stream(on_event=lambda c, e: None, max_events=1)
+        self.assertNotIn("Last-Event-ID", cap["headers"])
+
+    def test_keepalive_cb_and_eof_raises(self):
+        os.environ["RELAY_URL"] = "https://r"
+        pings = []
+        with mock.patch.object(ev, "_open_stream", return_value=_sse_resp(": ping\n\n")):
+            with self.assertRaises(ev.StreamDisconnected):
+                ev.stream(on_event=lambda c, e: None, keepalive_cb=pings.append)
+        self.assertEqual(pings, ["ping"])
+
+    def test_403_open_raises_runtimeerror(self):
+        # Permission problems must NOT look like a transient disconnect, or the
+        # resume wrapper would retry a hopeless connection forever.
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(ev, "_open_stream", side_effect=err):
+            with self.assertRaises(RuntimeError):
+                ev.stream(on_event=lambda c, e: None)
+
+
+# ----- events: durable cursor ----- #
+class CursorFileTests(unittest.TestCase):
+    def test_save_load_roundtrip_atomic(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "cursor")
+        ev.save_cursor(p, 41)
+        ev.save_cursor(p, 42)  # overwrite goes through the same tmp+rename path
+        self.assertEqual(ev.load_cursor(p), 42)
+        self.assertFalse(os.path.exists(p + ".tmp"))  # rename consumed the tmp
+
+    def test_load_missing_is_none(self):
+        self.assertIsNone(ev.load_cursor("/nonexistent/cursor"))
+
+    def test_load_garbled_is_none(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "cursor")
+        open(p, "w").write("junk")
+        self.assertIsNone(ev.load_cursor(p))
+
+
+class StreamWithResumeTests(EnvCase):
+    def test_resumes_from_file_and_persists_each_event(self):
+        os.environ["RELAY_URL"] = "https://r"
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")
+        ev.save_cursor(cf, 10)
+        cap, got = {"resume_ids": []}, []
+        body = ('id: 11\ndata: {"event_id":"$a","cursor":11}\n\n'
+                'id: 12\ndata: {"event_id":"$b","cursor":12}\n\n')
+
+        def fake_open(url, headers):
+            cap["resume_ids"].append(headers.get("Last-Event-ID"))
+            return _sse_resp(body)
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open):
+            cur = ev.stream_with_resume(cf, lambda c, e: got.append(c), max_events=2)
+        self.assertEqual(cap["resume_ids"][0], "10")  # resumed from the file
+        self.assertEqual(got, [11, 12])
+        self.assertEqual(ev.load_cursor(cf), 12)      # last delivered persisted
+        self.assertEqual(cur, 12)
+
+    def test_reconnects_with_backoff_after_disconnect(self):
+        os.environ["RELAY_URL"] = "https://r"
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")
+        calls, naps = {"n": 0}, []
+
+        def fake_open(url, headers):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _sse_resp(": ping\n\n")  # EOF → StreamDisconnected
+            return _sse_resp('id: 1\ndata: {"event_id":"$a","cursor":1}\n\n')
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open), \
+             mock.patch.object(ev.time, "sleep", side_effect=naps.append):
+            cur = ev.stream_with_resume(cf, lambda c, e: None, max_events=1)
+        self.assertEqual(cur, 1)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(naps, [1.0])  # the ladder starts at 1s
+
+
+# ----- events CLI ----- #
+class EventsCliTests(EnvCase):
+    def test_rooms_exits_zero(self):
+        self.assertEqual(room_ops._main(["rooms", "--agent", HS]), 0)
+
+    def test_events_pull_exits_zero_no_gateway(self):
+        self.assertEqual(room_ops._main(["events", "pull"]), 0)
+
+    def test_events_subscribe_bad_filters_structured(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_ = room_ops._main(["events", "subscribe", ROOM, "--types", "message.created",
+                                  "--filters", "{not json", "--agent", HS])
+        self.assertEqual(rc_, 0)
+        res = json.loads(buf.getvalue())
+        self.assertFalse(res["ok"])
+        self.assertIn("not valid JSON", res["reason"])
+
+    def test_events_stream_no_gateway_structured(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_ = room_ops._main(["events", "stream", "--once"])
+        self.assertEqual(rc_, 0)
+        out = json.loads(buf.getvalue().strip().split("\n")[-1])
+        self.assertFalse(out["ok"])
+        self.assertIn("no gateway", out["reason"])
+
+
+# ----- taskify accumulator (events_acceptance) ----- #
+class EventAccumulatorTests(unittest.TestCase):
+    @staticmethod
+    def _env(eid, actor, etype="message.created", room=ROOM):
+        return {"event_id": eid, "type": etype, "room_id": room, "actor_id": actor,
+                "ts": 0, "content": {}}
+
+    def test_threshold_promotion_skips_self_and_dups(self):
+        d = tempfile.mkdtemp()
+        acc = ea.EventAccumulator(ROOM, HS, 3, d)
+        feed = [
+            (1, self._env("$self1", HS)),                        # self → skip
+            (2, self._env("$a", "@u:hs")),                       # counts (1)
+            (3, self._env("$self2", HS)),                        # self → skip
+            (4, self._env("$b", "@u:hs", "reaction.added")),     # counts (2)
+            (5, self._env("$a", "@u:hs")),                       # duplicate → skip
+            (6, self._env("$c", "@u:hs")),                       # counts (3) → promote
+        ]
+        paths = [p for cur, e in feed for p in [acc.offer(cur, e)] if p]
+        self.assertEqual(len(paths), 1)
+
+        base = os.path.basename(paths[0])
+        self.assertTrue(base.startswith("task-") and base.endswith(".txt"))
+        lines = open(paths[0]).read().split("\n")
+        self.assertEqual(lines[0], f"id: {base[:-4]}")
+        self.assertTrue(lines[1].startswith("timestamp: ") and lines[1].endswith("Z"))
+        # Origin must be explicit at a glance: the [taskify] marker leads the
+        # task line and the promoted-from suffix names the room.
+        self.assertTrue(lines[2].startswith("task: [taskify] "))
+        self.assertIn("2 messages, 1 reaction", lines[2])
+        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[2])
+        self.assertEqual(lines[3], "source: events-promotion")
+        self.assertEqual(lines[4], f"channel_id: {ROOM}")
+        self.assertEqual(lines[5], "priority: low")          # never outranks humans
+        self.assertEqual(lines[6], "model_hint: efficient")  # cheap-model eligible
+        self.assertEqual(lines[7], "access_tier: owner")
+        self.assertEqual(lines[8], "")
+        prov = json.loads(lines[9].split("provenance: ", 1)[1])
+        self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])
+        self.assertEqual(prov["promotion_reason"], "threshold 3 meaningful events")
+        self.assertEqual(prov["cursor_range"], [2, 6])
+
+    def test_wrong_room_and_state_changed_do_not_count(self):
+        d = tempfile.mkdtemp()
+        acc = ea.EventAccumulator(ROOM, HS, 1, d)
+        self.assertIsNone(acc.offer(1, self._env("$x", "@u:hs", room="!other:hs")))
+        self.assertIsNone(acc.offer(2, self._env("$y", "@u:hs", "room.state_changed")))
+
+    def test_each_batch_promotes_once_and_resets(self):
+        d = tempfile.mkdtemp()
+        acc = ea.EventAccumulator(ROOM, HS, 1, d)
+        p1 = acc.offer(1, self._env("$x", "@u:hs"))
+        p2 = acc.offer(2, self._env("$y", "@u:hs"))
+        self.assertTrue(p1 and p2)
+        self.assertNotEqual(p1, p2)  # same-ms collision guard: distinct files
+        self.assertIn("1 message", open(p1).read())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
