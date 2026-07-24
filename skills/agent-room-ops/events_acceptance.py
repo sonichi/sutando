@@ -11,12 +11,26 @@ Modes:
            message's event id (`content.message_id`) via the existing react
            verb, and print a JSON status line — the observe→act round-trip.
   print    print every delivered envelope as a JSON line (passive observation).
-  taskify  accumulate meaningful events and promote every N of them into ONE
-           task file in --task-dir (see EventAccumulator).
+  taskify  TEST-ONLY: accumulate meaningful events and promote every N of
+           them into ONE task file in --task-dir (see EventAccumulator).
+           Exercises the promotion contract for acceptance evidence; the
+           PRODUCTION taskify consumer is ag2-sparrow's (see POSITIONING).
 
 Every mode streams via stream_with_resume(--cursor-file): kill the runner,
 restart it, and delivery resumes from the persisted cursor — the replayed
 window is the at-least-once proof.
+
+POSITIONING (decided with the owner, 2026-07-24): this runner is an
+ACCEPTANCE/DEBUG HARNESS, not a production consumer. Production event
+streaming + taskify promotion belong to the ag2-sparrow long-running client
+(EventChannel/EventInbox/TaskifyHandler — durable SQLite inbox, crash-safe
+exactly-once promotion, human-action decision routing), enabled via
+SPARROW_EVENTS in the gateway bridge. Never run this runner's `taskify` mode
+against a room the sparrow consumer is also draining: two consumers with
+independent cursors will promote the same events twice. What THIS module and
+events.py remain canonical for: subscription management (subscribe/
+unsubscribe/rooms), ad-hoc pull/print debugging, and scripted acceptance
+evidence — the control-plane half, bridge-independent by design.
 """
 from __future__ import annotations
 
@@ -222,7 +236,9 @@ def _main(argv):
                                  description="#184 events-client acceptance runner")
     ap.add_argument("--room", required=True)
     ap.add_argument("--cursor-file", required=True)
-    ap.add_argument("--mode", choices=["react", "print", "taskify"], default="react")
+    ap.add_argument("--mode", choices=["react", "print", "taskify"], default="react",
+                    help="react|print|taskify — taskify is TEST-ONLY (acceptance "
+                         "harness); production promotion is the sparrow consumer")
     ap.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
     ap.add_argument("--max-events", type=int, default=None,
                     help="stop after N delivered events (scripted acceptance)")
