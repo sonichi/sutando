@@ -93,10 +93,12 @@ layer (its CLAUDE.md equivalent) at connect time.
   with backoff (~3 tries over ~10s), then report the outage instead of
   spinning. Task intake (`/v1/tasks`) and room ops fail independently — a
   room-op outage doesn't mean your tasks stopped.
-- `create`/`invite` may be slow. List-before-create is the idempotence rule;
-  the `rooms` (room-list) verb that enables it ships with the events-client
-  companion PR — until that lands, record created room ids immediately (e.g.
-  in your cron/config entry) and treat that record as the only handle.
+- `create`/`invite` may be slow. List-before-create is the idempotence rule:
+  `python3 room_ops.py rooms` lists this agent's joined rooms (`rooms.py`,
+  op `joined_rooms`) — check it before creating. Still record created room
+  ids immediately (e.g. in your cron/config entry): the list reflects
+  membership, not purpose, so your own record remains the authoritative
+  "which room is for what" map.
 
 Every tool prints a structured JSON result and **exits 0** for any structured
 result (a graceful `ok:false` "no context / no-op" is not a failed task); usage
