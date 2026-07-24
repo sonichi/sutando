@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Hardcoded-path scanner for review-checks.sh (kept as a sibling file so the
 shell runner never embeds a heredoc inside $(), which macOS's bash 3.2
-mis-parses). Inputs via env: RC_FLAGS / RC_ALLOWS (newline-separated pattern
-lists from the guide's checks: block) and RC_DIFF (the unified diff). Prints one
-`file:line: hardcoded path (tok): text` per violation to stdout; exit is always
-0 — the caller decides pass/fail from whether anything was printed."""
+mis-parses). The pattern lists come via env (RC_FLAGS / RC_ALLOWS — small,
+newline-separated lists from the guide's checks: block); the unified diff is
+read from STDIN, never argv/env, so an ~8MB PR diff can't blow the OS
+'Argument list too long' limit and make the scan silently skip (#2281). Prints
+one `file:line: hardcoded path (tok): text` per violation to stdout; exit is 0
+when the scan runs (with or without hits — the caller decides pass/fail from
+whether anything was printed) and non-zero only if the scanner itself crashes,
+so the runner can fail closed."""
 import os
 import re
 import sys
@@ -40,11 +44,12 @@ def allowed(tok):
 
 
 def main():
+    diff = sys.stdin.read()  # streamed by the runner — see module docstring (#2281)
     skip = False
     ln = 0
     cur_file = ""
     hits = 0
-    for raw in os.environ.get("RC_DIFF", "").split("\n"):
+    for raw in diff.split("\n"):
         if raw.startswith("+++ "):
             f = raw[4:].split("\t")[0]
             if f.startswith("b/"):

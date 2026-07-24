@@ -37,11 +37,16 @@ def ok(name, cond):
 
 
 def scan(diff):
-    """Run main() with RC_DIFF=diff, return (exit, stdout)."""
-    os.environ["RC_DIFF"] = diff
+    """Run main() with `diff` fed on STDIN (the runner streams it there — #2281),
+    return (exit, stdout)."""
+    old_stdin = sys.stdin
+    sys.stdin = io.StringIO(diff)
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        code = rc.main()
+    try:
+        with contextlib.redirect_stdout(buf):
+            code = rc.main()
+    finally:
+        sys.stdin = old_stdin
     return code, buf.getvalue()
 
 
@@ -96,6 +101,19 @@ ok("mixed forbidden+allowed still flags real path", "/Users/a" in out)
 
 code, out = scan("")
 ok("empty diff -> no output, exit 0", code == 0 and out == "")
+
+# --- oversized input can't bypass the scan (#2281) --------------------------
+# A diff far larger than the OS argv/env limit (~1MB on macOS) used to be passed
+# via the RC_DIFF env var and blew 'Argument list too long', silently skipping
+# the scan. Streamed on stdin it must still flag the embedded hardcoded path.
+big = ["+++ b/big.js", "@@ -1,0 +1,200001 @@"]
+big += ["+const filler = resolveWorkspace();"] * 200000
+big += ['+const home = "/Users/alice/secret";']
+big_diff = "\n".join(big)
+assert len(big_diff) > 1048576, "regression fixture must exceed ARG_MAX"
+code, out = scan(big_diff)
+ok("oversized diff (>ARG_MAX) still flags hardcoded path",
+   code == 0 and "big.js:200001:" in out and "/Users/alice/secret" in out)
 
 print("---")
 if failed:

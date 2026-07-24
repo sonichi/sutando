@@ -15,7 +15,8 @@
 # Guide resolution: --guide wins; else <repo>/REVIEW.md. Missing
 # guide -> generic fallback patterns + a stderr note (degrades safely).
 #
-# Exit: 0 = clean; 1 = a check flagged something; 2 = usage error.
+# Exit: 0 = clean; 1 = a check flagged something; 2 = usage error OR the scanner
+#       failed to launch/run (fail-closed — NEVER print PASS in that case).
 set -u
 
 DIFF_FILE=""
@@ -74,8 +75,18 @@ fi
 # --- scan ADDED diff lines for flagged hardcoded paths -----------------------
 # The scan itself is a sibling Python file (robust string handling; and keeping
 # it out of a $() heredoc dodges macOS bash 3.2's heredoc-in-$() mis-parse).
-# Patterns + diff are passed via env.
-HITS="$(RC_FLAGS="$FLAGS" RC_ALLOWS="$ALLOWS" RC_DIFF="$DIFF" python3 "$HERE/review-checks.py")"
+# Patterns pass via env (small); the diff is STREAMED via stdin — never argv/env
+# — so a large PR diff (~8MB) can't hit 'Argument list too long' and make the
+# scanner fail to launch while we blindly print PASS (#2281). `printf` is a bash
+# builtin, so piping the whole diff carries no exec-size limit.
+HITS="$(printf '%s' "$DIFF" | RC_FLAGS="$FLAGS" RC_ALLOWS="$ALLOWS" python3 "$HERE/review-checks.py")"
+SCAN_RC=$?
+# Fail closed: if the scanner didn't run to completion (exec failure, crash),
+# its exit is non-zero. Do NOT interpret an empty stdout as "clean" — error out.
+if [[ $SCAN_RC -ne 0 ]]; then
+    echo "review-checks: ERROR — hardcoded-paths scanner failed to run (exit $SCAN_RC); failing closed (NOT a pass)." >&2
+    exit 2
+fi
 
 [[ -n "$NOTE" ]] && echo "review-checks: $NOTE" >&2
 

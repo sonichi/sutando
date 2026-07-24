@@ -42,6 +42,22 @@ check "explicit --guide is honored"                   flag  $'+++ b/z.ts\n@@ -1,
 check "missing guide falls back, still flags /Users/" flag  $'+++ b/z.ts\n@@ -1,0 +1,1 @@\n+const p="/Users/a/b";' --guide /does/not/exist
 check "empty diff exits 0 (nothing to check)"         clean $''
 
+# --- oversized input can't silently bypass the scan (#2281) -------------------
+# A diff far larger than the OS argv/env limit (~1MB on macOS) used to be handed
+# to the Python scanner via the RC_DIFF env var, which blew 'Argument list too
+# long' — the scanner never launched, yet the runner still printed PASS/exit 0.
+# Streamed via stdin the embedded hardcoded path must still be flagged (exit 1),
+# and it must never silently PASS.
+big_out="$( { printf '+++ b/big.js\n@@ -1,0 +1,200001 @@\n'; \
+              yes '+const filler = resolveWorkspace();' | head -n 200000; \
+              printf '+const home = "/Users/alice/secret";\n'; } \
+            | bash "$RUNNER" 2>/dev/null )"; big_rc=$?
+if [ "$big_rc" = 1 ] && [ -z "$big_out" ]; then
+    echo "ok   oversized diff still flags (no silent PASS)"; pass=$((pass+1))
+else
+    echo "FAIL oversized diff bypassed scan (rc=$big_rc, stdout='$big_out')"; fail=$((fail+1))
+fi
+
 # --- guide's own checks: block is parseable ----------------------------------
 if grep -q "hardcoded-paths:" "$GUIDE" && grep -qE "^\s*flag:" "$GUIDE"; then
     echo "ok   REVIEW.md carries a hardcoded-paths checks: block"; pass=$((pass+1))
