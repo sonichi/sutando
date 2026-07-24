@@ -177,19 +177,33 @@ class EventConsumer:
         self._batch = batch
 
     def drain(self) -> dict:
-        events = self._inbox.unconsumed(self._batch)
         settled: list = []
         promoted_before = getattr(self._handler, "last_path", None)
         promoted: list = []
-        for ev in events:
-            s = self._handler.offer(ev)
-            settled.extend(s)
-            lp = getattr(self._handler, "last_path", None)
-            if lp and lp != promoted_before and lp not in promoted:
-                promoted.append(lp)
-                promoted_before = lp
+        seen = 0
+        after: "int | None" = None
+        # Page through the WHOLE unconsumed backlog, anchoring each page past
+        # the previous one by cursor. Held (sub-threshold) rows stay unconsumed
+        # for crash recovery, but they can no longer pin the read window — a
+        # later event that completes some room's batch is always reached
+        # (review P1: 100 held single-event rooms starved every newer event).
+        while True:
+            events = self._inbox.unconsumed(self._batch, after=after)
+            if not events:
+                break
+            seen += len(events)
+            for ev in events:
+                s = self._handler.offer(ev)
+                settled.extend(s)
+                lp = getattr(self._handler, "last_path", None)
+                if lp and lp != promoted_before and lp not in promoted:
+                    promoted.append(lp)
+                    promoted_before = lp
+            after = events[-1].get("cursor")
+            if not isinstance(after, int) or len(events) < self._batch:
+                break
         # Mark consumed ONLY settled events (skipped or in a flushed batch).
         # Events still held in the handler's pending batch stay UNCONSUMED, so a
         # crash re-drains them (no loss); the handler dedups them on re-drain.
         self._inbox.mark_consumed(settled)
-        return {"seen": len(events), "promoted": promoted, "consumed": len(settled)}
+        return {"seen": seen, "promoted": promoted, "consumed": len(settled)}
