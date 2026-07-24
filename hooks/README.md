@@ -61,6 +61,30 @@ Test: `python3 tests/skip-ask-user-question.test.py` (hook) and
 Config paths are env-overridable for testing: `SUTANDO_DISCORD_ACCESS_FILE`,
 `SUTANDO_DISCORD_ENV_FILE`, `SUTANDO_WORKSPACE`. Test: `python3 tests/context-source-guard.test.py`.
 
+## `human-action-bridge.py`
+
+Upgrades the `AskUserQuestion` hard-deny into a **remote ask** (human-action
+bridge v1 step 1 — design: `workspace notes/tasks-events/human_action_bridge_design.md`).
+On an `AskUserQuestion` call it writes a durable pending-action file
+(`<workspace>/state/human-actions/ha_*.json`), drops a question card for the
+owner (`results/proactive-ha-*.txt` — the sanctioned proactive path), and
+polls the action file for a bounded window. A resolved decision returns
+PreToolUse `allow` with `updatedInput.answers` (Claude continues as if answered
+locally); **timeout or cancellation denies** with the same decide-autonomously
+guidance `skip-ask-user-question.py` ships — so with no resolver present the
+behavior is exactly today's. Timeout NEVER approves; fail-**open** for the
+session, fail-**closed** for the decision. Decisions are written by the sparrow
+`DecisionHandler` (bridge v1 step 3) or by the core when the owner's answer
+arrives as a normal task.
+
+Register under `PreToolUse` matcher `"AskUserQuestion"` **instead of**
+`skip-ask-user-question.py` (the timeout branch subsumes it). Not yet
+auto-registered — flipping `build-core-settings.mjs` over is a follow-up once
+the decision path is live end-to-end.
+
+Test: `python3 tests/human-action-bridge.test.py`. Test-only env overrides:
+`SUTANDO_HA_DIR`, `SUTANDO_HA_CARD_DIR`, `SUTANDO_HA_TIMEOUT`, `SUTANDO_HA_POLL`.
+
 ## `gmail-write-guard.py`
 
 Denies the **claude.ai Gmail MCP connector's WRITE-scoped tools** (create_draft,
