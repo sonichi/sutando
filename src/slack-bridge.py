@@ -94,6 +94,14 @@ INBOX_DIR = REPO / "slack-inbox"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
+# Durable on-disk backup of the Slack access allowlist. The in-memory
+# _access_cache restores access.json after an intermittent wipe (#899) ONLY
+# while the process lives; a wipe + process restart (observed 2026-07-17 —
+# the bridge booted into TOFU and would have enrolled the next DM'er as owner)
+# loses the cache. This backup lives under state/auth/ (per CLAUDE.md, the
+# cleanup-exempt per-host install-state dir) so a restart can restore the
+# allowlist from disk instead of falling through to a security-exposing TOFU.
+ACCESS_BACKUP_FILE = STATE_DIR / "auth" / "slack-access-backup.json"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -255,6 +263,65 @@ def _update_access_cache(data: dict) -> None:
     with _access_cache_lock:
         _access_cache = data
         _access_cache_mtime = mtime
+    _backup_access_to_disk(data)
+
+
+def _is_valid_access_doc(data) -> bool:
+    """A structurally valid access-control document worth backing up / restoring.
+
+    The core schema is an ``allowFrom`` list. Three states qualify and MUST be
+    protected, none of which ``tofuOwner`` alone covers (CR #2163, qingyun-wu):
+      - a TOFU-enrolled allowlist (has ``tofuOwner``);
+      - a legacy populated allowlist enrolled before ``tofuOwner`` existed;
+      - the intentional locked-down state ``allowFrom: []``.
+    Only a transient/partial wipe — a non-dict, a parse failure, or a
+    missing/non-list ``allowFrom`` — is rejected, so it can't overwrite a good
+    backup. (A slack wipe deletes access.json rather than rewriting it to empty,
+    so an empty allowlist reaches this path only when it was written on purpose.)
+    """
+    return isinstance(data, dict) and isinstance(data.get("allowFrom"), list)
+
+
+def _backup_access_to_disk(data: dict) -> None:
+    """Persist a copy of a VALID access-control document to the durable backup.
+    Backs up any structurally valid state (see ``_is_valid_access_doc``) —
+    including a legacy populated allowlist or an intentional empty lockdown —
+    but never a transient/partial wipe, so a wipe can't overwrite the good
+    backup."""
+    if not _is_valid_access_doc(data):
+        return
+    try:
+        ACCESS_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCESS_BACKUP_FILE.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(ACCESS_BACKUP_FILE, 0o600)
+    except OSError:
+        pass  # best-effort; backup must never break the write path
+
+
+def _restore_access_from_disk() -> bool:
+    """Restore access.json from the durable on-disk backup. Survives process
+    death (unlike the in-memory cache), closing the wipe+restart -> TOFU
+    exposure. Returns True if restored."""
+    try:
+        backup = json.loads(ACCESS_BACKUP_FILE.read_text())
+    except Exception:
+        return False
+    if not _is_valid_access_doc(backup):
+        return False
+    try:
+        ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCESS_FILE.write_text(json.dumps(backup, indent=2) + "\n")
+        os.chmod(ACCESS_FILE, 0o600)
+        _update_access_cache(backup)
+        print(
+            "  [access] restored access.json from durable on-disk backup "
+            "(wipe survived a restart — #899 defense-in-depth)",
+            flush=True,
+        )
+        return True
+    except Exception as e:
+        print(f"  [access] disk-backup restore failed: {e}", flush=True)
+        return False
 
 
 def _restore_access_from_cache() -> bool:
@@ -325,6 +392,11 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
         return load_allowed() or set()
     # File is missing. Was it externally deleted after a prior onboarding?
     if _restore_access_from_cache():
+        return load_allowed() or set()
+    # In-memory cache is empty too (e.g. this is a fresh process after a
+    # wipe + restart). Try the durable on-disk backup before enrolling —
+    # otherwise a wiped allowlist would TOFU-enroll the next DM'er as owner.
+    if _restore_access_from_disk():
         return load_allowed() or set()
     # Genuine first-time TOFU.
     ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
