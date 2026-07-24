@@ -85,6 +85,7 @@ case "$cmd" in
             -e "s|__REPO__|$REPO|g" \
             -e "s|__WORKSPACE__|$WORKSPACE|g" \
             -e "s|__BREW_BIN__|$BREW_BIN|g" \
+            -e "s|__SUTANDO_NODE__|${SUTANDO_NODE:-}|g" \
             -e "s|__HOME__|$HOME|g" \
             "$TEMPLATE" > "$DEST"
         bootout_if_loaded
