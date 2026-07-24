@@ -246,6 +246,15 @@ def pick_email_for_name(messages_headers: list[dict], name: str) -> dict:
     Heuristic: collect (display, email) pairs from From/To headers; rank an
     address higher when the display name contains a query token. Pure so it can
     be tested offline against fixture headers.
+
+    FAILS CLOSED (the contract is "returns None — never a guess — on no match"):
+      * If NO candidate's display name actually matches a query token (top
+        score 0), return email=None. A guessed address emails the invite to the
+        WRONG person, which is worse than an unresolved name.
+      * If two+ addresses TIE at the top score, the match is genuinely
+        ambiguous — return email=None with 'ambiguous': True and the tied
+        'candidates'. The caller must disambiguate with an explicit --attendees
+        email (or --force) before --send; we never auto-pick.
     """
     tokens = [t for t in re.split(r"\s+", name.strip().casefold()) if t]
     seen: dict[str, str] = {}  # email -> best display seen
@@ -268,6 +277,16 @@ def pick_email_for_name(messages_headers: list[dict], name: str) -> dict:
     if not seen:
         return {"name": name, "email": None, "alternates": []}
     ranked = sorted(seen, key=lambda e: (scores.get(e, 0), e), reverse=True)
+    top = scores.get(ranked[0], 0)
+    # Fail closed (a): nobody's display name matched the requested name.
+    if top <= 0:
+        return {"name": name, "email": None, "alternates": [],
+                "candidates": [{"email": e, "display": seen[e]} for e in ranked[:5]]}
+    # Fail closed (b): a tie at the top score is ambiguous — do NOT auto-pick.
+    tied = [e for e in ranked if scores.get(e, 0) == top]
+    if len(tied) > 1:
+        return {"name": name, "email": None, "ambiguous": True, "alternates": [],
+                "candidates": [{"email": e, "display": seen[e]} for e in tied[:5]]}
     best = ranked[0]
     return {
         "name": name,
@@ -326,13 +345,17 @@ def list_events_for_day(start: dt.datetime, account: str, calendar: str,
     """Return the owner's events across the calendar day of `start` (so one call
     serves BOTH the slot-conflict check and the same-day dedup check)."""
     day = start.date()
-    time_min = dt.datetime(day.year, day.month, day.day, 0, 0).isoformat()
-    time_max = (dt.datetime(day.year, day.month, day.day, 0, 0)
-                + dt.timedelta(days=1)).isoformat()
+    day_start = dt.datetime(day.year, day.month, day.day, 0, 0)
+    next_day = day_start + dt.timedelta(days=1)
+    # Each boundary's UTC offset is computed at ITS OWN date, not at 'now', so a
+    # cross-DST-season query stays correct — a December (PST, -08:00) day emits
+    # -08:00 even when this runs in July (PDT). day_start and next_day are
+    # localized independently in case the day itself straddles a DST switch;
+    # otherwise the window could start an hour late and MISS a real conflict.
     params = {
         "calendarId": calendar,
-        "timeMin": time_min + _tz_offset(tz),
-        "timeMax": time_max + _tz_offset(tz),
+        "timeMin": day_start.isoformat() + _tz_offset(tz, day_start),
+        "timeMax": next_day.isoformat() + _tz_offset(tz, next_day),
         "singleEvents": True,
         "orderBy": "startTime",
         "maxResults": 250,
@@ -343,13 +366,15 @@ def list_events_for_day(start: dt.datetime, account: str, calendar: str,
     return data.get("items") or []
 
 
-def _tz_offset(tz: str) -> str:
-    """RFC3339 offset (e.g. -07:00) for an IANA tz at 'now'. Falls back to 'Z'
-    (UTC) if the zoneinfo isn't available — Calendar still interprets timeMin/
-    timeMax correctly, this only widens the window slightly."""
+def _tz_offset(tz: str, at: dt.datetime) -> str:
+    """RFC3339 offset (e.g. -07:00) for an IANA tz AT the wall-clock moment `at`
+    — NOT at 'now'. Computing it at the target date is what keeps a December
+    (PST, -08:00) query correct even when the process runs in July (PDT). Falls
+    back to 'Z' (UTC) if the zoneinfo isn't available — Calendar still interprets
+    timeMin/timeMax correctly, this only widens the window slightly."""
     try:
         from zoneinfo import ZoneInfo  # py3.9+
-        off = dt.datetime.now(ZoneInfo(tz)).utcoffset()
+        off = at.replace(tzinfo=ZoneInfo(tz)).utcoffset()
         if off is None:
             return "Z"
         total = int(off.total_seconds())
@@ -459,6 +484,22 @@ def self_check() -> int:
           "pick_email_for_name resolves display-name match")
     check(pick_email_for_name([], "Nobody")["email"] is None,
           "pick_email_for_name returns None when nothing found")
+    # FAIL CLOSED (a): headers exist but NONE match the name → None, not a guess.
+    nonmatch = [{"from": "Carol Manager <carol@example.com>"}]
+    check(pick_email_for_name(nonmatch, "Alice Example")["email"] is None,
+          "pick_email_for_name fails closed when no display name matches")
+    # FAIL CLOSED (b): a top-score tie is ambiguous → None (never auto-picked).
+    tie = [{"from": "Dana Green <dana.green@example.com>",
+            "to": "Dana Blue <dana.blue@example.com>"}]
+    picked_tie = pick_email_for_name(tie, "Dana")
+    check(picked_tie["email"] is None and picked_tie.get("ambiguous"),
+          "pick_email_for_name flags an ambiguous tie instead of guessing")
+
+    # tz offset is DATE-aware (not 'now'): summer→PDT, winter→PST for LA.
+    check(_tz_offset("America/Los_Angeles", dt.datetime(2026, 7, 15)) == "-07:00",
+          "_tz_offset gives PDT (-07:00) for a summer date")
+    check(_tz_offset("America/Los_Angeles", dt.datetime(2026, 12, 15)) == "-08:00",
+          "_tz_offset gives PST (-08:00) for a winter date")
 
     print("\nSELF-CHECK:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
@@ -581,14 +622,18 @@ def main(argv: list[str] | None = None) -> int:
         print("\n✓ Slot is free on the owner's calendar.")
 
     if duplicates:
-        print(f"⚠ DUPLICATE: a same-title event already exists that day:")
+        print("⚠ DUPLICATE: a same-title event already exists that day:")
         for ev in duplicates:
             print(f"    - {ev.get('summary')}  {(ev.get('start') or {}).get('dateTime','?')}  "
                   f"{ev.get('htmlLink','')}")
     else:
         print("✓ No same-title event that day (not a duplicate).")
 
-    blocked = bool(conflicts or duplicates)
+    # An unresolved name (no Gmail match, or an ambiguous tie we refused to
+    # guess) is ALSO a send-blocker: better to refuse than email an invite to
+    # the wrong person. --force (owner's explicit call) or supplying the address
+    # via --attendees is the way past it.
+    blocked = bool(conflicts or duplicates or unresolved)
 
     # 4) create ------------------------------------------------------------ #
     if not is_send:
@@ -597,9 +642,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if blocked and not args.force:
-        print("\nREFUSING to create: conflict/duplicate detected. "
+        reasons = []
+        if conflicts or duplicates:
+            reasons.append("conflict/duplicate detected")
+        if unresolved:
+            reasons.append(f"unresolved name(s): {', '.join(unresolved)}")
+        print("\nREFUSING to create: " + "; ".join(reasons) + ". "
               "Re-run with --send --force to override (owner's explicit call), "
-              "or pick a different slot/title.", file=sys.stderr)
+              "supply the email via --attendees, or pick a different slot/title.",
+              file=sys.stderr)
         return 3
 
     print("\nCreating event + sending invites (sendUpdates=all)…")

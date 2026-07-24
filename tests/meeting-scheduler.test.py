@@ -9,7 +9,6 @@ Run: python3 tests/meeting-scheduler.test.py
 """
 import datetime as dt
 import importlib.util
-import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -106,6 +105,44 @@ def test_pick_email_for_name():
     # display-name token match beats a random address
     mixed = [{"from": "Bob Brown <bob@team.com>", "cc": "misc@team.com"}]
     assert M.pick_email_for_name(mixed, "Bob")["email"] == "bob@team.com"
+
+
+def test_pick_email_fails_closed_on_no_match():
+    # (a) headers exist but NONE of them match the requested name → the contract
+    # is "None (never a guess)". Regression for the fail-OPEN bug where any
+    # From/To/Cc address was returned as a "best" guess even with zero matches.
+    nonmatch = [
+        {"from": "Carol Manager <carol@example.com>", "to": "Frank Ops <frank@example.com>"},
+        {"from": "Eve North <eve@example.com>"},
+    ]
+    got = M.pick_email_for_name(nonmatch, "Alice Example")
+    assert got["email"] is None, got  # would have wrongly returned carol@/frank@/eve@
+
+
+def test_pick_email_ambiguous_tie_not_auto_picked():
+    # (b) two addresses tie at the top score → ambiguous. We must NOT auto-pick
+    # one (that could email the invite to the wrong Dana); email stays None so
+    # main() leaves the name unresolved and refuses to --send without --force.
+    tie = [
+        {"from": "Dana Green <dana.green@example.com>",
+         "to": "Dana Blue <dana.blue@example.com>"},
+    ]
+    got = M.pick_email_for_name(tie, "Dana")
+    assert got["email"] is None, got
+    assert got.get("ambiguous") is True, got
+    assert {c["email"] for c in got.get("candidates", [])} == {
+        "dana.green@example.com", "dana.blue@example.com"}, got
+
+
+def test_tz_offset_is_date_aware():
+    # Regression: the offset must be computed at the TARGET date, not 'now'.
+    # A summer LA date is PDT (-07:00); a winter LA date is PST (-08:00). The
+    # old code computed both at 'now', so a December query built during July
+    # emitted -07:00 and started the conflict window an hour late.
+    summer = dt.datetime(2026, 7, 15, 0, 0)
+    winter = dt.datetime(2026, 12, 15, 0, 0)
+    assert M._tz_offset("America/Los_Angeles", summer) == "-07:00"
+    assert M._tz_offset("America/Los_Angeles", winter) == "-08:00"
 
 
 def test_argparse_is_side_effect_free():
