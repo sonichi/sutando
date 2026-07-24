@@ -581,6 +581,16 @@ def main() -> int:
     if _oa is not None and _oa.exists():
         check(_secret not in _oa.read_text(),
               "pasted token never reaches last-owner-activity summary")
+    # #2267 parity second half: the in-band security notice rides the task so
+    # the core neither reproduces nor re-requests the value — and stays absent
+    # from clean tasks. access_tier must still parse as the LAST header line.
+    check("SUTANDO SECURITY NOTICE" in _sec_body,
+          "security notice appended when a secret was redacted")
+    check("SUTANDO SECURITY NOTICE" not in
+          (rtc.TASKS_DIR / "task-MOCK1.txt").read_text(),
+          "no security notice on clean tasks")
+    _hdrs = [ln for ln in _sec_body.split("\n") if ln.startswith("access_tier: ")]
+    check(len(_hdrs) == 1, "notice introduces no second access_tier line")
 
     srv.shutdown()
     if FAILS:

@@ -86,7 +86,7 @@ if os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1":
 # the path (no repo-walking; the old triple-parent form predated the move into
 # src/ and pointed outside the repo).
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
-from .chat_secret_filter import filter_chat_secrets
+from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
@@ -888,6 +888,7 @@ def _write_task(task: dict) -> str | None:
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
+    _secret_types: tuple = ()
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -918,8 +919,9 @@ def _write_task(task: dict) -> str | None:
             # only the resolved text is filtered.
             _filtered = filter_chat_secrets(_fetched)
             if _filtered.secret_types:
+                _secret_types = tuple(_filtered.secret_types)
                 _log(f"redacted pasted secret(s) in {tid} body: "
-                     f"{', '.join(sorted(_filtered.secret_types))}")
+                     f"{', '.join(sorted(_secret_types))}")
             lines.append(f"task: {_one_line(_filtered.text)}")
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
@@ -958,6 +960,12 @@ def _write_task(task: dict) -> str | None:
     # no double read of the tierMap).
     sender_tier = _tier_for(task.get("user_id"))
     lines.append(f"access_tier: {sender_tier}")
+    # #2267 parity, second half: the other bridges append the in-band security
+    # notice so the core neither reproduces nor re-requests the redacted value.
+    # Appended AFTER access_tier: the notice is bridge-generated fixed text with
+    # no header-shaped lines, so the access-tier-wins-last invariant holds.
+    if _secret_types:
+        lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
