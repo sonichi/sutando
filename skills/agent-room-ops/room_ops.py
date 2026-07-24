@@ -30,6 +30,7 @@ import react as _react     # noqa: E402
 import join as _join       # noqa: E402
 import resolve as _resolve # noqa: E402
 import mention as _mention # noqa: E402
+import rooms as _rooms     # noqa: E402
 
 
 def _main(argv):
@@ -65,6 +66,9 @@ def _main(argv):
 
     p = sub.add_parser("join", help="accept this agent's own pending room invite")
     p.add_argument("room_id")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
+    p = sub.add_parser("rooms", help="list the rooms this agent is a member of")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
     for name in ("react", "unreact"):
@@ -114,6 +118,8 @@ def _main(argv):
                 res = _doc.doc_rm(a.room, a.name, folder=a.folder, agent_mxid=a.agent)
     elif a.cmd == "join":
         res = _join.join_room(a.room_id, a.agent_mxid)
+    elif a.cmd == "rooms":
+        res = _rooms.list_rooms(a.agent_mxid)
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
