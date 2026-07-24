@@ -32,7 +32,9 @@ export type Source =
 	| 'filewatcher'
 	| 'health-check'
 	| 'core-heartbeat'
-	// eslint-disable-next-line @typescript-eslint/ban-types
+	// `string & {}` keeps the literal union autocompleting while still accepting
+	// any string. ban-types was removed in typescript-eslint v8 and replaced by
+	// no-empty-object-type, which this baseline does not enable — no disable needed.
 	| (string & {});
 
 /** WHO the request is from/for — the ingress surface + identity. */

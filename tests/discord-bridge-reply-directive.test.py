@@ -150,7 +150,7 @@ def case_a_directive_present_constructs_reference():
         return fails
     first = sent[0]
     if first["reference"] is None:
-        fails.append(f"a) first send should have reference set (got None)")
+        fails.append("a) first send should have reference set (got None)")
         return fails
     ref = first["reference"]
     if not hasattr(ref, "message_id") or str(ref.message_id) != parent_msg_id:

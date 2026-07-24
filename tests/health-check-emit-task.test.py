@@ -320,7 +320,7 @@ def case_l_task_field_is_last() -> list[str]:
             if sentinel not in keys:
                 continue
             if "task" not in keys:
-                fails.append(f"l) task: key missing from task file")
+                fails.append("l) task: key missing from task file")
                 break
             if keys.index(sentinel) > keys.index("task"):
                 fails.append(

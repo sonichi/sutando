@@ -2,7 +2,12 @@
 Covers the shape a local supervisor reads and the last_ok_ts preservation that
 lets it show "last connected N s ago" while reconnecting.
 """
-import json, os, tempfile, importlib, sys, pathlib
+import json
+import os
+import tempfile
+import importlib
+import sys
+import pathlib
 
 def _load(tmp):
     os.environ["AGENT_CONNECT_STATE_DIR"] = str(tmp)
