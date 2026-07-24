@@ -94,6 +94,32 @@ def test_url_hints_strip_query_and_fragment():
           "URL hint keeps scheme+host+path (still useful display)")
 
 
+def test_url_hints_strip_userinfo_credentials():
+    # Second-review P1: netloc INCLUDES userinfo, so scheme+netloc+path still
+    # leaked `user:password@`. The authority must be rebuilt from
+    # hostname[:port] — username, password, query, fragment ALL absent.
+    d = tempfile.mkdtemp()
+    _run({"hook_event_name": "PreToolUse", "session_id": "s",
+          "tool_name": "WebFetch",
+          "tool_input": {"url":
+              "https://alice:sk-SECRET@files.example:8443/download?tok=q#f"}}, d)
+    rows = _journal(d)
+    dumped = json.dumps(rows)
+    check("sk-SECRET" not in dumped and "alice" not in dumped
+          and "tok=q" not in dumped and "#f" not in dumped,
+          "URL SECRET HYGIENE — userinfo (user:password@) never reaches the journal")
+    check(rows[0]["tool"]["display"] == "https://files.example:8443/download",
+          "URL hint authority rebuilt as hostname:port only")
+    # an unparseable-port URL degrades to no hint, never a crash or a leak
+    d2 = tempfile.mkdtemp()
+    _run({"hook_event_name": "PreToolUse", "session_id": "s",
+          "tool_name": "WebFetch",
+          "tool_input": {"url": "https://bob:pw@files.example:not-a-port/x"}}, d2)
+    dumped2 = json.dumps(_journal(d2))
+    check("pw" not in dumped2 and "bob" not in dumped2,
+          "URL SECRET HYGIENE — invalid-port URL drops the hint, no leak")
+
+
 def test_binding_attribution():
     ws = Path(tempfile.mkdtemp())
     (ws / "state" / "bindings").mkdir(parents=True)

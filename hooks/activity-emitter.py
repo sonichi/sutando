@@ -109,11 +109,16 @@ def _tool_summary(data: dict) -> dict:
     hint = (ti.get("description") or ti.get("file_path") or ti.get("path")
             or ti.get("pattern") or "")
     if not hint and ti.get("url"):
-        # URLs carry tokens in query strings/fragments (presigned sigs, OAuth
-        # codes — Codex review, reproduced) — journal scheme+host+path ONLY.
+        # URLs carry secrets in query strings/fragments (presigned sigs, OAuth
+        # codes) AND in userinfo (https://user:token@host — netloc includes it,
+        # so reusing netloc leaked credentials; second review). Journal
+        # scheme + hostname[:port] + path ONLY, authority REBUILT from parts.
         try:
             u = urllib.parse.urlsplit(str(ti["url"]))
-            hint = urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, "", ""))
+            host = u.hostname or ""
+            authority = host + (f":{u.port}" if u.port else "")
+            hint = urllib.parse.urlunsplit(
+                (u.scheme, authority, u.path, "", "")) if host else ""
         except ValueError:
             hint = ""
     hint = str(hint).splitlines()[0][:_SUMMARY_LIMIT] if hint else ""
