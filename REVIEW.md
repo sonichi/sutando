@@ -1,14 +1,24 @@
-# Review guide — sonichi/sutando
+# Review guide — sonichi/sutando (`REVIEW.md`)
 
-Canonical, in-repo review criteria for this repository. Two audiences in one file:
+Canonical, in-repo review criteria for this repository. This is Claude Code's
+conventional `REVIEW.md` at the repo root, so it is consumed by **three** audiences:
 
+- **Claude Code's managed GitHub App PR reviews** inject this file's prose directly
+  into every review agent's system prompt (that service reads a root `REVIEW.md`).
 - **Humans + the codex reviewer** read the prose lessons below as review criteria.
 - **Automated scanners** (`scripts/review-checks.sh`, run in CI on every PR) parse the
   fenced `checks:` block at the bottom — the *only* machine-read section.
 
-This file is the single source of truth: adding a lesson or a check is a PR to this
-file, **not** a code change to the review tooling. Another repo ships its own
-`.github/REVIEW_GUIDE.md`; the tooling is generic and loads whichever repo it reviews.
+This file is the single source of truth for the machine checks and the GitHub-App
+criteria: adding a lesson or a check is a PR to *this* file, **not** a code change to
+the review tooling. Another repo ships its own root `REVIEW.md`; the tooling is generic
+and loads whichever repo it reviews.
+
+> **Note on the local `/code-review` command:** the in-session `/code-review` reads
+> `CLAUDE.md` but **not** `REVIEW.md` (only the managed GitHub App reads this file).
+> So the same lessons are mirrored into `CLAUDE.md` ("Reviewing a PR") to cover
+> in-session reviews. Keep the two prose copies in sync; the `checks:` block below
+> lives here only.
 
 ## Lessons (criteria for reviewers)
 

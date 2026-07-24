@@ -43,7 +43,7 @@ trap 'rm -f "$OUT"' EXIT   # clean up even on interrupt / non-zero exit, not jus
 
 # Mechanical checks first — the deterministic, guide-driven scanners (today:
 # hardcoded paths) via the shared runner (supersedes the baked-in scanner from
-# #2229; the patterns live in .github/REVIEW_GUIDE.md, not here). Surfaced ahead
+# #2229; the patterns live in REVIEW.md, not here). Surfaced ahead
 # of the codex verdict so the mechanical findings are never buried. Best-effort:
 # the runner's own exit code doesn't fail the review.
 CHECKS_SH="$(cd "$HERE/../../.." && pwd)/scripts/review-checks.sh"

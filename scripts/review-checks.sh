@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # review-checks.sh — run a repo's machine-readable review checks over a unified diff.
 #
-# Reads the `checks:` block from the repo's .github/REVIEW_GUIDE.md (the single
+# Reads the `checks:` block from the repo's REVIEW.md (the single
 # source of truth — lessons + checks live there, NOT baked into this runner) and
 # runs each check over the ADDED lines of a diff. Today the only check is
 # `hardcoded-paths` (folds the per-review scanner from #2229 into one place that
@@ -10,9 +10,9 @@
 # Usage:
 #   git diff | bash scripts/review-checks.sh                 # scan a diff on stdin
 #   bash scripts/review-checks.sh --diff pr.diff             # scan a diff file
-#   bash scripts/review-checks.sh --guide path/to/REVIEW_GUIDE.md --diff pr.diff
+#   bash scripts/review-checks.sh --guide path/to/REVIEW.md --diff pr.diff
 #
-# Guide resolution: --guide wins; else <repo>/.github/REVIEW_GUIDE.md. Missing
+# Guide resolution: --guide wins; else <repo>/REVIEW.md. Missing
 # guide -> generic fallback patterns + a stderr note (degrades safely).
 #
 # Exit: 0 = clean; 1 = a check flagged something; 2 = usage error.
@@ -42,7 +42,7 @@ fi
 # O(pathological) on a large string under macOS bash 3.2 and effectively hangs).
 [[ "$DIFF" =~ [^[:space:]] ]] || { echo "review-checks: empty diff — nothing to check." >&2; exit 0; }
 
-[[ -n "$GUIDE" ]] || GUIDE="$REPO/.github/REVIEW_GUIDE.md"
+[[ -n "$GUIDE" ]] || GUIDE="$REPO/REVIEW.md"
 
 # --- parse the guide's checks: hardcoded-paths {flag,allow} lists -------------
 parse_list() {  # $1 = flag|allow ; reads $GUIDE
@@ -82,7 +82,7 @@ HITS="$(RC_FLAGS="$FLAGS" RC_ALLOWS="$ALLOWS" RC_DIFF="$DIFF" python3 "$HERE/rev
 if [[ "$HITS" =~ [^[:space:]] ]]; then
     echo "review-checks: FAIL — hardcoded-paths:" >&2
     printf '%s\n' "$HITS" >&2
-    echo "review-checks: $(printf '%s\n' "$HITS" | grep -c '') violation(s). Resolve via workspace/config helpers, or add a scoped allow to .github/REVIEW_GUIDE.md if it's a genuine fixture." >&2
+    echo "review-checks: $(printf '%s\n' "$HITS" | grep -c '') violation(s). Resolve via workspace/config helpers, or add a scoped allow to REVIEW.md if it's a genuine fixture." >&2
     exit 1
 fi
 echo "review-checks: PASS (hardcoded-paths clean)"

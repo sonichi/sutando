@@ -34,11 +34,11 @@ jobs:
         run: python3 scripts/lint-class-rules.py
 
       # Repo-scoped review checks: runs the machine-readable `checks:` block from
-      # .github/REVIEW_GUIDE.md (today: hardcoded-path scan) over the PR diff, so
+      # REVIEW.md (today: hardcoded-path scan) over the PR diff, so
       # the guide's lessons gate EVERY PR — not just reviews that use the codex
       # tool. `gh pr diff` needs no history/fetch-depth. PR events only (a push to
       # main has no PR diff). See docs + scripts/review-checks.sh.
-      - name: Review checks (REVIEW_GUIDE)
+      - name: Review checks (REVIEW.md)
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}

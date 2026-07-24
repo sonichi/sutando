@@ -7,7 +7,7 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER="$HERE/../scripts/review-checks.sh"
-GUIDE="$HERE/../.github/REVIEW_GUIDE.md"
+GUIDE="$HERE/../REVIEW.md"
 
 pass=0; fail=0
 # check <name> <expect: flag|clean> <diff> [extra-args...]
@@ -44,9 +44,9 @@ check "empty diff exits 0 (nothing to check)"         clean $''
 
 # --- guide's own checks: block is parseable ----------------------------------
 if grep -q "hardcoded-paths:" "$GUIDE" && grep -qE "^\s*flag:" "$GUIDE"; then
-    echo "ok   REVIEW_GUIDE.md carries a hardcoded-paths checks: block"; pass=$((pass+1))
+    echo "ok   REVIEW.md carries a hardcoded-paths checks: block"; pass=$((pass+1))
 else
-    echo "FAIL REVIEW_GUIDE.md missing checks: block"; fail=$((fail+1))
+    echo "FAIL REVIEW.md missing checks: block"; fail=$((fail+1))
 fi
 
 echo "---"
