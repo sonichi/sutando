@@ -11,7 +11,6 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
-import { resolveCredential } from './credential-resolver.js';
 import { readCaptureToken } from './util_paths.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
