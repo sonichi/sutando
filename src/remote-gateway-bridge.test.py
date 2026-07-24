@@ -567,6 +567,21 @@ def main() -> int:
     check("AGENTS.md" not in _ro_only and "room-ops metadata" not in _ro_only.lower(),
           "metadata-only task file carries no injected block (empty task body)")
 
+    # #2267 parity: a token pasted into a room message must never persist —
+    # not in the task file, not in the owner-presence summary.
+    _secret = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2  # GitHub-token shaped
+    rtc._write_task({**TASK, "id": "task-SECRET",
+                     "task": f"[AG2Space @qingyun] deploy with {_secret} please"})
+    _sec_body = (rtc.TASKS_DIR / "task-SECRET.txt").read_text()
+    check(_secret not in _sec_body and "deploy with" in _sec_body,
+          "pasted GitHub token REDACTED from persisted task body (#2267 parity)")
+    check("REDACTED" in _sec_body or "[" in _sec_body,
+          "redaction leaves an explicit placeholder, not silent deletion")
+    _oa = getattr(rtc, "OWNER_ACTIVITY_FILE", None)
+    if _oa is not None and _oa.exists():
+        check(_secret not in _oa.read_text(),
+              "pasted token never reaches last-owner-activity summary")
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1
