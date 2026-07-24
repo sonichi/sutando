@@ -85,6 +85,24 @@ the decision path is live end-to-end.
 Test: `python3 tests/human-action-bridge.test.py`. Test-only env overrides:
 `SUTANDO_HA_DIR`, `SUTANDO_HA_CARD_DIR`, `SUTANDO_HA_TIMEOUT`, `SUTANDO_HA_POLL`.
 
+## `activity-emitter.py`
+
+Journals the core's activity as AWP activity objects (Activity outbox Phase 2,
+step 1). Async command hook for SessionStart / UserPromptSubmit / PreToolUse /
+PostToolUse / PostToolUseFailure / Notification / Stop / SessionEnd — each fires
+this emitter, which normalizes the hook JSON to an activity object and appends
+it to `<workspace>/state/activity-journal/YYYY-MM-DD.jsonl`. Attribution rides
+in from the Execution Binding Registry when present. Secret hygiene: tool input
+reduces to a display hint (description/file_path/pattern/url — deliberately
+never the raw `command`). Fail-OPEN + fast; register every entry with
+`"async": true`. Upstream HTTP delivery is a later step (broker `/v1/activities`);
+until then the journal is the local activity feed.
+
+Not yet auto-registered. Manual registration: async command-hook entries for the
+events above, argv[1] = hook name as a stdin fallback. Test:
+`python3 tests/activity-emitter.test.py`. Test-only env override:
+`SUTANDO_ACTIVITY_DIR`.
+
 ## `gmail-write-guard.py`
 
 Denies the **claude.ai Gmail MCP connector's WRITE-scoped tools** (create_draft,
