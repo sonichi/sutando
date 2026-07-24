@@ -21,7 +21,7 @@
 
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // --------------------------------------------------------------------------- //

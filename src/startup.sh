@@ -543,6 +543,17 @@ else
   echo "  ✓ core heartbeat (already running)"
 fi
 
+# Services-status emitter — aggregates sidecar liveness into
+# state/services-status.json for the desktop Settings → Services surface.
+# Single instance per host; ~30s cadence; SIGTERM-clean like the heartbeat.
+if ! pgrep -f "$REPO/src/services_status.py" > /dev/null 2>&1; then
+  echo "  Starting services-status emitter..."
+  python3 "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
+  echo "  ✓ services-status emitter"
+else
+  echo "  ✓ services-status emitter (already running)"
+fi
+
 # 0. Credential proxy for quota tracking (port 7846).
 # Prefer the launchd-supervised job (KeepAlive + ThrottleInterval=10s) so the
 # proxy restarts on crash instead of leaving a proxy-routed core stranded on a
@@ -874,6 +885,33 @@ fi
 
 echo ""
 
+# Vault scanner preflight, shared by the three bridges that intercept secrets
+# (telegram, discord, slack — all import src/vault_intercept.py).
+#
+# detect-secrets has been treated as a CI-only test dep, but it is a RUNTIME dep
+# of a shipping feature: without it vault_intercept fails closed and REFUSES
+# every unquoted `vault set KEY VALUE` — which is the form CLAUDE.md documents
+# as the way to store a secret. Quoted values still work, so the degradation is
+# safe but silent: nothing surfaced it until an owner tried to store a secret
+# and got a refusal.
+#
+# This mirrors how discord.py / slack_bolt are handled below — name the missing
+# dep and the exact fix at the startup console, don't auto-install.
+#
+# Checked PER INTERPRETER because each bridge is launched with whichever python
+# had ITS client library, and those are frequently not the same binary.
+_vault_scanner_check() {
+  _vsc_py="$1"; _vsc_who="$2"
+  [ -n "$_vsc_py" ] || return 0
+  if ! "$_vsc_py" -c "import detect_secrets" >/dev/null 2>&1; then
+    echo "  ~ $_vsc_who: detect-secrets missing in $_vsc_py — unquoted \`vault set\` will be REFUSED"
+    # Both plain and --user installs are blocked by PEP 668 on stock
+    # Homebrew/macOS python, so the fallback is named up front rather than
+    # leaving the operator to rediscover it.
+    echo "      fix: $_vsc_py -m pip install detect-secrets   (add --break-system-packages if PEP 668 blocks it)"
+  fi
+}
+
 # 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN, skip with SKIP_TELEGRAM=1)
 if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
   echo "  ~ telegram bridge (skipped via SKIP_TELEGRAM)"
@@ -894,6 +932,7 @@ elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
     fi
     "$TGPY" src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
     echo "  ✓ telegram bridge ($TGPY)"
+    _vault_scanner_check "$TGPY" "telegram bridge"
   else
     echo "  ✓ telegram bridge (already running)"
   fi
@@ -968,6 +1007,7 @@ elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
     PYTHONUNBUFFERED=1 "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
     echo "  ✓ discord bridge"
+    _vault_scanner_check "$PYTHON_WITH_DISCORD" "discord bridge"
   else
     echo "  ✓ discord bridge (already running)"
   fi
@@ -996,6 +1036,7 @@ elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
     set -a; . "$_SL_ENV"; set +a
     "$PYTHON_WITH_SLACK" src/slack-bridge.py > "$LOGS_DIR/slack-bridge.log" 2>&1 &
     echo "  ✓ slack bridge"
+    _vault_scanner_check "$PYTHON_WITH_SLACK" "slack bridge"
   else
     echo "  ✓ slack bridge (already running)"
   fi
@@ -1098,7 +1139,11 @@ open "http://localhost:$WEB_CLIENT_PORT"
 # stdin is untouched by the tee exec, so `-t 0` still tells the truth;
 # launchd / Sutando.app runs have non-TTY stdin and keep the detached path.
 # The startup log keeps everything except the interactive session itself.
-if [ -t 0 ]; then
+# A startup launched from a tmux pane (notably the self-upgrade service pane)
+# must stay detached. Restoring /dev/tty there makes the runtime launcher try
+# to attach to sutando-core from inside tmux, which blocks startup forever and
+# leaves the old core running without completing recovery.
+if [ -t 0 ] && [ -z "${TMUX:-}" ]; then
     exec >/dev/tty 2>&1
 fi
 exec bash "$REPO/src/agent/start-cli.sh"

@@ -48,7 +48,7 @@ check(
 )
 check(
     "slack: notify command uses task-progress skill",
-    "task-progress/scripts/notify.py" in slack_src,
+    '"task-progress", "scripts", "notify.py"' in slack_src,
 )
 check(
     "slack: audio transcription command uses audio-transcribe skill",
@@ -85,7 +85,7 @@ check(
 )
 check(
     "discord: notify command uses task-progress skill",
-    "task-progress/scripts/notify.py" in discord_src,
+    '"task-progress", "scripts", "notify.py"' in discord_src,
 )
 check(
     "discord: audio transcription command uses audio-transcribe skill",
@@ -121,7 +121,7 @@ check(
 )
 check(
     "telegram: notify command uses task-progress skill",
-    "task-progress/scripts/notify.py" in telegram_src,
+    '"task-progress", "scripts", "notify.py"' in telegram_src,
 )
 check(
     "telegram: audio transcription command uses audio-transcribe skill",
