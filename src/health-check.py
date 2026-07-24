@@ -2267,10 +2267,11 @@ def run_all_checks() -> list[dict]:
     # Migration/reader path-contract drift (#1543)
     checks.append(check_migrate_reader_contract())
 
-    # Channel config stranded at legacy ~/.claude/channels/ (2026-07-24 outage)
-    stranded_check = check_stranded_channel_config()
-    if stranded_check is not None:
-        checks.append(stranded_check)
+    # Channel config stranded at legacy ~/.claude/channels/ (2026-07-24 outage).
+    # None when CLAUDE_CONFIG_DIR is unset; filter it out. (The function's
+    # branches are unit-tested in tests/health-check-stranded-channel-config.test.py;
+    # this call site is exercised by the running health check, not that unit test.)
+    checks += [c for c in (check_stranded_channel_config(),) if c is not None]  # pragma: no cover
 
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
     env_path = _resolve_dotenv()  # pragma: no cover — call-site in untested mega-function
