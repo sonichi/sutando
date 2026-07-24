@@ -6,6 +6,18 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "core": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Persistent CLI runtime used for the Sutando core task executor.",
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "enum": ["claude", "codex"],
+          "default": "claude"
+        }
+      }
+    },
     "workspace": {
       "type": "object",
       "additionalProperties": false,
@@ -29,6 +41,26 @@
           "default": ".claude-sutando",
           "pattern": "^(?!.*\\.\\.)(?!/)[^/].*$",
           "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace — absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
+        }
+      }
+    },
+    "core_config_dirs": {
+      "type": "array",
+      "description": "Per-runtime CLI state/config directories. Arrays replace wholesale in local config.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "type", "env_name", "value"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "type": { "type": "string", "enum": ["claude", "codex"] },
+          "env_name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "synced": { "type": "boolean", "default": true },
+          "value": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Supports ${REPO_DIR}, ${WORKSPACE_DIR}, and a leading ~. synced=true values must resolve under the workspace."
+          }
         }
       }
     },

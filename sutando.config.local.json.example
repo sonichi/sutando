@@ -1,6 +1,11 @@
 {
   "_comment": "Copy this file to sutando.config.local.json and edit. Everything is optional — omit any field to fall through to the default in sutando.config.json. The .local.json file is gitignored.",
 
+  "core": {
+    "_comment": "Persistent task-execution CLI. Set codex for Codex CLI or omit this block to keep the default claude runtime.",
+    "runtime": "codex"
+  },
+
   "workspace": {
     "_comment": "Override the workspace location. Default is ${REPO_DIR}/workspace (in-repo). Set this only if you want the workspace outside the repo (e.g. on a different volume).",
     "path": "/absolute/path/to/your/workspace"

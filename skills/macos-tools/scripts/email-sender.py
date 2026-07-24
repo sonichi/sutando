@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Send email via macOS Mail.app. Usage: python3 email-sender.py "to" "subject" "body" [--draft] [--cc "cc"]"""
-import subprocess, sys
+import subprocess
+import sys
 
 def escape(s): return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 

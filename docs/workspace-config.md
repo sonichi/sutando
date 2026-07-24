@@ -26,6 +26,7 @@ That's it for a fresh clone — no setup, no env var, no config file. The direct
 
 ```json
 {
+  "core": { "runtime": "claude" },
   "workspace": {
     "path": "${REPO_DIR}/workspace"
   },
@@ -50,13 +51,16 @@ Keys whose name starts with `_` (e.g. `_comment`) are stripped before validation
 ## Three common overrides
 
 ```json
-// 1. Move workspace outside the repo (e.g. shared between clones)
+// 1. Use Codex CLI as the persistent core
+{ "core": { "runtime": "codex" } }
+
+// 2. Move workspace outside the repo (e.g. shared between clones)
 { "workspace": { "path": "/Users/you/.sutando/workspace" } }
 
-// 2. Enable vault sync to a private remote
+// 3. Enable vault sync to a private remote
 { "vault": { "enabled": true, "remote_url": "https://vault.example.com/you/workspace.git" } }
 
-// 3. Both
+// 4. Multiple overrides
 {
   "workspace": { "path": "/Users/you/.sutando/workspace" },
   "vault": { "enabled": true, "remote_url": "https://vault.example.com/you/workspace.git" }
@@ -67,10 +71,10 @@ Keys whose name starts with `_` (e.g. `_comment`) are stripped before validation
 
 | Language | API |
 |---|---|
-| Python | `from sutando_config import resolve_workspace, resolve_vault, load_config` |
-| TypeScript | `import { resolveWorkspace, resolveVault, loadConfig } from './sutando_config.js'` |
+| Python | `from sutando_config import resolve_workspace, resolve_vault, resolve_core_runtime, load_config` |
+| TypeScript | `import { resolveWorkspace, resolveVault, resolveCoreRuntime, loadConfig } from './sutando_config.js'` |
 | Swift | `SutandoConfig.resolveWorkspace()` / `SutandoConfig.loadConfig()` |
-| Bash | `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"` |
+| Bash | `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"`; runtime via `core-runtime` |
 
 `src/workspace_default.{py,ts}` (the legacy resolver) now delegates to the loader transparently — existing callers don't need code changes.
 

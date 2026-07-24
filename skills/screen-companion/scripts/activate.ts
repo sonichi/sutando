@@ -19,7 +19,7 @@
  * same pattern as src/oc-profile-catalog.ts).
  */
 
-import { discoverConfigs, loadConfig, parseYaml, validateConfig, renderGoal, type ScreenCompanionConfig } from './load-config.js';
+import { discoverConfigs, loadConfig, parseYaml, validateConfig, type ScreenCompanionConfig } from './load-config.js';
 
 function cliArg(name: string): string | undefined {
 	const i = process.argv.indexOf(`--${name}`);

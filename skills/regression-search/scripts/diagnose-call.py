@@ -358,7 +358,7 @@ def main() -> int:
 
     if metrics:
         print()
-        print(f"Metrics (data/conversation.sqlite):")
+        print("Metrics (data/conversation.sqlite):")
         print(f"  duration: {metrics.get('durationMs', 0) // 1000}s")
         print(f"  isOwner: {metrics.get('isOwner')}, isMeeting: {metrics.get('isMeeting')}")
         print(f"  tool calls: {metrics.get('toolCount', 0)}")
