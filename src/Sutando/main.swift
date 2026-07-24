@@ -226,7 +226,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// enough — a missed notification left no way to tell whether the
     /// recorder was still rolling.
     func setRecordingIndicator(_ on: Bool) {
+        // Keep the ⌃R toggle state in lockstep with the indicator so a recording
+        // started/stopped externally (observed via the Darwin notification) also
+        // updates behavioral state — otherwise the next ⌃R mis-computes `starting`
+        // and needs a double-press to stop. Written on the main queue alongside the
+        // menu update so notification callbacks never touch it off-main. (CR: john-the-dev)
         DispatchQueue.main.async {
+            self.isRecordingVideo = on
             guard let item = self.videoClipMenuItem else { return }
             let glyph = (item.representedObject as? String) ?? ""
             // Same leading-marker convention as the Mode rows (● = active):
@@ -234,6 +240,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             item.title = on ? "🔴 Drop Video Clip — recording… \(glyph)"
                             : "Drop Video Clip \(glyph)"
         }
+    }
+
+    /// Darwin-notification observers for recording state (push, not poll).
+    /// The capture server posts com.sutando.recording.on/.off via notifyutil
+    /// whenever recording starts or stops, whoever started it.
+    func registerRecordingStateObservers() {
+        let dn = CFNotificationCenterGetDarwinNotifyCenter()
+        let me = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(dn, me, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            Unmanaged<AppDelegate>.fromOpaque(observer).takeUnretainedValue().setRecordingIndicator(true)
+        }, "com.sutando.recording.on" as CFString, nil, .deliverImmediately)
+        CFNotificationCenterAddObserver(dn, me, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            Unmanaged<AppDelegate>.fromOpaque(observer).takeUnretainedValue().setRecordingIndicator(false)
+        }, "com.sutando.recording.off" as CFString, nil, .deliverImmediately)
     }
 
     func setupMenuBar() {
@@ -351,6 +373,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 300.0, repeats: true) { [weak self] _ in
             self?.checkWatcher()
         }
+
+        // Recording-indicator sync (Susan 2026-07-22, push not poll): the
+        // capture server Darwin-notifies com.sutando.recording.on/.off on
+        // every state change (⌃R, watcher-started sessions, watchdog
+        // auto-stop) — observe those and mirror onto the Drop Video Clip row.
+        registerRecordingStateObservers()
 
         // Contextual chips: every 120s, refresh contextual-chips.json from
         // cheap mechanical sources (open PRs, top pending question, recent
@@ -1733,7 +1761,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if starting {
                 // Recording began — flip state; nothing to drop until stop.
                 if status == "recording" || status == "already_recording" {
-                    isRecordingVideo = true
                     setRecordingIndicator(true)
                     appendLog(logFile, "[\(timestamp)] dropVideoClip: recording started")
                 } else {
@@ -1743,7 +1770,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             // Stopping — flip state and drop the produced clip.
-            isRecordingVideo = false
             setRecordingIndicator(false)
             guard status == "ok", let path = json["path"] as? String else {
                 notify("Sutando", "Recording stopped, no clip (\(status))")
