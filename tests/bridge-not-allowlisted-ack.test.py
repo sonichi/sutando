@@ -66,6 +66,16 @@ class _FakeChannel:
     async def send(self, text, **kw): self.sent.append(text)
 
 
+class _YieldingChannel(_FakeChannel):
+    async def send(self, text, **kw):
+        await asyncio.sleep(0)
+        self.sent.append(text)
+
+
+async def _run_concurrently(*awaitables):
+    await asyncio.gather(*awaitables)
+
+
 def test_discord():
     db = _load_discord()
     # CRITICAL: redirect ACCESS_FILE to a throwaway temp path so this test can
@@ -94,6 +104,34 @@ def test_discord():
     other = _FakeChannel(channel_id=456)
     asyncio.run(db._ack_not_allowlisted(other, "U_C", "carol"))
     check("discord: another channel receives its own notice", len(other.sent) == 1, str(other.sent))
+
+    # Concurrent Discord event handlers must not both pass the cooldown check
+    # before either send records its reservation. The same serialization also
+    # prevents different-channel writers from overwriting each other's state.
+    concurrent_root = Path(tempfile.mkdtemp(prefix="sutando-ack-concurrent-"))
+    db.STATE_DIR = concurrent_root
+    db._NOT_ALLOWLISTED_ACK_STATE_FILE = concurrent_root / "ack-state.json"
+    db._not_allowlisted_ack_at.clear()
+    same = _YieldingChannel(channel_id=600)
+    asyncio.run(_run_concurrently(
+        db._ack_not_allowlisted(same, "U_G", "gina"),
+        db._ack_not_allowlisted(same, "U_H", "hank"),
+    ))
+    check("discord: concurrent handlers send one notice per channel", len(same.sent) == 1, str(same.sent))
+    db._not_allowlisted_ack_at.clear()
+    db._not_allowlisted_ack_lock = asyncio.Lock()
+    left = _YieldingChannel(channel_id=601)
+    right = _YieldingChannel(channel_id=602)
+    asyncio.run(_run_concurrently(
+        db._ack_not_allowlisted(left, "U_I", "ivy"),
+        db._ack_not_allowlisted(right, "U_J", "jules"),
+    ))
+    concurrent_state = db._not_allowlisted_ack_state()
+    check(
+        "discord: concurrent different-channel sends preserve both durable records",
+        {"601", "602"}.issubset(concurrent_state),
+        str(concurrent_state),
+    )
 
     # An entry older than seven days is expired and replaced by a fresh send.
     db._NOT_ALLOWLISTED_ACK_STATE_FILE.write_text(json.dumps({

@@ -2356,6 +2356,7 @@ def _message_mentions_bot(message):
 # restarts and upgrades do not reset it (owner ask 2026-07-23).
 _NOT_ALLOWLISTED_ACK_COOLDOWN_S = 7 * 24 * 60 * 60
 _not_allowlisted_ack_at: dict[str, float] = {}
+_not_allowlisted_ack_lock = asyncio.Lock()
 _NOT_ALLOWLISTED_ACK_STATE_FILE = STATE_DIR / "discord-not-allowlisted-ack.json"
 _NOT_ALLOWLISTED_ACK_TEXT = (
     "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
@@ -2408,23 +2409,24 @@ def _save_not_allowlisted_ack_state(entries: dict[str, float], now: float) -> No
 async def _ack_not_allowlisted(channel, sender_id: str, username: str = "") -> None:
     """One-line 'you're not on the allowlist' reply so an addressed-but-dropped
     message isn't silent. Rate-limited per channel across bridge restarts."""
-    now = time.time()
-    channel_id = str(getattr(channel, "id", "") or f"sender:{sender_id}")
-    persisted = _not_allowlisted_ack_state()
-    last_sent = max(
-        _not_allowlisted_ack_at.get(channel_id, 0.0),
-        persisted.get(channel_id, 0.0),
-    )
-    if now - last_sent < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
-        return  # this channel already received the notice recently
-    try:
-        await channel.send(_NOT_ALLOWLISTED_ACK_TEXT)
-        _not_allowlisted_ack_at[channel_id] = now
-        persisted[channel_id] = now
-        _save_not_allowlisted_ack_state(persisted, now)
-        print(f"  [not-allowlisted-ack] sent to @{username or sender_id}", flush=True)
-    except Exception as e:
-        print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
+    async with _not_allowlisted_ack_lock:
+        now = time.time()
+        channel_id = str(getattr(channel, "id", "") or f"sender:{sender_id}")
+        persisted = _not_allowlisted_ack_state()
+        last_sent = max(
+            _not_allowlisted_ack_at.get(channel_id, 0.0),
+            persisted.get(channel_id, 0.0),
+        )
+        if now - last_sent < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
+            return  # this channel already received the notice recently
+        try:
+            await channel.send(_NOT_ALLOWLISTED_ACK_TEXT)
+            _not_allowlisted_ack_at[channel_id] = now
+            persisted[channel_id] = now
+            _save_not_allowlisted_ack_state(persisted, now)
+            print(f"  [not-allowlisted-ack] sent to @{username or sender_id}", flush=True)
+        except Exception as e:
+            print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
 
 
 @client.event
