@@ -51,8 +51,17 @@ def _relates_to(event: dict) -> "str | None":
 
 
 def _text(event: dict) -> str:
+    """Answer-bearing text of an event: the body, plus — when the envelope
+    carries a structured A2UI click (content["space.ag2.a2ui.action"], per
+    A2UI-CONTRACT.md) — that click's value/name. Button actions use our own
+    `answer ha_x N` grammar, so folding them into the scanned text lets ONE
+    regex serve typed replies, ▸-style click bodies, and structured clicks."""
     content = event.get("content") or {}
-    return str(content.get("body") or content.get("text") or "")
+    parts = [str(content.get("body") or content.get("text") or "")]
+    click = content.get("space.ag2.a2ui.action")
+    if isinstance(click, dict):
+        parts += [str(click.get("value") or ""), str(click.get("name") or "")]
+    return " ".join(p for p in parts if p)
 
 
 def _emoji_key(event: dict) -> "str | None":
@@ -127,6 +136,13 @@ class CardPoster:
         self._log = log
 
     def _render(self, rec: dict) -> str:
+        # Markdown text = the fallback (renders in any client); the fenced
+        # ```a2ui block = the interactive card (A2UI-CONTRACT.md: the broker
+        # lifts it into content["space.ag2.a2ui"], leaving the text outside the
+        # block as the degraded view). Each option's `action` is our EXISTING
+        # decision grammar (`answer ha_x N`), so a button click — which comes
+        # back as a normal m.room.message carrying the action string — is
+        # parsed by the same regex as a typed reply. Buttons are a macro.
         lines = ["**Claude is asking you a question**", ""]
         for qi, q in enumerate(rec.get("questions") or [], 1):
             lines.append(f"Q{qi}. {q.get('question', '?')}")
@@ -135,6 +151,18 @@ class CardPoster:
             lines.append("")
         lines.append(f"React with the option number, or reply "
                      f"`answer {rec['action_id']} <n>`.")
+        first_q = (rec.get("questions") or [{}])[0]
+        card = {
+            "version": "0.9",
+            "type": "buttons",
+            "prompt": first_q.get("question", "?"),
+            "options": [
+                {"label": opt.get("label", "?"),
+                 "action": f"answer {rec['action_id']} {oi}"}
+                for oi, opt in enumerate(first_q.get("options") or [], 1)
+            ],
+        }
+        lines += ["", "```a2ui", json.dumps(card, ensure_ascii=False), "```"]
         return "\n".join(lines)
 
     def sweep(self) -> int:

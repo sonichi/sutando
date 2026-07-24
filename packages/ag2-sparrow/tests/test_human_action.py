@@ -102,6 +102,26 @@ def test_answer_command_and_reply_forms():
           "bare option number replying to the card resolves")
 
 
+def test_a2ui_button_click_resolves():
+    # A2UI-CONTRACT.md: a button click arrives as a NORMAL m.room.message with a
+    # human body (e.g. "▸ ack") + structured content["space.ag2.a2ui.action"].
+    # The action string is our own grammar, so the click resolves like a reply.
+    store, rec = _store_with_action()
+    h = ha.DecisionHandler(store, OWNER, log=lambda *_: None)
+    click = {"event_id": "$click", "cursor": 9, "type": "message.created",
+             "actor_id": OWNER,
+             "content": {"body": "▸ ack",
+                         "space.ag2.a2ui.action": {
+                             "name": "buttons", "component_id": "c1",
+                             "value": "answer ha_abc123def456 2",
+                             "in_reply_to": "$card1"}}}
+    h.offer(click)
+    got = json.loads(Path(store.dir, rec["action_id"] + ".json").read_text())
+    check(got["status"] == "resolved"
+          and got["decision"]["answers"] == {"Ship v1 or wait?": "Wait"},
+          "a structured A2UI button click resolves via the SAME answer grammar")
+
+
 def test_terminal_states_immutable():
     store, rec = _store_with_action()
     store.resolve(rec["action_id"], {"Ship v1 or wait?": "Ship v1"}, OWNER)
@@ -161,6 +181,14 @@ def test_card_poster_posts_once():
     check(calls[0]["op"] == "message" and calls[0]["room_id"] == "!room:hs"
           and "Ship v1" in calls[0]["text"],
           "poster: card carries the options via the gateway message op")
+    # A2UI contract: one fenced ```a2ui block; options carry OUR decision
+    # grammar as the action, so a button click round-trips through the same
+    # regex as a typed reply.
+    a2ui_json = calls[0]["text"].split("```a2ui")[1].split("```")[0]
+    card_obj = json.loads(a2ui_json)
+    check(card_obj["type"] == "buttons"
+          and card_obj["options"][0]["action"] == "answer ha_abc123def456 1",
+          "poster: fenced a2ui block present; option actions use the answer grammar")
     got = json.loads(Path(store.dir, rec["action_id"] + ".json").read_text())
     check(got["card_event_id"] == "$newcard",
           "poster: card_event_id recorded (correlation anchor)")
