@@ -342,6 +342,39 @@ def test_card_poster_failure_retries():
           "poster: failed post leaves the action card-less (retried next sweep)")
 
 
+def test_card_instructions_match_answer_grammar():
+    # Review blocker (re-check on 8bcf13a4): the card's instructions must match
+    # what _complete_answers accepts for THIS action's shape — a card telling
+    # the owner to react on a multi-question action is silently
+    # claimed-but-pending until timeout.
+    store, rec = _store_with_action(card_event_id=None)
+    poster = ha.CardPoster(store, "https://gw", {}, "!room:hs",
+                           log=lambda *_: None)
+    single = poster._render(rec)
+    check("React with the option number" in single and "<n>`" in single,
+          "single-question single-select: reaction or `answer <n>`")
+    ms = dict(rec, questions=[dict(rec["questions"][0], multiSelect=True)])
+    ms_card = poster._render(ms)
+    check("<n1>,<n2>" in ms_card and "React with the option number" not in ms_card,
+          "single-question multiSelect: comma-separated form, no react-only prompt")
+    multi = dict(rec, questions=[rec["questions"][0],
+                                 {"question": "Q2?", "options": [{"label": "A"}]}])
+    multi_card = poster._render(multi)
+    check("one number per question" in multi_card
+          and "React with the option number" not in multi_card,
+          "multi-question: full ordered vector; reactions ruled out")
+    mixed = dict(rec, questions=[dict(rec["questions"][0], multiSelect=True),
+                                 {"question": "Q2?", "options": [{"label": "A"}]}])
+    check("decides autonomously at timeout" in poster._render(mixed),
+          "multi-question + multiSelect: honest can't-answer-by-numbers notice")
+    a2 = ha.CardPoster(store, "https://gw", {}, "!room:hs",
+                       log=lambda *_: None, include_a2ui=True)
+    check("```a2ui" in a2._render(rec),
+          "a2ui: single-question single-select still gets buttons")
+    check("```a2ui" not in a2._render(multi) and "```a2ui" not in a2._render(ms),
+          "a2ui: shapes one click can't resolve stay text-only (no eaten clicks)")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

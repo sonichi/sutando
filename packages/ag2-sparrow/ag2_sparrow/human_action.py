@@ -198,11 +198,31 @@ class CardPoster:
             for oi, opt in enumerate(q.get("options") or [], 1):
                 lines.append(f"  {oi}. {opt.get('label', '?')}")
             lines.append("")
-        lines.append(f"React with the option number, or reply "
-                     f"`answer {rec['action_id']} <n>`.")
-        if not self._a2ui:
+        # Instructions must match what _complete_answers actually accepts for
+        # THIS action's shape — a card telling the owner to react on a
+        # multi-question action would be silently claimed-but-pending.
+        aid = rec["action_id"]
+        qs = rec.get("questions") or []
+        if len(qs) <= 1 and not (qs and qs[0].get("multiSelect")):
+            lines.append(f"React with the option number, or reply "
+                         f"`answer {aid} <n>`.")
+        elif len(qs) <= 1:
+            lines.append(f"Pick one or more: reply `answer {aid} <n1>,<n2>,...` "
+                         f"(a reaction or a single number picks just one).")
+        elif any(q.get("multiSelect") for q in qs):
+            lines.append("This card mixes multiple questions with multi-select, "
+                         "which can't be answered by numbers here — if it stays "
+                         "unanswered, Claude decides autonomously at timeout.")
+        else:
+            lines.append(f"Reply `answer {aid} <n1>,<n2>,...` — one number per "
+                         f"question, in order. (Reactions can't answer a "
+                         f"multi-question card.)")
+        # A2UI buttons are single-pick macros for `answer <id> <n>` — only a
+        # single-question single-select action can be resolved by one click, so
+        # other shapes keep the text-only card (same silent-claim hazard).
+        if not self._a2ui or len(qs) != 1 or qs[0].get("multiSelect"):
             return "\n".join(lines)
-        first_q = (rec.get("questions") or [{}])[0]
+        first_q = qs[0]
         card = {
             "version": "0.9",
             "type": "buttons",
