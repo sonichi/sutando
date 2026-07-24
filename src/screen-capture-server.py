@@ -358,7 +358,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # _recording_lock, so the callback blocks until this returns).
                     _active_recording = {"proc": proc, "path": path, "watchdog": wd}
                     wd.start()
-                _post_recording_state(True)
+                    _post_recording_state(True)  # under the lock: a concurrent stop can't interleave a stale ON (CR: qingyun-wu)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

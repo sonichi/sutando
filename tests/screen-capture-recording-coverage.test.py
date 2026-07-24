@@ -204,6 +204,25 @@ class RecordingCoverage(unittest.TestCase):
                          "stop must not publish off when a new recording started during finalization")
         self.assertIs(self.mod._active_recording, newB, "the new recording must remain active")
 
+    def test_start_publishes_on_under_lock_no_stale_on(self):
+        # Mirror of the OFF-race (qingyun Finding #2): START must publish recording.on
+        # while holding _recording_lock, so a concurrent stop can't clear _active_recording
+        # first and leave a stale ON (isRecordingVideo=true with nothing recording). (CR: qingyun-wu)
+        held_at_on = {"v": None}
+        orig = self.mod._post_recording_state
+        def hook(on):
+            if on:
+                held_at_on["v"] = self.mod._recording_lock.locked()
+            return orig(on)
+        hdr = {"X-Sutando-Capture-Token": "test-capture-token"}
+        with mock.patch.object(self.mod, "_post_recording_state", hook):
+            with urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{self.port}/capture-video?action=start&silent=true", headers=hdr), timeout=5) as r:
+                self.assertEqual(r.status, 200)
+        self.assertTrue(held_at_on["v"],
+                        "start must publish recording.on while holding _recording_lock (else a concurrent stop leaves a stale ON)")
+        self.assertIsNotNone(self.mod._active_recording, "start must leave the recording active")
+
 
 if __name__ == "__main__":
     unittest.main()
