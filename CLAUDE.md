@@ -68,15 +68,7 @@ When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.
 - Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
 - Merge only when the current head is mergeable, required CI + CLA are green, and two maintainers have recorded formal approvals. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
 
-**Canonical review criteria (mirror of `REVIEW.md`).** These are the repo's review lessons. The root `REVIEW.md` carries the same list for Claude Code's managed GitHub-App PR reviews (which read `REVIEW.md`); the local in-session `/code-review` reads *this* file (`CLAUDE.md`), **not** `REVIEW.md` — so the lessons live in both. Keep the two prose copies in sync. The machine-readable `checks:` block (hardcoded-path scan, run in CI via `scripts/review-checks.sh`) lives only in `REVIEW.md`.
-
-1. **Confirm the bug exists on `main` before endorsing a fix.** A patch for a bug that isn't there is noise.
-2. **Review the whole activated path, not just the diff.** Bugs hide in the unchanged code the diff now reaches; a parity change means reading both branches end-to-end.
-3. **Prove the fix by exercising the failure mode.** Happy-path green ≠ proof — a test must actually reproduce the original failure, or the fix is unverified.
-4. **Destructive / auto-remediating actions: check default state and blast radius.** For anything that deletes, restarts, recovers, or prunes, ask *is it on by default, and how many hosts/files does it touch?* Prefer fail-closed over silently reporting success.
-5. **Disruption to existing users is part of correctness.** Check opt-in vs always-on, on-disk state-format/migration compatibility across the rolling-upgrade window, new hard-required config that breaks current installs, and process-global patches with wide blast radius.
-6. **No hardcoded absolute paths.** Machine/user-specific literals (`/Users/…`, `/home/<user>/…`, `~/.claude`, `~/.sutando`) break on other hosts; resolve via the workspace/config helpers. Enforced by the `checks:` block in `REVIEW.md`.
-7. **A verdict must state merge-readiness explicitly** ("ready to merge" / "changes requested: …" / "LGTM, non-blocking") — and only honestly if you actually ran these criteria on *this* PR; a readiness claim with no evidence attached is an over-claim.
+**Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the 7 lessons here — read them from `REVIEW.md`. When you review, `review-preflight.py` reads `REVIEW.md` and prints the criteria inline so you see them on every preflight run; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Claude Code's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
 
 Skill-PR destination: a skill is **coupled** (PR to `sonichi/sutando`) if it imports from `src/` or another skill, modifies main-repo files, or is tightly bound to a feature there (e.g. `skills/phone-conversation/`). A skill is **standalone** (PR to `sonichi/sutando-skills-community`) if it ships its own scripts/binaries, reads files but doesn't import main-repo modules, and works against any checkout. If unsure, ask in #design.
 
