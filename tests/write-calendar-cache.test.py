@@ -144,6 +144,31 @@ def test_cli_error_paths() -> None:
     ok("CLI non-list JSON → rc 2", wcc.main(["--events-json", '{"raw": "x"}']) == 2)
 
 
+def test_nonempty_payload_no_usable_events_preserves_prior() -> None:
+    """Honesty guard (#2256 CR): a non-empty payload that normalizes to zero events
+    must NOT certify a verified-empty day — it fails nonzero and leaves any prior
+    cache untouched. A Google-API-shaped item (no `raw` key) is the canonical case."""
+    google_shaped = [{"summary": "Owner 1:1", "start": {"dateTime": "2026-07-24T09:00:00-07:00"}}]
+    # (a) with a prior good cache: the bad write must not clobber it.
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "state" / "calendar-today.json"
+        prior = {"date": TODAY, "events": [{"raw": "9am Standup", "calendar": "work"}]}
+        cache.parent.mkdir(parents=True)
+        cache.write_text(json.dumps(prior))
+        with unittest.mock.patch.object(wcc, "cache_path", lambda: cache):
+            rc = wcc.main(["--events-json", json.dumps(google_shaped)])
+        ok("guard: non-empty→zero-usable payload exits nonzero (no false-clear)", rc != 0, f"rc={rc}")
+        ok("guard: prior cache left untouched (not overwritten to events:[])",
+           json.loads(cache.read_text()) == prior, cache.read_text())
+    # (b) with no prior cache: nothing is written (no blank verified-empty file).
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "state" / "calendar-today.json"
+        with unittest.mock.patch.object(wcc, "cache_path", lambda: cache):
+            rc = wcc.main(["--events-json", json.dumps(google_shaped)])
+        ok("guard: no prior cache → nothing written, still nonzero",
+           rc != 0 and not cache.exists(), f"rc={rc} exists={cache.exists()}")
+
+
 def test_cache_path_default_location() -> None:
     """The real (un-mocked) cache_path resolves under <workspace>/state/."""
     p = wcc.cache_path()
@@ -160,6 +185,7 @@ test_cli_empty_flag()
 test_cli_events_json_flag()
 test_cli_stdin_events()
 test_cli_error_paths()
+test_nonempty_payload_no_usable_events_preserves_prior()
 test_cache_path_default_location()
 
 print()

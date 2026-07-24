@@ -93,13 +93,25 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return 2
         try:
-            events = json.loads(blob)
+            parsed = json.loads(blob)
         except ValueError as e:
             print(f"write_calendar_cache: invalid JSON — {e}", file=sys.stderr)
             return 2
-        if not isinstance(events, list):
+        if not isinstance(parsed, list):
             print("write_calendar_cache: expected a JSON array of events", file=sys.stderr)
             return 2
+        # Honesty guard (#2256): normalize BEFORE writing so a payload that maps to
+        # zero usable events never becomes a verified-empty ("clear") day. A
+        # Google-API-shaped list like [{"summary":"1:1","start":{...}}] has no `raw`
+        # key, so it normalizes to [] — writing that as events:[] is the exact
+        # false-"clear" this producer exists to prevent. Only --empty may certify an
+        # empty day; here we fail nonzero and leave any prior cache untouched.
+        events = normalize_events(parsed)
+        if not events:
+            print("write_calendar_cache: input contained no usable events — refusing to "
+                  "certify a verified-empty day (use --empty for a genuinely empty day). "
+                  "Prior cache left untouched.", file=sys.stderr)
+            return 3
 
     path = write_cache(events)
     n = len(normalize_events(events))
