@@ -16,6 +16,9 @@ from typing import Iterable, Tuple
 _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     ("AWS Access Key", re.compile(r"AKIA[A-Z0-9]{16}")),
     ("GitHub Token", re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}")),
+    # Fine-grained PATs (2022+) use a distinct prefix + longer body — the
+    # legacy ghp_/gho_/… pattern above never matches them (review P1).
+    ("GitHub Fine-Grained PAT", re.compile(r"github_pat_[A-Za-z0-9_]{36,}")),
     ("Matrix Access Token", re.compile(r"syt_[A-Za-z0-9_-]{20,}")),
     ("Remote Task Token", re.compile(
         r"https?://[^\s|]+\|[A-Za-z0-9_+/=-]{20,}"

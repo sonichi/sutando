@@ -586,6 +586,18 @@ def main() -> int:
     # from clean tasks. access_tier must still parse as the LAST header line.
     check("SUTANDO SECURITY NOTICE" in _sec_body,
           "security notice appended when a secret was redacted")
+    # Fine-grained PATs use a different prefix the legacy pattern misses
+    # (review P1): github_pat_ + 22-char id + _ + 59-char body in the wild;
+    # any 36+ [A-Za-z0-9_] run after the prefix must redact.
+    _fg = "github_pat_" + "11AAAAAAA" + "0" * 13 + "_" + "a" * 40
+    rtc._write_task({**TASK, "id": "task-FGPAT",
+                     "task": f"[AG2Space @qingyun] use {_fg} for the repo"})
+    _fg_body = (rtc.TASKS_DIR / "task-FGPAT.txt").read_text()
+    check(_fg not in _fg_body and "github_pat_" not in _fg_body.replace(
+              "GitHub Fine-Grained PAT", ""),
+          "fine-grained github_pat_ token REDACTED from persisted body")
+    check("SUTANDO SECURITY NOTICE" in _fg_body,
+          "fine-grained PAT redaction also carries the security notice")
     rtc._write_task({**TASK, "id": "task-CLEANBODY",
                      "task": "[AG2Space @qingyun] plain request, nothing secret"})
     check("SUTANDO SECURITY NOTICE" not in
