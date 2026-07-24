@@ -31,6 +31,14 @@ def check(name, cond, detail=""):
 
 # ─────────────────────────── Discord ───────────────────────────
 def _load_discord():
+    # Isolate import-time channel resolution before loading the bridge. Setting
+    # ACCESS_FILE after import is too late: the module resolves/chmods its .env
+    # and access.json while executing top-level code.
+    ccd = Path(tempfile.mkdtemp(prefix="sutando-ack-discord-ccd-"))
+    channel_dir = ccd / "channels" / "discord"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "access.json").write_text("{}\n")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(ccd)
     d = types.ModuleType("discord")
     class _Intents:
         def __init__(self, *a, **k): pass
@@ -58,6 +66,8 @@ def _load_discord():
     spec = importlib.util.spec_from_loader("dbridge_ack", loader=None)
     b = importlib.util.module_from_spec(spec); b.__file__ = str(REPO / "src" / "discord-bridge.py")
     exec(compile(src, b.__file__, "exec"), b.__dict__)
+    assert Path(b.channels_env).parent == channel_dir
+    assert Path(b.ACCESS_FILE) == channel_dir / "access.json"
     return b
 
 
@@ -238,6 +248,14 @@ def test_discord():
 
 # ─────────────────────────── Slack ───────────────────────────
 def _load_slack():
+    # Slack also resolves its channel paths during import, so seed a canonical
+    # temp access file before loading the module. This prevents the legacy
+    # reader fallback from consulting or mutating the developer's live config.
+    ccd = Path(tempfile.mkdtemp(prefix="sutando-ack-slack-ccd-"))
+    channel_dir = ccd / "channels" / "slack"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "access.json").write_text("{}\n")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(ccd)
     class _FakeClient:
         def __init__(self): self.posts = []
         def chat_postMessage(self, **kw): self.posts.append(kw); return {"ok": True}
@@ -256,6 +274,8 @@ def _load_slack():
     os.environ["SLACK_BOT_TOKEN"] = "xoxb-test"; os.environ["SLACK_APP_TOKEN"] = "xapp-test"
     spec = importlib.util.spec_from_file_location("sbridge_ack", REPO / "src" / "slack-bridge.py")
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    assert Path(m.channels_env).parent == channel_dir
+    assert Path(m.ACCESS_FILE) == channel_dir / "access.json"
     return m
 
 
