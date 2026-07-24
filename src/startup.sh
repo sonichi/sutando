@@ -41,7 +41,10 @@ export SUTANDO_ROOT="$REPO"
 # such hosts (web-client outage 2026-07-17).
 _APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
 [ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
-_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin)"
+# `|| true`: tsx-bin prints nothing AND returns nonzero on a bare bundled
+# runtime (no tsx anywhere) — under set -e that exited startup at this line
+# before the bundled-mode gate could run (Codex blocking finding #2).
+_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin || true)"
 run_tsx() {
   if [ -n "$_TSX_BIN" ]; then
     "$_TSX_BIN" "$@"
@@ -50,14 +53,25 @@ run_tsx() {
   fi
 }
 
-# G1.5 node-bundle (owner-adopted design 2026-07-19): when the desktop app
-# manages the launch it exports SUTANDO_NODE=<exact bundled node executable>.
-# That runtime's dir wins PATH (covers every `#!/usr/bin/env node` re-exec),
-# and services prefer the pre-built dist/<name>.js artifact under it — no npm
-# install, no tsx, no node_modules at runtime. Dev/OSS hosts (SUTANDO_NODE
-# unset) keep tsx-over-src EXACTLY as before, so a stale dist/ can never
-# shadow live src edits.
-if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ]; then
+# G1.5 node-bundle (owner-adopted design + owner review 2026-07-19).
+# Bundled and dev are MUTUALLY EXCLUSIVE modes, not a preference (P1-2):
+#   BUNDLED = the desktop-managed runtime is present — SUTANDO_NODE exported
+#   (fail-closed if invalid, see node-bin) OR the bundled runtime discovered
+#   at its canonical home (app-node-dir; covers launchd jobs without the env
+#   var) — AND dist artifacts are shipped. Services run dist/<name>.js under
+#   the pinned node; a missing artifact is an explicit PACKAGING ERROR, never
+#   a tsx fallback (tsx/npm/node_modules deliberately don't exist here).
+#   DEV = everything else; tsx-over-src exactly as before, so a stale dist/
+#   can never shadow live src edits.
+_NODE_BIN="$(bash "$REPO/scripts/sutando-config.sh" node-bin)" || {
+  echo "✗ SUTANDO_NODE is set but invalid — desktop packaging error; refusing PATH fallback (G1.5 fail-closed)"
+  exit 1
+}
+BUNDLED_MODE=0
+if { [ -n "${SUTANDO_NODE:-}" ] || [ -x "$_APP_NODE_DIR/node" ]; } && [ -f "$REPO/dist/web-client.js" ]; then
+  BUNDLED_MODE=1
+fi
+if [ -n "${SUTANDO_NODE:-}" ]; then
   _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
   case ":$PATH:" in *":$_SUTANDO_NODE_DIR:"*) ;; *) PATH="$_SUTANDO_NODE_DIR:$PATH"; export PATH ;; esac
 fi
@@ -67,8 +81,12 @@ run_node_service() {
   _rns_dist="$REPO/dist/$1.js"
   _rns_entry="$2"
   shift 2
-  if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ] && [ -f "$_rns_dist" ]; then
-    "$SUTANDO_NODE" "$_rns_dist" "$@"
+  if [ "$BUNDLED_MODE" = "1" ]; then
+    if [ ! -f "$_rns_dist" ]; then
+      echo "  ✗ bundled mode: dist artifact missing: $_rns_dist (packaging error — refusing tsx fallback)"
+      return 1
+    fi
+    "$_NODE_BIN" "$_rns_dist" "$@"
   else
     run_tsx "$_rns_entry" "$@"
   fi
@@ -387,17 +405,13 @@ echo ""
 # things piece by piece.
 bash "$REPO/src/init.sh" --preflight | tail -1
 
-# Bundled mode (G1.5 node-bundle, Codex review finding on #2182): when the
-# desktop app manages the launch it exports SUTANDO_NODE and ships pre-built
-# dist artifacts — there is deliberately NO npm/npx/node_modules in that
-# runtime, so the dependency bootstrap and the npx prerequisite below would
-# kill startup before run_node_service ever runs. Gate them off. Sentinel =
-# a valid SUTANDO_NODE plus the web-client dist artifact (built by
-# build:bundle; the one service every install runs).
-BUNDLED_MODE=0
-if [ -n "${SUTANDO_NODE:-}" ] && [ -x "${SUTANDO_NODE}" ] && [ -f "$REPO/dist/web-client.js" ]; then
-  BUNDLED_MODE=1
-  echo "  ✓ bundled mode (SUTANDO_NODE + dist artifacts) — skipping dependency bootstrap"
+# Bundled mode (G1.5): BUNDLED_MODE is computed ONCE next to
+# run_node_service (single source of truth — owner review P1-2: app-node-dir
+# discovery counts as bundled too, not just the env var). The npm bootstrap
+# + node/npx prereq blocks below are gated on it because a bundled runtime
+# deliberately has NO npm/npx/node_modules (Codex finding #1).
+if [ "$BUNDLED_MODE" = "1" ]; then
+  echo "  ✓ bundled mode (pinned runtime + dist artifacts) — skipping dependency bootstrap"
 fi
 
 # Install dependencies if needed (dev/source mode only — bundled installs
