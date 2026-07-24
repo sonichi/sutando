@@ -96,16 +96,16 @@ def test_find_duplicates():
 
 def test_pick_email_for_name():
     headers = [
-        {"from": "Qingyun Wu <qingyun@example.com>", "to": "Chi <chi@x.com>"},
-        {"from": "Random Person <noise@example.com>", "to": "qingyun@example.com"},
+        {"from": "Alice Adams <alice@example.com>", "to": "Dana <dana@x.com>"},
+        {"from": "Random Person <noise@example.com>", "to": "alice@example.com"},
     ]
-    picked = M.pick_email_for_name(headers, "Qingyun")
-    assert picked["email"] == "qingyun@example.com", picked
+    picked = M.pick_email_for_name(headers, "Alice")
+    assert picked["email"] == "alice@example.com", picked
     # nothing found → None (never a guess)
     assert M.pick_email_for_name([], "Nobody")["email"] is None
     # display-name token match beats a random address
-    mixed = [{"from": "Susan Liu <susan@team.com>", "cc": "misc@team.com"}]
-    assert M.pick_email_for_name(mixed, "Susan")["email"] == "susan@team.com"
+    mixed = [{"from": "Bob Brown <bob@team.com>", "cc": "misc@team.com"}]
+    assert M.pick_email_for_name(mixed, "Bob")["email"] == "bob@team.com"
 
 
 def test_argparse_is_side_effect_free():

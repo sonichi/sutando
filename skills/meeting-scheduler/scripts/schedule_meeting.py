@@ -27,7 +27,7 @@ The dedup / conflict / when-parsing logic is pure and unit-tested offline
 Examples:
     # dry-run (default) — resolve names, check the slot, dedup, report only:
     python3 schedule_meeting.py --title "Sync" --when 2026-07-25T15:00 \
-        --duration-min 30 --resolve "Qingyun, Susan"
+        --duration-min 30 --resolve "Alice, Bob"
 
     # actually create + email invites:
     python3 schedule_meeting.py --title "Sync" --when 2026-07-25T15:00 \
@@ -451,11 +451,11 @@ def self_check() -> int:
 
     # email resolution heuristic
     headers = [
-        {"from": "Qingyun Wu <qingyun@example.com>", "to": "Chi <chi@x.com>"},
-        {"from": "Someone Else <nobody@example.com>", "to": "qingyun@example.com"},
+        {"from": "Alice Adams <alice@example.com>", "to": "Dana <dana@x.com>"},
+        {"from": "Someone Else <nobody@example.com>", "to": "alice@example.com"},
     ]
-    picked = pick_email_for_name(headers, "Qingyun")
-    check(picked["email"] == "qingyun@example.com",
+    picked = pick_email_for_name(headers, "Alice")
+    check(picked["email"] == "alice@example.com",
           "pick_email_for_name resolves display-name match")
     check(pick_email_for_name([], "Nobody")["email"] is None,
           "pick_email_for_name returns None when nothing found")

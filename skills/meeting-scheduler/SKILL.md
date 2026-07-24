@@ -56,7 +56,7 @@ hand with the `gws` commands shown.
 For each name, search recent mail and read From/To headers to extract the address:
 
 ```bash
-gws gmail users messages list --params '{"userId":"me","q":"\"Qingyun\" newer_than:365d","maxResults":10}'
+gws gmail users messages list --params '{"userId":"me","q":"\"Alice\" newer_than:365d","maxResults":10}'
 # then, per hit id:
 gws gmail users messages get --params '{"userId":"me","id":"<id>","format":"metadata","metadataHeaders":["From","To","Cc"]}'
 ```
@@ -103,7 +103,7 @@ Print the `htmlLink` from the insert response back to the owner.
 # Dry-run (default) — resolve, check, dedup, report. NO changes:
 python3 skills/meeting-scheduler/scripts/schedule_meeting.py \
   --title "Sutando sync" --when 2026-07-25T15:00 --duration-min 30 \
-  --resolve "Qingyun, Susan"
+  --resolve "Alice, Bob"
 
 # Create + email invites (owner action):
 python3 skills/meeting-scheduler/scripts/schedule_meeting.py \
