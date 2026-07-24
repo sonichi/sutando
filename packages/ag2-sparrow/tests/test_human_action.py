@@ -179,12 +179,12 @@ def test_card_poster_posts_once():
         ha.urllib.request.urlopen = orig
     check(n1 == 1 and n2 == 0, "poster: one card per action, never re-posted")
     check(calls[0]["op"] == "message" and calls[0]["room_id"] == "!room:hs"
-          and "Ship v1" in calls[0]["text"],
+          and "Ship v1" in calls[0]["body"],
           "poster: card carries the options via the gateway message op")
     # A2UI contract: one fenced ```a2ui block; options carry OUR decision
     # grammar as the action, so a button click round-trips through the same
     # regex as a typed reply.
-    a2ui_json = calls[0]["text"].split("```a2ui")[1].split("```")[0]
+    a2ui_json = calls[0]["body"].split("```a2ui")[1].split("```")[0]
     card_obj = json.loads(a2ui_json)
     check(card_obj["type"] == "buttons"
           and card_obj["options"][0]["action"] == "answer ha_abc123def456 1",

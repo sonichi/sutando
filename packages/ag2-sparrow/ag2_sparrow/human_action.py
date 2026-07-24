@@ -171,7 +171,7 @@ class CardPoster:
             if rec.get("card_event_id"):
                 continue
             body = json.dumps({"op": "message", "room_id": self._room,
-                               "text": self._render(rec)}).encode()
+                               "body": self._render(rec)}).encode()
             req = urllib.request.Request(
                 self._url + "/v1/room", data=body,
                 headers={**self._headers, "Content-Type": "application/json"},
