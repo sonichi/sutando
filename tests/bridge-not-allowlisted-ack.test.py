@@ -159,6 +159,14 @@ def test_discord():
     db._NOT_ALLOWLISTED_ACK_STATE_FILE.write_text("{")
     asyncio.run(db._ack_not_allowlisted(corrupt, "U_E", "erin"))
     check("discord: malformed cooldown state fails open", len(corrupt.sent) == 1, str(corrupt.sent))
+    non_object = _FakeChannel(channel_id=791)
+    db._NOT_ALLOWLISTED_ACK_STATE_FILE.write_text("[]")
+    asyncio.run(db._ack_not_allowlisted(non_object, "U_G", "grace"))
+    check(
+        "discord: non-object cooldown state fails open",
+        len(non_object.sent) == 1,
+        str(non_object.sent),
+    )
     blocked_parent = db.ACCESS_FILE.parent / "not-a-directory"
     blocked_parent.write_text("fixture")
     db._NOT_ALLOWLISTED_ACK_STATE_FILE = blocked_parent / "ack-state.json"

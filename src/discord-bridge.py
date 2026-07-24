@@ -2386,6 +2386,8 @@ def _not_allowlisted_ack_state() -> dict[str, float]:
     """Read valid per-channel send timestamps; malformed state fails open."""
     try:
         raw = json.loads(_NOT_ALLOWLISTED_ACK_STATE_FILE.read_text())
+        if not isinstance(raw, dict):
+            return {}
         entries = raw.get("sent_at_by_channel", {})
         if not isinstance(entries, dict):
             return {}
