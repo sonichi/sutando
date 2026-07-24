@@ -1,0 +1,48 @@
+name: eslint
+
+# CI lint: the general-purpose ESLint baseline over all first-party sources —
+# TypeScript (src/, skills/, tests/) and plain JavaScript (.js/.mjs build
+# scripts + the Electron overlay app, which tsc never sees).
+#
+# Distinct from the five lint-*.yml workflows, which are targeted greps for
+# architectural rules (workspace resolution, host labels, home-path literals).
+# This one runs the actual linter: unused vars, dead code, unreachable branches
+# — the class of defect tsc does not catch.
+#
+# Config and the rationale for every relaxed rule live in eslint.config.mjs.
+# Errors fail this check. no-explicit-any is an ERROR everywhere except the
+# shrinking allowlist of files that predate the ratchet (see eslint.config.mjs)
+# — those stay warnings so their count is visible without blocking.
+#
+# Runs as its own workflow (rather than a step inside ci.yml) so a lint failure
+# surfaces as a named "eslint" check on the PR instead of being buried in the
+# CI job — matching the one-workflow-per-lint convention above. Cost is one
+# extra `npm ci`; the npm cache keeps it short.
+
+on:
+  pull_request:
+    branches: [main, staging-interaction-planes]
+  push:
+    branches: [main, staging-interaction-planes]
+
+jobs:
+  eslint:
+    name: eslint over first-party TS + JS
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint

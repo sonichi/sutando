@@ -1,5 +1,6 @@
 """CI guard: the packaged modules must match sonichi/sutando src/ verbatim."""
-import subprocess, sys
+import subprocess
+import sys
 from pathlib import Path
 
 def test_package_in_sync_with_src():

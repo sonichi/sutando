@@ -113,7 +113,7 @@ def run():
             fake_access.write_text(json.dumps({"allowFrom": ["alice", "bob"]}))
             result = bridge.load_allowed()
             if result != {"alice", "bob"}:
-                fails.append("(f) valid: expected {'alice','bob'}, got {!r}".format(result))
+                fails.append("(f) valid: expected {{'alice','bob'}}, got {!r}".format(result))
             else:
                 passed += 1
 
@@ -162,7 +162,7 @@ def run():
 
             # Should return {"12345"}
             if allowed != {"12345"}:
-                fails.append("(a) TOFU: expected {'12345'}, got {!r}".format(allowed))
+                fails.append("(a) TOFU: expected {{'12345'}}, got {!r}".format(allowed))
             else:
                 passed += 1
 
@@ -225,7 +225,7 @@ def run():
 
             result = bridge.load_allowed()
             if result != {"111", "222"}:
-                fails.append("(d) populated: expected {'111','222'}, got {!r}".format(result))
+                fails.append("(d) populated: expected {{'111','222'}}, got {!r}".format(result))
             else:
                 passed += 1
 

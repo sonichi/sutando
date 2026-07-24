@@ -153,7 +153,8 @@ class TestDeliver(unittest.TestCase):
         self.m.notify_macos = lambda c, t: True
         self.m.voice_client_connected = lambda: False
         self.m.undrained_proactive_files = lambda: ["proactive-old.txt"]
-        import io, contextlib
+        import io
+        import contextlib
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             s = self.m.deliver([{"title": "q"}], 1, ["q"])
@@ -180,7 +181,8 @@ class TestReviewFindings(unittest.TestCase):
 
     # --- finding 1: cooldown must not be stamped when delivery raises ---
     def test_a_cooldown_not_stamped_when_delivery_raises(self):
-        import tempfile, pathlib
+        import tempfile
+        import pathlib
         stamp = pathlib.Path(tempfile.mkdtemp()) / "last-notify"
         self.m.LAST_NOTIFY_FILE = stamp
         self.m.deliver = lambda *a, **k: (_ for _ in ()).throw(OSError("delivery blew up"))
@@ -195,7 +197,8 @@ class TestReviewFindings(unittest.TestCase):
         """The positive half. Testing only the failure case let the stamp be
         deleted outright without any test failing — which would notify on every
         run forever. A guard needs both directions or it pins nothing."""
-        import tempfile, pathlib
+        import tempfile
+        import pathlib
         stamp = pathlib.Path(tempfile.mkdtemp()) / "last-notify"
         self.m.LAST_NOTIFY_FILE = stamp
         self.m.deliver = lambda *a, **k: "Notified: 1 pending questions [ok]"
