@@ -254,6 +254,38 @@ print(_host_label(), end='')
     printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
     ;;
 
+  node-bin)
+    # SINGLE SOURCE OF TRUTH for the Node executable (G1.5 node-bundle,
+    # owner-adopted design + owner review 2026-07-19). Precedence:
+    #   1. $SUTANDO_NODE — the EXACT executable, exported by the desktop app.
+    #      AUTHORITATIVE ONCE SET: if it is set but not executable, that is a
+    #      desktop packaging error — FAIL CLOSED (stderr + exit 1) instead of
+    #      silently rescuing via whatever node the host happens to have, which
+    #      would mask the packaging bug and void the deterministic-runtime
+    #      guarantee (owner review P1-1).
+    #   2. app-node-dir/node — the bundled runtime at its canonical home
+    #      <engine-root>/runtime/node/bin (covers launchd jobs whose plist
+    #      doesn't export SUTANDO_NODE).
+    #   3. first `node` on PATH — dev/OSS hosts, unchanged behavior.
+    # Prints the resolved path; empty output + exit 0 when nothing resolves
+    # (caller decides), exit 1 ONLY for the invalid-explicit case.
+    if [ -n "${SUTANDO_NODE:-}" ]; then
+      if [ -x "${SUTANDO_NODE}" ]; then
+        printf '%s' "$SUTANDO_NODE"
+      else
+        echo "sutando-config: SUTANDO_NODE is set but not an executable: $SUTANDO_NODE (desktop packaging error — refusing PATH fallback)" >&2
+        exit 1
+      fi
+    else
+      _app_node="${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}/node"
+      if [ -x "$_app_node" ]; then
+        printf '%s' "$_app_node"
+      else
+        command -v node 2>/dev/null || true
+      fi
+    fi
+    ;;
+
   tsx-bin)
     # SINGLE SOURCE OF TRUTH for tsx resolution — the launchd wrapper and
     # src/startup.sh both call this instead of each duplicating the candidate
@@ -261,7 +293,11 @@ print(_host_label(), end='')
     # pins, and the ONLY tsx on a host with no homebrew/nvm/volta node at all),
     # then the usual global locations. Prints the resolved path, or nothing —
     # the caller falls back to `npx tsx` on empty output.
-    _nvm_tsx="$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/tsx"
+    # `|| true` inside the substitution: on a host with no ~/.nvm the `ls`
+    # fails, and under `set -euo pipefail` that pipeline status would kill the
+    # whole script BEFORE the candidate loop — startup.sh then dies silently at
+    # its `_TSX_BIN=$(...)` line even though node_modules/.bin/tsx exists.
+    _nvm_tsx="$HOME/.nvm/versions/node/$( (ls "$HOME/.nvm/versions/node/" 2>/dev/null || true) | sort -V | tail -1)/bin/tsx"
     for _p in \
       "$REPO_ROOT/node_modules/.bin/tsx" \
       /opt/homebrew/bin/tsx \
@@ -270,6 +306,10 @@ print(_host_label(), end='')
       "$HOME/.volta/bin/tsx"; do
       [ -x "$_p" ] && { printf '%s' "$_p"; break; }
     done
+    # The contract is "print the path, or nothing" — exit 0 either way. Without
+    # this, a no-match run exits with the last [ -x ] test's failure status and
+    # set -e callers die instead of falling back to `npx tsx`.
+    true
     ;;
 
   dump)
@@ -438,6 +478,57 @@ try:
         probe_call_tiers = ct
 except Exception:
     pass
+# ag2space: is this install already enrolled on AG2 Space, and as whom?
+# 'connected' = ENROLLED (the gateway bridge has a task token configured in
+# channels/ag2space/relay-client.env under the brain dir) — deliberately not
+# process-liveness: the consumer is the desktop onboarding dialog, and a
+# momentarily-down bridge must not push the user into re-minting an identity.
+# agent_id comes from state/auth/ag2space.json — the durable per-host identity
+# home (state/auth/ is exempt from transient-state cleanup; relay-client.env is
+# the WRONG home for identity because the bridge regenerates that file and
+# clobbers foreign keys). Written by the connect flow; absent on installs
+# enrolled before it existed -> null, and consumers should treat null as
+# 'enrolled, identity unknown', not 'not enrolled'.
+probe_ag2space = {'connected': False, 'agent_id': None, 'owner': None}
+# Reader fallback (repo convention): relay-client.env is the canonical creds
+# file, but installs enrolled via the OSS path (onboard.sh -> startup.sh) and
+# the AG2 Space desktop launcher (AG2_DEVICE_ENV) write channels/ag2space/.env
+# instead. Try canonical first, then legacy, before concluding not-connected.
+for _envname in ('relay-client.env', '.env'):
+    try:
+        _kv = {}
+        with open(os.path.join(brain, 'channels', 'ag2space', _envname)) as f:
+            for _line in f:
+                _line = _line.strip()
+                if _line and not _line.startswith('#') and '=' in _line:
+                    _k, _, _v = _line.partition('=')
+                    _kv[_k.strip()] = _v.strip()
+        # AG2_REMOTE_TOKEN is the legacy alias for the same enrollment
+        # (startup.sh + health-check.py both recognize it) — either counts.
+        if _kv.get('REMOTE_TASK_TOKEN') or _kv.get('AG2_REMOTE_TOKEN'):
+            probe_ag2space['connected'] = True
+            break
+    except Exception:
+        pass
+try:
+    with open(os.path.join(ws, 'state', 'auth', 'ag2space.json')) as f:
+        _aid = json.load(f).get('agent_id') or ''
+    # only trust a well-formed mxid (@localpart:server)
+    if isinstance(_aid, str) and _aid.startswith('@') and ':' in _aid[1:]:
+        probe_ag2space['agent_id'] = _aid
+except Exception:
+    pass
+# owner: the mxid the core obeys as owner (TOFU enrollment in the gateway
+# bridge's access.json). Lets the dialog render 'you are its owner' vs 'this
+# core belongs to <owner>' when the signed-in user differs — authority itself
+# is enforced at message-processing time (allowFrom/tierMap), this is display.
+try:
+    with open(os.path.join(brain, 'channels', 'ag2space', 'access.json')) as f:
+        _own = json.load(f).get('tofuOwner') or ''
+    if isinstance(_own, str) and _own.startswith('@') and ':' in _own[1:]:
+        probe_ag2space['owner'] = _own
+except Exception:
+    pass
 env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
 h = {}
 try:
@@ -493,6 +584,13 @@ print(json.dumps({
     # reachable rows, un-greying Direct(Tailscale)/Direct(LAN) when their url is
     # advertised. Runtime-authored via probe_call_tiers above (emit-call-tiers.ts).
     'call_tiers': probe_call_tiers,
+    # ag2space: AG2 Space enrollment of THIS install (probe_ag2space above).
+    # {connected: bool, agent_id: '@…:server'|null}. 'connected' = enrolled
+    # (relay token configured), NOT bridge liveness — consumed by the desktop
+    # onboarding dialog to stop offering identity-minting to an already-
+    # connected core (owner report 2026-07-19). agent_id null on pre-
+    # AG2_AGENT_ID installs: treat as 'enrolled, identity unknown'.
+    'ag2space': probe_ag2space,
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
 }))

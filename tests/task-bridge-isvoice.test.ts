@@ -1,6 +1,6 @@
-import { describe, it, before, after, afterEach } from 'node:test';
+import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, existsSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
+import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../src/workspace_default.js';
 import { _isVoiceTask } from '../src/task-bridge.js';

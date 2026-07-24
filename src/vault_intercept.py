@@ -192,6 +192,54 @@ def _register_key(key: str) -> None:
     os.replace(tmp, path)
 
 
+def _deregister_key(key: str) -> None:
+    manifest = _read_manifest()
+    if key not in manifest:
+        return
+    del manifest[key]
+    path = _manifest_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Atomic write — same pattern as _register_key so concurrent bridge
+    # processes won't corrupt keys.json.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, path)
+
+
+def delete_vault_key(key: str) -> None:
+    """Remove a secret from Keychain + manifest — the public delete path.
+
+    Counterpart to set_vault_key for callers that need to forget a stored
+    secret (CLI `delete` verb; the desktop's cloud_logout forgetting the
+    `sutk_` bearer). Removes the Keychain item AND deregisters the manifest
+    entry; tolerates the two drifting (a manifest entry with no Keychain item,
+    or vice versa, is cleaned up rather than erroring). Raises ValueError on
+    an invalid key name; KeyError when the key exists in neither place.
+    """
+    if not _ENV_KEY_RE.match(key or ""):
+        raise ValueError(f"vault: invalid key name '{key}' (want [A-Za-z_][A-Za-z0-9_]*)")
+    result = subprocess.run(
+        ["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
+        capture_output=True,
+    )
+    keychain_had_it = result.returncode == 0
+    # Only NOT-FOUND (errSecItemNotFound, rc 44) is tolerable drift. Any other
+    # nonzero result (locked Keychain, user denial, other OSStatus) means the
+    # secret may STILL be in the Keychain — deregistering the manifest then
+    # would hide a live credential from `list`. Fail loudly and leave the
+    # manifest intact so the entry stays findable.
+    if not keychain_had_it and result.returncode != 44:
+        raise RuntimeError(
+            f"vault: Keychain delete failed for '{key}' "
+            f"(rc={result.returncode}): {result.stderr.decode(errors='replace').strip()}"
+        )
+    manifest_had_it = key in _read_manifest()
+    if not keychain_had_it and not manifest_had_it:
+        raise KeyError(f"vault: key '{key}' not found")
+    _deregister_key(key)
+
+
 def list_vault_keys() -> list[str]:
     """Return all key names stored in the vault manifest (no values)."""
     return sorted(_read_manifest().keys())
@@ -279,16 +327,30 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # pip-install (env mutation in a message handler) and no separate task:
                 # the refusal rides the normal task to core, channel context intact.
                 print(
-                    f"vault: detect-secrets not installed — refused unquoted "
-                    f"`vault set {key}` (can't validate). Core will install the dep; "
-                    f"quote the value to store immediately.",
+                    f"vault: detect-secrets not installed in {sys.executable} — refused "
+                    f"unquoted `vault set {key}` (can't validate). Quote the value to "
+                    f"store immediately; see the task text for the install command.",
                     flush=True,
                 )
                 failed.append(key)
+                # The install hint must name THIS interpreter (sys.executable),
+                # not a bare `python3`: the bridges are launched with whichever
+                # interpreter had their client library (see the probes in
+                # src/startup.sh), which is frequently NOT the `python3` first on
+                # PATH. Installing into the wrong one leaves the refusal in place
+                # and looks like the fix silently failed.
+                #
+                # The --break-system-packages fallback is required, not optional
+                # noise: on a stock Homebrew/macOS python both `pip install` AND
+                # `pip install --user` are refused by PEP 668, so the previous
+                # bare `python3 -m pip install detect-secrets` could not succeed
+                # on the most common Sutando host. Verified 2026-07-20.
                 return (
                     f"vault set {key} [vault: REFUSED — detect-secrets not installed, "
                     f"can't validate an unquoted value. AGENT: run "
-                    f"'python3 -m pip install detect-secrets', then tell the owner to "
+                    f"'{sys.executable} -m pip install detect-secrets' — if that fails "
+                    f"with 'externally-managed-environment' (PEP 668), retry the same "
+                    f"command with --break-system-packages. Then tell the owner to "
                     f"re-send this vault set (or quote the value next time). Never echo "
                     f"or ask for the value.]"
                 )

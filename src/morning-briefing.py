@@ -397,12 +397,29 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     return " ".join(parts)
 
 
+def completion_line(result_file, narrative: str) -> str:
+    """What the run actually accomplished.
+
+    This script WRITES a result file; delivery is a channel bridge's job and may
+    never happen — no bridge running, or no channel configured on the host. The
+    previous wording ("Briefing delivered:") reported an outcome this script does
+    not observe and cannot verify, so a run that reached nobody looked identical
+    to one that reached the owner. Observed 2026-07-21: six proactive results,
+    the oldest 8h old, sat undrained while every run printed "delivered".
+
+    Extracted so the claim is testable rather than an inline literal (same shape
+    as `summary_line` in health-check.py).
+    """
+    return (f"Briefing written to {result_file.name} — delivery depends on a "
+            f"channel bridge draining results/:\n{narrative}")
+
+
 def main():
     # Check sentinel — don't repeat if already run today
     today = datetime.now().strftime("%Y-%m-%d")
     sentinel = STATE_DIR / f"morning-briefing-{today}.sentinel"
     if sentinel.exists() and "--force" not in sys.argv:
-        print(f"Morning briefing already delivered today ({today}). Use --force to re-run.")
+        print(f"Morning briefing already generated today ({today}). Use --force to re-run.")
         return
 
     print("Gathering morning briefing...")
@@ -443,7 +460,7 @@ def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     sentinel.write_text(datetime.now().isoformat())
 
-    print(f"\nBriefing delivered:\n{narrative}")
+    print("\n" + completion_line(result_file, narrative))
 
     # Anonymous, opt-out product telemetry: one bucketed event when this feature
     # actually runs (not on the already-delivered early return). No content/PII.

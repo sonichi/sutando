@@ -1,6 +1,6 @@
-import { describe, it, before, after, beforeEach } from 'node:test';
+import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from 'node:fs';
+import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { setupTempWorkspace } from './_helpers/temp-workspace.js';
 
