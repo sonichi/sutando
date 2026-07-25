@@ -80,9 +80,115 @@ _last_notify_ts = 0.0
 # A single open-ended `screencapture -v` recording driven by two ⌃R presses
 # (start, then stop). Only one at a time; guarded by _recording_lock. The
 # watchdog auto-stops a forgotten recording so it can't run forever / fill disk.
-_active_recording = None  # {"proc": Popen, "path": str, "watchdog": threading.Timer}
+_active_recording = None  # {"proc": Popen, "path": str, "watchdog": threading.Timer, "tap": Popen|None, "mic": Popen|None, "video_path": str}
 _recording_lock = threading.Lock()
 MAX_RECORDING_SECONDS = 600  # safety cap for a recording nobody stopped
+
+# --- system-audio process tap (issue #2314) ----------------------------------
+# System audio is captured with a Core Audio process tap (src/audio-tap/), NOT
+# by re-routing output through a BlackHole Multi-Output device. The tap reads
+# the output stream in place: speakers stay the default output, volume keys
+# keep working, and the audio is lossless. The helper is built on demand.
+TAP_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio-tap", "sys-audio-tap")
+TAP_BUILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio-tap", "build-audio-tap.sh")
+
+
+def _ensure_tap_binary() -> bool:
+    """Build the tap helper if missing (swiftc, ~5s, once per checkout)."""
+    if os.path.exists(TAP_BIN):
+        return True
+    try:
+        subprocess.run(["bash", TAP_BUILD], timeout=120, capture_output=True)
+    except Exception:
+        return False
+    return os.path.exists(TAP_BIN)
+
+
+def _spawn_audio_captures(audio: str, base: str):
+    """Start system-tap and/or mic capture for mode `audio` (mix|system|mic).
+    Returns (tap_proc|None, mic_proc|None, fallback_to_legacy_mic: bool).
+    A tap that dies within its first ~0.7s (TCC denied / unsupported) triggers
+    graceful fallback to the legacy default-input path."""
+    tap = mic = None
+    if audio in ("mix", "system") and _ensure_tap_binary():
+        try:
+            tap = subprocess.Popen([TAP_BIN, base + "-sys.wav"],
+                                   stderr=subprocess.DEVNULL)
+            threading.Event().wait(0.7)
+            if tap.poll() is not None:  # died instantly → no permission
+                tap = None
+        except Exception:
+            tap = None
+    if audio == "mix" and tap is not None:
+        try:
+            mic = subprocess.Popen(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "avfoundation", "-i", ":default", base + "-mic.wav"],
+                stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            threading.Event().wait(0.5)
+            if mic.poll() is not None:
+                mic = None
+        except Exception:
+            mic = None
+    # tap unavailable → legacy `screencapture -g` mic path so audio isn't lost
+    return tap, mic, (audio in ("mix", "system") and tap is None)
+
+
+def _finalize_recording(rec) -> str:
+    """Stop all capture processes and mux audio into the final clip.
+    Returns the path of the finished .mov. Shared by action=stop and the
+    watchdog so both produce identical results."""
+    for key, sig_ in (("proc", signal.SIGINT), ("tap", signal.SIGINT), ("mic", signal.SIGINT)):
+        p = rec.get(key)
+        if p is not None:
+            try:
+                p.send_signal(sig_)
+            except Exception:
+                pass
+    for key, tmo in (("proc", 30), ("tap", 10), ("mic", 10)):
+        p = rec.get(key)
+        if p is not None:
+            try:
+                p.wait(timeout=tmo)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+    video, final = rec["video_path"], rec["path"]
+    if video == final:  # legacy single-process path — nothing to mux
+        return final
+    sys_wav, mic_wav = final[:-4] + "-sys.wav", final[:-4] + "-mic.wav"
+    inputs, have = [], []
+    for w in (sys_wav, mic_wav):
+        if os.path.exists(w) and os.path.getsize(w) > 44:  # >WAV header
+            inputs += ["-i", w]
+            have.append(w)
+    try:
+        if have:
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                   "-i", video] + inputs
+            if len(have) == 2:
+                cmd += ["-filter_complex",
+                        "[1:a][2:a]amix=inputs=2:duration=longest[a]",
+                        "-map", "0:v", "-map", "[a]"]
+            else:
+                cmd += ["-map", "0:v", "-map", "1:a"]
+            cmd += ["-c:v", "copy", "-c:a", "aac", final]
+            subprocess.run(cmd, timeout=120, check=True, capture_output=True)
+            os.unlink(video)
+        else:  # no audio captured — ship the silent video rather than nothing
+            os.replace(video, final)
+    except Exception:
+        # mux failed: fall back to the raw video so the clip isn't lost
+        if os.path.exists(video) and not os.path.exists(final):
+            os.replace(video, final)
+    for w in have:
+        try:
+            os.unlink(w)
+        except Exception:
+            pass
+    return final
 
 
 def _post_recording_state(on: bool):
@@ -259,9 +365,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     if rec.get("watchdog"):
                         rec["watchdog"].cancel()
-                    rec["proc"].send_signal(signal.SIGINT)  # -v finalizes on SIGINT
-                    rec["proc"].wait(timeout=30)
-                    path = rec["path"]
+                    path = _finalize_recording(rec)  # stops video+tap+mic, muxes
                     # Only publish OFF if no NEW recording started during this
                     # finalization (SIGINT+wait released the lock). Otherwise the
                     # stale stop would stomp the new recording's ON state, leaving
@@ -304,22 +408,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if query.get("silent", ["false"])[0] != "true":
                         _signal_seeing()
                         _notify_capture()
-                    # Audio: -g records the *default input device*, so the clip's
-                    # sound source follows System Settings > Sound > Input:
-                    #   mic (MacBook Pro Microphone) → narration / room audio
-                    #   BlackHole 2ch (with output routed there) → system/app audio
-                    # ?audio=off disables sound; ?device=<id> pins a specific input via -G<id>.
-                    audio = query.get("audio", ["on"])[0]
+                    # Audio (issue #2314): default `mix` = system audio via the
+                    # process tap (src/audio-tap/) + mic via ffmpeg, muxed at stop.
+                    # Output device is untouched → volume keys work while recording.
+                    #   ?audio=mix     system + mic (default; meetings/narration)
+                    #   ?audio=system  system audio only (screen demos)
+                    #   ?audio=mic     legacy default-input path (-g / -G<id>)
+                    #   ?audio=off     silent
+                    # `on` is accepted as an alias of `mix` for old callers.
+                    # If the tap can't run (TCC denied, unbuilt, pre-14.2 macOS)
+                    # we fall back to the legacy -g path so audio isn't lost.
+                    audio = query.get("audio", ["mix"])[0]
+                    if audio == "on":
+                        audio = "mix"
                     device = query.get("device", [None])[0]
+                    tap = mic_proc = None
+                    video_path = path
+                    if audio in ("mix", "system"):
+                        tap, mic_proc, fallback = _spawn_audio_captures(audio, path[:-4])
+                        if fallback:
+                            audio = "mic"
+                        else:
+                            video_path = path[:-4] + "-video.mov"
                     cmd = ["screencapture", "-v", "-x"]  # no -V → records until SIGINT
-                    if audio != "off":
+                    if audio == "mic":
                         cmd.append(f"-G{device}" if device else "-g")
                     if display:
                         cmd.append(f"-D{display}")
-                    cmd.append(path)
+                    cmd.append(video_path)
                     try:
                         proc = subprocess.Popen(cmd)
                     except Exception as e:
+                        for p in (tap, mic_proc):  # don't leak audio captures
+                            if p is not None:
+                                try:
+                                    p.kill()
+                                except Exception:
+                                    pass
                         self.send_response(500)
                         self.send_header("Content-Type", "application/json")
                         self.end_headers()
@@ -332,15 +457,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # recording, atomically under the lock — a stale watchdog
                         # (its proc already replaced by a newer recording) must not
                         # stomp the newer recording's ON state. (CR: qingyun-wu)
+                        rec = None
                         with _recording_lock:
                             if _active_recording and _active_recording.get("proc") is p:
+                                rec = _active_recording
                                 _active_recording = None
                                 _post_recording_state(False)
-                        try:
-                            p.send_signal(signal.SIGINT)
-                            p.wait(timeout=30)
-                        except Exception:
-                            pass
+                        if rec:
+                            try:
+                                _finalize_recording(rec)
+                            except Exception:
+                                pass
 
                     # ?max=<seconds> raises the safety cap for known-long sessions
                     # (meeting-link auto-record needs meeting-length clips; the
@@ -356,7 +483,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # tiny cap could fire _auto_stop almost immediately, and it must
                     # see _active_recording already set (both run under
                     # _recording_lock, so the callback blocks until this returns).
-                    _active_recording = {"proc": proc, "path": path, "watchdog": wd}
+                    _active_recording = {"proc": proc, "path": path, "watchdog": wd,
+                                         "tap": tap, "mic": mic_proc,
+                                         "video_path": video_path}
                     wd.start()
                     _post_recording_state(True)  # under the lock: a concurrent stop can't interleave a stale ON (CR: qingyun-wu)
                 self.send_response(200)
