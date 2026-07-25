@@ -641,16 +641,25 @@ def _checkout_is_canonical(repo_dir) -> tuple:
     and fail-closed: if git state is unreadable, treat it as non-canonical.
     """
     try:
-        branch = subprocess.run(
+        branch_proc = subprocess.run(
             ["git", "-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, timeout=10,
-        ).stdout.strip()
-        dirty = subprocess.run(
+        )
+        dirty_proc = subprocess.run(
             ["git", "-C", str(repo_dir), "status", "--porcelain"],
             capture_output=True, text=True, timeout=10,
-        ).stdout.strip()
+        )
     except Exception as e:  # noqa: BLE001 — any git failure → fail closed
         return (False, f"git state unreadable ({e})")
+    # A nonzero git exit means the (possibly empty) stdout can't be trusted — an
+    # empty `status --porcelain` from a FAILED call must not read as "clean" and
+    # green-light an auto-restart (#2316, Qingyun review: the docstring promised
+    # fail-closed but the returncodes were never checked).
+    if branch_proc.returncode != 0 or dirty_proc.returncode != 0:
+        rc = branch_proc.returncode or dirty_proc.returncode
+        return (False, f"git state unreadable (git exit {rc})")
+    branch = branch_proc.stdout.strip()
+    dirty = dirty_proc.stdout.strip()
     if branch != "main":
         return (False, f"checkout on '{branch or 'detached HEAD'}', not main")
     if dirty:

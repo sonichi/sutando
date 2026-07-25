@@ -548,6 +548,18 @@ def case_s_checkout_is_canonical() -> list[str]:
         if ok or "uncommitted" not in why:
             fails.append(f"s) dirty tree should fail, got ({ok},{why})")
 
+    # A NONZERO git exit with empty stdout must fail closed — an errored
+    # `git status --porcelain` (empty output) must not read as "clean" and
+    # green-light an auto-restart (#2316, Qingyun review).
+    def fail_status(argv, **kwargs):
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="main\n", stderr="")
+        return subprocess.CompletedProcess(argv, 128, stdout="", stderr="fatal")
+    with mock.patch.object(hc.subprocess, "run", side_effect=fail_status):
+        ok, why = hc._checkout_is_canonical("/repo")
+        if ok or "unreadable" not in why:
+            fails.append(f"s) nonzero git exit should fail-closed, got ({ok},{why})")
+
     def boom(*a, **k):
         raise OSError("git missing")
     with mock.patch.object(hc.subprocess, "run", side_effect=boom):

@@ -102,6 +102,19 @@
           "description": "Seconds between sync runs when sync is enabled. Minimum 60 to avoid hammering the remote."
         }
       }
+    },
+    "health_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Behavior of src/health-check.py.",
+      "properties": {
+        "down_bridge_action": {
+          "type": "string",
+          "enum": ["restart", "alert", "off"],
+          "default": "restart",
+          "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout — clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert`: never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
+        }
+      }
     }
   }
 }
