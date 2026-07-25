@@ -112,8 +112,10 @@ mod.TASKS_DIR = TASKS_DIR
 def write_task(text: str, user_id: str = "U_OWNER", tier_map: dict | None = None) -> Path | None:
     """Call _write_task with access control mocked; return the written file path."""
     event = {"user": user_id, "channel": "CFAKE", "channel_type": "im", "ts": "1000.001"}
+    effective_tier_map = tier_map if tier_map is not None else {user_id: "owner"}
     with patch.object(mod, "load_allowed", lambda: {user_id}), \
-         patch.object(mod, "load_tier_map", lambda: (tier_map or {})):
+         patch.object(mod, "_ensure_tier_map_seeded", lambda: True), \
+         patch.object(mod, "load_tier_map", lambda: effective_tier_map):
         task_id = mod._write_task(event, "DM", text, "testowner")
     if not task_id:
         return None
