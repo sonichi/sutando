@@ -34,6 +34,7 @@ def is_addressed_in_shared_channel(
     is_reply: bool,
     reply_author_id,
     self_id,
+    author_id=None,
 ) -> bool:
     """Return True iff this message should be processed as addressed to us.
 
@@ -43,17 +44,27 @@ def is_addressed_in_shared_channel(
     Addressed to us (→ True) when any of:
       * we are @-mentioned (`bot_mentioned`) or role-mentioned (`role_mentioned`);
       * the message is a reply to one of OUR messages
-        (`is_reply and reply_author_id == self_id`).
+        (`is_reply and reply_author_id == self_id`);
+      * a HUMAN replies to their OWN message (`reply_author_id == author_id`) —
+        that is the sender continuing their own thread, addressed to whoever is
+        listening (us), exactly like a fresh non-reply post. Requires `author_id`
+        to be passed; when it is omitted (legacy callers) this exemption is off
+        and behavior is unchanged.
 
     Otherwise the message is addressed elsewhere (→ False) when it is:
-      * another agent's own post — `author_is_bot` and not addressed to us; or
-      * a reply to a DIFFERENT author — `is_reply` whose target is not us.
+      * another agent's own post/reply — `author_is_bot` and not addressed to us
+        (checked before the self-reply exemption, so a sibling bot replying to
+        itself stays skipped); or
+      * a HUMAN reply to a DIFFERENT author — `is_reply` whose target is neither
+        us nor the sender.
 
     A fresh (non-reply) message from a human that doesn't address anyone is still
     processed (→ True): the owner posting directly is for whoever is listening —
-    that is the pre-existing `requireMention:false` behavior and is out of scope
-    for this fix (the multi-agent "who owns an unaddressed message" question
-    belongs to the channel-IFC design, not the addressee gate).
+    that is the pre-existing `requireMention:false` behavior.
+
+    Fix 2026-07-25: owner self-replies (reply to own message, no @-mention) were
+    being dropped as `replying_to_other` in a requireMention:false owner channel
+    (e.g. #echo). The `author_id` exemption makes a self-reply count as addressed.
     """
     replying_to_me = bool(
         is_reply and reply_author_id is not None and reply_author_id == self_id
@@ -61,8 +72,17 @@ def is_addressed_in_shared_channel(
     if bot_mentioned or role_mentioned or replying_to_me:
         return True
 
-    replying_to_other = bool(is_reply) and not replying_to_me
-    if author_is_bot or replying_to_other:
+    # Another agent's own post/reply is never for us — checked before the
+    # self-reply exemption so a sibling bot replying to itself stays skipped.
+    if author_is_bot:
+        return False
+
+    replying_to_self = bool(
+        is_reply and reply_author_id is not None
+        and author_id is not None and reply_author_id == author_id
+    )
+    replying_to_other = bool(is_reply) and not replying_to_me and not replying_to_self
+    if replying_to_other:
         return False
 
     return True
