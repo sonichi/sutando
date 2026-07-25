@@ -82,11 +82,11 @@ class _FakeResp:
     """Minimal context-manager stand-in for an http.client.HTTPResponse."""
 
     def __init__(self, body: bytes, content_type: str):
-        self._body = body
+        self._body = io.BytesIO(body)
         self.headers = {"Content-Type": content_type}
 
-    def read(self):
-        return self._body
+    def read(self, size=-1):
+        return self._body.read(size)
 
     def __enter__(self):
         return self
