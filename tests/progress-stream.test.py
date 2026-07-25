@@ -54,9 +54,33 @@ try:
     os.environ["SUTANDO_PROGRESS_STREAM"] = "1"
     sc.resolve_progress_stream = lambda *a, **k: False
     check("env=1 overrides config False → ON", ps.stream_enabled() is True)
+    # config reader raising must fall through to the safe default (OFF), never
+    # break the caller — exercises the except branch in stream_enabled().
+    os.environ.pop("SUTANDO_PROGRESS_STREAM", None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("config unreadable")
+
+    sc.resolve_progress_stream = _boom
+    check("config read raises → OFF (safe)", ps.stream_enabled() is False)
 finally:
     sc.resolve_progress_stream = _orig_resolve
     os.environ.pop("SUTANDO_PROGRESS_STREAM", None)
+
+# --- resolve_progress_stream: exercise the REAL config reader (not mocked) ---
+with tempfile.TemporaryDirectory() as _cd:
+    _cfgp = Path(_cd) / "sutando.config.json"
+
+    def _resolve_with(val):
+        sc._reset_cache_for_tests()
+        body = {"bridges": {"progress_stream": val}} if val is not None else {"core": {"runtime": "claude"}}
+        _cfgp.write_text(json.dumps(body))
+        return sc.resolve_progress_stream(repo_root=Path(_cd))
+
+    check("resolve_progress_stream True", _resolve_with(True) is True)
+    check("resolve_progress_stream False", _resolve_with(False) is False)
+    check("resolve_progress_stream unset → None", _resolve_with(None) is None)
+sc._reset_cache_for_tests()
 
 # --- should_stream_task (owner-only) ---
 check("owner streams", ps.should_stream_task("owner") is True)
