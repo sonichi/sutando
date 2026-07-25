@@ -567,6 +567,25 @@ def main() -> int:
     check("AGENTS.md" not in _ro_only and "room-ops metadata" not in _ro_only.lower(),
           "metadata-only task file carries no injected block (empty task body)")
 
+    # Onboarding-token parse: the combined "url|secret" form, and the %7C-encoded
+    # separator the desktop connect flow emits (ag2space-cinny-desktop#231). A
+    # %7C token must decode so URL is populated — otherwise it parses as a bare
+    # secret with empty URL and FATALs at startup (the Vidhu "connected but not
+    # responding" failure, 2026-07-24).
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay|deadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: literal | splits into (url, secret)")
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7Cdeadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: %7C-encoded separator decodes to (url, secret)")
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7cdeadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: lowercase %7c also decodes")
+    check(rtc._parse_onboarding_token("baresecret") == ("", "baresecret"),
+          "token parse: bare secret yields empty url (REMOTE_TASK_URL supplies it)")
+    check(rtc._parse_onboarding_token("https://gw|a|b") == ("https://gw", "a|b"),
+          "token parse: splits on the FIRST separator only (secret may contain |)")
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1
