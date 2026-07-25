@@ -28,12 +28,23 @@ and loads whichever repo it reviews.
    isn't there is noise.
 2. **Review the whole activated path, not just the diff.** Bugs hide in the unchanged
    code the diff now reaches. A parity change means reading both branches end-to-end.
+   *Grounded by:* the #1600 M-fix — the watchdog's new forced-full-reset path reached
+   unchanged wake-state code the diff never touched, leaving the bot permanently muted
+   despite owner summons (#1663). Also #1403: the migration script's `rehome-state`
+   classification was never traced against the reader's `personal_path()` resolution
+   order, so post-migration bots lost their Stand names (fixed in #1540).
 3. **Prove the fix by exercising the failure mode.** Happy-path green ≠ proof — a test
    must actually reproduce the original failure, or the fix is unverified.
 4. **Destructive / auto-remediating actions: check default state and blast radius.** For
    anything that deletes, restarts, recovers, or prunes, ask *is it on by default, and
    how many hosts/files does it touch?* Prefer fail-closed (raise rather than proceed on
    an ambiguous result) over silently reporting success.
+   *Grounded by:* #1428 — the `--recover-core` watchdog shipped **on by default** in the
+   committed launchd template (every host that ran the installer), and its false-positive
+   restarts killed the in-flight task and re-fired in a loop, leaving Chi's Sutando
+   "not responsive or not functioning at many times, nearly unusable" for weeks
+   (reported #dev 2026-07-21); Rui's host was bitten too (11 wedge-restarts) without
+   anyone noticing.
 5. **Disruption to existing users is part of correctness — ask the worst-case question.**
    "No bugs" is not a sufficient verdict. The explicit question every reviewer **and the
    maintainer (before merging)** must answer: **"What is the worst-case disruption to
@@ -43,6 +54,11 @@ and loads whichever repo it reviews.
    process-global patches with wide blast radius; and — per #1898 — for any auto-action,
    *what code or state does it act on* (does it verify the target is canonical, or run
    whatever's there?). A PR is not merge-ready until that worst case is named and mitigated.
+   *Grounded by:* #1898 itself — the live test verified the claimed behavior, but the
+   latent bug sat in exactly this un-asked worst-case question and surfaced 2026-07-25.
+   The full reported-breakage corpus grounding these lessons lives in
+   sutando-pr-triage `kb/breakage/breakages.csv` (reporter, verbatim quote, breaking
+   merge, previously-working evidence per row).
 6. **No hardcoded absolute paths.** Machine- or user-specific path literals
    (`/Users/…`, `/home/<user>/…`, `~/.claude`, `~/.sutando`, …) break on other hosts;
    resolve via the workspace/config helpers instead. Enforced by the `checks:` block.
