@@ -427,6 +427,42 @@ def case_n_load_channel_env_unreadable_file() -> list[str]:
     return fails
 
 
+def case_u_defaults_from_config_and_module() -> list[str]:
+    """Cover the default-resolution branches when action/sender/guard are omitted:
+    action←resolve_down_bridge_action, send←_default_slack_sender,
+    guard←_checkout_is_canonical (all module-level defaults)."""
+    fails = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+             mock.patch.object(hc, "resolve_down_bridge_action", return_value="restart"), \
+             mock.patch.object(hc, "_checkout_is_canonical", return_value=(True, "clean")), \
+             mock.patch.object(hc, "_default_slack_sender", return_value=True), \
+             mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+             mock.patch.object(hc.subprocess, "Popen", side_effect=lambda a, **k: mock.MagicMock()):
+            restarted = hc.fix_down_bridges(checks)  # no kwargs → module defaults
+    if restarted != ["discord-bridge"]:
+        fails.append(f"u) default-resolution path should restart, got {restarted}")
+    return fails
+
+
+def case_v_alert_send_failure_is_swallowed() -> list[str]:
+    """_alert must swallow a sender that raises — alerting never breaks the check."""
+    fails = []
+
+    def boom(_m):
+        raise RuntimeError("slack unreachable")
+
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    try:
+        restarted, spawned = run_with_popen_stub(checks, action="alert", sender=boom)
+    except Exception as e:  # pragma: no cover — a leak here IS the failure
+        return [f"v) a raising sender propagated out of fix_down_bridges: {e!r}"]
+    if restarted or spawned:
+        fails.append(f"v) alert mode must not restart: {restarted}/{spawned}")
+    return fails
+
+
 def case_o_action_off_is_noop() -> list[str]:
     """down_bridge_action="off": never restart, never alert (return [])."""
     fails = []
@@ -556,7 +592,9 @@ def main() -> int:
                  case_q_restart_guard_fail_downgrades_to_alert,
                  case_r_restart_guard_ok_restarts_and_alerts,
                  case_s_checkout_is_canonical,
-                 case_t_resolve_down_bridge_action):
+                 case_t_resolve_down_bridge_action,
+                 case_u_defaults_from_config_and_module,
+                 case_v_alert_send_failure_is_swallowed):
         fails = case()
         status = "PASS" if not fails else "FAIL"
         print(f"  {status} {case.__name__}")
