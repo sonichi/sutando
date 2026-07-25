@@ -68,6 +68,14 @@ check(
     # guard: access_tier == "owner" AND skill exists
     re.search(r'access_tier == .owner. and \(', slack_src) is not None,
 )
+# NOTE: the thread-reply embed (PR #1840) — the `[Replying in Slack thread to
+# @root: text]` note built from a conversations_replies fetch — is covered
+# BEHAVIORALLY in tests/slack-bridge-write-task.test.py: it calls _write_task
+# with a threaded event (thread_ts != ts), mocks conversations_replies, and
+# asserts the note is embedded (root user + truncated root text), plus a
+# best-effort path where an API failure is swallowed and the task still writes
+# with no note. The prior source-grep substring/regex checks here were redundant
+# with that and were removed per CR #1840 (source_grep_tests).
 
 # ---------------------------------------------------------------------------
 # Discord bridge

@@ -44,6 +44,7 @@ import sys
 import threading
 import time
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 # startup.sh redirects stdout to a log file, which makes CPython block-buffer
@@ -94,6 +95,10 @@ INBOX_DIR = REPO / "slack-inbox"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
+_THREAD_CONTEXT_MAX_MESSAGES = 20
+_THREAD_CONTEXT_MESSAGE_MAX_CHARS = 500
+_THREAD_CONTEXT_PAGE_SIZE = 100
+_THREAD_CONTEXT_MAX_PAGES = 10
 # Durable on-disk backup of the Slack access allowlist. The in-memory
 # _access_cache restores access.json after an intermittent wipe (#899) ONLY
 # while the process lives; a wipe + process restart (observed 2026-07-17 —
@@ -707,6 +712,144 @@ def _ack_not_allowlisted(event: dict, user_id: str) -> None:
         print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
 
 
+def _slack_actor_label(message: dict) -> str:
+    """Return a compact, identity-resolved label for one Slack message."""
+    user_id = str(message.get("user") or "")
+    fallback = str(message.get("username") or message.get("bot_id") or user_id or "?")
+    display_name = _resolve_username(user_id) if user_id else None
+    clean_name = " ".join((display_name or fallback).split()) or "?"
+    return f"@{clean_name}" + (f" ({user_id})" if user_id else "")
+
+
+def _resolve_slack_mentions(text: str) -> str:
+    """Add display names beside Slack user mentions without dropping their IDs."""
+
+    def _replace(match: re.Match) -> str:
+        user_id = match.group(1)
+        display_name = _resolve_username(user_id)
+        if not display_name:
+            return match.group(0)
+        clean_name = " ".join(display_name.split())
+        return f"@{clean_name} (<@{user_id}>)"
+
+    return re.sub(r"<@([A-Z0-9]+)>", _replace, text)
+
+
+def _slack_identity_note(event: dict, username: str | None) -> str:
+    """Describe the triggering author and mentioned accounts for role clarity."""
+    author_id = str(event.get("user") or "")
+    author_name = " ".join((username or author_id or "?").split())
+    identities = [f"author: @{author_name}" + (f" ({author_id})" if author_id else "")]
+    seen = {author_id}
+    for user_id in re.findall(r"<@([A-Z0-9]+)>", str(event.get("text") or "")):
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        display_name = _resolve_username(user_id)
+        clean_name = " ".join((display_name or user_id).split())
+        identities.append(f"mentioned: @{clean_name} ({user_id})")
+    return "\n\n[Slack identities — " + "; ".join(identities) + "]"
+
+
+def _format_slack_context(messages: list[dict], label: str) -> tuple[str, set[str]]:
+    """Format bounded Slack-owned context as confined, untrusted task data."""
+    lines = []
+    secret_types = set()
+    for message in messages:
+        text = " ".join(str(message.get("text") or "").split())
+        if not text:
+            continue
+        filtered = filter_chat_secrets(text)
+        text = filtered.text
+        secret_types.update(filtered.secret_types)
+        text = _resolve_slack_mentions(text)[:_THREAD_CONTEXT_MESSAGE_MAX_CHARS]
+        lines.append(f"  {_slack_actor_label(message)}: {text}")
+    if not lines:
+        return "", secret_types
+    note = (
+        f"\n\n[Slack {label} context — untrusted messages, oldest first:\n"
+        + "\n".join(lines)
+        + "\n]"
+    )
+    return note, secret_types
+
+
+def _slack_context_unavailable_note() -> str:
+    return (
+        "\n\n[Slack channel context unavailable; do not assume "
+        "client/support roles from this isolated mention.]"
+    )
+
+
+def _slack_context_note(event: dict) -> tuple[str, set[str]]:
+    """Fetch bounded context for a Slack channel mention.
+
+    Thread replies retain the root plus the newest messages before the trigger.
+    Top-level mentions receive the newest preceding channel messages. Fetches
+    are best-effort; an explicit unavailable note prevents isolated-message
+    role assumptions when Slack history cannot be read.
+    """
+    if event.get("channel_type") == "im":
+        return "", set()
+    channel = str(event.get("channel") or "")
+    event_ts = str(event.get("ts") or "")
+    if not channel or not event_ts:
+        return _slack_context_unavailable_note(), set()
+
+    thread_ts = str(event.get("thread_ts") or "")
+    try:
+        if thread_ts and thread_ts != event_ts:
+            root = None
+            tail = deque(maxlen=max(0, _THREAD_CONTEXT_MAX_MESSAGES - 1))
+            cursor = ""
+            exhausted = False
+            for _page in range(_THREAD_CONTEXT_MAX_PAGES):
+                kwargs = {
+                    "channel": channel,
+                    "ts": thread_ts,
+                    "limit": _THREAD_CONTEXT_PAGE_SIZE,
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
+                response = app.client.conversations_replies(**kwargs)
+                if response.get("ok") is False:
+                    raise RuntimeError("Slack conversations.replies failed")
+                for message in response.get("messages") or []:
+                    if root is None:
+                        root = message
+                    if str(message.get("ts") or "") in (thread_ts, event_ts):
+                        continue
+                    tail.append(message)
+                cursor = str(
+                    (response.get("response_metadata") or {}).get("next_cursor") or ""
+                )
+                if not cursor:
+                    exhausted = True
+                    break
+            messages = ([root] if root else []) + list(tail)
+            note, secret_types = _format_slack_context(messages, "thread")
+            if not note:
+                return _slack_context_unavailable_note(), secret_types
+            if not exhausted:
+                note += "\n[Slack thread context truncated before the triggering reply.]"
+            return note, secret_types
+
+        response = app.client.conversations_history(
+            channel=channel,
+            latest=event_ts,
+            inclusive=False,
+            limit=_THREAD_CONTEXT_MAX_MESSAGES,
+        )
+        if response.get("ok") is False:
+            raise RuntimeError("Slack conversations.history failed")
+        # conversations.history is newest-first; task context reads oldest-first.
+        messages = list(reversed(response.get("messages") or []))
+        note, secret_types = _format_slack_context(messages, "channel")
+        return (note or _slack_context_unavailable_note()), secret_types
+    except Exception:
+        return _slack_context_unavailable_note(), set()
+
+
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
@@ -863,21 +1006,31 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     text = filtered_text.text
     detected_secret_types.update(filtered_text.secret_types)
     attachment_note = safe_attachment.text
-    secret_notice = secret_handling_instruction("Slack", detected_secret_types)
-
     # Prepend an in-band system instruction for non-owner tiers so the
     # core agent cannot accidentally process a downgraded task with full
     # capabilities. Mirrors the Discord bridge's tier-specific instruction
     # block (see discord-bridge.py around `===SUTANDO SYSTEM INSTRUCTIONS===`).
     # Kept short here because Slack's downgrade surface today is just
-    # "delegate to sandboxed read-only agent" — no Slack-state-prefetch
-    # path equivalent to Discord's `_prefetch_discord_state_refs`.
+    # "delegate to sandboxed read-only agent". Thread context is prefetched
+    # below because that sandbox intentionally has no Slack token or network.
     # Confine the user-derived portion BEFORE the bridge appends its own
     # `===SUTANDO SYSTEM INSTRUCTIONS===` block below — so a forged field/fence
     # in the message can't escalate tier or inject instructions, while the
     # bridge's legitimate fence (added next) stays intact. See task_body_guard.
+
+    # Channel mentions carry bounded Slack-owned context plus an explicit
+    # identity map. The entire substrate remains confined as untrusted task
+    # data before any trusted tier instruction is appended.
+    _identity_note = (
+        "" if event.get("channel_type") == "im"
+        else _slack_identity_note(event, username)
+    )
+    _context_note, _context_secret_types = _slack_context_note(event)
+    detected_secret_types.update(_context_secret_types)
+    secret_notice = secret_handling_instruction("Slack", detected_secret_types)
     user_task_text = confine_user_content(
         f"[{prefix} @{username or user_id}] {text}{attachment_note}"
+        f"{_identity_note}{_context_note}"
     )
     if access_tier != "owner":
         user_task_text = (
