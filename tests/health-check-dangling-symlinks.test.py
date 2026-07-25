@@ -51,9 +51,12 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         self.src.mkdir(parents=True)
         self.dst.mkdir(parents=True)
         self.hc.REPO_DIR = self.repo
-        # check_skill_symlinks hardcodes Path.home(); redirect it.
+        # check_skill_symlinks resolves its destination via claude_home_path()
+        # (CLAUDE_CONFIG_DIR-aware); point it at the sandbox claude-home.
         self._home = root / "home"
-        self.hc.Path.home = staticmethod(lambda: self._home)
+        self.hc.claude_home_path = (
+            lambda *sub: self._home.joinpath(".claude", *sub)
+        )
 
     def tearDown(self):
         self._tmp.cleanup()
