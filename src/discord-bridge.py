@@ -3110,13 +3110,13 @@ async def _handle_discord_message(message, force=False):
             if ref_msg is None:
                 ref_msg = await message.channel.fetch_message(message.reference.message_id)
             if ref_msg is not None:
-                # Walk the reply chain to the root and inline the FULL text of
-                # each ancestor (Chi 2026-07-25: "Remove the truncation").
-                # The old `ref_content[:400]` single-level snippet silently
-                # dropped the root question in a deep thread. parent_message_id
-                # is only a fetch-handle — inlining the walked chain here makes
-                # the ancestor context unavoidable DATA in the task file rather
-                # than something the agent must remember to re-fetch.
+                # Walk the reply chain to the root (Chi 2026-07-25). The old
+                # `ref_content[:400]` snippet silently truncated the parent.
+                # Lean design: inline only the FULL immediate parent (no cut) via
+                # format_reply_chain(chain[0]); the walk's purpose here is to
+                # collect the ancestor IDS for the `reply_chain_ids` spine, so a
+                # deeper ancestor can be fetched precisely on demand rather than
+                # bloating every task file with the whole thread's content.
                 chain = []                       # pragma: no cover — immediate-parent-first; bridge-only glue, formatting covered in reply_chain.py
                 cur = ref_msg                    # pragma: no cover
                 depth = 0                        # pragma: no cover

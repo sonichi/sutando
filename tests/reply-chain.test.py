@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Tests for src/reply_chain.py — the pure reply-context formatter.
 
-Regression for the owner-reported truncation loss (Chi 2026-07-25:
-"Remove the truncation"): the bridge used to inline only a 400-char
-single-level snippet of the replied-to message, silently dropping the root
-question in a deep thread. The formatter now inlines the FULL text and, for a
-multi-level reply, the whole ancestor chain root-first — with visible size
-guards so a pathological message/chain is trimmed loudly, never silently.
+Regression + design test for the owner-reported truncation loss (Chi 2026-07-25:
+"Remove the truncation", then "I'm not sure about full chain inline" → lean).
+
+Lean contract:
+  * inline the FULL immediate parent (no 400-char cap; size-clipped only for a
+    pathological multi-KB body, and clipped LOUDLY);
+  * do NOT inline deeper ancestors — those are referenced by reply_chain_ids;
+  * reply_chain_ids carries the full walked spine, root-first.
 
 Run: python3 tests/reply-chain.test.py   (exit 0 pass / non-zero on failure)
 """
@@ -35,54 +37,38 @@ def E(author, ts, content):
 
 # --- empty / nothing to inline ---
 check("empty chain -> ''", rc.format_reply_chain([]) == "")
-check("all-blank content -> ''", rc.format_reply_chain([E("a", "t", "   ")]) == "")
+check("attachment-only parent (blank content) -> ''",
+      rc.format_reply_chain([E("a", "t", "   ")]) == "")
 
-# --- single level: backward-compatible shape, no truncation ---
+# --- immediate parent: full content, backward-compatible shape, no truncation ---
 out = rc.format_reply_chain([E("Sutando-Pro#8185", "2026-07-25 17:42", "the full answer")])
-check("single level shape", out == "\n\n[Replying to Sutando-Pro#8185 (2026-07-25 17:42): the full answer]")
+check("immediate parent shape",
+      out == "\n\n[Replying to Sutando-Pro#8185 (2026-07-25 17:42): the full answer]")
 
-# The old 400-char cap is GONE: a 900-char body survives whole (well under the
-# 2000-char pathological guard).
+# The old 400-char cap is GONE: a 900-char body survives whole.
 long_body = "x" * 900
 out = rc.format_reply_chain([E("a", "t", long_body)])
 check("no 400-char truncation", long_body in out and "…[" not in out)
 
-# --- pathological single message: clipped LOUDLY, never silent ---
-huge = "y" * 5000
-out = rc.format_reply_chain([E("a", "t", huge)], max_msg_chars=2000)
-check("pathological msg clipped", "…[+3000 chars" in out and "re-fetch" in out)
-check("pathological msg length bounded", len(out) < 2200)
-
-# --- multi-level: root-first ordering, full text of each ---
+# --- LEAN: a deep chain inlines ONLY the immediate parent ---
 chain = [
-    E("Sutando-Pro", "17:42", "the minimal fix answer"),   # immediate parent
-    E("sonichi", "17:41", "is there no pr removing the truncation?"),
-    E("sonichi", "17:38", "what's it like? show me the task file"),   # root-ish
+    E("Sutando-Pro", "17:42", "the immediate reply I am responding to"),   # parent
+    E("sonichi", "17:41", "GRANDPARENT should NOT be inlined"),
+    E("sonichi", "17:38", "ROOT should NOT be inlined"),
 ]
 out = rc.format_reply_chain(chain)
-check("multi-level uses chain block", "[Reply chain" in out)
-# root must appear BEFORE the immediate parent (chronological, root leads)
-root_i = out.index("show me the task file")
-parent_i = out.index("the minimal fix answer")
-check("root ordered before parent", root_i < parent_i)
-check("all three levels present",
-      all(s in out for s in ["the minimal fix answer",
-                             "is there no pr removing the truncation?",
-                             "show me the task file"]))
+check("deep chain: immediate parent inlined", "the immediate reply I am responding to" in out)
+check("deep chain: grandparent NOT inlined", "GRANDPARENT should NOT be inlined" not in out)
+check("deep chain: root NOT inlined", "ROOT should NOT be inlined" not in out)
+check("deep chain: single-line block (no 'Reply chain')", "Reply chain" not in out)
 
-# --- blank ancestor is skipped, walk not broken ---
-chain = [E("a", "t1", "reply body"), E("b", "t2", "   "), E("c", "t3", "root body")]
-out = rc.format_reply_chain(chain)
-check("blank ancestor skipped", "root body" in out and "reply body" in out)
+# --- pathological immediate parent: clipped LOUDLY, never silent ---
+huge = "y" * 5000
+out = rc.format_reply_chain([E("a", "t", huge)], max_msg_chars=2000)
+check("pathological parent clipped", "…[+3000 chars" in out and "re-fetch" in out)
+check("pathological parent length bounded", len(out) < 2200)
 
-# --- total-size guard drops OLDEST ancestors, keeps immediate parent ---
-big = [E(f"u{i}", f"t{i}", "z" * 400) for i in range(10)]  # 10 × 400 = 4000
-out = rc.format_reply_chain(big, max_total_chars=1000)
-check("size guard notes omitted ancestors", "older ancestor(s) omitted" in out)
-check("size guard keeps immediate parent", "u0" in out)   # index 0 = immediate parent
-check("size guard bounded total", len(out) < 1600)
-
-# --- format_reply_chain_ids: root-first id spine for thread reconstruction ---
+# --- format_reply_chain_ids: full root-first spine for thread reconstruction ---
 check("no chain (<2 ids) -> ''", rc.format_reply_chain_ids([111]) == "")
 check("empty ids -> ''", rc.format_reply_chain_ids([]) == "")
 check("Nones filtered to <2 -> ''", rc.format_reply_chain_ids([None, 5, None]) == "")
@@ -90,9 +76,9 @@ check("Nones filtered to <2 -> ''", rc.format_reply_chain_ids([None, 5, None]) =
 out = rc.format_reply_chain_ids([300, 200, 100])   # parent=300 … root=100
 check("ids root-first line", out == "reply_chain_ids: 100,200,300\n")
 check("ids line has trailing newline", out.endswith("\n"))
-# real discord snowflakes (ints) stringify cleanly, None ancestors dropped
+# the id spine keeps EVERY ancestor even though only the parent was inlined
 out = rc.format_reply_chain_ids([1530634946949943497, None, 1530631339764875396])
-check("snowflakes stringified, None dropped",
+check("id spine spans full chain, None dropped",
       out == "reply_chain_ids: 1530631339764875396,1530634946949943497\n")
 
 print()
