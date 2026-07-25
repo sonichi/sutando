@@ -93,6 +93,15 @@ TAP_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio-tap", 
 TAP_BUILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio-tap", "build-audio-tap.sh")
 
 
+def _ffmpeg() -> str | None:
+    """ffmpeg path — homebrew's /opt/homebrew/bin is NOT on PATH for
+    launchd/nohup-started servers (bit us on Maddy), so check it explicitly."""
+    import shutil
+    return shutil.which("ffmpeg") or next(
+        (p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
+         if os.path.exists(p)), None)
+
+
 def _ensure_tap_binary() -> bool:
     """Build the tap helper if missing (swiftc, ~5s, once per checkout)."""
     if os.path.exists(TAP_BIN):
@@ -121,8 +130,11 @@ def _spawn_audio_captures(audio: str, base: str):
             tap = None
     if audio == "mix" and tap is not None:
         try:
+            ff = _ffmpeg()
+            if ff is None:
+                raise RuntimeError("no ffmpeg")
             mic = subprocess.Popen(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                [ff, "-hide_banner", "-loglevel", "error",
                  "-f", "avfoundation", "-i", ":default", base + "-mic.wav"],
                 stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             threading.Event().wait(0.5)
@@ -165,8 +177,9 @@ def _finalize_recording(rec) -> str:
             inputs += ["-i", w]
             have.append(w)
     try:
-        if have:
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        ff = _ffmpeg()
+        if have and ff:
+            cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
                    "-i", video] + inputs
             if len(have) == 2:
                 cmd += ["-filter_complex",
