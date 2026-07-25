@@ -147,6 +147,19 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r["detail"])
         self.assertEqual(r.get("_orphaned", []), [])
 
+    def test_skillmd_less_dir_is_not_reported_unlinked(self):
+        """Manifest-loaded / scripts-only skills have no SKILL.md and are
+        correctly never symlinked by skills/install.sh — the probe must apply
+        the installer's own filter instead of warning about them."""
+        d = self.src / "manifest-only"
+        d.mkdir()
+        (d / "manifest.json").write_text("{}\n")
+        self._skill("real-skill")  # has SKILL.md, genuinely unlinked
+        r = self.hc.check_skill_symlinks()
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("real-skill", r["detail"])
+        self.assertNotIn("manifest-only", r["detail"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

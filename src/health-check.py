@@ -1656,6 +1656,12 @@ def check_skill_symlinks() -> dict:
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
             continue
+        # Mirror skills/install.sh's filter: only dirs WITH a SKILL.md are
+        # slash-invocable skills the installer links. Manifest-loaded and
+        # scripts-only skills (gws-gmail-voice, learned-skills, ...) have no
+        # SKILL.md, are correctly never symlinked, and must not warn here.
+        if not (skill_dir / "SKILL.md").is_file():
+            continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
         if dst.is_symlink() and not dst.exists():
