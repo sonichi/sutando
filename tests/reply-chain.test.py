@@ -82,6 +82,19 @@ check("size guard notes omitted ancestors", "older ancestor(s) omitted" in out)
 check("size guard keeps immediate parent", "u0" in out)   # index 0 = immediate parent
 check("size guard bounded total", len(out) < 1600)
 
+# --- format_reply_chain_ids: root-first id spine for thread reconstruction ---
+check("no chain (<2 ids) -> ''", rc.format_reply_chain_ids([111]) == "")
+check("empty ids -> ''", rc.format_reply_chain_ids([]) == "")
+check("Nones filtered to <2 -> ''", rc.format_reply_chain_ids([None, 5, None]) == "")
+# ids arrive immediate-parent-first; emitted root-first (reversed) with trailing \n
+out = rc.format_reply_chain_ids([300, 200, 100])   # parent=300 … root=100
+check("ids root-first line", out == "reply_chain_ids: 100,200,300\n")
+check("ids line has trailing newline", out.endswith("\n"))
+# real discord snowflakes (ints) stringify cleanly, None ancestors dropped
+out = rc.format_reply_chain_ids([1530634946949943497, None, 1530631339764875396])
+check("snowflakes stringified, None dropped",
+      out == "reply_chain_ids: 1530631339764875396,1530634946949943497\n")
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")

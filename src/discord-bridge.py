@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
-from reply_chain import format_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+from reply_chain import format_reply_chain, format_reply_chain_ids  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain walk depth (a fetch per level; the immediate parent is
 # depth 0). Beyond this the format helper's size guard would trim anyway.
@@ -3103,6 +3103,7 @@ async def _handle_discord_message(message, force=False):
     # which earlier answer the user is responding to. Without this the
     # bot sees only the new reply text in isolation.
     reply_context = ""
+    reply_chain_ids_line = ""   # `reply_chain_ids:` metadata (root-first) for thread reconstruction
     if message.reference and message.reference.message_id:
         try:
             ref_msg = message.reference.resolved
@@ -3125,6 +3126,7 @@ async def _handle_discord_message(message, force=False):
                     )
                     chain.append(
                         {
+                            "id": getattr(cur, "id", None),
                             "author": str(cur.author),
                             "ts": cur.created_at.strftime("%Y-%m-%d %H:%M"),
                             "content": c,
@@ -3142,6 +3144,9 @@ async def _handle_discord_message(message, force=False):
                     cur = nxt
                     depth += 1
                 reply_context = format_reply_chain(chain)  # pragma: no cover
+                reply_chain_ids_line = format_reply_chain_ids(  # pragma: no cover
+                    [e.get("id") for e in chain]
+                )
                 # Also download attachments that live on the replied-to
                 # message. Without this, a file shared on a parent message
                 # and then acted on via an @-mention *reply* is silently
@@ -3595,6 +3600,11 @@ async def _handle_discord_message(message, force=False):
         if getattr(message, "reference", None) and message.reference.message_id
         else ""
     )
+    # Full walked ancestor id spine (root-first) for thread reconstruction —
+    # handles to re-fetch any ancestor the inlined chain clipped/dropped past
+    # the depth/size guard. Only emitted for a real chain (>=2 ids); a single
+    # parent is already covered by parent_message_id above. (Chi 2026-07-25.)
+    parent_msg_line += reply_chain_ids_line
     # Also emit the replied-to author as a STRUCTURED header, not just the
     # opaque parent_message_id. In a multi-bot channel a consumer must be able
     # to tell WHO the sender was addressing (e.g. a reply aimed at another bot)

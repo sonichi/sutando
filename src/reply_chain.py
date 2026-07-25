@@ -46,6 +46,28 @@ def _clip(text: str, max_chars: int) -> str:
     return text[:max_chars].rstrip() + f" …[+{dropped} chars, reply id to re-fetch]"
 
 
+def format_reply_chain_ids(ids: Sequence) -> str:
+    """Format the ``reply_chain_ids:`` task-file metadata line (Chi 2026-07-25:
+    "list of msg ids for thread reconstruction").
+
+    ``ids`` is the walked ancestor chain **immediate-parent-first** (the same
+    order the walk produces). The emitted line is **root-first** so it reads as
+    the thread's chronological id spine: ``reply_chain_ids: <root>,…,<parent>``.
+    Combined with ``source_message_id`` (the current message) this gives the
+    precise handles to re-fetch any ancestor whose inlined content was
+    size-clipped, edited, or dropped past the depth/size guard — the inlined
+    text is the guarantee, these ids are the reconstruction handles.
+
+    Returns ``""`` when there is no real chain to reconstruct (fewer than two
+    ids): a single id is already covered by ``parent_message_id``, so emitting
+    it here would be redundant noise.
+    """
+    clean = [str(i) for i in ids if i]
+    if len(clean) < 2:
+        return ""
+    return "reply_chain_ids: " + ",".join(reversed(clean)) + "\n"
+
+
 def format_reply_chain(
     chain: Sequence[dict],
     *,
