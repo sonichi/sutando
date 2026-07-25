@@ -148,6 +148,30 @@ code, out = scan(
 )
 ok("even triple-quote count doesn't corrupt state; next line flags", "/Users/z" in out)
 
+# A multi-line ASSIGNED string (not a docstring) must NOT be exempted — a
+# hardcoded path inside it is still flagged (#2281, Qingyun review). The old
+# count-only toggle opened the exempt span on `COMMAND = """`, letting host
+# config slip past this required gate under a false-green check.
+code, out = scan(
+    '+++ b/src/deploy.py\n'
+    '@@ -1,0 +1,3 @@\n'
+    '+COMMAND = """\n'
+    '+rsync /Users/alice/data /backup\n'
+    '+"""'
+)
+ok("multi-line assigned string does NOT exempt a hardcoded path (#2281 bypass)",
+   "/Users/alice/data" in out)
+
+# ...and a prefixed real docstring (r\"\"\") still exempts its prose.
+code, out = scan(
+    '+++ b/src/z.py\n'
+    '@@ -1,0 +1,3 @@\n'
+    '+    r"""Legacy note.\n'
+    '+    Old path was /Users/legacy/thing.\n'
+    '+    """'
+)
+ok("prefixed (r) docstring prose is still NOT flagged", out.strip() == "")
+
 print("---")
 if failed:
     print("FAILED — %d of %d" % (failed, passed + failed))

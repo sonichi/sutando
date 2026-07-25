@@ -42,7 +42,16 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh pr diff ${{ github.event.pull_request.number }} | bash scripts/review-checks.sh
+        # Materialize the diff BEFORE scanning and fail closed if `gh pr diff`
+        # errors (#2281, Qingyun review). The old `gh pr diff … | review-checks.sh`
+        # pipe reported the pipeline's LAST exit status, so a failed `gh pr diff`
+        # (auth/rate-limit/network) sent an empty diff to the scanner, which
+        # printed "empty diff — nothing to check" and exited 0 → the gate passed
+        # WITHOUT scanning the PR. `set -euo pipefail` + `--diff` closes that.
+        run: |
+          set -euo pipefail
+          gh pr diff ${{ github.event.pull_request.number }} > /tmp/review-pr.diff
+          bash scripts/review-checks.sh --diff /tmp/review-pr.diff
 
       - name: Setup Node
         uses: actions/setup-node@v4

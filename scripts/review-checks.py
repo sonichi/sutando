@@ -43,12 +43,30 @@ def allowed(tok):
     return False
 
 
-def _toggles_docstring(line):
-    """A line flips triple-quote (docstring) state when it holds an ODD number of
-    ``\"\"\"``/``'''`` delimiters (one opens or closes; two on a line open+close and
-    leave state unchanged). Approximate — good enough to keep the scanner off
-    docstring PROSE, which is where a path is documentation, not a code path."""
-    return (line.count('"""') + line.count("'''")) % 2 == 1
+# Opens an exempt span ONLY for a bare string-expression (the shape of a real
+# docstring): optional string prefix (r/b/u/f, up to 2) then a triple-quote at
+# the very start of the stripped line. An assignment/call that merely carries a
+# triple-quoted literal (`COMMAND = """`) does NOT match, so it stays executable
+# code and a hardcoded path inside it is still flagged (#2281, Qingyun review —
+# the old count-only toggle suppressed ANY multi-line string, a scanner bypass).
+_DOCSTRING_OPEN = re.compile(r"^[rbuf]{0,2}('''|" + '"' * 3 + ")", re.IGNORECASE)
+
+
+def _doc_transition(line, in_doc):
+    """Triple-quote (docstring) state AFTER `line`, given the state before it.
+
+    - Inside a docstring: an ODD number of triple-quote delimiters closes it
+      (the closing delimiter may sit anywhere on the line).
+    - Not inside one: open only for a bona-fide docstring line whose stripped
+      content STARTS with a triple-quote (per _DOCSTRING_OPEN) AND has an odd
+      delimiter count (even = a same-line open+close one-liner, stay out). This
+      is the assignment-string bypass fix: a triple-quoted literal assigned to a
+      name no longer exempts a hardcoded path inside it (#2281, Qingyun review).
+    """
+    quotes = line.count('"""') + line.count("'''")
+    if in_doc:
+        return quotes % 2 == 0                       # odd → closed
+    return bool(_DOCSTRING_OPEN.match(line.lstrip())) and quotes % 2 == 1
 
 
 def main():
@@ -83,8 +101,7 @@ def main():
             # Context lines exist in both old and new files, so they advance the
             # new-file line counter just like additions do — and they move the
             # docstring state (a docstring may open on unchanged context).
-            if _toggles_docstring(raw[1:]):
-                in_doc = not in_doc
+            in_doc = _doc_transition(raw[1:], in_doc)
             ln += 1
             continue
         if raw.startswith("+"):
@@ -98,8 +115,7 @@ def main():
             # describing a legacy path a PR is REMOVING) is not flagged, while
             # the opening `"""` line itself is still checked.
             was_in_doc = in_doc
-            if _toggles_docstring(line):
-                in_doc = not in_doc
+            in_doc = _doc_transition(line, in_doc)
             stripped = line.lstrip()
             if was_in_doc or stripped.startswith("#") or stripped.startswith("//"):
                 continue
