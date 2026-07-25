@@ -42,7 +42,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
-from sutando_config import resolve_core_runtime  # noqa: E402
+from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -631,8 +631,35 @@ def fix_screen_capture() -> str:
         f"restart attempted but port check says {after['status']} — see {log_path}")
 
 
-def fix_down_bridges(checks: list) -> list:
-    """Restart configured-but-not-running channel bridges.
+def _checkout_is_canonical(repo_dir) -> tuple:
+    """(ok, reason): is the code checkout safe to auto-restart a bridge FROM?
+
+    ok=True iff the repo is on `main` with a clean working tree. A dirty tree
+    or a non-main branch means an auto-restart would silently run UNINTENDED
+    code (2026-07-25: an auto-restart relaunched the bridge onto an unmerged
+    feature branch that happened to be parked in the live checkout). Best-effort
+    and fail-closed: if git state is unreadable, treat it as non-canonical.
+    """
+    try:
+        branch = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(repo_dir), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except Exception as e:  # noqa: BLE001 — any git failure → fail closed
+        return (False, f"git state unreadable ({e})")
+    if branch != "main":
+        return (False, f"checkout on '{branch or 'detached HEAD'}', not main")
+    if dirty:
+        return (False, "checkout has uncommitted changes")
+    return (True, "clean + on main")
+
+
+def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None) -> list:
+    """Restart or alert on configured-but-not-running channel bridges.
 
     A dead bridge reports status "warn" (optional channels don't page), which
     keeps it out of `issues` — so main()'s fix loop never reaches it, and
@@ -642,7 +669,21 @@ def fix_down_bridges(checks: list) -> list:
     warn (multiple PIDs, token invalid, stale log), each of which needs
     different handling than a plain start.
 
-    Returns the list of bridge names restarted.
+    Behavior is governed by `health_check.down_bridge_action`
+    (resolve_down_bridge_action; override `action` for tests):
+      - "restart" (default): relaunch the bridge AND alert the owner — but ONLY
+        when the checkout is canonical (clean + on main). A non-canonical
+        checkout DOWNGRADES to alert, so a restart never silently runs
+        unintended code (Chi 2026-07-25: the restart itself was invisible AND
+        loaded an unmerged branch). Alerting makes crash-loops visible.
+      - "alert": never relaunch; alert the owner that the bridge is down.
+      - "off": neither — stay silent (return []).
+
+    Alerts print to stdout (captured in the health-check log) AND are sent to
+    the owner via `sender` (default `_default_slack_sender`, best-effort — a
+    missing sender never breaks the health check). Returns the list of bridge
+    names ACTUALLY (re)started (backward-compatible with the print loop in
+    main()).
 
     Launch parity with startup.sh (per PR #1898 review): a naive
     `sys.executable src/<bridge>.py` skips the bootstrapping startup.sh does and
@@ -657,37 +698,72 @@ def fix_down_bridges(checks: list) -> list:
     Fail-safe: if no capable interpreter is found (or the required env is
     missing), skip that bridge rather than spawn a guaranteed crash-loop.
     """
+    if action is None:
+        action = resolve_down_bridge_action()
+    if action == "off":
+        return []
+    send = sender or _default_slack_sender
+    guard = guard or _checkout_is_canonical
+
+    def _alert(msg: str) -> None:
+        print(f"  {msg}")
+        try:
+            send(msg)
+        except Exception:  # noqa: BLE001 — alerting must never break the check
+            pass
+
     restarted = []
     for c in checks:
-        if (
+        if not (
             c["name"] in ("telegram-bridge", "discord-bridge", "slack-bridge")
             and c["status"] == "warn"
             and c.get("detail") == "configured but not running"
         ):
-            name = c["name"]
-            interp = _bridge_interpreter(name)
-            if interp is None:
-                # No interpreter that can import the bridge's dependency —
-                # spawning would just crash-loop (startup.sh skips it too).
+            continue
+        name = c["name"]
+
+        # Decide restart vs. alert. "restart" only restarts from a canonical
+        # checkout; otherwise it downgrades to an alert.
+        if action == "restart":
+            ok, why = guard(REPO_DIR)
+            if not ok:
+                _alert(f"⚠️ health-check: {name} is DOWN — NOT auto-restarted "
+                       f"({why}). Start it via startup.sh once the checkout is clean/on main.")
                 continue
-            child_env = os.environ.copy()
-            if name == "slack-bridge":
-                # startup.sh sources channels/slack/.env so SLACK_BOT_TOKEN /
-                # SLACK_APP_TOKEN reach the child. Mirror that here; skip the
-                # restart if the env file / tokens are missing (fail-safe).
-                slack_env = _load_channel_env("slack")
-                if "SLACK_BOT_TOKEN" not in {**os.environ, **slack_env}:
-                    continue
-                child_env.update(slack_env)
-            log_path = WORKSPACE_DIR / "logs" / f"{name}.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            # `with` closes the parent's handle after Popen; the child holds
-            # its own dup of the fd, so the log stays writable.
-            with open(str(log_path), "a") as log_f:
-                subprocess.Popen([interp, str(REPO_DIR / "src" / f"{name}.py")],
-                                 stdout=log_f, stderr=subprocess.STDOUT,
-                                 env=child_env, start_new_session=True)
-            restarted.append(name)
+        else:  # action == "alert"
+            _alert(f"⚠️ health-check: {name} is DOWN — alert-only "
+                   f"(down_bridge_action=alert). Start it via startup.sh.")
+            continue
+
+        interp = _bridge_interpreter(name)
+        if interp is None:
+            # No interpreter that can import the bridge's dependency —
+            # spawning would just crash-loop (startup.sh skips it too).
+            _alert(f"⚠️ health-check: {name} is DOWN and could NOT be auto-restarted "
+                   f"(no interpreter can import its dependency). Start it via startup.sh.")
+            continue
+        child_env = os.environ.copy()
+        if name == "slack-bridge":
+            # startup.sh sources channels/slack/.env so SLACK_BOT_TOKEN /
+            # SLACK_APP_TOKEN reach the child. Mirror that here; skip the
+            # restart if the env file / tokens are missing (fail-safe).
+            slack_env = _load_channel_env("slack")
+            if "SLACK_BOT_TOKEN" not in {**os.environ, **slack_env}:
+                _alert(f"⚠️ health-check: {name} is DOWN and could NOT be auto-restarted "
+                       f"(missing SLACK_BOT_TOKEN). Start it via startup.sh.")
+                continue
+            child_env.update(slack_env)
+        log_path = WORKSPACE_DIR / "logs" / f"{name}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # `with` closes the parent's handle after Popen; the child holds
+        # its own dup of the fd, so the log stays writable.
+        with open(str(log_path), "a") as log_f:
+            subprocess.Popen([interp, str(REPO_DIR / "src" / f"{name}.py")],
+                             stdout=log_f, stderr=subprocess.STDOUT,
+                             env=child_env, start_new_session=True)
+        restarted.append(name)
+        _alert(f"♻️ health-check auto-restarted **{name}** (was down). "
+               f"If this repeats, it's crash-looping — check logs/{name}.log.")
     return restarted
 
 
