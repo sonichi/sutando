@@ -6,15 +6,16 @@ Regression guard for the 2026-07-25 tester incident: the gateway sat in a
 timeout) blocked the long-poll loop when DNS for the relay host stopped
 answering. urllib's socket timeout does not cover name resolution, so the loop
 never raised, never wrote a status update, and never retried.
+
+Plain-script convention (run as `python3 test_dns_timeout.py`), matching the
+other ag2-sparrow tests — no pytest.
 """
+import importlib
 import os
+import pathlib
 import socket
 import sys
 import time
-import importlib
-import pathlib
-
-import pytest
 
 
 def _load():
@@ -25,47 +26,97 @@ def _load():
     return importlib.reload(mod)
 
 
-def test_hung_resolver_raises_within_bound(monkeypatch):
+def _with(mod, *, timeout, resolver, fn):
+    """Swap the module's DNS bound + underlying resolver, run fn, restore."""
+    orig_t, orig_r = mod._DNS_TIMEOUT_S, mod._orig_getaddrinfo
+    mod._DNS_TIMEOUT_S, mod._orig_getaddrinfo = timeout, resolver
+    try:
+        return fn()
+    finally:
+        mod._DNS_TIMEOUT_S, mod._orig_getaddrinfo = orig_t, orig_r
+
+
+def test_hung_resolver_raises_within_bound():
     mod = _load()
-    monkeypatch.setattr(mod, "_DNS_TIMEOUT_S", 0.3)
 
-    def _hang(*a, **k):
-        time.sleep(30)  # never returns within the test window
+    def body():
+        start = time.monotonic()
+        try:
+            mod._resolve_bounded("relay.ag2.space", 443)
+        except socket.gaierror:
+            elapsed = time.monotonic() - start
+            assert elapsed < 5, f"resolver not bounded (took {elapsed:.1f}s)"
+            return
+        raise AssertionError("hung resolver did not raise")
 
-    monkeypatch.setattr(mod, "_orig_getaddrinfo", _hang)
-
-    start = time.monotonic()
-    with pytest.raises(socket.gaierror):
-        mod._resolve_bounded("relay.ag2.space", 443)
-    elapsed = time.monotonic() - start
-    # Must give up near the bound, not hang for the full 30s.
-    assert elapsed < 5, f"resolver was not bounded (took {elapsed:.1f}s)"
+    _with(mod, timeout=0.3, resolver=lambda *a, **k: time.sleep(30), fn=body)
+    print("PASS test_hung_resolver_raises_within_bound")
 
 
-def test_normal_resolution_passes_through(monkeypatch):
+def test_normal_resolution_passes_through():
     mod = _load()
-    monkeypatch.setattr(mod, "_DNS_TIMEOUT_S", 5.0)
     sentinel = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 443))]
-    monkeypatch.setattr(mod, "_orig_getaddrinfo", lambda *a, **k: sentinel)
-    assert mod._resolve_bounded("relay.ag2.space", 443) == sentinel
+    got = _with(
+        mod, timeout=5.0, resolver=lambda *a, **k: sentinel,
+        fn=lambda: mod._resolve_bounded("relay.ag2.space", 443),
+    )
+    assert got == sentinel
+    print("PASS test_normal_resolution_passes_through")
 
 
-def test_resolver_error_propagates(monkeypatch):
+def test_v4_preference_and_passthrough():
     mod = _load()
-    monkeypatch.setattr(mod, "_DNS_TIMEOUT_S", 5.0)
+    mixed = [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 443, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 443)),
+    ]
+    # ag2.space host → v4 filtered to the front-only set
+    v4only = _with(
+        mod, timeout=5.0, resolver=lambda *a, **k: mixed,
+        fn=lambda: mod._getaddrinfo_prefer_v4("relay.ag2.space", 443),
+    )
+    assert all(i[0] == socket.AF_INET for i in v4only), v4only
+    # non-ag2 host → untouched
+    passthru = _with(
+        mod, timeout=5.0, resolver=lambda *a, **k: mixed,
+        fn=lambda: mod._getaddrinfo_prefer_v4("example.com", 443),
+    )
+    assert passthru == mixed
+    print("PASS test_v4_preference_and_passthrough")
 
-    def _boom(*a, **k):
+
+def test_resolver_error_propagates():
+    mod = _load()
+
+    def boom(*a, **k):
         raise socket.gaierror("name or service not known")
 
-    monkeypatch.setattr(mod, "_orig_getaddrinfo", _boom)
-    with pytest.raises(socket.gaierror):
-        mod._resolve_bounded("nope.invalid", 443)
+    def body():
+        try:
+            mod._resolve_bounded("nope.invalid", 443)
+        except socket.gaierror:
+            return
+        raise AssertionError("resolver error did not propagate")
+
+    _with(mod, timeout=5.0, resolver=boom, fn=body)
+    print("PASS test_resolver_error_propagates")
 
 
-def test_zero_timeout_disables_bound(monkeypatch):
+def test_zero_timeout_disables_bound():
     mod = _load()
-    monkeypatch.setattr(mod, "_DNS_TIMEOUT_S", 0)
     sentinel = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 443))]
-    monkeypatch.setattr(mod, "_orig_getaddrinfo", lambda *a, **k: sentinel)
-    # With the bound disabled it calls straight through (no thread).
-    assert mod._resolve_bounded("relay.ag2.space", 443) == sentinel
+    got = _with(
+        mod, timeout=0, resolver=lambda *a, **k: sentinel,
+        fn=lambda: mod._resolve_bounded("relay.ag2.space", 443),
+    )
+    assert got == sentinel
+    print("PASS test_zero_timeout_disables_bound")
+
+
+if __name__ == "__main__":
+    test_hung_resolver_raises_within_bound()
+    test_normal_resolution_passes_through()
+    test_v4_preference_and_passthrough()
+    test_resolver_error_propagates()
+    test_zero_timeout_disables_bound()
+    print("ALL PASS")
