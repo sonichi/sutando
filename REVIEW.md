@@ -34,10 +34,15 @@ and loads whichever repo it reviews.
    anything that deletes, restarts, recovers, or prunes, ask *is it on by default, and
    how many hosts/files does it touch?* Prefer fail-closed (raise rather than proceed on
    an ambiguous result) over silently reporting success.
-5. **Disruption to existing users is part of correctness.** "No bugs" is not a
-   sufficient verdict. Check: opt-in vs always-on; on-disk state-format/migration
-   compatibility across the rolling-upgrade window; new hard-required config that breaks
-   current installs; process-global patches with wide blast radius.
+5. **Disruption to existing users is part of correctness — ask the worst-case question.**
+   "No bugs" is not a sufficient verdict. The explicit question every reviewer **and the
+   maintainer (before merging)** must answer: **"What is the worst-case disruption to
+   Sutando's users from this PR, and how do we mitigate it?"** (Chi 2026-07-25.) Concretely
+   check: opt-in vs always-on; on-disk state-format/migration compatibility across the
+   rolling-upgrade window; new hard-required config that breaks current installs;
+   process-global patches with wide blast radius; and — per #1898 — for any auto-action,
+   *what code or state does it act on* (does it verify the target is canonical, or run
+   whatever's there?). A PR is not merge-ready until that worst case is named and mitigated.
 6. **No hardcoded absolute paths.** Machine- or user-specific path literals
    (`/Users/…`, `/home/<user>/…`, `~/.claude`, `~/.sutando`, …) break on other hosts;
    resolve via the workspace/config helpers instead. Enforced by the `checks:` block.
