@@ -35,6 +35,29 @@ os.environ["SUTANDO_PROGRESS_STREAM"] = "true"
 check("flag off when !=1 (strict)", ps.stream_enabled() is False)
 os.environ.pop("SUTANDO_PROGRESS_STREAM", None)
 
+# --- stream_enabled config-file fallback (env unset → bridges.progress_stream) ---
+import sutando_config as sc  # noqa: E402
+
+_orig_resolve = sc.resolve_progress_stream
+try:
+    os.environ.pop("SUTANDO_PROGRESS_STREAM", None)
+    sc.resolve_progress_stream = lambda *a, **k: True
+    check("config True → ON when env unset", ps.stream_enabled() is True)
+    sc.resolve_progress_stream = lambda *a, **k: False
+    check("config False → OFF when env unset", ps.stream_enabled() is False)
+    sc.resolve_progress_stream = lambda *a, **k: None
+    check("config unset → OFF (default)", ps.stream_enabled() is False)
+    # env is the override — it wins over config either way
+    os.environ["SUTANDO_PROGRESS_STREAM"] = "0"
+    sc.resolve_progress_stream = lambda *a, **k: True
+    check("env=0 overrides config True → OFF", ps.stream_enabled() is False)
+    os.environ["SUTANDO_PROGRESS_STREAM"] = "1"
+    sc.resolve_progress_stream = lambda *a, **k: False
+    check("env=1 overrides config False → ON", ps.stream_enabled() is True)
+finally:
+    sc.resolve_progress_stream = _orig_resolve
+    os.environ.pop("SUTANDO_PROGRESS_STREAM", None)
+
 # --- should_stream_task (owner-only) ---
 check("owner streams", ps.should_stream_task("owner") is True)
 check("owner streams (caps/space)", ps.should_stream_task("  Owner ") is True)

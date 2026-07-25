@@ -57,6 +57,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "core_config_dirs",
     "vault",
     "migrate",
+    "bridges",
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
@@ -413,6 +414,21 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     vault["sync"] = sync
     vault.setdefault("interval_seconds", 1800)
     return vault
+
+
+def resolve_progress_stream(repo_root: Optional[Path] = None) -> Optional[bool]:
+    """Return ``bridges.progress_stream`` from config, or ``None`` if unset.
+
+    This is the config home for the owner progress-streamer toggle consulted by
+    both the Discord and Telegram bridges (``progress_stream.stream_enabled``).
+    Returns ``None`` (not ``False``) when the key is absent so the caller can
+    distinguish "not configured" (fall through to its own default) from an
+    explicit ``false``. The ``SUTANDO_PROGRESS_STREAM`` env var overrides this.
+    """
+    cfg = load_config(repo_root)
+    bridges = cfg.get("bridges") or {}
+    val = bridges.get("progress_stream")
+    return bool(val) if val is not None else None
 
 
 def resolve_dotenv(repo_root: Optional[Path] = None,
