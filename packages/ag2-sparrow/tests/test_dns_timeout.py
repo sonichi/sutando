@@ -113,10 +113,28 @@ def test_zero_timeout_disables_bound():
     print("PASS test_zero_timeout_disables_bound")
 
 
+def test_reload_preserves_true_original_resolver():
+    """Regression: re-executing the module must NOT capture our own wrapper as
+    the original resolver (reload made _orig_getaddrinfo = the wrapper, so the
+    first real resolution recursed to death). Exercises the REAL wrapper chain
+    without swapping _orig_getaddrinfo."""
+    mod = _load()
+    mod = _load()  # second re-exec: socket.getaddrinfo is already the wrapper
+    assert mod._orig_getaddrinfo.__name__ != "_getaddrinfo_prefer_v4", (
+        "reload captured the wrapper as the original resolver"
+    )
+    # localhost resolves from system files — no network, no fake resolver, and
+    # would RecursionError immediately on the broken capture.
+    infos = mod._resolve_bounded("localhost", 80)
+    assert infos, "localhost resolution through the real chain returned nothing"
+    print("PASS test_reload_preserves_true_original_resolver")
+
+
 if __name__ == "__main__":
     test_hung_resolver_raises_within_bound()
     test_normal_resolution_passes_through()
     test_v4_preference_and_passthrough()
     test_resolver_error_propagates()
     test_zero_timeout_disables_bound()
+    test_reload_preserves_true_original_resolver()
     print("ALL PASS")

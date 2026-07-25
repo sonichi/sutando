@@ -82,7 +82,11 @@ from pathlib import Path
 # with REMOTE_GATEWAY_DNS_TIMEOUT (seconds); 0/negative disables it.
 _DNS_TIMEOUT_S = float(os.environ.get("REMOTE_GATEWAY_DNS_TIMEOUT") or "8")
 _PREFER_V4 = os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1"
-_orig_getaddrinfo = socket.getaddrinfo
+# Reload-safe original capture: on module re-exec/reload, socket.getaddrinfo is
+# already our wrapper — capturing it blindly makes _resolve_bounded call itself
+# (RecursionError). The installed wrapper carries the TRUE original on its
+# `_ag2_orig_getaddrinfo` attribute, so re-executions pick that up instead.
+_orig_getaddrinfo = getattr(socket.getaddrinfo, "_ag2_orig_getaddrinfo", socket.getaddrinfo)
 
 
 def _resolve_bounded(host, *args, **kwargs):
@@ -125,6 +129,7 @@ def _getaddrinfo_prefer_v4(host, *args, **kwargs):
     return infos
 
 
+_getaddrinfo_prefer_v4._ag2_orig_getaddrinfo = _orig_getaddrinfo
 socket.getaddrinfo = _getaddrinfo_prefer_v4
 
 # resolve_workspace lives alongside this file in src/ — put THIS directory on
