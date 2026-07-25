@@ -51,6 +51,7 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -112,6 +113,10 @@ TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
 # guessing from tmux-window presence. Written on every poll outcome: connected
 # after a healthy round-trip, reconnecting in the backoff branches.
 GATEWAY_STATUS_FILE = _STATE / "gateway-status.json"
+
+# AWP P0: the persistent event channel (if enabled) — a module-level handle so
+# gateway-status can report per-channel health. None until _maybe_start_event_channel.
+_EVENT_CHANNEL = None
 
 # Back-compat: instances onboarded before the AG2_REMOTE_* → REMOTE_TASK_*
 # rename still export the legacy names in their .env. Honor them as DEPRECATED
@@ -571,6 +576,17 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "gateway": _redact_url(URL),
             "schema_version": 1,
         }
+        # AWP P0 per-channel health: the task connection is `connected` above; the
+        # additive event channel (if running) reports its own status, so a
+        # supervisor never shows the agent healthy while the event stream is dead.
+        _ch = _EVENT_CHANNEL
+        if _ch is not None:
+            payload["channels"] = {
+                "tasks": "connected" if connected else "reconnecting",
+                "events": _ch.health.get("status"),
+            }
+            payload["events"] = {k: _ch.health.get(k) for k in
+                                 ("status", "last_cursor", "last_event_at", "retry_count")}
         GATEWAY_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
         # Per-PID staging (sonichi/sutando#2222 follow-up): single-writer today,
         # but a shared temp name collides if a second sparrow instance ever runs;
@@ -1230,6 +1246,60 @@ def _acquire_singleton() -> bool:
     return True
 
 
+def _maybe_start_event_channel() -> None:
+    """AWP P0: start the persistent Workspace-Event channel in its OWN daemon
+    thread, ISOLATED from task delivery. Opt-in (SPARROW_EVENTS truthy) and
+    fully guarded — any startup failure is logged and swallowed so it can NEVER
+    affect task polling. Off by default = zero change to existing deployments;
+    the task loop below is untouched whether this runs or not."""
+    global _EVENT_CHANNEL
+    if str(os.environ.get("SPARROW_EVENTS", "")).strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    try:
+        from .event_inbox import EventInbox
+        from .event_channel import EventChannel
+        inbox = EventInbox(str(_STATE / "event-inbox.db"))
+        ch = EventChannel(inbox, URL, {"Authorization": f"Bearer {TOKEN}"}, log=_log)
+        threading.Thread(target=ch.run, name="sparrow-event-channel", daemon=True).start()
+        _EVENT_CHANNEL = ch
+        # P1: drain the inbox into the Core's attention (taskify → tasks/) on a
+        # timer, in ITS OWN daemon thread, fully guarded — task delivery unaffected.
+        from .event_consumer import EventConsumer, TaskifyHandler
+        handler = TaskifyHandler(str(TASKS_DIR), os.environ.get("AGENT_MXID"), log=_log)
+        # Human-action bridge (v1 steps 2+3): when an owner + room are configured,
+        # route the owner's answers to pending actions BEFORE taskify sees them,
+        # and sweep-post question cards for actions the hook created. Both are
+        # additive — unset env leaves the plain taskify path exactly as before.
+        poster = None
+        ha_owner = os.environ.get("SPARROW_HA_OWNER")
+        ha_room = os.environ.get("SPARROW_HA_ROOM")
+        if ha_owner:
+            from .human_action import ActionStore, CardPoster, DecisionHandler, HandlerChain
+            store = ActionStore(str(_STATE / "human-actions"))
+            handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
+            if ha_room:
+                poster = CardPoster(store, URL, {"Authorization": f"Bearer {TOKEN}"},
+                                    ha_room, log=_log,
+                                    include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
+                                    .strip().lower() in ("1", "true", "yes", "on"))
+        consumer = EventConsumer(inbox, handler)
+
+        def _drain_loop():
+            while True:
+                try:
+                    consumer.drain()
+                    if poster is not None:
+                        poster.sweep()
+                except Exception as e:  # noqa: BLE001 — drain must never break anything
+                    _log(f"event drain error (isolated): {e}")
+                time.sleep(2.0)
+        threading.Thread(target=_drain_loop, name="sparrow-event-drain", daemon=True).start()
+        _log("event channel + consumer started (SPARROW_EVENTS enabled) — isolated "
+             "daemon threads, task delivery unaffected")
+    except Exception as e:  # noqa: BLE001 — event startup must NEVER break tasks
+        _log(f"event channel start failed (task delivery unaffected): {e}")
+
+
 def main() -> None:
     if not URL or not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
@@ -1241,6 +1311,7 @@ def main() -> None:
          f"(restored {len(inflight)} in-flight)")
     backoff = 1
     _emit_gateway_status(False, error="starting — not yet connected")
+    _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     while True:
         try:
             if not _heartbeat_singleton():

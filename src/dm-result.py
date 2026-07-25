@@ -39,6 +39,7 @@ import discord_config  # noqa: E402  — workspace-local Sutando discord config 
 REPO = resolve_workspace()
 ACCESS_JSON = claude_home_path("channels", "discord", "access.json")
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
+USAGE = "Usage: python3 src/dm-result.py 'text' | --file path"
 
 # Path allowlist for `[file: ...]` markers — sourced from
 # `src/send_allowlist.py` so this REST-fallback path uses the SAME
@@ -373,8 +374,17 @@ def send_dm(text: str) -> bool:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 src/dm-result.py 'text' | --file path", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         sys.exit(1)
+
+    # This script intentionally accepts free-form positional text, so a normal
+    # argparse parser would reject legitimate messages beginning with a dash.
+    # Still honor the two conventional help flags before any voice/network
+    # checks: otherwise `--help` is interpreted as message text and delivered
+    # to the owner's DM.
+    if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
+        print(USAGE)
+        return
 
     if sys.argv[1] == "--file":
         if len(sys.argv) < 3:

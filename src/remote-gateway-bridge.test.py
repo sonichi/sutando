@@ -442,7 +442,7 @@ def main() -> int:
     # 6e. malformed media URLs never crash task intake (drop-in-safe)
     #     (re-review 2026-07-03: `.port` raises ValueError at ACCESS time)
     rtc._download_bytes = lambda url, headers, cap: b"X"
-    for bad in (f"https://127.0.0.1:bad/media/p", "https://hs.example:bad/_matrix/media/v3/download/hs/id",
+    for bad in ("https://127.0.0.1:bad/media/p", "https://hs.example:bad/_matrix/media/v3/download/hs/id",
                 "https://[broken/media/p"):
         try:
             out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {bad} name=x.bin]")
