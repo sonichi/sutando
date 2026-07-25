@@ -54,7 +54,7 @@ jobs:
       # was pure indirection. Must run BEFORE `npm test`: the `test` script chains
       # `npm run test:py`, so Python tests execute inside the "Run tests" step.
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0'
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       - name: Typecheck
         run: npm run typecheck
@@ -65,6 +65,10 @@ jobs:
       - name: Typecheck skills
         run: npm run typecheck:skills
 
+      # NOTE: ESLint runs in its own workflow (.github/workflows/eslint.yml), not
+      # as a step here — so a lint failure surfaces as a named "eslint" check on
+      # the PR rather than being buried inside this job's result.
+
       # Skill-manifest validator + its own test. The test lives next to the code
       # in scripts/ (not tests/), so the standalone-Python-test step below won't
       # discover it — wire both explicitly here. `--all --strict` validates every
@@ -74,6 +78,28 @@ jobs:
         run: |
           python3 scripts/lint-skill.test.py
           python3 scripts/lint-skill.py --all --strict
+
+      # Python tests that live OUTSIDE tests/ and so are invisible to the
+      # `find tests -name '*.test.py'` step below. Same reason the skill-manifest
+      # test above is wired by hand. Without this they run only when someone
+      # remembers to run them locally, which is indistinguishable from passing.
+      # Notably src/remote-gateway-bridge.test.py — the suite the transport
+      # change process requires for ANY package change — and tools/test_no_drift.py,
+      # which is the guard against src/ and the package silently diverging.
+      - name: Run out-of-tree Python tests
+        run: |
+          python3 src/remote-gateway-bridge.test.py
+          python3 packages/ag2-sparrow/tests/test_gateway_status.py
+          python3 packages/ag2-sparrow/tests/test_ack_retry.py
+          python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
+          python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
+          python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
+          python3 packages/ag2-sparrow/tests/test_event_consumer.py
+          python3 packages/ag2-sparrow/tests/test_event_wiring.py
+          python3 packages/ag2-sparrow/tests/test_human_action.py
+          python3 packages/ag2-sparrow/tools/test_no_drift.py
+          python3 skills/agent-room-ops/test_room_ops.py
+          python3 skills/make-viral-video/scripts/test_source_tag.py
 
       - name: Run tests
         run: npm test

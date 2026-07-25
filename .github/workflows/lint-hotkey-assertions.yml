@@ -1,0 +1,36 @@
+name: lint-hotkey-assertions
+
+# CI lint: refuse PRs that introduce NEW hardcoded ⌃-combo hotkey assertions in
+# docs/comments. Hotkeys are configurable (defaults published in
+# state/hotkeys.json); a fixed-keystroke assertion goes stale when the default
+# changes (issue #1925).
+#
+# This workflow runs `scripts/lint-hotkey-assertions.sh --diff`, which scans
+# only ADDED lines in the PR — existing design-rationale comments are exempt
+# (see the ALLOWED list + the per-line "cite the contract" escape in the script).
+#
+# Companion to the workspace-path / claude-home-path lints — same added-lines
+# discipline, closing the class of stale hotkey docs (CR #1958).
+
+on:
+  pull_request:
+    branches: [main, staging-workspace-revamp]
+  push:
+    branches: [main, staging-workspace-revamp]
+
+jobs:
+  lint-hotkey-assertions:
+    name: refuse new hardcoded hotkey assertions
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Checkout (with full history for base-ref diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run lint in --diff mode
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: bash scripts/lint-hotkey-assertions.sh --diff

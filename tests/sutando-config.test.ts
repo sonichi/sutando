@@ -22,6 +22,7 @@ import {
 	findRepoRoot,
 	loadConfig,
 	resetCacheForTests,
+	resolveCoreRuntime,
 	resolveVault,
 	resolveWorkspace,
 } from '../src/sutando_config.js';
@@ -447,6 +448,34 @@ describe('sutando_config loader', () => {
 			assert.ok(!combined.includes('does not read'), 'stderr should be silent on the happy path');
 		} finally {
 			process.stderr.write = origWrite;
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('resolves the configured core runtime and invocation override', () => {
+		writeConfig(repo, 'sutando.config.json', { core: { runtime: 'codex' } });
+		const saved = process.env.SUTANDO_CORE_RUNTIME;
+		try {
+			delete process.env.SUTANDO_CORE_RUNTIME;
+			assert.equal(resolveCoreRuntime(repo), 'codex');
+			process.env.SUTANDO_CORE_RUNTIME = 'claude';
+			assert.equal(resolveCoreRuntime(repo), 'claude');
+		} finally {
+			if (saved === undefined) delete process.env.SUTANDO_CORE_RUNTIME;
+			else process.env.SUTANDO_CORE_RUNTIME = saved;
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('rejects an unsupported core runtime', () => {
+		writeConfig(repo, 'sutando.config.json', { core: { runtime: 'other' } });
+		const saved = process.env.SUTANDO_CORE_RUNTIME;
+		try {
+			delete process.env.SUTANDO_CORE_RUNTIME;
+			assert.throws(() => resolveCoreRuntime(repo), /unsupported core\.runtime/);
+		} finally {
+			if (saved === undefined) delete process.env.SUTANDO_CORE_RUNTIME;
+			else process.env.SUTANDO_CORE_RUNTIME = saved;
 			restoreEnvAndRepo();
 		}
 	});

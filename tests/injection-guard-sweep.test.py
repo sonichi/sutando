@@ -347,11 +347,13 @@ _check(
 # ---------------------------------------------------------------------------
 
 _GUARDED_PY_WRITERS = {
+    "skills/schedule-crons/scripts/codex-scheduler.py",
     "src/discord-bridge.py",
     "src/telegram-bridge.py",
     "src/slack-bridge.py",
     "src/github-webhook.py",
     "src/agent-api.py",
+    "src/cron-runner.py",
 }
 
 _TASK_FIELD_PATTERN = 'f"task: {'

@@ -22,7 +22,9 @@ Checks:
 import hashlib
 import json
 import os
+import re
 import shutil
+import tempfile
 import socket
 import subprocess
 import sys
@@ -40,6 +42,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_config import resolve_core_runtime  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -393,6 +396,45 @@ def check_memory_sync() -> dict:
             return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
         return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
+
+
+def check_onboarding_status() -> "dict | None":
+    """Read the desktop checklist's agent surface (onboarding v2 spec,
+    ag2space-cinny-desktop#165 S4).
+
+    The desktop Console mirrors its setup-checklist row states into
+    `<workspace>/state/onboarding-status.json` (written by console_status,
+    write-on-change). This check is the core-side half: surface rows the USER
+    still needs (or that regressed from green) so the proactive loop can run
+    the self-heal ladder and, failing that, tell the owner — instead of the
+    Console being the only place onboarding failures are visible.
+
+    Absent file → None (CLI installs and pre-S1 desktop builds have no
+    checklist; nothing to report). Rows in "todo" → warn with the row names.
+    Read-only; never raises.
+    """
+    name = "onboarding-status"
+    path = WORKSPACE_DIR / "state" / "onboarding-status.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        # Shape-guard (Codex P1): a frontend bug could write [] or {"rows": []}
+        # — non-dict shapes must degrade to 'unreadable', never raise.
+        if not isinstance(data, dict) or not isinstance(data.get("rows"), dict):
+            return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
+        rows = data["rows"]
+        todo = sorted(k for k, v in rows.items() if isinstance(v, dict) and v.get("state") == "todo")
+        age_s = max(0, int(time.time()) - int(data.get("updated_at", 0) or 0))
+    except (ValueError, OSError, TypeError):
+        return {"name": name, "status": "warn", "detail": "onboarding-status.json unreadable"}
+    if todo:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"user-facing setup incomplete: {', '.join(todo)} (as of {age_s}s ago)",
+        }
+    return {"name": name, "status": "ok", "detail": f"all checklist rows satisfied ({age_s}s ago)"}
 
 
 def check_host_subtrees() -> dict:
@@ -1101,6 +1143,53 @@ def check_voice_transport(voice_check: dict) -> dict:
     return check
 
 
+def check_quota_telemetry(proxy_status: str) -> dict:
+    """Warn when the credential proxy is up but producing no quota state.
+
+    quota-state.json is written by the proxy from the quota headers on
+    upstream responses, so it only appears if a core actually ROUTES through
+    the proxy. `src/startup.sh` is the only thing that exports
+    ANTHROPIC_BASE_URL=http://localhost:7846 — and a core launched by the
+    desktop supervisor never runs startup.sh. Result on such a host: the
+    proxy is healthy and listening, every check is green, and quota
+    telemetry is silently absent forever. The proactive loop's per-pass
+    budget check reads "unknown" on every pass and nobody is told why.
+
+    The existing credential-proxy check can't catch this: it is a plain
+    TCP-listening probe (correctly so — a forwarding proxy has no liveness
+    endpoint), so "listening" is all it can ever assert.
+
+    Deliberately narrow to stay quiet in the legitimate cases:
+      - proxy not up          -> silent. Not every host routes through it,
+                                 and its own check already says so.
+      - file present          -> ok, with its age. NOT stale-checked: a quiet
+                                 core legitimately writes nothing for a long
+                                 time, so an age threshold would fire on
+                                 healthy idle hosts. Absence is the signal
+                                 that actually distinguishes broken wiring.
+    """
+    check = {"name": "quota-telemetry", "status": "ok"}
+    if proxy_status != "ok":
+        check["detail"] = "credential proxy not running — quota telemetry not expected"
+        return check
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if path.exists():
+        try:
+            age_min = int((time.time() - path.stat().st_mtime) / 60)
+            check["detail"] = f"quota state present (updated {age_min}m ago)"
+        except OSError:
+            check["detail"] = "quota state present"
+        return check
+    check["status"] = "warn"
+    check["detail"] = (
+        "credential proxy is up but has never written quota-state.json — "
+        "nothing is routing through it (ANTHROPIC_BASE_URL unset; set by "
+        "src/startup.sh, which a supervisor-launched core never runs). "
+        "Quota-based budgeting is blind on this host."
+    )
+    return check
+
+
 def check_bodhi_dist() -> dict:
     """Verify the installed bodhi-realtime-agent dist has the Gemini 3.1
     wire-format fixes applied. Greps the Gemini sendAudio/sendFile bodies
@@ -1116,12 +1205,37 @@ def check_bodhi_dist() -> dict:
 
     Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
+
+    Scans whichever artifact the voice-agent ACTUALLY loads, because that
+    differs by deployment and the node_modules copy is not always the one
+    running:
+
+      - dev checkout  -> node_modules/bodhi-realtime-agent/dist/index.js
+      - bundled app   -> dist/voice-agent.js, an esbuild bundle with bodhi
+                         inlined and NO node_modules on disk at all
+
+    Checking only the node_modules path made this probe useless in exactly
+    the deployment where it matters: a bundled install has an empty
+    node_modules, so the check warned "run `npm install`" on every tick
+    (noise that reads as benign) while giving ZERO coverage of the running
+    bundle. The 1007 regression this was written to catch would have
+    shipped undetected. The body scan below needs no change — it matches
+    the bundled output as-is.
     """
     check = {"name": "bodhi-dist", "status": "ok", "detail": "Gemini 3.1 wire-format fixes present"}
-    dist = REPO_DIR / "node_modules" / "bodhi-realtime-agent" / "dist" / "index.js"
-    if not dist.exists():
+    # Order matters: node_modules first so a dev checkout reports on the
+    # package it actually resolves, bundle second for bundled installs.
+    candidates = [
+        REPO_DIR / "node_modules" / "bodhi-realtime-agent" / "dist" / "index.js",
+        REPO_DIR / "dist" / "voice-agent.js",
+    ]
+    dist = next((c for c in candidates if c.exists()), None)
+    if dist is None:
         check["status"] = "warn"
-        check["detail"] = "bodhi dist not found — run `npm install`"
+        check["detail"] = (
+            "no bodhi artifact found (checked node_modules and dist/voice-agent.js) — "
+            "run `npm install`, or `npm run build` for a bundled install"
+        )
         return check
     try:
         text = dist.read_text(errors="replace")
@@ -1129,13 +1243,14 @@ def check_bodhi_dist() -> dict:
         check["status"] = "warn"
         check["detail"] = f"dist read failed: {e}"
         return check
+    check["detail"] = f"Gemini 3.1 wire-format fixes present ({dist.name})"
     # Isolate the Gemini transport's sendAudio body. The OpenAI realtime
     # transport also defines sendAudio but uses `audio: base64Data` as a
     # flat string — a naive grep would false-positive.
     idx = text.find("sendAudio(base64Data) {")
     if idx < 0:
         check["status"] = "warn"
-        check["detail"] = "could not locate sendAudio in bodhi dist"
+        check["detail"] = f"could not locate sendAudio in {dist.name}"
         return check
     # Find the first two sendAudio definitions; the Gemini one wraps its
     # arg in `this.session.sendRealtimeInput(...)`.
@@ -1467,6 +1582,44 @@ def check_gateway_bridge() -> "dict | None":
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
+# Free-space thresholds. A full volume is not a slow degradation — it is a hard
+# stop: task/result writes fail with ENOSPC, so the bridge silently stops
+# delivering and the core looks alive while doing nothing. Observed 2026-07-21,
+# when the volume hit 100% and this script still reported "All systems
+# operational" because nothing here looked at disk at all.
+DISK_WARN_GIB = 10.0
+DISK_FAIL_GIB = 2.0
+
+
+def check_disk_space() -> dict:
+    """Free space on the volume(s) the core actually writes to.
+
+    Checks the workspace and the temp dir, reporting the WORST of the two —
+    they are usually the same volume, but a separate /tmp must not hide a full
+    workspace (or the reverse). Reports absolute GiB rather than percentage:
+    5% of a 460G disk is 23G (fine) while 5% of a 20G disk is 1G (dead), so a
+    percentage threshold would mean different things on different hosts.
+    """
+    name = "disk-space"
+    targets = {}
+    for label, path in (("workspace", WORKSPACE_DIR), ("tmp", Path(tempfile.gettempdir()))):
+        try:
+            st = os.statvfs(str(path))
+        except OSError as e:
+            return {"name": name, "status": "error", "detail": f"cannot stat {label} ({path}): {e}"}
+        # Key by device so the same volume isn't reported twice.
+        targets[st.f_fsid or label] = (label, path, st.f_bavail * st.f_frsize / (1024 ** 3))
+
+    worst_label, worst_path, worst_free = min(targets.values(), key=lambda t: t[2])
+    where = f"{worst_free:.1f} GiB free on {worst_label} ({worst_path})"
+    if worst_free < DISK_FAIL_GIB:
+        return {"name": name, "status": "fail",
+                "detail": f"{where} — writes will fail with ENOSPC; free space now"}
+    if worst_free < DISK_WARN_GIB:
+        return {"name": name, "status": "warn", "detail": f"{where} — below {DISK_WARN_GIB:.0f} GiB"}
+    return {"name": name, "status": "ok", "detail": where}
+
+
 def check_skill_symlinks() -> dict:
     """Detect skills in the OSS repo checkout that are not symlinked into
     ~/.claude/skills/. A missing symlink means Claude Code never loads the
@@ -1485,23 +1638,58 @@ def check_skill_symlinks() -> dict:
     if not skills_dst.exists():
         return {"name": name, "status": "ok", "detail": "~/.claude/skills/ not found — skipped"}
 
-    unlinked: list[str] = []
+    # A DANGLING symlink (entry present, target gone) is the case the original
+    # condition let through: `exists()` follows the link and is False, but
+    # `is_symlink()` is True, so `not exists and not is_symlink` is False and the
+    # skill counted as linked. Claude Code cannot load it either way, so it was
+    # invisible AND reported healthy. Tracked as #2213.
+    unlinked: list[str] = []   # no entry at all -> symlink_to() works
+    broken: list[str] = []     # dangling link  -> must be unlinked first
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
-        if not dst.exists() and not dst.is_symlink():
+        if dst.is_symlink() and not dst.exists():
+            broken.append(skill_name)
+        elif not dst.exists() and not dst.is_symlink():
             unlinked.append(skill_name)
 
-    if not unlinked:
+    # Dangling links whose skill is NOT in this repo are missed by the loop
+    # above, which only walks repo skills. They are still dead entries that make
+    # a skill silently unloadable, so sweep the destination too. Reported, never
+    # auto-removed: the target may belong to another checkout that is simply
+    # not mounted right now, and deleting someone else's link is not this
+    # check's call.
+    orphaned: list[str] = []
+    try:
+        repo_names = {d.name for d in skills_src.iterdir() if d.is_dir()}
+        for entry in sorted(skills_dst.iterdir()):
+            if entry.name in repo_names:
+                continue
+            if entry.is_symlink() and not entry.exists():
+                orphaned.append(entry.name)
+    except OSError:
+        pass
+
+    if not unlinked and not broken and not orphaned:
         return {"name": name, "status": "ok", "detail": f"all {sum(1 for d in skills_src.iterdir() if d.is_dir())} skills linked"}
+
+    parts = []
+    if broken:
+        parts.append(f"{len(broken)} dangling: {', '.join(broken[:4])}{'...' if len(broken) > 4 else ''}")
+    if unlinked:
+        parts.append(f"{len(unlinked)} unlinked: {', '.join(unlinked[:4])}{'...' if len(unlinked) > 4 else ''}")
+    if orphaned:
+        parts.append(f"{len(orphaned)} dangling not in this repo: {', '.join(orphaned[:4])}{'...' if len(orphaned) > 4 else ''}")
 
     return {
         "name": name,
         "status": "warn",
-        "detail": f"{len(unlinked)} unlinked skill(s): {', '.join(unlinked[:5])}{'...' if len(unlinked) > 5 else ''}",
+        "detail": "; ".join(parts),
         "_unlinked": unlinked,
+        "_broken": broken,
+        "_orphaned": orphaned,
         "_skills_src": str(skills_src),
         "_skills_dst": str(skills_dst),
     }
@@ -1510,14 +1698,21 @@ def check_skill_symlinks() -> dict:
 def fix_skill_symlinks(check: dict) -> dict:
     """Create missing symlinks for unlinked skills (--fix handler)."""
     unlinked = check.get("_unlinked", [])
+    broken = check.get("_broken", [])
     skills_src = Path(check.get("_skills_src", ""))
     skills_dst = Path(check.get("_skills_dst", ""))
     created: list[str] = []
     errors: list[str] = []
-    for skill_name in unlinked:
+    for skill_name in list(broken) + list(unlinked):
         src = skills_src / skill_name
         dst = skills_dst / skill_name
         try:
+            # A dangling link occupies the name: symlink_to() would raise
+            # FileExistsError, so --fix could not repair the very case it was
+            # meant to. Guard on is_symlink() so a real directory is never
+            # removed by a health check.
+            if dst.is_symlink() and not dst.exists():
+                dst.unlink()
             dst.symlink_to(src)
             created.append(skill_name)
         except Exception as e:
@@ -1534,9 +1729,51 @@ def apply_skill_symlink_fixes(checks: list) -> None:
     """--fix dispatch for skill-symlinks: warn-level (excluded from the issues
     loop) but auto-fixable, so it is handled by its own pass over checks."""
     for c in checks:
-        if c["name"] == "skill-symlinks" and c.get("_unlinked"):
+        if c["name"] == "skill-symlinks" and (c.get("_unlinked") or c.get("_broken")):
             result = fix_skill_symlinks(c)
             print(f"  {c['name']}: {result['detail']}")
+
+
+def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> list[Path]:
+    """Top-level task files that have not produced or archived a result."""
+    if results_dir is None:
+        results_dir = tasks_dir.parent / "results"
+    try:
+        archive_dir = results_dir / "archive"
+        archived_names = set()
+        for path in archive_dir.glob("*/*.txt"):
+            if path.is_file():
+                archived_names.add(path.name)
+        for path in archive_dir.glob("*.txt"):
+            if not path.is_file():
+                continue
+            archived_names.add(path.name)
+            renamed = re.match(r"^(.+)-[0-9]+\.txt$", path.name)
+            if renamed:
+                archived_names.add(f"{renamed.group(1)}.txt")
+        return [
+            path for path in tasks_dir.glob("*.txt")
+            if path.is_file()
+            and not (results_dir / path.name).is_file()
+            and path.name not in archived_names
+        ]
+    except OSError:
+        return []
+
+
+def _bridge_log_belongs_to_process(log_file: Path, process_started_at: "float | None") -> bool:
+    """Whether log content can describe the currently running bridge.
+
+    A bridge restarted under tmux may write to its pane while the prior
+    startup-managed log remains on disk. Old LoginFailure text must not
+    override a live, newly authenticated process.
+    """
+    if process_started_at is None:
+        return True
+    try:
+        return log_file.stat().st_mtime >= process_started_at - 1
+    except OSError:
+        return True
 
 
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> dict:
@@ -1552,7 +1789,7 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
         return {"name": name, "status": "ok", "detail": "tasks/ not yet created"}
     # *.txt at the top level only — archive lives in tasks/archive/<YYYY-MM>/
     # (PR #591) and shouldn't count toward the queue.
-    files = [p for p in tasks_dir.glob("*.txt") if p.is_file()]
+    files = _pending_task_files(tasks_dir)
     if not files:
         return {"name": name, "status": "ok", "detail": "queue empty"}
     now = time.time()
@@ -1565,6 +1802,156 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
             "detail": f"{len(files)} tasks queued, oldest {oldest_age}s — watcher or core may be stuck",
         }
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
+
+
+def _proc_argv(pid: int) -> str:
+    """argv of `pid`, or "" if no such process.
+
+    Deliberately `ps -p <pid>`, NOT `pgrep -f watch-tasks-stream`: pgrep's
+    `-f` matches the search string against full argv, and the calling shell's
+    own argv contains that string — a transient self-match that returns a PID
+    already gone by the next `ps` (the anti-pattern documented in
+    /schedule-crons step 5 and /proactive-loop step 9). Inspecting one known
+    PID cannot self-match.
+    """
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001 — a probe failure must not fail the check
+        return ""
+
+
+# The argv must BE the script invocation, not merely mention it. A substring
+# test counts the observer: any shell whose command line contains the name —
+# a `ps | grep watch-tasks-stream`, or the wrapper running this very check —
+# matches, and each one reads as another watcher. Observed 2026-07-21: a loose
+# match reported 3 trees where 2 were real, the phantom being the shell that
+# ran the query. Same family as the pgrep self-match noted in _proc_argv; the
+# fix is to anchor on the whole command rather than search inside it.
+_WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
+
+
+def _is_watcher_argv(argv: str) -> bool:
+    """True only for `<shell> <path>/watch-tasks-stream.sh` and nothing more."""
+    parts = argv.split()
+    if len(parts) != 2:
+        return False
+    exe, script = parts
+    return (exe.rsplit("/", 1)[-1] in _WATCHER_SHELLS
+            and script.endswith("watch-tasks-stream.sh"))
+
+
+def _watcher_trees(ps_output: "str | None" = None) -> dict:
+    """Map root PID -> set of PIDs for each distinct watcher TREE running.
+
+    Each watcher is several processes (a shell wrapper, the script, a
+    subshell), so counting matching lines overcounts. A "root" is a match
+    whose parent is not itself a match — one per independent watcher. Callers
+    need the whole tree, not just the root, to tell which tree owns the
+    sentinel PID (the sentinel records the script's PID, not the wrapper's).
+
+    `ps -Ao` + filtering here rather than `pgrep -f watch-tasks-stream`, for
+    the reason in _proc_argv: pgrep would match the caller. Our own argv is
+    the health-check invocation, but we drop it explicitly anyway.
+    """
+    if ps_output is None:
+        try:
+            ps_output = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                                       capture_output=True, text=True,
+                                       timeout=5).stdout
+        except Exception:  # noqa: BLE001
+            return {}
+    me = str(os.getpid())
+    parent = {}
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] == me:
+            continue
+        if not _is_watcher_argv(parts[2]):
+            continue
+        parent[parts[0]] = parts[1]
+    trees: dict = {}
+    for pid in parent:
+        root, seen = pid, set()
+        while parent.get(root) in parent and root not in seen:
+            seen.add(root)
+            root = parent[root]
+        trees.setdefault(root, set()).add(pid)
+    return trees
+
+
+def check_task_watcher() -> dict:
+    """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
+
+    The two consequence checks above cannot see a dead watcher on their own:
+    `check_task_queue` needs BOTH >3 tasks AND >300s age, so a watcher that
+    dies against an empty (or small) queue reads green, and a single stranded
+    owner DM never trips the count threshold at all; `check_core_proactive_loop`
+    reads core-status.json, which the proactive loop writes every pass — it is
+    freshest exactly when the loop is alive and the watcher is not. Observed
+    2026-07-21: watcher dead, queue empty, health-check reported 0 failures.
+
+    So this is the direct signal to pair with them, read from the PID sentinel
+    the watcher maintains itself (written at startup, removed by its cleanup
+    trap on clean exit) — present-but-dead therefore means "crashed", absent
+    means "not running".
+
+    Gated on `_any_core_alive()`: with no core running, no watcher is expected
+    and warning here would latch on permanently for anyone not currently
+    running Sutando — a check that is always red carries the same information
+    as one that is always green.
+    """
+    name = "task-watcher"
+    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    if not _any_core_alive():
+        return {"name": name, "status": "ok", "detail": "no core running — watcher not expected"}
+    trees = _watcher_trees()
+    roots = sorted(trees)
+    if not pid_file.exists():
+        if roots:
+            # Sentinel gone but watchers alive: they are draining tasks/ but
+            # nothing supervises them, and each new start adds another (observed
+            # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
+            # duplicate processing, not a stalled queue).
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
+                              f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
+                              "stop them and restart one cleanly"}
+        return {"name": name, "status": "warn",
+                "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
+                          "restart via Monitor: bash src/watch-tasks-stream.sh"}
+    try:
+        pid = int(pid_file.read_text().strip())
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "status": "warn",
+                "detail": f"unreadable PID sentinel ({str(e)[:40]}) — restart the watcher"}
+    argv = _proc_argv(pid)
+    if not argv:
+        if roots:
+            # The sentinel tracks only the MOST RECENT start (the script writes
+            # $$ at startup), so a dead sentinel does NOT mean nothing is
+            # draining tasks/ — an older watcher can still be running. Saying
+            # "not running" here would be false, and restarting on that basis is
+            # what produces the duplicates in the first place.
+            return {"name": name, "status": "warn",
+                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
+                              f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
+                              "stop them and restart one cleanly"}
+        return {"name": name, "status": "warn",
+                "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
+    if "watch-tasks-stream" not in argv:
+        # PID reuse: the sentinel outlived the watcher and the OS handed the
+        # number to something else. `kill -0` alone would call this alive.
+        return {"name": name, "status": "warn",
+                "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
+    extras = sorted(r for r, members in trees.items() if str(pid) not in members)
+    if extras:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by the "
+                          f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
+                          f"more than once. Keep the sentinel's ({pid}), stop the rest"}
+    return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 
 def check_notes_split_brain() -> "dict | None":
@@ -1706,6 +2093,33 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
     return pgrep_status, pids
 
 
+def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Optional[tuple[str, str]]:
+    """Check a bridge's recent log lines for known failure-mode signatures.
+
+    Returns an (status, detail) override, or None if nothing to override.
+    discord-bridge: LoginFailure means the token is revoked/invalid. Always
+      overrides — there is no point restarting with stale code if the token
+      is bad; the token fix is the only path forward.
+    slack-bridge: "60s elapsed" hint means Socket Mode connected but events
+      weren't routing yet at startup (Slack app Event Subscriptions
+      disabled). Only overrides "ok" — stale/dead-inode are higher priority.
+      The hint is a one-time startup message that never clears itself in the
+      log, so it only counts if no event has actually been processed since
+      it last fired (checked via a subsequent "Wrote task-" line) — otherwise
+      Event Subscriptions clearly ARE enabled and it's a stale false alarm.
+    """
+    if name == "discord-bridge":
+        if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
+            return "fail", "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
+    elif name == "slack-bridge" and status == "ok":
+        warn_idxs = [i for i, ln in enumerate(tail) if "60s elapsed with zero events" in ln]
+        if warn_idxs:
+            events_after = any("Wrote task-" in ln for ln in tail[warn_idxs[-1] + 1:])
+            if not events_after:
+                return "warn", "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+    return None
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -1745,6 +2159,9 @@ def run_all_checks() -> list[dict]:
         proxy_check["status"] = "warn"
         proxy_check["detail"] = "not running (optional)"
     checks.append(proxy_check)
+
+    # Quota telemetry — only meaningful when the proxy is actually up.
+    checks.append(check_quota_telemetry(proxy_check["status"]))
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -1789,6 +2206,9 @@ def run_all_checks() -> list[dict]:
 
     # Per-host subtree freshness (hosts/<host>/ stopped syncing?)
     checks.append(check_host_subtrees())
+    onboarding_check = check_onboarding_status()
+    if onboarding_check is not None:
+        checks.append(onboarding_check)
 
     # Migration/reader path-contract drift (#1543)
     checks.append(check_migrate_reader_contract())
@@ -1920,6 +2340,7 @@ def run_all_checks() -> list[dict]:
         # modification. This catches the case where a fix is on disk but the
         # running process is from a previous version (e.g., PR #203 silently
         # not in effect because nobody restarted the bridge after merge).
+        proc_start = None
         try:
             src_file = REPO_DIR / "src" / f"{name}.py"
             if src_file.exists() and pids:
@@ -1987,17 +2408,13 @@ def run_all_checks() -> list[dict]:
         # slack-bridge: "60s elapsed" hint means Socket Mode connected but
         #   events aren't routing (Slack app Event Subscriptions disabled).
         #   Only overrides "ok" — stale/dead-inode are higher priority.
-        if log_file.exists() and name in ("discord-bridge", "slack-bridge"):
+        if (log_file.exists() and name in ("discord-bridge", "slack-bridge")
+                and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
-                if name == "discord-bridge":
-                    if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
-                        status = "fail"
-                        detail = "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
-                elif name == "slack-bridge" and status == "ok":
-                    if any("60s elapsed with zero events" in ln for ln in tail):
-                        status = "warn"
-                        detail = "connected but events not arriving — enable Event Subscriptions at api.slack.com/apps"
+                override = bridge_log_content_status(name, status, tail)
+                if override is not None:
+                    status, detail = override
             except OSError:
                 pass
 
@@ -2088,7 +2505,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_task_watcher())
     checks.append(check_skill_symlinks())
+    checks.append(check_disk_space())
 
     return checks
 
@@ -2479,7 +2898,8 @@ def notify_slack_for_failures(
 # makes it SELF-HEALING.
 #
 # Recovery action is the one mechanism we already own and trust:
-# `src/agent/claude/cli/start-cli.sh --restart`. A restarted session starts fresh under the
+# `src/agent/start-cli.sh --restart`. The dispatcher restarts whichever core
+# runtime is configured. A restarted session starts fresh under the
 # standard context boundary; because the /usage-credits enable persists
 # ACCOUNT-WIDE once a human sets it (and on Max/Team plans 1M is included with
 # no gate at all), the restarted core keeps 1M and re-clears the gate by
@@ -2538,10 +2958,7 @@ def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple
     backlog never triggers a restart."""
     if tasks_dir is None:
         tasks_dir = WORKSPACE_DIR / "tasks"
-    try:
-        files = [p for p in tasks_dir.glob("*.txt") if p.is_file()]
-    except OSError:
-        return None
+    files = _pending_task_files(tasks_dir)
     if not files:
         return None
     try:
@@ -2629,15 +3046,16 @@ def _resolve_launch_env() -> dict:
 
 
 def _default_core_restart(standard_context: bool) -> bool:
-    """Run src/agent/claude/cli/start-cli.sh --restart out-of-process. When
-    standard_context is True, pin SUTANDO_CORE_MODEL=opus so the restarted core
-    runs in the standard 200K window (graceful degradation). Returns True if the
-    restart command exited 0."""
-    script = REPO_DIR / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
+    """Run the selected core CLI dispatcher with --restart out-of-process. When
+    standard_context is True and Claude is selected, pin
+    SUTANDO_CORE_MODEL=opus so the restarted core uses the standard 200K window.
+    Codex restarts without a provider-specific model override. Returns True if
+    the restart command exited 0."""
+    script = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not script.exists():
         return False
     env = _resolve_launch_env()  # pragma: no cover — real-subprocess restart path (integration, not unit)
-    if standard_context:
+    if standard_context and resolve_core_runtime(REPO_DIR) == "claude":
         env["SUTANDO_CORE_MODEL"] = "opus"
     try:
         proc = subprocess.run(
@@ -3098,8 +3516,29 @@ def recover_cron_if_dead(
             except Exception:
                 pass
             lock_fh.close()
+def community_support_line() -> str:
+    """The issue-time pointer to the official Discord (real humans +
+    community-run agents). Pure so it's unit-testable without invoking the
+    full health-check main() path (owner request 2026-07-17)."""
+    return "  Stuck? Community support (real humans + community agents): https://discord.gg/uZHWXXmrCS"
 
 
+def summary_line(checks) -> str:
+    """The no-failures summary. Warnings are deliberately NOT issues — they must
+    not fail the exit code or wake the launchd notifier, and that is unchanged.
+    But the unqualified "All systems operational." printed directly under a
+    `⚠ core degraded` row contradicts the screen, and anything summarising this
+    tool by its last line (a human skimming, a grepped status check) then reports
+    healthy while a warning stands. Name them instead.
+
+    Pure and importable on purpose, so a regression test exercises THIS code
+    rather than a copy of it.
+    """
+    warns = [c for c in checks if c.get("status") == "warn"]
+    if not warns:
+        return "All systems operational."
+    return (f"No failures — {len(warns)} warning(s): "
+            + ", ".join(c["name"] for c in warns))
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -3191,11 +3630,12 @@ def main():
         print()
     if not issues:
         if not quiet:
-            print("All systems operational.")
+            print(summary_line(checks))
     else:
         print(f"{len(issues)} issue(s) found:")
         for c in issues:
             print(f"  - {c['name']}: {c['status']} ({c['detail']})")
+        print(community_support_line())  # pragma: no cover — main() summary glue; the line's content is unit-tested via community_support_line()
 
         if do_fix:
             print()

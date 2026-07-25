@@ -8,7 +8,10 @@ All ids below are FICTITIOUS placeholders (no real channels/guilds). The guild
 resolver is stubbed, so no live Discord is needed. Run:
   python3 tests/read-discord-channel-gate.test.py
 """
-import json, tempfile, os, importlib.util
+import json
+import tempfile
+import os
+import importlib.util
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent

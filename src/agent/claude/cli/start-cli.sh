@@ -34,7 +34,8 @@ SESSION="sutando-core"
 # branches via `new-session -e` (below) since tmux runs the command under the
 # server's environment, not necessarily this shell's.
 export SUTANDO_CORE_SESSION=1
-CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1)
+export SUTANDO_CORE_RUNTIME=claude
+CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
@@ -468,7 +469,7 @@ if tmux_session_exists; then
   # restart-core (kill core window → rerun this script) truly window-scoped.
   echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
   apply_tmux_defaults
-  CORE_CMD=(claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+  CORE_CMD=(claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} -- "/schedule-crons")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
@@ -511,7 +512,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] && cd "$SUTANDO_CLAUDE_WORKING_DIR"
-  exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+  exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
 fi
@@ -542,12 +543,12 @@ apply_tmux_defaults
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
