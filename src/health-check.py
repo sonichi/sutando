@@ -3250,6 +3250,279 @@ def recover_core_if_wedged(
             lock_fh.close()
 
 
+# Cron-layer death in a LIVE core (the third recovery gap)
+# ---------------------------------------------------------------------------
+# recover_core_if_wedged handles a core that is alive-but-STUCK; the dead-core
+# relaunch (PR #2160) handles a core that EXITED. Neither catches the failure
+# mode observed 2026-07-17: the core session alive and responsive, but its
+# IN-SESSION cron layer dead — session crons are registered per-session via
+# CronCreate and auto-expire after 7 days, so a long-lived core (23 days that
+# morning) silently outlives its own crons. Scheduled work (the morning report,
+# the briefing, the */5 main loop) stops firing while every liveness probe
+# reads healthy. Owner: "Core was not dead. Cron was dead."
+#
+# Heartbeat source: `<workspace>/state/core-status.json` `ts`. The canonical
+# main-loop cron (/proactive-loop) stamps it at every pass start AND end
+# (CLAUDE.md "Work Status" / proactive-loop step 0), so a live cron layer
+# advances `ts` at least once per main-loop period — no new writer needed. A
+# frozen `ts` while the core heartbeat (`state/cores/<host>.alive` mtime) stays
+# fresh means the scheduler died inside the session. Other activity (task
+# processing) also stamps `ts`; that can only DELAY detection, never
+# false-fire it.
+#
+# CRON_STALE_SEC = 1800: 3 × the 10-minute /schedule-crons step-4 fallback
+# cadence — the LARGEST canonical main-loop period. Tolerates one long pass
+# plus one missed tick before declaring the layer dead; a */5 config simply
+# detects a little later than it strictly could.
+#
+# Recovery is a NUDGE, not a restart: type `/schedule-crons` into the live
+# core's tmux pane — the same keystroke channel Sutando.app's checkWatcher
+# uses (`watcher` keystroke) when the task watcher dies — so the session
+# re-arms its own crons and keeps its context. Bounded by the SAME
+# confirm/cooldown/give-up discipline as the wedge path so it can't
+# nudge-storm a pane.
+
+CRON_STALE_SEC = int(os.environ.get("SUTANDO_CRON_STALE_SEC", "1800"))
+
+
+def _live_core_socket(workspace: Optional[Path] = None) -> str:
+    """Tmux socket of the freshest LIVE core heartbeat — the runtime-authored
+    `socket` field of `state/cores/<host>.alive` (the same source
+    `sutando-config.sh runtime` trusts, correct for custom sockets and immune
+    to a foreign caller's ambient env). Falls back to the default OSS socket
+    when no fresh heartbeat records one."""
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    default = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return default
+    now = time.time()
+    best_mtime = None
+    best_socket = None
+    for alive_file in cores_dir.glob("*.alive"):
+        try:
+            mtime = alive_file.stat().st_mtime
+            if now - mtime >= 90.0:
+                continue  # stale heartbeat — not a live core
+            sock = json.loads(alive_file.read_text()).get("socket")
+        except (OSError, ValueError):
+            continue
+        if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
+            best_mtime = mtime
+            best_socket = sock
+    return best_socket or default
+
+
+def _resolve_tmux_bin(candidates: "tuple[str, ...]" = ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")) -> str:
+    """Absolute tmux path when a known install location exists, else a bare
+    PATH lookup (run with _resolve_launch_env's healed PATH). Same
+    PATH-narrowing class as _resolve_launch_env: under launchd's minimal PATH,
+    homebrew tmux doesn't resolve. Candidates injectable for tests."""
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    return "tmux"
+
+
+def _default_cron_nudge(
+    tmux_bin: Optional[str] = None,
+    sock: Optional[str] = None,
+    session: Optional[str] = None,
+) -> bool:
+    """Re-arm the live core's in-session crons by typing `/schedule-crons`
+    into its tmux pane — the same keystroke channel Sutando.app's checkWatcher
+    uses for a dead task watcher (main.swift tmuxSendKeys). Returns True only
+    when the session exists and send-keys succeeded. tmux_bin/sock/session are
+    injectable so tests can drive the real subprocess path against a fake
+    tmux binary."""
+    if sock is None:
+        sock = _live_core_socket()
+    if session is None:
+        session = os.environ.get("SUTANDO_TMUX_SESSION", "sutando-core")
+    if tmux_bin is None:
+        tmux_bin = _resolve_tmux_bin()
+    env = _resolve_launch_env()
+    try:
+        has = subprocess.run(
+            [tmux_bin, "-S", sock, "has-session", "-t", session],
+            env=env, capture_output=True, timeout=15,
+        )
+        if has.returncode != 0:
+            return False
+        send = subprocess.run(
+            [tmux_bin, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
+            env=env, capture_output=True, timeout=15,
+        )
+        return send.returncode == 0
+    except Exception:
+        return False
+
+
+def recover_cron_if_dead(
+    state_file: Optional[Path] = None,
+    now: Optional[float] = None,
+    alive_fn=None,
+    status_ts_fn=None,
+    just_booted_fn=None,
+    nudge_fn=None,
+    sender=None,
+) -> "dict | None":
+    """Nudge the core to re-arm its in-session crons when the core is ALIVE
+    but its cron layer is dead (main-loop heartbeat frozen — see the module
+    comment above). Returns an action dict for tests/observability, or None
+    when no action was warranted.
+
+    Deliberately NOT a restart: the session is fine — killing it would lose
+    its context for a scheduler that one `/schedule-crons` keystroke re-arms.
+    A truly dead core (no fresh heartbeat) is out of scope here — that's the
+    dead-core relaunch branch (PR #2160). Same guard shape as the wedge path:
+    flock-serialized, confirmed across two passes ≥ RECOVER_CONFIRM_SEC apart,
+    RECOVER_COOLDOWN_SEC between nudges, give-up DM past RECOVER_MAX_PER_HOUR.
+    All side-effecting collaborators are injectable for tests."""
+    if now is None:
+        now = time.time()
+    if state_file is None:
+        state_file = WORKSPACE_DIR / "state" / "cron-recovery.json"
+    alive_fn = alive_fn or _any_core_alive
+    status_ts_fn = status_ts_fn or _core_status_ts
+    # Boot grace = CRON_STALE_SEC (not RECOVER_WEDGE_SEC): a freshly restarted
+    # core inherits the previous session's stale core-status.json and needs a
+    # full main-loop period (plus slack) to stamp its first pass.
+    just_booted_fn = just_booted_fn or (lambda: _core_started_within(CRON_STALE_SEC, now=now))
+    nudge_fn = nudge_fn or _default_cron_nudge
+    send = sender or _default_slack_sender
+
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    lock_path = state_file.with_name(state_file.name + ".lock")
+    lock_fh = None
+    if fcntl is not None:
+        try:
+            lock_fh = open(lock_path, "w")
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if lock_fh is not None:
+                lock_fh.close()
+            return {"action": "locked"}
+
+    try:
+        try:
+            state = json.loads(state_file.read_text()) if state_file.exists() else {}
+        except Exception:
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+
+        def _save():
+            try:
+                state_file.write_text(json.dumps(state))
+            except Exception:
+                pass
+
+        def _reset_observation():
+            state["cron_first_seen"] = 0
+            state["cron_status_ts"] = None
+
+        status_ts = status_ts_fn()
+        stale_for = int(now - status_ts) if isinstance(status_ts, (int, float)) else None
+        cron_dead = (
+            alive_fn()                       # core alive — a DEAD core is #2160's branch, not ours
+            and stale_for is not None        # no stamp ever written → new install, not a death
+            and stale_for > CRON_STALE_SEC
+            and not just_booted_fn()
+        )
+
+        if not cron_dead:
+            # Healthy stamp / core down / just booted / new install. Clear any
+            # in-progress observation; last_nudge / history survive (cooldown
+            # + give-up persist across episodes within the hour).
+            if state.get("cron_first_seen") or state.get("cron_status_ts") is not None:
+                _reset_observation()
+                _save()
+            return None
+
+        # Confirm across passes. If the stamp ADVANCED since first seen, the
+        # cron layer (or something) is stamping again — reset, no nudge.
+        prev_ts = state.get("cron_status_ts")
+        first_seen = state.get("cron_first_seen") or 0
+        progressed = (
+            isinstance(prev_ts, (int, float))
+            and isinstance(status_ts, (int, float))
+            and status_ts > prev_ts
+        )
+        if (not first_seen) or progressed:
+            state["cron_first_seen"] = now
+            state["cron_status_ts"] = status_ts
+            _save()
+            return {"action": "observed", "stale_for": stale_for}
+
+        if now - first_seen < RECOVER_CONFIRM_SEC:
+            return {"action": "confirming", "stale_for": stale_for, "for": int(now - first_seen)}
+
+        last_nudge = state.get("last_nudge") or 0
+        if last_nudge and now - last_nudge < RECOVER_COOLDOWN_SEC:
+            return {"action": "cooldown", "stale_for": stale_for, "since_nudge": int(now - last_nudge)}
+
+        history = [t for t in (state.get("nudge_history") or []) if isinstance(t, (int, float)) and now - t < 3600]
+        if len(history) >= RECOVER_MAX_PER_HOUR:
+            if not state.get("gave_up_at") or now - state["gave_up_at"] > 3600:
+                if send(
+                    ":octagonal_sign: *Sutando cron-layer recovery gave up* — nudged the core "
+                    f"{len(history)}× in the last hour and scheduled passes still aren't stamping "
+                    f"core-status.json (stale {stale_for // 60} min). The core itself is alive; "
+                    "run `/schedule-crons` in its pane manually."
+                ):
+                    state["gave_up_at"] = now
+                    _save()
+                else:
+                    print("[recover-cron] WARNING: give-up DM to owner failed", flush=True)
+            return {"action": "gave_up", "nudges_last_hour": len(history)}
+
+        # DM the owner BEFORE nudging — wording is explicit that the CRON
+        # LAYER died, not the core (the core is alive and keeps its session).
+        dm_ok = send(
+            ":alarm_clock: *Sutando cron layer died in the live core* — the core heartbeat is "
+            f"fresh but no scheduled pass has stamped core-status.json for {stale_for // 60} min "
+            "(session crons expire after ~7 days; a long-lived core outlives them). Nudging the "
+            "core to re-arm via `/schedule-crons` — the core itself is fine, no restart."
+        )
+        if not dm_ok:
+            print("[recover-cron] WARNING: cron-nudge DM failed; nudging anyway", flush=True)
+
+        if not nudge_fn():
+            # Nudge failed to land — don't burn a cooldown/history slot, keep
+            # the observation so we stay confirmed and retry next pass.
+            return {"action": "nudge_failed", "dm_sent": dm_ok}
+
+        history.append(now)
+        state["nudge_history"] = history
+        state["last_nudge"] = now
+        state["last_nudge_dm_sent"] = dm_ok
+        _reset_observation()  # re-observe after the nudge settles
+        state.pop("gave_up_at", None)
+        _save()
+        return {
+            "action": "nudged", "stale_for": stale_for,
+            "nudges_last_hour": len(history), "dm_sent": dm_ok,
+        }
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_fh.close()
+def community_support_line() -> str:
+    """The issue-time pointer to the official Discord (real humans +
+    community-run agents). Pure so it's unit-testable without invoking the
+    full health-check main() path (owner request 2026-07-17)."""
+    return "  Stuck? Community support (real humans + community agents): https://discord.gg/uZHWXXmrCS"
+
+
 def summary_line(checks) -> str:
     """The no-failures summary. Warnings are deliberately NOT issues — they must
     not fail the exit code or wake the launchd notifier, and that is unchanged.
@@ -3266,8 +3539,6 @@ def summary_line(checks) -> str:
         return "All systems operational."
     return (f"No failures — {len(warns)} warning(s): "
             + ", ".join(c["name"] for c in warns))
-
-
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -3304,7 +3575,14 @@ def main():
     # without waiting for a human. Heavily guarded (confirm window, cooldown,
     # give-up cap); a no-op when the core is healthy.
     if do_recover:
-        recover_core_if_wedged()
+        wedge_action = recover_core_if_wedged()
+        # Cron-layer check rides the same flag: core ALIVE but its in-session
+        # cron layer dead → nudge `/schedule-crons` into the pane (see
+        # recover_cron_if_dead). Skipped when the wedge path just RESTARTED
+        # the core — a restart re-arms crons via the startup path anyway, and
+        # keystrokes into a relaunching pane are noise.
+        if not (wedge_action and wedge_action.get("action") == "restarted"):
+            recover_cron_if_dead()
 
     # Emit-task: when NOT running --fix, the initial check IS the residual,
     # so emit here BEFORE the early-exit paths (--json return, --quiet
@@ -3357,6 +3635,7 @@ def main():
         print(f"{len(issues)} issue(s) found:")
         for c in issues:
             print(f"  - {c['name']}: {c['status']} ({c['detail']})")
+        print(community_support_line())  # pragma: no cover — main() summary glue; the line's content is unit-tested via community_support_line()
 
         if do_fix:
             print()
