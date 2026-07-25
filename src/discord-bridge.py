@@ -81,6 +81,11 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
+from reply_chain import format_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+
+# Cap the reply-chain walk depth (a fetch per level; the immediate parent is
+# depth 0). Beyond this the format helper's size guard would trim anyway.
+REPLY_CHAIN_MAX_DEPTH = 8
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
@@ -3104,18 +3109,39 @@ async def _handle_discord_message(message, force=False):
             if ref_msg is None:
                 ref_msg = await message.channel.fetch_message(message.reference.message_id)
             if ref_msg is not None:
-                # Include reply context for all messages so the core agent
-                # understands what the user is responding to.
-                ref_author = str(ref_msg.author)
-                ref_content = (ref_msg.content or "").strip()
-                # Strip bot-id mentions so the context doesn't show raw id soup
-                ref_content = ref_content.replace(f"<@{client.user.id}>", "")
-                snippet = ref_content[:400].replace("\n", " ").strip()
-                if snippet:
-                    reply_context = (
-                        f"\n\n[Replying to {ref_author} "
-                        f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
+                # Walk the reply chain to the root and inline the FULL text of
+                # each ancestor (Chi 2026-07-25: "Remove the truncation").
+                # The old `ref_content[:400]` single-level snippet silently
+                # dropped the root question in a deep thread. parent_message_id
+                # is only a fetch-handle — inlining the walked chain here makes
+                # the ancestor context unavoidable DATA in the task file rather
+                # than something the agent must remember to re-fetch.
+                chain = []                       # pragma: no cover — immediate-parent-first; bridge-only glue, formatting covered in reply_chain.py
+                cur = ref_msg                    # pragma: no cover
+                depth = 0                        # pragma: no cover
+                while cur is not None and depth < REPLY_CHAIN_MAX_DEPTH:  # pragma: no cover
+                    c = (cur.content or "").strip().replace(
+                        f"<@{client.user.id}>", ""
                     )
+                    chain.append(
+                        {
+                            "author": str(cur.author),
+                            "ts": cur.created_at.strftime("%Y-%m-%d %H:%M"),
+                            "content": c,
+                        }
+                    )
+                    nref = getattr(cur, "reference", None)
+                    if not (nref and getattr(nref, "message_id", None)):
+                        break
+                    nxt = nref.resolved
+                    if nxt is None:
+                        try:
+                            nxt = await message.channel.fetch_message(nref.message_id)
+                        except Exception:
+                            nxt = None
+                    cur = nxt
+                    depth += 1
+                reply_context = format_reply_chain(chain)  # pragma: no cover
                 # Also download attachments that live on the replied-to
                 # message. Without this, a file shared on a parent message
                 # and then acted on via an @-mention *reply* is silently
