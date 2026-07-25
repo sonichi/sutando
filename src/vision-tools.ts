@@ -256,6 +256,33 @@ export function _getVisionOnContributorCount(): number {
 	return visionOnContributors.length;
 }
 
+// --- Per-frame post-send hook registry ----------------------
+//
+// Skills may register a hook that fires after each push-mode frame is sent.
+// Core provides no AX or Chrome selection logic — that belongs in skills.
+// The hook receives a `sendUserCtx(text)` helper that injects a hidden user
+// turn so the model sees context without triggering audio output. Hooks run
+// synchronously on the tick path so they must be fast (probe with short
+// timeouts or compare against cached state before calling AX).
+
+export type VisionFramePostSendHook = (sendUserCtx: (text: string) => void) => void;
+const visionFrameHooks: VisionFramePostSendHook[] = [];
+
+/** Register a hook called after every push-mode frame is sent. Returns an
+ *  unregister function. Called by skills at module-load time. */
+export function registerVisionFrameHook(fn: VisionFramePostSendHook): () => void {
+	visionFrameHooks.push(fn);
+	return () => {
+		const i = visionFrameHooks.indexOf(fn);
+		if (i >= 0) visionFrameHooks.splice(i, 1);
+	};
+}
+
+/** Visible for tests. */
+export function _getVisionFrameHookCount(): number {
+	return visionFrameHooks.length;
+}
+
 // TODO(roadmap §5 Now: "Define DeviceSession"): Replace this single-session
 // global with a DeviceSession map keyed by device ID. Today push-mode senders
 // (browser, Mentra glasses, Discord/Telegram photo helper, phone agent) all
@@ -535,6 +562,20 @@ async function captureAndSend(source: VisionSource): Promise<{ ok: boolean; erro
 	if (!sendFile) return { ok: false, error: 'no active voice session' };
 	const frame = await source.capture();
 	sendFile(frame.data.toString('base64'), frame.mimeType);
+	// Fire post-send hooks (e.g. screen-companion injects selection text).
+	if (visionFrameHooks.length > 0) {
+		const transport = sessionRef?.transport;
+		if (transport && typeof transport.sendContent === 'function') {
+			const sendUserCtx = (text: string): void => {
+				try { transport.sendContent!([{ role: 'user', text }], false); } catch {}
+			};
+			for (const hook of visionFrameHooks) {
+				try { hook(sendUserCtx); } catch (err) {
+					console.warn(`${ts()} [Vision] frame hook threw: ${(err as Error)?.message}`);
+				}
+			}
+		}
+	}
 	return { ok: true };
 }
 

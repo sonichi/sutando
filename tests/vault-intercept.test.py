@@ -5,6 +5,8 @@ All Keychain writes are mocked: no real 'security' subprocess is spawned,
 secrets never touch the test runner's Keychain.
 """
 
+import importlib.util
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -12,6 +14,35 @@ from unittest.mock import MagicMock, call, patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+
+# vault_intercept imports cleanly without detect-secrets — but it FAILS CLOSED
+# at runtime: with no scanner available it refuses every unquoted `vault set`
+# rather than storing a value it cannot validate (see vault_intercept.py:266).
+#
+# That is correct production behaviour, but it means 15 of these 47 tests
+# assert outcomes that only hold when scanning actually works. Without the
+# package they report as ordinary failures, which reads like broken vault
+# logic instead of a missing dev dependency.
+#
+# Skipping the whole suite (rather than the 15) is deliberate: with no scanner
+# this file exercises a degraded configuration that never occurs in
+# production — CI and every real deployment have detect-secrets — so a partial
+# local pass would assert against a shape that does not ship.
+#
+# The guard does NOT apply under CI: if $CI is set the suite runs regardless,
+# so a silently broken install step fails the build instead of being papered
+# over as a skip.
+if importlib.util.find_spec("detect_secrets") is None and not os.environ.get("CI"):
+    print(
+        "SKIP tests/vault-intercept.test.py — detect-secrets not installed, so\n"
+        "      vault_intercept fails closed and 15 of 47 assertions cannot hold.\n"
+        "      Install the test dep to run this suite:\n"
+        f"          {sys.executable} -m pip install 'detect-secrets>=1.5.0'\n"
+        "      (if that fails with 'externally-managed-environment' (PEP 668),\n"
+        "       retry the same command with --break-system-packages)",
+        file=sys.stderr,
+    )
+    raise SystemExit(0)
 
 import vault_intercept
 from vault_intercept import InterceptResult, intercept_vault_commands, redact_vault_commands

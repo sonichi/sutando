@@ -8,7 +8,8 @@ returns the holder's channel when it differs (→ bridge posts a pointer), else
 None (→ keep silent archive). All ids are FICTITIOUS. Run:
   python3 tests/dedup-cross-channel.test.py
 """
-import sys, unittest
+import sys
+import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))

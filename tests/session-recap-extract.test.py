@@ -87,7 +87,21 @@ class TestTranscriptsDir(unittest.TestCase):
         with patch.object(self.m.subprocess, "run", return_value=fake):
             got = self.m.transcripts_dir()
         self.assertTrue(str(got).startswith("/tmp/ws/.claude-sutando/projects/"))
-        self.assertIn(str(self.m.REPO).replace("/", "-"), str(got))
+        import re as _re
+        self.assertIn(_re.sub(r"[^A-Za-z0-9]", "-", str(self.m.REPO)), str(got))
+
+    def test_slug_dashes_all_non_alphanumerics(self):
+        # Claude Code's project slug dashes spaces and dots too, not just "/".
+        # A repo path like the desktop-bundled engine checkout must resolve to
+        # the dir Claude Code actually writes.
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="/tmp/ws\n")
+        bundled = Path("/Users/u/Library/Application Support/space.ag2.app/engine/sutando")
+        with patch.object(self.m, "REPO", bundled), \
+                patch.object(self.m.subprocess, "run", return_value=fake):
+            got = self.m.transcripts_dir()
+        self.assertEqual(
+            got.name,
+            "-Users-u-Library-Application-Support-space-ag2-app-engine-sutando")
 
 
 class TestMainDumpAndList(unittest.TestCase):
