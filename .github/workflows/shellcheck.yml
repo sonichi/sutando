@@ -1,0 +1,50 @@
+name: shellcheck
+
+# CI lint: the shell baseline, completing the set alongside eslint.yml (TS/JS)
+# and ruff.yml (Python).
+#
+# 124 .sh files across src/, scripts/, skills/, tests/ and hooks/ — startup,
+# migration, health-check and the shell test suites. Shell has no compiler and
+# no type checker, so an unquoted expansion or a typo'd variable fails only at
+# runtime, on a user's machine, mid-migration.
+#
+# GATED AT `error` SEVERITY ONLY, deliberately. Current counts:
+#
+#     error    5    <- gated (fixed in this PR, so the gate starts green)
+#     warning  87   \
+#     info     211   >  real signal, but too large to fix in a lint-introduction PR
+#     style    219  /
+#
+# Gating at `warning` today would mean either 87 shell edits bundled into this
+# change, or a permanently-red check. `error` is the subset that is nearly
+# always a genuine defect, so it can gate immediately and the bar can be raised
+# in follow-ups as the warning backlog comes down.
+#
+# ubuntu-latest ships shellcheck preinstalled, so there is no install step to
+# pin or cache.
+
+on:
+  pull_request:
+    branches: [main, staging-interaction-planes]
+  push:
+    branches: [main, staging-interaction-planes]
+
+jobs:
+  shellcheck:
+    name: shellcheck over shell scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show shellcheck version
+        run: shellcheck --version
+
+      - name: Run shellcheck (error severity)
+        run: |
+          # -print0/-0 so paths with spaces cannot split into bogus arguments.
+          # `-S error` sets the gate; see the header for why not `warning` yet.
+          find src scripts skills tests hooks -name '*.sh' -not -path '*/node_modules/*' -print0 \
+            | xargs -0 shellcheck -S error -f gcc

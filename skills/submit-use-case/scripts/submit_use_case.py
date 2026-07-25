@@ -19,7 +19,14 @@ Usage:
 """
 from __future__ import annotations
 
-import argparse, datetime, json, re, shutil, subprocess, sys, time
+import argparse
+import datetime
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 REPO = "sonichi/sutando"
@@ -306,7 +313,7 @@ def main():
         print("--- END PR FILE ---")
         _nm, _em = committer_identity()
         print(f"identity: would commit as {_nm or '(unset)'} <{_em or '(unset)'}> — your existing git config, never overridden. Ensure it's the identity you want on the CLA.")
-        print(f"DRY RUN — staged in memory only, no clone/issue/PR")
+        print("DRY RUN — staged in memory only, no clone/issue/PR")
         return
 
     # Idempotency probes (live only).
