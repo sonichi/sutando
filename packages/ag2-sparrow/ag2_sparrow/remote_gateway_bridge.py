@@ -138,28 +138,34 @@ def _env_compat(new, old):
 # string may be the combined "https://<gateway>|<secret>" form (the URL travels
 # inside the token — nothing service-specific lives in this repo); a bare
 # secret needs REMOTE_TASK_URL alongside it.
+# The combined onboarding form is "<url>|<secret>" — the URL travels inside the
+# token. The separator is a literal "|", OR a "%7C"/"%7c" when the desktop connect
+# flow URL-encodes it (ag2space-cinny-desktop#231): "https://<gateway>/relay%7C<secret>".
+# A %7C-separated token carries no literal "|", so a naive split leaves it a bare
+# secret with an empty URL and the bridge FATALs at startup — the core looks
+# "connected" (device-connect completed) but never responds, the Vidhu-onboarding
+# failure 2026-07-24.
+_SEPARATOR_RE = re.compile(r"\||%7[Cc]")
+
+
 def _parse_onboarding_token(raw):
     """Split the onboarding string into (url_from_token, secret).
 
-    The combined form is "https://<gateway>|<secret>" — the URL travels inside
-    the token. Returns ("", raw) for a bare secret (URL then comes from
-    REMOTE_TASK_URL alongside it).
+    NEVER mutates the token bytes — it only *splits* at the separator, so the
+    secret is returned verbatim (a bearer that itself contains "%7C" or "|" is
+    preserved intact; #2307 review). Disambiguation: only the combined form —
+    which begins with an http(s):// scheme — carries a separator to split on; a
+    bare secret is opaque and returned untouched even if it contains "%7C".
 
-    Defensive: the desktop connect flow has been observed to URL-encode the
-    separator as %7C — "https://<gateway>/relay%7C<secret>"
-    (ag2space-cinny-desktop#231). A %7C token carries no literal "|", so without
-    this it parses as a bare secret with an empty URL and FATALs at startup —
-    the core looks "connected" (device-connect completed) but never responds,
-    the Vidhu-onboarding failure 2026-07-24. Decoding here, at the single parse
-    point, covers every caller (startup.sh, direct env, legacy alias) regardless
-    of which onboarding writer produced the token.
+    Handled at the single parse point, so every caller (startup.sh, direct env,
+    legacy AG2_REMOTE_TOKEN alias) is covered regardless of the onboarding writer.
     """
-    if "%7c" in raw.lower():
-        raw = raw.replace("%7C", "|").replace("%7c", "|")
-    if "|" in raw:
-        url, secret = raw.split("|", 1)
-        return url, secret
-    return "", raw
+    if not raw.lower().startswith(("http://", "https://")):
+        return "", raw  # bare secret — opaque, never touched
+    m = _SEPARATOR_RE.search(raw)
+    if m is None:
+        return "", raw  # scheme but no separator; the URL-less guard in main() speaks
+    return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
 
 
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""

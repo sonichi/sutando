@@ -585,6 +585,13 @@ def main() -> int:
           "token parse: bare secret yields empty url (REMOTE_TASK_URL supplies it)")
     check(rtc._parse_onboarding_token("https://gw|a|b") == ("https://gw", "a|b"),
           "token parse: splits on the FIRST separator only (secret may contain |)")
+    # #2307 review: never mutate token bytes — the secret is returned verbatim.
+    check(rtc._parse_onboarding_token("https://gw|AB%7CCD") == ("https://gw", "AB%7CCD"),
+          "token parse: %7C INSIDE the secret is preserved, not decoded (split on the literal |)")
+    check(rtc._parse_onboarding_token("AB%7CCD") == ("", "AB%7CCD"),
+          "token parse: a bare secret containing %7C is opaque — returned untouched")
+    check(rtc._parse_onboarding_token("bare|secret") == ("", "bare|secret"),
+          "token parse: a bare secret with no URL scheme is not split on its own | bytes")
 
     srv.shutdown()
     if FAILS:
