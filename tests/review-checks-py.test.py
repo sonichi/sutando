@@ -115,6 +115,39 @@ code, out = scan(big_diff)
 ok("oversized diff (>ARG_MAX) still flags hardcoded path",
    code == 0 and "big.js:200001:" in out and "/Users/alice/secret" in out)
 
+# --- docstring prose is not a hardcoded path (#2313 false-positive) ---------
+# A PR that ADDS a docstring describing a legacy path it's removing must not be
+# flagged for the path sitting in that prose.
+code, out = scan(
+    '+++ b/src/health-check.py\n'
+    '@@ -1,0 +1,3 @@\n'
+    '+    """Detect unlinked skills.\n'
+    '+    On a migrated install this scanned a stale ~/.claude/skills/ path.\n'
+    '+    """'
+)
+ok("path inside a multi-line docstring is NOT flagged (#2313)", out.strip() == "")
+
+# But real code AFTER the docstring closes is still scanned.
+code, out = scan(
+    '+++ b/src/x.py\n'
+    '@@ -1,0 +1,3 @@\n'
+    '+    """doc line one\n'
+    '+    doc line two."""\n'
+    '+    skills = "/Users/real/path"'
+)
+ok("code after a docstring still flags a hardcoded path",
+   "/Users/real/path" in out)
+
+# A single-line pair of triple-quotes (open+close) leaves state unchanged, so a
+# real path on the NEXT line is still caught (parity not corrupted).
+code, out = scan(
+    '+++ b/src/y.py\n'
+    '@@ -1,0 +1,2 @@\n'
+    '+    doc = """inline"""\n'
+    '+    p = "/Users/z"'
+)
+ok("even triple-quote count doesn't corrupt state; next line flags", "/Users/z" in out)
+
 print("---")
 if failed:
     print("FAILED — %d of %d" % (failed, passed + failed))

@@ -43,12 +43,21 @@ def allowed(tok):
     return False
 
 
+def _toggles_docstring(line):
+    """A line flips triple-quote (docstring) state when it holds an ODD number of
+    ``\"\"\"``/``'''`` delimiters (one opens or closes; two on a line open+close and
+    leave state unchanged). Approximate — good enough to keep the scanner off
+    docstring PROSE, which is where a path is documentation, not a code path."""
+    return (line.count('"""') + line.count("'''")) % 2 == 1
+
+
 def main():
     diff = sys.stdin.read()  # streamed by the runner — see module docstring (#2281)
     skip = False
     ln = 0
     cur_file = ""
     hits = 0
+    in_doc = False   # inside a triple-quoted docstring/string block (reset per hunk)
     for raw in diff.split("\n"):
         if raw.startswith("+++ "):
             f = raw[4:].split("\t")[0]
@@ -57,17 +66,25 @@ def main():
             cur_file = f
             ln = 0
             skip = bool(SKIP.search(f))
+            in_doc = False
             continue
         if raw.startswith("@@ "):
             m = re.search(r"\+(\d+)", raw)
             if m:
                 ln = int(m.group(1))
+            # A hunk can't be trusted to continue a prior hunk's string state
+            # (gaps between hunks); reset so a docstring opened + closed within
+            # this hunk is tracked, without carrying stale state across a gap.
+            in_doc = False
             continue
         if raw.startswith("-"):
             continue
         if raw.startswith(" "):
             # Context lines exist in both old and new files, so they advance the
-            # new-file line counter just like additions do.
+            # new-file line counter just like additions do — and they move the
+            # docstring state (a docstring may open on unchanged context).
+            if _toggles_docstring(raw[1:]):
+                in_doc = not in_doc
             ln += 1
             continue
         if raw.startswith("+"):
@@ -76,8 +93,15 @@ def main():
             line = raw[1:]
             cur = ln
             ln += 1
+            # Decide skip from the state at the line's START, then advance it —
+            # so a path sitting inside a docstring (documentation, e.g. a comment
+            # describing a legacy path a PR is REMOVING) is not flagged, while
+            # the opening `"""` line itself is still checked.
+            was_in_doc = in_doc
+            if _toggles_docstring(line):
+                in_doc = not in_doc
             stripped = line.lstrip()
-            if stripped.startswith("#") or stripped.startswith("//"):
+            if was_in_doc or stripped.startswith("#") or stripped.startswith("//"):
                 continue
             for p in flags:
                 pos = line.find(p)
