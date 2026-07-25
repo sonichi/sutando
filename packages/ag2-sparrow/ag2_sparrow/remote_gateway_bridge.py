@@ -70,17 +70,62 @@ from pathlib import Path
 # is never tried; we keep the original result when there is no v4 address, so a
 # genuinely v6-only destination still resolves. Opt out with
 # REMOTE_GATEWAY_ALLOW_IPV6=1 (hosts with working v6 lose nothing either way).
-if os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1":
-    _orig_getaddrinfo = socket.getaddrinfo
+# DNS resolution has NO native timeout: getaddrinfo blocks the caller until the
+# resolver answers or the OS gives up (which can be minutes, or never on a
+# captive portal / dropped link mid-query). urllib's socket timeout covers
+# connect+read but NOT name resolution — so without a bound, a hung resolver
+# wedges the long-poll loop indefinitely with no "reconnecting" status write and
+# no self-recovery (observed on a tester's machine 2026-07-25: gateway process
+# stuck, DNS for space.ag2.space failing, UI showing "reconnecting" forever).
+# Bounding it lets the loop raise → emit gateway-status reconnecting → back off →
+# retry, so the connection self-heals the moment DNS recovers. Override the bound
+# with REMOTE_GATEWAY_DNS_TIMEOUT (seconds); 0/negative disables it.
+_DNS_TIMEOUT_S = float(os.environ.get("REMOTE_GATEWAY_DNS_TIMEOUT") or "8")
+_PREFER_V4 = os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1"
+_orig_getaddrinfo = socket.getaddrinfo
 
-    def _getaddrinfo_prefer_v4(host, *args, **kwargs):
-        infos = _orig_getaddrinfo(host, *args, **kwargs)
-        if host and "ag2.space" in str(host):
-            v4 = [i for i in infos if i[0] == socket.AF_INET]
-            return v4 or infos
-        return infos
 
-    socket.getaddrinfo = _getaddrinfo_prefer_v4
+def _resolve_bounded(host, *args, **kwargs):
+    """socket.getaddrinfo with a hard wall-clock bound.
+
+    getaddrinfo cannot be interrupted, so run it in a daemon thread and abandon
+    the thread if it overruns _DNS_TIMEOUT_S. A hung resolver thread is a daemon
+    (dies with the process) and, since the poll loop backs off before retrying,
+    at most one leaks per retry cycle — bounded, non-fatal, and they all drain
+    when DNS recovers. Raising gaierror makes urllib surface a URLError that the
+    poll loop's reconnect branch already handles.
+    """
+    if _DNS_TIMEOUT_S <= 0:
+        return _orig_getaddrinfo(host, *args, **kwargs)
+    box: dict = {}
+
+    def _run():
+        try:
+            box["ok"] = _orig_getaddrinfo(host, *args, **kwargs)
+        except BaseException as e:  # noqa: BLE001 — re-raised to the caller below
+            box["err"] = e
+
+    th = threading.Thread(target=_run, name="dns-resolve", daemon=True)
+    th.start()
+    th.join(_DNS_TIMEOUT_S)
+    if th.is_alive():
+        raise socket.gaierror(
+            f"DNS resolution for {host!r} exceeded {_DNS_TIMEOUT_S}s (resolver hung)"
+        )
+    if "err" in box:
+        raise box["err"]
+    return box["ok"]
+
+
+def _getaddrinfo_prefer_v4(host, *args, **kwargs):
+    infos = _resolve_bounded(host, *args, **kwargs)
+    if _PREFER_V4 and host and "ag2.space" in str(host):
+        v4 = [i for i in infos if i[0] == socket.AF_INET]
+        return v4 or infos
+    return infos
+
+
+socket.getaddrinfo = _getaddrinfo_prefer_v4
 
 # resolve_workspace lives alongside this file in src/ — put THIS directory on
 # the path (no repo-walking; the old triple-parent form predated the move into
