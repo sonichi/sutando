@@ -70,17 +70,105 @@ from pathlib import Path
 # is never tried; we keep the original result when there is no v4 address, so a
 # genuinely v6-only destination still resolves. Opt out with
 # REMOTE_GATEWAY_ALLOW_IPV6=1 (hosts with working v6 lose nothing either way).
-if os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1":
-    _orig_getaddrinfo = socket.getaddrinfo
+# DNS resolution has NO native timeout: getaddrinfo blocks the caller until the
+# resolver answers or the OS gives up (which can be minutes, or never on a
+# captive portal / dropped link mid-query). urllib's socket timeout covers
+# connect+read but NOT name resolution — so without a bound, a hung resolver
+# wedges the long-poll loop indefinitely with no "reconnecting" status write and
+# no self-recovery (observed on a tester's machine 2026-07-25: gateway process
+# stuck, DNS for space.ag2.space failing, UI showing "reconnecting" forever).
+# Bounding it lets the loop raise → emit gateway-status reconnecting → back off →
+# retry, so the connection self-heals the moment DNS recovers. Override the bound
+# with REMOTE_GATEWAY_DNS_TIMEOUT (seconds); 0/negative disables it.
+_DNS_TIMEOUT_S = float(os.environ.get("REMOTE_GATEWAY_DNS_TIMEOUT") or "8")
+_PREFER_V4 = os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1"
+# Reload-safe original capture: on module re-exec/reload, socket.getaddrinfo is
+# already our wrapper — capturing it blindly makes _resolve_bounded call itself
+# (RecursionError). The installed wrapper carries the TRUE original on its
+# `_ag2_orig_getaddrinfo` attribute, so re-executions pick that up instead.
+_orig_getaddrinfo = getattr(socket.getaddrinfo, "_ag2_orig_getaddrinfo", socket.getaddrinfo)
 
-    def _getaddrinfo_prefer_v4(host, *args, **kwargs):
-        infos = _orig_getaddrinfo(host, *args, **kwargs)
-        if host and "ag2.space" in str(host):
-            v4 = [i for i in infos if i[0] == socket.AF_INET]
-            return v4 or infos
-        return infos
 
-    socket.getaddrinfo = _getaddrinfo_prefer_v4
+class _InflightResolve:
+    """One outstanding getaddrinfo call: waiters share its Event + outcome."""
+
+    __slots__ = ("done", "result", "err")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.result = None
+        self.err = None
+
+
+# Single-flight registry: at most ONE resolver thread exists per distinct
+# (host, args) key. While a call is outstanding — including one wedged on a
+# hung system resolver — every retry for the same key attaches to it instead
+# of spawning another thread, so a persistently hung resolver pins exactly
+# one thread no matter how many times the poll loop retries. The worker
+# removes its slot when the underlying call finally returns, so recovery
+# drains cleanly and the next call starts fresh.
+_INFLIGHT: dict = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _resolve_bounded(host, *args, **kwargs):
+    """socket.getaddrinfo with a hard wall-clock bound.
+
+    getaddrinfo cannot be interrupted, so the actual call runs in a daemon
+    thread; the caller waits up to _DNS_TIMEOUT_S on its completion Event and
+    raises gaierror on overrun (urllib surfaces that as the URLError the poll
+    loop's reconnect branch already handles). The thread is shared single-
+    flight per (host, args) key — see _INFLIGHT — so repeated retries against
+    a wedged resolver never accumulate threads.
+    """
+    if _DNS_TIMEOUT_S <= 0:
+        return _orig_getaddrinfo(host, *args, **kwargs)
+    try:
+        key = (host, args, tuple(sorted(kwargs.items())))
+    except TypeError:  # unhashable arg — never true of real getaddrinfo calls
+        key = None
+
+    with _INFLIGHT_LOCK:
+        call = _INFLIGHT.get(key) if key is not None else None
+        if call is None:
+            call = _InflightResolve()
+            if key is not None:
+                _INFLIGHT[key] = call
+
+            def _run(call=call, key=key):
+                try:
+                    call.result = _orig_getaddrinfo(host, *args, **kwargs)
+                except BaseException as e:  # noqa: BLE001 — re-raised to waiters
+                    call.err = e
+                finally:
+                    # Clear the slot BEFORE signalling: a waiter woken by the
+                    # Event must never re-attach to a completed call.
+                    if key is not None:
+                        with _INFLIGHT_LOCK:
+                            _INFLIGHT.pop(key, None)
+                    call.done.set()
+
+            threading.Thread(target=_run, name="dns-resolve", daemon=True).start()
+
+    if not call.done.wait(_DNS_TIMEOUT_S):
+        raise socket.gaierror(
+            f"DNS resolution for {host!r} exceeded {_DNS_TIMEOUT_S}s (resolver hung)"
+        )
+    if call.err is not None:
+        raise call.err
+    return call.result
+
+
+def _getaddrinfo_prefer_v4(host, *args, **kwargs):
+    infos = _resolve_bounded(host, *args, **kwargs)
+    if _PREFER_V4 and host and "ag2.space" in str(host):
+        v4 = [i for i in infos if i[0] == socket.AF_INET]
+        return v4 or infos
+    return infos
+
+
+_getaddrinfo_prefer_v4._ag2_orig_getaddrinfo = _orig_getaddrinfo
+socket.getaddrinfo = _getaddrinfo_prefer_v4
 
 # resolve_workspace lives alongside this file in src/ — put THIS directory on
 # the path (no repo-walking; the old triple-parent form predated the move into
