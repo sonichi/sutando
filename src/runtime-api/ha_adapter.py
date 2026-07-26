@@ -49,6 +49,16 @@ def _now() -> float:
     return time.time()
 
 
+def ha_action_id(request_id: str) -> str:
+    """ha action id for a runtime request — MUST stay matchable by
+    DecisionHandler's answer grammar `ha_[0-9a-f]{6,}` (hex only!). The
+    requestId's uuid tail is hex; the type prefix ("approval-") is NOT and
+    must never leak into the id. Live-acceptance finding 2026-07-26: the
+    first cut used the full requestId and the owner's real answer could not
+    match — the local E2E missed it by writing resolutions directly."""
+    return "ha_" + request_id.split("-", 1)[-1][:24]
+
+
 class HumanActionAdapter:
     def __init__(self, actions_dir: str):
         Path(actions_dir).mkdir(parents=True, exist_ok=True)
@@ -80,9 +90,7 @@ class HumanActionAdapter:
         }])
 
     def _write(self, request: dict, questions: list) -> str:
-        # ha id = runtime request id (prefix-safe: DecisionHandler matches on
-        # the literal id string), so resolution correlates with zero extra state.
-        action_id = "ha_" + request["requestId"].replace("-", "")[:24]
+        action_id = ha_action_id(request["requestId"])
         now = _now()
         rec = {
             "action_id": action_id,

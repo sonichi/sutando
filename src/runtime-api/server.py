@@ -42,7 +42,7 @@ sys.path.insert(0, str(_HERE))
 from protocol import (MAX_LINE_BYTES, ELICITATION_TYPES, ProtocolError,  # noqa: E402
                       error_frame, parse_line, result_frame)
 from request_store import RequestStore, TERMINAL  # noqa: E402
-from ha_adapter import HumanActionAdapter  # noqa: E402
+from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
 
 def _exec_message_send(params: dict) -> dict:
     """Governed room send through the gateway. Fails closed: only a response
@@ -127,8 +127,7 @@ class RuntimeServer:
         n = 0
         for rec in self.store.pending():
             if rec["requestType"] in ("approval", "elicitation"):
-                self._ha_of[rec["requestId"]] = (
-                    "ha_" + rec["requestId"].replace("-", "")[:24])
+                self._ha_of[rec["requestId"]] = ha_action_id(rec["requestId"])
                 n += 1
         if n:
             _log(f"recovered {n} pending request(s)")

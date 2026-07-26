@@ -90,7 +90,7 @@ def ha_store():
 
 
 def pending_action_for(request_id, store, timeout=5):
-    aid = "ha_" + request_id.replace("-", "")[:24]
+    aid = "ha_" + request_id.split("-", 1)[-1][:24]
     deadline = time.time() + timeout
     while time.time() < deadline:
         rec = store.get(aid)
@@ -151,6 +151,13 @@ def main() -> int:
         check(r["status"] == "pending" and r["requestId"].startswith("approval-"),
               "approval.request issues pending immediately")
         act = pending_action_for(r["requestId"], store)
+        # DecisionHandler answer-grammar compatibility: the REAL owner answers
+        # `answer <action_id> N` and _ANSWER_RE only matches ha_ + HEX. A
+        # non-hex id silently strands the card (live finding 2026-07-26).
+        import re as _re
+        _answer_re = _re.compile(r"\banswer\s+(ha_[0-9a-f]{6,})\s+([0-9])")
+        check(act is not None and _answer_re.search(f"answer {act['action_id']} 1") is not None,
+              "ha action id matches DecisionHandler's answer grammar (hex-only)")
         check(act is not None and act["status"] == "pending"
               and not act.get("card_event_id")
               and "Approve" in json.dumps(act["questions"]),
