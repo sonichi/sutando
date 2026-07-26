@@ -614,11 +614,13 @@ def _reload_rotated_token() -> bool:
     raw = _read_token_file(TOKEN_FILE)
     if not raw:
         return False
-    # Mirror the module's import-time onboarding parse (plain "|" split).
-    if "|" in raw:
-        url_from_token, secret = raw.split("|", 1)
-    else:
-        url_from_token, secret = "", raw
+    # Route through the SAME parse used at import time (_parse_onboarding_token)
+    # so a rotation written in the URL-encoded form (https://gw/relay%7C<secret>,
+    # the desktop connect flow) splits correctly. A literal "|" split treated the
+    # encoded form as a bare secret and set the bearer to the whole URL string,
+    # so a valid rotation kept failing auth (regression caught on #2323 once
+    # #2307's %7C onboarding parser reached main).
+    url_from_token, secret = _parse_onboarding_token(raw)
     if url_from_token and url_from_token.rstrip("/") != URL:
         _log(f"token file names a DIFFERENT gateway ({url_from_token.rstrip('/')}) "
              f"than the running one ({URL}) — a URL change is not hot-swappable; "

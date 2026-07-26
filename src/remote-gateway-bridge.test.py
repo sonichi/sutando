@@ -427,6 +427,19 @@ def main() -> int:
           and rtc.URL == old_url
           and rtc._AUTH_HEADERS["Authorization"] == "Bearer rotated-secret",
           "URL-changing rotation refused — no partial gateway move")
+    # a rotation written in the URL-ENCODED form (https://url%7Csecret — the
+    # desktop connect flow writes this) must parse identically to the literal
+    # "|" form: extract just the secret, never set the bearer to the whole URL
+    # string. Regression guard for #2323: _reload_rotated_token used a literal
+    # "|" split, so an encoded rotation was mis-read as a bare secret and the
+    # bearer became "Bearer https://...%7C<secret>", failing auth after a valid
+    # rotation. Now it routes through _parse_onboarding_token (handles %7C).
+    tok_file.write_text(f"REMOTE_TASK_TOKEN={old_url}%7Cencoded-secret\n")
+    check(rtc._reload_rotated_token() is True
+          and rtc.TOKEN == "encoded-secret"
+          and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer encoded-secret",
+          "%7C-encoded rotation swaps just the secret (not the whole URL string)")
     # _recover_auth immediate path: file already rotated again → True, no wait
     tok_file.write_text("REMOTE_TASK_TOKEN=rotated-secret-2\n")
     check(rtc._recover_auth(401) is True and rtc.TOKEN == "rotated-secret-2",
