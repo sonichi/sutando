@@ -147,6 +147,18 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
+# `results/proactive-*.txt` the agent writes is delivered to that room as a
+# gateway message (POST /v1/room op:message) and archived. This is the
+# transport half of the repo's long-standing "write proactive-{ts}.txt to
+# speak to the user" contract — historically drained only by the Discord/
+# Telegram bridges, so on a gateway-only host those files were dead letters
+# (observed live: a pending-questions DM nudge sat undrained forever while
+# only its macOS notification fired). Unset → no scan, no behavior change.
+# Deliberately an EXPLICIT room id, not auto-learned from recent task
+# channel_ids: a proactive nudge is often owner-private, and auto-targeting
+# the last active room could deliver it to a shared room.
+PROACTIVE_ROOM = os.environ.get("REMOTE_PROACTIVE_ROOM") or ""
 HEARTBEAT_INTERVAL = 60
 # When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
 # instead of hammering it — but only for this cooldown, then retry. A permanent
@@ -1049,6 +1061,81 @@ def _archive_result(path: Path, tid: str) -> None:
             pass  # best-effort; core may have archived it concurrently
 
 
+def _recover_orphan_proactive() -> None:
+    """Restart-safety: rename orphan `proactive-*.sending` claims back to
+    `.txt` so the next drain re-claims them. A crash between claim and
+    delivery otherwise strands the nudge invisibly (no scan ever looks at
+    `.sending`). Same recovery idiom as the Discord bridge's drain."""
+    if not PROACTIVE_ROOM:
+        return
+    for f in RESULTS_DIR.glob("proactive-*.sending"):
+        target = f.with_suffix(".txt")
+        if target.exists():
+            continue  # collision — leave for an operator, never clobber
+        try:
+            f.rename(target)
+            _log(f"recovered orphan proactive claim {f.name}")
+        except OSError:
+            pass
+
+
+def _post_proactive() -> None:
+    """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
+
+    Claim-by-rename (`.txt` → `.sending`) so a concurrent drain (or a racing
+    legacy bridge on a multi-channel host) can't double-deliver; a delivered
+    file archives beside task results; a failed POST renames the claim back
+    to `.txt` for retry on the next loop pass. Auth errors propagate to the
+    caller (the poll loop owns auth handling); everything else is per-file
+    fail-open — one malformed nudge never blocks the rest. No-op without
+    PROACTIVE_ROOM."""
+    if not PROACTIVE_ROOM:
+        return
+    for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
+        claim = f.with_suffix(".sending")
+        try:
+            f.rename(claim)  # atomic claim; loser of a race just misses
+        except OSError:
+            continue
+        try:
+            body = claim.read_text(encoding="utf-8").strip()
+        except OSError:
+            body = ""
+        if not body:
+            claim.unlink(missing_ok=True)  # empty nudge — nothing to say
+            continue
+        try:
+            _req("POST", "/v1/room",
+                 {"op": "message", "room_id": PROACTIVE_ROOM, "body": body},
+                 timeout=15)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                try:
+                    claim.rename(f)  # un-claim before auth handling takes over
+                except OSError:
+                    pass
+                raise
+            _log(f"proactive send failed for {f.name}: HTTP {e.code} — will retry")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        except (urllib.error.URLError, TimeoutError) as e:
+            _log(f"proactive send network error for {f.name}: {e} — will retry")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
+        ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
+        except OSError:
+            claim.unlink(missing_ok=True)
+        _log(f"delivered proactive {f.name}")
+
+
 def _load_inflight() -> set[str]:
     """Restore the in-flight set from disk (fail-open to empty)."""
     try:
@@ -1306,6 +1393,7 @@ def main() -> None:
     if not _acquire_singleton():
         return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
     inflight: set[str] = _load_inflight()
+    _recover_orphan_proactive()
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
@@ -1339,6 +1427,7 @@ def main() -> None:
             for tid in pending_ack:
                 _post_task_ack(tid)
             _post_ready_results(inflight)
+            _post_proactive()
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff

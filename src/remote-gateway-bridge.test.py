@@ -34,6 +34,7 @@ def check(cond: bool, msg: str) -> None:
 # ── mock gateway ────────────────────────────────────────────────────────────
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
+         "room_posts": [], "force_room_502": False,
          "force_heartbeat_404": False, "force_media_redirect": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
@@ -86,6 +87,12 @@ class Handler(BaseHTTPRequestHandler):
                 "path": self.path,
                 "body": json.loads(self.rfile.read(n).decode()),
             })
+            self.send_response(200); self.end_headers()
+        elif self.path == "/v1/room":
+            if STATE["force_room_502"]:
+                self.send_response(502); self.end_headers(); return
+            n = int(self.headers.get("Content-Length") or 0)
+            STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
             self.send_response(200); self.end_headers()
         elif self.path == "/v1/heartbeat":
             if STATE["force_heartbeat_404"]:
@@ -361,6 +368,48 @@ def main() -> int:
     rtc._save_inflight({"task-MOCK2"})
     rtc._post_ready_results({"task-MOCK2"})
     check("task-MOCK2" not in rtc._load_inflight(), "delivered task removed from persisted inflight")
+
+    # 3.5 proactive drain (REMOTE_PROACTIVE_ROOM)
+    # Unset → no scan, files untouched (existing hosts unchanged).
+    (rtc.RESULTS_DIR / "proactive-t1.txt").write_text("nudge one\n")
+    rtc.PROACTIVE_ROOM = ""
+    rtc._post_proactive()
+    check((rtc.RESULTS_DIR / "proactive-t1.txt").exists() and not STATE["room_posts"],
+          "proactive drain is a no-op without REMOTE_PROACTIVE_ROOM")
+    # Set → delivered as op:message to the room, file archived.
+    rtc.PROACTIVE_ROOM = "!owner:example.org"
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 1
+          and STATE["room_posts"][0] == {"op": "message", "room_id": "!owner:example.org",
+                                          "body": "nudge one"}
+          and not (rtc.RESULTS_DIR / "proactive-t1.txt").exists()
+          and any(x.name.startswith("proactive-t1-") for x in rtc.ARCHIVE_RESULTS_DIR.iterdir()),
+          "proactive file delivered via /v1/room and archived")
+    # Failed POST → claim restored to .txt for retry; nothing archived.
+    (rtc.RESULTS_DIR / "proactive-t2.txt").write_text("nudge two")
+    STATE["force_room_502"] = True
+    rtc._post_proactive()
+    STATE["force_room_502"] = False
+    check((rtc.RESULTS_DIR / "proactive-t2.txt").exists()
+          and len(STATE["room_posts"]) == 1,
+          "failed proactive POST restores the file for retry")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 2 and not (rtc.RESULTS_DIR / "proactive-t2.txt").exists(),
+          "retry after failure delivers")
+    # Empty file → dropped silently, no POST.
+    (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("  \n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 2 and not (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
+          "empty proactive file dropped without a send")
+    # Orphan .sending recovery (crash between claim and delivery).
+    (rtc.RESULTS_DIR / "proactive-t4.sending").write_text("orphan nudge")
+    rtc._recover_orphan_proactive()
+    check((rtc.RESULTS_DIR / "proactive-t4.txt").exists(),
+          "orphan .sending claim recovered to .txt")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 3 and STATE["room_posts"][2]["body"] == "orphan nudge",
+          "recovered orphan delivers on next drain")
+    rtc.PROACTIVE_ROOM = ""
 
     # 4. auth header was sent on every call
     check(all(a == "Bearer testtoken" for a in STATE["auth_seen"] if a is not None)

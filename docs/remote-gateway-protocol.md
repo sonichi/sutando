@@ -23,6 +23,7 @@ The bridge reads these from the environment (typically sourced from
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`other` for a shared gateway (see Security). |
+| `REMOTE_PROACTIVE_ROOM` | no | — | Room id to deliver `results/proactive-*.txt` nudges to (`POST /v1/room` op:message, claim-by-rename, archive on success). Unset → proactive files are not scanned. Deliberately explicit — never auto-learned from task channel_ids, since a nudge may be owner-private. |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
