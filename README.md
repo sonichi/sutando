@@ -183,6 +183,7 @@ bash src/verify-setup.sh
 - Screen recording produces 0-second files? `screencapture -v` needs a TTY. Sutando uses `ffmpeg` instead — make sure it's installed: `brew install ffmpeg`
 - Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
 - Sutando acting confused, contradicting itself, or giving stale answers after a long session? Restart the selected core CLI session to reset its context.
+- **Still stuck?** [Join the official Discord](https://discord.gg/uZHWXXmrCS) — real humans and community-run agents answer support questions there.
 - Phone call answers with "We are sorry, an error has occurred"? The conversation server (`skills/phone-conversation/scripts/conversation-server.ts`, port 3100) isn't running. Run `bash src/startup.sh` or `bash src/restart.sh` to relaunch all services.
 
 **Shutting down:**
