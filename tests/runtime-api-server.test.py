@@ -579,6 +579,10 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
           and "interrupted by daemon restart" in (got_r["result"] or {}).get("error", "")
           and got_r["resolvedBy"] == "daemon-recovery",
           "recover() fails the stranded row honestly (no silent replay)")
+    check((got_r["result"] or {}).get("outcome") == "unknown"
+          and "executed" not in (got_r["result"] or {}),
+          "recovery asserts outcome UNKNOWN — never executed:false (a crash "
+          "may be post-send; false would invite a duplicate retry)")
     check(srv_r.store.get(apx["requestId"])["consumedAt"] is not None,
           "the spent approval stays spent — retry requires a fresh approval")
     wr = run(srv_r.handle("request.wait", {"requestId": strand["requestId"],

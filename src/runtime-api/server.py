@@ -152,13 +152,20 @@ class RuntimeServer:
                 self._ha_of[rec["requestId"]] = ha_action_id(rec["requestId"])
                 relinked += 1
             elif rec["requestType"] == "capability":
+                # Deliberately NO `executed` boolean: the crash may have
+                # landed after the gateway accepted the send but before the
+                # terminal transition, so asserting executed:false would
+                # invite a confident duplicate retry (review P1). `outcome:
+                # unknown` forces the caller to verify the side effect before
+                # spending a fresh approval.
                 self.store.transition(
                     rec["requestId"], "failed",
-                    result={"executed": False,
-                            "error": "interrupted by daemon restart before "
-                                     "completion — outcome unknown; any consumed "
-                                     "approval is spent (issue a new approval to "
-                                     "retry)"},
+                    result={"outcome": "unknown",
+                            "error": "interrupted by daemon restart — the "
+                                     "execution may or may not have completed; "
+                                     "VERIFY the side effect before retrying. "
+                                     "Any consumed approval is spent (a retry "
+                                     "needs a new approval)"},
                     resolved_by="daemon-recovery")
                 n += 1
         if relinked or n:
