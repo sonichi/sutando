@@ -375,6 +375,65 @@ def main() -> int:
     except urllib.error.HTTPError as e:
         check(e.code == 401, "401 raises HTTPError")
 
+    # 5b. auth-rejection recovery: token-file re-read + live rotation
+    tok_dir = Path(tempfile.mkdtemp(prefix="rtc-tokfile-"))
+    tok_file = tok_dir / "relay.env"
+    # _read_token_file: dotenv form (export prefix + quotes stripped)
+    tok_file.write_text('# comment\nexport REMOTE_TASK_TOKEN="dotenv-secret"\nOTHER=x\n')
+    check(rtc._read_token_file(str(tok_file)) == "dotenv-secret",
+          "_read_token_file parses dotenv form (export + quotes)")
+    # raw onboarding-string form (no KEY=)
+    tok_file.write_text("# note\nhttp://u.example|raw-secret\n")
+    check(rtc._read_token_file(str(tok_file)) == "http://u.example|raw-secret",
+          "_read_token_file falls back to raw onboarding string")
+    check(rtc._read_token_file(str(tok_dir / "missing.env")) == "",
+          "_read_token_file missing file → empty (no-rotation)")
+    # _reload_rotated_token: no TOKEN_FILE configured → False (FATAL path kept)
+    rtc.TOKEN_FILE = ""
+    check(rtc._reload_rotated_token() is False, "no TOKEN_FILE → no rotation")
+    check(rtc._recover_auth(401) is False,
+          "_recover_auth without TOKEN_FILE → False (caller keeps FATAL exit)")
+    # same secret as the running one → no rotation
+    rtc.TOKEN_FILE = str(tok_file)
+    tok_file.write_text(f"REMOTE_TASK_TOKEN={rtc.TOKEN}\n")
+    check(rtc._reload_rotated_token() is False, "unchanged token → no rotation")
+    # a rotated combined url|secret form swaps TOKEN + URL + shared headers live
+    old_url = rtc.URL
+    tok_file.write_text(f"REMOTE_TASK_TOKEN={old_url}|rotated-secret\n")
+    check(rtc._reload_rotated_token() is True
+          and rtc.TOKEN == "rotated-secret"
+          and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer rotated-secret",
+          "rotated token swapped into TOKEN + shared _AUTH_HEADERS")
+    # _recover_auth immediate path: file already rotated again → True, no wait
+    tok_file.write_text("REMOTE_TASK_TOKEN=rotated-secret-2\n")
+    check(rtc._recover_auth(401) is True and rtc.TOKEN == "rotated-secret-2",
+          "_recover_auth resumes immediately when file already rotated")
+    # _recover_auth wait-loop path: rotation lands during the re-check sleep
+    slept = []
+
+    def _sleep_and_rotate(secs):
+        slept.append(secs)
+        tok_file.write_text("REMOTE_TASK_TOKEN=rotated-secret-3\n")
+    real_sleep, real_emit = rtc.time.sleep, rtc._emit_gateway_status
+    real_hb = rtc._heartbeat_singleton
+    rtc.time.sleep, rtc._emit_gateway_status = _sleep_and_rotate, lambda *a, **k: None
+    # The suite never ran main()'s _acquire_singleton, so a real heartbeat here
+    # would read as "lost ownership"; stub it — held-lock behavior is what the
+    # production loop has.
+    rtc._heartbeat_singleton = lambda: True
+    try:
+        check(rtc._recover_auth(403) is True and rtc.TOKEN == "rotated-secret-3"
+              and slept == [rtc.AUTH_RECHECK_INTERVAL],
+              "_recover_auth wait-loop picks up rotation after one re-check")
+    finally:
+        rtc.time.sleep, rtc._emit_gateway_status = real_sleep, real_emit
+        rtc._heartbeat_singleton = real_hb
+    # restore the suite's token so later sections keep authenticating
+    rtc.TOKEN = "testtoken"
+    rtc._AUTH_HEADERS["Authorization"] = "Bearer testtoken"
+    rtc.TOKEN_FILE = ""
+
     # 6. inbound media marker → local file rewrite (network mocked)
     fetched = []
     real_download = rtc._download_bytes

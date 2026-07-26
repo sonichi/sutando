@@ -56,7 +56,11 @@ class EventChannel:
                  log=print, max_backoff: float = 30.0):
         self._inbox = inbox
         self._base = base_url.rstrip("/")
-        self._headers = dict(headers)
+        # Held BY REFERENCE, not copied: the owning bridge mutates this dict
+        # in place when the bearer rotates (auth-rejection recovery), and the
+        # next (re)connect must carry the new token without a restart. Every
+        # request already works on a per-request copy (dict(self._headers)).
+        self._headers = headers
         # Cloudflare rejects urllib's default UA with 403 — which _consume_once
         # classifies as FATAL, so without this the channel would stop
         # permanently on first real-gateway connect (review P1). Same explicit

@@ -147,6 +147,11 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# The ONE auth-header dict shared with long-lived consumers (event channel,
+# card poster). They must hold this dict BY REFERENCE (no copy) so a token
+# rotation (_reload_rotated_token) propagates to their next request without a
+# restart. _req() itself reads the TOKEN global per call and needs no dict.
+_AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 HEARTBEAT_INTERVAL = 60
 # When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
 # instead of hammering it — but only for this cooldown, then retry. A permanent
@@ -154,6 +159,18 @@ HEARTBEAT_INTERVAL = 60
 # picked up until the worker restarts; time-gating makes it self-healing.
 ACK_UNSUPPORTED_COOLDOWN = int(os.environ.get("REMOTE_ACK_RETRY_COOLDOWN") or "300")
 _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipped
+# Auth-rejection recovery: when the gateway rejects the bearer (401/403 — the
+# key was revoked or expired), the historical behavior is an immediate FATAL
+# exit. Under a supervisor that blindly relaunches, that becomes a silent
+# crash-loop hammering the gateway until a human notices. When
+# REMOTE_TASK_TOKEN_FILE names the durable token source (a dotenv-style file
+# with a REMOTE_TASK_TOKEN= line, or the raw onboarding string alone on a
+# line), the bridge instead re-reads that file on rejection: a DIFFERENT token
+# there (the connect/onboarding flow re-ran) is swapped in live — no restart —
+# and an unchanged one holds the bridge in a slow re-check loop until rotation
+# happens. Unset → exactly the pre-existing FATAL-exit behavior.
+TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or ""
+AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
@@ -424,6 +441,84 @@ def _http_error_body(e) -> str:
         return (e.read() or b"").decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _read_token_file(path: str) -> str:
+    """The onboarding string from a token file, or "" (missing / unreadable /
+    empty — the caller treats all three as no-rotation). Two accepted shapes:
+    a dotenv-style file carrying a REMOTE_TASK_TOKEN= line (legacy
+    AG2_REMOTE_TOKEN= honored, optional `export `, surrounding quotes
+    stripped), or the raw onboarding string alone on the first non-comment,
+    '='-free line."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+            if line.startswith(key + "="):
+                return line[len(key) + 1:].strip().strip("'\"")
+    for line in text.splitlines():
+        line = line.strip()
+        if line and "=" not in line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def _reload_rotated_token() -> bool:
+    """Re-read TOKEN_FILE and swap in a rotated token. True only when a
+    usable, DIFFERENT secret was found: module globals TOKEN (and URL, when
+    the combined url|secret onboarding form carries one) plus the shared
+    _AUTH_HEADERS dict are updated in place, so the poll loop and the event
+    channel resume with the new bearer without a process restart."""
+    global TOKEN, URL
+    if not TOKEN_FILE:
+        return False
+    raw = _read_token_file(TOKEN_FILE)
+    if not raw:
+        return False
+    # Mirror the module's import-time onboarding parse (plain "|" split).
+    if "|" in raw:
+        url_from_token, secret = raw.split("|", 1)
+    else:
+        url_from_token, secret = "", raw
+    if not secret or secret == TOKEN:
+        return False
+    TOKEN = secret
+    if url_from_token:
+        URL = url_from_token.rstrip("/")
+    _AUTH_HEADERS["Authorization"] = f"Bearer {TOKEN}"
+    return True
+
+
+def _recover_auth(code: int) -> bool:
+    """Auth-rejection recovery. An immediate re-read catches a rotation that
+    already happened (the bridge lagged behind a re-onboard); otherwise hold
+    in a slow re-check loop — keeping the poller singleton heartbeated so a
+    supervisor sees ONE live waiting process instead of a crash-loop — until
+    the token file rotates. Returns True once a rotated token is live; False
+    when no TOKEN_FILE is configured (caller keeps the historical FATAL
+    exit)."""
+    if _reload_rotated_token():
+        _log("auth rejected but token file already rotated — resuming with new token")
+        return True
+    if not TOKEN_FILE:
+        return False
+    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation in "
+         f"{TOKEN_FILE} (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    while True:
+        _emit_gateway_status(False,
+                             error=f"auth rejected HTTP {code} — waiting for re-connect",
+                             backoff_s=AUTH_RECHECK_INTERVAL)
+        time.sleep(AUTH_RECHECK_INTERVAL)
+        if not _heartbeat_singleton():
+            sys.exit("FATAL: lost poller singleton while waiting for token rotation")
+        if _reload_rotated_token():
+            _log("rotated token detected — resuming")
+            return True
 
 
 def _post_task_ack(tid: str) -> bool:
@@ -1259,7 +1354,7 @@ def _maybe_start_event_channel() -> None:
         from .event_inbox import EventInbox
         from .event_channel import EventChannel
         inbox = EventInbox(str(_STATE / "event-inbox.db"))
-        ch = EventChannel(inbox, URL, {"Authorization": f"Bearer {TOKEN}"}, log=_log)
+        ch = EventChannel(inbox, URL, _AUTH_HEADERS, log=_log)
         threading.Thread(target=ch.run, name="sparrow-event-channel", daemon=True).start()
         _EVENT_CHANNEL = ch
         # P1: drain the inbox into the Core's attention (taskify → tasks/) on a
@@ -1278,7 +1373,7 @@ def _maybe_start_event_channel() -> None:
             store = ActionStore(str(_STATE / "human-actions"))
             handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
             if ha_room:
-                poster = CardPoster(store, URL, {"Authorization": f"Bearer {TOKEN}"},
+                poster = CardPoster(store, URL, _AUTH_HEADERS,
                                     ha_room, log=_log,
                                     include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
                                     .strip().lower() in ("1", "true", "yes", "on"))
@@ -1345,6 +1440,9 @@ def main() -> None:
             _emit_gateway_status(True)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
+                if _recover_auth(e.code):
+                    backoff = 1
+                    continue
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
