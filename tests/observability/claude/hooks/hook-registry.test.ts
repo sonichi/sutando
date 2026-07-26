@@ -13,8 +13,21 @@ import type { ClaudeCodeHook } from '../../../../src/observability/claude/cc-hoo
 // (docs/runtime/claude-hook-contract-v1.md) — this test is what keeps it from
 // silently drifting into fiction when either code side moves.
 
+interface RegistryEntry {
+	registered: boolean;
+	modeled: boolean;
+	normalizedKinds: string[];
+	pairedKinds?: string[];
+	visibility: string;
+	redactionReviewed?: boolean;
+}
+interface Registry {
+	events: Record<string, RegistryEntry>;
+	unknownEvent: { normalizedKindPattern: string };
+}
+
 const HOOKS_DIR = '../../../../src/observability/claude/hooks/';
-const REGISTRY = JSON.parse(
+const REGISTRY: Registry = JSON.parse(
 	readFileSync(fileURLToPath(new URL(`${HOOKS_DIR}hook-registry.json`, import.meta.url)), 'utf8'),
 );
 const BUILDER = fileURLToPath(new URL(`${HOOKS_DIR}build-hook-settings.mjs`, import.meta.url));
@@ -47,7 +60,7 @@ describe('hook-registry conformance', () => {
 		const settings = JSON.parse(execFileSync('node', [BUILDER, '/tmp/obs-hook.sh'], { encoding: 'utf8' }));
 		const registeredInSettings = Object.keys(settings.hooks).sort();
 		const registeredInRegistry = Object.entries(REGISTRY.events)
-			.filter(([, v]: [string, any]) => v.registered)
+			.filter(([, v]) => v.registered)
 			.map(([k]) => k)
 			.sort();
 		assert.deepEqual(registeredInRegistry, registeredInSettings);
@@ -55,7 +68,7 @@ describe('hook-registry conformance', () => {
 
 	it('every modeled event has a registry entry and a fixture', () => {
 		const modeled = Object.entries(REGISTRY.events)
-			.filter(([, v]: [string, any]) => v.modeled)
+			.filter(([, v]) => v.modeled)
 			.map(([k]) => k);
 		for (const name of modeled) {
 			assert.ok(FIXTURES[name], `modeled event ${name} is missing a conformance fixture`);
@@ -67,7 +80,7 @@ describe('hook-registry conformance', () => {
 	});
 
 	it('mapper emits exactly the registry normalizedKinds for each modeled event', () => {
-		for (const [name, entry] of Object.entries<any>(REGISTRY.events)) {
+		for (const [name, entry] of Object.entries(REGISTRY.events)) {
 			if (!entry.modeled) continue;
 			assert.deepEqual(
 				kindsOf(FIXTURES[name]),
@@ -99,7 +112,7 @@ describe('hook-registry conformance', () => {
 	});
 
 	it('registry hygiene: visibility enum; no product-tier entry without redaction review', () => {
-		for (const [name, entry] of Object.entries<any>(REGISTRY.events)) {
+		for (const [name, entry] of Object.entries(REGISTRY.events)) {
 			assert.ok(['product', 'diagnostic', 'raw'].includes(entry.visibility), `bad visibility on ${name}`);
 			if (entry.visibility === 'product') {
 				// Promoting a kind to product tier requires an explicit redaction
