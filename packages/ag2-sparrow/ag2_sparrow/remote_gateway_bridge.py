@@ -454,13 +454,24 @@ def _read_token_file(path: str) -> str:
         text = Path(path).read_text(encoding="utf-8")
     except OSError:
         return ""
+    # Collect BOTH alias assignments across the WHOLE file, then apply the
+    # documented precedence REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN regardless of
+    # line order (review P1: a migration-era env with a stale legacy line
+    # ABOVE the current canonical one made recovery hot-swap back to the stale
+    # legacy secret — first-match-in-file-order inverted startup.sh's
+    # precedence). Last assignment of a repeated key wins, matching shell
+    # sourcing semantics.
+    found: dict = {}
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("export "):
             line = line[len("export "):].lstrip()
         for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
             if line.startswith(key + "="):
-                return line[len(key) + 1:].strip().strip("'\"")
+                found[key] = line[len(key) + 1:].strip().strip("'\"")
+    for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+        if found.get(key):
+            return found[key]
     for line in text.splitlines():
         line = line.strip()
         if line and "=" not in line and not line.startswith("#"):

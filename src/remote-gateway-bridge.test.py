@@ -388,6 +388,18 @@ def main() -> int:
           "_read_token_file falls back to raw onboarding string")
     check(rtc._read_token_file(str(tok_dir / "missing.env")) == "",
           "_read_token_file missing file → empty (no-rotation)")
+    # mixed-alias precedence: a stale legacy AG2_REMOTE_TOKEN line ABOVE the
+    # canonical REMOTE_TASK_TOKEN must NOT win (file order is irrelevant;
+    # REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN, matching startup.sh).
+    tok_file.write_text("AG2_REMOTE_TOKEN=legacy-stale\nREMOTE_TASK_TOKEN=current-secret\n")
+    check(rtc._read_token_file(str(tok_file)) == "current-secret",
+          "canonical key wins over an EARLIER legacy line (mixed-alias env)")
+    tok_file.write_text("REMOTE_TASK_TOKEN=current-secret\nAG2_REMOTE_TOKEN=legacy-stale\n")
+    check(rtc._read_token_file(str(tok_file)) == "current-secret",
+          "canonical key wins over a LATER legacy line too")
+    tok_file.write_text("AG2_REMOTE_TOKEN=legacy-only\n")
+    check(rtc._read_token_file(str(tok_file)) == "legacy-only",
+          "legacy alias still honored when canonical absent")
     # _reload_rotated_token: no TOKEN_FILE configured → False (FATAL path kept)
     rtc.TOKEN_FILE = ""
     check(rtc._reload_rotated_token() is False, "no TOKEN_FILE → no rotation")
