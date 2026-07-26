@@ -39,7 +39,13 @@ import urllib.request
 import uuid
 
 _KEYCAP = {f"{i}️⃣": i for i in range(1, 10)}  # 1️⃣..9️⃣ → 1..9
-_ANSWER_RE = re.compile(r"\banswer\s+(ha_[0-9a-f]{6,})\s+([0-9][0-9,\s]*)", re.IGNORECASE)
+# The `answer` keyword is OPTIONAL: live human acceptance (2026-07-26) showed
+# a real owner naturally types the bare `ha_<hex> 1` — a grammar humans fail
+# on the first try is a UX defect, not a user error. A bare id+number can in
+# principle appear in prose, but resolution still requires: the sender is the
+# configured owner, the id names a PENDING action, and the numbers are valid
+# options — so the loosening is bounded by the same gates as before.
+_ANSWER_RE = re.compile(r"\b(?:answer\s+)?(ha_[0-9a-f]{6,})\s+([0-9][0-9,\s]*)", re.IGNORECASE)
 
 
 def _relates_to(event: dict) -> "str | None":

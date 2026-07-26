@@ -101,6 +101,20 @@ def test_answer_command_and_reply_forms():
     check(got2["decision"]["answers"] == {"Ship v1 or wait?": "Ship v1"},
           "bare option number replying to the card resolves")
 
+    # Keyword-optional grammar (live-acceptance finding 2026-07-26): a real
+    # owner naturally types the bare `ha_<hex> N` without `answer`.
+    store3, rec3 = _store_with_action()
+    h3 = ha.DecisionHandler(store3, OWNER, log=lambda *_: None)
+    h3.offer(_message("ha_abc123def456 2"))
+    got3 = json.loads(Path(store3.dir, rec3["action_id"] + ".json").read_text())
+    check(got3["decision"]["answers"] == {"Ship v1 or wait?": "Wait"},
+          "bare `ha_x 2` (no answer keyword) resolves")
+    # a NON-pending id mentioned with a number stays inert (terminal immutable)
+    h3.offer(_message("ha_abc123def456 1"))
+    got3b = json.loads(Path(store3.dir, rec3["action_id"] + ".json").read_text())
+    check(got3b["decision"]["answers"] == {"Ship v1 or wait?": "Wait"},
+          "late bare-id answer cannot overwrite the resolution")
+
 
 def test_a2ui_button_click_resolves():
     # A2UI-CONTRACT.md: a button click arrives as a NORMAL m.room.message with a
