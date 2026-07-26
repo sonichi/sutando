@@ -406,6 +406,38 @@ exit 0
         calls = self.log.read_text() if self.log.exists() else ""
         self.assertNotIn("send-keys", calls)
 
+    def test_notifier_does_not_replay_task_with_retention_archived_result(self):
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(exist_ok=True)
+        archive = workspace / "results" / "archive-2026-07-26"
+        archive.mkdir(parents=True)
+        (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
+        (archive / "task-done.txt").write_text("already delivered\n")
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("send-keys", calls)
+
+    def test_notifier_recognizes_gateway_result_in_retention_archive(self):
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(exist_ok=True)
+        archive = workspace / "results" / "archive-2026-07-26"
+        archive.mkdir(parents=True)
+        (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
+        (archive / "task-done-1784690000.txt").write_text("already delivered\n")
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("send-keys", calls)
+
     def test_managed_notifier_waits_for_each_result_before_next_task(self):
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"
