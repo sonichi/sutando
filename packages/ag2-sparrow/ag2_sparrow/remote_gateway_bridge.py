@@ -96,6 +96,10 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# Terminal resting place for proactive nudges that can never be delivered
+# (e.g. a body too large for any Matrix event). Kept separate from `archive/`
+# so "delivered" and "given up on" are never confused when auditing.
+UNDELIVERABLE_RESULTS_DIR = ARCHIVE_RESULTS_DIR / "undeliverable"
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
 # gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
@@ -1063,8 +1067,21 @@ def _archive_result(path: Path, tid: str) -> None:
 
 # A legacy bare `.sending` claim carries no owner info, so recovery for those
 # falls back to an age guard: younger than this = possibly a live worker's
-# in-flight claim, leave it alone.
+# in-flight claim, leave it alone. This guard is DELIBERATELY legacy-only —
+# new claims are pid-scoped, and pid-liveness is a stronger signal than age
+# (it recovers a dead worker's claim immediately instead of after 10 minutes),
+# so it supersedes rather than complements this threshold.
 _ORPHAN_MIN_AGE_S = 600
+
+# An empty body observed right after claiming is far more likely a writer
+# mid-flush than a genuinely empty nudge, so re-queue it until it has been
+# untouched this long. Only then is "empty" treated as final.
+_EMPTY_SETTLE_S = 2.0
+
+# Bodies above this never fit a Matrix event, so they are undeliverable no
+# matter how often they are retried; they are dead-lettered instead of looping.
+# Well under the 64 KiB event ceiling to leave room for envelope overhead.
+_PROACTIVE_MAX_BODY_B = 48 * 1024
 
 # Result-body routing marker (CLAUDE.md protocol): `[channel: <id>]` as the
 # first non-empty line redirects delivery. This bridge can only deliver to
@@ -1140,6 +1157,27 @@ def _recover_orphan_proactive() -> None:
             pass
 
 
+def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
+    """Retire a claimed nudge that was NOT delivered, without destroying it.
+
+    Used by the terminal non-delivery paths (settled-empty, dead-lettered).
+    Deliberately not shared with the delivered path: there the content already
+    reached the owner, so unlinking on an archive failure is harmless, whereas
+    handing the claim back would re-send a duplicate. Here nothing was
+    delivered, so the fallback is the opposite — hand it back as `.txt` rather
+    than unlink, since a duplicate on a later pass beats a lost message.
+    """
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        claim.rename(dest_dir / f"{original.stem}-{int(time.time())}.txt")
+    except OSError as e:
+        _log(f"could not retire proactive {original.name} ({e}) — re-queueing")
+        try:
+            claim.rename(original)
+        except OSError:
+            pass
+
+
 def _post_proactive() -> None:
     """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
 
@@ -1158,8 +1196,7 @@ def _post_proactive() -> None:
         # claiming it here would leak the raw body (marker included) to the
         # gateway room and starve the real consumer (review blocker).
         try:
-            route, room_override, routed_body = _proactive_route(
-                f.read_text(encoding="utf-8"))
+            route, _, _ = _proactive_route(f.read_text(encoding="utf-8"))
         except OSError:
             continue  # racing consumer already claimed it
         if route == "skip":
@@ -1171,9 +1208,52 @@ def _post_proactive() -> None:
             f.rename(claim)  # atomic claim; loser of a race just misses
         except OSError:
             continue
+        # Re-read and re-route AFTER the claim, and act only on THIS result.
+        # The peek above can observe a writer mid-write (file created, body not
+        # yet flushed); acting on that stale empty read is what silently
+        # destroyed a nudge (review blocker). Renaming does not disturb the
+        # writer's descriptor, so the post-claim read sees the flushed body.
+        try:
+            route, room_override, routed_body = _proactive_route(
+                claim.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if route == "skip":
+            # A foreign destination that only became visible post-claim: hand
+            # the file back to its real consumer rather than eating it.
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
+            continue
         body = routed_body.strip()
         if not body:
-            claim.unlink(missing_ok=True)  # empty nudge — nothing to say
+            # NEVER unlink silently — a vanished owner-facing message with no
+            # log line is the exact harm this drain exists to remove. A file
+            # that is still young is most likely a writer mid-flush: hand it
+            # back and let a later pass take it once it has settled.
+            try:
+                if time.time() - claim.stat().st_mtime < _EMPTY_SETTLE_S:
+                    claim.rename(f)
+                    continue
+            except OSError:
+                continue
+            _log(f"proactive {f.name} still empty after "
+                 f"{_EMPTY_SETTLE_S}s — archiving rather than dropping")
+            _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
+            continue
+        if len(body.encode("utf-8")) > _PROACTIVE_MAX_BODY_B:
+            # Every failure branch below re-queues unconditionally, so a body
+            # that can NEVER be delivered would retry and log on every loop
+            # pass forever. An oversized body is exactly that case, and it is
+            # decidable here — dead-letter it once instead (review: retry
+            # ceiling). Undeliverable-for-other-reasons (kicked from the room,
+            # typo'd room id) still retries by design, so a misconfigured room
+            # stays loud.
+            _log(f"proactive {f.name} body is "
+                 f"{len(body.encode('utf-8'))}B (> {_PROACTIVE_MAX_BODY_B}B) "
+                 "— dead-lettering, it can never be delivered")
+            _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         try:
             resp = _req("POST", "/v1/room",

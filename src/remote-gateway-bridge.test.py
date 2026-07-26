@@ -419,11 +419,46 @@ def main() -> int:
     check(not (rtc.RESULTS_DIR / "proactive-t2b.txt").exists(),
           "retry with a real delivery signal archives")
 
-    # Empty file → dropped silently, no POST.
+    # Empty file → no POST, and NEVER destroyed. A freshly-written empty file
+    # is indistinguishable from a writer mid-flush, so it is re-queued rather
+    # than unlinked (review blocker: the old code unlinked it silently, which
+    # loses the body when the writer's flush lands after the claim).
     (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("  \n")
     rtc._post_proactive()
-    check(len(STATE["room_posts"]) == 4 and not (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
-          "empty proactive file dropped without a send")
+    check(len(STATE["room_posts"]) == 4 and (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
+          "empty proactive file is re-queued, not sent and not destroyed")
+
+    # The body the writer was still flushing wins: once it lands, the SAME file
+    # delivers normally. This is the regression for the data-loss race.
+    (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("the late-flushed body")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 5
+          and STATE["room_posts"][-1]["body"] == "the late-flushed body"
+          and not (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
+          "a body flushed after the empty peek is delivered, never lost")
+
+    # Genuinely empty past the settle window → archived (not unlinked), so the
+    # drop is auditable rather than silent.
+    stale = rtc.RESULTS_DIR / "proactive-t3b.txt"
+    stale.write_text("   \n")
+    old = time.time() - (rtc._EMPTY_SETTLE_S + 5)
+    os.utime(stale, (old, old))
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 5 and not stale.exists()
+          and any(p.name.startswith("proactive-t3b")
+                  for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
+          "settled-empty proactive file is archived, never silently unlinked")
+
+    # Oversized body → dead-lettered once instead of retrying forever, and it
+    # lands in archive/undeliverable so "given up on" is not confused with
+    # "delivered".
+    huge = rtc.RESULTS_DIR / "proactive-t3c.txt"
+    huge.write_text("x" * (rtc._PROACTIVE_MAX_BODY_B + 1))
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == 5 and not huge.exists()
+          and any(p.name.startswith("proactive-t3c")
+                  for p in rtc.UNDELIVERABLE_RESULTS_DIR.glob("*.txt")),
+          "oversized proactive body is dead-lettered, not retried forever")
     # Routing protocol (review blocker): a [channel: <discord id>] nudge
     # belongs to the Discord bridge — this consumer must not claim it, must
     # not post it, and must leave the .txt in place for the real consumer.
