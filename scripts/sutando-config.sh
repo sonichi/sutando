@@ -559,8 +559,11 @@ print(json.dumps({
     'authenticated': h.get('authenticated'),
     # ── additive runtime-standardization fields (standard.md task A P1; air
     # confirmed ADDITIVE 2026-07-26). Old readers ignore unknown keys, and the
-    # existing socket/session fields stay for desktop back-compat. `components`
-    # (the 4-window topology) is intentionally NOT emitted yet — it lands in P2
+    # existing socket/session fields stay for desktop back-compat. The components
+    # field (the 4-window topology) is intentionally NOT emitted yet — it lands in P2
+    # (NOTE: no backticks/$-vars anywhere in this python -c comment block — it runs
+    # inside a bash double-quoted -c string, so a backtick would command-substitute
+    # and a $-var would expand; both break the program / execute PATH binaries.)
     # with the session rename (sutando-core -> sutando + core/gateway/runtime-api/
     # monitor windows); emitting it now would misrepresent the single current
     # session.
