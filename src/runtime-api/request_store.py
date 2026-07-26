@@ -1,0 +1,127 @@
+"""runtime-api request store — durable request lifecycle in SQLite.
+
+The Unix socket is transport, never storage: every request is durably
+recorded the moment it is issued, survives daemon restarts, and resolves
+exactly once. SQLite (WAL) over loose JSON files because the lifecycle needs
+atomic state transitions (a resolution and an expiry racing must produce ONE
+terminal state), status queries, and concurrent `request.wait` pollers.
+
+States: pending → approved|denied|resolved|completed|failed|cancelled|expired
+(approved may later be stamped consumed — one-time-use approvals). Terminal
+states are immutable: `transition()` is compare-and-swap on status, so a late
+answer can never overwrite a resolution — the same contract the human-action
+store enforces with flock.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import time
+import uuid
+
+TERMINAL = frozenset(
+    {"approved", "denied", "resolved", "completed", "failed", "cancelled", "expired"}
+)
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runtime_requests (
+  request_id   TEXT PRIMARY KEY,
+  request_type TEXT NOT NULL,
+  task_id      TEXT,
+  execution_id TEXT,
+  actor_id     TEXT NOT NULL,
+  method       TEXT NOT NULL,
+  params_json  TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  result_json  TEXT,
+  created_at   REAL NOT NULL,
+  expires_at   REAL,
+  resolved_at  REAL,
+  resolved_by  TEXT,
+  consumed_at  REAL
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_requests_status
+  ON runtime_requests (status);
+"""
+
+
+class RequestStore:
+    def __init__(self, db_path: str):
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.executescript(_SCHEMA)
+        self._db.commit()
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+    def create(self, request_type: str, method: str, actor_id: str,
+               params: dict, task_id=None, execution_id=None,
+               expires_in_s=None) -> dict:
+        rid = f"{request_type}-{uuid.uuid4().hex[:12]}"
+        now = time.time()
+        expires_at = (now + float(expires_in_s)) if expires_in_s else None
+        self._db.execute(
+            "INSERT INTO runtime_requests (request_id, request_type, task_id,"
+            " execution_id, actor_id, method, params_json, status, created_at,"
+            " expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (rid, request_type, task_id, execution_id, actor_id, method,
+             json.dumps(params, ensure_ascii=False), "pending", now, expires_at))
+        self._db.commit()
+        return self.get(rid)
+
+    def get(self, request_id: str):
+        cur = self._db.execute(
+            "SELECT request_id, request_type, task_id, execution_id, actor_id,"
+            " method, params_json, status, result_json, created_at, expires_at,"
+            " resolved_at, resolved_by, consumed_at FROM runtime_requests"
+            " WHERE request_id = ?", (request_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        rec = {
+            "requestId": row[0], "requestType": row[1], "taskId": row[2],
+            "executionId": row[3], "actorId": row[4], "method": row[5],
+            "params": json.loads(row[6]), "status": row[7],
+            "result": json.loads(row[8]) if row[8] else None,
+            "createdAt": row[9], "expiresAt": row[10], "resolvedAt": row[11],
+            "resolvedBy": row[12], "consumedAt": row[13],
+        }
+        # Lazy expiry: a pending request past its deadline reads as expired —
+        # and is transitioned durably so every later reader agrees.
+        if (rec["status"] == "pending" and rec["expiresAt"]
+                and time.time() > rec["expiresAt"]):
+            if self.transition(request_id, "expired"):
+                rec["status"] = "expired"
+        return rec
+
+    def transition(self, request_id: str, new_status: str, result=None,
+                   resolved_by=None) -> bool:
+        """pending → terminal, exactly once (CAS on status). False = lost the
+        race (already terminal) or unknown id — the caller must re-read."""
+        cur = self._db.execute(
+            "UPDATE runtime_requests SET status = ?, result_json = ?,"
+            " resolved_at = ?, resolved_by = ? WHERE request_id = ? AND"
+            " status = 'pending'",
+            (new_status, json.dumps(result, ensure_ascii=False) if result is not None else None,
+             time.time(), resolved_by, request_id))
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def consume(self, request_id: str) -> bool:
+        """Stamp a one-time-use approval as consumed (approved → consumed_at
+        set, exactly once). An approval for one action must not replay."""
+        cur = self._db.execute(
+            "UPDATE runtime_requests SET consumed_at = ? WHERE request_id = ?"
+            " AND status = 'approved' AND consumed_at IS NULL",
+            (time.time(), request_id))
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def pending(self) -> list:
+        cur = self._db.execute(
+            "SELECT request_id FROM runtime_requests WHERE status = 'pending'")
+        return [self.get(r[0]) for r in cur.fetchall()]
+
+    def close(self) -> None:
+        self._db.close()

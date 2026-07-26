@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""E2E test for the runtime API v0 (owner acceptance: "E2E 可以测通").
+
+Boots the REAL daemon on a temp socket, drives it through the REAL CLI, and
+resolves requests through the REAL human-action store — the only simulated
+piece is the owner's answer, written exactly the way DecisionHandler writes it
+(ActionStore.resolve with 1-based option indexes). This is the local half of
+the design doc's acceptance scenario; slice ② swaps the fake capability
+executor for the governed gateway send.
+
+Covered:
+  1. approval.request → pending → card record visible to CardPoster's sweep
+     source (pending + no card_event_id) → owner approves → request.wait
+     returns approved.
+  2. approval denied path.
+  3. elicitation single_select → owner picks option 2 → wait returns the
+     chosen label.
+  4. capability.execute (fake executor) → completed immediately.
+  5. request.get unknown id → protocol error (exit 1).
+  6. wait timeout on an unanswered request → timedOut: true, still pending.
+  7. daemon restart recovery: pending request survives, resolves after boot.
+  8. cancel → cancelled; a late owner answer does NOT overwrite (CAS).
+
+Run: python3 tests/runtime-api-e2e.test.py   (stdlib only)
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SERVER = REPO / "src" / "runtime-api" / "server.py"
+CLI = REPO / "src" / "runtime-cli" / "sutando-runtime.py"
+
+FAILS: list = []
+
+
+def check(cond, msg):
+    print(("  ok  " if cond else "  FAIL ") + msg)
+    if not cond:
+        FAILS.append(msg)
+
+
+def cli(*args, expect_rc=0, timeout=30):
+    p = subprocess.run([sys.executable, str(CLI), *args],
+                       capture_output=True, text=True, timeout=timeout,
+                       env=ENV)
+    if p.returncode != expect_rc:
+        raise AssertionError(f"cli {args} rc={p.returncode} err={p.stderr}")
+    return json.loads(p.stdout) if p.stdout.strip() else None
+
+
+def wait_socket(path, timeout=10):
+    import socket as _s
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
+        try:
+            s.connect(path)
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def start_daemon():
+    proc = subprocess.Popen([sys.executable, str(SERVER)], env=ENV,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    if not wait_socket(ENV["SUTANDO_RUNTIME_SOCKET"]):
+        proc.kill()
+        print(proc.stdout.read())
+        raise AssertionError("daemon socket never came up")
+    return proc
+
+
+def ha_store():
+    spec = importlib.util.spec_from_file_location(
+        "ha", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "human_action.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.ActionStore(ENV["SUTANDO_HA_DIR"])
+
+
+def pending_action_for(request_id, store, timeout=5):
+    aid = "ha_" + request_id.replace("-", "")[:24]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rec = store.get(aid)
+        if rec is not None:
+            return rec
+        time.sleep(0.1)
+    return None
+
+
+TMP = tempfile.mkdtemp(prefix="runtime-api-e2e-")
+ENV = {**os.environ,
+       "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),
+       "SUTANDO_RUNTIME_DB": str(Path(TMP) / "runtime-state.sqlite"),
+       "SUTANDO_HA_DIR": str(Path(TMP) / "human-actions"),
+       "SUTANDO_RUNTIME_RESOLVE_POLL": "0.3",
+       "SUTANDO_AGENT_ID": "@test-agent:example.org"}
+
+
+def main() -> int:
+    daemon = start_daemon()
+    store = ha_store()
+    try:
+        # 1. approval → approve
+        r = cli("approval", "request", "--task-id", "task-e2e",
+                "--action", "message.send",
+                "--resource", '{"roomId":"!room:example.org"}',
+                "--reason", "post the summary")
+        check(r["status"] == "pending" and r["requestId"].startswith("approval-"),
+              "approval.request issues pending immediately")
+        act = pending_action_for(r["requestId"], store)
+        check(act is not None and act["status"] == "pending"
+              and not act.get("card_event_id")
+              and "Approve" in json.dumps(act["questions"]),
+              "pending ha action exists for CardPoster to sweep (card lifecycle wired)")
+        # owner answers exactly as DecisionHandler writes it: option 1 = Approve
+        check(store.resolve(act["action_id"], {"1": [1]}, "@owner:example.org"),
+              "owner resolution lands (DecisionHandler write shape)")
+        w = cli("request", "wait", r["requestId"], "--timeout", "10")
+        check(w["status"] == "approved" and w["resolvedBy"] == "@owner:example.org",
+              "wait returns approved with resolver identity")
+
+        # 2. approval → deny (option 2)
+        r2 = cli("approval", "request", "--action", "repo.force_push")
+        act2 = pending_action_for(r2["requestId"], store)
+        store.resolve(act2["action_id"], {"1": [2]}, "@owner:example.org")
+        w2 = cli("request", "wait", r2["requestId"], "--timeout", "10")
+        check(w2["status"] == "denied", "Deny option resolves to denied")
+
+        # 3. elicitation single_select
+        r3 = cli("elicitation", "request", "--question", "Deploy where?",
+                 "--type", "single_select", "--options", '["staging","production"]')
+        act3 = pending_action_for(r3["requestId"], store)
+        store.resolve(act3["action_id"], {"1": [2]}, "@owner:example.org")
+        w3 = cli("request", "wait", r3["requestId"], "--timeout", "10")
+        check(w3["status"] == "resolved"
+              and w3["result"]["answer"] == "production",
+              "elicitation returns the chosen option label")
+
+        # 4. capability (fake executor in v0)
+        r4 = cli("capability", "execute", "--action", "message.send",
+                 "--input", '{"body":"hello"}')
+        check(r4["status"] == "completed"
+              and r4["result"]["echo"]["input"]["body"] == "hello",
+              "capability.execute completes through the fake executor")
+
+        # 5. unknown id → error
+        p = subprocess.run([sys.executable, str(CLI), "request", "get", "nope-1"],
+                           capture_output=True, text=True, env=ENV)
+        check(p.returncode == 1 and "unknown requestId" in p.stderr,
+              "unknown requestId is a clean protocol error")
+
+        # 6. wait timeout leaves the request pending
+        r6 = cli("approval", "request", "--action", "slow.thing")
+        w6 = cli("request", "wait", r6["requestId"], "--timeout", "1")
+        check(w6.get("timedOut") is True and w6["status"] == "pending",
+              "wait timeout reports timedOut and stays pending")
+
+        # 7. restart recovery: r6 survives and resolves after a daemon restart
+        daemon.terminate()
+        daemon.wait(timeout=5)
+        daemon = start_daemon()
+        act6 = pending_action_for(r6["requestId"], store)
+        store.resolve(act6["action_id"], {"1": [1]}, "@owner:example.org")
+        w7 = cli("request", "wait", r6["requestId"], "--timeout", "10")
+        check(w7["status"] == "approved",
+              "pending request survives daemon restart and resolves (recovery)")
+
+        # 8. cancel wins over a late answer (CAS terminal immutability)
+        r8 = cli("approval", "request", "--action", "late.answer")
+        act8 = pending_action_for(r8["requestId"], store)
+        c8 = cli("request", "cancel", r8["requestId"])
+        check(c8["status"] == "cancelled", "cancel transitions to cancelled")
+        store.resolve(act8["action_id"], {"1": [1]}, "@owner:example.org")
+        time.sleep(1.0)  # give the resolver loop a pass to (not) clobber
+        g8 = cli("request", "get", r8["requestId"])
+        check(g8["status"] == "cancelled",
+              "late owner answer cannot overwrite a terminal state (CAS)")
+    finally:
+        daemon.terminate()
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+
+    print(f"\n{'PASS — runtime-api v0 E2E green' if not FAILS else f'FAILED ({len(FAILS)})'}")
+    return 1 if FAILS else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
