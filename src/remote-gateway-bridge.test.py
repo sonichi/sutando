@@ -593,6 +593,56 @@ def main() -> int:
     check(rtc._parse_onboarding_token("bare|secret") == ("", "bare|secret"),
           "token parse: a bare secret with no URL scheme is not split on its own | bytes")
 
+    # ── env-fallback: token from channels/ag2space/.env when the launcher never
+    # exported it into the env. A desktop-spawned core skips startup.sh (the only
+    # thing that exports the token connect wrote to the file), so without this the
+    # bridge sees an empty env token and never connects — every new desktop-only
+    # user reproduces it (mark, 2026-07-26). The bridge must read the file directly.
+    _saved = {k: os.environ.get(k) for k in
+              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "CLAUDE_CONFIG_DIR")}
+    try:
+        for _k in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL"):
+            os.environ.pop(_k, None)
+        _cfg = tempfile.mkdtemp()
+        _chan = Path(_cfg) / "channels" / "ag2space"
+        _chan.mkdir(parents=True)
+        # connect writes AG2_REMOTE_TOKEN='<url|secret>' (quoted) — lib.rs CONNECT_ENV_KEY.
+        (_chan / ".env").write_text("# relay onboarding\nAG2_REMOTE_TOKEN='https://gw.example/relay|s3cr3t'\n")
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg
+        _fspec = importlib.util.spec_from_file_location(
+            "rtc_fallback", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _frtc = importlib.util.module_from_spec(_fspec)
+        _fspec.loader.exec_module(_frtc)
+        check(_frtc.TOKEN == "s3cr3t",
+              "env-fallback: token read from channels/ag2space/.env (quote-stripped, legacy alias) when env empty")
+        check(_frtc.URL == "https://gw.example/relay",
+              "env-fallback: URL comes from the file token's url|secret form")
+
+        # negative: no env token AND no file → empty token, no crash at import.
+        os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()
+        _nspec = importlib.util.spec_from_file_location(
+            "rtc_nofile", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _nrtc = importlib.util.module_from_spec(_nspec)
+        _nspec.loader.exec_module(_nrtc)
+        check(_nrtc.TOKEN == "",
+              "env-fallback: no env token and no file yields empty token (no crash)")
+
+        # env token still wins over the file when both are present.
+        os.environ["REMOTE_TASK_TOKEN"] = "https://env.example/relay|envwins"
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg
+        _wspec = importlib.util.spec_from_file_location(
+            "rtc_envwins", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _wrtc = importlib.util.module_from_spec(_wspec)
+        _wspec.loader.exec_module(_wrtc)
+        check(_wrtc.TOKEN == "envwins",
+              "env-fallback: env token takes precedence over the file fallback")
+    finally:
+        for _k, _v in _saved.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1

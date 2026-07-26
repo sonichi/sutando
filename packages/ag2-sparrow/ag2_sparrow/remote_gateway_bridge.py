@@ -256,7 +256,50 @@ def _parse_onboarding_token(raw):
     return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
 
 
+def _token_from_ag2space_env():
+    """Fallback token source when the launcher didn't export it into the env.
+
+    `connect` writes the relay token to
+    $CLAUDE_CONFIG_DIR/channels/ag2space/.env, but the ONLY thing that exports
+    it into the process environment is startup.sh. A desktop-spawned core never
+    runs startup.sh — its supervisor spawns the core with a fixed env whitelist
+    that does not carry the token — so on a pure desktop install the token sits
+    in that file with nothing reading it into the bridge: the bridge sees an
+    empty token and never connects (every new desktop-only user reproduces this).
+    Read it straight from the file so the bridge connects under ANY launcher, and
+    so a core that was already running when `connect` wrote the token picks it up
+    on the next start without depending on someone re-exporting the env.
+
+    The token carries the gateway URL (the url|secret onboarding form), so no
+    separate URL read is needed — _parse_onboarding_token splits it downstream.
+    Returns "" when the file or key is absent.
+    """
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    path = os.path.join(base, "channels", "ag2space", ".env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return ""
+    vals = {}
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        key, _, val = ln.partition("=")
+        vals[key.strip()] = val.strip().strip('"').strip("'")
+    # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
+    return vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN") or ""
+
+
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
+if not _RAW:
+    _RAW = _token_from_ag2space_env()
+    if _RAW:
+        print("[remote-gateway-bridge] token not in env; loaded from "
+              "channels/ag2space/.env (launcher did not export it — e.g. a "
+              "desktop-spawned core that skips startup.sh)",
+              file=sys.stderr, flush=True)
 _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN).rstrip("/")
