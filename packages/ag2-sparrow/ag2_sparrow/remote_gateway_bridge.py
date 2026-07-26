@@ -256,10 +256,79 @@ def _parse_onboarding_token(raw):
     return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
 
 
+def _token_from_ag2space_env():
+    """Fallback token source when the launcher didn't export it into the env.
+
+    `connect` writes the relay token to the channel .env, but not every launcher
+    gets it into the process environment. The desktop-spawned core is the case
+    that matters: its supervisor spawns the core (and the gateway window) with a
+    fixed env whitelist, and the window sources the .env only once at start — so
+    if connect writes the token after that (or the export step is skipped), the
+    bridge sees an empty token and never connects (every new desktop-only user
+    can reproduce this). Read the file directly so the bridge connects regardless
+    of who launched it, and so a bridge already looping when connect wrote the
+    token picks it up on its next start.
+
+    Returns (token, url). A combined url|secret token embeds the URL (split
+    downstream by _parse_onboarding_token), but a split-layout file (bare token +
+    separate REMOTE_TASK_URL) does not — so the file's REMOTE_TASK_URL is returned
+    alongside for the caller to feed into the URL chain. Returns ("", "") when no
+    candidate file holds a token.
+
+    Candidates, in order:
+      1. AG2_DEVICE_ENV — the absolute path the desktop launcher (launch-sutando.sh)
+         lays into the gateway window, pointing straight at the file connect wrote;
+         the ONLY one that reaches the bridge in the desktop-spawned case.
+      2. $CLAUDE_CONFIG_DIR/channels/ag2space/.env — for non-desktop launchers that
+         do export CLAUDE_CONFIG_DIR into the bridge's environment.
+    We deliberately do NOT guess ~/.claude: a bare-home guess is the one path that
+    could silently pick up a token from an UNRELATED/old install and connect as the
+    WRONG identity (reinstall, account switch, leftover config). Both real launchers
+    are covered above; the bare-home guess only adds a footgun.
+    """
+    candidates = [os.environ.get("AG2_DEVICE_ENV")]
+    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _cfg:
+        candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        vals = {}
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            key, _, val = ln.partition("=")
+            vals[key.strip()] = val.strip().strip('"').strip("'")
+        # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
+        tok = vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN")
+        if tok:
+            # Name the exact file — which .env supplied the token is load-bearing
+            # for diagnosis (and for spotting a wrong-file bind).
+            print(f"[remote-gateway-bridge] token not in env; loaded from {path}",
+                  file=sys.stderr, flush=True)
+            # Carry the file's REMOTE_TASK_URL too. A combined url|secret token
+            # embeds the URL (parsed downstream), but a SPLIT layout (bare token +
+            # separate REMOTE_TASK_URL) does not — and in the fallback case the env
+            # is empty, so without this the URL chain has nothing and the bridge
+            # fatals on "no gateway URL" in the exact scenario this fix targets.
+            url = vals.get("REMOTE_TASK_URL") or vals.get("AG2_REMOTE_URL") or ""
+            return tok, url
+    return "", ""
+
+
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
+_URL_FALLBACK = ""
+if not _RAW:
+    _RAW, _URL_FALLBACK = _token_from_ag2space_env()
 _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
-       or _URL_FROM_TOKEN).rstrip("/")
+       or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 HEARTBEAT_INTERVAL = 60
