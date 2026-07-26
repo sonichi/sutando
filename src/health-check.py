@@ -2120,6 +2120,39 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
     return None
 
 
+def check_comm_sweep_freshness() -> dict:
+    """Comm-handling liveness (P1 of the comm-handling overhaul).
+
+    The comm-sweep driver stamps state/last-comm-sweep.json every run. A stale
+    stamp means comm handling has silently STOPPED — the exact failure that let
+    the inbox-score loop die 2026-07-21 and owner-comm sweeps lapse for days
+    with nobody alerted (comm handling was a *discipline*, not a *mechanism*).
+    This probe makes that loud instead of silent: warn past ~2h, down past ~6h,
+    warn (not down) when the stamp is absent — a host that never wired the
+    driver isn't "broken", it just hasn't adopted P1 yet.
+
+    Age-checked (unlike quota-telemetry, which is absence-only): comm handling
+    is expected to run on a fixed cadence, so a lengthening age IS the signal.
+    """
+    path = status_read_path("last-comm-sweep.json", WORKSPACE_DIR)
+    name = "comm-sweep"
+    if not path.exists():
+        return {"name": name, "status": "warn",
+                "detail": "no last-comm-sweep.json — comm-sweep driver not wired on this host yet (P1)"}
+    try:
+        age_h = (time.time() - path.stat().st_mtime) / 3600
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"last-comm-sweep.json stat failed ({exc})"}
+    if age_h > 6:
+        return {"name": name, "status": "down",
+                "detail": f"last comm sweep {age_h:.1f}h ago (>6h) — comm handling has silently stopped"}
+    if age_h > 2:
+        return {"name": name, "status": "warn",
+                "detail": f"last comm sweep {age_h:.1f}h ago (>2h) — comm handling lagging"}
+    return {"name": name, "status": "ok", "detail": f"last comm sweep {age_h:.1f}h ago"}
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -2162,6 +2195,9 @@ def run_all_checks() -> list[dict]:
 
     # Quota telemetry — only meaningful when the proxy is actually up.
     checks.append(check_quota_telemetry(proxy_check["status"]))
+
+    # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
+    checks.append(check_comm_sweep_freshness())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
