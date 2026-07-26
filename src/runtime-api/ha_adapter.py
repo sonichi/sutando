@@ -27,13 +27,20 @@ import sys
 import time
 from pathlib import Path
 
-# ActionStore lives in the sparrow package (in-repo path, same resolution the
-# gateway loader shim uses) — the adapter reuses its flock/CAS semantics
-# rather than re-implementing the file contract.
-_REPO = Path(__file__).resolve().parent.parent.parent
-for _p in (str(_REPO / "packages" / "ag2-sparrow"),):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+# Sibling-import bootstrap (NOT workspace resolution — that goes through the
+# sanctioned sutando_config helpers below): put src/ on sys.path so
+# sutando_config imports, then let its marker-walking _find_repo_root locate
+# the repo root for the in-repo sparrow package.
+_HERE = Path(__file__).resolve().parent  # src/runtime-api
+_SRC = _HERE.parent                      # src
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+from sutando_config import _find_repo_root  # noqa: E402
+
+_REPO = _find_repo_root(_HERE) or _SRC.parent
+_PKG = str(_REPO / "packages" / "ag2-sparrow")
+if _PKG not in sys.path:
+    sys.path.insert(0, _PKG)
 
 from ag2_sparrow.human_action import ActionStore  # noqa: E402
 

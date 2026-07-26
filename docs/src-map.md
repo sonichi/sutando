@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-165 modules indexed.
+170 modules indexed.
 
 ## `src/`
 
@@ -206,3 +206,14 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`collector.ts`** — Collector — the single, source-agnostic local ingestion point.
 - **`normalizer.ts`** — Normalizer — turns ONE source's raw payload into the universal spine vocabulary (ObsEvent / UsageRecord).
 - **`server.ts`** — HTTP shell for the Collector — the long-running local daemon.
+
+## `src/runtime-api/`
+
+- **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
+- **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
+- **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.
+- **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).
+
+## `src/runtime-cli/`
+
+- **`sutando-runtime.py`** — sutando-runtime — CLI face of the local runtime API (v0).
