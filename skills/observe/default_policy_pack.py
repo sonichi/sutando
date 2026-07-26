@@ -28,7 +28,7 @@ default-subscribed" line):
     within a generation keep connect-time re-seeding idempotent (skip if the
     current-generation record is already active).
 
-First entry: 👀 react baseline — observe m.reaction in every member room.
+First entry: 👀 react baseline — observe new messages (message.created) in every member room.
 """
 from __future__ import annotations
 
@@ -48,8 +48,8 @@ PACK_ENTRIES: "list[dict]" = [
     {
         "key": "react_baseline",
         "label": "👀 React baseline",
-        "description": "Observe reactions across every room the agent is in.",
-        "event_types": ["m.reaction"],
+        "description": "Observe new messages across every room the agent is in (the 👀 observed-receipt subscription).",
+        "event_types": ["message.created"],
         "mode": "observe",
         "cost_cap": {"evals_per_day": op.DEFAULT_EVALS_PER_DAY},
         "scope": "all_member_rooms",

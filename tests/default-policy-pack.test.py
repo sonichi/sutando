@@ -53,7 +53,7 @@ def test_seed_defaults_activates_per_room():
     check(len(active) == len(ROOMS), "one active record per room in the store")
     for rec in active:
         check(rec["room_id"] in ROOMS, "record carries a concrete member room_id")
-        check(rec["event_types"] == ["m.reaction"], "record observes m.reaction")
+        check(rec["event_types"] == ["message.created"], "record observes message.created")
         check(rec["mode"] == "observe", "record is observe (notify-only)")
         check((rec.get("pack") or {}).get("entry") == "react_baseline",
               "record carries pack provenance")
@@ -162,7 +162,7 @@ def test_on_room_join_default_scope_and_disabled_skip():
 def test_wrong_scope_entry_is_skipped():
     d = _store()
     dummy = {"key": "_dummy_scope", "label": "x", "description": "x",
-             "event_types": ["m.reaction"], "mode": "observe",
+             "event_types": ["message.created"], "mode": "observe",
              "cost_cap": {"evals_per_day": 1}, "scope": "single_room",
              "default_enabled": True}
     dpp.PACK_ENTRIES.append(dummy)
