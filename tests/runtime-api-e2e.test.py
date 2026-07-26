@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E2E test for the runtime API v0 (owner acceptance: "E2E 可以测通").
+"""E2E test for the runtime API v0 (owner acceptance: the E2E loop must be testable through).
 
 Boots the REAL daemon on a temp socket, drives it through the REAL CLI, and
 resolves requests through the REAL human-action store — the only simulated

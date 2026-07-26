@@ -260,7 +260,7 @@ class RuntimeServer:
                 return _replay(existing)
         # Governed actions REQUIRE approval — validated and consumed atomically
         # BEFORE the executor can touch daemon-held credentials. One approval
-        # authorizes exactly one execution (design: "批准 merge PR X 不能被复用").
+        # authorizes exactly one execution (design: "approving 'merge PR X' must not be replayable").
         approval_id = params.get("approvalRequestId")
         if action in GOVERNED_ACTIONS and not approval_id:
             raise ProtocolError(-32602,
