@@ -269,9 +269,11 @@ def _token_from_ag2space_env():
     of who launched it, and so a bridge already looping when connect wrote the
     token picks it up on its next start.
 
-    The token carries the gateway URL (the url|secret onboarding form), so no
-    separate URL read is needed — _parse_onboarding_token splits it downstream.
-    Returns "" when no candidate file holds a token.
+    Returns (token, url). A combined url|secret token embeds the URL (split
+    downstream by _parse_onboarding_token), but a split-layout file (bare token +
+    separate REMOTE_TASK_URL) does not — so the file's REMOTE_TASK_URL is returned
+    alongside for the caller to feed into the URL chain. Returns ("", "") when no
+    candidate file holds a token.
 
     Candidates, in order:
       1. AG2_DEVICE_ENV — the absolute path the desktop launcher (launch-sutando.sh)
@@ -310,16 +312,23 @@ def _token_from_ag2space_env():
             # for diagnosis (and for spotting a wrong-file bind).
             print(f"[remote-gateway-bridge] token not in env; loaded from {path}",
                   file=sys.stderr, flush=True)
-            return tok
-    return ""
+            # Carry the file's REMOTE_TASK_URL too. A combined url|secret token
+            # embeds the URL (parsed downstream), but a SPLIT layout (bare token +
+            # separate REMOTE_TASK_URL) does not — and in the fallback case the env
+            # is empty, so without this the URL chain has nothing and the bridge
+            # fatals on "no gateway URL" in the exact scenario this fix targets.
+            url = vals.get("REMOTE_TASK_URL") or vals.get("AG2_REMOTE_URL") or ""
+            return tok, url
+    return "", ""
 
 
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
+_URL_FALLBACK = ""
 if not _RAW:
-    _RAW = _token_from_ag2space_env()
+    _RAW, _URL_FALLBACK = _token_from_ag2space_env()
 _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
-       or _URL_FROM_TOKEN).rstrip("/")
+       or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 HEARTBEAT_INTERVAL = 60

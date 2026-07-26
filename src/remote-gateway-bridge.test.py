@@ -666,6 +666,25 @@ def main() -> int:
         _pspec.loader.exec_module(_prtc)
         check(_prtc.TOKEN == "s3cr3t",
               "env-fallback: AG2_DEVICE_ENV takes precedence over CLAUDE_CONFIG_DIR")
+
+        # split-key layout: bare REMOTE_TASK_TOKEN + a SEPARATE REMOTE_TASK_URL
+        # (not the combined url|secret token). The fallback must carry the URL too,
+        # else the bridge gets a token but URL='' and fatals on "no gateway URL" —
+        # the exact failure for a split-layout desktop .env in the target scenario.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("REMOTE_TASK_URL", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        _split_chan = Path(tempfile.mkdtemp()) / "channels" / "ag2space"
+        _split_chan.mkdir(parents=True)
+        (_split_chan / ".env").write_text(
+            "REMOTE_TASK_TOKEN='splitsecret'\nREMOTE_TASK_URL='https://split.example/relay'\n")
+        os.environ["AG2_DEVICE_ENV"] = str(_split_chan / ".env")
+        _sspec = importlib.util.spec_from_file_location(
+            "rtc_split", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _srtc = importlib.util.module_from_spec(_sspec)
+        _sspec.loader.exec_module(_srtc)
+        check(_srtc.TOKEN == "splitsecret" and _srtc.URL == "https://split.example/relay",
+              "env-fallback: split-layout file (bare token + REMOTE_TASK_URL) resolves BOTH token and URL")
     finally:
         for _k, _v in _saved.items():
             if _v is None:
