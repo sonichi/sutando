@@ -2779,13 +2779,18 @@ def recover_core_if_wedged(
             and isinstance(status_ts, (int, float))
             and status_ts > prev_status_ts
         )
-        # Only a KNOWN prior mode that differs counts as a flip. A missing
-        # wedge_mode (None) is a pre-upgrade/fresh state file — treating that as a
-        # change would spuriously reset the window on the first post-upgrade pass
-        # (and break an in-progress give-up whose seeded state predates this
-        # field), so fall back to the key/progress gating there. cur_mode is
-        # backfilled on the next observe.
-        mode_flipped = prev_mode is not None and prev_mode != cur_mode
+        # A missing wedge_mode on an IN-PROGRESS observation (first_seen set) is a
+        # pre-upgrade state file. The previous head only ever observed WEDGES
+        # (dead-core relaunch is new in this change), so an absent mode implies the
+        # accumulated window is a WEDGE window — treat it as "wedged". That makes a
+        # now-DEAD core correctly register as a flip (re-observe, so death gets its
+        # own confirm window instead of inheriting the wedge's elapsed one — the
+        # exact rollout Qingyun flagged), while a still-WEDGED core sees no flip and
+        # keeps its window (an in-progress give-up on pre-upgrade state is preserved,
+        # case_h). On a fresh observation (first_seen == 0) the `(not first_seen)`
+        # term below already forces a reset, so the implied mode is moot there.
+        effective_prev_mode = prev_mode if prev_mode is not None else "wedged"
+        mode_flipped = bool(first_seen) and effective_prev_mode != cur_mode
         if (not first_seen) or prev_key != cur_key or mode_flipped or progressed:
             state["wedge_first_seen"] = now
             state["wedge_task"] = cur_key

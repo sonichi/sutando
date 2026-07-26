@@ -449,6 +449,42 @@ def case_p_wedged_to_dead_transition_reobserves() -> list[str]:
     return fails
 
 
+def case_q_preupgrade_state_dead_reobserves() -> list[str]:
+    """Persisted-state migration regression (Qingyun review, #2160): a PRE-UPGRADE
+    state file has wedge_first_seen/wedge_task but NO wedge_mode. The previous head
+    only ever observed WEDGES, so that absent mode is an implied wedge window. If
+    the core is DEAD on the first post-upgrade pass with the same oldest task and
+    the old window has already elapsed, the death must be RE-OBSERVED on its own
+    window — NOT restarted immediately by inheriting the elapsed wedge window.
+    Direct repro of the seed Qingyun reported returning action='restarted'."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "rec.json"
+        h = Harness(sf)
+        # Pre-upgrade format: no wedge_mode. Window opened at 1_000_000; elapsed by
+        # 1_000_200 (> CONFIRM 120). Core is DEAD, same oldest task "t1".
+        sf.write_text(json.dumps({
+            "wedge_first_seen": 1_000_000,
+            "wedge_task": "t1",
+            "wedge_status_ts": None,
+        }))
+        r = h.run(now=1_000_200, alive=False, age=1000, key="t1")
+        if not r or r.get("action") != "observed":
+            fails.append(f"q) pre-upgrade state + dead must RE-OBSERVE, got {r}")
+        if h.restart_calls:
+            fails.append(f"q) must NOT restart on the first post-upgrade dead pass, got {h.restart_calls}")
+        st = json.loads(sf.read_text())
+        if st.get("wedge_mode") != "dead":
+            fails.append(f"q) re-observe should backfill wedge_mode='dead', got {st.get('wedge_mode')}")
+        if st.get("wedge_first_seen") != 1_000_200:
+            fails.append(f"q) re-observe should reset the window to now, got {st.get('wedge_first_seen')}")
+        # Death now persists and confirms on ITS OWN window → relaunch.
+        r2 = h.run(now=1_000_400, alive=False, age=1000, key="t1")   # +200s from the dead observe
+        if not r2 or r2.get("action") != "restarted":
+            fails.append(f"q) confirmed-dead (own window) should relaunch, got {r2}")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_healthy_no_action),
@@ -468,6 +504,7 @@ def main() -> int:
         ("n", case_n_failed_dm_still_restarts_and_records),
         ("o", case_o_launch_env_path),
         ("p", case_p_wedged_to_dead_transition_reobserves),
+        ("q", case_q_preupgrade_state_dead_reobserves),
     ]
     all_failures = []
     for label, fn in cases:
