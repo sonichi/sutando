@@ -1282,6 +1282,22 @@ def _maybe_start_event_channel() -> None:
                                     ha_room, log=_log,
                                     include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
                                     .strip().lower() in ("1", "true", "yes", "on"))
+        # Built-in 👀 observed-receipt — DEFAULT ON with the event plane (set
+        # SPARROW_OBSERVE_REACT=0 to disable). Wrapped OUTERMOST and
+        # chain-transparent, so decision routing + taskify see exactly the
+        # same stream and settlement they would without it. Needs AGENT_MXID
+        # for self-echo suppression; without it the receipt stays off (an
+        # agent 👀-ing its own messages is noise, not a signal).
+        if (str(os.environ.get("SPARROW_OBSERVE_REACT", "1")).strip().lower()
+                not in ("0", "false", "no", "off")):
+            mxid = os.environ.get("AGENT_MXID")
+            if mxid:
+                from .default_observer import ReactObserverHandler
+                handler = ReactObserverHandler(
+                    handler, URL, {"Authorization": f"Bearer {TOKEN}"}, mxid,
+                    log=_log)
+            else:
+                _log("react-observer: AGENT_MXID unset — observed-receipt off")
         consumer = EventConsumer(inbox, handler)
 
         def _drain_loop():
