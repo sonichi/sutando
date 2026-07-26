@@ -598,6 +598,17 @@ def main() -> int:
           "fine-grained github_pat_ token REDACTED from persisted body")
     check("SUTANDO SECURITY NOTICE" in _fg_body,
           "fine-grained PAT redaction also carries the security notice")
+    # Relay/onboarding tokens carry the separator in BOTH forms — the desktop
+    # connect flow writes the URL-encoded one — so redaction must match what
+    # `_SEPARATOR_RE` accepts. Matching only the literal `|` let a valid
+    # `…/relay%7C<secret>` paste reach disk unredacted (review blocker).
+    for _sep_label, _sep in (("literal", "|"), ("upper", "%7C"), ("lower", "%7c")):
+        _rt = "https://chat.ag2.space/relay" + _sep + ("a" * 24)
+        rtc._write_task({**TASK, "id": f"task-RELAY{_sep_label.upper()}",
+                         "task": f"[AG2Space @qingyun] token is {_rt}"})
+        _rt_body = (rtc.TASKS_DIR / f"task-RELAY{_sep_label.upper()}.txt").read_text()
+        check(_rt not in _rt_body and "SUTANDO SECURITY NOTICE" in _rt_body,
+              f"relay token with {_sep_label} separator REDACTED from persisted body")
     rtc._write_task({**TASK, "id": "task-CLEANBODY",
                      "task": "[AG2Space @qingyun] plain request, nothing secret"})
     check("SUTANDO SECURITY NOTICE" not in

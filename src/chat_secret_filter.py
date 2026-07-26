@@ -20,8 +20,16 @@ _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     # legacy ghp_/gho_/… pattern above never matches them (review P1).
     ("GitHub Fine-Grained PAT", re.compile(r"github_pat_[A-Za-z0-9_]{36,}")),
     ("Matrix Access Token", re.compile(r"syt_[A-Za-z0-9_-]{20,}")),
+    # Onboarding tokens are `<url><sep><secret>`, and the separator is accepted
+    # in BOTH forms by the parser that consumes them (`_SEPARATOR_RE` in
+    # remote_gateway_bridge: `\||%7[Cc]`) — the desktop connect flow writes the
+    # URL-encoded one. Matching only the literal `|` here let a valid
+    # `…/relay%7C<secret>` paste reach disk unredacted, which is exactly what
+    # this module exists to prevent (review blocker). The lookahead stops the
+    # URL run from swallowing the encoded separator, mirroring the parser's
+    # first-separator-wins `search()`.
     ("Remote Task Token", re.compile(
-        r"https?://[^\s|]+\|[A-Za-z0-9_+/=-]{20,}"
+        r"https?://(?:(?!%7[Cc])[^\s|])+(?:\||%7[Cc])[A-Za-z0-9_+/=-]{20,}"
     )),
     ("JSON Web Token", re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
     ("Slack Token", re.compile(r"xox[abps]-[A-Za-z0-9-]+")),
