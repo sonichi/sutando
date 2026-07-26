@@ -1054,7 +1054,15 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # would export a value and the bridge's default never fires. A shared /
   # multi-user gateway sets REMOTE_TASK_TIER=team explicitly.
   REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
-  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
+  # AG2 Space's gateway tags inbound image/file markers `ag2space-media` (its
+  # media-proxy at {gateway}/v1/media/...). The provider-neutral bridge defaults
+  # its marker tag to `remote-media`, so without this the marker never matches and
+  # the media URL lands in the task body unresolved — the core can't see the image
+  # (owner-reported 2026-07-25). Default it to the AG2 tag here, in the AG2-specific
+  # launch block, so the generic package carries no provider string. Explicit
+  # REMOTE_MEDIA_MARKER (e.g. from the channel .env) still wins.
+  REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
+  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
   if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
     python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
     echo "  ✓ gateway bridge"
