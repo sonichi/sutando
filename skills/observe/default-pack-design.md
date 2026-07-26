@@ -11,7 +11,7 @@ A set of **factory-default subscription policies** that:
 - are **owner-visible** and **individually disable-able**,
 - follow the `/observe` policy structure (`observe_policy.py`).
 
-First entry: **👀 react baseline** — observe `m.reaction` in every member room.
+First entry: **👀 react baseline** — observe `message.created` in every member room.
 
 ## Why it reuses `observe_policy` instead of a new path
 
