@@ -269,6 +269,39 @@ def _start_and_grab_handler(m):
     return grabbed.get("handler")
 
 
+def test_catchup_guard_skips_backlog():
+    import time as _time
+    # Old event (beyond max_age) → marked seen, NOT reacted; a redelivery of
+    # the same message also stays silent. Fresh event → reacted. ts-less
+    # events are treated as live. max_age_s=0 disables the guard.
+    net = _Net()
+    h, orig = _handler(net)
+    try:
+        old_ms = (_time.time() - 3600) * 1000
+        fresh_ms = _time.time() * 1000
+        h._maybe_react({**_msg(mid="m-old"), "ts": old_ms})
+        check(not net.calls and "m-old" in h._seen,
+              "backlog event marked seen, no react (catch-up guard)")
+        h._maybe_react({**_msg(mid="m-old"), "ts": fresh_ms})
+        check(not net.calls, "redelivered backlog message stays silent (seen)")
+        h._maybe_react({**_msg(mid="m-fresh"), "ts": fresh_ms})
+        h._maybe_react(_msg(mid="m-tsless"))
+        check(h.flush(5) and len(net.calls) == 2,
+              "fresh + ts-less events still react")
+    finally:
+        urllib.request.urlopen = orig
+
+    net2 = _Net()
+    h2, orig2 = _handler(net2)
+    h2._max_age_s = 0
+    try:
+        h2._maybe_react({**_msg(mid="m-old2"), "ts": (_time.time() - 3600) * 1000})
+        check(h2.flush(5) and len(net2.calls) == 1,
+              "max_age_s=0 disables the guard (old event reacts)")
+    finally:
+        urllib.request.urlopen = orig2
+
+
 def test_bridge_wiring_default_on_optout_and_no_mxid():
     with tempfile.TemporaryDirectory() as d:
         m = _load_bridge(pathlib.Path(d))
@@ -289,9 +322,18 @@ def test_bridge_wiring_default_on_optout_and_no_mxid():
 
         os.environ.pop("SPARROW_OBSERVE_REACT", None)
         os.environ.pop("AGENT_MXID", None)
+        os.environ.pop("AGENT_ID", None)
         h = _start_and_grab_handler(m)
         check(type(h).__name__ == "TaskifyHandler",
-              "wiring: no AGENT_MXID → observer stays off")
+              "wiring: no AGENT_MXID/AGENT_ID → observer stays off")
+
+        # AGENT_ID fallback (live-deployment finding: a real install's durable
+        # env names the id AGENT_ID — "default-on" must hold there too).
+        os.environ["AGENT_ID"] = "@me:hs"
+        h = _start_and_grab_handler(m)
+        check(type(h).__name__ == "ReactObserverHandler",
+              "wiring: AGENT_ID alone arms the observer (fallback name)")
+        os.environ.pop("AGENT_ID", None)
 
         os.environ.pop("SPARROW_EVENTS", None)
 
@@ -305,6 +347,7 @@ if __name__ == "__main__":
     test_room_id_fully_escaped()
     test_slow_reaction_never_delays_inner()
     test_queue_overflow_drops_never_blocks()
+    test_catchup_guard_skips_backlog()
     test_bridge_wiring_default_on_optout_and_no_mxid()
     print(("PASS" if not FAILS else f"FAIL ({len(FAILS)})"))
     sys.exit(1 if FAILS else 0)

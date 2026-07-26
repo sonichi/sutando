@@ -1285,19 +1285,22 @@ def _maybe_start_event_channel() -> None:
         # Built-in 👀 observed-receipt — DEFAULT ON with the event plane (set
         # SPARROW_OBSERVE_REACT=0 to disable). Wrapped OUTERMOST and
         # chain-transparent, so decision routing + taskify see exactly the
-        # same stream and settlement they would without it. Needs AGENT_MXID
-        # for self-echo suppression; without it the receipt stays off (an
-        # agent 👀-ing its own messages is noise, not a signal).
+        # same stream and settlement they would without it. Needs the agent's
+        # own id for self-echo suppression; without it the receipt stays off
+        # (an agent 👀-ing its own messages is noise, not a signal).
+        # AGENT_ID is honored as a fallback name: live-deployment finding — a
+        # real install's durable env carried AGENT_ID, and reading only
+        # AGENT_MXID left the "default-on" receipt silently off.
         if (str(os.environ.get("SPARROW_OBSERVE_REACT", "1")).strip().lower()
                 not in ("0", "false", "no", "off")):
-            mxid = os.environ.get("AGENT_MXID")
+            mxid = os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID")
             if mxid:
                 from .default_observer import ReactObserverHandler
                 handler = ReactObserverHandler(
                     handler, URL, {"Authorization": f"Bearer {TOKEN}"}, mxid,
                     log=_log)
             else:
-                _log("react-observer: AGENT_MXID unset — observed-receipt off")
+                _log("react-observer: AGENT_MXID/AGENT_ID unset — observed-receipt off")
         consumer = EventConsumer(inbox, handler)
 
         def _drain_loop():

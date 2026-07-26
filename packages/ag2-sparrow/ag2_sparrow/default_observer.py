@@ -27,6 +27,7 @@ guarantee; the message stays marked seen so redelivery won't double-react).
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -47,12 +48,24 @@ _SEEN_CAP = 4096
 # the point where they stopped being a meaningful "seen just now" signal.
 _QUEUE_CAP = 256
 
+# Catch-up guard: only react to messages younger than this (seconds). A fresh
+# install's first event drain replays the room's FULL history (observed live:
+# a new inbox consumed cursor 0→570 in seconds) — an armed observer would 👀
+# every historical message across rooms, bounded only by _SEEN_CAP. The
+# receipt means "seen just NOW", so old events get marked seen without a
+# react. Events without a usable `ts` are treated as live (the field is
+# gateway-standard; dropping receipts on a missing field would silently
+# disable the feature). Tune with SPARROW_OBSERVE_MAX_AGE_S; 0/negative
+# disables the guard.
+_MAX_AGE_S_DEFAULT = 300.0
+
 
 class ReactObserverHandler:
     """Tee wrapper: react 👀 to others' new messages, then delegate offer()."""
 
     def __init__(self, inner, base_url: str, headers: dict, agent_mxid: str,
-                 log=print, timeout: float = 10.0, queue_cap: int = _QUEUE_CAP):
+                 log=print, timeout: float = 10.0, queue_cap: int = _QUEUE_CAP,
+                 max_age_s: "float | None" = None):
         self._inner = inner
         self._base = base_url.rstrip("/")
         self._headers = dict(headers)
@@ -63,6 +76,13 @@ class ReactObserverHandler:
         self._mxid = agent_mxid
         self._log = log
         self._timeout = timeout
+        if max_age_s is None:
+            try:
+                max_age_s = float(os.environ.get("SPARROW_OBSERVE_MAX_AGE_S")
+                                  or _MAX_AGE_S_DEFAULT)
+            except ValueError:
+                max_age_s = _MAX_AGE_S_DEFAULT
+        self._max_age_s = max_age_s
         self._seen: set = set()
         self._order: list = []
         self._queue: queue.Queue = queue.Queue(maxsize=queue_cap)
@@ -100,6 +120,15 @@ class ReactObserverHandler:
         if not room or not msg_id or msg_id in self._seen:
             return
         self._mark_seen(msg_id)
+        # Catch-up guard: a backlog/replayed event (first-boot inbox drain,
+        # deep reconnect) is marked seen but NOT reacted — the receipt means
+        # "seen just now", and first-boot history would otherwise be 👀-spammed
+        # across every room. ts is epoch-millis (gateway event schema).
+        if self._max_age_s > 0:
+            ts = event.get("ts")
+            if isinstance(ts, (int, float)) and ts > 0:
+                if (time.time() - ts / 1000.0) > self._max_age_s:
+                    return
         # safe="" so every reserved char in the room id is escaped — the
         # default safe="/" would leave a room id containing "/" split across
         # URL path segments, misrouting the react.
