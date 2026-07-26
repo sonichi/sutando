@@ -418,6 +418,37 @@ def case_o_launch_env_path() -> list[str]:
     return fails
 
 
+def case_p_wedged_to_dead_transition_reobserves() -> list[str]:
+    """A wedged→dead transition on the SAME oldest task must RE-OBSERVE (start a
+    fresh confirm window for the dead condition) — NOT inherit the wedge's
+    already-elapsed window and relaunch on the first dead pass. Regression for
+    the mode-unaware confirm-window reuse found reviewing #2160: dead and wedged
+    share wedge_first_seen/wedge_task, and without a mode check a core that is
+    wedged-and-confirming, then dies with the same oldest task, would restart
+    immediately though the DEAD condition was never confirmed across a pass."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        h = Harness(Path(td) / "rec.json")
+        h.run(now=1_000_000, alive=True, age=900, key="t1")            # wedged → observe
+        r_conf = h.run(now=1_000_100, alive=True, age=1000, key="t1")  # +100 < CONFIRM(120) → confirming
+        if not r_conf or r_conf.get("action") != "confirming":
+            fails.append(f"p) wedge should be confirming at +100s, got {r_conf}")
+        # Core DIES, SAME oldest task, at +200s (> CONFIRM measured from the wedge observe).
+        # Pre-fix this restarts (inherits the wedge window); post-fix it re-observes.
+        r_flip = h.run(now=1_000_200, alive=False, age=1000, key="t1")
+        if not r_flip or r_flip.get("action") != "observed":
+            fails.append(f"p) wedged→dead flip must RE-OBSERVE (fresh window), got {r_flip}")
+        if h.restart_calls:
+            fails.append(f"p) must NOT relaunch on the first dead pass after a wedge, got {h.restart_calls}")
+        # Dead now persists and confirms on ITS OWN window → relaunch.
+        r_dead = h.run(now=1_000_400, alive=False, age=1000, key="t1")  # +200s from the dead observe
+        if not r_dead or r_dead.get("action") != "restarted":
+            fails.append(f"p) confirmed-dead (own window) should relaunch, got {r_dead}")
+        if h.restart_calls != [False]:
+            fails.append(f"p) dead relaunch should call restart once (1M), got {h.restart_calls}")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_healthy_no_action),
@@ -436,6 +467,7 @@ def main() -> int:
         ("m", case_m_lock_prevents_concurrent_restart),
         ("n", case_n_failed_dm_still_restarts_and_records),
         ("o", case_o_launch_env_path),
+        ("p", case_p_wedged_to_dead_transition_reobserves),
     ]
     all_failures = []
     for label, fn in cases:

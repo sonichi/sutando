@@ -2723,6 +2723,7 @@ def recover_core_if_wedged(
             state["wedge_first_seen"] = 0
             state["wedge_task"] = None
             state["wedge_status_ts"] = None
+            state["wedge_mode"] = None
 
         oldest = oldest_task_fn()                    # (identity, age) | None
         cur_key = oldest[0] if oldest else None
@@ -2758,9 +2759,19 @@ def recover_core_if_wedged(
         # from a legitimately long single task. Reset the confirmation window if
         # EITHER the oldest task changed (queue draining → a different oldest, or
         # the file was rewritten → new mtime) OR the core advanced core-status.json
-        # (it's making progress, not looping). Only a SAME-task, NO-progress
-        # streak across the window is treated as a real wedge.
+        # (it's making progress, not looping) OR the observation MODE flipped
+        # (wedged↔dead). The mode reset matters because a wedge and a dead core
+        # share this observation state: a core that is wedged (alive, oldest task
+        # X, already confirming) can DIE with X still the oldest — without the
+        # mode check it would inherit the wedge's elapsed confirm window and
+        # relaunch on the first dead pass, so the "death persists across a pass"
+        # guarantee would not actually hold. wedged/dead are mutually exclusive
+        # here (wedged requires alive, dead requires not-alive), so cur_mode is
+        # unambiguous. Only a SAME-task, SAME-mode, NO-progress streak across the
+        # window is treated as a real wedge/death.
+        cur_mode = "wedged" if wedged else "dead"
         prev_key = state.get("wedge_task")
+        prev_mode = state.get("wedge_mode")
         prev_status_ts = state.get("wedge_status_ts")
         first_seen = state.get("wedge_first_seen") or 0
         progressed = (
@@ -2768,9 +2779,17 @@ def recover_core_if_wedged(
             and isinstance(status_ts, (int, float))
             and status_ts > prev_status_ts
         )
-        if (not first_seen) or prev_key != cur_key or progressed:
+        # Only a KNOWN prior mode that differs counts as a flip. A missing
+        # wedge_mode (None) is a pre-upgrade/fresh state file — treating that as a
+        # change would spuriously reset the window on the first post-upgrade pass
+        # (and break an in-progress give-up whose seeded state predates this
+        # field), so fall back to the key/progress gating there. cur_mode is
+        # backfilled on the next observe.
+        mode_flipped = prev_mode is not None and prev_mode != cur_mode
+        if (not first_seen) or prev_key != cur_key or mode_flipped or progressed:
             state["wedge_first_seen"] = now
             state["wedge_task"] = cur_key
+            state["wedge_mode"] = cur_mode
             state["wedge_status_ts"] = status_ts
             _save()
             return {"action": "observed", "oldest_age": oldest_age, "task": cur_key}
