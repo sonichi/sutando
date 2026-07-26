@@ -7,6 +7,7 @@ record shape (concrete room_id + pack provenance + observe/notify-only), reuse
 of observe_policy's standing-approval boundary (fail-closed on non-owner /
 out-of-scope room), owner disable→cancel + re-enable→re-seed (generation bump),
 join-time incremental seeding, deterministic id shape. Exit 0/1."""
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -131,6 +132,69 @@ def test_deterministic_id_shape_and_stability():
     check(a != c, "generation bump changes the id")
     check(op._POLICY_ID_RE.match(a) is not None,
           "derived id matches observe_policy._POLICY_ID_RE")
+
+
+def test_list_pack_and_unknown_entry_branches():
+    d = _store()
+    dpp.seed_defaults(d, OWNER, ROOMS)
+    rows = dpp.list_pack(d)
+    check(len(rows) == len(dpp.PACK_ENTRIES) and rows[0]["key"] == "react_baseline",
+          "list_pack returns a row per entry with live room counts")
+    check(dpp.is_enabled(d, "does_not_exist") is False,
+          "is_enabled is False for an unknown entry (fail-closed)")
+    out = dpp.set_enabled(d, "does_not_exist", False)
+    check(out["ok"] is False and "unknown" in out["reason"],
+          "set_enabled refuses an unknown entry")
+
+
+def test_on_room_join_default_scope_and_disabled_skip():
+    d = _store()
+    # default member_rooms=None -> owner_rooms defaults to [room_id]
+    res = dpp.on_room_join(d, OWNER, "!solo:ag2.space")
+    check(len(res) == 1 and res[0]["status"] == "seeded",
+          "on_room_join with default member_rooms seeds using the room itself as scope")
+    # disabled entry is skipped by on_room_join too
+    dpp.set_enabled(d, "react_baseline", False)
+    res2 = dpp.on_room_join(d, OWNER, "!another:ag2.space")
+    check(res2 == [], "on_room_join skips a disabled entry")
+
+
+def test_wrong_scope_entry_is_skipped():
+    d = _store()
+    dummy = {"key": "_dummy_scope", "label": "x", "description": "x",
+             "event_types": ["m.reaction"], "mode": "observe",
+             "cost_cap": {"evals_per_day": 1}, "scope": "single_room",
+             "default_enabled": True}
+    dpp.PACK_ENTRIES.append(dummy)
+    try:
+        res = dpp.seed_defaults(d, OWNER, ROOMS)
+        seeded_keys = {r["entry"] for r in res}
+        check("_dummy_scope" not in seeded_keys,
+              "seed_defaults skips an entry whose scope != all_member_rooms")
+        res2 = dpp.on_room_join(d, OWNER, "!z:ag2.space", member_rooms=["!z:ag2.space"])
+        check(all(r["entry"] != "_dummy_scope" for r in res2),
+              "on_room_join skips a non-all-member-rooms entry")
+    finally:
+        dpp.PACK_ENTRIES.remove(dummy)
+
+
+def test_cli_main():
+    d = _store()
+    check(dpp.main(["seed", "--owner", OWNER, "--rooms", ",".join(ROOMS), "--store", d]) == 0,
+          "CLI seed exits 0")
+    check(dpp.main(["list", "--store", d]) == 0, "CLI list exits 0")
+    check(dpp.main(["disable", "react_baseline", "--store", d]) == 0, "CLI disable exits 0")
+    check(dpp.is_enabled(d, "react_baseline") is False, "CLI disable took effect")
+    check(dpp.main(["enable", "react_baseline", "--store", d]) == 0, "CLI enable exits 0")
+    # error paths
+    check(dpp.main(["disable", "--store", d]) == 2, "CLI disable without key exits 2")
+    check(dpp.main(["seed", "--store", d]) == 2, "CLI seed without owner/rooms exits 2")
+
+
+def test_default_store_dir_resolves():
+    p = dpp._default_store_dir()
+    check(p.endswith(os.path.join("state", "observe")),
+          "_default_store_dir resolves to <workspace>/state/observe")
 
 
 def main():
