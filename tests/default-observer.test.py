@@ -10,7 +10,8 @@ import tempfile
 import urllib.error
 import urllib.request
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]
+                       / "packages" / "ag2-sparrow"))
 
 from ag2_sparrow.default_observer import (  # noqa: E402
     OBSERVE_REACTION, ReactObserverHandler, _SEEN_CAP,
