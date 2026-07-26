@@ -259,33 +259,35 @@ def _parse_onboarding_token(raw):
 def _token_from_ag2space_env():
     """Fallback token source when the launcher didn't export it into the env.
 
-    `connect` writes the relay token to
-    $CLAUDE_CONFIG_DIR/channels/ag2space/.env, but the ONLY thing that exports
-    it into the process environment is startup.sh. A desktop-spawned core never
-    runs startup.sh — its supervisor spawns the core with a fixed env whitelist
-    that does not carry the token — so on a pure desktop install the token sits
-    in that file with nothing reading it into the bridge: the bridge sees an
-    empty token and never connects (every new desktop-only user reproduces this).
-    Read it straight from the file so the bridge connects under ANY launcher, and
-    so a core that was already running when `connect` wrote the token picks it up
-    on the next start without depending on someone re-exporting the env.
+    `connect` writes the relay token to the channel .env, but not every launcher
+    gets it into the process environment. The desktop-spawned core is the case
+    that matters: its supervisor spawns the core (and the gateway window) with a
+    fixed env whitelist, and the window sources the .env only once at start — so
+    if connect writes the token after that (or the export step is skipped), the
+    bridge sees an empty token and never connects (every new desktop-only user
+    can reproduce this). Read the file directly so the bridge connects regardless
+    of who launched it, and so a bridge already looping when connect wrote the
+    token picks it up on its next start.
 
     The token carries the gateway URL (the url|secret onboarding form), so no
     separate URL read is needed — _parse_onboarding_token splits it downstream.
     Returns "" when no candidate file holds a token.
 
-    Candidate order matters. AG2_DEVICE_ENV is the absolute path the desktop
-    launcher (launch-sutando.sh) lays into the gateway window and points straight
-    at the file connect wrote — it is the ONLY one of these that reaches the
-    bridge in the desktop-spawned case. CLAUDE_CONFIG_DIR is NOT passed into that
-    window (only the core process gets it), so it is the weaker candidate — kept
-    for non-desktop launchers that do export it, plus the ~/.claude default.
+    Candidates, in order:
+      1. AG2_DEVICE_ENV — the absolute path the desktop launcher (launch-sutando.sh)
+         lays into the gateway window, pointing straight at the file connect wrote;
+         the ONLY one that reaches the bridge in the desktop-spawned case.
+      2. $CLAUDE_CONFIG_DIR/channels/ag2space/.env — for non-desktop launchers that
+         do export CLAUDE_CONFIG_DIR into the bridge's environment.
+    We deliberately do NOT guess ~/.claude: a bare-home guess is the one path that
+    could silently pick up a token from an UNRELATED/old install and connect as the
+    WRONG identity (reinstall, account switch, leftover config). Both real launchers
+    are covered above; the bare-home guess only adds a footgun.
     """
     candidates = [os.environ.get("AG2_DEVICE_ENV")]
     _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if _cfg:
         candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
-    candidates.append(os.path.join(os.path.expanduser("~"), ".claude", "channels", "ag2space", ".env"))
     for path in candidates:
         if not path:
             continue
@@ -304,6 +306,10 @@ def _token_from_ag2space_env():
         # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
         tok = vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN")
         if tok:
+            # Name the exact file — which .env supplied the token is load-bearing
+            # for diagnosis (and for spotting a wrong-file bind).
+            print(f"[remote-gateway-bridge] token not in env; loaded from {path}",
+                  file=sys.stderr, flush=True)
             return tok
     return ""
 
@@ -311,11 +317,6 @@ def _token_from_ag2space_env():
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
 if not _RAW:
     _RAW = _token_from_ag2space_env()
-    if _RAW:
-        print("[remote-gateway-bridge] token not in env; loaded from "
-              "channels/ag2space/.env (launcher did not export it — e.g. a "
-              "desktop-spawned core that skips startup.sh)",
-              file=sys.stderr, flush=True)
 _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN).rstrip("/")
