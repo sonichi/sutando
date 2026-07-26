@@ -18,6 +18,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -71,6 +72,35 @@ class TestCommSweepFreshness(unittest.TestCase):
         out = self.hc.check_comm_sweep_freshness()
         self.assertEqual(out["status"], "down")
         self.assertIn("silently stopped", out["detail"])
+
+    def test_stat_failure_warns_not_crashes(self):
+        # A stamp that exists() but whose stat() raises (races, permission, a
+        # broken mount) must degrade to warn, never propagate an OSError that
+        # would crash the whole health check.
+        class _StatFails:
+            def exists(self):
+                return True
+
+            def stat(self):
+                raise OSError("simulated stat failure")
+
+        with mock.patch.object(self.hc, "status_read_path", return_value=_StatFails()):
+            out = self.hc.check_comm_sweep_freshness()
+        self.assertEqual(out["name"], "comm-sweep")
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("stat failed", out["detail"])
+
+    def test_run_all_checks_emits_comm_sweep(self):
+        # Reachability guard (mirrors PR #1898): the probe is useless if it's
+        # defined but never wired into run_all_checks(). Exercise the actual
+        # call site and assert a "comm-sweep" check is emitted.
+        try:
+            checks = self.hc.run_all_checks()
+        except Exception as e:  # pragma: no cover - failure path
+            self.fail(f"run_all_checks() raised: {e!r}")
+        names = [c.get("name") for c in checks if isinstance(c, dict)]
+        self.assertIn("comm-sweep", names,
+                      "run_all_checks() emitted no comm-sweep check (branch unreachable)")
 
 
 if __name__ == "__main__":
