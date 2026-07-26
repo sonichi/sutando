@@ -31,6 +31,7 @@ import asyncio
 import json
 import os
 import socket
+import sqlite3
 import stat
 import sys
 import time
@@ -206,22 +207,26 @@ class RuntimeServer:
         # key is persisted BEFORE approval consumption and gateway contact.
         idem_key = params.get("idempotencyKey")
         fp = _fingerprint(params)
+
+        def _replay(existing: dict) -> dict:
+            # A key replays ONLY the identical execution — a different
+            # fingerprint under the same key is a caller bug and must not
+            # report the earlier side effect as this call's result.
+            if existing.get("fingerprint") != fp:
+                raise ProtocolError(-32602,
+                                    f"idempotencyKey {idem_key!r} was used for a "
+                                    "different action/resource/input — keys are "
+                                    "per-execution, pick a new one")
+            return {"requestId": existing["requestId"],
+                    "status": existing["status"],
+                    **({"result": existing["result"]}
+                       if existing.get("result") is not None else {}),
+                    "idempotentReplay": True}
+
         if idem_key:
             existing = self.store.by_idempotency_key(idem_key)
             if existing is not None:
-                # A key replays ONLY the identical execution — a different
-                # fingerprint under the same key is a caller bug and must not
-                # report the earlier side effect as this call's result.
-                if existing.get("fingerprint") != fp:
-                    raise ProtocolError(-32602,
-                                        f"idempotencyKey {idem_key!r} was used for a "
-                                        "different action/resource/input — keys are "
-                                        "per-execution, pick a new one")
-                return {"requestId": existing["requestId"],
-                        "status": existing["status"],
-                        **({"result": existing["result"]}
-                           if existing.get("result") is not None else {}),
-                        "idempotentReplay": True}
+                return _replay(existing)
         # Governed actions REQUIRE approval — validated and consumed atomically
         # BEFORE the executor can touch daemon-held credentials. One approval
         # authorizes exactly one execution (design: "批准 merge PR X 不能被复用").
@@ -252,14 +257,36 @@ class RuntimeServer:
                 raise ProtocolError(-32602,
                                     f"approval {approval_id} is bound to a different "
                                     "resource than this execution")
-            if not self.store.consume(approval_id):
-                raise ProtocolError(-32602,
-                                    f"approval {approval_id} already consumed (one-time use)")
-        rec = self.store.create("capability", "capability.execute",
-                                self.actor_id, params,
-                                task_id=params.get("taskId"),
-                                idempotency_key=idem_key,
-                                fingerprint=fp)
+        # Record creation + approval consumption are ONE durable transaction
+        # (review P1: consume-then-create left a window where a crash between
+        # the steps spent the approval with no replayable record, and a
+        # same-key/different-approval race could consume an extra approval
+        # before the unique index rejected the insert). create_consuming
+        # commits both or neither; a duplicate-key loss rolls back untouched.
+        try:
+            if approval_id:
+                rec = self.store.create_consuming(
+                    approval_id, "capability", "capability.execute",
+                    self.actor_id, params, task_id=params.get("taskId"),
+                    idempotency_key=idem_key, fingerprint=fp)
+                if rec is None:
+                    raise ProtocolError(-32602,
+                                        f"approval {approval_id} already consumed "
+                                        "(one-time use)")
+            else:
+                rec = self.store.create("capability", "capability.execute",
+                                        self.actor_id, params,
+                                        task_id=params.get("taskId"),
+                                        idempotency_key=idem_key,
+                                        fingerprint=fp)
+        except sqlite3.IntegrityError:
+            # Lost a same-key race after the replay check above: the winner's
+            # row is durable and OUR approval consume rolled back with the
+            # insert — replay the winner instead of double-executing.
+            existing = self.store.by_idempotency_key(idem_key) if idem_key else None
+            if existing is None:
+                raise
+            return _replay(existing)
         executor = EXECUTORS.get(action)
         if executor is None:
             result = {"executed": False,

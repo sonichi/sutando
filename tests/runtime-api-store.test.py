@@ -5,8 +5,9 @@ The E2E suite (tests/runtime-api-e2e.test.py) exercises the store through the
 REAL daemon — a subprocess the coverage recorder cannot see. This suite drives
 RequestStore directly in-process so the durable-lifecycle contract is both
 unit-pinned and coverage-visible: CAS transitions, lazy expiry, one-time
-consumption, idempotency-key lookup with fingerprint, pending recovery, and
-the pre-idempotency schema migration.
+consumption, idempotency-key lookup with fingerprint, atomic
+create_consuming (record + approval consumption in one transaction),
+pending recovery, and the pre-idempotency schema migration.
 
 Run: python3 tests/runtime-api-store.test.py   (stdlib only)
 """
@@ -95,6 +96,49 @@ def main() -> int:
           "by_idempotency_key returns the request with its fingerprint")
     check(store.by_idempotency_key("k-none") is None,
           "unknown idempotency key → None")
+
+    # ── create_consuming: record insert + approval consume are ONE txn ──────
+    # (review P1: consume-then-create left a window where a crash or a
+    # same-key race spent an approval without leaving a replayable record)
+    ap = store.create("approval", "approval.request", "@a:hs",
+                      {"action": "message.send", "resource": {"roomId": "!r"}})
+    store.transition(ap["requestId"], "approved", resolved_by="@o:hs")
+    cap = store.create_consuming(ap["requestId"], "capability",
+                                 "capability.execute", "@a:hs", {},
+                                 idempotency_key="atomic-k1", fingerprint="fpA")
+    check(cap is not None and cap["status"] == "pending"
+          and cap["requestId"].startswith("capability-"),
+          "create_consuming: record created")
+    check(store.get(ap["requestId"])["consumedAt"] is not None,
+          "create_consuming: approval consumed in the same commit")
+
+    n_before = store._db.execute(
+        "SELECT COUNT(*) FROM runtime_requests").fetchone()[0]
+    check(store.create_consuming(ap["requestId"], "capability",
+                                 "capability.execute", "@a:hs", {},
+                                 idempotency_key="atomic-k2") is None,
+          "already-consumed approval → create_consuming returns None")
+    n_after = store._db.execute(
+        "SELECT COUNT(*) FROM runtime_requests").fetchone()[0]
+    check(n_after == n_before and store.by_idempotency_key("atomic-k2") is None,
+          "lost consume race rolls back the insert (no orphan row, key unspent)")
+
+    ap2 = store.create("approval", "approval.request", "@a:hs",
+                       {"action": "message.send"})
+    store.transition(ap2["requestId"], "approved", resolved_by="@o:hs")
+    try:
+        store.create_consuming(ap2["requestId"], "capability",
+                               "capability.execute", "@a:hs", {},
+                               idempotency_key="atomic-k1", fingerprint="fpB")
+        dup_raised = False
+    except sqlite3.IntegrityError:
+        dup_raised = True
+    check(dup_raised, "duplicate idempotency key raises IntegrityError")
+    a2 = store.get(ap2["requestId"])
+    check(a2["status"] == "approved" and a2["consumedAt"] is None,
+          "same-key/different-approval race leaves the 2nd approval unconsumed")
+    check(store.consume(ap2["requestId"]) is True,
+          "raced-but-unspent approval remains consumable afterwards")
 
     store.close()
 

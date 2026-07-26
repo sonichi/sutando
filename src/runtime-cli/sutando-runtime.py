@@ -82,9 +82,12 @@ def main(argv=None) -> int:
              .add_parser("request")
     eli.add_argument("--task-id")
     eli.add_argument("--question", required=True)
-    eli.add_argument("--type", default="free_text",
+    eli.add_argument("--type", default="single_select",
                      choices=["free_text", "single_select", "multi_select",
-                              "confirmation"])
+                              "confirmation"],
+                     help="elicitation type (default: single_select; the v0 "
+                          "server rejects free_text — card transport is "
+                          "options-based)")
     eli.add_argument("--options")
     eli.add_argument("--expires-in", type=float)
 

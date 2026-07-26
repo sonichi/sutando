@@ -267,6 +267,32 @@ def main() -> int:
               and len(GW["posts"]) == posts_after_first,
               "idempotency key replays the first result — no duplicate send")
 
+        # same key + a DIFFERENT approval → replay, and the fresh approval is
+        # NOT consumed (review P1: record + approval consumption are one
+        # atomic step; a replayed key must never spend a second approval)
+        ra3 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}')
+        acta3 = pending_action_for(ra3["requestId"], store)
+        store.resolve(acta3["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", ra3["requestId"], "--timeout", "10")
+        rk3 = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"once"}',
+                  "--approval", ra3["requestId"],
+                  "--idempotency-key", "task-e2e:final")
+        check(rk3.get("idempotentReplay") is True
+              and rk3["requestId"] == rk1["requestId"]
+              and len(GW["posts"]) == posts_after_first,
+              "same key + different approval replays without a second send")
+        rk4 = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"fresh-after-replay"}',
+                  "--approval", ra3["requestId"],
+                  "--idempotency-key", "task-e2e:fresh")
+        check(rk4["status"] == "completed"
+              and GW["posts"][-1]["body"] == "fresh-after-replay",
+              "the replay did not consume the approval — still spendable once")
+
         # approval BINDING: an approval for another action cannot authorize
         # message.send — and the mismatch must not consume it.
         rb = cli("approval", "request", "--action", "repo.force_push",

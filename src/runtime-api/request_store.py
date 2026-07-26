@@ -90,6 +90,41 @@ class RequestStore:
         self._db.commit()
         return self.get(rid)
 
+    def create_consuming(self, approval_id: str, request_type: str, method: str,
+                         actor_id: str, params: dict, task_id=None,
+                         idempotency_key=None, fingerprint=None):
+        """create() + consume(approval_id) as ONE transaction. The record
+        insert (carrying its idempotency key) and the approval's consumption
+        commit together or not at all — a crash or duplicate-key race between
+        the two steps can never spend an approval without leaving a replayable
+        record (review P1: consume-then-create left exactly that window).
+        Returns the new record; None when the approval lost the consume race
+        (nothing inserted). A duplicate idempotency_key raises
+        sqlite3.IntegrityError with the approval untouched."""
+        rid = f"{request_type}-{uuid.uuid4().hex[:12]}"
+        now = time.time()
+        try:
+            self._db.execute(
+                "INSERT INTO runtime_requests (request_id, request_type, task_id,"
+                " execution_id, actor_id, method, params_json, status, created_at,"
+                " expires_at, idempotency_key, fingerprint)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, request_type, task_id, None, actor_id, method,
+                 json.dumps(params, ensure_ascii=False), "pending", now, None,
+                 idempotency_key, fingerprint))
+            cur = self._db.execute(
+                "UPDATE runtime_requests SET consumed_at = ? WHERE request_id = ?"
+                " AND status = 'approved' AND consumed_at IS NULL",
+                (now, approval_id))
+            if cur.rowcount != 1:
+                self._db.rollback()
+                return None
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        return self.get(rid)
+
     def by_idempotency_key(self, key: str):
         """The existing request created under this key, or None. The unique
         index makes create() with a duplicate key raise — callers must look
