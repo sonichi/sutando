@@ -16,6 +16,11 @@
 set -e
 
 LABEL="com.sutando.credential-proxy"
+# Logical `cd` (no -P, no realpath) is load-bearing: tests/credential-proxy-bundled-install.test.sh
+# runs the installer from a staged repo whose src/ is a SYMLINK to the real src/, and relies on
+# `$STAGE/src/..` resolving to $STAGE (not the symlink target) so the test only ever touches a
+# scratch dist/. If you change this to `cd -P`/`realpath`, that test will silently start writing
+# the real dist/credential-proxy.js — a production file on a bundled host. Keep it logical.
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$REPO/src/launchd/$LABEL.plist"
 DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
