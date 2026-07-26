@@ -594,15 +594,18 @@ def main() -> int:
           "token parse: a bare secret with no URL scheme is not split on its own | bytes")
 
     # ── env-fallback: token from channels/ag2space/.env when the launcher never
-    # exported it into the env. A desktop-spawned core skips startup.sh (the only
-    # thing that exports the token connect wrote to the file), so without this the
-    # bridge sees an empty env token and never connects — every new desktop-only
-    # user reproduces it (mark, 2026-07-26). The bridge must read the file directly.
+    # got it into the env. startup.sh exports it and the gateway window sources the
+    # file once at launch — but a supervisor-spawned core reliably hits neither, so
+    # without this the bridge sees an empty env token and never connects (every new
+    # desktop-only user reproduces it — mark, 2026-07-26). Read the file directly.
+    # Save/clear BOTH the current names and their legacy aliases (the production URL
+    # chain reads AG2_REMOTE_URL too), so an ambient value can't contaminate these
+    # imports.
     _saved = {k: os.environ.get(k) for k in
-              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL",
+              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
                "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV")}
     try:
-        for _k in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL",
+        for _k in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
                    "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV"):
             os.environ.pop(_k, None)
         _cfg = tempfile.mkdtemp()
