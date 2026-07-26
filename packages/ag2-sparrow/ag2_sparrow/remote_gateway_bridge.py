@@ -226,11 +226,38 @@ def _env_compat(new, old):
 # string may be the combined "https://<gateway>|<secret>" form (the URL travels
 # inside the token — nothing service-specific lives in this repo); a bare
 # secret needs REMOTE_TASK_URL alongside it.
+# The combined onboarding form is "<url>|<secret>" — the URL travels inside the
+# token. The separator is a literal "|", OR a "%7C"/"%7c" when the desktop connect
+# flow URL-encodes it (ag2space-cinny-desktop#231): "https://<gateway>/relay%7C<secret>".
+# A %7C-separated token carries no literal "|", so a naive split leaves it a bare
+# secret with an empty URL and the bridge FATALs at startup — the core looks
+# "connected" (device-connect completed) but never responds, the Vidhu-onboarding
+# failure 2026-07-24.
+_SEPARATOR_RE = re.compile(r"\||%7[Cc]")
+
+
+def _parse_onboarding_token(raw):
+    """Split the onboarding string into (url_from_token, secret).
+
+    NEVER mutates the token bytes — it only *splits* at the separator, so the
+    secret is returned verbatim (a bearer that itself contains "%7C" or "|" is
+    preserved intact; #2307 review). Disambiguation: only the combined form —
+    which begins with an http(s):// scheme — carries a separator to split on; a
+    bare secret is opaque and returned untouched even if it contains "%7C".
+
+    Handled at the single parse point, so every caller (startup.sh, direct env,
+    legacy AG2_REMOTE_TOKEN alias) is covered regardless of the onboarding writer.
+    """
+    if not raw.lower().startswith(("http://", "https://")):
+        return "", raw  # bare secret — opaque, never touched
+    m = _SEPARATOR_RE.search(raw)
+    if m is None:
+        return "", raw  # scheme but no separator; the URL-less guard in main() speaks
+    return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
+
+
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
-if "|" in _RAW:
-    _URL_FROM_TOKEN, TOKEN = _RAW.split("|", 1)
-else:
-    _URL_FROM_TOKEN, TOKEN = "", _RAW
+_URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
@@ -1389,8 +1416,17 @@ def _maybe_start_event_channel() -> None:
 
 
 def main() -> None:
-    if not URL or not TOKEN:
-        sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
+    if not TOKEN:
+        sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
+    if not URL:
+        # A token that starts with a URL scheme but yielded no URL means the
+        # url|secret separator was swallowed (e.g. a %7C survived decoding, or a
+        # new encoding we don't handle) — say so, instead of the misleading
+        # "set REMOTE_TASK_TOKEN" when the token is present but malformed.
+        _hint = (" — the token carries a gateway URL but the url|secret separator "
+                 "looks missing/corrupted" if TOKEN[:4].lower() == "http" else "")
+        sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
+                 f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     if not _acquire_singleton():
         return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
     inflight: set[str] = _load_inflight()
