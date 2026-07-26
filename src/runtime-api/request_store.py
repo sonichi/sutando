@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS runtime_requests (
   resolved_at  REAL,
   resolved_by  TEXT,
   consumed_at  REAL,
-  idempotency_key TEXT
+  idempotency_key TEXT,
+  fingerprint  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_requests_idem
   ON runtime_requests (idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -54,23 +55,38 @@ class RequestStore:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
+        # Idempotent migration BEFORE the schema script: a pre-idempotency v0
+        # DB (the live acceptance created one) has the table without the two
+        # newer columns, and CREATE TABLE IF NOT EXISTS won't add them — the
+        # index creation would then fail on boot (review P1: rolling-update
+        # path). ALTER is a no-op error when the column already exists.
+        have = {r[1] for r in self._db.execute(
+            "PRAGMA table_info(runtime_requests)").fetchall()}
+        if have:  # table exists — migrate missing columns
+            for col, decl in (("idempotency_key", "TEXT"),
+                              ("fingerprint", "TEXT")):
+                if col not in have:
+                    self._db.execute(
+                        f"ALTER TABLE runtime_requests ADD COLUMN {col} {decl}")
         self._db.executescript(_SCHEMA)
         self._db.commit()
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def create(self, request_type: str, method: str, actor_id: str,
                params: dict, task_id=None, execution_id=None,
-               expires_in_s=None, idempotency_key=None) -> dict:
+               expires_in_s=None, idempotency_key=None,
+               fingerprint=None) -> dict:
         rid = f"{request_type}-{uuid.uuid4().hex[:12]}"
         now = time.time()
         expires_at = (now + float(expires_in_s)) if expires_in_s else None
         self._db.execute(
             "INSERT INTO runtime_requests (request_id, request_type, task_id,"
             " execution_id, actor_id, method, params_json, status, created_at,"
-            " expires_at, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " expires_at, idempotency_key, fingerprint)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (rid, request_type, task_id, execution_id, actor_id, method,
              json.dumps(params, ensure_ascii=False), "pending", now, expires_at,
-             idempotency_key))
+             idempotency_key, fingerprint))
         self._db.commit()
         return self.get(rid)
 
@@ -79,9 +95,14 @@ class RequestStore:
         index makes create() with a duplicate key raise — callers must look
         up FIRST and return the recorded request instead of re-executing."""
         row = self._db.execute(
-            "SELECT request_id FROM runtime_requests WHERE idempotency_key = ?",
-            (key,)).fetchone()
-        return self.get(row[0]) if row else None
+            "SELECT request_id, fingerprint FROM runtime_requests"
+            " WHERE idempotency_key = ?", (key,)).fetchone()
+        if not row:
+            return None
+        rec = self.get(row[0])
+        if rec is not None:
+            rec["fingerprint"] = row[1]
+        return rec
 
     def get(self, request_id: str):
         cur = self._db.execute(

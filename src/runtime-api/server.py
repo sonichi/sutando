@@ -88,6 +88,19 @@ EXECUTORS = {
 GOVERNED_ACTIONS = frozenset({"message.send"})
 
 
+def _fingerprint(params: dict) -> str:
+    """Canonical identity of an execution: action + resource + input. An
+    idempotency key may only replay a request with the SAME fingerprint —
+    a reused key with different content must be rejected, never report a
+    different side effect as complete (review P1)."""
+    import hashlib
+    canon = json.dumps({"action": params.get("action"),
+                        "resource": params.get("resource"),
+                        "input": params.get("input")},
+                       sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
 RESOLVER_POLL_S = float(os.environ.get("SUTANDO_RUNTIME_RESOLVE_POLL", "2"))
 WAIT_POLL_S = 0.5
 DEFAULT_WAIT_TIMEOUT_S = 30.0
@@ -161,7 +174,7 @@ class RuntimeServer:
             return self._issue("elicitation", method, params,
                                required=("question",))
         if method == "capability.execute":
-            return self._capability(params)
+            return await self._capability(params)
         if method == "request.get":
             return self._get(params)
         if method == "request.wait":
@@ -182,7 +195,7 @@ class RuntimeServer:
         self._ha_of[rec["requestId"]] = opener(rec)
         return {"requestId": rec["requestId"], "status": "pending"}
 
-    def _capability(self, params: dict) -> dict:
+    async def _capability(self, params: dict) -> dict:
         action = params.get("action")
         if not action:
             raise ProtocolError(-32602, "missing required param: action")
@@ -192,9 +205,18 @@ class RuntimeServer:
         # send, or spuriously failed on the already-consumed approval). The
         # key is persisted BEFORE approval consumption and gateway contact.
         idem_key = params.get("idempotencyKey")
+        fp = _fingerprint(params)
         if idem_key:
             existing = self.store.by_idempotency_key(idem_key)
             if existing is not None:
+                # A key replays ONLY the identical execution — a different
+                # fingerprint under the same key is a caller bug and must not
+                # report the earlier side effect as this call's result.
+                if existing.get("fingerprint") != fp:
+                    raise ProtocolError(-32602,
+                                        f"idempotencyKey {idem_key!r} was used for a "
+                                        "different action/resource/input — keys are "
+                                        "per-execution, pick a new one")
                 return {"requestId": existing["requestId"],
                         "status": existing["status"],
                         **({"result": existing["result"]}
@@ -216,13 +238,28 @@ class RuntimeServer:
             if appr["status"] != "approved":
                 raise ProtocolError(-32602,
                                     f"approval {approval_id} is {appr['status']}, not approved")
+            # BINDING: an approval authorizes exactly the action+resource the
+            # owner saw on the card — an approved repo.force_push must never
+            # authorize a message.send (review P1). Compared canonically,
+            # BEFORE consumption, so a mismatch costs nothing.
+            ap = appr.get("params") or {}
+            if ap.get("action") != action:
+                raise ProtocolError(-32602,
+                                    f"approval {approval_id} authorizes action "
+                                    f"{ap.get('action')!r}, not {action!r}")
+            if json.dumps(ap.get("resource"), sort_keys=True) != \
+                    json.dumps(params.get("resource"), sort_keys=True):
+                raise ProtocolError(-32602,
+                                    f"approval {approval_id} is bound to a different "
+                                    "resource than this execution")
             if not self.store.consume(approval_id):
                 raise ProtocolError(-32602,
                                     f"approval {approval_id} already consumed (one-time use)")
         rec = self.store.create("capability", "capability.execute",
                                 self.actor_id, params,
                                 task_id=params.get("taskId"),
-                                idempotency_key=idem_key)
+                                idempotency_key=idem_key,
+                                fingerprint=fp)
         executor = EXECUTORS.get(action)
         if executor is None:
             result = {"executed": False,
@@ -232,7 +269,10 @@ class RuntimeServer:
             return {"requestId": rec["requestId"], "status": "failed",
                     "result": result}
         try:
-            result = executor(params)
+            # Blocking executors (urlopen) must not stall the event loop — one
+            # slow send would freeze every client AND the resolver (review P1,
+            # measured: a 1.5s executor delayed asyncio.sleep(0) by 1.5s).
+            result = await asyncio.to_thread(executor, params)
             status = "completed"
         except Exception as e:  # noqa: BLE001 — executor failure = failed request
             result = {"executed": False, "error": str(e)}

@@ -105,7 +105,7 @@ def pending_action_for(request_id, store, timeout=5):
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-GW = {"posts": [], "swallow": False}
+GW = {"posts": [], "swallow": False, "slow": False}
 
 
 class _GwHandler(BaseHTTPRequestHandler):
@@ -113,6 +113,8 @@ class _GwHandler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
+        if GW["slow"]:
+            time.sleep(1.5)
         n = int(self.headers.get("Content-Length") or 0)
         GW["posts"].append(json.loads(self.rfile.read(n).decode()))
         body = b"{}" if GW["swallow"] else json.dumps(
@@ -206,6 +208,7 @@ def main() -> int:
         # 4. capability.execute — REAL message.send against the mock gateway,
         #    gated by a consumed-once approval (the full acceptance chain).
         ra = cli("approval", "request", "--action", "message.send",
+                 "--resource", '{"roomId":"!room:example.org"}',
                  "--reason", "post the summary")
         acta = pending_action_for(ra["requestId"], store)
         store.resolve(acta["action_id"], {"1": [1]}, "@owner:example.org")
@@ -242,7 +245,8 @@ def main() -> int:
 
         # idempotency: same key replays the recorded result — no second send,
         # no 'already consumed' failure on retry
-        ra2 = cli("approval", "request", "--action", "message.send")
+        ra2 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}')
         acta2 = pending_action_for(ra2["requestId"], store)
         store.resolve(acta2["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", ra2["requestId"], "--timeout", "10")
@@ -263,8 +267,75 @@ def main() -> int:
               and len(GW["posts"]) == posts_after_first,
               "idempotency key replays the first result — no duplicate send")
 
+        # approval BINDING: an approval for another action cannot authorize
+        # message.send — and the mismatch must not consume it.
+        rb = cli("approval", "request", "--action", "repo.force_push",
+                 "--resource", '{"repository":"o/r"}')
+        actb = pending_action_for(rb["requestId"], store)
+        store.resolve(actb["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", rb["requestId"], "--timeout", "10")
+        pb = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                             "--action", "message.send",
+                             "--resource", '{"roomId":"!room:example.org"}',
+                             "--input", '{"body":"cross"}',
+                             "--approval", rb["requestId"]],
+                            capture_output=True, text=True, env=ENV)
+        check(pb.returncode == 1 and "authorizes action" in pb.stderr,
+              "approval for another action cannot authorize message.send")
+        # resource binding: same action, different resource → refused
+        rb2 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!OTHER:example.org"}')
+        actb2 = pending_action_for(rb2["requestId"], store)
+        store.resolve(actb2["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", rb2["requestId"], "--timeout", "10")
+        pb2 = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                              "--action", "message.send",
+                              "--resource", '{"roomId":"!room:example.org"}',
+                              "--input", '{"body":"cross2"}',
+                              "--approval", rb2["requestId"]],
+                             capture_output=True, text=True, env=ENV)
+        check(pb2.returncode == 1 and "different resource" in pb2.stderr,
+              "approval bound to another resource cannot authorize this send")
+
+        # idempotency-key REUSE with a different fingerprint → rejected
+        pk = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                             "--action", "message.send",
+                             "--resource", '{"roomId":"!room:example.org"}',
+                             "--input", '{"body":"DIFFERENT"}',
+                             "--idempotency-key", "task-e2e:final"],
+                            capture_output=True, text=True, env=ENV)
+        check(pk.returncode == 1 and "different action/resource/input" in pk.stderr,
+              "idempotency key reuse with a different fingerprint is rejected")
+
+        # concurrency: a slow gateway send must not stall other requests
+        import threading as _th
+        ra4 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}')
+        acta4 = pending_action_for(ra4["requestId"], store)
+        store.resolve(acta4["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", ra4["requestId"], "--timeout", "10")
+        GW["slow"] = True
+        slow_done = {}
+        def _slow_send():
+            slow_done["r"] = cli("capability", "execute", "--action", "message.send",
+                                 "--resource", '{"roomId":"!room:example.org"}',
+                                 "--input", '{"body":"slowpoke"}',
+                                 "--approval", ra4["requestId"], timeout=30)
+        t = _th.Thread(target=_slow_send)
+        t.start()
+        time.sleep(0.3)  # let the slow send enter the executor
+        t0 = time.monotonic()
+        g = cli("request", "get", ra4["requestId"])
+        dt = time.monotonic() - t0
+        t.join(timeout=30)
+        GW["slow"] = False
+        check(dt < 1.0 and g is not None
+              and slow_done.get("r", {}).get("status") == "completed",
+              f"slow executor does not stall other requests (get took {dt:.2f}s)")
+
         # swallowed-send 200 (no event_id) → failed, never falsely completed
-        ra3 = cli("approval", "request", "--action", "message.send")
+        ra3 = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}')
         acta3 = pending_action_for(ra3["requestId"], store)
         store.resolve(acta3["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", ra3["requestId"], "--timeout", "10")
@@ -302,6 +373,33 @@ def main() -> int:
         w7 = cli("request", "wait", r6["requestId"], "--timeout", "10")
         check(w7["status"] == "approved",
               "pending request survives daemon restart and resolves (recovery)")
+
+        # 7b. rolling-update migration: a pre-idempotency v0 DB gains the new
+        # columns on boot instead of crashing (the live acceptance created one).
+        import sqlite3 as _sq
+        old_db = str(Path(TMP) / "old-schema.sqlite")
+        con = _sq.connect(old_db)
+        con.executescript("""
+CREATE TABLE runtime_requests (
+  request_id TEXT PRIMARY KEY, request_type TEXT NOT NULL, task_id TEXT,
+  execution_id TEXT, actor_id TEXT NOT NULL, method TEXT NOT NULL,
+  params_json TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT,
+  created_at REAL NOT NULL, expires_at REAL, resolved_at REAL,
+  resolved_by TEXT, consumed_at REAL);
+INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
+  '@a:hs','approval.request','{}','pending',NULL,1,NULL,NULL,NULL,NULL);
+""")
+        con.commit(); con.close()
+        spec_rs = importlib.util.spec_from_file_location(
+            "rs", REPO / "src" / "runtime-api" / "request_store.py")
+        rs = importlib.util.module_from_spec(spec_rs)
+        spec_rs.loader.exec_module(rs)
+        migrated = rs.RequestStore(old_db)
+        rec_old = migrated.get("approval-old1")
+        check(rec_old is not None and rec_old["status"] == "pending"
+              and migrated.by_idempotency_key("nope") is None,
+              "pre-idempotency DB migrates on boot (old rows readable, index usable)")
+        migrated.close()
 
         # 8. cancel wins over a late answer (CAS terminal immutability)
         r8 = cli("approval", "request", "--action", "late.answer")
