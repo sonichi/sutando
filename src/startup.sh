@@ -671,7 +671,15 @@ if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ];
 fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
-  _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+  # Same dist-only contract as the wrapper and the installer: a bundled host
+  # ships dist/ and has no quota-tracker skill dir, so resolving the TS source
+  # here would hand run_node_service a path that does not exist and leave the
+  # host with no proxy at all ("Claude will connect directly").
+  if [ "$BUNDLED_MODE" = "1" ]; then
+    _PROXY_SCRIPT="$REPO/dist/credential-proxy.js"
+  else
+    _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+  fi
   run_node_service credential-proxy "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then

@@ -68,11 +68,34 @@ case "$cmd" in
             echo "ERROR: template not found: $TEMPLATE" >&2
             exit 1
         fi
-        _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
-        if [ ! -f "$_PROXY_SCRIPT" ]; then
-            echo "ERROR: quota-tracker skill not found at $_PROXY_SCRIPT" >&2
-            echo "  Install it first — credential-proxy.ts is the proxy target." >&2
-            exit 1
+        # Validate the target the WRAPPER will actually use. In bundled mode the
+        # wrapper execs dist/credential-proxy.js and never reads the TS source
+        # (credential-proxy-wrapper.sh), so gating on the TS source there would
+        # reject a correctly-packaged host: a pristine bundled install ships dist
+        # only, has no quota-tracker skill dir, and would end up with no proxy at
+        # all. Detect bundled mode exactly as the wrapper does.
+        _I_APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
+        _I_ENGINE_ROOT="${_I_APP_NODE_DIR%/node/bin}"; _I_ENGINE_ROOT="${_I_ENGINE_ROOT%/runtime}"
+        _I_BUNDLED=0
+        if [ -n "${SUTANDO_NODE:-}" ]; then
+            _I_BUNDLED=1
+        elif [ -x "$_I_APP_NODE_DIR/node" ] && [ "${REPO#"$_I_ENGINE_ROOT"/}" != "$REPO" ]; then
+            _I_BUNDLED=1
+        fi
+        if [ "$_I_BUNDLED" = "1" ]; then
+            _PROXY_SCRIPT="$REPO/dist/credential-proxy.js"
+            if [ ! -f "$_PROXY_SCRIPT" ]; then
+                echo "ERROR: bundled mode but $_PROXY_SCRIPT missing — desktop packaging error" >&2
+                echo "  The wrapper fail-closes on this too (exit 78); build:bundle must emit it." >&2
+                exit 1
+            fi
+        else
+            _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+            if [ ! -f "$_PROXY_SCRIPT" ]; then
+                echo "ERROR: quota-tracker skill not found at $_PROXY_SCRIPT" >&2
+                echo "  Install it first — credential-proxy.ts is the proxy target." >&2
+                exit 1
+            fi
         fi
         BREW_BIN="$(resolve_brew_bin)"
         echo "Installing $LABEL"
