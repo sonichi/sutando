@@ -34,7 +34,7 @@ def check(cond: bool, msg: str) -> None:
 # ── mock gateway ────────────────────────────────────────────────────────────
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
-         "room_posts": [], "force_room_502": False,
+         "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
          "force_heartbeat_404": False, "force_media_redirect": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
@@ -93,7 +93,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(502); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
-            self.send_response(200); self.end_headers()
+            if STATE["force_room_empty_200"]:
+                # Deployed-broker failure shape: room-send swallowed server-side,
+                # 200 with no event_id — must NOT count as delivered.
+                body = b"{}"
+            else:
+                body = json.dumps({"ok": True,
+                                   "event_id": f"$evt-{len(STATE['room_posts'])}"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers(); self.wfile.write(body)
         elif self.path == "/v1/heartbeat":
             if STATE["force_heartbeat_404"]:
                 self.send_response(404); self.end_headers(); return
@@ -396,10 +405,23 @@ def main() -> int:
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == 2 and not (rtc.RESULTS_DIR / "proactive-t2.txt").exists(),
           "retry after failure delivers")
+    # 200 WITHOUT a delivery signal (server swallowed the room send) → the
+    # file is restored for retry, NOT archived — a bare 200 never proves
+    # delivery (review P1: bad room / kicked agent / power-level denial).
+    (rtc.RESULTS_DIR / "proactive-t2b.txt").write_text("nudge 2b")
+    STATE["force_room_empty_200"] = True
+    rtc._post_proactive()
+    STATE["force_room_empty_200"] = False
+    check((rtc.RESULTS_DIR / "proactive-t2b.txt").exists(),
+          "200 without event_id restores the file (no false archive)")
+    rtc._post_proactive()
+    check(not (rtc.RESULTS_DIR / "proactive-t2b.txt").exists(),
+          "retry with a real delivery signal archives")
+
     # Empty file → dropped silently, no POST.
     (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("  \n")
     rtc._post_proactive()
-    check(len(STATE["room_posts"]) == 2 and not (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
+    check(len(STATE["room_posts"]) == 4 and not (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
           "empty proactive file dropped without a send")
     # Orphan .sending recovery (crash between claim and delivery).
     (rtc.RESULTS_DIR / "proactive-t4.sending").write_text("orphan nudge")
@@ -407,7 +429,7 @@ def main() -> int:
     check((rtc.RESULTS_DIR / "proactive-t4.txt").exists(),
           "orphan .sending claim recovered to .txt")
     rtc._post_proactive()
-    check(len(STATE["room_posts"]) == 3 and STATE["room_posts"][2]["body"] == "orphan nudge",
+    check(len(STATE["room_posts"]) == 5 and STATE["room_posts"][4]["body"] == "orphan nudge",
           "recovered orphan delivers on next drain")
     rtc.PROACTIVE_ROOM = ""
 

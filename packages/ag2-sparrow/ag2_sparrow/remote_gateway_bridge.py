@@ -1105,9 +1105,27 @@ def _post_proactive() -> None:
             claim.unlink(missing_ok=True)  # empty nudge — nothing to say
             continue
         try:
-            _req("POST", "/v1/room",
-                 {"op": "message", "room_id": PROACTIVE_ROOM, "body": body},
-                 timeout=15)
+            resp = _req("POST", "/v1/room",
+                        {"op": "message", "room_id": PROACTIVE_ROOM, "body": body},
+                        timeout=15)
+            # A bare 200 is NOT proof of delivery: the gateway can swallow a
+            # room-send failure server-side (bad room id, kicked agent,
+            # power-level denial) and still answer 200 (review P1). Archive
+            # ONLY on the positive delivery signal — the event id of the
+            # posted message (the deployed broker returns
+            # {"ok": true, "event_id": "$..."}). Anything else is treated as
+            # a failed send: the claim is renamed back and retried next pass,
+            # loudly, so a misconfigured room is visible instead of silently
+            # eating nudges.
+            if not (isinstance(resp, dict) and resp.get("event_id")):
+                _log(f"proactive send for {f.name} got no delivery signal "
+                     f"(response {str(resp)[:120]!r}) — will retry; check "
+                     "REMOTE_PROACTIVE_ROOM and the agent's room membership")
+                try:
+                    claim.rename(f)
+                except OSError:
+                    pass
+                continue
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 try:
