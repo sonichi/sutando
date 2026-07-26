@@ -95,6 +95,7 @@ def main(argv=None) -> int:
     cap.add_argument("--resource")
     cap.add_argument("--input")
     cap.add_argument("--idempotency-key")
+    cap.add_argument("--approval", help="approval requestId that authorizes this execution (consumed once)")
 
     req = sub.add_parser("request").add_subparsers(dest="cmd", required=True)
     for name in ("get", "wait", "cancel"):
@@ -119,7 +120,8 @@ def main(argv=None) -> int:
             result = _rpc("capability.execute", {
                 "taskId": args.task_id, "action": args.action,
                 "resource": _jarg(args.resource), "input": _jarg(args.input),
-                "idempotencyKey": args.idempotency_key}, timeout=60)
+                "idempotencyKey": args.idempotency_key,
+                "approvalRequestId": args.approval}, timeout=60)
         else:
             method = f"request.{args.cmd}"
             params = {"requestId": args.request_id}

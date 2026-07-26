@@ -44,6 +44,45 @@ from protocol import (MAX_LINE_BYTES, ELICITATION_TYPES, ProtocolError,  # noqa:
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter  # noqa: E402
 
+def _exec_message_send(params: dict) -> dict:
+    """Governed room send through the gateway. Fails closed: only a response
+    carrying the posted message's event_id counts as delivered (the #2324
+    client / #207 broker contract) — a swallowed-send 200 is a failure.
+    Credentials are daemon-resolved from the environment (REMOTE_TASK_URL /
+    REMOTE_TASK_TOKEN, same names the gateway bridge documents); the CLI can
+    never supply them."""
+    import urllib.request
+    url = (os.environ.get("REMOTE_TASK_URL") or "").rstrip("/")
+    token = os.environ.get("REMOTE_TASK_TOKEN") or ""
+    if not url or not token:
+        raise RuntimeError("gateway not configured (REMOTE_TASK_URL/REMOTE_TASK_TOKEN)")
+    resource = params.get("resource") or {}
+    room = resource.get("roomId")
+    body = (params.get("input") or {}).get("body")
+    if not room or not body:
+        raise RuntimeError("message.send needs resource.roomId and input.body")
+    req = urllib.request.Request(
+        url + "/v1/room",
+        data=json.dumps({"op": "message", "room_id": room,
+                         "body": str(body)}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json",
+                 "Accept": "application/json",
+                 "User-Agent": "sutando-gateway-client/1.0"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        reply = json.loads(resp.read().decode("utf-8") or "{}")
+    event_id = reply.get("event_id") or (reply.get("result") or {}).get("event_id")
+    if not event_id:
+        raise RuntimeError(f"send not confirmed (no event_id in {str(reply)[:120]!r})")
+    return {"executed": True, "eventId": event_id, "roomId": room}
+
+
+EXECUTORS = {
+    "message.send": _exec_message_send,
+}
+
+
 RESOLVER_POLL_S = float(os.environ.get("SUTANDO_RUNTIME_RESOLVE_POLL", "2"))
 WAIT_POLL_S = 0.5
 DEFAULT_WAIT_TIMEOUT_S = 30.0
@@ -131,18 +170,41 @@ class RuntimeServer:
         action = params.get("action")
         if not action:
             raise ProtocolError(-32602, "missing required param: action")
+        # One-time approval consumption: when the caller names the approval
+        # that authorizes this execution, it must be APPROVED and unconsumed —
+        # and consuming it is atomic, so one approval can never authorize two
+        # executions (design: "批准 merge PR X 不能被复用").
+        approval_id = params.get("approvalRequestId")
+        if approval_id:
+            appr = self.store.get(approval_id)
+            if appr is None or appr["requestType"] != "approval":
+                raise ProtocolError(-32602, f"unknown approval: {approval_id!r}")
+            if appr["status"] != "approved":
+                raise ProtocolError(-32602,
+                                    f"approval {approval_id} is {appr['status']}, not approved")
+            if not self.store.consume(approval_id):
+                raise ProtocolError(-32602,
+                                    f"approval {approval_id} already consumed (one-time use)")
         rec = self.store.create("capability", "capability.execute",
                                 self.actor_id, params,
                                 task_id=params.get("taskId"))
-        # v0: fake executor — records and completes immediately so the request
-        # lifecycle is E2E-testable. Slice ② replaces this with the governed
-        # gateway path (message.send verified by event_id, per #2324/#207).
-        result = {"executed": False, "echo": {"action": action,
-                                              "input": params.get("input")},
-                  "note": "capability execution lands in slice ②"}
-        self.store.transition(rec["requestId"], "completed", result=result,
-                              resolved_by="fake-executor")
-        return {"requestId": rec["requestId"], "status": "completed",
+        executor = EXECUTORS.get(action)
+        if executor is None:
+            result = {"executed": False,
+                      "error": f"no executor for action {action!r}"}
+            self.store.transition(rec["requestId"], "failed", result=result,
+                                  resolved_by="executor")
+            return {"requestId": rec["requestId"], "status": "failed",
+                    "result": result}
+        try:
+            result = executor(params)
+            status = "completed"
+        except Exception as e:  # noqa: BLE001 — executor failure = failed request
+            result = {"executed": False, "error": str(e)}
+            status = "failed"
+        self.store.transition(rec["requestId"], status, result=result,
+                              resolved_by="executor")
+        return {"requestId": rec["requestId"], "status": status,
                 "result": result}
 
     def _get(self, params: dict) -> dict:

@@ -100,16 +100,46 @@ def pending_action_for(request_id, store, timeout=5):
     return None
 
 
+# Mock gateway: /v1/room returns {ok, event_id} (the #207 broker contract);
+# togglable swallowed-send mode returns bare {} — must read as NOT delivered.
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+GW = {"posts": [], "swallow": False}
+
+
+class _GwHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        GW["posts"].append(json.loads(self.rfile.read(n).decode()))
+        body = b"{}" if GW["swallow"] else json.dumps(
+            {"ok": True, "event_id": f"$evt-{len(GW['posts'])}"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+_gw_srv = ThreadingHTTPServer(("127.0.0.1", 0), _GwHandler)
+threading.Thread(target=_gw_srv.serve_forever, daemon=True).start()
+GW_URL = f"http://127.0.0.1:{_gw_srv.server_address[1]}"
+
 TMP = tempfile.mkdtemp(prefix="runtime-api-e2e-")
 ENV = {**os.environ,
        "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),
        "SUTANDO_RUNTIME_DB": str(Path(TMP) / "runtime-state.sqlite"),
        "SUTANDO_HA_DIR": str(Path(TMP) / "human-actions"),
        "SUTANDO_RUNTIME_RESOLVE_POLL": "0.3",
-       "SUTANDO_AGENT_ID": "@test-agent:example.org"}
+       "SUTANDO_AGENT_ID": "@test-agent:example.org",
+       "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
+       "REMOTE_TASK_TOKEN": "test-bearer"}
 
 
 def main() -> int:
+    ENV["REMOTE_TASK_URL"] = GW_URL
     daemon = start_daemon()
     store = ha_store()
     try:
@@ -149,12 +179,44 @@ def main() -> int:
               and w3["result"]["answer"] == "production",
               "elicitation returns the chosen option label")
 
-        # 4. capability (fake executor in v0)
+        # 4. capability.execute — REAL message.send against the mock gateway,
+        #    gated by a consumed-once approval (the full acceptance chain).
+        ra = cli("approval", "request", "--action", "message.send",
+                 "--reason", "post the summary")
+        acta = pending_action_for(ra["requestId"], store)
+        store.resolve(acta["action_id"], {"1": [1]}, "@owner:example.org")
+        wa = cli("request", "wait", ra["requestId"], "--timeout", "10")
+        check(wa["status"] == "approved", "gating approval approved")
         r4 = cli("capability", "execute", "--action", "message.send",
-                 "--input", '{"body":"hello"}')
+                 "--resource", '{"roomId":"!room:example.org"}',
+                 "--input", '{"body":"hello"}',
+                 "--approval", ra["requestId"])
         check(r4["status"] == "completed"
-              and r4["result"]["echo"]["input"]["body"] == "hello",
-              "capability.execute completes through the fake executor")
+              and r4["result"]["eventId"] == "$evt-1"
+              and GW["posts"][-1]["body"] == "hello"
+              and GW["posts"][-1]["room_id"] == "!room:example.org",
+              "capability.execute delivers via gateway, verified by event_id")
+        # one-time consumption: the same approval cannot authorize a second send
+        p4 = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                             "--action", "message.send",
+                             "--resource", '{"roomId":"!room:example.org"}',
+                             "--input", '{"body":"again"}',
+                             "--approval", ra["requestId"]],
+                            capture_output=True, text=True, env=ENV)
+        check(p4.returncode == 1 and "already consumed" in p4.stderr,
+              "an approval authorizes exactly ONE execution (consumed)")
+        # swallowed-send 200 (no event_id) → failed, never falsely completed
+        GW["swallow"] = True
+        r4b = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"ghost"}')
+        GW["swallow"] = False
+        check(r4b["status"] == "failed" and "not confirmed" in r4b["result"]["error"],
+              "send without event_id fails closed (no false completed)")
+        # unknown action → failed with a clear error
+        r4c = cli("capability", "execute", "--action", "no.such_action")
+        check(r4c["status"] == "failed" and "no executor" in r4c["result"]["error"],
+              "unknown capability action fails cleanly")
 
         # 5. unknown id → error
         p = subprocess.run([sys.executable, str(CLI), "request", "get", "nope-1"],
