@@ -10,7 +10,7 @@ edit the registry and the code together or the conformance test fails.
 
 Per `standard.md` (sutando-socket): the thing standardized here is **not
 Claude's event names** — it is AG2's *interpretation, mapping, privacy boundary
-and 事实源* for those events.
+and source of truth* for those events.
 
 ## 1. Provider + version
 
