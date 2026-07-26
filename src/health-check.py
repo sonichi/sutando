@@ -2171,11 +2171,14 @@ def check_codex_task_notifier() -> dict:
 
 
 def fix_codex_task_notifier() -> str:
-    """Repair only the notifier through the canonical runtime launcher.
+    """Delegate notifier-only recovery to the canonical runtime launcher.
 
-    The launcher owns notifier topology and versioning. Calling it without
-    `--restart` preserves the verified live Codex core while recreating or
-    upgrading its managed watcher session.
+    Calling the launcher without `--restart` preserves the verified live Codex
+    core. On current main, the launcher recreates a missing watcher session.
+    Other unhealthy existing-session shapes are still detected, but recovery
+    depends on the launcher's topology support (for example, #2280's stale
+    session replacement); the post-launch probe reports them as not repaired
+    rather than claiming success.
     """
     # Re-check config inside the side-effecting function. It may have changed
     # since run_all_checks() took its snapshot; the dispatcher would otherwise

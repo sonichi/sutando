@@ -326,7 +326,7 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
                 self.assertIn("not repaired", repaired)
                 run.assert_not_called()
 
-    def test_fix_uses_canonical_launcher_without_restarting_core(self):
+    def test_fix_recreates_missing_session_without_restarting_core(self):
         self.write_local_core()
         tmux = FakeTmux(panes=None)
         launcher_calls = []
