@@ -431,9 +431,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # `on` is accepted as an alias of `mix` for old callers.
                     # If the tap can't run (TCC denied, unbuilt, pre-14.2 macOS)
                     # we fall back to the legacy -g path so audio isn't lost.
-                    audio = query.get("audio", ["mix"])[0]
+                    # Default REVERTED to the legacy mic path (Susan 2026-07-26 02:29:
+                    # Studio was correct without any code change; the mix default
+                    # double-captured bot audio). The tap remains available behind
+                    # explicit ?audio=mix / ?audio=system for system-sound needs.
+                    audio = query.get("audio", ["mic"])[0]
                     if audio == "on":
-                        audio = "mix"
+                        audio = "mic"
                     device = query.get("device", [None])[0]
                     tap = mic_proc = None
                     video_path = path
