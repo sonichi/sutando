@@ -128,8 +128,8 @@ def _draft_for(entry: dict, room_id: str, owner_mxid: str, generation: int) -> d
 # ── Seeding (connect-time + join-time), authz via the reused boundary ────────
 def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
               room_id: str, owner_mxid: str, owner_rooms: "list[str]") -> dict:
-    """Seed one per-room policy for `entry` in `room_id`. Idempotent: skips if
-    the current-generation record is already active. Reuses observe_policy's
+    """Seed one per-room policy for `entry` in `room_id`. Idempotent: skips if a
+    current-generation record already EXISTS in any state. Reuses observe_policy's
     validate_draft + evaluate_standing_approval — a draft that fails either is
     REFUSED (returned with status='refused'), never activated. Returns a result
     dict {status, policy_id, reason}."""
@@ -139,8 +139,18 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
     pid = _policy_id_for(entry["key"], gen, room_id)
 
     existing = store.get(pid)
-    if existing and existing.get("status") == "active":
-        return {"status": "skipped", "policy_id": pid, "reason": "already active"}
+    if existing is not None:
+        # A record already exists for this (entry, generation, room). It is the
+        # single source of truth for this generation and is TERMINAL/idempotent:
+        #   - active    → already seeded (the intended re-seed skip).
+        #   - cancelled → the OWNER's direct cancellation. Reseeding on reconnect
+        #     must NEVER resurrect it (a prior version overwrote it back to
+        #     active — the seed then transition below). A genuine re-enable bumps
+        #     the entry's generation, yielding a FRESH pid with no existing
+        #     record, so re-enabling still seeds; only same-generation reseed is
+        #     suppressed here.
+        return {"status": "skipped", "policy_id": pid,
+                "reason": f"generation record exists ({existing.get('status')})"}
 
     draft = _draft_for(entry, room_id, owner_mxid, gen)
     normalized, errors = op.validate_draft(draft)

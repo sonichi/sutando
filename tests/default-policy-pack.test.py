@@ -71,6 +71,26 @@ def test_seed_is_idempotent():
           "still exactly one active record per room after re-seed")
 
 
+def test_reseed_does_not_resurrect_owner_cancelled_record():
+    # Regression for John #2320: after seeding, the owner directly cancels ONE
+    # room's record (same generation — NOT a pack disable/re-enable). A
+    # reconnect reseed must NOT flip it back to active; that would silently undo
+    # the owner's cancellation. The prior guard only skipped `active` records,
+    # so it re-seeded + re-activated the cancelled one.
+    d = _store()
+    dpp.seed_defaults(d, OWNER, ROOMS)
+    pid = op.SubscriptionStore(d).list(status="active")[0]["policy_id"]
+    op.SubscriptionStore(d).transition(pid, "cancelled", note="owner direct cancel")
+    check(op.SubscriptionStore(d).get(pid)["status"] == "cancelled",
+          "precondition: owner cancelled the record")
+    res = dpp.seed_defaults(d, OWNER, ROOMS)  # reconnect reseed, same generation
+    check(op.SubscriptionStore(d).get(pid)["status"] == "cancelled",
+          "reseed does NOT resurrect the owner-cancelled current-generation record")
+    r = [x for x in res if x["policy_id"] == pid]
+    check(bool(r) and r[0]["status"] == "skipped",
+          "reseed reports the existing (cancelled) record as skipped, not seeded")
+
+
 def test_standing_approval_boundary_reused_failclosed():
     d = _store()
     store = op.SubscriptionStore(d)
