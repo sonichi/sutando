@@ -136,14 +136,34 @@ class RuntimeServer:
 
     # ── boot ────────────────────────────────────────────────────────────────
     def recover(self) -> None:
-        """Re-link pending requests to their ha actions after a restart."""
-        n = 0
+        """Post-restart recovery. Approvals/elicitations re-link to their ha
+        actions (the card lifecycle continues). A PENDING capability row is
+        different: create_consuming() commits it (and spends the approval)
+        BEFORE the executor runs, so a crash in that window leaves a row
+        nothing will ever execute — permanently pending with a one-time
+        approval consumed (review P1). The outcome is genuinely unknown (the
+        crash may have been before OR mid-send), so the safe recovery is an
+        honest terminal state, never a silent replay that could double-send:
+        mark it failed with the ambiguity recorded; retrying requires a fresh
+        approval by design."""
+        n = relinked = 0
         for rec in self.store.pending():
             if rec["requestType"] in ("approval", "elicitation"):
                 self._ha_of[rec["requestId"]] = ha_action_id(rec["requestId"])
+                relinked += 1
+            elif rec["requestType"] == "capability":
+                self.store.transition(
+                    rec["requestId"], "failed",
+                    result={"executed": False,
+                            "error": "interrupted by daemon restart before "
+                                     "completion — outcome unknown; any consumed "
+                                     "approval is spent (issue a new approval to "
+                                     "retry)"},
+                    resolved_by="daemon-recovery")
                 n += 1
-        if n:
-            _log(f"recovered {n} pending request(s)")
+        if relinked or n:
+            _log(f"recovered {relinked} pending request(s)"
+                 + (f", failed {n} interrupted capability execution(s)" if n else ""))
 
     # ── dispatch ───────────────────────────────────────────────────────────
     async def handle(self, method: str, params: dict) -> dict:
@@ -247,20 +267,23 @@ class RuntimeServer:
             if appr["status"] != "approved":
                 raise ProtocolError(-32602,
                                     f"approval {approval_id} is {appr['status']}, not approved")
-            # BINDING: an approval authorizes exactly the action+resource the
-            # owner saw on the card — an approved repo.force_push must never
-            # authorize a message.send (review P1). Compared canonically,
-            # BEFORE consumption, so a mismatch costs nothing.
+            # BINDING: an approval authorizes exactly the EFFECT the owner saw
+            # on the card — action, resource AND governed input (review P1:
+            # binding only action+resource let a caller obtain approval for a
+            # benign message body and substitute any other body afterwards —
+            # the payload IS the effect for message.send). Compared via the
+            # same canonical fingerprint idempotency uses, BEFORE consumption,
+            # so a mismatch costs nothing.
             ap = appr.get("params") or {}
             if ap.get("action") != action:
                 raise ProtocolError(-32602,
                                     f"approval {approval_id} authorizes action "
                                     f"{ap.get('action')!r}, not {action!r}")
-            if json.dumps(ap.get("resource"), sort_keys=True) != \
-                    json.dumps(params.get("resource"), sort_keys=True):
+            if _fingerprint(ap) != fp:
                 raise ProtocolError(-32602,
                                     f"approval {approval_id} is bound to a different "
-                                    "resource than this execution")
+                                    "resource/input than this execution — the owner "
+                                    "approves the exact effect, payload included")
         # Record creation + approval consumption are ONE durable transaction
         # (review P1: consume-then-create left a window where a crash between
         # the steps spent the approval with no replayable record, and a

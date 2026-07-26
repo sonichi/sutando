@@ -142,7 +142,8 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
         # the governed test executor so binding passes on the happy path)
         rb = run(srv.handle("approval.request",
                             {"action": "test.echo",
-                             "resource": {"roomId": "!r:hs"}}))
+                             "resource": {"roomId": "!r:hs"},
+                             "input": {"body": "hi"}}))
         _resolve_ha(srv, rb["requestId"], {"1": [1]})
         w = run(srv.handle("request.wait", {"requestId": rb["requestId"],
                                             "timeoutS": 5}))
@@ -188,7 +189,8 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
         # duplicate-key RACE branch: replay check misses, unique index wins
         ra2 = run(srv.handle("approval.request",
                              {"action": "test.echo",
-                              "resource": {"roomId": "!r:hs"}}))
+                              "resource": {"roomId": "!r:hs"},
+                              "input": {"body": "hi"}}))
         _resolve_ha(srv, ra2["requestId"], {"1": [1]})
         run(srv.handle("request.wait", {"requestId": ra2["requestId"], "timeoutS": 5}))
         real_lookup = srv.store.by_idempotency_key
@@ -526,6 +528,63 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
         rt.asyncio.run = real_run2
         for k in ("SUTANDO_RUNTIME_SOCKET", "SUTANDO_RUNTIME_DB", "SUTANDO_HA_DIR"):
             os.environ.pop(k, None)
+
+    # ── INPUT binding (review P1): approval binds the exact effect ──────────
+    rt.EXECUTORS["test.echo"] = lambda p2: {"executed": True, "eventId": "$x"}
+    rt.GOVERNED_ACTIONS = frozenset({"test.echo"})
+    try:
+        rbi = run(srv.handle("approval.request",
+                             {"action": "test.echo",
+                              "resource": {"roomId": "!r:hs"},
+                              "input": {"body": "benign"}}))
+        card = json.loads((tmp / "ha" / (ha_action_id(rbi["requestId"]) + ".json"))
+                          .read_text())
+        check("benign" in card["questions"][0]["question"],
+              "approval card shows the governed input")
+        _resolve_ha(srv, rbi["requestId"], {"1": [1]})
+        run(srv.handle("request.wait", {"requestId": rbi["requestId"], "timeoutS": 5}))
+        try:
+            run(srv.handle("capability.execute",
+                           {"action": "test.echo", "resource": {"roomId": "!r:hs"},
+                            "input": {"body": "SUBSTITUTED"},
+                            "approvalRequestId": rbi["requestId"]}))
+            check(False, "substituted input rejected")
+        except rt.ProtocolError as e:
+            check("different resource/input" in e.message, "substituted input rejected")
+        rok = run(srv.handle("capability.execute",
+                             {"action": "test.echo", "resource": {"roomId": "!r:hs"},
+                              "input": {"body": "benign"},
+                              "approvalRequestId": rbi["requestId"]}))
+        check(rok["status"] == "completed",
+              "refusal did not consume — the exact approved effect executes")
+    finally:
+        rt.EXECUTORS.pop("test.echo", None)
+        rt.GOVERNED_ACTIONS = frozenset({"message.send"})
+
+    # ── restart-strand (review P1): consumed-approval capability row must not
+    # stay pending forever after a daemon restart ───────────────────────────
+    apx = run(srv.handle("approval.request", {"action": "x.y"}))
+    _resolve_ha(srv, apx["requestId"], {"1": [1]})
+    run(srv.handle("request.wait", {"requestId": apx["requestId"], "timeoutS": 5}))
+    strand = srv.store.create_consuming(apx["requestId"], "capability",
+                                        "capability.execute", "@a:hs",
+                                        {"action": "x.y"})
+    check(strand["status"] == "pending"
+          and srv.store.get(apx["requestId"])["consumedAt"] is not None,
+          "simulated crash window: row pending, approval consumed")
+    srv_r = _srv(tmp)
+    srv_r.recover()
+    got_r = srv_r.store.get(strand["requestId"])
+    check(got_r["status"] == "failed"
+          and "interrupted by daemon restart" in (got_r["result"] or {}).get("error", "")
+          and got_r["resolvedBy"] == "daemon-recovery",
+          "recover() fails the stranded row honestly (no silent replay)")
+    check(srv_r.store.get(apx["requestId"])["consumedAt"] is not None,
+          "the spent approval stays spent — retry requires a fresh approval")
+    wr = run(srv_r.handle("request.wait", {"requestId": strand["requestId"],
+                                           "timeoutS": 2}))
+    check(wr["status"] == "failed" and wr.get("timedOut") is None,
+          "wait on the recovered row returns failed, not a pending timeout")
 
     print(f"\n{'PASS — in-process daemon suite green' if not FAILS else f'FAILED ({len(FAILS)})'}")
     return 1 if FAILS else 0

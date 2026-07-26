@@ -69,9 +69,15 @@ class HumanActionAdapter:
         p = request["params"]
         action_line = p.get("action", "?")
         resource = p.get("resource")
+        inp = p.get("input")
         reason = p.get("reason")
+        # The card must show the FULL effect being approved — including the
+        # governed input (for message.send, the input IS the message body).
+        # The daemon binds the approval to this exact effect (review P1:
+        # an unshown input could be substituted after the owner answered).
         q = (f"Approve: {action_line}"
              + (f"\nResource: {json.dumps(resource, ensure_ascii=False)}" if resource else "")
+             + (f"\nInput: {json.dumps(inp, ensure_ascii=False)}" if inp else "")
              + (f"\nReason: {reason}" if reason else ""))
         return self._write(request, [{
             "question": q,

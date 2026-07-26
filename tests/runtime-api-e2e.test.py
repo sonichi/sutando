@@ -209,6 +209,7 @@ def main() -> int:
         #    gated by a consumed-once approval (the full acceptance chain).
         ra = cli("approval", "request", "--action", "message.send",
                  "--resource", '{"roomId":"!room:example.org"}',
+                 "--input", '{"body":"hello"}',
                  "--reason", "post the summary")
         acta = pending_action_for(ra["requestId"], store)
         store.resolve(acta["action_id"], {"1": [1]}, "@owner:example.org")
@@ -227,7 +228,7 @@ def main() -> int:
         p4 = subprocess.run([sys.executable, str(CLI), "capability", "execute",
                              "--action", "message.send",
                              "--resource", '{"roomId":"!room:example.org"}',
-                             "--input", '{"body":"again"}',
+                             "--input", '{"body":"hello"}',
                              "--approval", ra["requestId"]],
                             capture_output=True, text=True, env=ENV)
         check(p4.returncode == 1 and "already consumed" in p4.stderr,
@@ -246,7 +247,8 @@ def main() -> int:
         # idempotency: same key replays the recorded result — no second send,
         # no 'already consumed' failure on retry
         ra2 = cli("approval", "request", "--action", "message.send",
-                  "--resource", '{"roomId":"!room:example.org"}')
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"once"}')
         acta2 = pending_action_for(ra2["requestId"], store)
         store.resolve(acta2["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", ra2["requestId"], "--timeout", "10")
@@ -271,7 +273,8 @@ def main() -> int:
         # NOT consumed (review P1: record + approval consumption are one
         # atomic step; a replayed key must never spend a second approval)
         ra3 = cli("approval", "request", "--action", "message.send",
-                  "--resource", '{"roomId":"!room:example.org"}')
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"fresh-after-replay"}')
         acta3 = pending_action_for(ra3["requestId"], store)
         store.resolve(acta3["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", ra3["requestId"], "--timeout", "10")
@@ -292,6 +295,37 @@ def main() -> int:
         check(rk4["status"] == "completed"
               and GW["posts"][-1]["body"] == "fresh-after-replay",
               "the replay did not consume the approval — still spendable once")
+
+        # INPUT binding (review P1): the owner approved the card's exact
+        # effect — an execute that substitutes a different input (the message
+        # body!) after approval must be refused, pre-consume, pre-gateway.
+        rbi = cli("approval", "request", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"benign approved body"}')
+        actbi = pending_action_for(rbi["requestId"], store)
+        card_bi = json.loads((Path(ENV["SUTANDO_HA_DIR"]) / (actbi["action_id"] + ".json")).read_text())
+        check('"body": "benign approved body"' in card_bi["questions"][0]["question"]
+              or 'benign approved body' in card_bi["questions"][0]["question"],
+              "approval card SHOWS the governed input (the body the owner approves)")
+        store.resolve(actbi["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", rbi["requestId"], "--timeout", "10")
+        posts_bi = len(GW["posts"])
+        pbi = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                              "--action", "message.send",
+                              "--resource", '{"roomId":"!room:example.org"}',
+                              "--input", '{"body":"SUBSTITUTED-UNSHOWN-BODY"}',
+                              "--approval", rbi["requestId"]],
+                             capture_output=True, text=True, env=ENV)
+        check(pbi.returncode == 1 and "different resource/input" in pbi.stderr
+              and len(GW["posts"]) == posts_bi,
+              "substituted input after approval is refused pre-gateway")
+        rbi_ok = cli("capability", "execute", "--action", "message.send",
+                     "--resource", '{"roomId":"!room:example.org"}',
+                     "--input", '{"body":"benign approved body"}',
+                     "--approval", rbi["requestId"])
+        check(rbi_ok["status"] == "completed"
+              and GW["posts"][-1]["body"] == "benign approved body",
+              "the refusal did not consume the approval — exact effect still executes")
 
         # approval BINDING: an approval for another action cannot authorize
         # message.send — and the mismatch must not consume it.
@@ -336,7 +370,8 @@ def main() -> int:
         # concurrency: a slow gateway send must not stall other requests
         import threading as _th
         ra4 = cli("approval", "request", "--action", "message.send",
-                  "--resource", '{"roomId":"!room:example.org"}')
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"slowpoke"}')
         acta4 = pending_action_for(ra4["requestId"], store)
         store.resolve(acta4["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", ra4["requestId"], "--timeout", "10")
@@ -361,7 +396,8 @@ def main() -> int:
 
         # swallowed-send 200 (no event_id) → failed, never falsely completed
         ra3 = cli("approval", "request", "--action", "message.send",
-                  "--resource", '{"roomId":"!room:example.org"}')
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"ghost"}')
         acta3 = pending_action_for(ra3["requestId"], store)
         store.resolve(acta3["action_id"], {"1": [1]}, "@owner:example.org")
         cli("request", "wait", ra3["requestId"], "--timeout", "10")

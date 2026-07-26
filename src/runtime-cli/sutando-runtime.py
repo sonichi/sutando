@@ -75,6 +75,11 @@ def main(argv=None) -> int:
     apr.add_argument("--task-id")
     apr.add_argument("--action", required=True)
     apr.add_argument("--resource")
+    apr.add_argument("--input",
+                     help="JSON input of the effect being approved (for "
+                          "governed actions the daemon binds the approval to "
+                          "the EXACT action+resource+input — e.g. the message "
+                          "body for message.send)")
     apr.add_argument("--reason")
     apr.add_argument("--expires-in", type=float)
 
@@ -112,7 +117,8 @@ def main(argv=None) -> int:
         if args.group == "approval":
             result = _rpc("approval.request", {
                 "taskId": args.task_id, "action": args.action,
-                "resource": _jarg(args.resource), "reason": args.reason,
+                "resource": _jarg(args.resource), "input": _jarg(args.input),
+                "reason": args.reason,
                 "expiresInS": args.expires_in}, timeout=15)
         elif args.group == "elicitation":
             result = _rpc("elicitation.request", {
