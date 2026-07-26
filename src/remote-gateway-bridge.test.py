@@ -605,6 +605,31 @@ def main() -> int:
           "no security notice on clean tasks")
     _hdrs = [ln for ln in _sec_body.split("\n") if ln.startswith("access_tier: ")]
     check(len(_hdrs) == 1, "notice introduces no second access_tier line")
+    # Onboarding-token parse: the combined "url|secret" form, and the %7C-encoded
+    # separator the desktop connect flow emits (ag2space-cinny-desktop#231). A
+    # %7C token must decode so URL is populated — otherwise it parses as a bare
+    # secret with empty URL and FATALs at startup (the Vidhu "connected but not
+    # responding" failure, 2026-07-24).
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay|deadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: literal | splits into (url, secret)")
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7Cdeadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: %7C-encoded separator decodes to (url, secret)")
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7cdeadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: lowercase %7c also decodes")
+    check(rtc._parse_onboarding_token("baresecret") == ("", "baresecret"),
+          "token parse: bare secret yields empty url (REMOTE_TASK_URL supplies it)")
+    check(rtc._parse_onboarding_token("https://gw|a|b") == ("https://gw", "a|b"),
+          "token parse: splits on the FIRST separator only (secret may contain |)")
+    # #2307 review: never mutate token bytes — the secret is returned verbatim.
+    check(rtc._parse_onboarding_token("https://gw|AB%7CCD") == ("https://gw", "AB%7CCD"),
+          "token parse: %7C INSIDE the secret is preserved, not decoded (split on the literal |)")
+    check(rtc._parse_onboarding_token("AB%7CCD") == ("", "AB%7CCD"),
+          "token parse: a bare secret containing %7C is opaque — returned untouched")
+    check(rtc._parse_onboarding_token("bare|secret") == ("", "bare|secret"),
+          "token parse: a bare secret with no URL scheme is not split on its own | bytes")
 
     srv.shutdown()
     if FAILS:
