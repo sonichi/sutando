@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import tempfile
 import socket
@@ -2072,6 +2073,28 @@ def _expected_codex_notifier_entrypoint() -> Path:
     return REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier.sh"
 
 
+def _command_runs_script(command: str, expected: Path) -> bool:
+    """Whether tmux started the expected script as the actual command.
+
+    `pane_start_command` is shell-quoted text. Tokenize it instead of searching
+    the raw string: an unrelated wrapper may mention the expected path in an
+    argument, suffix, or comment without running it.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    expected_text = str(expected)
+    if argv[0] == expected_text:
+        return True
+    if Path(argv[0]).name != "bash":
+        return False
+    script_index = 2 if len(argv) > 1 and argv[1] == "--" else 1
+    return len(argv) > script_index and argv[script_index] == expected_text
+
+
 def _probe_codex_task_notifier(target: dict) -> dict:
     """Inspect the exact managed notifier tmux session for one healthy pane."""
     name = "codex-task-notifier"
@@ -2116,7 +2139,7 @@ def _probe_codex_task_notifier(target: dict) -> dict:
             "detail": f"managed tmux session {watcher_session!r} has a dead pane",
         }
     expected = _expected_codex_notifier_entrypoint()
-    if str(expected) not in command:
+    if not _command_runs_script(command, expected):
         return {
             "name": name,
             "status": "warn",

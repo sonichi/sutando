@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -266,6 +267,51 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
             ):
                 result = hc.check_codex_task_notifier()
         self.assertEqual(result["status"], "ok", result["detail"])
+
+    def test_notifier_command_handles_tmux_shell_quoting(self):
+        with tempfile.TemporaryDirectory(prefix="sutando notifier ") as repo_td:
+            expected = (
+                Path(repo_td) / "src/agent/codex/cli/task-notifier.sh"
+            )
+            expected.parent.mkdir(parents=True)
+            expected.write_text("#!/bin/bash\n")
+            for command in (
+                f"bash {shlex.quote(str(expected))}",
+                f'/bin/bash "{expected}"',
+                f"bash -- {shlex.quote(str(expected))}",
+                shlex.quote(str(expected)),
+            ):
+                with self.subTest(command=command):
+                    self.assertTrue(hc._command_runs_script(command, expected))
+
+    def test_expected_notifier_path_only_as_text_is_rejected(self):
+        expected = REPO / "src/agent/codex/cli/task-notifier.sh"
+        cases = {
+            "argument": f"bash /tmp/notifier-wrapper.sh --label {expected}",
+            "suffix": f"bash {expected}.backup",
+            "comment": f"bash /tmp/notifier-wrapper.sh '# {expected}'",
+            "shell-command": f"bash -lc 'exec {expected}'",
+            "malformed-quoting": f"bash '{expected}",
+        }
+        for label, command in cases.items():
+            with self.subTest(label=label):
+                self.assertFalse(hc._command_runs_script(command, expected))
+
+    def test_probe_rejects_notifier_path_only_as_wrapper_argument(self):
+        self.write_local_core()
+        expected = hc._expected_codex_notifier_entrypoint()
+        tmux = FakeTmux(
+            panes=[
+                (
+                    "0",
+                    f"bash /tmp/notifier-wrapper.sh --label {expected}",
+                )
+            ]
+        )
+        with mock.patch.object(hc, "_run_tmux", side_effect=tmux):
+            result = hc.check_codex_task_notifier()
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("unexpected command", result["detail"])
 
     def test_dead_wrong_and_duplicate_panes_warn(self):
         self.write_local_core()
