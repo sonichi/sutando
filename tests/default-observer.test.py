@@ -78,6 +78,7 @@ def test_reacts_and_stays_transparent():
     h, orig = _handler(net, inner)
     try:
         out = h.offer(_msg())
+        check(h.flush(5), "queued receipt delivered")
     finally:
         urllib.request.urlopen = orig
     check(out == ["settled-e1"], "offer() returns inner result unchanged")
@@ -106,6 +107,7 @@ def test_skips_self_noise_and_dups():
                  "actor_id": "@alice:hs", "room_id": "!r:hs"})  # no message_id
         h.offer(_msg(eid="s4", mid="dup"))
         h.offer(_msg(eid="s5", mid="dup"))                      # redelivery
+        check(h.flush(5), "queued receipts delivered")
     finally:
         urllib.request.urlopen = orig
     check(len(net.calls) == 1, "self/non-message/missing-id/dup all skipped (1 react)")
@@ -133,6 +135,7 @@ def test_failures_never_break_the_chain():
         h, orig = _handler(net, inner)
         try:
             out = h.offer(_msg())
+            h.flush(5)
         finally:
             urllib.request.urlopen = orig
         check(out == ["settled-e1"] and len(inner.offered) == 1,
@@ -145,10 +148,82 @@ def test_seen_set_is_bounded():
     try:
         for i in range(_SEEN_CAP + 10):
             h.offer(_msg(eid=f"e{i}", mid=f"m{i}"))
+        h.flush(10)
     finally:
         urllib.request.urlopen = orig
     check(len(h._seen) <= _SEEN_CAP and len(h._order) <= _SEEN_CAP,
           "seen-set FIFO-bounded at cap")
+
+
+def test_room_id_fully_escaped():
+    net = _Net()
+    h, orig = _handler(net)
+    try:
+        h.offer(_msg(room="!a/b:hs"))
+        check(h.flush(5), "receipt for slash-room delivered")
+    finally:
+        urllib.request.urlopen = orig
+    check(len(net.calls) == 1, "one react POST for slash-room id")
+    url = net.calls[0].full_url
+    check("%21a%2Fb%3Ahs" in url and "/%21a/b" not in url,
+          "room id with / fully escaped (safe='') — path not split")
+
+
+def test_slow_reaction_never_delays_inner():
+    import time as _time
+
+    class _SlowNet(_Net):
+        def __call__(self, req, timeout=None):
+            _time.sleep(0.25)
+            return super().__call__(req, timeout)
+
+    net = _SlowNet()
+    inner = _Inner()
+    h, orig = _handler(net, inner)
+    try:
+        t0 = _time.monotonic()
+        h.offer(_msg())
+        elapsed = _time.monotonic() - t0
+        check(h.flush(5), "slow receipt eventually delivered")
+    finally:
+        urllib.request.urlopen = orig
+    check(elapsed < 0.1,
+          f"offer() returned in {elapsed:.3f}s with 250ms react I/O — drain not delayed")
+    check(len(inner.offered) == 1 and len(net.calls) == 1,
+          "inner ran immediately; react delivered async")
+
+
+def test_queue_overflow_drops_never_blocks():
+    import threading as _threading
+    import time as _time
+
+    release = _threading.Event()
+
+    class _BlockedNet(_Net):
+        def __call__(self, req, timeout=None):
+            release.wait(5)
+            return super().__call__(req, timeout)
+
+    net = _BlockedNet()
+    logs = []
+    h = ReactObserverHandler(_Inner(), "https://gw.example/relay",
+                             {"Authorization": "Bearer t"}, "@me:hs",
+                             log=logs.append, queue_cap=2)
+    urllib.request.urlopen, orig = net, urllib.request.urlopen
+    try:
+        t0 = _time.monotonic()
+        # worker takes m0 and blocks; m1+m2 fill the 2-slot queue; m3+ drop
+        for i in range(6):
+            h.offer(_msg(eid=f"o{i}", mid=f"om{i}"))
+            _time.sleep(0.02)
+        elapsed = _time.monotonic() - t0
+        release.set()
+        check(h.flush(5), "queue drains after endpoint unblocks")
+    finally:
+        urllib.request.urlopen = orig
+    check(elapsed < 1.0, f"6 offers against a wedged endpoint took {elapsed:.3f}s — never blocked")
+    check(any("queue full" in m for m in logs), "overflow drop is logged")
+    check(len(net.calls) < 6, "overflow receipts dropped, not queued unboundedly")
 
 
 # ---- bridge wiring (mirrors test_event_wiring's stubbed-thread approach) ----
@@ -227,6 +302,9 @@ if __name__ == "__main__":
     test_no_mxid_never_reacts()
     test_failures_never_break_the_chain()
     test_seen_set_is_bounded()
+    test_room_id_fully_escaped()
+    test_slow_reaction_never_delays_inner()
+    test_queue_overflow_drops_never_blocks()
     test_bridge_wiring_default_on_optout_and_no_mxid()
     print(("PASS" if not FAILS else f"FAIL ({len(FAILS)})"))
     sys.exit(1 if FAILS else 0)

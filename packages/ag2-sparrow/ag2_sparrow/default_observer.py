@@ -16,10 +16,20 @@ a side effect that must fire for every event while leaving routing/settlement
 (taskify batching, decision routing) untouched — so offer() tees the react and
 returns the inner handler's result unchanged. Reacting is a courtesy signal:
 every failure is swallowed + logged, and can never break event consumption.
+
+Delivery is asynchronous: offer() only enqueues the prepared request onto a
+bounded queue drained by a single daemon worker, so a slow or wedged /react
+endpoint can never delay the inner handler or the sequential event drain.
+Overflow policy: when the queue is full the receipt is dropped and logged —
+never blocked, never retried (it's a courtesy signal, not a delivery
+guarantee; the message stays marked seen so redelivery won't double-react).
 """
 from __future__ import annotations
 
 import json
+import queue
+import threading
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import quote
@@ -32,12 +42,17 @@ OBSERVE_REACTION = "\U0001F440"
 # double-react. FIFO eviction; 4096 message-ids ≈ weeks of a busy room.
 _SEEN_CAP = 4096
 
+# Pending-receipt bound: with the 10s network timeout this is minutes of
+# backlog against a wedged endpoint before receipts start dropping — far past
+# the point where they stopped being a meaningful "seen just now" signal.
+_QUEUE_CAP = 256
+
 
 class ReactObserverHandler:
     """Tee wrapper: react 👀 to others' new messages, then delegate offer()."""
 
     def __init__(self, inner, base_url: str, headers: dict, agent_mxid: str,
-                 log=print, timeout: float = 10.0):
+                 log=print, timeout: float = 10.0, queue_cap: int = _QUEUE_CAP):
         self._inner = inner
         self._base = base_url.rstrip("/")
         self._headers = dict(headers)
@@ -50,6 +65,9 @@ class ReactObserverHandler:
         self._timeout = timeout
         self._seen: set = set()
         self._order: list = []
+        self._queue: queue.Queue = queue.Queue(maxsize=queue_cap)
+        self._worker = None
+        self._worker_lock = threading.Lock()
 
     # ---- chain transparency: the consumer contract passes straight through
     @property
@@ -82,18 +100,57 @@ class ReactObserverHandler:
         if not room or not msg_id or msg_id in self._seen:
             return
         self._mark_seen(msg_id)
-        url = f"{self._base}/v1/rooms/{quote(str(room))}/react"
+        # safe="" so every reserved char in the room id is escaped — the
+        # default safe="/" would leave a room id containing "/" split across
+        # URL path segments, misrouting the react.
+        url = f"{self._base}/v1/rooms/{quote(str(room), safe='')}/react"
         data = json.dumps({"event_id": msg_id, "key": OBSERVE_REACTION}).encode()
         req = urllib.request.Request(url, data=data, headers=self._headers,
                                      method="POST")
+        try:
+            self._queue.put_nowait((msg_id, req))
+        except queue.Full:
+            self._log(f"react-observer: queue full, dropping receipt for {msg_id}")
+            return
+        self._ensure_worker()
+
+    # ---- asynchronous delivery (a slow /react must never stall the drain)
+    def _ensure_worker(self) -> None:
+        w = self._worker
+        if w is not None and w.is_alive():
+            return
+        with self._worker_lock:
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._deliver_loop, name="react-observer", daemon=True)
+                self._worker.start()
+
+    def _deliver_loop(self) -> None:
+        while True:
+            msg_id, req = self._queue.get()
+            try:
+                self._send(msg_id, req)
+            finally:
+                self._queue.task_done()
+
+    def _send(self, msg_id, req) -> None:
         try:
             urllib.request.urlopen(req, timeout=self._timeout).close()
         except urllib.error.HTTPError as e:
             # Duplicate-react rejections (a previous run already reacted) and
             # permission degrades are benign for a courtesy receipt.
             self._log(f"react-observer: HTTP {e.code} reacting to {msg_id} (ignored)")
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            self._log(f"react-observer: network error reacting to {msg_id}: {e} (ignored)")
+        except Exception as e:  # noqa: BLE001 — the worker must never die
+            self._log(f"react-observer: error reacting to {msg_id}: {e} (ignored)")
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait until queued receipts are delivered (tests / graceful stops)."""
+        deadline = time.monotonic() + timeout
+        while self._queue.unfinished_tasks:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
 
     def _mark_seen(self, msg_id) -> None:
         self._seen.add(msg_id)
