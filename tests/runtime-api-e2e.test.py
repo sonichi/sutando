@@ -186,6 +186,23 @@ def main() -> int:
               and w3["result"]["answer"] == "production",
               "elicitation returns the chosen option label")
 
+        # 3b. multi_select: multiSelect flag makes the comma grammar resolve
+        r3b = cli("elicitation", "request", "--question", "Which envs?",
+                  "--type", "multi_select", "--options", '["dev","staging","prod"]')
+        act3b = pending_action_for(r3b["requestId"], store)
+        check((act3b.get("questions") or [{}])[0].get("multiSelect") is True,
+              "multi_select sets the multiSelect flag on the card")
+        store.resolve(act3b["action_id"], {"1": [1, 3]}, "@owner:example.org")
+        w3b = cli("request", "wait", r3b["requestId"], "--timeout", "10")
+        check(w3b["status"] == "resolved" and w3b["result"]["answer"],
+              "multi_select resolves with the chosen options")
+        # 3c. free_text is a clean v0 rejection (dead path would strand forever)
+        p3c = subprocess.run([sys.executable, str(CLI), "elicitation", "request",
+                              "--question", "Say anything", "--type", "free_text"],
+                             capture_output=True, text=True, env=ENV)
+        check(p3c.returncode == 1 and "not supported in v0" in p3c.stderr,
+              "free_text elicitation rejected loudly in v0 (no stranded request)")
+
         # 4. capability.execute — REAL message.send against the mock gateway,
         #    gated by a consumed-once approval (the full acceptance chain).
         ra = cli("approval", "request", "--action", "message.send",
@@ -212,11 +229,50 @@ def main() -> int:
                             capture_output=True, text=True, env=ENV)
         check(p4.returncode == 1 and "already consumed" in p4.stderr,
               "an approval authorizes exactly ONE execution (consumed)")
+        # UNGATED governed action → refused BEFORE any gateway contact
+        posts_before = len(GW["posts"])
+        p4u = subprocess.run([sys.executable, str(CLI), "capability", "execute",
+                              "--action", "message.send",
+                              "--resource", '{"roomId":"!room:example.org"}',
+                              "--input", '{"body":"sneaky"}'],
+                             capture_output=True, text=True, env=ENV)
+        check(p4u.returncode == 1 and "governed" in p4u.stderr
+              and len(GW["posts"]) == posts_before,
+              "governed message.send without approval is refused pre-gateway")
+
+        # idempotency: same key replays the recorded result — no second send,
+        # no 'already consumed' failure on retry
+        ra2 = cli("approval", "request", "--action", "message.send")
+        acta2 = pending_action_for(ra2["requestId"], store)
+        store.resolve(acta2["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", ra2["requestId"], "--timeout", "10")
+        rk1 = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"once"}',
+                  "--approval", ra2["requestId"],
+                  "--idempotency-key", "task-e2e:final")
+        posts_after_first = len(GW["posts"])
+        rk2 = cli("capability", "execute", "--action", "message.send",
+                  "--resource", '{"roomId":"!room:example.org"}',
+                  "--input", '{"body":"once"}',
+                  "--approval", ra2["requestId"],
+                  "--idempotency-key", "task-e2e:final")
+        check(rk1["status"] == "completed"
+              and rk2["requestId"] == rk1["requestId"]
+              and rk2.get("idempotentReplay") is True
+              and len(GW["posts"]) == posts_after_first,
+              "idempotency key replays the first result — no duplicate send")
+
         # swallowed-send 200 (no event_id) → failed, never falsely completed
+        ra3 = cli("approval", "request", "--action", "message.send")
+        acta3 = pending_action_for(ra3["requestId"], store)
+        store.resolve(acta3["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", ra3["requestId"], "--timeout", "10")
         GW["swallow"] = True
         r4b = cli("capability", "execute", "--action", "message.send",
                   "--resource", '{"roomId":"!room:example.org"}',
-                  "--input", '{"body":"ghost"}')
+                  "--input", '{"body":"ghost"}',
+                  "--approval", ra3["requestId"])
         GW["swallow"] = False
         check(r4b["status"] == "failed" and "not confirmed" in r4b["result"]["error"],
               "send without event_id fails closed (no false completed)")

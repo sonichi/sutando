@@ -39,8 +39,11 @@ CREATE TABLE IF NOT EXISTS runtime_requests (
   expires_at   REAL,
   resolved_at  REAL,
   resolved_by  TEXT,
-  consumed_at  REAL
+  consumed_at  REAL,
+  idempotency_key TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_requests_idem
+  ON runtime_requests (idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_runtime_requests_status
   ON runtime_requests (status);
 """
@@ -57,18 +60,28 @@ class RequestStore:
     # ── lifecycle ───────────────────────────────────────────────────────────
     def create(self, request_type: str, method: str, actor_id: str,
                params: dict, task_id=None, execution_id=None,
-               expires_in_s=None) -> dict:
+               expires_in_s=None, idempotency_key=None) -> dict:
         rid = f"{request_type}-{uuid.uuid4().hex[:12]}"
         now = time.time()
         expires_at = (now + float(expires_in_s)) if expires_in_s else None
         self._db.execute(
             "INSERT INTO runtime_requests (request_id, request_type, task_id,"
             " execution_id, actor_id, method, params_json, status, created_at,"
-            " expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " expires_at, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (rid, request_type, task_id, execution_id, actor_id, method,
-             json.dumps(params, ensure_ascii=False), "pending", now, expires_at))
+             json.dumps(params, ensure_ascii=False), "pending", now, expires_at,
+             idempotency_key))
         self._db.commit()
         return self.get(rid)
+
+    def by_idempotency_key(self, key: str):
+        """The existing request created under this key, or None. The unique
+        index makes create() with a duplicate key raise — callers must look
+        up FIRST and return the recorded request instead of re-executing."""
+        row = self._db.execute(
+            "SELECT request_id FROM runtime_requests WHERE idempotency_key = ?",
+            (key,)).fetchone()
+        return self.get(row[0]) if row else None
 
     def get(self, request_id: str):
         cur = self._db.execute(

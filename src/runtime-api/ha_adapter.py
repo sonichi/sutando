@@ -80,14 +80,17 @@ class HumanActionAdapter:
 
     def open_elicitation(self, request: dict) -> str:
         p = request["params"]
-        etype = p.get("type", "free_text")
+        etype = p.get("type", "single_select")
         options = [{"label": str(o)} for o in (p.get("options") or [])]
         if etype == "confirmation" and not options:
             options = [{"label": "Yes"}, {"label": "No"}]
-        return self._write(request, [{
-            "question": str(p.get("question", "?")),
-            "options": options,
-        }])
+        q = {"question": str(p.get("question", "?")), "options": options}
+        if etype == "multi_select":
+            # The multiSelect flag switches DecisionHandler to the comma-list
+            # grammar; without it multiple numbers are rejected by the
+            # single-select branch (review P1 dead path).
+            q["multiSelect"] = True
+        return self._write(request, [q])
 
     def _write(self, request: dict, questions: list) -> str:
         action_id = ha_action_id(request["requestId"])

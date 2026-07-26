@@ -82,6 +82,11 @@ EXECUTORS = {
     "message.send": _exec_message_send,
 }
 
+# Governed actions REQUIRE an approved, unconsumed approval — the daemon holds
+# real credentials, so an ungated socket client must never reach the gateway
+# (review P1: omitting approvalRequestId silently skipped the gate).
+GOVERNED_ACTIONS = frozenset({"message.send"})
+
 
 RESOLVER_POLL_S = float(os.environ.get("SUTANDO_RUNTIME_RESOLVE_POLL", "2"))
 WAIT_POLL_S = 0.5
@@ -138,9 +143,21 @@ class RuntimeServer:
             return self._issue("approval", method, params,
                                required=("action",))
         if method == "elicitation.request":
-            etype = params.get("type", "free_text")
+            etype = params.get("type", "single_select")
             if etype not in ELICITATION_TYPES:
                 raise ProtocolError(-32602, f"type must be one of {ELICITATION_TYPES}")
+            # v0 transport = the human-action card lifecycle, whose answer
+            # grammar is numeric-options only. free_text has no answerable
+            # shape there (zero options → every answer rejected → the request
+            # would strand until expiry — review P1 dead path). Reject loudly
+            # instead of stranding; lands with a richer transport.
+            if etype == "free_text":
+                raise ProtocolError(-32602,
+                                    "free_text elicitation is not supported in v0 "
+                                    "(card transport is options-based) — use "
+                                    "single_select/multi_select/confirmation")
+            if etype in ("single_select", "multi_select") and not params.get("options"):
+                raise ProtocolError(-32602, f"{etype} requires options")
             return self._issue("elicitation", method, params,
                                required=("question",))
         if method == "capability.execute":
@@ -169,11 +186,29 @@ class RuntimeServer:
         action = params.get("action")
         if not action:
             raise ProtocolError(-32602, "missing required param: action")
-        # One-time approval consumption: when the caller names the approval
-        # that authorizes this execution, it must be APPROVED and unconsumed —
-        # and consuming it is atomic, so one approval can never authorize two
-        # executions (design: "批准 merge PR X 不能被复用").
+        # Idempotent retry: a key that already created a request returns THAT
+        # request's current state — no re-execution, no double approval
+        # consumption (review P1: a retry after a lost response duplicated the
+        # send, or spuriously failed on the already-consumed approval). The
+        # key is persisted BEFORE approval consumption and gateway contact.
+        idem_key = params.get("idempotencyKey")
+        if idem_key:
+            existing = self.store.by_idempotency_key(idem_key)
+            if existing is not None:
+                return {"requestId": existing["requestId"],
+                        "status": existing["status"],
+                        **({"result": existing["result"]}
+                           if existing.get("result") is not None else {}),
+                        "idempotentReplay": True}
+        # Governed actions REQUIRE approval — validated and consumed atomically
+        # BEFORE the executor can touch daemon-held credentials. One approval
+        # authorizes exactly one execution (design: "批准 merge PR X 不能被复用").
         approval_id = params.get("approvalRequestId")
+        if action in GOVERNED_ACTIONS and not approval_id:
+            raise ProtocolError(-32602,
+                                f"action {action!r} is governed — an approved "
+                                "approvalRequestId is required (issue one with "
+                                "approval.request and wait for it to resolve)")
         if approval_id:
             appr = self.store.get(approval_id)
             if appr is None or appr["requestType"] != "approval":
@@ -186,7 +221,8 @@ class RuntimeServer:
                                     f"approval {approval_id} already consumed (one-time use)")
         rec = self.store.create("capability", "capability.execute",
                                 self.actor_id, params,
-                                task_id=params.get("taskId"))
+                                task_id=params.get("taskId"),
+                                idempotency_key=idem_key)
         executor = EXECUTORS.get(action)
         if executor is None:
             result = {"executed": False,
