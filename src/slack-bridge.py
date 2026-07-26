@@ -40,6 +40,7 @@ import os
 import uuid
 import re
 import secrets
+import shutil
 import sys
 import threading
 import time
@@ -620,15 +621,18 @@ def _download_slack_file(file_dict: dict) -> str | None:
             url, headers={"Authorization": f"Bearer {BOT_TOKEN}"}
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
+            # Read only the small prefix needed for the HTML/login-page guard,
+            # then stream the remainder. This preserves the bounded-memory fix
+            # while retaining main's files:read failure detection.
+            head = resp.read(64)
             # When the bot token lacks the files:read scope (or the file is
             # otherwise unauthorized), Slack does NOT error — it 200s with an
             # HTML sign-in page. Persisting that page as e.g. a ".m4a" silently
             # corrupts the attachment: downstream transcription/parsing then
             # chokes on a login page. Detect it and fail cleanly instead so the
             # caller surfaces "no attachment" rather than feeding garbage on.
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            looks_html = ctype.startswith("text/html") or data[:64].lstrip()[:14].lower() == b"<!doctype html"
+            ctype = (getattr(resp, "headers", {}).get("Content-Type") or "").lower()
+            looks_html = ctype.startswith("text/html") or head.lstrip()[:14].lower() == b"<!doctype html"
             if looks_html:
                 print(
                     f"  [file] download for {name_hint} returned an HTML page, "
@@ -638,8 +642,9 @@ def _download_slack_file(file_dict: dict) -> str | None:
                     flush=True,
                 )
                 return None
-        with open(local_path, "wb") as f:
-            f.write(data)
+            with open(local_path, "wb") as f:
+                f.write(head)
+                shutil.copyfileobj(resp, f)
         return str(local_path)
     except Exception as e:
         print(f"  [file] download failed for {name_hint}: {e}", flush=True)
