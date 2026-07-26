@@ -272,24 +272,40 @@ def _token_from_ag2space_env():
 
     The token carries the gateway URL (the url|secret onboarding form), so no
     separate URL read is needed — _parse_onboarding_token splits it downstream.
-    Returns "" when the file or key is absent.
+    Returns "" when no candidate file holds a token.
+
+    Candidate order matters. AG2_DEVICE_ENV is the absolute path the desktop
+    launcher (launch-sutando.sh) lays into the gateway window and points straight
+    at the file connect wrote — it is the ONLY one of these that reaches the
+    bridge in the desktop-spawned case. CLAUDE_CONFIG_DIR is NOT passed into that
+    window (only the core process gets it), so it is the weaker candidate — kept
+    for non-desktop launchers that do export it, plus the ~/.claude default.
     """
-    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    path = os.path.join(base, "channels", "ag2space", ".env")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-    except OSError:
-        return ""
-    vals = {}
-    for ln in lines:
-        ln = ln.strip()
-        if not ln or ln.startswith("#") or "=" not in ln:
+    candidates = [os.environ.get("AG2_DEVICE_ENV")]
+    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _cfg:
+        candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
+    candidates.append(os.path.join(os.path.expanduser("~"), ".claude", "channels", "ag2space", ".env"))
+    for path in candidates:
+        if not path:
             continue
-        key, _, val = ln.partition("=")
-        vals[key.strip()] = val.strip().strip('"').strip("'")
-    # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
-    return vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN") or ""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        vals = {}
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            key, _, val = ln.partition("=")
+            vals[key.strip()] = val.strip().strip('"').strip("'")
+        # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
+        tok = vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN")
+        if tok:
+            return tok
+    return ""
 
 
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""

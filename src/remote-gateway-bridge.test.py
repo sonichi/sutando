@@ -599,9 +599,11 @@ def main() -> int:
     # bridge sees an empty env token and never connects — every new desktop-only
     # user reproduces it (mark, 2026-07-26). The bridge must read the file directly.
     _saved = {k: os.environ.get(k) for k in
-              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "CLAUDE_CONFIG_DIR")}
+              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL",
+               "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV")}
     try:
-        for _k in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL"):
+        for _k in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL",
+                   "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV"):
             os.environ.pop(_k, None)
         _cfg = tempfile.mkdtemp()
         _chan = Path(_cfg) / "channels" / "ag2space"
@@ -636,6 +638,34 @@ def main() -> int:
         _wspec.loader.exec_module(_wrtc)
         check(_wrtc.TOKEN == "envwins",
               "env-fallback: env token takes precedence over the file fallback")
+
+        # The desktop case: CLAUDE_CONFIG_DIR is NOT passed into the gateway
+        # window (launch-sutando.sh passes only SUTANDO_APP_SUPPORT / SUTANDO_PY /
+        # AG2_DEVICE_ENV), so the fallback MUST resolve via AG2_DEVICE_ENV — the
+        # absolute path the launcher lays in. This is the scenario the fix targets.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ["AG2_DEVICE_ENV"] = str(_chan / ".env")
+        _dspec2 = importlib.util.spec_from_file_location(
+            "rtc_deviceenv", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _drtc2 = importlib.util.module_from_spec(_dspec2)
+        _dspec2.loader.exec_module(_drtc2)
+        check(_drtc2.TOKEN == "s3cr3t",
+              "env-fallback: AG2_DEVICE_ENV resolves the token when CLAUDE_CONFIG_DIR is absent (desktop case)")
+
+        # AG2_DEVICE_ENV wins over CLAUDE_CONFIG_DIR when both point at a token.
+        _cfg2 = tempfile.mkdtemp()
+        _chan2 = Path(_cfg2) / "channels" / "ag2space"
+        _chan2.mkdir(parents=True)
+        (_chan2 / ".env").write_text("AG2_REMOTE_TOKEN='https://cfg.example/relay|cfgtok'\n")
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg2
+        os.environ["AG2_DEVICE_ENV"] = str(_chan / ".env")  # still points at s3cr3t
+        _pspec = importlib.util.spec_from_file_location(
+            "rtc_devpriority", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _prtc = importlib.util.module_from_spec(_pspec)
+        _pspec.loader.exec_module(_prtc)
+        check(_prtc.TOKEN == "s3cr3t",
+              "env-fallback: AG2_DEVICE_ENV takes precedence over CLAUDE_CONFIG_DIR")
     finally:
         for _k, _v in _saved.items():
             if _v is None:
