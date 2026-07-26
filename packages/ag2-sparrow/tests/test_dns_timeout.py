@@ -130,6 +130,66 @@ def test_reload_preserves_true_original_resolver():
     print("PASS test_reload_preserves_true_original_resolver")
 
 
+def test_wedged_resolver_leaks_at_most_one_thread():
+    """Regression (review on a074150): every timed-out call spawned a fresh
+    daemon thread, so a persistently wedged resolver leaked one thread per
+    retry (20 calls → 20 threads). Single-flight now attaches retries to the
+    one outstanding call: 20 timed-out calls must pin exactly ONE resolver
+    thread."""
+    import threading
+
+    mod = _load()
+    wedge = threading.Event()  # never set — the resolver hangs forever
+    # Relative count: earlier tests may have left their own (finite) resolver
+    # threads still draining; only growth caused by THESE calls is the leak.
+    before = sum(t.name == "dns-resolve" for t in threading.enumerate())
+
+    def body():
+        for _ in range(20):
+            try:
+                mod._resolve_bounded("relay.ag2.space", 443)
+            except socket.gaierror:
+                pass
+        grew = sum(t.name == "dns-resolve" for t in threading.enumerate()) - before
+        assert grew == 1, f"leaked {grew} resolver threads for 20 retries (want 1)"
+
+    _with(mod, timeout=0.001, resolver=lambda *a, **k: wedge.wait(), fn=body)
+    wedge.set()  # release the pinned thread so it exits cleanly
+    print("PASS test_wedged_resolver_leaks_at_most_one_thread")
+
+
+def test_recovery_after_wedge_starts_fresh():
+    """After a wedged call completes, the slot clears: the next call spawns a
+    fresh resolver and returns the NEW resolver's answer (not the stale one)."""
+    import threading
+
+    mod = _load()
+    wedge = threading.Event()
+    sentinel = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 443))]
+
+    def hang(*a, **k):
+        wedge.wait()
+        return []
+
+    def body():
+        try:
+            mod._resolve_bounded("relay.ag2.space", 443)
+        except socket.gaierror:
+            pass
+
+    _with(mod, timeout=0.001, resolver=hang, fn=body)
+    wedge.set()  # wedged call completes → worker clears its slot
+    for t in threading.enumerate():
+        if t.name == "dns-resolve":
+            t.join(5)
+    got = _with(
+        mod, timeout=5.0, resolver=lambda *a, **k: sentinel,
+        fn=lambda: mod._resolve_bounded("relay.ag2.space", 443),
+    )
+    assert got == sentinel, f"stale in-flight slot served {got!r}"
+    print("PASS test_recovery_after_wedge_starts_fresh")
+
+
 if __name__ == "__main__":
     test_hung_resolver_raises_within_bound()
     test_normal_resolution_passes_through()
@@ -137,4 +197,6 @@ if __name__ == "__main__":
     test_resolver_error_propagates()
     test_zero_timeout_disables_bound()
     test_reload_preserves_true_original_resolver()
+    test_wedged_resolver_leaks_at_most_one_thread()
+    test_recovery_after_wedge_starts_fresh()
     print("ALL PASS")

@@ -89,36 +89,74 @@ _PREFER_V4 = os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1"
 _orig_getaddrinfo = getattr(socket.getaddrinfo, "_ag2_orig_getaddrinfo", socket.getaddrinfo)
 
 
+class _InflightResolve:
+    """One outstanding getaddrinfo call: waiters share its Event + outcome."""
+
+    __slots__ = ("done", "result", "err")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.result = None
+        self.err = None
+
+
+# Single-flight registry: at most ONE resolver thread exists per distinct
+# (host, args) key. While a call is outstanding — including one wedged on a
+# hung system resolver — every retry for the same key attaches to it instead
+# of spawning another thread, so a persistently hung resolver pins exactly
+# one thread no matter how many times the poll loop retries. The worker
+# removes its slot when the underlying call finally returns, so recovery
+# drains cleanly and the next call starts fresh.
+_INFLIGHT: dict = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
 def _resolve_bounded(host, *args, **kwargs):
     """socket.getaddrinfo with a hard wall-clock bound.
 
-    getaddrinfo cannot be interrupted, so run it in a daemon thread and abandon
-    the thread if it overruns _DNS_TIMEOUT_S. A hung resolver thread is a daemon
-    (dies with the process) and, since the poll loop backs off before retrying,
-    at most one leaks per retry cycle — bounded, non-fatal, and they all drain
-    when DNS recovers. Raising gaierror makes urllib surface a URLError that the
-    poll loop's reconnect branch already handles.
+    getaddrinfo cannot be interrupted, so the actual call runs in a daemon
+    thread; the caller waits up to _DNS_TIMEOUT_S on its completion Event and
+    raises gaierror on overrun (urllib surfaces that as the URLError the poll
+    loop's reconnect branch already handles). The thread is shared single-
+    flight per (host, args) key — see _INFLIGHT — so repeated retries against
+    a wedged resolver never accumulate threads.
     """
     if _DNS_TIMEOUT_S <= 0:
         return _orig_getaddrinfo(host, *args, **kwargs)
-    box: dict = {}
+    try:
+        key = (host, args, tuple(sorted(kwargs.items())))
+    except TypeError:  # unhashable arg — never true of real getaddrinfo calls
+        key = None
 
-    def _run():
-        try:
-            box["ok"] = _orig_getaddrinfo(host, *args, **kwargs)
-        except BaseException as e:  # noqa: BLE001 — re-raised to the caller below
-            box["err"] = e
+    with _INFLIGHT_LOCK:
+        call = _INFLIGHT.get(key) if key is not None else None
+        if call is None:
+            call = _InflightResolve()
+            if key is not None:
+                _INFLIGHT[key] = call
 
-    th = threading.Thread(target=_run, name="dns-resolve", daemon=True)
-    th.start()
-    th.join(_DNS_TIMEOUT_S)
-    if th.is_alive():
+            def _run(call=call, key=key):
+                try:
+                    call.result = _orig_getaddrinfo(host, *args, **kwargs)
+                except BaseException as e:  # noqa: BLE001 — re-raised to waiters
+                    call.err = e
+                finally:
+                    # Clear the slot BEFORE signalling: a waiter woken by the
+                    # Event must never re-attach to a completed call.
+                    if key is not None:
+                        with _INFLIGHT_LOCK:
+                            _INFLIGHT.pop(key, None)
+                    call.done.set()
+
+            threading.Thread(target=_run, name="dns-resolve", daemon=True).start()
+
+    if not call.done.wait(_DNS_TIMEOUT_S):
         raise socket.gaierror(
             f"DNS resolution for {host!r} exceeded {_DNS_TIMEOUT_S}s (resolver hung)"
         )
-    if "err" in box:
-        raise box["err"]
-    return box["ok"]
+    if call.err is not None:
+        raise call.err
+    return call.result
 
 
 def _getaddrinfo_prefer_v4(host, *args, **kwargs):
