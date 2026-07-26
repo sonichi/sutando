@@ -508,9 +508,13 @@ code = {
     'tree_sha': _git('rev-parse', 'HEAD^{tree}'),
     'dirty': bool(_git('status', '--porcelain')),
 }
-# run-dir + runtime-api socket: mirror #2325's rundir.py EXACTLY (same policy as
-# the `run-dir`/`runtime-socket` subcommands) so the shell and the daemon never
-# disagree on where the runtime-api socket lives.
+# run-dir + runtime-api socket: mirror #2325 rundir.py (same policy as the
+# run-dir / runtime-socket subcommands). This is a second copy of the chain (the
+# bash subcommand is the other); the resolver test asserts the descriptor
+# runtimeSocket equals the runtime-socket subcommand, so the two cannot drift
+# silently (review nit). NOTE: no shell-active chars in this comment block -- the
+# python runs inside a bash double-quoted -c string, so a dollar-var or backtick
+# here would be bash-expanded and break the program.
 _run_dir_env = os.environ.get('SUTANDO_RUN_DIR')
 if _run_dir_env:
     _rundir = _run_dir_env
@@ -521,6 +525,10 @@ elif os.environ.get('XDG_RUNTIME_DIR'):
 else:
     _rundir = os.path.join(os.path.expanduser('~'), '.sutando', 'run')
 _runtime_socket = os.environ.get('SUTANDO_RUNTIME_SOCKET') or os.path.join(_rundir, 'sutando-runtime.sock')
+# runtimeRoot = parent of run/ when run-dir is <root>/run (darwin App-Support,
+# portable dot-sutando); for the XDG case the run-dir (XDG_RUNTIME_DIR/sutando) IS
+# the app dir (its parent is the shared XDG base), so use the run-dir itself.
+_runtime_root = os.path.dirname(_rundir) if os.path.basename(_rundir) == 'run' else _rundir
 
 print(json.dumps({
     'alive': bool(h.get('core_running', False)),
@@ -558,7 +566,7 @@ print(json.dumps({
     # session.
     'schemaVersion': 1,
     'runtimeId': os.environ.get('SUTANDO_RUNTIME_ID', 'primary'),
-    'runtimeRoot': os.path.dirname(_rundir),
+    'runtimeRoot': _runtime_root,
     'runtimeSocket': _runtime_socket,
     'backend': {
         'type': 'tmux',

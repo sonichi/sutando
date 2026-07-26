@@ -30,6 +30,13 @@ ok "runtime-socket derives <run-dir>/sutando-runtime.sock" \
    "$(env -u SUTANDO_RUNTIME_SOCKET SUTANDO_RUN_DIR=/r bash "$CFG" runtime-socket)" \
    "/r/sutando-runtime.sock"
 
+# ── drift guard: the descriptor's runtimeSocket (its own chain copy) must equal
+# the `runtime-socket` subcommand, so the two copies of the rundir.py chain can
+# never drift silently (review nit — de-dup by assertion, not fragile subprocess).
+ok "descriptor.runtimeSocket == runtime-socket subcommand (no chain drift)" \
+   "$(bash "$CFG" runtime 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("runtimeSocket",""))')" \
+   "$(bash "$CFG" runtime-socket)"
+
 # ── descriptor: additive fields present + back-compat keys intact ────────────
 DESC="$(bash "$CFG" runtime 2>/dev/null)"
 python3 - "$DESC" <<'PY'
@@ -44,8 +51,8 @@ ok("descriptor: schemaVersion == 1", d.get("schemaVersion") == 1)
 ok("descriptor: runtimeId present", bool(d.get("runtimeId")))
 ok("descriptor: runtimeSocket ends with sutando-runtime.sock",
    str(d.get("runtimeSocket","")).endswith("/sutando-runtime.sock"))
-ok("descriptor: runtimeRoot == dirname(run-dir)",
-   d.get("runtimeRoot") == d.get("runtimeSocket","").rsplit("/run/",1)[0] if "/run/" in d.get("runtimeSocket","") else True)
+ok("descriptor: runtimeRoot present + is a prefix of runtimeSocket (OS-independent)",
+   bool(d.get("runtimeRoot")) and str(d.get("runtimeSocket","")).startswith(str(d.get("runtimeRoot",""))))
 ok("descriptor: backend.type == tmux", (d.get("backend") or {}).get("type") == "tmux")
 ok("descriptor: back-compat socket key still present", "socket" in d)
 ok("descriptor: back-compat session key still present", "session" in d)
