@@ -18,8 +18,7 @@ Run:  python3 src/runtime-api/server.py
 Env:  SUTANDO_RUNTIME_SOCKET  socket path (default <run dir>/sutando-runtime.sock)
       SUTANDO_RUNTIME_DB      sqlite path (default <state>/runtime-state.sqlite)
       SUTANDO_HA_DIR          human-actions dir (default <state>/human-actions)
-      SUTANDO_RUN_DIR         run dir (default ~/Library/Application Support/
-                              space.ag2.app/run)
+      SUTANDO_RUN_DIR         run dir (platform default via rundir.py)
 
 Supervision: launched by the supervisor layer (launch path or a tmux window),
 deliberately NOT by start-cli.sh — the core-launch chokepoint stays free of
@@ -44,6 +43,7 @@ from protocol import (MAX_LINE_BYTES, ELICITATION_TYPES, ProtocolError,  # noqa:
                       error_frame, parse_line, result_frame)
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
+from rundir import socket_path  # noqa: E402
 
 def _exec_message_send(params: dict) -> dict:
     """Governed room send through the gateway. Fails closed: only a response
@@ -105,12 +105,6 @@ def _fingerprint(params: dict) -> str:
 RESOLVER_POLL_S = float(os.environ.get("SUTANDO_RUNTIME_RESOLVE_POLL", "2"))
 WAIT_POLL_S = 0.5
 DEFAULT_WAIT_TIMEOUT_S = 30.0
-
-
-def _run_dir() -> Path:
-    return Path(os.environ.get("SUTANDO_RUN_DIR")
-                or Path.home() / "Library" / "Application Support"
-                / "space.ag2.app" / "run")
 
 
 def _state_dir() -> Path:
@@ -193,7 +187,17 @@ class RuntimeServer:
                                 expires_in_s=params.get("expiresInS"))
         opener = (self.ha.open_approval if rtype == "approval"
                   else self.ha.open_elicitation)
-        self._ha_of[rec["requestId"]] = opener(rec)
+        try:
+            self._ha_of[rec["requestId"]] = opener(rec)
+        except Exception as e:  # noqa: BLE001 — mirror failure = failed request
+            # The durable row must never outlive a failed card mirror as
+            # "pending" — nothing would ever answer it (review blocker). Mark
+            # it failed durably, THEN surface the error to the caller.
+            self.store.transition(rec["requestId"], "failed",
+                                  result={"error": f"human-action mirror failed: {e}"},
+                                  resolved_by="daemon")
+            raise ProtocolError(-32603,
+                                f"could not open the human-action card: {e}") from e
         return {"requestId": rec["requestId"], "status": "pending"}
 
     async def _capability(self, params: dict) -> dict:
@@ -445,11 +449,11 @@ class RuntimeServer:
 
 
 def main() -> None:
-    run_dir = _run_dir()
     state = _state_dir()
     srv = RuntimeServer(
-        socket_path=os.environ.get("SUTANDO_RUNTIME_SOCKET")
-        or str(run_dir / "sutando-runtime.sock"),
+        # Canonical shared resolution (rundir.py) — daemon and CLI must agree
+        # on the same default socket, on every platform (review blocker).
+        socket_path=socket_path(),
         db_path=os.environ.get("SUTANDO_RUNTIME_DB")
         or str(state / "runtime-state.sqlite"),
         ha_dir=os.environ.get("SUTANDO_HA_DIR")

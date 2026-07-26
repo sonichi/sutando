@@ -32,11 +32,11 @@ import uuid
 from pathlib import Path
 
 
-def _socket_path() -> str:
-    return (os.environ.get("SUTANDO_RUNTIME_SOCKET")
-            or str(Path(os.environ.get("SUTANDO_RUN_DIR")
-                        or Path.home() / "Library" / "Application Support"
-                        / "space.ag2.app" / "run") / "sutando-runtime.sock"))
+# Canonical socket resolution shared with the daemon (review blocker: both
+# sides duplicated a macOS-only fallback; rundir.py is the one policy).
+_RUNTIME_API_DIR = Path(__file__).resolve().parent.with_name("runtime-api")
+sys.path.insert(0, str(_RUNTIME_API_DIR))
+from rundir import socket_path as _socket_path  # noqa: E402
 
 
 def _rpc(method: str, params: dict, timeout: float) -> dict:
