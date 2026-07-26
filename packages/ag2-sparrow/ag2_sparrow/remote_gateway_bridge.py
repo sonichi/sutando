@@ -469,12 +469,20 @@ def _read_token_file(path: str) -> str:
 
 
 def _reload_rotated_token() -> bool:
-    """Re-read TOKEN_FILE and swap in a rotated token. True only when a
-    usable, DIFFERENT secret was found: module globals TOKEN (and URL, when
-    the combined url|secret onboarding form carries one) plus the shared
-    _AUTH_HEADERS dict are updated in place, so the poll loop and the event
-    channel resume with the new bearer without a process restart."""
-    global TOKEN, URL
+    """Re-read TOKEN_FILE and swap in a rotated SECRET. True only when a
+    usable, DIFFERENT secret was found for the SAME gateway: the TOKEN global
+    and the shared _AUTH_HEADERS dict are updated in place, so the poll loop,
+    event channel, and card poster resume with the new bearer without a
+    process restart.
+
+    A rotation NEVER moves URL. The long-lived consumers (EventChannel,
+    CardPoster) captured the base URL at construction, so honoring a new URL
+    here would split the process across gateways — the poller on the new
+    base, SSE + card posts still on the old one, now carrying the freshly
+    rotated bearer to the old endpoint (review P1). Changing gateways is a
+    reconfiguration, not a key rotation: refuse it loudly and keep waiting —
+    a restart picks the new URL up through the normal import-time parse."""
+    global TOKEN
     if not TOKEN_FILE:
         return False
     raw = _read_token_file(TOKEN_FILE)
@@ -485,11 +493,14 @@ def _reload_rotated_token() -> bool:
         url_from_token, secret = raw.split("|", 1)
     else:
         url_from_token, secret = "", raw
+    if url_from_token and url_from_token.rstrip("/") != URL:
+        _log(f"token file names a DIFFERENT gateway ({url_from_token.rstrip('/')}) "
+             f"than the running one ({URL}) — a URL change is not hot-swappable; "
+             "restart the bridge to move gateways")
+        return False
     if not secret or secret == TOKEN:
         return False
     TOKEN = secret
-    if url_from_token:
-        URL = url_from_token.rstrip("/")
     _AUTH_HEADERS["Authorization"] = f"Bearer {TOKEN}"
     return True
 
@@ -1354,7 +1365,8 @@ def _maybe_start_event_channel() -> None:
         from .event_inbox import EventInbox
         from .event_channel import EventChannel
         inbox = EventInbox(str(_STATE / "event-inbox.db"))
-        ch = EventChannel(inbox, URL, _AUTH_HEADERS, log=_log)
+        ch = EventChannel(inbox, URL, _AUTH_HEADERS, log=_log,
+                          auth_retry=bool(TOKEN_FILE))
         threading.Thread(target=ch.run, name="sparrow-event-channel", daemon=True).start()
         _EVENT_CHANNEL = ch
         # P1: drain the inbox into the Core's attention (taskify → tasks/) on a

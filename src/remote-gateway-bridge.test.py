@@ -397,7 +397,8 @@ def main() -> int:
     rtc.TOKEN_FILE = str(tok_file)
     tok_file.write_text(f"REMOTE_TASK_TOKEN={rtc.TOKEN}\n")
     check(rtc._reload_rotated_token() is False, "unchanged token → no rotation")
-    # a rotated combined url|secret form swaps TOKEN + URL + shared headers live
+    # a rotated combined url|secret form (SAME gateway) swaps the secret;
+    # URL is never moved by rotation.
     old_url = rtc.URL
     tok_file.write_text(f"REMOTE_TASK_TOKEN={old_url}|rotated-secret\n")
     check(rtc._reload_rotated_token() is True
@@ -405,6 +406,15 @@ def main() -> int:
           and rtc.URL == old_url
           and rtc._AUTH_HEADERS["Authorization"] == "Bearer rotated-secret",
           "rotated token swapped into TOKEN + shared _AUTH_HEADERS")
+    # a combined form naming a DIFFERENT gateway is REFUSED outright — honoring
+    # it would split the process across bases (poller on new, SSE/cards on old,
+    # carrying the fresh bearer to the old endpoint). Nothing changes.
+    tok_file.write_text("REMOTE_TASK_TOKEN=https://other.example/relay|other-secret\n")
+    check(rtc._reload_rotated_token() is False
+          and rtc.TOKEN == "rotated-secret"
+          and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer rotated-secret",
+          "URL-changing rotation refused — no partial gateway move")
     # _recover_auth immediate path: file already rotated again → True, no wait
     tok_file.write_text("REMOTE_TASK_TOKEN=rotated-secret-2\n")
     check(rtc._recover_auth(401) is True and rtc.TOKEN == "rotated-secret-2",
