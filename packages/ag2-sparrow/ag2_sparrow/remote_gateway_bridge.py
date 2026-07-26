@@ -1061,15 +1061,76 @@ def _archive_result(path: Path, tid: str) -> None:
             pass  # best-effort; core may have archived it concurrently
 
 
+# A legacy bare `.sending` claim carries no owner info, so recovery for those
+# falls back to an age guard: younger than this = possibly a live worker's
+# in-flight claim, leave it alone.
+_ORPHAN_MIN_AGE_S = 600
+
+# Result-body routing marker (CLAUDE.md protocol): `[channel: <id>]` as the
+# first non-empty line redirects delivery. This bridge can only deliver to
+# Matrix rooms — Discord (17-20 digit) / Slack ([CDG]…) destinations belong to
+# their own bridges and must be left unclaimed for them.
+_CHANNEL_MARKER_RE = re.compile(r"^\[channel:\s*([^\]\s]+)\s*\]\s*$")
+_MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
+
+
+def _proactive_route(body: str) -> "tuple[str, str | None, str]":
+    """('send', room_or_None, body-to-send) | ('skip', None, '').
+
+    Honors the result-body routing protocol on proactive files (review
+    blocker: a `[channel: C…]` Slack/Discord nudge could be won by this
+    consumer and leaked raw to the gateway room, marker included)."""
+    lines = body.splitlines()
+    idx = next((i for i, ln in enumerate(lines) if ln.strip()), None)
+    if idx is None:
+        return ("send", None, body)
+    m = _CHANNEL_MARKER_RE.match(lines[idx].strip())
+    if not m:
+        return ("send", None, body)
+    dest = m.group(1)
+    if _MATRIX_ROOM_RE.match(dest):
+        return ("send", dest, "\n".join(lines[idx + 1:]).strip())
+    return ("skip", None, "")  # foreign destination — its bridge owns the file
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but not signalable — treat as alive
+    return True
+
+
 def _recover_orphan_proactive() -> None:
-    """Restart-safety: rename orphan `proactive-*.sending` claims back to
-    `.txt` so the next drain re-claims them. A crash between claim and
-    delivery otherwise strands the nudge invisibly (no scan ever looks at
-    `.sending`). Same recovery idiom as the Discord bridge's drain."""
+    """Restart-safety: recover orphan proactive claims back to `.txt` so the
+    next drain re-claims them — WITHOUT stealing a live worker's in-flight
+    claim (review blocker). Claims are pid-scoped (`.sending.<pid>`): a claim
+    whose owner pid is alive is left alone; a dead owner's claim recovers
+    immediately. Legacy bare `.sending` claims (no owner info) recover only
+    past an age threshold."""
     if not PROACTIVE_ROOM:
         return
-    for f in RESULTS_DIR.glob("proactive-*.sending"):
-        target = f.with_suffix(".txt")
+    for f in list(RESULTS_DIR.glob("proactive-*.sending.*")) \
+            + list(RESULTS_DIR.glob("proactive-*.sending")):
+        name = f.name
+        owner = name.rsplit(".sending.", 1)
+        if len(owner) == 2:  # pid-scoped claim
+            try:
+                pid = int(owner[1])
+            except ValueError:
+                continue  # not ours to interpret
+            if _pid_alive(pid):
+                continue  # live worker's in-flight claim (incl. our own
+                # process's other thread) — never steal
+        else:  # legacy bare .sending — age guard only
+            try:
+                if time.time() - f.stat().st_mtime < _ORPHAN_MIN_AGE_S:
+                    continue
+            except OSError:
+                continue
+        target = f.with_name(name.split(".sending")[0] + ".txt")
         if target.exists():
             continue  # collision — leave for an operator, never clobber
         try:
@@ -1092,21 +1153,33 @@ def _post_proactive() -> None:
     if not PROACTIVE_ROOM:
         return
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
-        claim = f.with_suffix(".sending")
+        # PEEK before claiming: a file explicitly routed to a non-Matrix
+        # destination ([channel: <discord/slack id>]) belongs to that bridge —
+        # claiming it here would leak the raw body (marker included) to the
+        # gateway room and starve the real consumer (review blocker).
+        try:
+            route, room_override, routed_body = _proactive_route(
+                f.read_text(encoding="utf-8"))
+        except OSError:
+            continue  # racing consumer already claimed it
+        if route == "skip":
+            continue
+        # pid-scoped claim: recovery can tell a live worker's in-flight claim
+        # from a dead one's (review blocker: bare .sending was stealable).
+        claim = f.with_suffix(f".sending.{os.getpid()}")
         try:
             f.rename(claim)  # atomic claim; loser of a race just misses
         except OSError:
             continue
-        try:
-            body = claim.read_text(encoding="utf-8").strip()
-        except OSError:
-            body = ""
+        body = routed_body.strip()
         if not body:
             claim.unlink(missing_ok=True)  # empty nudge — nothing to say
             continue
         try:
             resp = _req("POST", "/v1/room",
-                        {"op": "message", "room_id": PROACTIVE_ROOM, "body": body},
+                        {"op": "message",
+                         "room_id": room_override or PROACTIVE_ROOM,
+                         "body": body},
                         timeout=15)
             # A bare 200 is NOT proof of delivery: the gateway can swallow a
             # room-send failure server-side (bad room id, kicked agent,

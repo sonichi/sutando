@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -423,13 +424,50 @@ def main() -> int:
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == 4 and not (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
           "empty proactive file dropped without a send")
-    # Orphan .sending recovery (crash between claim and delivery).
-    (rtc.RESULTS_DIR / "proactive-t4.sending").write_text("orphan nudge")
+    # Routing protocol (review blocker): a [channel: <discord id>] nudge
+    # belongs to the Discord bridge — this consumer must not claim it, must
+    # not post it, and must leave the .txt in place for the real consumer.
+    foreign = rtc.RESULTS_DIR / "proactive-t5.txt"
+    foreign.write_text("[channel: 1504619109516841121]\nfor discord only\n")
+    posts_before = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(foreign.exists() and len(STATE["room_posts"]) == posts_before,
+          "[channel: <discord id>] nudge is skipped, unclaimed, un-posted")
+    foreign.unlink()
+    # …while a [channel: !room] marker redirects within this bridge's reach:
+    (rtc.RESULTS_DIR / "proactive-t6.txt").write_text(
+        "[channel: !other:example.org]\nrouted nudge\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!other:example.org"
+          and STATE["room_posts"][-1]["body"] == "routed nudge",
+          "[channel: !room] nudge delivers to the routed room, marker stripped")
+
+    # Orphan claim recovery (crash between claim and delivery) — pid-scoped:
+    # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen
+    # (review blocker: bare .sending recovery could steal in-flight claims).
+    dead_pid = 4194303  # above macOS/Linux default pid_max ranges — not alive
+    (rtc.RESULTS_DIR / f"proactive-t4.sending.{dead_pid}").write_text("orphan nudge")
+    live = rtc.RESULTS_DIR / f"proactive-t7.sending.{os.getpid()}"
+    live.write_text("in-flight nudge")
     rtc._recover_orphan_proactive()
     check((rtc.RESULTS_DIR / "proactive-t4.txt").exists(),
-          "orphan .sending claim recovered to .txt")
+          "dead-owner .sending.<pid> claim recovered to .txt")
+    check(live.exists() and not (rtc.RESULTS_DIR / "proactive-t7.txt").exists(),
+          "live worker's in-flight claim is NOT stolen")
+    live.unlink()
+    # Legacy bare .sending (no owner info): fresh → left alone; aged → recovered.
+    legacy = rtc.RESULTS_DIR / "proactive-t8.sending"
+    legacy.write_text("legacy orphan")
+    rtc._recover_orphan_proactive()
+    check(legacy.exists(), "fresh legacy .sending claim left alone (age guard)")
+    old = time.time() - rtc._ORPHAN_MIN_AGE_S - 5
+    os.utime(legacy, (old, old))
+    rtc._recover_orphan_proactive()
+    check((rtc.RESULTS_DIR / "proactive-t8.txt").exists(),
+          "aged legacy .sending claim recovered")
+    (rtc.RESULTS_DIR / "proactive-t8.txt").unlink()
     rtc._post_proactive()
-    check(len(STATE["room_posts"]) == 5 and STATE["room_posts"][4]["body"] == "orphan nudge",
+    check(STATE["room_posts"][-1]["body"] == "orphan nudge",
           "recovered orphan delivers on next drain")
     rtc.PROACTIVE_ROOM = ""
 
