@@ -12,7 +12,6 @@
 # launchd domain are never touched — `launchctl` is shadowed by a no-op stub.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
 pass=0; fail=0
 check() { if [ "$1" = "0" ]; then echo "  ok  $2"; pass=$((pass+1)); else echo "  FAIL $2"; fail=$((fail+1)); fi; }
 
@@ -20,24 +19,35 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/home/Library/LaunchAgents" "$TMP/bin" "$TMP/empty-claude-home"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/launchctl"; chmod +x "$TMP/bin/launchctl"
 
+# Stage a throwaway repo so the test NEVER mutates the real dist/ — which on a
+# bundled host is the live production credential-proxy.js. src/ and scripts/ are
+# symlinked to the real tree (so we run the real installer + helpers), but dist/
+# is a scratch dir we own. The installer resolves its REPO to this stage
+# (`cd "$(dirname "$0")/.."`), so the present/absent scenarios only touch the
+# scratch dist — no stash/restore of a live artifact, and an interrupt anywhere
+# leaves the real tree untouched (the EXIT trap removes only $TMP; `rm -rf` on the
+# symlinks drops the links, not their targets).
+STAGE="$TMP/repo"; mkdir -p "$STAGE/dist"
+ln -s "$REPO/src" "$STAGE/src"
+ln -s "$REPO/scripts" "$STAGE/scripts"
+INSTALLER="$STAGE/src/install-credential-proxy-launchd.sh"
+
 run_install() {  # $1 = extra env assignments applied inline
   env HOME="$TMP/home" PATH="$TMP/bin:$PATH" CLAUDE_CONFIG_DIR="$TMP/empty-claude-home" \
       SUTANDO_NODE="${SUTANDO_NODE_OVERRIDE:-}" bash "$INSTALLER" install 2>&1
 }
 
 # 1. bundled mode + dist present -> must NOT reject over the missing TS source
-[ -f "$REPO/dist/credential-proxy.js" ] || { mkdir -p "$REPO/dist"; echo "// test artifact" > "$REPO/dist/credential-proxy.js"; _made_dist=1; }
+echo "// test artifact" > "$STAGE/dist/credential-proxy.js"
 out="$(SUTANDO_NODE_OVERRIDE=/usr/bin/env run_install)"
 echo "$out" | grep -q "quota-tracker skill not found"; [ $? -ne 0 ]
 check $? "bundled mode does not gate on the dev-only TS source"
 
 # 2. bundled mode + dist MISSING -> must fail closed, naming the packaging error
-if [ "${_made_dist:-0}" = "1" ]; then rm -f "$REPO/dist/credential-proxy.js"; fi
-mv "$REPO/dist/credential-proxy.js" "$TMP/stash.js" 2>/dev/null || true
+rm -f "$STAGE/dist/credential-proxy.js"
 out="$(SUTANDO_NODE_OVERRIDE=/usr/bin/env run_install)"
 echo "$out" | grep -q "desktop packaging error"
 check $? "bundled mode fails closed when dist/credential-proxy.js is absent"
-mv "$TMP/stash.js" "$REPO/dist/credential-proxy.js" 2>/dev/null || true
 
 # 3. dev mode (no SUTANDO_NODE, repo outside an app bundle) still requires the TS source
 out="$(SUTANDO_NODE_OVERRIDE= run_install)"
