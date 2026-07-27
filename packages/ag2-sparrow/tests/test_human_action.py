@@ -101,6 +101,40 @@ def test_answer_command_and_reply_forms():
     check(got2["decision"]["answers"] == {"Ship v1 or wait?": "Ship v1"},
           "bare option number replying to the card resolves")
 
+    # Keyword-optional grammar (live-acceptance finding 2026-07-26): a real
+    # owner naturally types the bare `ha_<hex> N` without `answer`.
+    store3, rec3 = _store_with_action()
+    h3 = ha.DecisionHandler(store3, OWNER, log=lambda *_: None)
+    h3.offer(_message("ha_abc123def456 2"))
+    got3 = json.loads(Path(store3.dir, rec3["action_id"] + ".json").read_text())
+    check(got3["decision"]["answers"] == {"Ship v1 or wait?": "Wait"},
+          "bare `ha_x 2` (no answer keyword) resolves")
+    # a NON-pending id mentioned with a number stays inert (terminal immutable)
+    h3.offer(_message("ha_abc123def456 1"))
+    got3b = json.loads(Path(store3.dir, rec3["action_id"] + ".json").read_text())
+    check(got3b["decision"]["answers"] == {"Ship v1 or wait?": "Wait"},
+          "late bare-id answer cannot overwrite the resolution")
+
+    # Intent boundary (review blocker): the BARE form must be the ENTIRE
+    # trimmed message. Prose that merely QUOTES a pending token must not
+    # resolve; the explicit `answer` keyword remains usable inside prose.
+    store4, rec4 = _store_with_action()
+    h4 = ha.DecisionHandler(store4, OWNER, log=lambda *_: None)
+    h4.offer(_message("fyi the pending card ha_abc123def456 2 is still open"))
+    got4 = json.loads(Path(store4.dir, rec4["action_id"] + ".json").read_text())
+    check(got4.get("decision") is None and got4["status"] == "pending",
+          "prose quoting `ha_x 2` does NOT resolve (bare form must fullmatch)")
+    h4.offer(_message("  ha_abc123def456 2  "))
+    got4b = json.loads(Path(store4.dir, rec4["action_id"] + ".json").read_text())
+    check(got4b["decision"]["answers"] == {"Ship v1 or wait?": "Wait"},
+          "whitespace-padded bare form still resolves (trimmed fullmatch)")
+    store5, rec5 = _store_with_action()
+    h5 = ha.DecisionHandler(store5, OWNER, log=lambda *_: None)
+    h5.offer(_message("ok let me answer ha_abc123def456 1 then"))
+    got5 = json.loads(Path(store5.dir, rec5["action_id"] + ".json").read_text())
+    check(got5["decision"]["answers"] == {"Ship v1 or wait?": "Ship v1"},
+          "explicit `answer ha_x N` inside prose still resolves")
+
 
 def test_a2ui_button_click_resolves():
     # A2UI-CONTRACT.md: a button click arrives as a NORMAL m.room.message with a
