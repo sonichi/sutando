@@ -144,7 +144,7 @@ def render_digest(items: list, mention: str | None) -> str:
     return "\n".join(lines)
 
 
-def _fetch_prs(repo: str) -> list:
+def _fetch_prs(repo: str) -> list:  # pragma: no cover — subprocess/gh glue
     cmd = [
         "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "50",
         "--json", "number,title,author,mergeable,reviewDecision,statusCheckRollup,isDraft",
@@ -159,7 +159,7 @@ def _fetch_prs(repo: str) -> list:
         return []
 
 
-def main() -> int:
+def main() -> int:  # pragma: no cover — CLI + gh/discord/state I/O glue; pure logic covered in tests
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="sonichi/sutando")
     ap.add_argument("--owner", default="sonichi", help="GH login whose authored PRs are 'mine'")

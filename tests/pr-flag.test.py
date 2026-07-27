@@ -83,6 +83,18 @@ def main() -> int:
     assert [i["number"] for i in items if i["court"] == "owner"] == [10]
     print("  ok  only green+mergeable+unblocked is in the owner's court")
 
+    # cover the remaining agent-court branches of classify_prs
+    more = [
+        _pr(20, OWNER, ci="failing"),                          # mine, CI failing
+        _pr(21, OWNER, review="REVIEW_REQUIRED", ci="green"),  # mine, needs a review
+        _pr(22, OWNER, ci="none", mergeable="UNKNOWN"),        # mine, no checks/unknown → 'open'
+    ]
+    g2 = {i["number"]: i for i in pf.classify_prs(more, OWNER)}
+    assert g2[20]["court"] == "agent" and "CI failing" in g2[20]["why"], g2[20]
+    assert g2[21]["court"] == "agent" and "review" in g2[21]["why"], g2[21]
+    assert g2[22]["court"] == "agent" and g2[22]["why"] == "open", g2[22]
+    print("  ok  agent-court branches: CI-failing / needs-review / open all covered")
+
     # sorted by number
     assert [i["number"] for i in items] == sorted(i["number"] for i in items)
     print("  ok  output sorted by PR number")
