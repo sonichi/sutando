@@ -572,14 +572,14 @@ def main() -> int:
     # %7C token must decode so URL is populated — otherwise it parses as a bare
     # secret with empty URL and FATALs at startup (the Vidhu "connected but not
     # responding" failure, 2026-07-24).
-    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay|deadbeef")
-          == ("https://chat.ag2.space/relay", "deadbeef"),
+    check(rtc._parse_onboarding_token("https://ag2.space/relay|deadbeef")
+          == ("https://ag2.space/relay", "deadbeef"),
           "token parse: literal | splits into (url, secret)")
-    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7Cdeadbeef")
-          == ("https://chat.ag2.space/relay", "deadbeef"),
+    check(rtc._parse_onboarding_token("https://ag2.space/relay%7Cdeadbeef")
+          == ("https://ag2.space/relay", "deadbeef"),
           "token parse: %7C-encoded separator decodes to (url, secret)")
-    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7cdeadbeef")
-          == ("https://chat.ag2.space/relay", "deadbeef"),
+    check(rtc._parse_onboarding_token("https://ag2.space/relay%7cdeadbeef")
+          == ("https://ag2.space/relay", "deadbeef"),
           "token parse: lowercase %7c also decodes")
     check(rtc._parse_onboarding_token("baresecret") == ("", "baresecret"),
           "token parse: bare secret yields empty url (REMOTE_TASK_URL supplies it)")

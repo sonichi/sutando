@@ -58,7 +58,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
+# Prefer IPv4 for gateway/relay connections. The relay host (e.g. ag2.space)
 # publishes AAAA records, but some hosts have IPv6 black-holed at the network
 # (the SYN is silently dropped, not refused). Python's getaddrinfo returns v6
 # first, so each fresh urllib connection — this bridge opens one per long-poll

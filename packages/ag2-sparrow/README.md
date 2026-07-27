@@ -19,7 +19,7 @@ pipx install ag2-sparrow        # or: pip install ag2-sparrow
 
 ```sh
 REMOTE_TASK_TOKEN=<your relay token from the AG2 Space Agent Portal> \
-REMOTE_TASK_URL=https://chat.ag2.space/relay \
+REMOTE_TASK_URL=https://ag2.space/relay \
 ag2-sparrow
 ```
 
