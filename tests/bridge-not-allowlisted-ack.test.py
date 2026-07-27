@@ -4,7 +4,7 @@
 When a sender ADDRESSES the bot (a DM, or an @mention) but isn't on the
 allowlist, the access gate drops the message — historically silently. These
 tests exercise the REAL `_ack_not_allowlisted` in each bridge (transport
-stubbed) and assert Discord's durable per-channel seven-day cooldown plus
+stubbed) and assert Discord's durable per-(channel, sender) seven-day cooldown plus
 Slack's existing per-sender cooldown and drop-path wiring.
 
 Run: python3 tests/bridge-not-allowlisted-ack.test.py   (exit 0 pass / 1 fail)
@@ -72,14 +72,16 @@ def _load_discord():
 
 
 class _FakeChannel:
-    def __init__(self, channel_id=123): self.id = channel_id; self.sent = []
-    async def send(self, text, **kw): self.sent.append(text)
+    def __init__(self, channel_id=123):
+        self.id = channel_id; self.sent = []; self.references = []
+    async def send(self, text, **kw):
+        self.sent.append(text); self.references.append(kw.get("reference"))
 
 
 class _YieldingChannel(_FakeChannel):
     async def send(self, text, **kw):
         await asyncio.sleep(0)
-        self.sent.append(text)
+        self.sent.append(text); self.references.append(kw.get("reference"))
 
 
 async def _run_concurrently(*awaitables):
@@ -104,13 +106,13 @@ def test_discord():
     asyncio.run(db._ack_not_allowlisted(ch, "U_A", "alice"))
     check("discord: repeat in the same channel is rate-limited", len(ch.sent) == 1, str(ch.sent))
     asyncio.run(db._ack_not_allowlisted(ch, "U_B", "bob"))
-    check("discord: a different sender cannot repeat the channel notice", len(ch.sent) == 1, str(ch.sent))
+    check("discord: a different sender gets their own notice", len(ch.sent) == 2, str(ch.sent))
 
     # Simulate a bridge restart: clearing memory must not reset the durable
-    # channel cooldown. A different channel still receives its own first notice.
+    # per-sender cooldown. A different channel still receives its own first notice.
     db._not_allowlisted_ack_at.clear()
-    asyncio.run(db._ack_not_allowlisted(ch, "U_C", "carol"))
-    check("discord: durable cooldown survives bridge restart", len(ch.sent) == 1, str(ch.sent))
+    asyncio.run(db._ack_not_allowlisted(ch, "U_A", "alice"))
+    check("discord: durable cooldown survives bridge restart", len(ch.sent) == 2, str(ch.sent))
     other = _FakeChannel(channel_id=456)
     asyncio.run(db._ack_not_allowlisted(other, "U_C", "carol"))
     check("discord: another channel receives its own notice", len(other.sent) == 1, str(other.sent))
@@ -125,9 +127,14 @@ def test_discord():
     same = _YieldingChannel(channel_id=600)
     asyncio.run(_run_concurrently(
         db._ack_not_allowlisted(same, "U_G", "gina"),
-        db._ack_not_allowlisted(same, "U_H", "hank"),
+        db._ack_not_allowlisted(same, "U_G", "gina"),
     ))
-    check("discord: concurrent handlers send one notice per channel", len(same.sent) == 1, str(same.sent))
+    check("discord: concurrent handlers send one notice per key", len(same.sent) == 1, str(same.sent))
+    asyncio.run(_run_concurrently(
+        db._ack_not_allowlisted(same, "U_H", "hank"),
+        db._ack_not_allowlisted(same, "U_K", "kira"),
+    ))
+    check("discord: concurrent distinct senders each get a notice", len(same.sent) == 3, str(same.sent))
     db._not_allowlisted_ack_at.clear()
     left = _YieldingChannel(channel_id=601)
     right = _YieldingChannel(channel_id=602)
@@ -138,20 +145,20 @@ def test_discord():
     concurrent_state = db._not_allowlisted_ack_state()
     check(
         "discord: concurrent different-channel sends preserve both durable records",
-        {"601", "602"}.issubset(concurrent_state),
+        {"601:U_I", "602:U_J"}.issubset(concurrent_state),
         str(concurrent_state),
     )
 
     # An entry older than seven days is expired and replaced by a fresh send.
     db._NOT_ALLOWLISTED_ACK_STATE_FILE.write_text(json.dumps({
-        "schema_version": 1,
-        "sent_at_by_channel": {
-            str(ch.id): db.time.time() - db._NOT_ALLOWLISTED_ACK_COOLDOWN_S - 1,
+        "schema_version": 2,
+        "sent_at_by_key": {
+            f"{ch.id}:U_D": db.time.time() - db._NOT_ALLOWLISTED_ACK_COOLDOWN_S - 1,
         },
     }))
     db._not_allowlisted_ack_at.clear()
     asyncio.run(db._ack_not_allowlisted(ch, "U_D", "dana"))
-    check("discord: channel notice is eligible again after seven days", len(ch.sent) == 2, str(ch.sent))
+    check("discord: sender notice is eligible again after seven days", len(ch.sent) == 3, str(ch.sent))
 
     # Corrupt/unwritable state must fail open: the sender still gets the notice
     # and an inability to persist the cooldown never breaks message handling.
@@ -191,8 +198,10 @@ def test_discord():
         def __hash__(self): return hash(self.id)
 
     class _FakeDM(_dsm.DMChannel):
-        def __init__(self, cid): self.id = cid; self.sent = []
-        async def send(self, text, **kw): self.sent.append(text)
+        def __init__(self, cid):
+            self.id = cid; self.sent = []; self.references = []
+        async def send(self, text, **kw):
+            self.sent.append(text); self.references.append(kw.get("reference"))
 
     class _FakeMsg:
         def __init__(self, author, channel, content):
@@ -209,8 +218,10 @@ def test_discord():
     db.ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
     db.ACCESS_FILE.write_text(json.dumps({"dmPolicy": "allowlist", "allowFrom": ["U_OWNER"]}))
     dm = _FakeDM(999)
-    asyncio.run(db._handle_discord_message(_FakeMsg(_FakeUser("U_STRANGER"), dm, "hi")))
+    dm_msg = _FakeMsg(_FakeUser("U_STRANGER"), dm, "hi")
+    asyncio.run(db._handle_discord_message(dm_msg))
     check("discord: _handle_discord_message DM drop fires the ack", len(dm.sent) == 1, str(dm.sent))
+    check("discord: DM ack replies to the triggering message", dm.references == [dm_msg], str(dm.references))
 
     # Channel @mention drops → ack (covers the two channel wiring points).
     class _FakeGuild:
@@ -218,8 +229,10 @@ def test_discord():
         def get_member(self, uid): return None
 
     class _FakeChan:
-        def __init__(self, cid, name="general"): self.id = cid; self.name = name; self.sent = []
-        async def send(self, text, **kw): self.sent.append(text)
+        def __init__(self, cid, name="general"):
+            self.id = cid; self.name = name; self.sent = []; self.references = []
+        async def send(self, text, **kw):
+            self.sent.append(text); self.references.append(kw.get("reference"))
 
     def _chan_msg(uid, chan, guild):
         m = _FakeMsg(_FakeUser(uid), chan, "hey @bot")
@@ -232,8 +245,10 @@ def test_discord():
     db._not_allowlisted_ack_at.clear()
     db.ACCESS_FILE.write_text(json.dumps({"dmPolicy": "allowlist", "allowFrom": ["U_OWNER"]}))
     c1 = _FakeChan(555)
-    asyncio.run(db._handle_discord_message(_chan_msg("U_S1", c1, g)))
+    c1_msg = _chan_msg("U_S1", c1, g)
+    asyncio.run(db._handle_discord_message(c1_msg))
     check("discord: channel @mention, unconfigured + not in global allowlist → ack", len(c1.sent) == 1, str(c1.sent))
+    check("discord: channel ack replies to the triggering message", c1.references == [c1_msg], str(c1.references))
     # (b) configured channel whose allowFrom excludes the sender, @mentioned → ack
     db._not_allowlisted_ack_at.clear()
     db.ACCESS_FILE.write_text(json.dumps({"dmPolicy": "allowlist", "allowFrom": ["U_OWNER"],
