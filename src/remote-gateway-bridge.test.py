@@ -593,6 +593,108 @@ def main() -> int:
     check(rtc._parse_onboarding_token("bare|secret") == ("", "bare|secret"),
           "token parse: a bare secret with no URL scheme is not split on its own | bytes")
 
+    # ── env-fallback: token from channels/ag2space/.env when the launcher never
+    # got it into the env. startup.sh exports it and the gateway window sources the
+    # file once at launch — but a supervisor-spawned core reliably hits neither, so
+    # without this the bridge sees an empty env token and never connects (every new
+    # desktop-only user reproduces it — mark, 2026-07-26). Read the file directly.
+    # Save/clear BOTH the current names and their legacy aliases (the production URL
+    # chain reads AG2_REMOTE_URL too), so an ambient value can't contaminate these
+    # imports.
+    _saved = {k: os.environ.get(k) for k in
+              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
+               "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV")}
+    try:
+        for _k in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
+                   "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV"):
+            os.environ.pop(_k, None)
+        _cfg = tempfile.mkdtemp()
+        _chan = Path(_cfg) / "channels" / "ag2space"
+        _chan.mkdir(parents=True)
+        # connect writes AG2_REMOTE_TOKEN='<url|secret>' (quoted) — lib.rs CONNECT_ENV_KEY.
+        (_chan / ".env").write_text("# relay onboarding\nAG2_REMOTE_TOKEN='https://gw.example/relay|s3cr3t'\n")
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg
+        _fspec = importlib.util.spec_from_file_location(
+            "rtc_fallback", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _frtc = importlib.util.module_from_spec(_fspec)
+        _fspec.loader.exec_module(_frtc)
+        check(_frtc.TOKEN == "s3cr3t",
+              "env-fallback: token read from channels/ag2space/.env (quote-stripped, legacy alias) when env empty")
+        check(_frtc.URL == "https://gw.example/relay",
+              "env-fallback: URL comes from the file token's url|secret form")
+
+        # negative: no env token AND no file → empty token, no crash at import.
+        os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()
+        _nspec = importlib.util.spec_from_file_location(
+            "rtc_nofile", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _nrtc = importlib.util.module_from_spec(_nspec)
+        _nspec.loader.exec_module(_nrtc)
+        check(_nrtc.TOKEN == "",
+              "env-fallback: no env token and no file yields empty token (no crash)")
+
+        # env token still wins over the file when both are present.
+        os.environ["REMOTE_TASK_TOKEN"] = "https://env.example/relay|envwins"
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg
+        _wspec = importlib.util.spec_from_file_location(
+            "rtc_envwins", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _wrtc = importlib.util.module_from_spec(_wspec)
+        _wspec.loader.exec_module(_wrtc)
+        check(_wrtc.TOKEN == "envwins",
+              "env-fallback: env token takes precedence over the file fallback")
+
+        # The desktop case: CLAUDE_CONFIG_DIR is NOT passed into the gateway
+        # window (launch-sutando.sh passes only SUTANDO_APP_SUPPORT / SUTANDO_PY /
+        # AG2_DEVICE_ENV), so the fallback MUST resolve via AG2_DEVICE_ENV — the
+        # absolute path the launcher lays in. This is the scenario the fix targets.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ["AG2_DEVICE_ENV"] = str(_chan / ".env")
+        _dspec2 = importlib.util.spec_from_file_location(
+            "rtc_deviceenv", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _drtc2 = importlib.util.module_from_spec(_dspec2)
+        _dspec2.loader.exec_module(_drtc2)
+        check(_drtc2.TOKEN == "s3cr3t",
+              "env-fallback: AG2_DEVICE_ENV resolves the token when CLAUDE_CONFIG_DIR is absent (desktop case)")
+
+        # AG2_DEVICE_ENV wins over CLAUDE_CONFIG_DIR when both point at a token.
+        _cfg2 = tempfile.mkdtemp()
+        _chan2 = Path(_cfg2) / "channels" / "ag2space"
+        _chan2.mkdir(parents=True)
+        (_chan2 / ".env").write_text("AG2_REMOTE_TOKEN='https://cfg.example/relay|cfgtok'\n")
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg2
+        os.environ["AG2_DEVICE_ENV"] = str(_chan / ".env")  # still points at s3cr3t
+        _pspec = importlib.util.spec_from_file_location(
+            "rtc_devpriority", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _prtc = importlib.util.module_from_spec(_pspec)
+        _pspec.loader.exec_module(_prtc)
+        check(_prtc.TOKEN == "s3cr3t",
+              "env-fallback: AG2_DEVICE_ENV takes precedence over CLAUDE_CONFIG_DIR")
+
+        # split-key layout: bare REMOTE_TASK_TOKEN + a SEPARATE REMOTE_TASK_URL
+        # (not the combined url|secret token). The fallback must carry the URL too,
+        # else the bridge gets a token but URL='' and fatals on "no gateway URL" —
+        # the exact failure for a split-layout desktop .env in the target scenario.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("REMOTE_TASK_URL", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        _split_chan = Path(tempfile.mkdtemp()) / "channels" / "ag2space"
+        _split_chan.mkdir(parents=True)
+        (_split_chan / ".env").write_text(
+            "REMOTE_TASK_TOKEN='splitsecret'\nREMOTE_TASK_URL='https://split.example/relay'\n")
+        os.environ["AG2_DEVICE_ENV"] = str(_split_chan / ".env")
+        _sspec = importlib.util.spec_from_file_location(
+            "rtc_split", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _srtc = importlib.util.module_from_spec(_sspec)
+        _sspec.loader.exec_module(_srtc)
+        check(_srtc.TOKEN == "splitsecret" and _srtc.URL == "https://split.example/relay",
+              "env-fallback: split-layout file (bare token + REMOTE_TASK_URL) resolves BOTH token and URL")
+    finally:
+        for _k, _v in _saved.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
     srv.shutdown()
     if FAILS:
         print(f"\nFAILED ({len(FAILS)})"); return 1
