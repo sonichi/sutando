@@ -149,6 +149,115 @@ def twilio_configured(env_content: str) -> bool:
     return False
 
 
+def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict:
+    """G1.5 node-bundle: resolve the Node executable the engine's JS services
+    would use, in the same precedence as `sutando-config.sh node-bin`:
+
+      1. $SUTANDO_NODE — exact executable exported by the desktop app.
+      2. $SUTANDO_APP_NODE_DIR/node (or its default app-support home) — the
+         bundled runtime found at rest (launchd jobs without the env var).
+      3. `node` on PATH — dev/OSS hosts.
+
+    Returns {"source": "bundled"|"app-bundle"|"system"|"none", "path": str|None}.
+    Pure over (env, which) for testability.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get("SUTANDO_NODE", "")
+    if explicit:
+        if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return {"source": "bundled", "path": explicit}
+        # Owner review P1-1: SUTANDO_NODE is the desktop's explicit
+        # declaration — set-but-invalid is a packaging error, NOT a case to
+        # silently rescue via PATH. Surface it as its own failure source.
+        return {"source": "invalid-explicit", "path": explicit}
+    app_dir = env.get("SUTANDO_APP_NODE_DIR", "") or os.path.expanduser(
+        "~/Library/Application Support/space.ag2.app/engine/runtime/node/bin"
+    )
+    app_node = os.path.join(app_dir, "node")
+    if os.path.isfile(app_node) and os.access(app_node, os.X_OK):
+        return {"source": "app-bundle", "path": app_node}
+    on_path = which("node")
+    if on_path:
+        # Desktop-managed installs should never end up here (bundled runtime
+        # dir exists but its node is broken/missing) — flag it so the probe
+        # can degrade instead of reporting a false green (owner review).
+        if os.path.isdir(app_dir):
+            return {"source": "system-degraded", "path": on_path}
+        return {"source": "system", "path": on_path}
+    return {"source": "none", "path": None}
+
+
+def check_node_runtime() -> dict:
+    """Surface WHICH node the JS services resolve to — or a loud red line when
+    none exists. The 2026-07-13 outage class: an interactive terminal finding
+    node does NOT mean launchd-/app-spawned services can (credential-proxy sat
+    dead for days on this failure). "none" is a real issue, not a warn: every
+    JS service (voice, phone, proxy, web-client) silently fails to start.
+    """
+    resolved = resolve_node_runtime()
+    if resolved["source"] == "none":
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": "no node found (no SUTANDO_NODE, no app bundle, none on PATH) — JS services cannot start",
+        }
+    if resolved["source"] == "invalid-explicit":
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"SUTANDO_NODE set but not executable: {resolved['path']} — desktop packaging error (fail-closed, no PATH fallback)",
+        }
+    if resolved["source"] == "system-degraded":
+        return {
+            "name": "node-runtime",
+            "status": "warn",
+            "detail": f"bundled runtime dir present but its node is unusable — running on system node {resolved['path']} (pinned-runtime guarantee NOT in effect)",
+        }
+    # Executable permission alone doesn't prove the runtime can launch the
+    # bundled services (Codex re-review F3): a --version that errors or fails
+    # to run means every JS service dies at spawn — that is DOWN, not ok.
+    try:
+        out = subprocess.run(
+            [resolved["path"], "--version"], capture_output=True, text=True, timeout=5
+        )
+        if out.returncode != 0:
+            return {
+                "name": "node-runtime",
+                "status": "down",
+                "detail": f"node at {resolved['path']} failed --version (rc={out.returncode}) — runtime not runnable",
+            }
+        version = out.stdout.strip()
+    except Exception as exc:
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"node at {resolved['path']} could not be executed ({exc}) — runtime not runnable",
+        }
+    # Version floor (external review on #2182): bundled services use node:sqlite,
+    # which needs Node >= 22.5 — an older node passes every other probe here but
+    # crashes those services at import. Unparseable versions degrade to warn
+    # (never block on a formatting surprise), too-old is DOWN with the fix named.
+    floor = (22, 5)
+    parsed = re.match(r"v?(\d+)\.(\d+)", version or "")
+    if parsed is None:
+        return {
+            "name": "node-runtime",
+            "status": "warn",
+            "detail": f"node at {resolved['path']} reported unparseable version {version!r} — cannot verify the >=22.5 floor (node:sqlite)",
+        }
+    if (int(parsed.group(1)), int(parsed.group(2))) < floor:
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"{version} via {resolved['source']} is below the 22.5 floor (node:sqlite) — bundled services will crash; upgrade the runtime",
+        }
+    return {
+        "name": "node-runtime",
+        "status": "ok",
+        "detail": f"{version} via {resolved['source']} ({resolved['path']})",
+    }
+
+
 def check_port(port: int, name: str, probe: bool = False) -> dict:
     """Check if a port is listening, optionally probing for a live response.
 
@@ -774,7 +883,10 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
     Sutando.app), the function ALSO checks whether the binary itself is
     older than the source. A stale binary means the running process —
     however recently relaunched — is executing old code. When this fires,
-    the message tells the user to rebuild, not just restart.
+    the message tells the user to rebuild, not just restart. That branch
+    applies the same `_file_unchanged_since` content cross-check as the
+    process-start path, so a mtime bump from `git checkout` on unchanged
+    content does not read as "rebuild needed".
     """
     if not src_file.exists():
         return
@@ -787,6 +899,14 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
             src_mtime = src_file.stat().st_mtime
             bin_mtime = binary_path.stat().st_mtime
             if src_mtime - bin_mtime > threshold_sec:
+                # Same git cross-check the other two mtime comparisons carry
+                # (PR #253 for the proc_start path below, #255 for the bridges
+                # path). `git checkout` bumps mtime on files whose content is
+                # byte-identical, so a branch switch alone made this branch
+                # report "rebuild needed" for a binary that is in fact built
+                # from exactly the source on disk.
+                if _binary_is_current(binary_path, src_file):
+                    return
                 age_min = int((src_mtime - bin_mtime) / 60)
                 check["status"] = "stale"
                 check["detail"] = f"running, but binary is {age_min} min older than source — rebuild needed"
@@ -887,6 +1007,27 @@ def _filter_pids_this_checkout(pids: list) -> list:
         elif not argv:
             kept.append(pid)  # neither probe answered — fail open
     return kept
+
+
+def _binary_is_current(binary_path: Path, src_file: Path) -> bool:
+    """True if `binary_path` was built from the content now in `src_file`.
+
+    mtime ordering alone is not enough. `git checkout`, `pull`, and `rebase`
+    restamp files whose content is byte-identical, so a branch switch can make
+    a perfectly current binary look stale. Accept two ways: the binary is at
+    least as new as the source, or the source's mtime moved but the content
+    cross-check proves the bump was idempotent.
+
+    Fails safe (False) on any stat error, matching `_file_unchanged_since`:
+    an unresolvable check must never assert a stale binary is current.
+    """
+    try:
+        bin_mtime = binary_path.stat().st_mtime
+        if bin_mtime >= src_file.stat().st_mtime:
+            return True
+    except OSError:
+        return False
+    return _file_unchanged_since(src_file, bin_mtime)
 
 
 def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
@@ -1622,21 +1763,29 @@ def check_disk_space() -> dict:
 
 def check_skill_symlinks() -> dict:
     """Detect skills in the OSS repo checkout that are not symlinked into
-    ~/.claude/skills/. A missing symlink means Claude Code never loads the
-    skill — it's silently invisible until manually linked (bug d920b18b).
+    the Claude home's skills/ dir. A missing symlink means Claude Code never
+    loads the skill — it's silently invisible until manually linked (bug
+    d920b18b).
 
     Scans REPO_DIR/skills/ for directories and checks for a matching entry
-    in ~/.claude/skills/. Reports unlinked skills as 'warn'; in --fix mode,
-    creates the missing symlinks automatically.
+    in <claude-home>/skills/. Reports unlinked skills as 'warn'; in --fix
+    mode, creates the missing symlinks automatically.
+
+    The destination resolves via claude_home_path() (same as
+    _default_memory_dir(), fixed for the identical reason in #1454): a bare
+    Path.home()/".claude" ignores the workspace-scoped CLAUDE_CONFIG_DIR, so
+    on a migrated install this check scanned a stale ~/.claude/skills/ and
+    warned "unlinked" about skills whose symlinks exist — and are loaded —
+    under the workspace claude-home.
     """
     name = "skill-symlinks"
     skills_src = REPO_DIR / "skills"
-    skills_dst = Path.home() / ".claude" / "skills"
+    skills_dst = claude_home_path("skills")
 
     if not skills_src.exists():
         return {"name": name, "status": "ok", "detail": "skills/ dir not found — skipped"}
     if not skills_dst.exists():
-        return {"name": name, "status": "ok", "detail": "~/.claude/skills/ not found — skipped"}
+        return {"name": name, "status": "ok", "detail": f"{skills_dst} not found — skipped"}
 
     # A DANGLING symlink (entry present, target gone) is the case the original
     # condition let through: `exists()` follows the link and is False, but
@@ -1647,6 +1796,12 @@ def check_skill_symlinks() -> dict:
     broken: list[str] = []     # dangling link  -> must be unlinked first
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
+            continue
+        # Mirror skills/install.sh's filter: only dirs WITH a SKILL.md are
+        # slash-invocable skills the installer links. Manifest-loaded and
+        # scripts-only skills (gws-gmail-voice, learned-skills, ...) have no
+        # SKILL.md, are correctly never symlinked, and must not warn here.
+        if not (skill_dir / "SKILL.md").is_file():
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
@@ -2196,6 +2351,9 @@ def run_all_checks() -> list[dict]:
     # Quota telemetry — only meaningful when the proxy is actually up.
     checks.append(check_quota_telemetry(proxy_check["status"]))
 
+    # G1.5: which Node would JS services resolve to (bundled/app-bundle/
+    # system), red when none — the silent-dead-services failure class.
+    checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
 
@@ -3750,7 +3908,7 @@ def main():
                         and "not running" in (c.get("detail") or "")
                         and binary.exists()
                         and source.exists()
-                        and binary.stat().st_mtime >= source.stat().st_mtime
+                        and _binary_is_current(binary, source)
                     ):
                         try:
                             subprocess.run(["/usr/bin/open", str(binary)],
