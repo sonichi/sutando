@@ -704,9 +704,16 @@ def _stale_safe(cached):
 
 
 def _load_tier_map():
-    """Return the cached local sender caps, preserving safe caps on read errors.
-    Only a successful changed-file read replaces the cache."""
+    """Return cached caps; read errors preserve only safe entries.
+    An absent launcher config explicitly clears the cache."""
     path = _ag2space_access_path()
+    if not path:
+        _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = (
+            path,
+            None,
+            {},
+        )
+        return {}
     try:
         st = os.stat(path)
     except OSError:

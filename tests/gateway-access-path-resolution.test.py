@@ -125,6 +125,15 @@ try:
         "path change invalidates an identity-colliding cache",
         bridge._tier_for("@teammate:ag2.space", "owner") == "team",
     )
+
+    # Removing both launcher pointers is an explicit disable, not a transient
+    # read failure, so no prior trust decision may survive it.
+    os.environ.pop("AG2_DEVICE_ENV")
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    check(
+        "removing launcher config clears a previously loaded tier map",
+        bridge._tier_for("@teammate:ag2.space", "owner") == bridge.LOCAL_TIER,
+    )
 finally:
     for key, value in SAVED_ENV.items():
         if value is None:
@@ -138,4 +147,4 @@ if failures:
     for failure in failures:
         print(" - " + failure)
     raise SystemExit(1)
-print(f"\nPASS — {6} access-path checks")
+print(f"\nPASS — {7} access-path checks")
