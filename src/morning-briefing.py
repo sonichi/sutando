@@ -517,7 +517,12 @@ def main():
     ts = int(time.time() * 1000)
     result_file = RESULTS_DIR / f"proactive-morning-{ts}.txt"
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    result_file.write_text(narrative)
+    # Privacy: the briefing carries calendar + email — private data that must
+    # go to the owner's DM only. The `[dm-only]` marker forces DM delivery and
+    # suppresses any `[channel:]` redirect at the bridge, so this can never be
+    # posted to a shared channel (result_markers.parse_markers). The marker is
+    # stripped before delivery/voice, so the owner never sees it.
+    result_file.write_text(f"[dm-only]\n{narrative}")
     print(f"  → {result_file.name}")
 
     # Mark as done today

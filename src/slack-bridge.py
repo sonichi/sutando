@@ -40,10 +40,13 @@ import os
 import uuid
 import re
 import secrets
+import shlex
+import shutil
 import sys
 import threading
 import time
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 # startup.sh redirects stdout to a log file, which makes CPython block-buffer
@@ -94,6 +97,18 @@ INBOX_DIR = REPO / "slack-inbox"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
+_THREAD_CONTEXT_MAX_MESSAGES = 20
+_THREAD_CONTEXT_MESSAGE_MAX_CHARS = 500
+_THREAD_CONTEXT_PAGE_SIZE = 100
+_THREAD_CONTEXT_MAX_PAGES = 10
+# Durable on-disk backup of the Slack access allowlist. The in-memory
+# _access_cache restores access.json after an intermittent wipe (#899) ONLY
+# while the process lives; a wipe + process restart (observed 2026-07-17 —
+# the bridge booted into TOFU and would have enrolled the next DM'er as owner)
+# loses the cache. This backup lives under state/auth/ (per CLAUDE.md, the
+# cleanup-exempt per-host install-state dir) so a restart can restore the
+# allowlist from disk instead of falling through to a security-exposing TOFU.
+ACCESS_BACKUP_FILE = STATE_DIR / "auth" / "slack-access-backup.json"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -255,6 +270,65 @@ def _update_access_cache(data: dict) -> None:
     with _access_cache_lock:
         _access_cache = data
         _access_cache_mtime = mtime
+    _backup_access_to_disk(data)
+
+
+def _is_valid_access_doc(data) -> bool:
+    """A structurally valid access-control document worth backing up / restoring.
+
+    The core schema is an ``allowFrom`` list. Three states qualify and MUST be
+    protected, none of which ``tofuOwner`` alone covers (CR #2163, qingyun-wu):
+      - a TOFU-enrolled allowlist (has ``tofuOwner``);
+      - a legacy populated allowlist enrolled before ``tofuOwner`` existed;
+      - the intentional locked-down state ``allowFrom: []``.
+    Only a transient/partial wipe — a non-dict, a parse failure, or a
+    missing/non-list ``allowFrom`` — is rejected, so it can't overwrite a good
+    backup. (A slack wipe deletes access.json rather than rewriting it to empty,
+    so an empty allowlist reaches this path only when it was written on purpose.)
+    """
+    return isinstance(data, dict) and isinstance(data.get("allowFrom"), list)
+
+
+def _backup_access_to_disk(data: dict) -> None:
+    """Persist a copy of a VALID access-control document to the durable backup.
+    Backs up any structurally valid state (see ``_is_valid_access_doc``) —
+    including a legacy populated allowlist or an intentional empty lockdown —
+    but never a transient/partial wipe, so a wipe can't overwrite the good
+    backup."""
+    if not _is_valid_access_doc(data):
+        return
+    try:
+        ACCESS_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCESS_BACKUP_FILE.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(ACCESS_BACKUP_FILE, 0o600)
+    except OSError:
+        pass  # best-effort; backup must never break the write path
+
+
+def _restore_access_from_disk() -> bool:
+    """Restore access.json from the durable on-disk backup. Survives process
+    death (unlike the in-memory cache), closing the wipe+restart -> TOFU
+    exposure. Returns True if restored."""
+    try:
+        backup = json.loads(ACCESS_BACKUP_FILE.read_text())
+    except Exception:
+        return False
+    if not _is_valid_access_doc(backup):
+        return False
+    try:
+        ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCESS_FILE.write_text(json.dumps(backup, indent=2) + "\n")
+        os.chmod(ACCESS_FILE, 0o600)
+        _update_access_cache(backup)
+        print(
+            "  [access] restored access.json from durable on-disk backup "
+            "(wipe survived a restart — #899 defense-in-depth)",
+            flush=True,
+        )
+        return True
+    except Exception as e:
+        print(f"  [access] disk-backup restore failed: {e}", flush=True)
+        return False
 
 
 def _restore_access_from_cache() -> bool:
@@ -296,23 +370,86 @@ def load_allowed():
 def load_tier_map() -> dict:
     """Return the per-user-id → tier map from access.json `tierMap`, or
     empty dict if missing. Recognized tiers: "owner", "team", "other".
-    Unmapped users default to "owner" — preserves the pre-tierMap behavior
-    where every entry in `allowFrom` was treated as owner-tier."""
+    Unmapped users are resolved by the caller as "other" (fail-safe): owner
+    comes STRICTLY from membership in a successfully-persisted map.
+    `_ensure_tier_map_seeded()` grandfathers existing members into a non-empty
+    map, so a legacy no-tierMap config still resolves its members to owner via
+    that seeded map — while an empty/unconfirmed map (seed could not persist)
+    fails closed to "other" rather than escalating to owner (#2161)."""
     with _access_cache_lock:
         cached = _access_cache
         cached_mtime = _access_cache_mtime
     if cached is not None:
         try:
             if ACCESS_FILE.stat().st_mtime == cached_mtime:
-                return cached.get("tierMap") or {}
+                tier_map = cached.get("tierMap")
+                return tier_map if isinstance(tier_map, dict) else {}
         except OSError:
             pass  # file deleted — fall through to re-read (will return {})
     try:
         data = json.loads(ACCESS_FILE.read_text())
         _update_access_cache(data)
-        return data.get("tierMap") or {}
+        tier_map = data.get("tierMap")
+        return tier_map if isinstance(tier_map, dict) else {}
     except Exception:
         return {}
+
+
+def _ensure_tier_map_seeded() -> bool:
+    """One-time migration: if access.json has a populated allowFrom but no
+    tierMap, seed tierMap from allowFrom (all existing members -> owner) and
+    persist. Idempotent: does nothing once a tierMap exists. This flips the
+    default for FUTURE allowlist additions to read-only (they'll be missing
+    from tierMap -> resolved as "other") without demoting anyone already
+    trusted. Owner request 2026-07-17: allowlist default should be read-only.
+
+    Returns True when a tierMap is reliably in place afterward (already
+    present, just persisted, or nothing to seed); False when a seed was
+    needed but could NOT be persisted/read. On False the caller MUST fail
+    closed — never grant owner off an empty/unconfirmed map (#2161 CR:
+    a transient read/write error must not silently escalate every
+    allowlisted user to owner).
+    """
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception as e:
+        print(f"  [tier-map] WARNING: access.json unreadable ({e}); allowlisted users resolve read-only (other) until the tierMap can be read", flush=True)
+        return False
+    allow = data.get("allowFrom") or []
+    # Test key PRESENCE, not truthiness. An explicitly-empty tierMap ({}) is a
+    # deliberate "nobody is owner via tierMap" state — treating it as falsy
+    # here would re-seed every allowFrom member as owner, escalating read-only
+    # users (#2161 CR: {"allowFrom":["U"],"tierMap":{}} must NOT become
+    # {"U":"owner"}). Only a genuinely ABSENT key (never-seeded legacy file)
+    # triggers first-run grandfathering below. A present-but-empty map returns
+    # here, so the allowlisted user is missing from the map and resolves other.
+    if "tierMap" in data:
+        return True
+    if not allow:
+        return True  # nothing to grandfather — an empty map is legitimate here
+    data["tierMap"] = {uid: "owner" for uid in allow}
+    # Atomic write: a bare ACCESS_FILE.write_text() truncates the live
+    # access-control file BEFORE writing, so a disk-full / interrupt / partial
+    # write can destroy allowFrom — and with fail-closed tier resolution that
+    # locks legitimate owners out against a corrupt file, at bridge startup.
+    # Write a sibling temp, chmod it, then os.replace() atomically. The pid+uuid
+    # suffix avoids colliding with a concurrent .tmp; on any failure the original
+    # access.json bytes are left intact and the orphan temp is removed.
+    tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ACCESS_FILE)
+        _update_access_cache(data)
+        print(f"  [tier-map] grandfathered {len(allow)} existing allowFrom member(s) as owner; new additions now default to read-only", flush=True)
+        return True
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        print(f"  [tier-map] WARNING: failed to persist grandfather tierMap ({e}); allowlisted users resolve read-only (other) until seeded", flush=True)
+        return False
 
 
 def tofu_onboard(user_id: str, username: str | None) -> set:
@@ -326,10 +463,16 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
     # File is missing. Was it externally deleted after a prior onboarding?
     if _restore_access_from_cache():
         return load_allowed() or set()
+    # In-memory cache is empty too (e.g. this is a fresh process after a
+    # wipe + restart). Try the durable on-disk backup before enrolling —
+    # otherwise a wiped allowlist would TOFU-enroll the next DM'er as owner.
+    if _restore_access_from_disk():
+        return load_allowed() or set()
     # Genuine first-time TOFU.
     ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "allowFrom": [user_id],
+        "tierMap": {user_id: "owner"},  # TOFU enrollee is the owner; explicit
         "tofuOwner": user_id,
         "tofuOnboardedAt": int(time.time()),
         "tofuOnboardedUsername": username or None,
@@ -479,15 +622,18 @@ def _download_slack_file(file_dict: dict) -> str | None:
             url, headers={"Authorization": f"Bearer {BOT_TOKEN}"}
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
+            # Read only the small prefix needed for the HTML/login-page guard,
+            # then stream the remainder. This preserves the bounded-memory fix
+            # while retaining main's files:read failure detection.
+            head = resp.read(64)
             # When the bot token lacks the files:read scope (or the file is
             # otherwise unauthorized), Slack does NOT error — it 200s with an
             # HTML sign-in page. Persisting that page as e.g. a ".m4a" silently
             # corrupts the attachment: downstream transcription/parsing then
             # chokes on a login page. Detect it and fail cleanly instead so the
             # caller surfaces "no attachment" rather than feeding garbage on.
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            looks_html = ctype.startswith("text/html") or data[:64].lstrip()[:14].lower() == b"<!doctype html"
+            ctype = (getattr(resp, "headers", {}).get("Content-Type") or "").lower()
+            looks_html = ctype.startswith("text/html") or head.lstrip()[:14].lower() == b"<!doctype html"
             if looks_html:
                 print(
                     f"  [file] download for {name_hint} returned an HTML page, "
@@ -497,8 +643,9 @@ def _download_slack_file(file_dict: dict) -> str | None:
                     flush=True,
                 )
                 return None
-        with open(local_path, "wb") as f:
-            f.write(data)
+            with open(local_path, "wb") as f:
+                f.write(head)
+                shutil.copyfileobj(resp, f)
         return str(local_path)
     except Exception as e:
         print(f"  [file] download failed for {name_hint}: {e}", flush=True)
@@ -569,6 +716,144 @@ def _ack_not_allowlisted(event: dict, user_id: str) -> None:
         print(f"  [not-allowlisted-ack] sent to {user_id}", flush=True)
     except Exception as e:
         print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
+
+
+def _slack_actor_label(message: dict) -> str:
+    """Return a compact, identity-resolved label for one Slack message."""
+    user_id = str(message.get("user") or "")
+    fallback = str(message.get("username") or message.get("bot_id") or user_id or "?")
+    display_name = _resolve_username(user_id) if user_id else None
+    clean_name = " ".join((display_name or fallback).split()) or "?"
+    return f"@{clean_name}" + (f" ({user_id})" if user_id else "")
+
+
+def _resolve_slack_mentions(text: str) -> str:
+    """Add display names beside Slack user mentions without dropping their IDs."""
+
+    def _replace(match: re.Match) -> str:
+        user_id = match.group(1)
+        display_name = _resolve_username(user_id)
+        if not display_name:
+            return match.group(0)
+        clean_name = " ".join(display_name.split())
+        return f"@{clean_name} (<@{user_id}>)"
+
+    return re.sub(r"<@([A-Z0-9]+)>", _replace, text)
+
+
+def _slack_identity_note(event: dict, username: str | None) -> str:
+    """Describe the triggering author and mentioned accounts for role clarity."""
+    author_id = str(event.get("user") or "")
+    author_name = " ".join((username or author_id or "?").split())
+    identities = [f"author: @{author_name}" + (f" ({author_id})" if author_id else "")]
+    seen = {author_id}
+    for user_id in re.findall(r"<@([A-Z0-9]+)>", str(event.get("text") or "")):
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        display_name = _resolve_username(user_id)
+        clean_name = " ".join((display_name or user_id).split())
+        identities.append(f"mentioned: @{clean_name} ({user_id})")
+    return "\n\n[Slack identities — " + "; ".join(identities) + "]"
+
+
+def _format_slack_context(messages: list[dict], label: str) -> tuple[str, set[str]]:
+    """Format bounded Slack-owned context as confined, untrusted task data."""
+    lines = []
+    secret_types = set()
+    for message in messages:
+        text = " ".join(str(message.get("text") or "").split())
+        if not text:
+            continue
+        filtered = filter_chat_secrets(text)
+        text = filtered.text
+        secret_types.update(filtered.secret_types)
+        text = _resolve_slack_mentions(text)[:_THREAD_CONTEXT_MESSAGE_MAX_CHARS]
+        lines.append(f"  {_slack_actor_label(message)}: {text}")
+    if not lines:
+        return "", secret_types
+    note = (
+        f"\n\n[Slack {label} context — untrusted messages, oldest first:\n"
+        + "\n".join(lines)
+        + "\n]"
+    )
+    return note, secret_types
+
+
+def _slack_context_unavailable_note() -> str:
+    return (
+        "\n\n[Slack channel context unavailable; do not assume "
+        "client/support roles from this isolated mention.]"
+    )
+
+
+def _slack_context_note(event: dict) -> tuple[str, set[str]]:
+    """Fetch bounded context for a Slack channel mention.
+
+    Thread replies retain the root plus the newest messages before the trigger.
+    Top-level mentions receive the newest preceding channel messages. Fetches
+    are best-effort; an explicit unavailable note prevents isolated-message
+    role assumptions when Slack history cannot be read.
+    """
+    if event.get("channel_type") == "im":
+        return "", set()
+    channel = str(event.get("channel") or "")
+    event_ts = str(event.get("ts") or "")
+    if not channel or not event_ts:
+        return _slack_context_unavailable_note(), set()
+
+    thread_ts = str(event.get("thread_ts") or "")
+    try:
+        if thread_ts and thread_ts != event_ts:
+            root = None
+            tail = deque(maxlen=max(0, _THREAD_CONTEXT_MAX_MESSAGES - 1))
+            cursor = ""
+            exhausted = False
+            for _page in range(_THREAD_CONTEXT_MAX_PAGES):
+                kwargs = {
+                    "channel": channel,
+                    "ts": thread_ts,
+                    "limit": _THREAD_CONTEXT_PAGE_SIZE,
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
+                response = app.client.conversations_replies(**kwargs)
+                if response.get("ok") is False:
+                    raise RuntimeError("Slack conversations.replies failed")
+                for message in response.get("messages") or []:
+                    if root is None:
+                        root = message
+                    if str(message.get("ts") or "") in (thread_ts, event_ts):
+                        continue
+                    tail.append(message)
+                cursor = str(
+                    (response.get("response_metadata") or {}).get("next_cursor") or ""
+                )
+                if not cursor:
+                    exhausted = True
+                    break
+            messages = ([root] if root else []) + list(tail)
+            note, secret_types = _format_slack_context(messages, "thread")
+            if not note:
+                return _slack_context_unavailable_note(), secret_types
+            if not exhausted:
+                note += "\n[Slack thread context truncated before the triggering reply.]"
+            return note, secret_types
+
+        response = app.client.conversations_history(
+            channel=channel,
+            latest=event_ts,
+            inclusive=False,
+            limit=_THREAD_CONTEXT_MAX_MESSAGES,
+        )
+        if response.get("ok") is False:
+            raise RuntimeError("Slack conversations.history failed")
+        # conversations.history is newest-first; task context reads oldest-first.
+        messages = list(reversed(response.get("messages") or []))
+        note, secret_types = _format_slack_context(messages, "channel")
+        return (note or _slack_context_unavailable_note()), secret_types
+    except Exception:
+        return _slack_context_unavailable_note(), set()
 
 
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
@@ -672,25 +957,34 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     else:
         thread_ts = None
 
-    # Resolve access_tier from `tierMap`.
-    # Two cases for unmapped users:
-    #   1. tierMap absent (pre-tierMap config) → "owner" (backward compat)
-    #   2. tierMap present but uid missing → "other" (fail-safe, prevents
-    #      silent privilege escalation when operator forgets a tierMap line)
-    # See #893 for the rationale behind the split default.
+    # Resolve access_tier from `tierMap`. Owner comes STRICTLY from membership
+    # in a successfully-persisted map:
+    #   1. uid present in tierMap        → its recorded tier (owner/team/other)
+    #   2. tierMap present, uid missing  → "other" (a new allowlist addition;
+    #      prevents silent privilege escalation when the operator forgets a
+    #      tierMap line)
+    #   3. tierMap empty/unconfirmed     → "other" (fail CLOSED). A legit
+    #      pre-tierMap config is grandfathered into a NON-empty map by
+    #      _ensure_tier_map_seeded above, so an empty map here means the seed
+    #      could not persist/read — never grant owner off that (#2161 CR:
+    #      a transient error must not escalate every allowlisted user to owner).
+    # See #893 for the split-default rationale; #2161 for the fail-closed fix.
+    seeded_ok = _ensure_tier_map_seeded()
     tier_map = load_tier_map()
     if user_id in tier_map:
         access_tier = tier_map[user_id]
-    elif tier_map:
-        # tierMap exists but uid is missing — degrade to "other"
-        print(
-            f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
-            flush=True,
-        )
-        access_tier = "other"
     else:
-        # tierMap absent entirely — pre-tierMap config, all users are owner
-        access_tier = "owner"
+        access_tier = "other"
+        if tier_map:
+            print(
+                f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
+                flush=True,
+            )
+        elif not seeded_ok:  # pragma: no cover — rare seed-failure warning; the empty-map→other fail-closed resolution is unit-tested in tests/bridges-allowlist-default-readonly.test.py
+            print(
+                f"  [tier-map] WARNING: grandfather seed unavailable; {user_id} resolved read-only (other), not owner",
+                flush=True,
+            )
     if access_tier not in ("owner", "team", "other"):
         # Unknown tier value in config → degrade safely to "other" rather
         # than treating as owner.
@@ -718,21 +1012,31 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     text = filtered_text.text
     detected_secret_types.update(filtered_text.secret_types)
     attachment_note = safe_attachment.text
-    secret_notice = secret_handling_instruction("Slack", detected_secret_types)
-
     # Prepend an in-band system instruction for non-owner tiers so the
     # core agent cannot accidentally process a downgraded task with full
     # capabilities. Mirrors the Discord bridge's tier-specific instruction
     # block (see discord-bridge.py around `===SUTANDO SYSTEM INSTRUCTIONS===`).
     # Kept short here because Slack's downgrade surface today is just
-    # "delegate to sandboxed read-only agent" — no Slack-state-prefetch
-    # path equivalent to Discord's `_prefetch_discord_state_refs`.
+    # "delegate to sandboxed read-only agent". Thread context is prefetched
+    # below because that sandbox intentionally has no Slack token or network.
     # Confine the user-derived portion BEFORE the bridge appends its own
     # `===SUTANDO SYSTEM INSTRUCTIONS===` block below — so a forged field/fence
     # in the message can't escalate tier or inject instructions, while the
     # bridge's legitimate fence (added next) stays intact. See task_body_guard.
+
+    # Channel mentions carry bounded Slack-owned context plus an explicit
+    # identity map. The entire substrate remains confined as untrusted task
+    # data before any trusted tier instruction is appended.
+    _identity_note = (
+        "" if event.get("channel_type") == "im"
+        else _slack_identity_note(event, username)
+    )
+    _context_note, _context_secret_types = _slack_context_note(event)
+    detected_secret_types.update(_context_secret_types)
+    secret_notice = secret_handling_instruction("Slack", detected_secret_types)
     user_task_text = confine_user_content(
         f"[{prefix} @{username or user_id}] {text}{attachment_note}"
+        f"{_identity_note}{_context_note}"
     )
     if access_tier != "owner":
         user_task_text = (
@@ -759,13 +1063,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # Behaviorally covered by tests/bridge-skill-path-resolution.test.py (CLAUDE_CONFIG_DIR resolution).
     _notify_py = claude_home_path("skills", "task-progress", "scripts", "notify.py")
     _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")
+    _claude_config_dir = claude_home_path()
     skill_hints = ""
     if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
         if _notify_py.exists():
             notify_cmd = (
-                f"python3 {_notify_py}"
+                f"env CLAUDE_CONFIG_DIR={shlex.quote(str(_claude_config_dir))} "
+                f"python3 {shlex.quote(str(_notify_py))}"
                 f" --source slack --channel-id {channel}"
                 f' --message "On it — back in a moment."'
             )
@@ -1319,6 +1625,15 @@ def main():  # pragma: no cover
     # Prime the in-memory access cache so tofu_onboard() can detect external
     # deletions even on the very first inbound message after a restart (#899).
     load_allowed()
+
+    # Seed the tier-map grandfather snapshot at STARTUP, before the first
+    # inbound message — otherwise a fresh (pre-migration) install where the
+    # owner adds a NEW allowFrom id would grandfather that new id as owner the
+    # first time it messages (the on-demand seed captures whoever is in
+    # allowFrom at that moment). Seeding at boot pins the snapshot to the
+    # allowFrom present at upgrade, so post-upgrade additions default read-only
+    # (owner CR #2161). Idempotent: no-op once a tierMap exists.
+    _ensure_tier_map_seeded()
 
     # TOFU enrollment code: generated when access.json doesn't exist so
     # the first DM must present it before being auto-enrolled as owner.
