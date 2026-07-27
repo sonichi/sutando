@@ -150,9 +150,14 @@ def should_notify():
 def notify_macos(count, titles):
     """Returns True only if osascript actually accepted the notification."""
     msg = f"{count} pending question{'s' if count > 1 else ''}: {', '.join(titles[:3])}"
+    # AppleScript string literal: backslashes and double quotes in question
+    # titles must be escaped, or osascript rejects the script and the
+    # notification silently reports FAILED (bit us 2026-07-26 — a title
+    # containing a quoted phrase broke every fire while it sat in the top 3).
+    esc = msg.replace("\\", "\\\\").replace('"', '\\"')
     r = subprocess.run([
         "osascript", "-e",
-        f'display notification "{msg}" with title "Sutando"'
+        f'display notification "{esc}" with title "Sutando"'
     ], capture_output=True)
     return r.returncode == 0
 

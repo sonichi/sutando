@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""
+Tests for the COMPILED-ARTIFACT branch of `mark_stale_if_outdated` in
+`src/health-check.py` (the `binary_path is not None` block).
+
+Background: `health-check.py` has three mtime comparisons. Two of them
+cross-check content with git before flagging — the process-start path
+(PR #253) and the bridges path (PR #255) — because `git checkout`,
+`pull`, and `rebase` bump mtime on files whose content is byte-identical.
+The compiled-artifact branch arrived later (PR #529) and was the only one
+without that cross-check, so any mtime bump older than the threshold read
+as "rebuild needed" regardless of whether the source actually changed.
+
+Observed 2026-07-26: `upstream-sync` fast-forwarded `main` and restored
+the deployment branch with a checkout. That restore restamped 116
+byte-identical files, `src/Sutando/main.swift` among them, and
+health-check reported `sutando-app: stale — binary is 2679 min older than
+source — rebuild needed`. The binary was current; `main.swift`'s last
+content change predated the build by six days. The alarm recurred on
+every sync and trained the reader to ignore the channel.
+
+Cases:
+  a) binary NEWER than source            → no flag (below threshold).
+  b) source mtime bumped, content
+     IDENTICAL to the tree the binary
+     was built from                      → no flag (the regression).
+  c) source mtime bumped, content
+     ACTUALLY CHANGED since the build    → flags "rebuild needed".
+  d) git cross-check unavailable
+     (no reflog entry at build time)     → flags (fail safe, never hide
+                                           a real stale binary).
+  e) binary absent                       → compiled branch skipped
+                                           entirely.
+
+(b) is the regression case: it FAILS on the parent commit and passes at
+HEAD. (c) and (d) are the guard rails that keep the fix from being a
+blanket suppression.
+
+Run: python3 tests/health-check-compiled-artifact-stale.test.py
+Exit 0 on pass, 1 on fail.
+"""
+
+from __future__ import annotations
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+hc = _load_module()
+
+# Captured before any patching: the tests stub `hc.subprocess.run`, which is
+# the same module object this file imported, so the stub needs an unpatched
+# handle to fall through to.
+_REAL_RUN = subprocess.run
+
+THRESHOLD = 1800  # seconds; matches mark_stale_if_outdated's default
+
+
+def _init_git_repo(tmpdir: Path) -> None:
+    subprocess.run(["git", "init", "-q", "--initial-branch=main"], cwd=tmpdir, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmpdir, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmpdir, check=True)
+
+
+def _commit_file(tmpdir: Path, path: str, content: bytes, msg: str,
+                 when: float | None = None) -> str:
+    """Commit `content` at `path`, optionally backdated to epoch `when`.
+
+    Backdating matters: `_file_unchanged_since` resolves the tree via
+    `git reflog HEAD --before=@<ts>`, and reflog entry times come from
+    GIT_COMMITTER_DATE. A fixture that commits "now" but dates the binary
+    hours earlier has no reflog entry at-or-before the build, so the
+    cross-check correctly refuses to resolve and every case fails safe —
+    which would make this suite structurally unable to exercise the fix.
+    Real timelines commit first and build after; the fixture must too.
+    """
+    f = tmpdir / path
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(content)
+    env = dict(os.environ)
+    if when is not None:
+        stamp = f"@{int(when)} +0000"
+        env["GIT_AUTHOR_DATE"] = stamp
+        env["GIT_COMMITTER_DATE"] = stamp
+    subprocess.run(["git", "add", path], cwd=tmpdir, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", msg], cwd=tmpdir, check=True, env=env)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmpdir,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _set_mtime(p: Path, ts: float) -> None:
+    os.utime(p, (ts, ts))
+
+
+class CompiledArtifactStaleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        _init_git_repo(self.repo)
+        self._patch = patch.object(hc, "REPO_DIR", self.repo)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+        self.now = time.time()
+        # Real timeline: source committed 30h ago, binary built 20h ago,
+        # so the reflog has an entry at-or-before the build for the
+        # cross-check to resolve against.
+        self.commit_ts = self.now - 30 * 3600
+        self.bin_mtime = self.now - 20 * 3600
+        self.src = self.repo / "src" / "App" / "main.swift"
+        self.binary = self.repo / "src" / "App" / "App"
+
+    def _build_binary(self):
+        self.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.binary.write_bytes(b"compiled")
+        _set_mtime(self.binary, self.bin_mtime)
+
+    def _run(self) -> dict:
+        """Invoke the compiled-artifact branch in isolation.
+
+        pgrep is stubbed to return nothing so the process-start path below
+        short-circuits — this test is only about the binary comparison.
+        """
+        check = {"name": "app", "status": "ok", "detail": "running"}
+        with patch.object(hc.subprocess, "run", side_effect=self._fake_run):
+            hc.mark_stale_if_outdated(check, self.src, "app-pattern",
+                                      threshold_sec=THRESHOLD,
+                                      binary_path=self.binary)
+        return check
+
+    def _fake_run(self, cmd, *args, **kwargs):
+        """Pass git through to the real repo; make pgrep return no PIDs.
+
+        Uses the module-level `_REAL_RUN` alias captured at import: patching
+        `hc.subprocess.run` rebinds the attribute on the shared `subprocess`
+        module object, so calling `subprocess.run` here would re-enter this
+        stub and recurse.
+        """
+        if cmd and "pgrep" in str(cmd[0]):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        return _REAL_RUN(cmd, *args, **kwargs)
+
+    # (a) binary newer than source → nothing to flag
+    def test_binary_newer_than_source_not_stale(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build_binary()
+        _set_mtime(self.src, self.bin_mtime - 3600)  # source older than binary
+        check = self._run()
+        self.assertEqual(check["status"], "ok")
+
+    # (b) THE REGRESSION: mtime bumped by a checkout, content identical
+    def test_idempotent_mtime_bump_is_not_stale(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build_binary()
+        # A checkout restamps the file long after the build; content unchanged.
+        _set_mtime(self.src, self.now)
+        check = self._run()
+        self.assertEqual(
+            check["status"], "ok",
+            "content is byte-identical to the tree the binary was built from; "
+            "an mtime-only bump must not report 'rebuild needed'")
+
+    # (c) content really changed after the build → must still flag
+    def test_real_content_change_is_stale(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build_binary()
+        # Source genuinely edited after the binary was built.
+        self.src.write_bytes(b"print(2)  // new behavior\n")
+        _set_mtime(self.src, self.now)
+        check = self._run()
+        self.assertEqual(check["status"], "stale")
+        self.assertIn("rebuild needed", check["detail"])
+
+    # (d) no reflog entry at build time → fail safe, still flag
+    def test_no_reflog_at_build_time_fails_safe(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build_binary()
+        _set_mtime(self.src, self.now)
+        # Binary predates the repo's entire reflog → cross-check cannot
+        # establish what the content was, so it must NOT suppress.
+        self.bin_mtime = self.now - 365 * 24 * 3600
+        _set_mtime(self.binary, self.bin_mtime)
+        check = self._run()
+        self.assertEqual(
+            check["status"], "stale",
+            "an unresolvable cross-check must fail safe and flag, never hide "
+            "a genuinely stale binary")
+
+    # (e) no binary on disk → compiled branch does not apply
+    def test_missing_binary_skips_compiled_branch(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        _set_mtime(self.src, self.now)
+        check = {"name": "app", "status": "ok", "detail": "running"}
+        with patch.object(hc.subprocess, "run", side_effect=self._fake_run):
+            hc.mark_stale_if_outdated(check, self.src, "app-pattern",
+                                      threshold_sec=THRESHOLD,
+                                      binary_path=self.binary)
+        self.assertEqual(check["status"], "ok")
+
+
+class BinaryIsCurrentTests(unittest.TestCase):
+    """`_binary_is_current` — the shared predicate behind both the stale
+    check and the `--fix` auto-launch gate.
+
+    The auto-launch gate previously compared mtimes directly
+    (`binary.st_mtime >= source.st_mtime`), so a checkout that restamped
+    `main.swift` made `--fix` refuse to launch a current binary and print
+    "needs manual rebuild + relaunch". The app then stayed down until
+    someone rebuilt something that did not need rebuilding.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        _init_git_repo(self.repo)
+        self._patch = patch.object(hc, "REPO_DIR", self.repo)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+        self.now = time.time()
+        self.commit_ts = self.now - 30 * 3600
+        self.bin_mtime = self.now - 20 * 3600
+        self.src = self.repo / "src" / "App" / "main.swift"
+        self.binary = self.repo / "src" / "App" / "App"
+
+    def _build(self):
+        self.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.binary.write_bytes(b"compiled")
+        _set_mtime(self.binary, self.bin_mtime)
+
+    def test_binary_newer_by_mtime_is_current(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build()
+        _set_mtime(self.src, self.bin_mtime - 60)
+        self.assertTrue(hc._binary_is_current(self.binary, self.src))
+
+    def test_idempotent_restamp_is_current(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build()
+        _set_mtime(self.src, self.now)  # checkout restamp, content unchanged
+        # Pin the behavior delta: the expression the --fix gate used before
+        # this change rejects the restamp, the predicate replacing it accepts
+        # it. Spelled out here because the new cases cannot fail against the
+        # parent commit — the symbol they exercise does not exist there, so
+        # they error rather than assert, and an error is a weaker gate.
+        old_gate = self.binary.stat().st_mtime >= self.src.stat().st_mtime
+        self.assertFalse(old_gate, "fixture must reproduce the restamp")
+        self.assertTrue(
+            hc._binary_is_current(self.binary, self.src),
+            "a restamp with identical content must not block --fix auto-launch")
+
+    def test_real_content_change_is_not_current(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build()
+        self.src.write_bytes(b"print(2)\n")
+        _set_mtime(self.src, self.now)
+        self.assertFalse(
+            hc._binary_is_current(self.binary, self.src),
+            "a genuine post-build edit must still block auto-launch")
+
+    def test_missing_binary_is_not_current(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        _set_mtime(self.src, self.now)
+        self.assertFalse(hc._binary_is_current(self.binary, self.src))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
