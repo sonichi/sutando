@@ -469,6 +469,44 @@ def main() -> int:
     rtc._AUTH_HEADERS["Authorization"] = "Bearer testtoken"
     rtc.TOKEN_FILE = ""
 
+    # 5b. DESKTOP recovery-arming regression (#2323): in the desktop-spawned case
+    # startup.sh is skipped and ONLY AG2_DEVICE_ENV reaches the bridge — no
+    # REMOTE_TASK_TOKEN and no REMOTE_TASK_TOKEN_FILE. A fresh import must not only
+    # resolve TOKEN/URL from that file but also set TOKEN_FILE to it, or the whole
+    # auth-recovery path stays DISABLED exactly on the desktop (auth_retry=bool(
+    # TOKEN_FILE), _reload_rotated_token/_recover_auth return False on ""). Before
+    # the fix TOKEN_FILE came only from REMOTE_TASK_TOKEN_FILE → "" here.
+    _dev_env = Path(tmp) / "device.env"
+    _dev_env.write_text("REMOTE_TASK_TOKEN=desktoptoken\n"
+                        "REMOTE_TASK_URL=https://gw.example/relay\n")
+    _saved = {k: os.environ.get(k) for k in
+              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN_FILE",
+               "REMOTE_TASK_URL", "AG2_REMOTE_URL", "AG2_DEVICE_ENV")}
+    for _k in _saved:
+        os.environ.pop(_k, None)
+    os.environ["AG2_DEVICE_ENV"] = str(_dev_env)      # the ONLY thing the desktop passes
+    try:
+        _spec = importlib.util.spec_from_file_location(
+            "rtc_desktop", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _desk = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_desk)
+        check(_desk.TOKEN == "desktoptoken" and _desk.URL == "https://gw.example/relay",
+              "desktop AG2_DEVICE_ENV import resolves TOKEN + URL")
+        check(_desk.TOKEN_FILE == str(_dev_env),
+              "desktop import ARMS TOKEN_FILE from AG2_DEVICE_ENV (not left empty)")
+        check(bool(_desk.TOKEN_FILE) is True,
+              "→ SSE event-channel auth_retry=bool(TOKEN_FILE) is armed on desktop")
+        # and the recovery path actually fires on that file: a rotation swaps in live.
+        _dev_env.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay|desktop-rotated\n")
+        check(_desk._reload_rotated_token() is True and _desk.TOKEN == "desktop-rotated",
+              "desktop _reload_rotated_token re-reads AG2_DEVICE_ENV → live rotation")
+    finally:
+        for _k, _v in _saved.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
     # 6. inbound media marker → local file rewrite (network mocked)
     fetched = []
     real_download = rtc._download_bytes

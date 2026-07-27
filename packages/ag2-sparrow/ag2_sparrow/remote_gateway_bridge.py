@@ -318,14 +318,20 @@ def _token_from_ag2space_env():
             # is empty, so without this the URL chain has nothing and the bridge
             # fatals on "no gateway URL" in the exact scenario this fix targets.
             url = vals.get("REMOTE_TASK_URL") or vals.get("AG2_REMOTE_URL") or ""
-            return tok, url
-    return "", ""
+            # Return the source file path too: it is the durable token source the
+            # auth-recovery path re-reads on rejection. In the desktop-spawned case
+            # this is the ONLY thing that arms recovery — REMOTE_TASK_TOKEN_FILE is
+            # unset there, so without carrying `path` into TOKEN_FILE the bridge
+            # keeps the historical FATAL/crash-loop behavior exactly on the desktop.
+            return tok, url, path
+    return "", "", ""
 
 
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
 _URL_FALLBACK = ""
+_TOKEN_FILE_FALLBACK = ""
 if not _RAW:
-    _RAW, _URL_FALLBACK = _token_from_ag2space_env()
+    _RAW, _URL_FALLBACK, _TOKEN_FILE_FALLBACK = _token_from_ag2space_env()
 _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
@@ -353,7 +359,7 @@ _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipp
 # there (the connect/onboarding flow re-ran) is swapped in live — no restart —
 # and an unchanged one holds the bridge in a slow re-check loop until rotation
 # happens. Unset → exactly the pre-existing FATAL-exit behavior.
-TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or ""
+TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or ""
 AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
