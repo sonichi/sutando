@@ -73,6 +73,24 @@ def classify_prs(prs: list, owner_login: str) -> list:
 
         is_mine = author == owner_login
         if not is_mine:
+            # Peer PRs are usually the peer author's job — but surface the narrow
+            # "one-approval-from-merge" set the owner can unblock: green, still
+            # REVIEW_REQUIRED, and already carrying ≥1 approval (the #2336 case
+            # that triggered this mechanism). Everything else peer is skipped, so
+            # this is NOT the ~45-PR REVIEW_REQUIRED firehose.
+            approvers = {
+                (r.get("author") or {}).get("login")
+                for r in (pr.get("reviews") or [])
+                if r.get("state") == "APPROVED"
+            }
+            approvers.discard(None)
+            if ci == "green" and decision == "REVIEW_REQUIRED" and len(approvers) >= 1:
+                out.append({
+                    "number": num, "title": pr.get("title", ""), "author": author,
+                    "court": "owner",
+                    "why": f"peer PR, {len(approvers)} approval(s) — your approval unblocks the merge",
+                    "ci": ci, "mergeable": mergeable, "review": decision or "none",
+                })
             continue
 
         # Whose court is the PR in? `mergeable == MERGEABLE` only means "no merge
@@ -147,7 +165,7 @@ def render_digest(items: list, mention: str | None) -> str:
 def _fetch_prs(repo: str) -> list:  # pragma: no cover — subprocess/gh glue
     cmd = [
         "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "50",
-        "--json", "number,title,author,mergeable,reviewDecision,statusCheckRollup,isDraft",
+        "--json", "number,title,author,mergeable,reviewDecision,statusCheckRollup,isDraft,reviews",
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:

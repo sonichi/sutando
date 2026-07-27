@@ -23,7 +23,7 @@ pf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pf)
 
 
-def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=False, title="t"):
+def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=False, title="t", approvers=()):
     rollup = []
     if ci == "green":
         rollup = [{"status": "COMPLETED", "conclusion": "SUCCESS"}]
@@ -35,6 +35,7 @@ def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=Fals
         "number": number, "title": title, "author": {"login": author},
         "reviewDecision": review, "statusCheckRollup": rollup,
         "mergeable": mergeable, "isDraft": draft,
+        "reviews": [{"author": {"login": a}, "state": "APPROVED"} for a in approvers],
     }
 
 
@@ -79,9 +80,25 @@ def main() -> int:
     print("  ok  peer REVIEW_REQUIRED / CHANGES_REQUESTED excluded (no noise-bomb)")
     print("  ok  my CHANGES_REQUESTED PR is in MY court, never 'ready for your merge'")
 
-    # only a clean PR is in the owner's court
+    # only a clean OWN PR is in the owner's court (peer PRs added separately below)
     assert [i["number"] for i in items if i["court"] == "owner"] == [10]
-    print("  ok  only green+mergeable+unblocked is in the owner's court")
+    print("  ok  only green+mergeable+unblocked own PR is in the owner's court")
+
+    # peer PRs: only the "one-approval-from-merge" set surfaces (the #2336 case).
+    peer = [
+        _pr(30, "peer", review="REVIEW_REQUIRED", ci="green", approvers=["qingyun"]),   # green + 1 approval → owner court
+        _pr(31, "peer", review="REVIEW_REQUIRED", ci="green", approvers=[]),             # green but 0 approvals → skip
+        _pr(32, "peer", review="REVIEW_REQUIRED", ci="pending", approvers=["qingyun"]),  # not green → skip
+        _pr(33, "peer", review="CHANGES_REQUESTED", ci="green", approvers=["qingyun"]),  # changes requested → skip
+        _pr(34, "peer", review="REVIEW_REQUIRED", ci="green", approvers=["a", "b"]),     # 2 approvals → owner court
+    ]
+    gp = {i["number"]: i for i in pf.classify_prs(peer, OWNER)}
+    assert gp[30]["court"] == "owner" and "approval unblocks" in gp[30]["why"], gp.get(30)
+    assert 31 not in gp, "peer with 0 approvals is not surfaced (avoids the firehose)"
+    assert 32 not in gp, "peer not green is not surfaced"
+    assert 33 not in gp, "peer changes-requested is the author's job, not the owner's"
+    assert gp[34]["court"] == "owner" and "2 approval" in gp[34]["why"], gp.get(34)
+    print("  ok  peer 'one-approval-from-merge' set surfaces to owner court; rest excluded")
 
     # cover the remaining agent-court branches of classify_prs
     more = [
