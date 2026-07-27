@@ -179,16 +179,19 @@ def main() -> int:
         print(digest or "(nothing needs the owner)")
         return 0
 
-    # dedup: only post if the actionable set changed since last flag
-    repo_root = Path(__file__).resolve().parent.parent
+    # dedup: only post if the actionable set changed since last flag. The script
+    # runs from the repo root (cron/loop cwd), so resolve the workspace via the
+    # loader (relative invocation) and let subprocesses inherit cwd — no
+    # __file__ path-walking (the workspace-resolution lint forbids that).
     sf = Path(args.state_file) if args.state_file else None
     if sf is None:
+        ws = ""
         try:
             ws = subprocess.run(["bash", "scripts/sutando-config.sh", "workspace"],
-                                cwd=repo_root, capture_output=True, text=True, timeout=20).stdout.strip()
-            sf = Path(ws) / "state" / "pr-flag-state.json"
+                                capture_output=True, text=True, timeout=20).stdout.strip()
         except Exception:
-            sf = repo_root / "state" / "pr-flag-state.json"
+            ws = ""
+        sf = Path(ws) / "state" / "pr-flag-state.json" if ws else Path("state/pr-flag-state.json")
     prev = ""
     try:
         prev = json.loads(sf.read_text()).get("hash", "")
@@ -203,7 +206,7 @@ def main() -> int:
         try:
             subprocess.run(
                 ["python3", "src/discord-bridge.py", "send", args.channel, digest],
-                cwd=repo_root, timeout=60,
+                timeout=60,
             )
             print(f"pr-flag: posted digest ({len(items)} PRs, hash={h}) to {args.channel}")
         except Exception as e:
