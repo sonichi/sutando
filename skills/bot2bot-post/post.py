@@ -25,6 +25,14 @@ ID is read from the bot2bot CHANNEL's `allowFrom`, excluding this bot
 allowlisted there. The resulting `<@id>` mention is prepended so the receiving
 bot's bridge will process it as a task (discord-bridge.py line 244 exception).
 
+SCOPE GUARD (2026-07-27): bot2bot-post is a FLEET-coordination tool — it only
+ever posts to the #bot2bot channel (Air/Mini/Pro). A `--to <X>` where X is NOT a
+member of that channel is REFUSED with a loud error, instead of silently posting
+where X will never see it. This is the fix for the contributor dead-letter
+(pings to qingyun/Rui/john went to fleet-only #bot2bot) and the bot-vs-human-
+owner id mix-up. Contributor messaging is a SEPARATE concern: post directly to
+their channel (e.g. #dev), not via bot2bot-post.
+
 Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env.
 """
 import json
@@ -138,6 +146,20 @@ def resolve_other_bot(access: dict, self_id: str, channel_id: str):
     return others[0]
 
 
+def _recipient_in_channel(access: dict, channel_id: str, recipient_id: str) -> bool:
+    """Whether `recipient_id` is in `channel_id`'s allowFrom (the scope guard).
+
+    bot2bot-post only ever posts to the #bot2bot channel; this checks the
+    recipient is actually a member there, so a `--to` for someone who isn't
+    (a contributor, or a bot's human owner) fails loudly instead of
+    dead-lettering into a channel they can't see.
+    """
+    cfg = access.get("groups", {}).get(channel_id)
+    if not isinstance(cfg, dict):
+        return False
+    return str(recipient_id) in {str(x) for x in cfg.get("allowFrom", [])}
+
+
 def post(channel_id: str, text: str, token: str):
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     body = json.dumps({"content": text}).encode()
@@ -221,6 +243,20 @@ def main():
         other_id = resolve_to_target(to_target)
         if other_id == self_id:
             sys.exit("ERROR: --to resolves to this bot itself; pick a peer")
+        # SCOPE GUARD: bot2bot-post is a FLEET-coordination tool — it posts to
+        # the #bot2bot channel (Air/Mini/Pro). If the recipient isn't a member
+        # of that channel, refuse LOUDLY instead of silently posting where they
+        # will never see it (the 2026-07-27 contributor dead-letter, and the
+        # bot-vs-human-owner id mix-up). Contributor messaging is a SEPARATE
+        # concern — post directly to their channel (e.g. #dev).
+        if not _recipient_in_channel(access, channel_id, other_id):
+            sys.exit(
+                f"ERROR: recipient {other_id} is not a member of the #bot2bot "
+                f"channel ({channel_id}). bot2bot-post is fleet-coordination only "
+                "(Air/Mini/Pro). To reach a contributor (qingyun/Rui/john/etc.), "
+                "post directly to their channel (e.g. #dev) — not via bot2bot-post. "
+                "Tip: a bot and its human owner are different ids; verify which you mean."
+            )
     else:
         other_id = resolve_other_bot(access, self_id, channel_id)
 
