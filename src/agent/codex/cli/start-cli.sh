@@ -124,6 +124,24 @@ ensure_core_monitor() {
     >/tmp/core-input-watch.log 2>&1 &
 }
 
+ensure_codex_scheduler() {
+  local ws host scheduler
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  host="${SUTANDO_HOST_LABEL:-}"
+  if [ -z "$host" ]; then
+    host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || return 0
+  fi
+  scheduler="${SUTANDO_CODEX_SCHEDULER_SCRIPT:-$REPO/skills/schedule-crons/scripts/codex-scheduler.py}"
+  if ! python3 "$scheduler" install --workspace "$ws" --host-label "$host" >/dev/null; then
+    echo "  ⚠ Could not reconcile the durable Codex scheduler; run: python3 $scheduler install" >&2
+  fi
+}
+
+# Codex has no session CronCreate surface. Reconcile the OS-backed scheduler
+# on every launcher invocation so the canonical five-minute main loop is owned
+# before the core starts (or while attaching to an existing core).
+ensure_codex_scheduler
+
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true

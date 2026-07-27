@@ -39,6 +39,11 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "    f.write(' '.join(sys.argv[1:]))\n"
         )
         (self.root / "src" / "__init__.py").touch()
+        scheduler = self.root / "fake-codex-scheduler.py"
+        scheduler.write_text(
+            "import os, pathlib, sys\n"
+            "pathlib.Path(os.environ['SCHEDULER_LOG']).write_text(' '.join(sys.argv[1:]))\n"
+        )
         workspace = self.root / "workspace"
         (workspace / "state").mkdir(parents=True)
         (self.root / "sutando.config.json").write_text(json.dumps({
@@ -102,6 +107,9 @@ exit 0
             "HOME": str(Path(self.tmp.name) / "home"),
             "SUTANDO_CORE_RUNTIME": "codex",
             "MONITOR_LOG": str(Path(self.tmp.name) / "monitor.log"),
+            "SCHEDULER_LOG": str(Path(self.tmp.name) / "scheduler.log"),
+            "SUTANDO_CODEX_SCHEDULER_SCRIPT": str(self.root / "fake-codex-scheduler.py"),
+            "SUTANDO_HOST_LABEL": "test-host",
         })
         env.update(env_extra or {})
         return subprocess.run(
@@ -180,6 +188,12 @@ exit 0
             time.sleep(0.01)
         self.assertTrue(monitor_log.exists(), "managed core-input monitor did not start")
         self.assertIn("--session sutando-core", monitor_log.read_text())
+
+        scheduler_log = Path(self.tmp.name) / "scheduler.log"
+        self.assertTrue(scheduler_log.exists(), "Codex scheduler was not reconciled")
+        invocation = scheduler_log.read_text()
+        self.assertIn("install --workspace", invocation)
+        self.assertIn("--host-label test-host", invocation)
 
     def test_restart_kills_core_and_notifier_before_launch(self):
         result = self.run_launcher("--restart")
