@@ -25,13 +25,14 @@ ID is read from the bot2bot CHANNEL's `allowFrom`, excluding this bot
 allowlisted there. The resulting `<@id>` mention is prepended so the receiving
 bot's bridge will process it as a task (discord-bridge.py line 244 exception).
 
-SCOPE GUARD (2026-07-27): bot2bot-post is a FLEET-coordination tool — it only
-ever posts to the #bot2bot channel (Air/Mini/Pro). A `--to <X>` where X is NOT a
-member of that channel is REFUSED with a loud error, instead of silently posting
-where X will never see it. This is the fix for the contributor dead-letter
-(pings to qingyun/Rui/john went to fleet-only #bot2bot) and the bot-vs-human-
-owner id mix-up. Contributor messaging is a SEPARATE concern: post directly to
-their channel (e.g. #dev), not via bot2bot-post.
+SCOPE GUARD (2026-07-27): bot2bot-post only ever posts to the one bot2bot channel
+(resolved from access.json's `role: bot2bot` tag — NOT hardcoded). A `--to <X>`
+where X is NOT a member of that channel is REFUSED with a loud error, instead of
+silently posting where X will never see it (the dead-letter, and the
+bot-vs-human-owner id mix-up — a bot and its owner are different ids). Where to
+route a message that ISN'T bot2bot coordination is the caller's judgment (it
+depends on the message + recipient + topic-home), so the guard does NOT
+prescribe a destination — it just refuses and says the recipient isn't a member.
 
 Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env.
 """
@@ -149,10 +150,10 @@ def resolve_other_bot(access: dict, self_id: str, channel_id: str):
 def _recipient_in_channel(access: dict, channel_id: str, recipient_id: str) -> bool:
     """Whether `recipient_id` is in `channel_id`'s allowFrom (the scope guard).
 
-    bot2bot-post only ever posts to the #bot2bot channel; this checks the
+    bot2bot-post only ever posts to the bot2bot channel; this checks the
     recipient is actually a member there, so a `--to` for someone who isn't
-    (a contributor, or a bot's human owner) fails loudly instead of
-    dead-lettering into a channel they can't see.
+    (someone only in a different channel, or a bot's human owner) fails loudly
+    instead of dead-lettering into a channel they can't see.
     """
     cfg = access.get("groups", {}).get(channel_id)
     if not isinstance(cfg, dict):
@@ -243,19 +244,20 @@ def main():
         other_id = resolve_to_target(to_target)
         if other_id == self_id:
             sys.exit("ERROR: --to resolves to this bot itself; pick a peer")
-        # SCOPE GUARD: bot2bot-post is a FLEET-coordination tool — it posts to
-        # the #bot2bot channel (Air/Mini/Pro). If the recipient isn't a member
-        # of that channel, refuse LOUDLY instead of silently posting where they
-        # will never see it (the 2026-07-27 contributor dead-letter, and the
-        # bot-vs-human-owner id mix-up). Contributor messaging is a SEPARATE
-        # concern — post directly to their channel (e.g. #dev).
+        # SCOPE GUARD: bot2bot-post only posts to the one bot2bot channel
+        # (resolved from access.json). If the recipient isn't a member of that
+        # channel, refuse LOUDLY instead of silently posting where they'll never
+        # see it (the 2026-07-27 dead-letter + bot-vs-human-owner id mix-up).
+        # Where to route a non-bot2bot message is the caller's judgment, so the
+        # guard doesn't prescribe a destination.
         if not _recipient_in_channel(access, channel_id, other_id):
             sys.exit(
-                f"ERROR: recipient {other_id} is not a member of the #bot2bot "
-                f"channel ({channel_id}). bot2bot-post is fleet-coordination only "
-                "(Air/Mini/Pro). To reach a contributor (qingyun/Rui/john/etc.), "
-                "post directly to their channel (e.g. #dev) — not via bot2bot-post. "
-                "Tip: a bot and its human owner are different ids; verify which you mean."
+                f"ERROR: recipient {other_id} is not a member of the bot2bot "
+                f"channel ({channel_id}) that bot2bot-post posts to — refusing "
+                "(it would be a dead letter). Send to a channel where "
+                f"{other_id} is allowlisted instead (see access.json groups). "
+                "Note: a bot and its human owner are different ids; verify which "
+                "you mean."
             )
     else:
         other_id = resolve_other_bot(access, self_id, channel_id)
