@@ -1731,21 +1731,29 @@ def check_disk_space() -> dict:
 
 def check_skill_symlinks() -> dict:
     """Detect skills in the OSS repo checkout that are not symlinked into
-    ~/.claude/skills/. A missing symlink means Claude Code never loads the
-    skill — it's silently invisible until manually linked (bug d920b18b).
+    the Claude home's skills/ dir. A missing symlink means Claude Code never
+    loads the skill — it's silently invisible until manually linked (bug
+    d920b18b).
 
     Scans REPO_DIR/skills/ for directories and checks for a matching entry
-    in ~/.claude/skills/. Reports unlinked skills as 'warn'; in --fix mode,
-    creates the missing symlinks automatically.
+    in <claude-home>/skills/. Reports unlinked skills as 'warn'; in --fix
+    mode, creates the missing symlinks automatically.
+
+    The destination resolves via claude_home_path() (same as
+    _default_memory_dir(), fixed for the identical reason in #1454): a bare
+    Path.home()/".claude" ignores the workspace-scoped CLAUDE_CONFIG_DIR, so
+    on a migrated install this check scanned a stale ~/.claude/skills/ and
+    warned "unlinked" about skills whose symlinks exist — and are loaded —
+    under the workspace claude-home.
     """
     name = "skill-symlinks"
     skills_src = REPO_DIR / "skills"
-    skills_dst = Path.home() / ".claude" / "skills"
+    skills_dst = claude_home_path("skills")
 
     if not skills_src.exists():
         return {"name": name, "status": "ok", "detail": "skills/ dir not found — skipped"}
     if not skills_dst.exists():
-        return {"name": name, "status": "ok", "detail": "~/.claude/skills/ not found — skipped"}
+        return {"name": name, "status": "ok", "detail": f"{skills_dst} not found — skipped"}
 
     # A DANGLING symlink (entry present, target gone) is the case the original
     # condition let through: `exists()` follows the link and is False, but
@@ -1756,6 +1764,12 @@ def check_skill_symlinks() -> dict:
     broken: list[str] = []     # dangling link  -> must be unlinked first
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
+            continue
+        # Mirror skills/install.sh's filter: only dirs WITH a SKILL.md are
+        # slash-invocable skills the installer links. Manifest-loaded and
+        # scripts-only skills (gws-gmail-voice, learned-skills, ...) have no
+        # SKILL.md, are correctly never symlinked, and must not warn here.
+        if not (skill_dir / "SKILL.md").is_file():
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
