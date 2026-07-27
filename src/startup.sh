@@ -693,17 +693,20 @@ else
   export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
 
-# 0b. Obs collector (OPTIONAL — opt-in via SUTANDO_OBS_COLLECTOR=1).
+# 0b. Obs collector (ON by default — opt-out via SUTANDO_OBS_COLLECTOR=0).
 # The single, source-agnostic local collector: it receives Claude Code hooks
 # (and, later, voice / filewatcher / bridge events) on /ingest/<source>,
 # normalizes them into the one event schema, and writes the durable JSONL floor
-# at <workspace>/logs/events-*.jsonl (the visualizer tails that). Off by default
-# — it's an observability/dev tool, not required for the agent to run.
+# at <workspace>/logs/events-*.jsonl (the visualizer tails that). On by default
+# so the usage/token + task-model dashboard works out of the box; set
+# SUTANDO_OBS_COLLECTOR=0 to disable. This is LOCAL-ONLY — forwarding usage to a
+# cloud endpoint stays separately opt-in via SUTANDO_METERING_ENABLED=1 +
+# SUTANDO_METERING_ENDPOINT, so no data leaves the machine by default.
 #
-# When enabled we also point the core's hooks at it (SUTANDO_OBS_ENDPOINT) UNLESS
-# an endpoint is already set — e.g. a remote upstream collector — so the "always
-# set hooks, only export when told where" contract still holds.
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+# We also point the core's hooks at it (SUTANDO_OBS_ENDPOINT) UNLESS an endpoint
+# is already set — e.g. a remote upstream collector — so the "always set hooks,
+# only export when told where" contract still holds.
+if [ "${SUTANDO_OBS_COLLECTOR:-1}" != "0" ]; then
   OBS_PORT="${SUTANDO_OBS_PORT:-4000}"
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
@@ -718,7 +721,7 @@ if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
     export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
   fi
 else
-  echo "  ~ obs collector (disabled — set SUTANDO_OBS_COLLECTOR=1 to enable)"
+  echo "  ~ obs collector (disabled via SUTANDO_OBS_COLLECTOR=0)"
 fi
 # A port can LISTEN while the service never responds (single-threaded server
 # blocked on a silent connection, hung event loop). The lsof guards below only
@@ -1221,7 +1224,7 @@ fi
 if phone_stack_enabled && grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+if [ "${SUTANDO_OBS_COLLECTOR:-1}" != "0" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
 for port_name in $VERIFY_PORTS; do
