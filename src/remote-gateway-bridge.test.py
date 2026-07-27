@@ -440,6 +440,22 @@ def main() -> int:
           and rtc.URL == old_url
           and rtc._AUTH_HEADERS["Authorization"] == "Bearer encoded-secret",
           "%7C-encoded rotation swaps just the secret (not the whole URL string)")
+    # SPLIT-layout rotation (bare REMOTE_TASK_TOKEN + a separate REMOTE_TASK_URL
+    # line — the documented persistent form) must get the SAME cross-gateway
+    # guard as the combined url|secret form. #2323 credential-boundary follow-up:
+    # _read_token_file drops the file URL, so before the fix a split file
+    # re-pointed by connect to a NEW gateway was mis-read as a same-gateway
+    # rotation → the new bearer went to the OLD running URL (bearer leak).
+    tok_file.write_text(f"REMOTE_TASK_TOKEN=split-same\nREMOTE_TASK_URL={old_url}\n")
+    check(rtc._reload_rotated_token() is True
+          and rtc.TOKEN == "split-same" and rtc.URL == old_url,
+          "split-layout rotation (same gateway URL) still hot-swaps the secret")
+    tok_file.write_text("REMOTE_TASK_TOKEN=split-other\n"
+                        "REMOTE_TASK_URL=https://other.example/relay\n")
+    check(rtc._reload_rotated_token() is False
+          and rtc.TOKEN == "split-same" and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer split-same",
+          "split-layout rotation to a DIFFERENT gateway refused (no cross-gateway bearer move)")
     # _recover_auth immediate path: file already rotated again → True, no wait
     tok_file.write_text("REMOTE_TASK_TOKEN=rotated-secret-2\n")
     check(rtc._recover_auth(401) is True and rtc.TOKEN == "rotated-secret-2",

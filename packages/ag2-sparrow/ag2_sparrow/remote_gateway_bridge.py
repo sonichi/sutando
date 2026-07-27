@@ -669,6 +669,31 @@ def _read_token_file(path: str) -> str:
     return ""
 
 
+def _read_token_file_url(path: str) -> str:
+    """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) from a SPLIT-layout token
+    file, or "" if absent/unreadable. The combined `url|secret` form embeds the
+    URL (extracted by _parse_onboarding_token), but a split file (bare
+    REMOTE_TASK_TOKEN + a separate REMOTE_TASK_URL line) does not — and
+    _read_token_file discards that URL. The reload path needs it so a split file
+    rewritten by connect to a DIFFERENT gateway is caught by the same
+    cross-gateway guard the combined form already gets; otherwise a re-onboard
+    to a new gateway would hot-swap the new bearer onto the OLD running URL
+    (the exact credential-boundary split the guard exists to prevent)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    found: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        for key in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
+            if line.startswith(key + "="):
+                found[key] = line[len(key) + 1:].strip().strip("'\"")
+    return found.get("REMOTE_TASK_URL") or found.get("AG2_REMOTE_URL") or ""
+
+
 def _reload_rotated_token() -> bool:
     """Re-read TOKEN_FILE and swap in a rotated SECRET. True only when a
     usable, DIFFERENT secret was found for the SAME gateway: the TOKEN global
@@ -696,8 +721,14 @@ def _reload_rotated_token() -> bool:
     # so a valid rotation kept failing auth (regression caught on #2323 once
     # #2307's %7C onboarding parser reached main).
     url_from_token, secret = _parse_onboarding_token(raw)
-    if url_from_token and url_from_token.rstrip("/") != URL:
-        _log(f"token file names a DIFFERENT gateway ({url_from_token.rstrip('/')}) "
+    # The URL guard must cover BOTH layouts: the combined url|secret form
+    # (url_from_token) AND the split form (bare secret + a separate
+    # REMOTE_TASK_URL line, which _read_token_file drops). Without the split
+    # fallback, a split file re-pointed by connect to a new gateway sends the
+    # new bearer to the OLD running URL — the credential split this guards.
+    file_url = (url_from_token or _read_token_file_url(TOKEN_FILE)).rstrip("/")
+    if file_url and file_url != URL:
+        _log(f"token file names a DIFFERENT gateway ({file_url}) "
              f"than the running one ({URL}) — a URL change is not hot-swappable; "
              "restart the bridge to move gateways")
         return False
