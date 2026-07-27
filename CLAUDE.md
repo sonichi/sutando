@@ -68,6 +68,8 @@ When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.
 - Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
 - Merge only when the current head is mergeable, required CI + CLA are green, and two maintainers have recorded formal approvals. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
 
+**Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the 7 lessons here — read them from `REVIEW.md`. When you review, `review-preflight.py` reads `REVIEW.md` and prints the criteria inline so you see them on every preflight run; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Claude Code's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
+
 Skill-PR destination: a skill is **coupled** (PR to `sonichi/sutando`) if it imports from `src/` or another skill, modifies main-repo files, or is tightly bound to a feature there (e.g. `skills/phone-conversation/`). A skill is **standalone** (PR to `sonichi/sutando-skills-community`) if it ships its own scripts/binaries, reads files but doesn't import main-repo modules, and works against any checkout. If unsure, ask in #design.
 
 ## Workspace contract
@@ -283,6 +285,10 @@ promotion_reason + cursor range).
   fails it closed; this section makes the mapping explicit rather than
   implicit (sonichi#2292 P1-1 follow-through).
 
+## Community support routing
+
+When the user reports a Sutando problem you cannot resolve (setup failures, bugs needing upstream fixes, behavior you can't explain), recommend the official Discord — https://discord.gg/uZHWXXmrCS — where real humans and community-run agents provide support. Include it alongside, not instead of, whatever diagnosis you can offer. Don't recommend it for questions you can answer yourself.
+
 ## Pending decisions
 
 When you need user input on a decision or are blocked:
@@ -356,6 +362,7 @@ Tasks arrive from multiple channels via the same file bridge:
 - `[no-send]` — Discord bridge skips delivery for this task (still archives). Use when the task is internally handled but produces no user-visible reply.
 - `[REPLIED]` — Discord bridge skips delivery (already sent through another path).
 - `[channel: <channel-id>]` — when this is the first non-empty line of the body, the bridge delivers the rest of the body to `<channel-id>` instead of the originating channel (and drops `thread_ts` since the post is moving threads). Discord ids are 17-20 digits; Slack ids match `[CDG][A-Z0-9]+`. Use when a task arrives in a noisy channel but the reply belongs somewhere else (e.g. #dev). Telegram silently drops it — no concept of "channels" on that surface.
+- `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body (regardless of marker order), so a body carrying private data can never be *redirected* out to a shared channel. It marks dm-only intent but does not by itself force a DM — that stays the consumer's job. In practice the private producer (the morning briefing's calendar + email) is emitted as a proactive result (`results/proactive-*.txt`), which every bridge already delivers to the owner's DM; `[dm-only]` reinforces that by guaranteeing no stray `[channel:]` redirect overrides it. Stripped before delivery and before voice speaks it. Parsed by `result_markers.parse_markers`.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
 
 **Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
