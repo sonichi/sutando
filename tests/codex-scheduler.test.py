@@ -41,6 +41,39 @@ def config(workspace: Path, **overrides):
     path.write_text(json.dumps([{"name": "session-job", "cron": "* * * * *", "prompt": "ignore"}, job]))
 
 
+def main_loop_config(workspace: Path):
+    path = workspace / "hosts" / "test-host" / "crons.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps([{
+        "name": "main-loop",
+        "cron": "*/5 * * * *",
+        "prompt_skill": "proactive-loop",
+    }]))
+
+
+def test_codex_runtime_owns_legacy_main_loop_without_mutating_config():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        main_loop_config(ws)
+
+        fired = scheduler.tick(ws, "test-host", at(6, 10), include_main_loop=True)
+        assert fired["job_count"] == 1
+        assert fired["events"][0]["job"] == "main-loop"
+        task = next((ws / "tasks").glob("task-cron-main-loop-*.txt"))
+        body = task.read_text()
+        assert "Run exactly one proactive-loop pass" in body
+        assert "Do not arm another recurring loop" in body
+        assert "[no-send]" in body
+
+        # Claude keeps the canonical session-owned loop; the Codex scheduler
+        # must not claim an unmarked entry after a runtime switch.
+        other_ws = Path(td) / "claude"
+        main_loop_config(other_ws)
+        skipped = scheduler.tick(other_ws, "test-host", at(6, 10), include_main_loop=False)
+        assert skipped["job_count"] == 0
+        assert not (other_ws / "tasks").exists()
+
+
 def test_cron_parser():
     local = datetime(2026, 7, 15, 6, 10, tzinfo=timezone.utc)
     assert scheduler.cron_matches("*/5 6 15 7 *", local)
@@ -285,6 +318,7 @@ def test_main_dispatch_and_error_handling():
 def main():
     tests = [
         test_cron_parser,
+        test_codex_runtime_owns_legacy_main_loop_without_mutating_config,
         test_helpers_and_config_validation,
         test_enqueue_retry_complete_and_no_duplicate,
         test_failure_alert_and_health,

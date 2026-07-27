@@ -8,6 +8,7 @@ cd "$REPO"
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 WATCHER_SESSION="${SESSION}-watcher"
+NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
 export SUTANDO_CORE_SESSION=1
 export SUTANDO_CORE_RUNTIME=codex
 
@@ -79,12 +80,31 @@ apply_tmux_defaults() {
 }
 
 ensure_task_notifier() {
-  session_exists "$WATCHER_SESSION" && return 0
+  local expected_version active_version
+  expected_version="$(
+    cksum \
+      "$NOTIFIER_SUPERVISOR" \
+      "$REPO/src/agent/codex/cli/task-notifier.sh" \
+      "$REPO/src/watch-tasks-stream.sh" \
+      | cksum | awk '{print $1 "-" $2}'
+  )"
+  if session_exists "$WATCHER_SESSION"; then
+    active_version="$(
+      tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
+        SUTANDO_NOTIFIER_VERSION 2>/dev/null \
+        | sed -n 's/^SUTANDO_NOTIFIER_VERSION=//p' || true
+    )"
+    if [ "$active_version" = "$expected_version" ]; then
+      return 0
+    fi
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+  fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
-    "${NOTIFIER_ENV_ARGS[@]}" bash "$REPO/src/agent/codex/cli/task-notifier.sh"
+    "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }
 
 # Keep the same core-supervisor signal available for both runtimes. The
@@ -103,6 +123,24 @@ ensure_core_monitor() {
     --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
     >/tmp/core-input-watch.log 2>&1 &
 }
+
+ensure_codex_scheduler() {
+  local ws host scheduler
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  host="${SUTANDO_HOST_LABEL:-}"
+  if [ -z "$host" ]; then
+    host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || return 0
+  fi
+  scheduler="${SUTANDO_CODEX_SCHEDULER_SCRIPT:-$REPO/skills/schedule-crons/scripts/codex-scheduler.py}"
+  if ! python3 "$scheduler" install --workspace "$ws" --host-label "$host" >/dev/null; then
+    echo "  ⚠ Could not reconcile the durable Codex scheduler; run: python3 $scheduler install" >&2
+  fi
+}
+
+# Codex has no session CronCreate surface. Reconcile the OS-backed scheduler
+# on every launcher invocation so the canonical five-minute main loop is owned
+# before the core starts (or while attaching to an existing core).
+ensure_codex_scheduler
 
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
