@@ -70,17 +70,105 @@ from pathlib import Path
 # is never tried; we keep the original result when there is no v4 address, so a
 # genuinely v6-only destination still resolves. Opt out with
 # REMOTE_GATEWAY_ALLOW_IPV6=1 (hosts with working v6 lose nothing either way).
-if os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1":
-    _orig_getaddrinfo = socket.getaddrinfo
+# DNS resolution has NO native timeout: getaddrinfo blocks the caller until the
+# resolver answers or the OS gives up (which can be minutes, or never on a
+# captive portal / dropped link mid-query). urllib's socket timeout covers
+# connect+read but NOT name resolution — so without a bound, a hung resolver
+# wedges the long-poll loop indefinitely with no "reconnecting" status write and
+# no self-recovery (observed on a tester's machine 2026-07-25: gateway process
+# stuck, DNS for space.ag2.space failing, UI showing "reconnecting" forever).
+# Bounding it lets the loop raise → emit gateway-status reconnecting → back off →
+# retry, so the connection self-heals the moment DNS recovers. Override the bound
+# with REMOTE_GATEWAY_DNS_TIMEOUT (seconds); 0/negative disables it.
+_DNS_TIMEOUT_S = float(os.environ.get("REMOTE_GATEWAY_DNS_TIMEOUT") or "8")
+_PREFER_V4 = os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1"
+# Reload-safe original capture: on module re-exec/reload, socket.getaddrinfo is
+# already our wrapper — capturing it blindly makes _resolve_bounded call itself
+# (RecursionError). The installed wrapper carries the TRUE original on its
+# `_ag2_orig_getaddrinfo` attribute, so re-executions pick that up instead.
+_orig_getaddrinfo = getattr(socket.getaddrinfo, "_ag2_orig_getaddrinfo", socket.getaddrinfo)
 
-    def _getaddrinfo_prefer_v4(host, *args, **kwargs):
-        infos = _orig_getaddrinfo(host, *args, **kwargs)
-        if host and "ag2.space" in str(host):
-            v4 = [i for i in infos if i[0] == socket.AF_INET]
-            return v4 or infos
-        return infos
 
-    socket.getaddrinfo = _getaddrinfo_prefer_v4
+class _InflightResolve:
+    """One outstanding getaddrinfo call: waiters share its Event + outcome."""
+
+    __slots__ = ("done", "result", "err")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.result = None
+        self.err = None
+
+
+# Single-flight registry: at most ONE resolver thread exists per distinct
+# (host, args) key. While a call is outstanding — including one wedged on a
+# hung system resolver — every retry for the same key attaches to it instead
+# of spawning another thread, so a persistently hung resolver pins exactly
+# one thread no matter how many times the poll loop retries. The worker
+# removes its slot when the underlying call finally returns, so recovery
+# drains cleanly and the next call starts fresh.
+_INFLIGHT: dict = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _resolve_bounded(host, *args, **kwargs):
+    """socket.getaddrinfo with a hard wall-clock bound.
+
+    getaddrinfo cannot be interrupted, so the actual call runs in a daemon
+    thread; the caller waits up to _DNS_TIMEOUT_S on its completion Event and
+    raises gaierror on overrun (urllib surfaces that as the URLError the poll
+    loop's reconnect branch already handles). The thread is shared single-
+    flight per (host, args) key — see _INFLIGHT — so repeated retries against
+    a wedged resolver never accumulate threads.
+    """
+    if _DNS_TIMEOUT_S <= 0:
+        return _orig_getaddrinfo(host, *args, **kwargs)
+    try:
+        key = (host, args, tuple(sorted(kwargs.items())))
+    except TypeError:  # unhashable arg — never true of real getaddrinfo calls
+        key = None
+
+    with _INFLIGHT_LOCK:
+        call = _INFLIGHT.get(key) if key is not None else None
+        if call is None:
+            call = _InflightResolve()
+            if key is not None:
+                _INFLIGHT[key] = call
+
+            def _run(call=call, key=key):
+                try:
+                    call.result = _orig_getaddrinfo(host, *args, **kwargs)
+                except BaseException as e:  # noqa: BLE001 — re-raised to waiters
+                    call.err = e
+                finally:
+                    # Clear the slot BEFORE signalling: a waiter woken by the
+                    # Event must never re-attach to a completed call.
+                    if key is not None:
+                        with _INFLIGHT_LOCK:
+                            _INFLIGHT.pop(key, None)
+                    call.done.set()
+
+            threading.Thread(target=_run, name="dns-resolve", daemon=True).start()
+
+    if not call.done.wait(_DNS_TIMEOUT_S):
+        raise socket.gaierror(
+            f"DNS resolution for {host!r} exceeded {_DNS_TIMEOUT_S}s (resolver hung)"
+        )
+    if call.err is not None:
+        raise call.err
+    return call.result
+
+
+def _getaddrinfo_prefer_v4(host, *args, **kwargs):
+    infos = _resolve_bounded(host, *args, **kwargs)
+    if _PREFER_V4 and host and "ag2.space" in str(host):
+        v4 = [i for i in infos if i[0] == socket.AF_INET]
+        return v4 or infos
+    return infos
+
+
+_getaddrinfo_prefer_v4._ag2_orig_getaddrinfo = _orig_getaddrinfo
+socket.getaddrinfo = _getaddrinfo_prefer_v4
 
 # resolve_workspace lives alongside this file in src/ — put THIS directory on
 # the path (no repo-walking; the old triple-parent form predated the move into
@@ -138,13 +226,109 @@ def _env_compat(new, old):
 # string may be the combined "https://<gateway>|<secret>" form (the URL travels
 # inside the token — nothing service-specific lives in this repo); a bare
 # secret needs REMOTE_TASK_URL alongside it.
+# The combined onboarding form is "<url>|<secret>" — the URL travels inside the
+# token. The separator is a literal "|", OR a "%7C"/"%7c" when the desktop connect
+# flow URL-encodes it (ag2space-cinny-desktop#231): "https://<gateway>/relay%7C<secret>".
+# A %7C-separated token carries no literal "|", so a naive split leaves it a bare
+# secret with an empty URL and the bridge FATALs at startup — the core looks
+# "connected" (device-connect completed) but never responds, the Vidhu-onboarding
+# failure 2026-07-24.
+_SEPARATOR_RE = re.compile(r"\||%7[Cc]")
+
+
+def _parse_onboarding_token(raw):
+    """Split the onboarding string into (url_from_token, secret).
+
+    NEVER mutates the token bytes — it only *splits* at the separator, so the
+    secret is returned verbatim (a bearer that itself contains "%7C" or "|" is
+    preserved intact; #2307 review). Disambiguation: only the combined form —
+    which begins with an http(s):// scheme — carries a separator to split on; a
+    bare secret is opaque and returned untouched even if it contains "%7C".
+
+    Handled at the single parse point, so every caller (startup.sh, direct env,
+    legacy AG2_REMOTE_TOKEN alias) is covered regardless of the onboarding writer.
+    """
+    if not raw.lower().startswith(("http://", "https://")):
+        return "", raw  # bare secret — opaque, never touched
+    m = _SEPARATOR_RE.search(raw)
+    if m is None:
+        return "", raw  # scheme but no separator; the URL-less guard in main() speaks
+    return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
+
+
+def _token_from_ag2space_env():
+    """Fallback token source when the launcher didn't export it into the env.
+
+    `connect` writes the relay token to the channel .env, but not every launcher
+    gets it into the process environment. The desktop-spawned core is the case
+    that matters: its supervisor spawns the core (and the gateway window) with a
+    fixed env whitelist, and the window sources the .env only once at start — so
+    if connect writes the token after that (or the export step is skipped), the
+    bridge sees an empty token and never connects (every new desktop-only user
+    can reproduce this). Read the file directly so the bridge connects regardless
+    of who launched it, and so a bridge already looping when connect wrote the
+    token picks it up on its next start.
+
+    Returns (token, url). A combined url|secret token embeds the URL (split
+    downstream by _parse_onboarding_token), but a split-layout file (bare token +
+    separate REMOTE_TASK_URL) does not — so the file's REMOTE_TASK_URL is returned
+    alongside for the caller to feed into the URL chain. Returns ("", "") when no
+    candidate file holds a token.
+
+    Candidates, in order:
+      1. AG2_DEVICE_ENV — the absolute path the desktop launcher (launch-sutando.sh)
+         lays into the gateway window, pointing straight at the file connect wrote;
+         the ONLY one that reaches the bridge in the desktop-spawned case.
+      2. $CLAUDE_CONFIG_DIR/channels/ag2space/.env — for non-desktop launchers that
+         do export CLAUDE_CONFIG_DIR into the bridge's environment.
+    We deliberately do NOT guess ~/.claude: a bare-home guess is the one path that
+    could silently pick up a token from an UNRELATED/old install and connect as the
+    WRONG identity (reinstall, account switch, leftover config). Both real launchers
+    are covered above; the bare-home guess only adds a footgun.
+    """
+    candidates = [os.environ.get("AG2_DEVICE_ENV")]
+    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _cfg:
+        candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        vals = {}
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            key, _, val = ln.partition("=")
+            vals[key.strip()] = val.strip().strip('"').strip("'")
+        # REMOTE_TASK_TOKEN is the current name; AG2_REMOTE_TOKEN the legacy alias.
+        tok = vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN")
+        if tok:
+            # Name the exact file — which .env supplied the token is load-bearing
+            # for diagnosis (and for spotting a wrong-file bind).
+            print(f"[remote-gateway-bridge] token not in env; loaded from {path}",
+                  file=sys.stderr, flush=True)
+            # Carry the file's REMOTE_TASK_URL too. A combined url|secret token
+            # embeds the URL (parsed downstream), but a SPLIT layout (bare token +
+            # separate REMOTE_TASK_URL) does not — and in the fallback case the env
+            # is empty, so without this the URL chain has nothing and the bridge
+            # fatals on "no gateway URL" in the exact scenario this fix targets.
+            url = vals.get("REMOTE_TASK_URL") or vals.get("AG2_REMOTE_URL") or ""
+            return tok, url
+    return "", ""
+
+
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
-if "|" in _RAW:
-    _URL_FROM_TOKEN, TOKEN = _RAW.split("|", 1)
-else:
-    _URL_FROM_TOKEN, TOKEN = "", _RAW
+_URL_FALLBACK = ""
+if not _RAW:
+    _RAW, _URL_FALLBACK = _token_from_ag2space_env()
+_URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
-       or _URL_FROM_TOKEN).rstrip("/")
+       or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 HEARTBEAT_INTERVAL = 60
@@ -1320,8 +1504,17 @@ def _maybe_start_event_channel() -> None:
 
 
 def main() -> None:
-    if not URL or not TOKEN:
-        sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
+    if not TOKEN:
+        sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
+    if not URL:
+        # A token that starts with a URL scheme but yielded no URL means the
+        # url|secret separator was swallowed (e.g. a %7C survived decoding, or a
+        # new encoding we don't handle) — say so, instead of the misleading
+        # "set REMOTE_TASK_TOKEN" when the token is present but malformed.
+        _hint = (" — the token carries a gateway URL but the url|secret separator "
+                 "looks missing/corrupted" if TOKEN[:4].lower() == "http" else "")
+        sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
+                 f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     if not _acquire_singleton():
         return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
     inflight: set[str] = _load_inflight()
