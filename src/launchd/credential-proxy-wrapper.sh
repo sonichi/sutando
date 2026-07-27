@@ -27,6 +27,7 @@ set -euo pipefail
 # on the supervised launchd path too — not just src/startup.sh (Codex #2154).
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 for _node_cand in \
+    "${SUTANDO_NODE:-}" \
     /opt/homebrew/bin/node \
     /usr/local/bin/node \
     "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/node" \
@@ -94,6 +95,35 @@ kill_stale_holder() {
 }
 
 kill_stale_holder
+
+# G1.5 node-bundle (Codex re-review F1b): the wrapper enforces the SAME
+# resolver + fail-closed + mode contract as startup.sh. node-bin exits 1 on a
+# set-but-invalid SUTANDO_NODE — that is a desktop packaging error and the
+# job must FAIL (KeepAlive backs off on ThrottleInterval), never silently
+# slide to tsx/npx on whatever node the host has. Bundled context = explicit
+# env OR this wrapper running from the packaged engine copy (repo inside the
+# engine root that owns the at-rest runtime); in that context the dist
+# artifact is REQUIRED.
+NODE_BIN="$(bash "$REPO_ROOT/scripts/sutando-config.sh" node-bin)" || {
+    echo "credential-proxy-wrapper: SUTANDO_NODE set but invalid — desktop packaging error; fail-closed (no PATH/tsx fallback)" >&2
+    exit 78
+}
+_W_APP_NODE_DIR="$(bash "$REPO_ROOT/scripts/sutando-config.sh" app-node-dir)"
+_W_ENGINE_ROOT="${_W_APP_NODE_DIR%/node/bin}"; _W_ENGINE_ROOT="${_W_ENGINE_ROOT%/runtime}"
+_W_BUNDLED=0
+if [ -n "${SUTANDO_NODE:-}" ]; then
+    _W_BUNDLED=1
+elif [ -x "$_W_APP_NODE_DIR/node" ] && [ "${REPO_ROOT#"$_W_ENGINE_ROOT"/}" != "$REPO_ROOT" ]; then
+    _W_BUNDLED=1
+fi
+DIST_PROXY="$REPO_ROOT/dist/credential-proxy.js"
+if [ "$_W_BUNDLED" = "1" ]; then
+    if [ ! -f "$DIST_PROXY" ]; then
+        echo "credential-proxy-wrapper: bundled mode but $DIST_PROXY missing — desktop packaging error; fail-closed" >&2
+        exit 78
+    fi
+    exec "$NODE_BIN" "$DIST_PROXY"
+fi
 
 # Resolve and run.
 TSX_BIN=$(resolve_tsx 2>/dev/null) || true
