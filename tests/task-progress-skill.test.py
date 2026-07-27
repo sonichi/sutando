@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -148,11 +149,16 @@ class TestSendDiscord(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
 
+    @staticmethod
+    def _response(body):
+        response = MagicMock()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+        response.read.return_value = json.dumps(body).encode()
+        return response
+
     def test_success(self):
-        mock_resp = MagicMock()
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = b'{"id": "msg123"}'
+        mock_resp = self._response({"id": "msg123", "mentions": []})
         with patch.object(self.mod, "_token", return_value="Bot-fake"), \
              patch("urllib.request.urlopen", return_value=mock_resp):
             result = self.mod.send_discord("111222333", "hello")
@@ -162,6 +168,130 @@ class TestSendDiscord(unittest.TestCase):
         with patch.object(self.mod, "_token", return_value=""):
             result = self.mod.send_discord("111", "hello")
         self.assertFalse(result)
+
+    def test_discord_request_api_error_returns_none(self):
+        with patch("urllib.request.urlopen", side_effect=Exception("timeout")), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod._discord_request(
+                "https://discord.com/api/v10/users/123",
+                "Bot-fake",
+            )
+        self.assertIsNone(result)
+        self.assertIn("Discord request failed: timeout", stderr.getvalue())
+
+    def test_post_failure_returns_false(self):
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(self.mod, "_discord_request", return_value=None):
+            result = self.mod.send_discord("111", "hello")
+        self.assertFalse(result)
+
+    def test_plain_at_handle_is_rejected_before_post(self):
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(self.mod, "_discord_request") as request, \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod.send_discord("111", "Please review, @qingyun-wu")
+        self.assertFalse(result)
+        request.assert_not_called()
+        self.assertIn("unresolved Discord mention(s): @qingyun-wu", stderr.getvalue())
+
+    def test_email_address_is_not_treated_as_a_mention(self):
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 return_value={"id": "msg123", "mentions": []},
+             ) as request:
+            result = self.mod.send_discord("111", "Email dev@example.com")
+        self.assertTrue(result)
+        self.assertEqual(request.call_count, 1)
+
+    def test_structured_mention_is_preflighted_and_verified(self):
+        user_id = "1025828152183885925"
+        posted = {
+            "id": "msg123",
+            "mentions": [{"id": user_id, "username": "qingyunwu"}],
+        }
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 side_effect=[{"id": user_id}, posted],
+             ) as request:
+            result = self.mod.send_discord("111", f"Please review, <@{user_id}>")
+        self.assertTrue(result)
+        self.assertEqual(request.call_count, 2)
+        payload = request.call_args_list[1].args[2]
+        self.assertEqual(payload["allowed_mentions"]["parse"], [])
+        self.assertEqual(payload["allowed_mentions"]["users"], [user_id])
+
+    def test_unresolvable_structured_mention_is_not_posted(self):
+        user_id = "999999999999999999"
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 return_value=None,
+             ) as request, \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod.send_discord("111", f"Please review, <@{user_id}>")
+        self.assertFalse(result)
+        self.assertEqual(request.call_count, 1)
+        self.assertIn("message was not sent", stderr.getvalue())
+
+    def test_missing_mention_in_post_response_returns_error(self):
+        user_id = "1025828152183885925"
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 side_effect=[{"id": user_id}, {"id": "msg123", "mentions": []}],
+             ), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod.send_discord("111", f"Please review, <@{user_id}>")
+        self.assertFalse(result)
+        self.assertIn("did not resolve expected mention", stderr.getvalue())
+
+    def test_validation_can_be_disabled_for_plain_text_handle(self):
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 return_value={"id": "msg123", "mentions": []},
+             ) as request:
+            result = self.mod.send_discord(
+                "111",
+                "GitHub author @qingyun-wu",
+                validate_mentions=False,
+            )
+        self.assertTrue(result)
+        self.assertEqual(request.call_count, 1)
+
+    def test_cli_defaults_to_validation_and_returns_agent_visible_error(self):
+        with patch("sys.argv", [
+            "notify.py", "--source", "discord", "--channel-id", "111",
+            "--message", "Please review, @qingyun-wu",
+        ]), patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(self.mod, "_discord_request") as request, \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod.main()
+        self.assertEqual(result, 1)
+        request.assert_not_called()
+        self.assertIn("Use <@USER_ID>", stderr.getvalue())
+
+    def test_cli_opt_out_allows_intentional_plain_text_handle(self):
+        with patch("sys.argv", [
+            "notify.py", "--source", "discord", "--channel-id", "111",
+            "--message", "GitHub author @qingyun-wu",
+            "--no-validate-mentions",
+        ]), patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 return_value={"id": "msg123", "mentions": []},
+             ) as request:
+            result = self.mod.main()
+        self.assertEqual(result, 0)
+        self.assertEqual(request.call_count, 1)
 
 
 class TestSendTelegram(unittest.TestCase):
