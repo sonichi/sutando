@@ -87,7 +87,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
-from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
+from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
@@ -3013,11 +3013,16 @@ async def _handle_discord_message(message, force=False):
             _ref = getattr(message, "reference", None)
             _ref_resolved = getattr(_ref, "resolved", None) if _ref is not None else None
             _ref_author = getattr(_ref_resolved, "author", None)
+            # A forward also sets message.reference (type=forward) but is NOT a
+            # reply — its payload is in message_snapshots. Treat only a genuine
+            # reply as is_reply, else an owner's forward is skipped here as a
+            # "reply not addressed to me" and the forward-handler never runs.
+            _is_reply = reference_is_reply(_ref is not None, getattr(_ref, "type", None))
             if not is_addressed_in_shared_channel(
                 author_is_bot=bool(getattr(message.author, "bot", False)),
                 bot_mentioned=bot_mentioned,
                 role_mentioned=role_mentioned,
-                is_reply=_ref is not None,
+                is_reply=_is_reply,
                 reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
                 self_id=getattr(client.user, "id", None),
             ):

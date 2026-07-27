@@ -26,7 +26,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from discord_addressee import is_addressed_in_shared_channel  # noqa: E402
+from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402
 
 ME = 1512984771305799792          # this bot
 PRO = 1504316176686120980         # another agent
@@ -74,6 +74,35 @@ def main() -> int:
                          is_reply=True, reply_author_id=PRO), "bot replying to a third bot"
     print("  ok  another bot replying to a third bot")
 
+    # --- forward vs reply: a forward is NOT a reply (owner-reported 2026-07-27) ---
+    # A forwarded message carries message.reference (type=forward) but its payload
+    # is in message_snapshots. reference_is_reply must return False for it, else the
+    # addressee gate skips an owner's forward as a "reply not addressed to me".
+    class _RefType:
+        def __init__(self, name):
+            self.name = name
+
+    assert reference_is_reply(True, _RefType("default")) is True, "reply reference is a reply"
+    print("  ok  reference type=default → reply")
+    assert reference_is_reply(True, _RefType("forward")) is False, "forward reference is not a reply"
+    print("  ok  reference type=forward → NOT a reply")
+    assert reference_is_reply(False, None) is False, "no reference → not a reply"
+    print("  ok  no reference → not a reply")
+    assert reference_is_reply(True, None) is True, "reference with missing type → treated as reply (pre-forward default)"
+    print("  ok  reference with None type → reply (back-compat)")
+    # accepts a bare string type name too (robust to how the caller passes it)
+    assert reference_is_reply(True, "forward") is False, "string 'forward' → not a reply"
+    assert reference_is_reply(True, "default") is True, "string 'default' → reply"
+    print("  ok  string type names handled")
+
+    # end-to-end through the addressee gate: owner forward (is_reply=False, human,
+    # not mentioned) is ADDRESSED → processed (so the forward-handler runs).
+    fwd_is_reply = reference_is_reply(True, _RefType("forward"))
+    assert addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+                     is_reply=fwd_is_reply, reply_author_id=None), \
+        "owner's forwarded message must be treated as addressed (not skipped)"
+    print("  ok  owner forward flows through as addressed")
+
     # --- structural: the bridge wires the gate in + carves out bot2bot ---
     bridge = (REPO / "src" / "discord-bridge.py").read_text()
     assert "is_addressed_in_shared_channel(" in bridge, \
@@ -82,6 +111,9 @@ def main() -> int:
     assert '_channel_role(str(message.channel.id)) != "bot2bot"' in bridge, \
         "discord-bridge.py does not carve out role:'bot2bot' channels"
     print("  ok  bridge carves out bot2bot channels")
+    assert "reference_is_reply(" in bridge, \
+        "discord-bridge.py does not use reference_is_reply (forward vs reply fix)"
+    print("  ok  bridge uses reference_is_reply for forward/reply disambiguation")
 
     print("\nAll addressee-gate cases pass.")
     return 0
