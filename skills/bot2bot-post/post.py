@@ -16,14 +16,18 @@ entries tagged with `{"role": "bot2bot", ...}` in `groups` are candidates. We
 pick the first such channel. If none is tagged, we fall back to the first
 group whose value is just `true` (legacy convention), or error out.
 
-Recipient targeting: pass `--to <peer|id>` to @-mention a specific peer. This
-is the correct way when more than one peer exists — the old auto-resolve below
-assumes a SINGLE other bot and silently mis-fires otherwise (it mentioned Mini
-for a post addressed to Pro, 2026-06-06). Without `--to`, the other bot's user
-ID is read from the bot2bot CHANNEL's `allowFrom`, excluding this bot
-(identified via Discord GET /users/@me) — fine only while exactly one peer is
-allowlisted there. The resulting `<@id>` mention is prepended so the receiving
-bot's bridge will process it as a task (discord-bridge.py line 244 exception).
+Recipient targeting: pass `--to <peer|id>` to @-mention a specific peer. With
+`--to`, the target channel is derived FROM the recipient — we post to a channel
+whose `allowFrom` contains them (recipient-first routing), and REFUSE rather
+than dead-letter if they are in no accessible channel. This fixes the 2026-07-27
+mis-route where contributor pings (qingyun/Rui/john) were sent to the fleet-only
+#bot2bot they aren't members of, so they silently went nowhere; and it guards
+the bot-vs-human-owner id confusion (different ids → different channels). Without
+`--to`, this is a fleet broadcast to the `role:bot2bot` channel, and the other
+bot's id is read from that channel's `allowFrom` (fine only while exactly one
+peer is allowlisted there — mis-fires with 3+, so prefer `--to`). The resulting
+`<@id>` mention is prepended so the receiving bot's bridge processes it as a
+task (discord-bridge.py line 244 exception).
 
 Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env.
 """
@@ -138,6 +142,33 @@ def resolve_other_bot(access: dict, self_id: str, channel_id: str):
     return others[0]
 
 
+def resolve_channel_for_recipient(access: dict, recipient_id: str):
+    """Return a channel whose allowFrom contains `recipient_id`, or None.
+
+    RECIPIENT-FIRST routing (the dead-letter fix, 2026-07-27). Instead of always
+    posting to the fixed `role:bot2bot` channel and *hoping* the recipient reads
+    it, resolve the channel FROM the recipient: post only to a channel they are
+    actually a member of. If the recipient is in NO channel's allowFrom, the
+    caller MUST refuse rather than dead-letter.
+
+    Why: `--to <contributor>` used to post to the fleet-only #bot2bot, whose
+    allowFrom is Air/Mini/Pro only — so pings to qingyun/Rui/john silently went
+    nowhere. Deriving the channel from `allowFrom` membership makes that
+    mis-route impossible by construction.
+
+    A recipient may be in several channels (any of them reaches them, so the
+    no-dead-letter guarantee holds); pick deterministically (lowest channel id).
+    """
+    rid = str(recipient_id)
+    matches = [
+        cid
+        for cid, cfg in access.get("groups", {}).items()
+        if isinstance(cfg, dict)
+        and rid in {str(x) for x in cfg.get("allowFrom", [])}
+    ]
+    return sorted(matches)[0] if matches else None
+
+
 def post(channel_id: str, text: str, token: str):
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     body = json.dumps({"content": text}).encode()
@@ -214,14 +245,27 @@ def main():
 
     token = load_token()
     access = load_access()
-    channel_id = resolve_bot2bot_channel(access)
     self_id = get_self_id(token)
 
     if to_target is not None:
         other_id = resolve_to_target(to_target)
         if other_id == self_id:
             sys.exit("ERROR: --to resolves to this bot itself; pick a peer")
+        # RECIPIENT-FIRST routing: post to a channel the recipient is actually
+        # in, NOT the fixed bot2bot channel. Refuse rather than dead-letter — the
+        # 2026-07-27 mis-route where contributor pings went to the fleet-only
+        # #bot2bot they aren't members of.
+        channel_id = resolve_channel_for_recipient(access, other_id)
+        if channel_id is None:
+            sys.exit(
+                f"ERROR: recipient {other_id} is in no channel's allowFrom in "
+                f"{ACCESS_JSON} — refusing to post (it would be a dead letter). "
+                "Add them to the target channel's allowFrom, or check the id "
+                "(a bot vs its human owner are different ids)."
+            )
     else:
+        # No explicit recipient → fleet broadcast to the bot2bot channel.
+        channel_id = resolve_bot2bot_channel(access)
         other_id = resolve_other_bot(access, self_id, channel_id)
 
     prefix = f"<@{other_id}> " if other_id else ""
