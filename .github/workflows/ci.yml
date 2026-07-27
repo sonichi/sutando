@@ -33,6 +33,26 @@ jobs:
       - name: CLASS_RULES vs reader-chain symmetry lint
         run: python3 scripts/lint-class-rules.py
 
+      # Repo-scoped review checks: runs the machine-readable `checks:` block from
+      # REVIEW.md (today: hardcoded-path scan) over the PR diff, so
+      # the guide's lessons gate EVERY PR — not just reviews that use the codex
+      # tool. `gh pr diff` needs no history/fetch-depth. PR events only (a push to
+      # main has no PR diff). See docs + scripts/review-checks.sh.
+      - name: Review checks (REVIEW.md)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Materialize the diff BEFORE scanning and fail closed if `gh pr diff`
+        # errors (#2281, Qingyun review). The old `gh pr diff … | review-checks.sh`
+        # pipe reported the pipeline's LAST exit status, so a failed `gh pr diff`
+        # (auth/rate-limit/network) sent an empty diff to the scanner, which
+        # printed "empty diff — nothing to check" and exited 0 → the gate passed
+        # WITHOUT scanning the PR. `set -euo pipefail` + `--diff` closes that.
+        run: |
+          set -euo pipefail
+          gh pr diff ${{ github.event.pull_request.number }} > /tmp/review-pr.diff
+          bash scripts/review-checks.sh --diff /tmp/review-pr.diff
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -90,9 +110,14 @@ jobs:
         run: |
           python3 src/remote-gateway-bridge.test.py
           python3 packages/ag2-sparrow/tests/test_gateway_status.py
+          python3 packages/ag2-sparrow/tests/test_dns_timeout.py
           python3 packages/ag2-sparrow/tests/test_ack_retry.py
           python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
           python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
+          python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
+          python3 packages/ag2-sparrow/tests/test_event_consumer.py
+          python3 packages/ag2-sparrow/tests/test_event_wiring.py
+          python3 packages/ag2-sparrow/tests/test_human_action.py
           python3 packages/ag2-sparrow/tools/test_no_drift.py
           python3 skills/agent-room-ops/test_room_ops.py
           python3 skills/make-viral-video/scripts/test_source_tag.py
