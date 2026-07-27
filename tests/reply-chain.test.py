@@ -81,6 +81,19 @@ out = rc.format_reply_chain_ids([1530634946949943497, None, 1530631339764875396]
 check("id spine spans full chain, None dropped",
       out == "reply_chain_ids: 1530631339764875396,1530634946949943497\n")
 
+# --- format_reply_chain_truncation: deep-thread id spine is never silently cut ---
+# reached_root=True → the spine is complete → no marker
+check("reached root -> no marker", rc.format_reply_chain_truncation(True, 999) == "")
+check("reached root, no id -> no marker", rc.format_reply_chain_truncation(True, None) == "")
+# not reached_root → visible marker anchored on the oldest captured id
+mk = rc.format_reply_chain_truncation(False, 1530631339764875396)
+check("truncated -> visible marker", "truncated" in mk and "1530631339764875396" in mk)
+check("truncated marker tells how to recover", "reply to an older message" in mk)
+check("truncated marker is a single leading-newline line",
+      mk.startswith("\n") and mk.count("\n") == 1)
+# defensive: no oldest id (empty walk) → nothing to anchor → no marker
+check("truncated but no id -> no marker", rc.format_reply_chain_truncation(False, None) == "")
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")

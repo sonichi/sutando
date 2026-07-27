@@ -66,6 +66,29 @@ def format_reply_chain_ids(ids: Sequence) -> str:
     return "reply_chain_ids: " + ",".join(reversed(clean)) + "\n"
 
 
+def format_reply_chain_truncation(reached_root: bool, oldest_walked_id) -> str:
+    """Visible marker for when the id walk stopped BEFORE the thread's root.
+
+    The bridge walks the ancestor chain toward the root within a bounded depth
+    (``REPLY_CHAIN_IDS_MAX_DEPTH``) so ``reply_chain_ids`` normally reaches the
+    root even for deep threads. On a pathologically deep (or unfetchable) thread
+    the walk stops before the root — previously that dropped the oldest
+    ancestors (incl. the root question) *silently*, with no inline content and
+    no id handle. This marker makes the truncation VISIBLE (same never-silent
+    principle as ``_clip``) so the agent knows older context exists and can
+    reply to an older message directly to pull it.
+
+    ``reached_root`` True → the spine is complete → no marker. Otherwise emit a
+    one-line marker anchored on the oldest id we DID capture.
+    """
+    if reached_root or not oldest_walked_id:
+        return ""
+    return (
+        f"\n[reply chain truncated: ancestors older than id {oldest_walked_id} "
+        "were not walked — reply to an older message directly to pull it]"
+    )
+
+
 def format_reply_chain(
     chain: Sequence[dict],
     *,
