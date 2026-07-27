@@ -2521,7 +2521,29 @@ async def _ack_not_allowlisted(
         if now - last_sent < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
             return  # this sender already received the notice here recently
         try:
-            await channel.send(_NOT_ALLOWLISTED_ACK_TEXT, reference=message)
+            ref = (
+                discord.MessageReference(
+                    message_id=message.id,
+                    channel_id=channel.id,
+                    fail_if_not_exists=False,
+                )
+                if message is not None
+                else None
+            )
+            try:
+                await channel.send(_NOT_ALLOWLISTED_ACK_TEXT, reference=ref)
+            except Exception as e:
+                # Reply anchors can be rejected for deleted/system messages.
+                # The notice matters more than preserving the quote context.
+                http_exc = getattr(discord, "HTTPException", None)
+                if ref is None or http_exc is None or not isinstance(e, http_exc):
+                    raise
+                print(
+                    f"  [not-allowlisted-ack] reference send failed ({e}); "
+                    "retrying without reference",
+                    flush=True,
+                )
+                await channel.send(_NOT_ALLOWLISTED_ACK_TEXT)
             _not_allowlisted_ack_at[cooldown_key] = now
             persisted[cooldown_key] = now
             _save_not_allowlisted_ack_state(persisted, now)

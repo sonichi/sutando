@@ -51,6 +51,15 @@ def _load_discord():
     d.Intents = _Intents; d.Client = _Client
     d.MessageType = types.SimpleNamespace(default=0, reply=1)
     d.File = lambda *a, **k: None
+    class _MessageReference:
+        def __init__(
+            self, *, message_id, channel_id, fail_if_not_exists=True, **_kwargs
+        ):
+            self.message_id = message_id
+            self.channel_id = channel_id
+            self.fail_if_not_exists = fail_if_not_exists
+    d.MessageReference = _MessageReference
+    d.HTTPException = type("_HTTPException", (Exception,), {})
     class _DM: pass
     d.DMChannel = _DM
     d.Thread = type("Thread", (), {})
@@ -221,7 +230,14 @@ def test_discord():
     dm_msg = _FakeMsg(_FakeUser("U_STRANGER"), dm, "hi")
     asyncio.run(db._handle_discord_message(dm_msg))
     check("discord: _handle_discord_message DM drop fires the ack", len(dm.sent) == 1, str(dm.sent))
-    check("discord: DM ack replies to the triggering message", dm.references == [dm_msg], str(dm.references))
+    dm_ref = dm.references[0] if dm.references else None
+    check(
+        "discord: DM ack replies to the triggering message without a hard anchor",
+        getattr(dm_ref, "message_id", None) == dm_msg.id
+        and getattr(dm_ref, "channel_id", None) == dm.id
+        and getattr(dm_ref, "fail_if_not_exists", True) is False,
+        str(dm_ref),
+    )
 
     # Channel @mention drops → ack (covers the two channel wiring points).
     class _FakeGuild:
@@ -248,7 +264,14 @@ def test_discord():
     c1_msg = _chan_msg("U_S1", c1, g)
     asyncio.run(db._handle_discord_message(c1_msg))
     check("discord: channel @mention, unconfigured + not in global allowlist → ack", len(c1.sent) == 1, str(c1.sent))
-    check("discord: channel ack replies to the triggering message", c1.references == [c1_msg], str(c1.references))
+    c1_ref = c1.references[0] if c1.references else None
+    check(
+        "discord: channel ack uses a non-failing reply reference",
+        getattr(c1_ref, "message_id", None) == c1_msg.id
+        and getattr(c1_ref, "channel_id", None) == c1.id
+        and getattr(c1_ref, "fail_if_not_exists", True) is False,
+        str(c1_ref),
+    )
     # (b) configured channel whose allowFrom excludes the sender, @mentioned → ack
     db._not_allowlisted_ack_at.clear()
     db.ACCESS_FILE.write_text(json.dumps({"dmPolicy": "allowlist", "allowFrom": ["U_OWNER"],
@@ -267,6 +290,43 @@ def test_discord():
         check("discord: a send failure in the ack is swallowed (no raise)", True)
     except Exception as e:
         check("discord: a send failure in the ack is swallowed (no raise)", False, repr(e))
+
+    # Discord can reject reply anchors for deleted/system messages. Retry once
+    # without a reference so the allowlist notice is not dropped entirely.
+    class _FakeHTTPException(Exception):
+        pass
+
+    class _RejectedAnchorChan:
+        id = 889
+        def __init__(self):
+            self.references = []
+            self.sent = []
+        async def send(self, text, **kw):
+            ref = kw.get("reference")
+            self.references.append(ref)
+            if ref is not None:
+                raise _FakeHTTPException("invalid message reference")
+            self.sent.append(text)
+
+    original_http_exception = db.discord.HTTPException
+    db.discord.HTTPException = _FakeHTTPException
+    fallback = _RejectedAnchorChan()
+    fallback_message = _FakeMsg(_FakeUser("U_FALLBACK"), fallback, "hi")
+    db._not_allowlisted_ack_at.clear()
+    try:
+        asyncio.run(db._ack_not_allowlisted(
+            fallback, "U_FALLBACK", "fallback", fallback_message
+        ))
+    finally:
+        db.discord.HTTPException = original_http_exception
+    check(
+        "discord: rejected reply anchor retries as a fresh notice",
+        fallback.sent == [db._NOT_ALLOWLISTED_ACK_TEXT]
+        and len(fallback.references) == 2
+        and fallback.references[0] is not None
+        and fallback.references[1] is None,
+        f"sent={fallback.sent!r} refs={fallback.references!r}",
+    )
 
 
 # ─────────────────────────── Slack ───────────────────────────
