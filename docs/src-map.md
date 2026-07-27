@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-172 modules indexed.
+173 modules indexed.
 
 ## `src/`
 
@@ -180,6 +180,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`realtime.ts`** — Realtime usage CLIENT — the voice agent (`src/voice-agent.ts`) and phone server (`skills/phone-conversation`) SEND raw usage payloads to the collector (`POST /ingest/realtime`); the collector's RealtimeNormalizer maps them to spine primitives and writes them through the SAME sink-set + meter ledger as every other source.
 - **`sink.py`** — Observability sinks (Python twin of sink.ts).
 - **`sink.ts`** — Observability sinks.
+- **`startup-policy.sh`** — Startup policy helpers for the local observability collector.
 - **`ticker.ts`** — Generic interval-based usage ticker — emit usage records while a session is live instead of accumulating everything into one end-of-session burst.
 - **`usage.py`** — The usage record (Python twin of types.ts).
 - **`usage.ts`** — The usage record — the durable, billable/attributable primitive.

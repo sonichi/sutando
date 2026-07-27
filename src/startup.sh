@@ -693,32 +693,39 @@ else
   export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
 
-# 0b. Obs collector (ON by default — opt-out via SUTANDO_OBS_COLLECTOR=0).
-# The single, source-agnostic local collector: it receives Claude Code hooks
-# (and, later, voice / filewatcher / bridge events) on /ingest/<source>,
-# normalizes them into the one event schema, and writes the durable JSONL floor
-# at <workspace>/logs/events-*.jsonl (the visualizer tails that). On by default
-# so the usage/token + task-model dashboard works out of the box; set
-# SUTANDO_OBS_COLLECTOR=0 to disable. This is LOCAL-ONLY — forwarding usage to a
-# cloud endpoint stays separately opt-in via SUTANDO_METERING_ENABLED=1 +
-# SUTANDO_METERING_ENDPOINT, so no data leaves the machine by default.
-#
-# We also point the core's hooks at it (SUTANDO_OBS_ENDPOINT) UNLESS an endpoint
-# is already set — e.g. a remote upstream collector — so the "always set hooks,
-# only export when told where" contract still holds.
-if [ "${SUTANDO_OBS_COLLECTOR:-1}" != "0" ]; then
+# 0b. Local usage collector. Token/cost metrics are on by default so dashboard
+# usage panels work out of the box; plaintext prompt/tool hooks retain their
+# previous explicit SUTANDO_OBS_COLLECTOR=1 opt-in. Set the flag to 0 to disable
+# the local collector entirely. Cloud forwarding remains separately opt-in.
+# shellcheck source=src/observability/startup-policy.sh
+source "$REPO/src/observability/startup-policy.sh"
+OBS_COLLECTOR_READY=0
+if obs_collector_enabled; then
   OBS_PORT="${SUTANDO_OBS_PORT:-4000}"
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
       run_node_service boot "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
-    echo "  ✓ obs collector"
-  else
-    echo "  ✓ obs collector (already running on $OBS_PORT)"
+    for _obs_wait in 1 2 3 4 5 6 7 8 9 10; do
+      obs_collector_healthy "$OBS_PORT" && break
+      sleep 0.2
+    done
   fi
-  # Wire the core's hooks to the local collector unless an endpoint is already set.
-  if [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
-    export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+  if obs_collector_healthy "$OBS_PORT"; then
+    OBS_COLLECTOR_READY=1
+    echo "  ✓ obs collector (verified on $OBS_PORT)"
+  else
+    echo "  ⚠ obs collector unavailable or foreign listener on $OBS_PORT — metrics/hook capture disabled" >&2
+  fi
+  if [ "$OBS_COLLECTOR_READY" = "1" ]; then
+    # Default-on path is metrics-only. Preserve the old explicit =1 behavior
+    # for operators who intentionally opted into prompt/tool hook capture.
+    if [ -z "${SUTANDO_OBS_METRICS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_METRICS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
+    if obs_hooks_enabled && [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
   fi
 else
   echo "  ~ obs collector (disabled via SUTANDO_OBS_COLLECTOR=0)"
@@ -1224,7 +1231,7 @@ fi
 if phone_stack_enabled && grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
-if [ "${SUTANDO_OBS_COLLECTOR:-1}" != "0" ]; then
+if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
 for port_name in $VERIFY_PORTS; do
