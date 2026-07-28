@@ -138,8 +138,16 @@ jobs:
           failed=0
           while IFS= read -r f; do
             echo "→ $f"
-            output=$(python3 "$f" 2>&1)
-            rc=$?
+            # `if ! assignment=$(...)` exempts the command from `bash -e` (GitHub's
+            # default for run: steps) while still capturing output + status. A bare
+            # `output=$(python3 "$f")` aborts the whole step the instant a test
+            # fails — before the `echo "$output"` below ever runs — so the failing
+            # test's traceback is DISCARDED, every later test is skipped, and the
+            # log shows only the bare `→ <file>` line. The shell-test step below
+            # already uses this idiom for exactly this reason; this step was
+            # missed. (Observed on a real CI run: a failure printed no output at
+            # all, making it undiagnosable from the log.)
+            if ! output=$(python3 "$f" 2>&1); then rc=1; else rc=0; fi
             # Always show FAIL lines and summary
             echo "$output" | grep -E 'FAIL|^Results:' || true
             if [ $rc -ne 0 ]; then
