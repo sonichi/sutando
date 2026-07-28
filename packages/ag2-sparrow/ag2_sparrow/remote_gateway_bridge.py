@@ -202,6 +202,21 @@ TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
 # after a healthy round-trip, reconnecting in the backoff branches.
 GATEWAY_STATUS_FILE = _STATE / "gateway-status.json"
 
+# Launch provenance + in-bridge file log. A supervisor that persists stdout
+# (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
+# SUTANDO_SUPERVISED=1, and _log stays stdout-only — byte-identical to before.
+# Launched any other way ("bare": a hand-run of the script, a debug shell, an
+# app spawn that forgot the redirect), stdout persists nowhere — the exact
+# diagnostic hole of the 2026-07-25 tester wedge (bridge stuck 21h, zero logs
+# or discoverable status to read). So a bare launch ALSO appends every _log
+# line to <state-parent>/logs/gateway-bridge.log (<workspace>/logs/ when
+# sutando injects dirs, ~/.ag2-sparrow/logs/ under defaults), size-capped with
+# a single .1 rotation, best-effort — log I/O must never break the bridge.
+_LAUNCHED_VIA = "supervised" if os.environ.get("SUTANDO_SUPERVISED") else "bare"
+_LOG_DIR = _STATE.parent / "logs"
+_LOG_FILE = _LOG_DIR / "gateway-bridge.log"
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+
 # AWP P0: the persistent event channel (if enabled) — a module-level handle so
 # gateway-status can report per-channel health. None until _maybe_start_event_channel.
 _EVENT_CHANNEL = None
@@ -581,7 +596,22 @@ def _redact_url(value: str) -> str:
 
 
 def _log(msg: str) -> None:
-    print(f"[remote-gateway-bridge] {msg}", flush=True)
+    line = f"[remote-gateway-bridge] {msg}"
+    print(line, flush=True)
+    if _LAUNCHED_VIA == "supervised":
+        return  # stdout already persisted by the supervisor's redirect
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if _LOG_FILE.stat().st_size > _LOG_MAX_BYTES:
+                _LOG_FILE.replace(_LOG_FILE.with_suffix(".log.1"))
+        except FileNotFoundError:
+            pass
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(_LOG_FILE, "a") as f:
+            f.write(f"{stamp} {line}\n")
+    except Exception:  # noqa: BLE001 — logging must never break the bridge
+        pass
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
@@ -758,6 +788,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "backoff_s": int(backoff_s),
             "error": _one_line(error) if error else None,
             "gateway": _redact_url(URL),
+            "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
         }
         # AWP P0 per-channel health: the task connection is `connected` above; the
@@ -1502,6 +1533,13 @@ def main() -> None:
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
+    # Always name where the diagnostics live: after an incident this line is the
+    # trailhead (a bare-launched bridge under default dirs writes status to
+    # ~/.ag2-sparrow/state/, where nobody thinks to look).
+    _log(f"launched_via={_LAUNCHED_VIA} status={GATEWAY_STATUS_FILE}")
+    if _LAUNCHED_VIA == "bare":
+        _log(f"running unsupervised — output also logged to {_LOG_FILE}; "
+             f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
     _emit_gateway_status(False, error="starting — not yet connected")
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
