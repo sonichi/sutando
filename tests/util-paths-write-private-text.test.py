@@ -70,6 +70,47 @@ class TestWritePrivateText(unittest.TestCase):
         self.assertTrue(mode & (stat.S_IRGRP | stat.S_IROTH),
                         "control did not reproduce the window; test is vacuous")
 
+
+    def test_hardening_failure_does_not_destroy_existing_content(self):
+        """#2356 review: a permission-hardening failure must not empty the file.
+
+        O_TRUNC empties at OPEN, so `O_CREAT|O_TRUNC` then fchmod would leave an
+        existing durable backup EMPTY when hardening fails — destroying exactly
+        the copy that exists to survive a wipe. Harden first, truncate after.
+        """
+        target = self.tmp / "access-backup.json"
+        original = '{"allowFrom": ["UOWNER"], "tofuOwner": "UOWNER"}'
+        target.write_text(original)
+
+        real_fchmod = os.fchmod
+
+        def boom(*a, **k):
+            raise PermissionError("hardening failed")
+
+        os.fchmod = boom
+        try:
+            with self.assertRaises(PermissionError):
+                self.mod.write_private_text(target, '{"allowFrom": ["UNEW"]}')
+        finally:
+            os.fchmod = real_fchmod
+
+        self.assertEqual(target.read_text(), original,
+                         "existing backup was modified despite a hardening failure")
+
+    def test_hardening_failure_leaves_no_leaked_fd(self):
+        """The error path closes the descriptor itself (fdopen never took it)."""
+        target = self.tmp / "fdcheck.json"
+        target.write_text("x")
+        real_fchmod = os.fchmod
+        os.fchmod = lambda *a, **k: (_ for _ in ()).throw(PermissionError("nope"))
+        try:
+            for _ in range(64):          # would exhaust a small fd table if leaked
+                with self.assertRaises(PermissionError):
+                    self.mod.write_private_text(target, "y")
+        finally:
+            os.fchmod = real_fchmod
+        self.assertEqual(target.read_text(), "x")
+
     def test_content_and_overwrite(self):
         """Behaviour must be unchanged: content correct, and an existing file is
         truncated (not appended) and re-restricted even though the mode arg to

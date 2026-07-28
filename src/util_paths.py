@@ -357,7 +357,20 @@ def write_private_text(path: "Path", text: str) -> None:
     broad excepts, and O_EXCL would turn a leftover temp file from a crash into a
     permanent silent failure.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        os.fchmod(fh.fileno(), 0o600)
+    # Order matters for DATA INTEGRITY, not just permissions. O_TRUNC empties the
+    # file at OPEN, so with `O_CREAT|O_TRUNC` then fchmod, a hardening failure
+    # leaves an EXISTING backup empty -- a permission error would destroy exactly
+    # the durable copy that exists to survive a wipe. (The old
+    # write_text()+chmod at least failed with correct data and loose perms.)
+    #
+    # So: open WITHOUT O_TRUNC, harden first, and only truncate once nothing can
+    # still fail destructively.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)   # existing file: mode arg above was ignored
+        os.ftruncate(fd, 0)    # nothing destroyed until hardening succeeded
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "w") as fh:  # fdopen takes ownership of fd from here
         fh.write(text)
