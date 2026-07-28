@@ -57,11 +57,20 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SETTINGS="$REPO_DIR/.claude/settings.json"
 
 # Hook specs: each line is "<event>|<command>".  Order = install order.
+# $REPO_DIR is expanded HERE, at install time, so the command written into
+# settings.json carries this clone's absolute path. It used to hardcode
+# $HOME/Desktop/sutando — escaped, so it landed in settings.json literally and
+# was expanded at HOOK-RUN time, resolving to that one path on every host. This
+# clone is at "Library/Application Support/space.ag2.app/engine/sutando" and a
+# sibling is at "Documents/github/sutando"; neither is ~/Desktop, so every hook
+# installed by this script would point at a directory that does not exist and
+# fail silently on each fire. REPO_DIR was already derived correctly on the line
+# above and simply was not used.
 HOOKS=(
   "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
-  "PreCompact|bash \$HOME/Desktop/sutando/src/session-handoff.sh \"\$TRANSCRIPT_PATH\""
-  "SessionEnd|bash \$HOME/Desktop/sutando/src/session-handoff.sh \"\$TRANSCRIPT_PATH\""
-  "Stop|bash \$HOME/Desktop/sutando/src/check-pending-tasks.sh"
+  "PreCompact|bash $REPO_DIR/src/session-handoff.sh \"\$TRANSCRIPT_PATH\""
+  "SessionEnd|bash $REPO_DIR/src/session-handoff.sh \"\$TRANSCRIPT_PATH\""
+  "Stop|bash $REPO_DIR/src/check-pending-tasks.sh"
 )
 
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
