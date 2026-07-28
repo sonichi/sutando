@@ -67,11 +67,14 @@ class VoiceHealthConfigTests(unittest.TestCase):
         self.assertEqual(checks, [voice_ok, watcher_ok, transport_ok, bodhi_ok])
         mark_stale.assert_called_once()
 
-    def test_explicit_skip_wins_over_configured_key(self) -> None:
+    def test_configured_key_wins_over_explicit_skip_like_startup(self) -> None:
         path = self.write_env("SKIP_VOICE=1\nGEMINI_API_KEY=file-key\n")
-        checks = hc.check_voice_stack(env={}, env_path=path)
-        self.assertTrue(all(c["status"] == "ok" for c in checks))
-        self.assertTrue(all("SKIP_VOICE=1" in c["detail"] for c in checks))
+        with mock.patch.object(hc, "check_port", return_value={
+            "name": "voice-agent", "status": "down", "detail": "port 9900",
+        }):
+            checks = hc.check_voice_stack(env={}, env_path=path)
+        self.assertEqual(checks[0]["name"], "voice-agent")
+        self.assertEqual(checks[0]["status"], "down")
 
     def test_process_environment_wins_over_file(self) -> None:
         path = self.write_env("SKIP_VOICE=1\nGEMINI_API_KEY=file-key\n")

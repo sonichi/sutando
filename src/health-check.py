@@ -164,12 +164,12 @@ def resolve_voice_health_config(
         return str(value).strip()
 
     skip_voice = effective("SKIP_VOICE")
+    if effective("GEMINI_VOICE_API_KEY") or effective("GEMINI_API_KEY"):
+        return {"enabled": True, "detail": "Gemini voice credential configured"}
     if skip_voice not in ("", "0", "1"):
         return {"enabled": True, "error": f"invalid SKIP_VOICE={skip_voice!r}"}
     if skip_voice == "1":
         return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
-    if effective("GEMINI_VOICE_API_KEY") or effective("GEMINI_API_KEY"):
-        return {"enabled": True, "detail": "Gemini voice credential configured"}
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
 
 
