@@ -179,6 +179,24 @@ finally:
 check("backup is BORN 0600 — no world/group-readable write window",
       born_mode & 0o077 == 0, oct(born_mode))
 
+# ── 10. state/auth/ is created owner-only (0700), umask-independent (#2354 rev) ─
+# The dir holds only 0600 secrets, so it must not rely on the parent's incidental
+# mode. Discriminator: under a permissive umask (0o000), a plain mkdir() births
+# 0o777; only an explicit mode=0o700 stays owner-only. Uses a fresh, not-yet-
+# existing dir so mkdir actually creates it.
+_fresh_auth = tmp / "fresh_auth_dir"
+rgb._TIER_MAP_BACKUP_FILE = _fresh_auth / "ag2space-tiermap-backup.json"
+_cold_process()
+_old_umask2 = os.umask(0o000)
+try:
+    rgb._backup_tier_map_to_disk({"@rick:ag2.space": "team"})
+    dir_mode = stat.S_IMODE(os.stat(_fresh_auth).st_mode)
+finally:
+    os.umask(_old_umask2)
+check("state/auth/ dir created 0700 (no group/other-readable), umask-independent",
+      dir_mode & 0o077 == 0, oct(dir_mode))
+rgb._TIER_MAP_BACKUP_FILE = BACKUP  # restore
+
 if failures:
     print(f"\n{len(failures)} FAILED: {failures}")
     sys.exit(1)

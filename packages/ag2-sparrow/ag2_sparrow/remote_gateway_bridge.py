@@ -474,7 +474,14 @@ def _backup_tier_map_to_disk(tm):
     if not isinstance(tm, dict):
         return
     try:
-        _TIER_MAP_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Create state/auth/ owner-only (0700). It holds only 0600 secrets, so
+        # don't rely on the parent's incidental mode: macOS ~/Library/Application
+        # Support is 0700 by OS default, but the documented default workspace
+        # (<repo>/workspace/) has no such cover — safety would otherwise rest on
+        # every writer remembering (#2354 review, air). mode applies to the leaf
+        # on create; hardening a *pre-existing* state/auth/ across all its writers
+        # is the cross-cutting follow-up, not this best-effort backup's job.
+        _TIER_MAP_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         tmp = _TIER_MAP_BACKUP_FILE.with_name(
             f"{_TIER_MAP_BACKUP_FILE.name}.{os.getpid()}.tmp"
         )
