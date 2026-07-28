@@ -435,6 +435,8 @@ describe('sutando_config loader', () => {
 		writeConfig(repo, 'sutando.config.json', {
 			workspace: { path: '/ws' },
 			vault: { enabled: false },
+			// #2316: health_check is a known key (Python twin registers it) — must not warn.
+			health_check: { down_bridge_action: 'restart' },
 		});
 		const writes: string[] = [];
 		const origWrite = process.stderr.write.bind(process.stderr);
