@@ -15,6 +15,12 @@ import sys
 
 flags = [p for p in os.environ.get("RC_FLAGS", "").split("\n") if p]
 allows = [a for a in os.environ.get("RC_ALLOWS", "").split("\n") if a]
+# Each entry is "TOKEN_PREFIX :: COMPANION": the token is exempt ONLY when the
+# same added line also contains COMPANION. Encodes "portable candidate list"
+# without exempting a naked architecture-specific literal.
+paired = [tuple(x.strip() for x in a.split("::", 1))
+          for a in os.environ.get("RC_ALLOW_PAIRED", "").split("\n")
+          if a and "::" in a]
 DELIMS = set("\"'()" + ", ;=" + chr(96) + chr(9))   # quotes, brackets, backtick, tab, etc.
 SKIP = re.compile(r"\.md$|(^|/)tests/|\.test\.|review-checks\.(sh|py)$")
 
@@ -28,6 +34,44 @@ def token_at(s, pos):
     while right < len(s) - 1 and s[right + 1] not in DELIMS:
         right += 1
     return s[left:right + 1]
+
+
+def _tokens(s):
+    """Every delimiter-separated token on the line (same delimiters token_at uses)."""
+    out, cur = [], []
+    for ch in s:
+        if ch in DELIMS:
+            if cur:
+                out.append("".join(cur)); cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def paired_allowed(tok, line):
+    """Contextual exemption for the portable candidate-list shape.
+
+    `tok` is exempt only when the SAME line carries a companion path for the
+    SAME binary — e.g. '/opt/homebrew/bin/ffmpeg' beside '/usr/local/bin/ffmpeg'.
+
+    Matching the companion's basename (not merely the prefix substring) is
+    deliberate: a bare `companion in line` test would exempt the naked form
+    whenever any unrelated '/usr/local/...' happened to share the line, which
+    re-opens the blind spot this rule exists to close. A naked
+    `X = "/opt/homebrew/bin/ffmpeg"` has no same-name companion and stays flagged.
+    """
+    base = tok.rsplit("/", 1)[-1]
+    if not base:
+        return False
+    for prefix, companion in paired:
+        if not tok.startswith(prefix):
+            continue
+        for other in _tokens(line):
+            if other.startswith(companion) and other.rsplit("/", 1)[-1] == base:
+                return True
+    return False
 
 
 def allowed(tok):
@@ -124,7 +168,7 @@ def main():
                 if pos < 0:
                     continue
                 tok = token_at(line, pos)
-                if not allowed(tok):
+                if not allowed(tok) and not paired_allowed(tok, line):
                     print("%s:%d: hardcoded path (%s): %s" % (cur_file, cur, tok, stripped))
                     hits += 1
                     break

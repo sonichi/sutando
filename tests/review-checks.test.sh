@@ -32,6 +32,19 @@ check "~/.claude flagged"                             flag  $'+++ b/g.sh\n@@ -1,
 check "/home/ flagged"                                flag  $'+++ b/i.py\n@@ -1,0 +1,1 @@\n+p = "/home/bob/.config"'
 check "clean diff passes"                             clean $'+++ b/h.js\n@@ -1,0 +1,1 @@\n+const x = resolveWorkspace();'
 
+# --- paired allow: portable candidate list vs naked arch-specific literal -----
+# The exemption for '/opt/homebrew/' is CONTEXTUAL (REVIEW.md allow_paired): the
+# token passes only beside a same-named companion under the companion prefix.
+# Both directions are asserted — an exception that only proves its allow is a
+# guard that cannot say NO.
+check "candidate-list: TS array passes"               clean $'+++ b/skills/x/a.ts\n@@ -1,0 +1,1 @@\n+const FFMPEG = [\'/opt/homebrew/bin/ffmpeg\', \'/usr/local/bin/ffmpeg\', \'ffmpeg\']'
+check "candidate-list: py generator passes"           clean $'+++ b/skills/x/r.py\n@@ -1,0 +1,1 @@\n+    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")'
+check "naked /opt/homebrew literal still flagged"     flag  $'+++ b/skills/x/b.ts\n@@ -1,0 +1,1 @@\n+const FFMPEG = "/opt/homebrew/bin/ffmpeg";'
+check "unrelated /opt/homebrew binary still flagged"  flag  $'+++ b/skills/x/c.py\n@@ -1,0 +1,1 @@\n+BIN = "/opt/homebrew/bin/python3"'
+check "coincidental /usr/local does not exempt"       flag  $'+++ b/skills/x/e.py\n@@ -1,0 +1,1 @@\n+A = "/opt/homebrew/bin/ffmpeg"; B = "/usr/local/share/doc"'
+check "mismatched companion basename does not exempt" flag  $'+++ b/skills/x/g.py\n@@ -1,0 +1,1 @@\n+A = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffprobe")'
+check "paired line still flags a real /Users/ leak"   flag  $'+++ b/skills/x/f.py\n@@ -1,0 +1,1 @@\n+A = ("/opt/homebrew/bin/x","/usr/local/bin/x"); L = "/Users/alice/s"'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

@@ -82,22 +82,33 @@ checks:
       - '~/.sutando'
     # ...unless the path token also matches one of these (fixtures / system noise).
     allow:
-      # Standard package-manager prefix, not machine- or user-specific: identical
-      # on every Apple-Silicon Mac with Homebrew, so it does not break on another
-      # host the way rule 6 is written to prevent. It is caught only because the
-      # flag list uses the broad '/opt/' token. The repo already resolves binaries
-      # through candidate lists containing it (src/agent-api.py's tmux lookup,
-      # health-check.py's _resolve_tmux_bin and _BRIDGE_INTERP_CANDIDATES,
-      # skills/voice-agent-test-harness's `rec`) — those pass only because the scan
-      # is diff-scoped, so the convention was effectively unextendable: adding a NEW
-      # candidate list failed while the existing ones sailed. Note the asymmetry it
-      # produced — '/usr/local/bin/ffmpeg' is NOT flagged, so the check permitted
-      # the Intel half of a candidate list and rejected the Apple-Silicon half.
-      # Safe because a path-like allow must match at the TOKEN START (see
-      # scripts/review-checks.py:allowed), so this cannot mask '/Users/...'.
-      - '/opt/homebrew/'
       - '/nonexistent'
       - '/usr/fake'
       - '/tmp/'
       - 'example.com'
+    # Tokens allowed ONLY when the SAME added line also carries a companion path
+    # for the SAME binary — i.e. the portable candidate-list shape, never a naked
+    # literal. Encoded as 'TOKEN_PREFIX :: COMPANION_PREFIX'.
+    #
+    # The companion is matched by BASENAME, not as a bare substring:
+    # '/opt/homebrew/bin/ffmpeg' is exempt only beside '/usr/local/bin/ffmpeg'.
+    # A substring test would exempt the naked form whenever any unrelated
+    # '/usr/local/...' shared the line, re-opening the blind spot.
+    #
+    # Why paired and not a plain allow: '/opt/homebrew/' is Apple-Silicon-only
+    # (Intel Homebrew installs under /usr/local), so an UNPAIRED use still breaks
+    # a supported host — exactly the bug class rule 6 exists to catch. A global
+    # prefix allow would hide that naked form too, which is broader than the need.
+    # Pairing keeps the portable form legal while a bare
+    # `X = "/opt/homebrew/bin/ffmpeg"` stays flagged.
+    #
+    # Scope note: this is a SAME-LINE test. The candidate lists it exists for are
+    # written on one line (see skills/screen-record narration-tee.ts + record.py).
+    # A list split across lines will still flag — deliberately: a multi-line
+    # window would re-admit the naked form whenever a same-named companion
+    # appeared anywhere nearby. Reformat the list onto one line, or resolve via a
+    # shared helper. Controls for both directions live in
+    # tests/review-checks.test.sh ('candidate-list' / 'naked' / 'unrelated').
+    allow_paired:
+      - '/opt/homebrew/ :: /usr/local/'
 ```
