@@ -73,6 +73,31 @@ def voice_client_connected():
     return False
 
 
+# A `## ` heading is not always a question. Two forms are structural, and both
+# must be classified HERE rather than by each consumer — morning-briefing.py used
+# to drop them locally, which meant the notifier and the briefing reported
+# different pending counts for the same file (notifier 2, briefing 1 on a corpus
+# with one active `[RESOLVED ...]` entry plus one open ask).
+#
+#   * organizer/section shells — "## ACTIVE — 2026-07-05", "## FRESH — …" — group
+#     questions but ask nothing;
+#   * an inline resolution MARKER in the title — "## [RESOLVED 2026-07-03] shipped".
+#     Matched as a bracketed marker, never as a bare substring: `'RESOLVED' in
+#     title` also fires on "design fully resolved, build on your nod" (an open ask)
+#     and on "NOT self-resolved", which asserts the opposite.
+#
+# Counting either as waiting re-notifies the owner about questions that are not
+# open, which is the same harm as missing a real one, pointed the other way.
+_ORG_HEADING = re.compile(
+    r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\b', re.IGNORECASE
+)
+# `(?![\w-])` not `\b`: a trailing hyphen IS a word boundary, so `\bDONE\b`
+# matched the title `## [done-ish] something` and dropped a live question.
+# Reintroducing an over-broad match while fixing one is the failure this
+# whole change is about — the marker must be the WHOLE token.
+_INLINE_RESOLVED = re.compile(r'\[\s*(✅\s*)?(RESOLVED|DONE|ANSWERED)(?![\w-])', re.IGNORECASE)
+
+
 def get_waiting_questions():
     """Parse pending-questions.md — matches the legacy `## Q1 — Title` and
     `## Title` / `- **Status:** unanswered` section formats AND the free-form
@@ -103,6 +128,8 @@ def get_waiting_questions():
         title_line, _, body = sec.partition('\n')
         title = title_line.strip()
         if not title:
+            continue
+        if _ORG_HEADING.match(title) or _INLINE_RESOLVED.search(title):
             continue
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
         if status_m:

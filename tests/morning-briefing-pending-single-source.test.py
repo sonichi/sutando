@@ -41,6 +41,10 @@ Still open despite the word appearing in the title.
 ## ACTIVE — 2026-07-05 [organizer header, not a question]
 Grouping shell.
 
+## [RESOLVED 2026-07-03] shipped already
+An inline resolution MARKER in the ACTIVE region — above the divider, no Status
+field. Both consumers must agree it is not waiting.
+
 # Resolved
 
 ## 2026-07-20T13:14Z — ✅ RESOLVED — this lives below the divider
@@ -58,7 +62,8 @@ MUST_COUNT = [
     "a plain open question",
 ]
 # Must NOT be counted: explicit status, organizer shell, below-divider.
-MUST_NOT_COUNT = ["an entry explicitly marked done", "organizer header", "below the divider"]
+MUST_NOT_COUNT = ["an entry explicitly marked done", "organizer header",
+                  "below the divider", "shipped already"]
 
 
 def load(name: str, path: Path):
@@ -102,24 +107,35 @@ def main() -> int:
         briefing = mb.get_pending_questions()
         _p.stop()
 
-        # 1. Agreement on the WAITING predicate. The briefing additionally drops
-        #    organizer shells for display, so parity is asserted over real
-        #    questions only — comparing raw totals would bake the notifier's
-        #    org-header gap into this test as if it were correct.
-        org = re.compile(r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\b', re.I)
-        real = [t for t in notifier if not org.match(t.strip())]
-        if len(real) != len(briefing):
-            failures.append(f"count drift: notifier(real)={len(real)} briefing={len(briefing)}")
+        # 1. RAW parity — same file, same count, no normalization. The previous
+        #    version filtered organizer shells off the notifier side before
+        #    comparing, which silently excused exactly the divergence this is
+        #    supposed to catch: a test that pre-removes the difference cannot
+        #    fail on it. Both classifications now live in the shared parser, so
+        #    the two consumers must agree on the raw number.
+        if len(notifier) != len(briefing):
+            # Compare on the briefing's own truncation width. Comparing raw
+            # strings makes any title longer than 60 chars look notifier-only,
+            # which blamed an innocent entry in the first control run.
+            seen = set(briefing)
+            only = sorted(x for x in notifier if x[:60] not in seen)
+            failures.append(
+                f"count drift: notifier={len(notifier)} briefing={len(briefing)} "
+                f"(notifier-only: {only})")
 
         # 2. every open entry is present, including the prose-"resolved" ones
         for needle in MUST_COUNT:
             if not any(needle in t for t in briefing):
                 failures.append(f"open question dropped from briefing: {needle!r}")
 
-        # 3. genuinely-resolved / structural entries stay out
+        # 3. genuinely-resolved / structural entries stay out of BOTH consumers.
+        #    Checking the notifier too is the point of the change: if only the
+        #    briefing rejects them, the predicate has forked again.
         for needle in MUST_NOT_COUNT:
-            if any(needle in t for t in briefing):
-                failures.append(f"non-question counted as pending: {needle!r}")
+            if any(needle in x for x in briefing):
+                failures.append(f"non-question counted as pending (briefing): {needle!r}")
+            if any(needle in x for x in notifier):
+                failures.append(f"non-question counted as pending (notifier): {needle!r}")
 
         # 4. Structural: the briefing must DELEGATE, not re-implement. Asserted on
         #    the function body rather than the whole file, because the module

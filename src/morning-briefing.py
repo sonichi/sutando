@@ -279,6 +279,13 @@ def get_pending_questions() -> list[str]:
     #2351 had already fixed the notifier's side (`Status: open`) without this one
     changing. So the predicate now lives in exactly one place.
 
+    That invariant was initially only half-true: this function still dropped
+    organizer shells and inline `[RESOLVED ...]` titles locally, so the two
+    consumers reported different counts (notifier 2 / briefing 1 on a corpus with
+    one active marker plus one open ask) — review finding on 919c35f2. Both
+    classifications now live in the shared parser, and nothing here judges
+    waiting-ness; this function only maps the result to display titles.
+
     Deliberately no fallback parser: a second implementation is the bug. And a
     failure here must not degrade to `[]`, which the briefing would render as the
     confident "no pending questions" that this whole class of bug produces.
@@ -292,35 +299,11 @@ def get_pending_questions() -> list[str]:
     # tests/morning-briefing-pending-extract.test.py), so the seam does not move.
     _CPQ.PQ_FILE = personal_path("pending-questions.md", WORKSPACE)
 
-    # Organizer/section-shell headers ("## ACTIVE — 2026-07-05", "## FRESH — …")
-    # group questions but are not questions, so the briefing's "top item" must not
-    # be a date-label (#2059). This is a PRESENTATION filter, not a second opinion
-    # on whether something is waiting — the waiting predicate stays entirely above.
-    # The notifier does not apply it and will count such a shell; that is a real
-    # gap on its side, filed separately rather than silently forked back here.
-    org_header = re.compile(
-        r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\b', re.IGNORECASE
-    )
-    # An inline resolution MARKER in the title — "[RESOLVED 2026-07-03] shipped
-    # already" — means resolved even though the notifier does not recognise the
-    # form and still reports it waiting. Matched as a bracketed marker, NOT as a
-    # bare substring: the retired `'RESOLVED' in title` fired on the word wherever
-    # it appeared, including "design fully resolved, build on your nod" (an open
-    # ask) and "NOT self-resolved" (which asserts the opposite). That over-broad
-    # match is the bug this change fixes; the marker case it also happened to
-    # catch is preserved here rather than lost.
-    #
-    # This is the ONE waiting-state judgment left outside the shared predicate,
-    # and it is here only because the notifier has the gap. The durable fix is to
-    # teach it the marker form so it stops re-notifying on resolved entries —
-    # filed as a follow-up rather than folded into this change, since it alters
-    # what the notifier reports.
-    inline_resolved = re.compile(r'\[\s*(✅\s*)?(RESOLVED|DONE|ANSWERED)\b', re.IGNORECASE)
     out: list[str] = []
     for q in _CPQ.get_waiting_questions():
         title = (q.get("title") or q.get("id") or "") if isinstance(q, dict) else str(q)
         title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
-        if not title or org_header.match(title) or inline_resolved.search(title):
+        if not title:
             continue
         out.append(title[:60])
     return out
