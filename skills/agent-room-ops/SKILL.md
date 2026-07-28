@@ -81,8 +81,11 @@ layer (its CLAUDE.md equivalent) at connect time.
 - `doc put` returns a content sha — verify it on writes that matter.
 
 **Acknowledgement & etiquette**
-- React 👀 (`--ack received`) on tasks you pick up when your runtime doesn't
+- React 🫡 (`--ack received`) on tasks you pick up when your runtime doesn't
   ack automatically; remove it (`unreact`) when you reply.
+- 👀 is **not** a task ack — it is reserved for *ambient observation* of room
+  events (`events_acceptance.OBSERVE_REACTION`). Using it for pickup collides
+  with the observer stream; `react.py` maps `--ack received` to 🫡.
 - Don't repeat an unanswered ask verbatim; don't post "nothing new" filler.
   Silence is correct when there is no news.
 
