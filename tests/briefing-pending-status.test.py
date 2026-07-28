@@ -70,6 +70,30 @@ class TestBriefingPendingStatus(unittest.TestCase):
         self.assertNotIn("Below the divider", joined)
         self.assertEqual(len(got), 2, f"expected 2 pending, got {got}")
 
+    def test_status_open_counts_as_pending(self):
+        """`**Status:** open` is the natural word writers reach for; it must count
+        as pending (not fall through to the resolved-skip). Mirrors
+        check-pending-questions.py so the briefing and the checker agree."""
+        import tempfile
+
+        content = (
+            "# Pending questions\n\n"
+            "## [OPEN] Plain open counts\n"
+            "**Status:** open\n\n"
+            "## [OPEN] Open with case + trailing prose counts\n"
+            "**Status:** Open — waiting on the owner's call.\n\n"
+            "## [OPEN] Resolved control still excluded\n"
+            "**Status:** resolved — done.\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            got = self._run(content, Path(d))
+
+        joined = " | ".join(got)
+        self.assertIn("Plain open counts", joined)
+        self.assertIn("Open with case + trailing prose counts", joined)
+        self.assertNotIn("Resolved control", joined)
+        self.assertEqual(len(got), 2, f"expected 2 pending (both open), got {got}")
+
 
 if __name__ == "__main__":
     unittest.main()
