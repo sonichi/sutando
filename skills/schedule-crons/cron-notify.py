@@ -198,8 +198,7 @@ def main(argv=None):
         print(f"suppressed: rate-limited (last ping < {args.min_interval}s ago)")
         return 3
 
-    body = format_ping(args.cron, args.summary, args.room if not args.event_id else args.room,
-                       args.event_id, args.via)
+    body = format_ping(args.cron, args.summary, args.room, args.event_id, args.via)
 
     if args.dry_run:
         print("DRY-RUN would post:")
