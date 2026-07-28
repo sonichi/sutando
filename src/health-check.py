@@ -494,6 +494,23 @@ def check_memory_dir_override() -> "dict | None":
     }
 
 
+def _slug_derivation_key(name: str) -> str:
+    """Collapse a Claude project slug to a derivation-INDEPENDENT key.
+
+    Claude Code slugifies a filesystem path, and the derivations differ only in
+    how they map ``.``, spaces and repeated separators. So two slugs describing
+    the SAME path agree once every run of non-alphanumerics is collapsed to one
+    ``-`` and case is folded, while an unrelated project does not collide:
+
+        -Users-me-Library-Application-Support-space.ag2.app-engine-sutando
+        -Users-me-Library-Application-Support-space-ag2-app-engine-sutando
+            -> users-me-library-application-support-space-ag2-app-engine-sutando   (same)
+        -Users-me-Documents-unrelated-repo
+            -> users-me-documents-unrelated-repo                                    (different)
+    """
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
 def check_memory_dir_siblings() -> "dict | None":
     """Flag a populated memory corpus sitting under a DIFFERENT project slug.
 
@@ -525,11 +542,18 @@ def check_memory_dir_siblings() -> "dict | None":
         return None
 
     live = MEMORY_DIR.resolve() if MEMORY_DIR.exists() else MEMORY_DIR
+    # Only ALTERNATE DERIVATIONS OF THIS PROJECT are candidates. Warning on any
+    # populated corpus would fire on every normal multi-project home — a
+    # permanent false warning that teaches people to ignore the health signal,
+    # which costs more than the split it is trying to surface (#2353 review).
+    live_key = _slug_derivation_key(MEMORY_DIR.parent.name)
     seen: "dict[str, tuple[str, int]]" = {}
     for entry in sorted(projects.iterdir()):
         mem = entry / "memory"
         if not mem.is_dir():
             continue
+        if _slug_derivation_key(entry.name) != live_key:
+            continue  # unrelated project, not a slug split
         count = len(list(mem.glob("*.md")))
         if count == 0:
             continue
