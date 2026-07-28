@@ -333,6 +333,16 @@ def test_gateway_sidecar_disconnected_is_offline_even_with_a_live_process():
     assert since is not None
 
 
+def test_gateway_disconnected_without_last_ok_still_offline():
+    """A bridge that has NEVER connected has no last_ok_ts — still offline, no crash."""
+    now = time.time()
+    p = _sidecar(False, ts_offset=-5, now=now)          # note: no last_ok_ts
+    status, detail, since = ss.probe_gateway(p, "nope", now, pgrep=lambda pat: ["999"])
+    assert status == "offline", (status, detail)
+    assert detail == "not serving"
+    assert since is None
+
+
 def test_gateway_stale_sidecar_falls_back_to_process():
     now = time.time()
     p = _sidecar(True, ts_offset=-(ss.GATEWAY_STATUS_TTL_S + 60), now=now)
