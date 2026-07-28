@@ -77,6 +77,10 @@ We're looking for contributors to help test and harden these capabilities. If yo
 
 ## How it works
 
+See [Sutando architecture boundaries](docs/architecture-boundaries.md) for the
+normative definitions of core, adapters, apps, skills, tooling, and workspace
+state.
+
 ```
     You ──voice (browser)──► Voice agent ─────────┐
      │                       (Gemini Live,        │
