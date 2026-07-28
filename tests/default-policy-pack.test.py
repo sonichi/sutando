@@ -91,6 +91,39 @@ def test_reseed_does_not_resurrect_owner_cancelled_record():
           "reseed reports the existing (cancelled) record as skipped, not seeded")
 
 
+def test_reseed_resumes_crash_interrupted_draft():
+    # Regression (#2320, my inline finding): seed_room does store.save() then a
+    # SEPARATE store.transition(active). A crash between them leaves a
+    # non-terminal DRAFT for this (entry, generation, room). The any-state-exists
+    # guard returned "skipped", so reconnect found the deterministic draft and
+    # left the room UNSUBSCRIBED FOREVER. Reconnect must RESUME the draft to
+    # active (self-heal), distinct from skipping terminal cancelled above.
+    d = _store()
+    entry = dpp._entry("react_baseline")
+    room = ROOMS[0]
+    gen = dpp._entry_state(dpp.load_pack_state(d), entry["key"])["generation"]
+    pid = dpp._policy_id_for(entry["key"], gen, room)
+    store = op.SubscriptionStore(d)
+    # Simulate the crash: the validated record is saved but never transitioned.
+    normalized, errors = op.validate_draft(dpp._draft_for(entry, room, OWNER, gen))
+    check(not errors, "setup: factory draft validates")
+    normalized["pack"] = {"entry": entry["key"], "generation": gen}
+    store.save(normalized)
+    check(store.get(pid)["status"] == "draft",
+          "precondition: a crash leaves a non-terminal draft record")
+    # Reconnect reseed must resume, not skip.
+    r = dpp.seed_room(store, d, entry, room, owner_mxid=OWNER, owner_rooms=ROOMS)
+    check(r["status"] == "resumed",
+          "reseed RESUMES a crash-interrupted draft (not 'skipped')")
+    check(op.SubscriptionStore(d).get(pid)["status"] == "active",
+          "the resumed draft is now active — room subscribed, not stranded forever")
+    # A subsequent reseed is idempotent again (now active -> skipped).
+    r2 = dpp.seed_room(op.SubscriptionStore(d), d, entry, room,
+                       owner_mxid=OWNER, owner_rooms=ROOMS)
+    check(r2["status"] == "skipped",
+          "a resumed (now active) record is skipped on the next reseed (idempotent)")
+
+
 def test_standing_approval_boundary_reused_failclosed():
     d = _store()
     store = op.SubscriptionStore(d)

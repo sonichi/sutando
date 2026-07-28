@@ -149,17 +149,40 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
 
     existing = store.get(pid)
     if existing is not None:
-        # A record already exists for this (entry, generation, room). It is the
-        # single source of truth for this generation and is TERMINAL/idempotent:
+        status = existing.get("status")
+        if status == "draft":
+            # A DRAFT (not active, not cancelled) means a prior seed CRASHED
+            # between store.save() and the transition-to-active below — those are
+            # two separate atomic writes. Skipping it (as the any-state-exists
+            # guard did) leaves this room unsubscribed FOREVER: reconnect keeps
+            # finding the deterministic draft and returning "skipped", and the
+            # draft never becomes active. Resume it instead so a crash-interrupted
+            # seed self-heals on the next connect. Re-run the standing boundary
+            # rather than trust the stored draft — the owner's scope may have
+            # changed since the crash; if it no longer passes, refuse instead of
+            # activating (never widen the boundary on a resume).
+            recheck = _draft_for(entry, room_id, owner_mxid, gen)
+            normalized, errors = op.validate_draft(recheck)
+            if errors:
+                return {"status": "refused", "policy_id": pid,
+                        "reason": f"schema: {errors}"}
+            auto, reason = op.evaluate_standing_approval(
+                normalized, owner_mxid=owner_mxid, owner_rooms=owner_rooms)
+            if not auto:
+                return {"status": "refused", "policy_id": pid, "reason": reason}
+            normalized["pack"] = {"entry": entry["key"], "generation": gen}
+            store.save(normalized)  # re-assert content (idempotent for this gen)
+            store.transition(pid, "active",
+                             note="factory default (resumed crash-interrupted draft)")
+            return {"status": "resumed", "policy_id": pid, "reason": reason}
+        # A terminal/idempotent record already exists for this (entry, gen, room):
         #   - active    → already seeded (the intended re-seed skip).
         #   - cancelled → the OWNER's direct cancellation. Reseeding on reconnect
-        #     must NEVER resurrect it (a prior version overwrote it back to
-        #     active — the seed then transition below). A genuine re-enable bumps
-        #     the entry's generation, yielding a FRESH pid with no existing
-        #     record, so re-enabling still seeds; only same-generation reseed is
-        #     suppressed here.
+        #     must NEVER resurrect it. A genuine re-enable bumps the entry's
+        #     generation, yielding a FRESH pid with no existing record, so
+        #     re-enabling still seeds; only same-generation reseed is suppressed.
         return {"status": "skipped", "policy_id": pid,
-                "reason": f"generation record exists ({existing.get('status')})"}
+                "reason": f"generation record exists ({status})"}
 
     draft = _draft_for(entry, room_id, owner_mxid, gen)
     normalized, errors = op.validate_draft(draft)
