@@ -9,6 +9,10 @@ source "$REPO/src/auth_hardening.sh"
 
 fails=0
 check() { if [ "$2" = "$3" ]; then echo "  ok  $1"; else echo "  FAIL $1 — want $3 got $2"; fails=$((fails+1)); fi; }
+# Portable octal-mode reader: GNU/Linux `stat -c '%a'` (CI runs on ubuntu),
+# BSD/macOS `stat -f '%Lp'` as the fallback. `-f` on Linux means something else,
+# so the earlier macOS-only form failed the whole suite under CI (#2363).
+mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -20,13 +24,13 @@ printf '{}' > "$TMP/state/auth/device.json";      chmod 644 "$TMP/state/auth/dev
 
 harden_auth_dir "$TMP"
 
-check "state/auth dir tightened to 0700" "$(stat -f '%Lp' "$TMP/state/auth")" "700"
-check "cloud-auth.json tightened to 0600" "$(stat -f '%Lp' "$TMP/state/auth/cloud-auth.json")" "600"
-check "device.json tightened to 0600"     "$(stat -f '%Lp' "$TMP/state/auth/device.json")" "600"
+check "state/auth dir tightened to 0700" "$(mode_of "$TMP/state/auth")" "700"
+check "cloud-auth.json tightened to 0600" "$(mode_of "$TMP/state/auth/cloud-auth.json")" "600"
+check "device.json tightened to 0600"     "$(mode_of "$TMP/state/auth/device.json")" "600"
 
 # Idempotent: a second run leaves them 0700/0600 (never widens).
 harden_auth_dir "$TMP"
-check "idempotent — dir stays 0700"  "$(stat -f '%Lp' "$TMP/state/auth")" "700"
+check "idempotent — dir stays 0700"  "$(mode_of "$TMP/state/auth")" "700"
 
 # Fail-safe: a missing workspace / missing auth dir is a clean no-op (rc 0).
 harden_auth_dir "$TMP/does-not-exist"; check "missing auth dir is a no-op (rc 0)" "$?" "0"

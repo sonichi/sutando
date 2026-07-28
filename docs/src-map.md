@@ -10,13 +10,14 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-165 modules indexed.
+166 modules indexed.
 
 ## `src/`
 
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
+- **`auth_hardening.sh`** — auth_hardening.sh — harden per-host install-state secrets under state/auth/.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.

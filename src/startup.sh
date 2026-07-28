@@ -204,13 +204,17 @@ python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
 source "$REPO/src/startup-runtime.sh"
 configure_startup_runtime
 
-# Harden per-host install-state secrets (state/auth/) on every boot. Factored to
+# Harden per-host install-state secrets (state/auth/). Factored to
 # src/auth_hardening.sh so the logic is unit-testable (tests/auth-hardening.test.sh)
 # without driving the whole boot. See that file for the why (workspace default is
 # not under ~/Library/Application Support, so 0700 must be ours, not incidental).
+# NOTE: the CALL is deliberately placed AFTER the migration block below, not here
+# — the migration is what CREATES state/auth/{cloud-auth,device}.json on a fresh
+# install (via `cp -p`, preserving loose source modes), so hardening it before the
+# files exist is a no-op (#2363 review, john-the-dev). Source the helper now; call
+# it once the migration has run.
 # shellcheck source=auth_hardening.sh
 source "$REPO/src/auth_hardening.sh"
-harden_auth_dir "$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
 
 # v0.8 auto-migration helpers (PR #1440 safety hardening — Mini review).
 # Sourced from a sibling file so the four guard functions (_realpath,
@@ -318,6 +322,14 @@ if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   # the resolver's deprecation nag stops firing on every subprocess spawn.
   unset SUTANDO_WORKSPACE
 fi
+
+# Harden state/auth/ AFTER the migration above — the migration is the creator of
+# cloud-auth.json / device.json on a fresh install (cp -p preserves the loose
+# source modes), so the tightening must run once the files exist, not before
+# (#2363 review, john-the-dev: pre-migration it was a no-op on a fresh box).
+# Idempotent + fail-safe (only tightens, never blocks boot); the every-boot run
+# also catches auth material a prior boot wrote after this point.
+harden_auth_dir "$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
 
 # Exercise the new config loader as a startup banner. Surfaces:
 #   • $SUTANDO_WORKSPACE legacy-escape-hatch warning (if env is set)
