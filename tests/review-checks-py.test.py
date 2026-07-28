@@ -17,6 +17,8 @@ MODPATH = REPO / "scripts" / "review-checks.py"
 # Module reads RC_FLAGS / RC_ALLOWS at import time — set them first.
 os.environ["RC_FLAGS"] = "\n".join(["/Users/", "/home/", "~/.claude"])
 os.environ["RC_ALLOWS"] = "\n".join(["/tmp/", "/nonexistent", "example.com"])
+# Contextual (paired) allow — exercised below. Parsed at import like the others.
+os.environ["RC_ALLOW_PAIRED"] = "/opt/homebrew/ :: /usr/local/"
 
 spec = importlib.util.spec_from_file_location("review_checks", MODPATH)
 rc = importlib.util.module_from_spec(spec)
@@ -171,6 +173,55 @@ code, out = scan(
     '+    """'
 )
 ok("prefixed (r) docstring prose is still NOT flagged", out.strip() == "")
+
+# --- paired (contextual) allow: portable candidate list vs naked literal ------
+# Unit-level, so the diff-coverage gate sees these lines: the shell suite drives
+# the same logic through a SUBPROCESS, which `coverage run` does not instrument
+# (.coveragerc sets parallel but no COVERAGE_PROCESS_START).
+ok("paired parsed from env at import",
+   ("/opt/homebrew/", "/usr/local/") in rc.paired)
+ok("_tokens splits a candidate list into whole paths",
+   "/usr/local/bin/ffmpeg" in rc._tokens('X = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")'))
+# A line ending WITHOUT a trailing delimiter must still yield its last token —
+# every other fixture here ends in a quote or paren, so this is the only case
+# that reaches the flush-the-remainder branch.
+ok("_tokens keeps a trailing token with no closing delimiter",
+   rc._tokens("BIN=/usr/local/bin/ffmpeg")[-1] == "/usr/local/bin/ffmpeg")
+ok("paired: same-basename companion exempts",
+   rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                     'X = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")'))
+ok("paired: naked literal is NOT exempt",
+   not rc.paired_allowed("/opt/homebrew/bin/ffmpeg", 'X = "/opt/homebrew/bin/ffmpeg"'))
+ok("paired: coincidental companion of a DIFFERENT name is NOT exempt",
+   not rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                         'A = "/opt/homebrew/bin/ffmpeg"; B = "/usr/local/share/doc"'))
+ok("paired: mismatched basename is NOT exempt",
+   not rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                         'A = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffprobe")'))
+ok("paired: a token with no basename is NOT exempt",
+   not rc.paired_allowed("/opt/homebrew/", 'X = "/opt/homebrew/"; Y = "/usr/local/"'))
+ok("paired: an unrelated prefix is untouched by the paired rule",
+   not rc.paired_allowed("/Users/alice/x", 'A = "/Users/alice/x"; B = "/usr/local/bin/x"'))
+
+# End-to-end through main(), so the `not allowed(...) and not paired_allowed(...)`
+# branch is exercised in situ. '/opt/' is not in this file's RC_FLAGS, so add it
+# for these two scans and restore, leaving the other cases untouched.
+rc.flags.append("/opt/")
+try:
+    code, out = scan(
+        '+++ b/src/a.ts\n'
+        '@@ -1,0 +1,1 @@\n'
+        '+const FFMPEG = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"];'
+    )
+    ok("main(): candidate list passes via the paired allow", out.strip() == "")
+    code, out = scan(
+        '+++ b/src/b.ts\n'
+        '@@ -1,0 +1,1 @@\n'
+        '+const FFMPEG = "/opt/homebrew/bin/ffmpeg";'
+    )
+    ok("main(): naked literal is still reported", "/opt/homebrew/bin/ffmpeg" in out)
+finally:
+    rc.flags.remove("/opt/")
 
 print("---")
 if failed:
