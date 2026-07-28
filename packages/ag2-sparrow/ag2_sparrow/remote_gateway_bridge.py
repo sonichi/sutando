@@ -423,6 +423,78 @@ def _ag2space_access_path():
 
 _TIER_MAP_CACHE = {"mtime": None, "map": {}}
 
+# Durable on-disk backup of the last-known-good tierMap, under state/auth/ — the
+# cleanup-exempt per-host install-state dir (per CLAUDE.md; never wiped by
+# transient-state cleanup). The in-memory cache above preserves the map across a
+# transient access.json fault, but ONLY while the process lives. A wipe/corrupt
+# access.json PLUS a process restart empties the cache and _load_tier_map()
+# returns {} — a fail-OPEN that silently up-tiers every down-tiered sender to
+# LOCAL_TIER (on a LOCAL_TIER=owner node, a "team" teammate regains owner with no
+# error, no log). This backup closes that restart window: same defense-in-depth
+# as the slack allowlist backup (cd5c5db1 / #2163), scoped to the tierMap.
+_TIER_MAP_BACKUP_FILE = _STATE / "auth" / "ag2space-tiermap-backup.json"
+
+
+def _validate_tier_map(raw):
+    """Coerce a raw {who: tier} dict to a validated {mxid: tier} map (drops any
+    entry whose value isn't owner/team/other or whose key isn't a str)."""
+    tm = {}
+    if isinstance(raw, dict):
+        for who, tier in raw.items():
+            t = str(tier).strip().lower()
+            if isinstance(who, str) and t in ("owner", "team", "other"):
+                tm[who.strip()] = t
+    return tm
+
+
+def _backup_tier_map_to_disk(tm):
+    """Persist the tierMap to the durable backup after a SUCCESSFUL parse of
+    access.json. Validates STRUCTURE, not emptiness: a well-formed EMPTY map is a
+    legitimate owner state (they removed every down-tier), so it IS persisted and
+    a later restart restores *that* — not a stale @rick. The good copy is never
+    overwritten by a wipe because a wipe/corrupt access.json never reaches here —
+    _load_tier_map() returns on the read error before calling this. Written 0600
+    (the backup holds the same authorization data as access.json; a world-readable
+    copy would be a new exposure introduced by the fix). Atomic via per-PID tmp +
+    os.replace; best-effort — a backup failure must never break tier resolution
+    (mirrors the slack allowlist backup, cd5c5db1 / #2163)."""
+    if not isinstance(tm, dict):
+        return
+    try:
+        _TIER_MAP_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _TIER_MAP_BACKUP_FILE.with_name(
+            f"{_TIER_MAP_BACKUP_FILE.name}.{os.getpid()}.tmp"
+        )
+        tmp.write_text(json.dumps(tm, indent=2, sort_keys=True) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _TIER_MAP_BACKUP_FILE)
+    except Exception:
+        pass
+
+
+def _restore_tier_map_from_disk():
+    """Return the last durable-backed tierMap, or {} if absent/unreadable/invalid."""
+    try:
+        raw = json.loads(_TIER_MAP_BACKUP_FILE.read_text())
+    except Exception:
+        return {}
+    return _validate_tier_map(raw)
+
+
+def _last_known_tier_map():
+    """The floor returned when access.json is unreadable: the in-memory
+    last-known-good if the process has one, else the durable on-disk backup (so a
+    wipe+restart restores the down-tier floor instead of failing OPEN to {}).
+    Seeds the cache from the backup so a cold process doesn't re-read disk every
+    call while access.json stays unreadable; mtime is left unset so a later
+    successful read of the fixed file still supersedes it."""
+    if _TIER_MAP_CACHE["map"]:
+        return _TIER_MAP_CACHE["map"]
+    backup = _restore_tier_map_from_disk()
+    if backup:
+        _TIER_MAP_CACHE["map"] = backup
+    return _TIER_MAP_CACHE["map"]
+
 
 def _load_tier_map():
     """Return the owner's {sender_mxid: tier} map, mtime-cached.
@@ -434,29 +506,30 @@ def _load_tier_map():
     LOCAL_TIER=owner node (a teammate momentarily regains owner). Only a
     SUCCESSFUL read of a changed file replaces the cache; a fixed file (new mtime)
     is picked up on the next call. A genuine deletion keeps the last map until the
-    owner writes an empty tierMap or the process restarts (the safe, non-surprising
-    tradeoff — the map floor never drops on a transient fault)."""
+    owner writes an empty tierMap.
+
+    On a COLD process (empty cache — e.g. a wipe + restart) the last-known-good is
+    restored from the durable on-disk backup (state/auth/) instead of {}, so the
+    restart no longer fails OPEN. A successful, non-empty read refreshes that
+    backup."""
     path = _ag2space_access_path()
     try:
         mt = os.path.getmtime(path)
     except OSError:
-        # Absent/unstattable → keep last-known-good (initially {} before any load).
-        return _TIER_MAP_CACHE["map"]
+        # Absent/unstattable → last-known-good (cache, or durable backup if cold).
+        return _last_known_tier_map()
     if mt == _TIER_MAP_CACHE["mtime"]:
         return _TIER_MAP_CACHE["map"]
     try:
         with open(path) as f:
             raw = (json.load(f) or {}).get("tierMap") or {}
-        tm = {}
-        for who, tier in raw.items():
-            t = str(tier).strip().lower()
-            if isinstance(who, str) and t in ("owner", "team", "other"):
-                tm[who.strip()] = t
+        tm = _validate_tier_map(raw)
     except Exception:
-        # Malformed / mid-write → keep last-known-good; don't advance mtime so a
-        # later successful read of the fixed file is still picked up.
-        return _TIER_MAP_CACHE["map"]
+        # Malformed / mid-write → last-known-good (cache, or durable backup if
+        # cold); don't advance mtime so a later successful read is still picked up.
+        return _last_known_tier_map()
     _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = mt, tm
+    _backup_tier_map_to_disk(tm)  # refresh durable copy for a future wipe+restart
     return tm
 
 
