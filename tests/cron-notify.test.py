@@ -137,6 +137,69 @@ def main() -> int:
         check("CLI: dry-run does not stamp state",
               json.loads(sf.read_text()) == {"c": 9_000})
 
+    # ── review blocker 1: deep-link room is a DIFFERENT identity from the
+    # delivery room. Linking a cron-room event under the destination room
+    # produces a matrix.to URL that cannot resolve the event.
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"
+        posted = []
+        cn._post_to_room = lambda room, body, env_path=".env": (
+            posted.append((room, body)) or "$evt"
+        )
+        rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                      "--room", "!dest:x", "--link-room", "!cronroom:x",
+                      "--event-id", "$e1", "--state-file", str(sf), "--now", "1"])
+        check("link-room: exit 0", rc == 0)
+        dest, body = posted[-1]
+        check("link-room: DELIVERED to --room", dest == "!dest:x")
+        check("link-room: LINK points at --link-room, not --room",
+              "!cronroom:x/$e1" in body and "!dest:x/$e1" not in body)
+
+        # default preserves room-local delivery
+        posted.clear()
+        sf.write_text("{}")
+        cn.main(["--cron", "d", "--summary", "s", "--kind", "digest",
+                 "--room", "!only:x", "--event-id", "$e2",
+                 "--state-file", str(sf), "--now", "1"])
+        check("link-room: defaults to --room when omitted",
+              "!only:x/$e2" in posted[-1][1])
+
+    # ── review blocker 2: cooldown must be RESERVED before delivery. Posting
+    # first and persisting after means an unwritable state path reports success
+    # with no cooldown recorded — the next fire duplicates the notification.
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "sub" / "s.json"          # parent does not exist
+        posted = []
+        cn._post_to_room = lambda room, body, env_path=".env": (
+            posted.append(room) or "$evt"
+        )
+        rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                      "--room", "!r:x", "--state-file", str(sf), "--now", "1"])
+        check("unpersistable state: does NOT post", posted == [])
+        check("unpersistable state: exits non-zero", rc == 2)
+
+    # rollback: a failed send must release the reservation, or one transient
+    # error mutes the cron for the whole cooldown window.
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"
+        sf.write_text("{}")
+        cn._post_to_room = lambda room, body, env_path=".env": None   # send fails
+        rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                      "--room", "!r:x", "--state-file", str(sf), "--now", "1"])
+        check("failed send: exit 2", rc == 2)
+        check("failed send: reservation rolled back (not muted)",
+              json.loads(sf.read_text()).get("c") is None)
+
+    # CONTROL: a SUCCESSFUL post must still record the cooldown.
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"
+        sf.write_text("{}")
+        cn._post_to_room = lambda room, body, env_path=".env": "$evt"
+        cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                 "--room", "!r:x", "--state-file", str(sf), "--now", "4242"])
+        check("CONTROL: successful post records cooldown",
+              json.loads(sf.read_text()).get("c") == 4242)
+
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1

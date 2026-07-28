@@ -117,6 +117,34 @@ def record_ping(state: dict, cron: str, now: int) -> dict:
     return state
 
 
+def save_state_atomic(path: str, state: dict) -> bool:
+    """Write `state` to `path` atomically. True on success, False on any failure.
+
+    temp-file + os.replace so a crash mid-write cannot leave a truncated or
+    half-written cooldown file — a corrupt state file reads as "never pinged"
+    and would let every cron ping on every fire. The boolean is the point: the
+    caller must be able to distinguish "cooldown recorded" from "not recorded",
+    because silently treating a failed write as success is what allows
+    duplicate notifications.
+    """
+    import json
+    import os
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(state, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI — room delivery (the SAFE delivery path: gateway op:message, single-delivery).
 #
@@ -182,6 +210,13 @@ def main(argv=None):
     ap.add_argument("--summary", required=True, help="one-line update text")
     ap.add_argument("--kind", default="digest", help="owner_action|error|digest|routine")
     ap.add_argument("--room", required=True, help="target room id (the ping destination)")
+    ap.add_argument(
+        "--link-room",
+        default="",
+        help="room the deep-link points at (default: --room). Set this when the "
+             "ping is delivered to one room but the detail event lives in another "
+             "— e.g. cron-room detail linked into the owner's active channel.",
+    )
     ap.add_argument("--event-id", default="", help="cron-room event to deep-link to")
     ap.add_argument("--via", default="ag2.space")
     ap.add_argument("--state-file", default="", help="JSON rate-limit state (cron→last-ping epoch)")
@@ -201,24 +236,48 @@ def main(argv=None):
         print(f"suppressed: rate-limited (last ping < {args.min_interval}s ago)")
         return 3
 
-    body = format_ping(args.cron, args.summary, args.room, args.event_id, args.via)
+    # Destination and deep-link target are DIFFERENT identities. --event-id is a
+    # cron-room event; linking it under the destination room yields a matrix.to
+    # URL that cannot resolve the event. Default to --room so room-local
+    # delivery is unchanged.
+    link_room = args.link_room or args.room
+    body = format_ping(args.cron, args.summary, link_room, args.event_id, args.via)
 
     if args.dry_run:
         print("DRY-RUN would post:")
         print(body)
         return 0
 
+    # Reserve the cooldown BEFORE delivering. Persisting after a successful post
+    # means an unwritable state path returns "posted" with no cooldown recorded,
+    # and the next fire duplicates the notification. Reserving first inverts the
+    # failure: the worst case becomes one SUPPRESSED ping (visible, self-heals on
+    # the next fire) instead of an unbounded duplicate stream.
+    prior = state.get(args.cron) if isinstance(state, dict) else None
+    if args.state_file:
+        record_ping(state, args.cron, now)
+        if not save_state_atomic(args.state_file, state):
+            print(
+                "error: could not persist rate-limit state — refusing to post "
+                "(posting without a cooldown risks duplicate notifications)"
+            )
+            return 2
+
     eid = _post_to_room(args.room, body)
     if not eid:
+        # Delivery failed, so the reservation is a lie — release it, or a
+        # transient send error would silently mute this cron for the whole
+        # cooldown window. Best-effort: if the rollback write fails we keep the
+        # reservation, which suppresses rather than duplicates.
+        if args.state_file:
+            if prior is None:
+                state.pop(args.cron, None)
+            else:
+                state[args.cron] = prior
+            save_state_atomic(args.state_file, state)
         print("error: post failed (no gateway / send error)")
         return 2
-    if args.state_file:
-        import json
-        record_ping(state, args.cron, now)
-        try:
-            json.dump(state, open(args.state_file, "w"), indent=2)
-        except OSError:
-            pass
+
     print(f"posted: {eid}")
     return 0
 
