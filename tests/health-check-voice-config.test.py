@@ -28,7 +28,7 @@ class VoiceHealthConfigTests(unittest.TestCase):
         for path in (missing, self.write_env("")):
             checks = hc.check_voice_stack(env={}, env_path=path)
             self.assertEqual([c["name"] for c in checks],
-                             ["voice-agent", "voice-watchers", "voice-transport"])
+                             ["voice-agent", "voice-watchers", "voice-transport", "bodhi-dist"])
             self.assertTrue(all(c["status"] == "ok" for c in checks))
             self.assertTrue(all("disabled" in c["detail"] for c in checks))
 
@@ -54,15 +54,17 @@ class VoiceHealthConfigTests(unittest.TestCase):
         voice_ok = {"name": "voice-agent", "status": "ok", "detail": "listening"}
         watcher_ok = {"name": "voice-watchers", "status": "ok", "detail": "active"}
         transport_ok = {"name": "voice-transport", "status": "ok", "detail": "healthy"}
+        bodhi_ok = {"name": "bodhi-dist", "status": "ok", "detail": "current"}
         with mock.patch.object(hc, "check_port", return_value=voice_ok), \
              mock.patch.object(hc, "mark_stale_if_outdated") as mark_stale, \
              mock.patch.object(hc, "check_voice_watchers", return_value=watcher_ok), \
-             mock.patch.object(hc, "check_voice_transport", return_value=transport_ok):
+             mock.patch.object(hc, "check_voice_transport", return_value=transport_ok), \
+             mock.patch.object(hc, "check_bodhi_dist", return_value=bodhi_ok):
             checks = hc.check_voice_stack(
                 env={},
                 env_path=self.write_env("export GEMINI_API_KEY='configured key'\n"),
             )
-        self.assertEqual(checks, [voice_ok, watcher_ok, transport_ok])
+        self.assertEqual(checks, [voice_ok, watcher_ok, transport_ok, bodhi_ok])
         mark_stale.assert_called_once()
 
     def test_explicit_skip_wins_over_configured_key(self) -> None:
@@ -124,6 +126,21 @@ class VoiceHealthConfigTests(unittest.TestCase):
         )
         self.assertEqual(checks[0]["name"], "voice-config")
         self.assertEqual(checks[0]["status"], "down")
+
+    def test_run_all_checks_skips_bodhi_probe_when_voice_disabled(self) -> None:
+        disabled = {"enabled": False, "detail": "disabled for test"}
+        unexpected = {
+            "name": "bodhi-dist",
+            "status": "warn",
+            "detail": "voice artifact missing",
+        }
+        with mock.patch.object(hc, "resolve_voice_health_config", return_value=disabled), \
+             mock.patch.object(hc, "check_bodhi_dist", return_value=unexpected) as bodhi_probe:
+            checks = hc.run_all_checks()
+        bodhi = next(check for check in checks if check["name"] == "bodhi-dist")
+        self.assertEqual(bodhi["status"], "ok")
+        self.assertIn("disabled", bodhi["detail"])
+        bodhi_probe.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -194,6 +194,7 @@ def check_voice_stack(
             {"name": "voice-agent", "status": "ok", "detail": detail},
             {"name": "voice-watchers", "status": "ok", "detail": detail},
             {"name": "voice-transport", "status": "ok", "detail": detail},
+            {"name": "bodhi-dist", "status": "ok", "detail": detail},
         ]
 
     voice_check = check_port(9900, "voice-agent", probe=True)
@@ -203,7 +204,12 @@ def check_voice_stack(
             REPO_DIR / "src" / "voice-agent.ts",
             "voice-agent.ts",
         )
-    checks = [voice_check, check_voice_watchers(voice_check), check_voice_transport(voice_check)]
+    checks = [
+        voice_check,
+        check_voice_watchers(voice_check),
+        check_voice_transport(voice_check),
+        check_bodhi_dist(),
+    ]
     if config_check is not None:
         checks.insert(0, config_check)
     return checks
@@ -2749,7 +2755,6 @@ def run_all_checks() -> list[dict]:
 
     # Core services (required)
     checks.extend(check_voice_stack())
-    checks.append(check_bodhi_dist())
 
     web_check = check_port(8080, "web-client", probe=True)
     if web_check["status"] == "ok":
