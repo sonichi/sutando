@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import tempfile
 import socket
@@ -40,7 +41,7 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from util_paths import claude_home_path, shared_personal_path  # noqa: E402
+from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 
@@ -2149,6 +2150,296 @@ def check_task_watcher() -> dict:
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 
+def _fresh_local_core_record(
+    workspace: "Optional[Path]" = None,
+    max_age_s: float = 90.0,
+) -> "dict | None":
+    """Return this host's fresh core heartbeat, or None.
+
+    `_any_core_alive()` deliberately accepts remote/shared-workspace heartbeats.
+    The notifier is a local tmux process, so using that fleet-wide signal here
+    could make one host try to inspect or repair another host's session.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    alive_file = workspace / "state" / "cores" / f"{_host_label()}.alive"
+    try:
+        if time.time() - alive_file.stat().st_mtime >= max_age_s:
+            return None
+        record = json.loads(alive_file.read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _run_tmux(socket_path: str, *args: str):
+    """Run one bounded tmux probe against a runtime-authored socket."""
+    try:
+        return subprocess.run(
+            [_resolve_tmux_bin(), "-S", socket_path, *args],
+            env=_resolve_launch_env(),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001 — probe failures become an absent target
+        return None
+
+
+def _codex_runtime_selected() -> bool:
+    """Whether config currently selects Codex (fail closed on invalid config)."""
+    try:
+        return resolve_core_runtime(REPO_DIR) == "codex"
+    except Exception:  # noqa: BLE001 — config check reports the underlying error
+        return False
+
+
+def _local_codex_runtime_target(
+    heartbeat: "dict | None" = None,
+) -> "dict | None":
+    """Resolve a locally recorded Codex target without acting on it."""
+    if heartbeat is None:
+        heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return None
+    socket_path = heartbeat.get("socket")
+    if not isinstance(socket_path, str) or not socket_path:
+        return None
+    try:
+        runtime_state = json.loads(
+            (WORKSPACE_DIR / "state" / "core-runtime.json").read_text()
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(runtime_state, dict) or runtime_state.get("runtime") != "codex":
+        return None
+    session = runtime_state.get("session")
+    if not isinstance(session, str) or not session:
+        return None
+    return {"socket": socket_path, "session": session}
+
+
+def _local_codex_core_target(target: "dict | None" = None) -> "dict | None":
+    """Resolve and verify the local Codex core's socket and exact session.
+
+    The heartbeat supplies the socket, `core-runtime.json` supplies the session,
+    and tmux's own session environment confirms that the live pane is Codex.
+    Requiring all three makes the repair path fail closed on stale/config-drift
+    state instead of accidentally starting or replacing a different core.
+    """
+    if target is None:
+        target = _local_codex_runtime_target()
+    if target is None:
+        return None
+    socket_path = target["socket"]
+    session = target["session"]
+
+    exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
+    if exists is None or exists.returncode != 0:
+        return None
+    runtime = _run_tmux(
+        socket_path,
+        "show-environment",
+        "-t",
+        f"={session}",
+        "SUTANDO_CORE_RUNTIME",
+    )
+    if (
+        runtime is None
+        or runtime.returncode != 0
+        or runtime.stdout.strip() != "SUTANDO_CORE_RUNTIME=codex"
+    ):
+        return None
+    return target
+
+
+def _expected_codex_notifier_entrypoint() -> Path:
+    """Entrypoint for the checkout's notifier topology.
+
+    PR #2280 adds a supervising entrypoint. Accept the direct notifier on
+    versions before that change and require the supervisor once it exists, so
+    rolling upgrades neither false-alarm nor silently keep obsolete topology.
+    """
+    supervisor = (
+        REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
+    )
+    if supervisor.exists():
+        return supervisor
+    return REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier.sh"
+
+
+def _command_runs_script(command: str, expected: Path) -> bool:
+    """Whether tmux started the expected script as the actual command.
+
+    `pane_start_command` is shell-quoted text. Tokenize it instead of searching
+    the raw string: an unrelated wrapper may mention the expected path in an
+    argument, suffix, or comment without running it.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    expected_text = str(expected)
+    if argv[0] == expected_text:
+        return True
+    if Path(argv[0]).name != "bash":
+        return False
+    script_index = 2 if len(argv) > 1 and argv[1] == "--" else 1
+    return len(argv) > script_index and argv[script_index] == expected_text
+
+
+def _probe_codex_task_notifier(target: dict) -> dict:
+    """Inspect the exact managed notifier tmux session for one healthy pane."""
+    name = "codex-task-notifier"
+    socket_path = target["socket"]
+    watcher_session = f"{target['session']}-watcher"
+    exists = _run_tmux(socket_path, "has-session", "-t", f"={watcher_session}")
+    if exists is None or exists.returncode != 0:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"managed tmux session {watcher_session!r} is missing",
+        }
+    panes = _run_tmux(
+        socket_path,
+        "list-panes",
+        "-t",
+        f"={watcher_session}",
+        "-F",
+        "#{pane_dead}\t#{pane_start_command}",
+    )
+    if panes is None or panes.returncode != 0:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"cannot inspect managed tmux session {watcher_session!r}",
+        }
+    rows = [line.split("\t", 1) for line in panes.stdout.splitlines() if line]
+    if len(rows) != 1 or any(len(row) != 2 for row in rows):
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"managed tmux session {watcher_session!r} has {len(rows)} panes; "
+                "expected exactly 1"
+            ),
+        }
+    dead, command = rows[0]
+    if dead != "0":
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"managed tmux session {watcher_session!r} has a dead pane",
+        }
+    expected = _expected_codex_notifier_entrypoint()
+    if not _command_runs_script(command, expected):
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"managed tmux session {watcher_session!r} runs an unexpected "
+                f"command; expected {expected.name}"
+            ),
+        }
+    return {
+        "name": name,
+        "status": "ok",
+        "detail": (
+            f"managed notifier healthy in {watcher_session!r} "
+            f"({expected.name})"
+        ),
+    }
+
+
+def check_codex_task_notifier() -> dict:
+    """Detect a missing managed notifier even when a bare watcher looks alive."""
+    if not _codex_runtime_selected():
+        return {
+            "name": "codex-task-notifier",
+            "status": "ok",
+            "detail": "Codex runtime not selected — notifier not expected",
+        }
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return {
+            "name": "codex-task-notifier",
+            "status": "ok",
+            "detail": "no fresh local core heartbeat — notifier not expected",
+        }
+    recorded_target = _local_codex_runtime_target(heartbeat)
+    if recorded_target is None:
+        return {
+            "name": "codex-task-notifier",
+            "status": "warn",
+            "detail": "fresh local Codex heartbeat has unusable runtime metadata",
+        }
+    target = _local_codex_core_target(recorded_target)
+    if target is None:
+        return {
+            "name": "codex-task-notifier",
+            "status": "warn",
+            "detail": (
+                "fresh local Codex runtime recorded, but its exact live tmux "
+                "session could not be verified"
+            ),
+        }
+    return _probe_codex_task_notifier(target)
+
+
+def fix_codex_task_notifier() -> str:
+    """Delegate notifier-only recovery to the canonical runtime launcher.
+
+    Calling the launcher without `--restart` preserves the verified live Codex
+    core. On current main, the launcher recreates a missing watcher session.
+    Other unhealthy existing-session shapes are still detected, but recovery
+    depends on the launcher's topology support (for example, #2280's stale
+    session replacement); the post-launch probe reports them as not repaired
+    rather than claiming success.
+    """
+    # Re-check config inside the side-effecting function. It may have changed
+    # since run_all_checks() took its snapshot; the dispatcher would otherwise
+    # interpret that drift as a request to restart Core into another runtime.
+    if not _codex_runtime_selected():
+        return "not repaired — Codex runtime is not selected"
+    target = _local_codex_core_target()
+    if target is None:
+        return "not repaired — no verified local Codex core"
+    current = _probe_codex_task_notifier(target)
+    if current["status"] == "ok":
+        return "already healthy"
+    launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"
+    if not launcher.is_file():
+        return "not repaired — canonical launcher is missing"
+    env = _resolve_launch_env()
+    env["SUTANDO_TMUX_SOCKET"] = target["socket"]
+    env["SUTANDO_TMUX_SESSION"] = target["session"]
+    env["SUTANDO_CORE_RUNTIME"] = "codex"
+    try:
+        launched = subprocess.run(
+            ["/bin/bash", str(launcher)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as error:  # noqa: BLE001
+        return f"not repaired — launcher failed ({type(error).__name__})"
+    if launched.returncode != 0:
+        detail = (launched.stderr or launched.stdout).strip().splitlines()
+        suffix = f": {detail[-1][:120]}" if detail else ""
+        return f"not repaired — launcher exited {launched.returncode}{suffix}"
+
+    verified = _local_codex_core_target()
+    if verified != target:
+        return "not repaired — local Codex core changed during repair"
+    after = _probe_codex_task_notifier(target)
+    if after["status"] != "ok":
+        return f"not repaired — {after['detail']}"
+    return "repaired managed notifier; live core session preserved"
+
+
 def check_notes_split_brain() -> "dict | None":
     """Detect notes/ split-brain (#1266): overlapping .md files in both
     <repo>/notes/ and <workspace>/notes/ — fires only when the two paths differ."""
@@ -2740,6 +3031,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_task_watcher())
+    checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_disk_space())
 
@@ -3784,6 +4076,18 @@ def main():
 
     checks = run_all_checks()
     issues = [c for c in checks if c["status"] not in ("ok", "warn")]
+    codex_notifier = (
+        next(
+            (
+                c
+                for c in checks
+                if c["name"] == "codex-task-notifier" and c["status"] == "warn"
+            ),
+            None,
+        )
+        if do_fix
+        else None
+    )
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
@@ -3849,7 +4153,7 @@ def main():
                 pass
             else:
                 sys.exit(1)
-        else:
+        elif codex_notifier is None:
             sys.exit(0)
 
     # Human-readable
@@ -4013,6 +4317,13 @@ def main():
                    and "not running" in (c.get("detail") or "")), None)
         if sc:
             print(f"  screen-capture: {fix_screen_capture()}")
+
+    # The managed Codex notifier is warn-only, like the generic task watcher:
+    # a missing bridge does not mean Core itself is down. It is still safe to
+    # repair under --fix because fix_codex_task_notifier() re-verifies the live
+    # local Codex session and delegates topology to the canonical launcher.
+    if codex_notifier:
+        print(f"  codex-task-notifier: {fix_codex_task_notifier()}")
 
     # Channel bridges have the same optional-component shape: "configured but
     # not running" is warn-only, so the fix loop above can't reach a dead
