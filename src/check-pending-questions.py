@@ -91,11 +91,20 @@ def voice_client_connected():
 _ORG_HEADING = re.compile(
     r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\b', re.IGNORECASE
 )
-# `(?![\w-])` not `\b`: a trailing hyphen IS a word boundary, so `\bDONE\b`
-# matched the title `## [done-ish] something` and dropped a live question.
-# Reintroducing an over-broad match while fixing one is the failure this
-# whole change is about — the marker must be the WHOLE token.
-_INLINE_RESOLVED = re.compile(r'\[\s*(✅\s*)?(RESOLVED|DONE|ANSWERED)(?![\w-])', re.IGNORECASE)
+# The marker must be a CLOSED bracket group, not a keyword plus a guard. Two
+# earlier attempts were both too permissive, each in a way that deleted a live
+# question from BOTH delivery surfaces:
+#   `\bDONE\b`      -> matched `[done-ish] something` (a hyphen is a word boundary)
+#   `(?![\w-])`      -> matched `[RESOLVED?] Did this actually ship?` and `[DONE?]`,
+#                       because `?` is neither a word char nor a hyphen. An open
+#                       uncertainty read as a resolution (review [P1], 2026-07-28).
+# So the grammar is explicit: an opening bracket, an optional ✅, the keyword, then
+# EITHER the closing bracket immediately OR whitespace and content up to the close.
+# Anything else touching the keyword — punctuation, a hyphen, more letters — is not
+# a marker. Question punctuation must never be able to suppress a live ask.
+_INLINE_RESOLVED = re.compile(
+    r'\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]', re.IGNORECASE
+)
 
 
 def get_waiting_questions():

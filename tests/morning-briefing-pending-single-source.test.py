@@ -45,6 +45,14 @@ Grouping shell.
 An inline resolution MARKER in the ACTIVE region — above the divider, no Status
 field. Both consumers must agree it is not waiting.
 
+## [RESOLVED?] Did this actually ship?
+Question punctuation is NOT a resolution. This is an open uncertainty and must
+survive on both surfaces (review [P1] 2026-07-28: `(?![\w-])` let `?` through,
+so an open ask was classified resolved and vanished from notifier AND briefing).
+
+## [DONE?] Still waiting for confirmation
+Same shape, second keyword.
+
 # Resolved
 
 ## 2026-07-20T13:14Z — ✅ RESOLVED — this lives below the divider
@@ -60,6 +68,11 @@ MUST_COUNT = [
     "/observe MVP",
     "NOT self-resolved",
     "a plain open question",
+    # Negative controls for the marker grammar: an interrogative marker is an
+    # OPEN question, never a resolution. A guard that only rejects word chars and
+    # hyphens lets `?` through and silently deletes these from both surfaces.
+    "[RESOLVED?] Did this actually ship?",
+    "[DONE?] Still waiting",
 ]
 # Must NOT be counted: explicit status, organizer shell, below-divider.
 MUST_NOT_COUNT = ["an entry explicitly marked done", "organizer header",
