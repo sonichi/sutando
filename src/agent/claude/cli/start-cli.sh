@@ -183,9 +183,23 @@ try:
 except Exception:
     pass
 changed = False
+chrome_seeded = False
 if cfg.get("hasCompletedOnboarding") is not True:
     cfg["hasCompletedOnboarding"] = True
     changed = True
+# Claude-in-Chrome onboarding seed. The core launches with --chrome (see the
+# CORE_CMD below), which on first run in a fresh scoped config shows a "Claude
+# in Chrome" acknowledgement prompt ("Enter to confirm · Esc to cancel").
+# --dangerously-skip-permissions does NOT bypass it, so a detached no-TTY core
+# hangs there — process alive but never reaching /schedule-crons, and the
+# desktop onboarding "Say hello" local probe times out with no reply
+# (owner-hit 2026-07-28, fresh install). Pre-accept it the same way as
+# hasCompletedOnboarding: Claude Code records acceptance as
+# hasCompletedClaudeInChromeOnboarding=true in .claude.json.
+if cfg.get("hasCompletedClaudeInChromeOnboarding") is not True:
+    cfg["hasCompletedClaudeInChromeOnboarding"] = True
+    changed = True
+    chrome_seeded = True
 if cfg.get("theme") is None and glob.get("theme") is not None:
     cfg["theme"] = glob["theme"]
     changed = True
@@ -241,6 +255,8 @@ if changed:
         json.dump(cfg, f, indent=2)
     os.replace(tmp, target)
     print("  ✓ onboarding-seed: hasCompletedOnboarding set in .claude.json")
+    if chrome_seeded:
+        print("  ✓ chrome-seed: hasCompletedClaudeInChromeOnboarding set in .claude.json")
     if trusted_dir:
         print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
 PY
