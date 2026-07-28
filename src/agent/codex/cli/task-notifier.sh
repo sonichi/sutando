@@ -15,15 +15,27 @@ POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 
 has_result() {
-  local filename="$1" stem
+  local filename="$1" stem archive_dir
   [ -f "$RESULTS_DIR/$filename" ] && return 0
-  [ -d "$RESULTS_DIR/archive" ] || return 1
   stem="${filename%.txt}"
   # Local bridges archive as archive/YYYY-MM/<task>.txt. The remote gateway
-  # archives as archive/<task>-<epoch>.txt. Both are completed deliveries.
-  find "$RESULTS_DIR/archive" -mindepth 1 -maxdepth 2 -type f \
-    \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-    | grep -q .
+  # archives as archive/<task>-<epoch>.txt. Startup retention uses sibling
+  # archive-YYYY-MM-DD/<task>.txt directories. All are completed deliveries.
+  if [ -d "$RESULTS_DIR/archive" ] && find "$RESULTS_DIR/archive" \
+      -mindepth 1 -maxdepth 2 -type f \
+      \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
+      | grep -q .; then
+    return 0
+  fi
+  for archive_dir in "$RESULTS_DIR"/archive-*; do
+    [ -d "$archive_dir" ] || continue
+    if find "$archive_dir" -mindepth 1 -maxdepth 1 -type f \
+        \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
+        | grep -q .; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 submit_task() {

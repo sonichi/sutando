@@ -151,6 +151,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 ## `src/agent/codex/cli/`
 
 - **`start-cli.sh`** — Persistent Codex CLI implementation of the Sutando core.
+- **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
 
 ## `src/launchd/`

@@ -23,6 +23,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
         for rel in (
             "src/agent/codex/cli/start-cli.sh",
             "src/agent/codex/cli/task-notifier.sh",
+            "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
             "src/watch-tasks-stream.sh",
             "src/sutando_config.py",
@@ -38,6 +39,11 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "    f.write(' '.join(sys.argv[1:]))\n"
         )
         (self.root / "src" / "__init__.py").touch()
+        scheduler = self.root / "fake-codex-scheduler.py"
+        scheduler.write_text(
+            "import os, pathlib, sys\n"
+            "pathlib.Path(os.environ['SCHEDULER_LOG']).write_text(' '.join(sys.argv[1:]))\n"
+        )
         workspace = self.root / "workspace"
         (workspace / "state").mkdir(parents=True)
         (self.root / "sutando.config.json").write_text(json.dumps({
@@ -56,9 +62,14 @@ printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then
   if [ -n "${TMUX_ACTIVE_RUNTIME:-}" ] && [ ! -f "$TMUX_STATE" ] && [ "${3:-}" = =sutando-core ]; then exit 0; fi
+  if [ "${TMUX_WATCHER_EXISTS:-}" = 1 ] && [ "${3:-}" = =sutando-core-watcher ]; then exit 0; fi
   exit 1
 fi
 if [ "${1:-}" = show-environment ]; then
+  if [ "${3:-}" = =sutando-core-watcher ] && [ "${4:-}" = SUTANDO_NOTIFIER_VERSION ]; then
+    printf 'SUTANDO_NOTIFIER_VERSION=%s\\n' "$TMUX_ACTIVE_NOTIFIER_VERSION"
+    exit 0
+  fi
   printf 'SUTANDO_CORE_RUNTIME=%s\\n' "$TMUX_ACTIVE_RUNTIME"
   exit 0
 fi
@@ -76,8 +87,20 @@ exit 0
         path.write_text(body)
         path.chmod(0o755)
 
+    def _notifier_version(self):
+        first = subprocess.check_output([
+            "cksum",
+            str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
+            str(self.root / "src/agent/codex/cli/task-notifier.sh"),
+            str(self.root / "src/watch-tasks-stream.sh"),
+        ])
+        checksum = subprocess.run(["cksum"], input=first, capture_output=True,
+                                  check=True, text=False).stdout.decode().split()
+        return f"{checksum[0]}-{checksum[1]}"
+
     def run_launcher(self, *args, env_extra=None):
         env = dict(os.environ)
+        env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -85,6 +108,9 @@ exit 0
             "HOME": str(Path(self.tmp.name) / "home"),
             "SUTANDO_CORE_RUNTIME": "codex",
             "MONITOR_LOG": str(Path(self.tmp.name) / "monitor.log"),
+            "SCHEDULER_LOG": str(Path(self.tmp.name) / "scheduler.log"),
+            "SUTANDO_CODEX_SCHEDULER_SCRIPT": str(self.root / "fake-codex-scheduler.py"),
+            "SUTANDO_HOST_LABEL": "test-host",
         })
         env.update(env_extra or {})
         return subprocess.run(
@@ -94,6 +120,7 @@ exit 0
 
     def run_launcher_with_tty(self, *args, env_extra=None):
         env = dict(os.environ)
+        env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -140,7 +167,10 @@ exit 0
                 os.close(slave)
 
     def test_launches_codex_and_managed_task_notifier(self):
-        result = self.run_launcher(env_extra={"SUTANDO_CORE_MODEL": "gpt-test"})
+        result = self.run_launcher(env_extra={
+            "SUTANDO_CORE_MODEL": "gpt-test",
+            "SUTANDO_SELF_DEVELOPMENT_ENABLED": "0",
+        })
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text()
         self.assertIn("new-session -d -s sutando-core", calls)
@@ -150,8 +180,10 @@ exit 0
         self.assertIn("--search", calls)
         self.assertIn("-m gpt-test", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
-        self.assertIn("task-notifier.sh", calls)
+        self.assertIn("task-notifier-supervisor.sh", calls)
+        self.assertIn("SUTANDO_NOTIFIER_VERSION=", calls)
         self.assertIn("CODEX_HOME=", calls)
+        self.assertIn("-e SUTANDO_SELF_DEVELOPMENT_ENABLED=0", calls)
         self.assertIn("has-session -t =sutando-core", calls)
         self.assertIn("has-session -t =sutando-core-watcher", calls)
 
@@ -163,12 +195,57 @@ exit 0
         self.assertTrue(monitor_log.exists(), "managed core-input monitor did not start")
         self.assertIn("--session sutando-core", monitor_log.read_text())
 
+        scheduler_log = Path(self.tmp.name) / "scheduler.log"
+        self.assertTrue(scheduler_log.exists(), "Codex scheduler was not reconciled")
+        invocation = scheduler_log.read_text()
+        self.assertIn("install --workspace", invocation)
+        self.assertIn("--host-label test-host", invocation)
+
     def test_restart_kills_core_and_notifier_before_launch(self):
         result = self.run_launcher("--restart")
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text()
         self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
                         calls.index("new-session -d -s sutando-core"))
+
+    def test_restart_loads_self_development_policy_from_dotenv(self):
+        (self.root / ".env").write_text("SUTANDO_SELF_DEVELOPMENT_ENABLED=0\n")
+        result = self.run_launcher("--restart", env_extra={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=0",
+            self.log.read_text(),
+        )
+
+    def test_ambient_self_development_policy_overrides_dotenv(self):
+        (self.root / ".env").write_text("SUTANDO_SELF_DEVELOPMENT_ENABLED=1\n")
+        result = self.run_launcher("--restart", env_extra={
+            "SUTANDO_SELF_DEVELOPMENT_ENABLED": "0",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=0",
+            self.log.read_text(),
+        )
+        self.assertNotIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=1",
+            self.log.read_text(),
+        )
+
+    def test_empty_ambient_self_development_policy_reaches_core_to_fail_closed(self):
+        (self.root / ".env").write_text("SUTANDO_SELF_DEVELOPMENT_ENABLED=1\n")
+        result = self.run_launcher("--restart", env_extra={
+            "SUTANDO_SELF_DEVELOPMENT_ENABLED": "",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=",
+            self.log.read_text(),
+        )
+        self.assertNotIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=1",
+            self.log.read_text(),
+        )
 
     def test_dispatcher_restarts_when_active_runtime_differs(self):
         result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "claude"})
@@ -187,6 +264,31 @@ exit 0
         self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
                         calls.index("new-session -d -s sutando-core"))
 
+    def test_stale_notifier_version_is_replaced_without_restarting_core(self):
+        result = self.run_launcher(env_extra={
+            "TMUX_ACTIVE_RUNTIME": "codex",
+            "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": "stale",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text()
+        self.assertIn("kill-session -t =sutando-core-watcher", calls)
+        self.assertIn("new-session -d -s sutando-core-watcher", calls)
+        self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
+                        calls.index("new-session -d -s sutando-core-watcher"))
+        self.assertNotIn("kill-session -t =sutando-core\n", calls)
+
+    def test_current_notifier_version_is_left_running(self):
+        result = self.run_launcher(env_extra={
+            "TMUX_ACTIVE_RUNTIME": "codex",
+            "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(),
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text()
+        self.assertNotIn("kill-session -t =sutando-core-watcher", calls)
+        self.assertNotIn("new-session -d -s sutando-core-watcher", calls)
+
     def test_nested_tmux_invocation_never_attaches(self):
         result = self.run_launcher_with_tty(env_extra={
             "TMUX": "/tmp/outer.sock,1,0",
@@ -204,6 +306,98 @@ exit 0
         self.assertIn("not authenticated", result.stderr)
         calls = self.log.read_text() if self.log.exists() else ""
         self.assertNotIn("new-session", calls)
+
+    def test_notifier_supervisor_restarts_after_child_exit(self):
+        count = Path(self.tmp.name) / "notifier-count"
+        self._write_exe("tmux", '''#!/bin/bash
+[ "${1:-}" = -S ] && shift 2
+[ "${1:-}" = has-session ] && exit 0
+exit 1
+''')
+        notifier = self.bin / "notifier-under-test"
+        notifier.write_text('''#!/bin/bash
+n=0
+[ -f "$SUPERVISOR_COUNT" ] && n=$(cat "$SUPERVISOR_COUNT")
+printf '%s' "$((n + 1))" > "$SUPERVISOR_COUNT"
+exit 23
+''')
+        notifier.chmod(0o755)
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_SCRIPT=str(notifier),
+                   SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
+                   SUPERVISOR_COUNT=str(count))
+        supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
+        process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(100):
+                if count.exists() and int(count.read_text()) >= 2:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(count.exists(), "supervisor never started notifier")
+            self.assertGreaterEqual(int(count.read_text()), 2)
+            self.assertIsNone(process.poll(), "supervisor exited with its failed child")
+        finally:
+            process.terminate()
+            process.communicate(timeout=2)
+
+    def test_notifier_supervisor_survives_child_process_group_cleanup(self):
+        count = Path(self.tmp.name) / "notifier-count"
+        self._write_exe("tmux", '''#!/bin/bash
+[ "${1:-}" = -S ] && shift 2
+[ "${1:-}" = has-session ] && exit 0
+exit 1
+''')
+        notifier = self.bin / "notifier-under-test"
+        notifier.write_text('''#!/bin/bash
+n=0
+[ -f "$SUPERVISOR_COUNT" ] && n=$(cat "$SUPERVISOR_COUNT")
+n=$((n + 1))
+printf '%s' "$n" > "$SUPERVISOR_COUNT"
+if [ "$n" = 1 ]; then
+  kill -TERM 0
+fi
+sleep 60
+''')
+        notifier.chmod(0o755)
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_SCRIPT=str(notifier),
+                   SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
+                   SUPERVISOR_COUNT=str(count))
+        supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
+        process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(200):
+                if count.exists() and int(count.read_text()) >= 2:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(count.exists(), "supervisor never started notifier")
+            self.assertGreaterEqual(int(count.read_text()), 2)
+            self.assertIsNone(process.poll(), "child kill 0 terminated supervisor")
+        finally:
+            process.terminate()
+            process.communicate(timeout=2)
+
+    def test_notifier_supervisor_exits_when_core_is_gone(self):
+        self._write_exe("tmux", '#!/bin/bash\nexit 1\n')
+        count = Path(self.tmp.name) / "notifier-count"
+        notifier = self.bin / "notifier-under-test"
+        notifier.write_text(f'#!/bin/bash\ntouch "{count}"\n')
+        notifier.chmod(0o755)
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_SCRIPT=str(notifier))
+        supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
+        result = subprocess.run(["/bin/bash", str(supervisor)], env=env,
+                                capture_output=True, text=True, timeout=2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(count.exists(), "notifier started without a live core")
 
     def test_notifier_submits_literal_safe_prompt(self):
         # The one-event mode tests the adapter without starting fswatch.
@@ -259,6 +453,38 @@ exit 0
         workspace = self.root / "workspace"
         (workspace / "tasks").mkdir(exist_ok=True)
         archive = workspace / "results" / "archive"
+        archive.mkdir(parents=True)
+        (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
+        (archive / "task-done-1784690000.txt").write_text("already delivered\n")
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("send-keys", calls)
+
+    def test_notifier_does_not_replay_task_with_retention_archived_result(self):
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(exist_ok=True)
+        archive = workspace / "results" / "archive-2026-07-26"
+        archive.mkdir(parents=True)
+        (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
+        (archive / "task-done.txt").write_text("already delivered\n")
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("send-keys", calls)
+
+    def test_notifier_recognizes_gateway_result_in_retention_archive(self):
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(exist_ok=True)
+        archive = workspace / "results" / "archive-2026-07-26"
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (archive / "task-done-1784690000.txt").write_text("already delivered\n")

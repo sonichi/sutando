@@ -65,6 +65,11 @@ STATUS_PATH = STATE_DIR / "services-status.json"
 # Liveness window shared with the .alive heartbeat: a signal older than this is
 # treated as "the thing that writes it is gone", i.e. offline.
 ALIVE_TTL_S = 90.0
+# The gateway bridge rewrites state/gateway-status.json on EVERY poll outcome,
+# so a sidecar older than this means the bridge is wedged or predates the
+# sidecar — either way it has no usable opinion and pgrep answers instead.
+GATEWAY_STATUS_PATH = STATE_DIR / "gateway-status.json"
+GATEWAY_STATUS_TTL_S = 180.0
 
 
 def _host_label() -> str:
@@ -146,6 +151,41 @@ def probe_process(pattern: str, pgrep) -> tuple[str, str, float | None]:
         return ("unknown", f"probe error: {e}", None)
 
 
+def probe_gateway(
+    path: Path, pattern: str, now: float, pgrep, ttl: float = GATEWAY_STATUS_TTL_S
+) -> tuple[str, str, float | None]:
+    """Gateway liveness: prefer the bridge's OWN status sidecar, fall back to pgrep.
+
+    `probe_process` answers "does a process with this argv exist", which is not
+    the same question as "is the connection serving". A gateway whose route has
+    gone can sit in a retry/backoff loop for hours with the process healthy, and
+    the dashboard would show it green the whole time (observed 2026-07-28: 4.9h
+    of `connected: false` reported as `running`, pid and all).
+
+    `state/gateway-status.json` is written by the transport on every poll
+    outcome, so it answers the real question. Missing or stale (bridge wedged,
+    or too old to emit one) → no opinion, and the pgrep probe answers as before,
+    so hosts running an older bridge keep their previous behaviour.
+
+    Same precedence `core-input-watch.gateway_alive()` adopted in #2253.
+    """
+    try:
+        raw = json.loads(path.read_text())
+        ts = raw.get("ts")
+        if isinstance(ts, (int, float)) and (now - ts) <= ttl:
+            last_ok = raw.get("last_ok_ts")
+            since = last_ok if isinstance(last_ok, (int, float)) else None
+            if raw.get("connected"):
+                return ("running", "connected", since)
+            detail = "not serving"
+            if since:
+                detail = f"not serving — no successful poll for {int(now - since)}s"
+            return ("offline", detail, since)
+    except (OSError, ValueError, AttributeError):
+        pass  # absent/unreadable/malformed → fall through to the process probe
+    return probe_process(pattern, pgrep)
+
+
 def _real_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -191,7 +231,7 @@ def service_registry() -> list[dict]:
         {"id": "core", "name": "Sutando Core",
          "probe": ("alive_file", CORES_DIR / f"{host}.alive")},
         {"id": "gateway", "name": "AG2 Gateway",
-         "probe": ("process", r"remote-gateway-bridge\.py$")},
+         "probe": ("gateway", GATEWAY_STATUS_PATH, r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",
          "probe": ("pidfile", STATE_DIR / "watch-tasks-stream.pid")},
         {"id": "voice-agent", "name": "Voice Agent",
@@ -225,8 +265,11 @@ def build_payload(
     the injected `pid_alive`/`connect`/`pgrep` callables and `now`."""
     services = []
     for spec in registry:
-        kind, arg = spec["probe"]
-        if kind == "alive_file":
+        kind, *args = spec["probe"]
+        arg = args[0]
+        if kind == "gateway":
+            status, detail, since = probe_gateway(args[0], args[1], now, pgrep)
+        elif kind == "alive_file":
             status, detail, since = probe_alive_file(arg, now)
         elif kind == "pidfile":
             status, detail, since = probe_pidfile(arg, pid_alive)
