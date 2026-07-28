@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """default_policy_pack — factory-default subscription policies for the events
-/observe lane. Auto-registered on agent first-connect (no manual config),
-owner-visible and individually disable-able.
+/observe lane, owner-visible and individually disable-able.
+
+This module provides the pack DEFINITION plus the seed functions
+(``seed_defaults`` / ``on_room_join``) that register those policies — invokable
+today via the CLI (``python3 default_policy_pack.py …``) and covered by
+``tests/default-policy-pack.test.py``. The functions are DESIGNED to run at
+agent first-connect / room-join so subscriptions register with no manual config,
+but that one-line hook lives in the events/room-ops layer and is a FOLLOW-UP —
+it is not wired here, and no production caller invokes ``seed_defaults`` yet (see
+``default-pack-design.md`` → "Wiring"). This PR is the pack + seed machinery, not
+the connect-time registration itself.
 
 Design (owner commission 2026-07-26, my Stage-2/events lane; air builds the
 sparrow consumer sonichi/sutando#2319 in parallel — we meet on the "rooms are

@@ -7,7 +7,11 @@ the "rooms are default-subscribed" line._
 ## Goal
 
 A set of **factory-default subscription policies** that:
-- auto-register when an agent first connects (no manual config by the user),
+- are **designed to** auto-register when an agent first connects (no manual
+  config by the user) — via a one-line connect/join hook that calls
+  `seed_defaults()`. That hook is the **follow-up** described in "Wiring" below;
+  this PR ships the pack + seed functions (CLI-invokable, tested), **not** the
+  connect-time caller,
 - are **owner-visible** and **individually disable-able**,
 - follow the `/observe` policy structure (`observe_policy.py`).
 
