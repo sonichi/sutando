@@ -132,6 +132,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_lock.py`** — Atomic per-workspace role lock for sutando singleton enforcement (MC1).
 - **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts.
+- **`write_calendar_cache.py`** — Producer for the morning-briefing Google-calendar cache (PR #2256).
 
 ## `src/Sutando/`
 

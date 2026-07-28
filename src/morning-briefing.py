@@ -28,6 +28,11 @@ RESULTS_DIR = WORKSPACE / "results"
 LOGS_DIR = WORKSPACE / "logs"
 STATE_DIR = WORKSPACE / "state"
 
+# Agent-written cache of the owner's real (Google Workspace) calendar. This
+# standalone script cannot reach the Station connector, but the core agent can —
+# it writes today's events here during the morning cron. See get_calendar_events.
+CALENDAR_CACHE_FILE = STATE_DIR / "calendar-today.json"
+
 # Weather codes → one-word description
 WEATHER_CODES = {
     0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
@@ -96,17 +101,76 @@ def get_weather() -> str:
         return None
 
 
-def get_calendar_events() -> list[dict] | None:
-    """Get today's calendar events via AppleScript.
+def _read_calendar_cache() -> list[dict] | None:
+    """Read today's calendar from the agent-written Google cache.
 
-    Returns a list of events ([] means verified empty) or None when the
-    calendar could not be read — callers must not render None as "clear".
+    This script cannot reach the owner's Google Workspace calendar (the Station
+    connector is agent-only), but the core agent can — during the morning cron
+    it writes ``state/calendar-today.json``::
+
+        {"date": "YYYY-MM-DD", "events": [{"raw": "9:30am Standup"}, ...]}
+
+    Returns the events list when the cache is present and stamped for TODAY,
+    else None (absent / stale / corrupt — never show yesterday's schedule).
+    """
+    try:
+        data = json.loads(CALENDAR_CACHE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("date") != datetime.now().strftime("%Y-%m-%d"):
+        return None
+    raw_events = data.get("events")
+    if not isinstance(raw_events, list):
+        return None
+    events: list[dict] = []
+    for ev in raw_events:
+        if isinstance(ev, dict):
+            raw = (ev.get("raw") or "").strip()
+            cal = ev.get("calendar", "")
+        else:
+            raw, cal = str(ev).strip(), ""
+        if raw:
+            events.append({"raw": raw, "calendar": cal})
+    return events
+
+
+def get_calendar_events() -> list[dict] | None:
+    """Get today's calendar events, preferring the owner's real Google calendar.
+
+    Source preference:
+      1. The Google-calendar cache (``state/calendar-today.json``) written by the
+         core agent — the ONLY source that sees the owner's Google Workspace
+         calendar, which a local macOS Calendar.app may not have subscribed.
+      2. Local macOS Calendar.app via AppleScript (fallback).
+
+    Returns a list of events ([] means verified empty) or None when the calendar
+    could not be read — callers must not render None as "clear".
+
+    When ``MORNING_BRIEFING_CALENDAR_SOURCE=google`` is set, the cache is the only
+    TRUSTED source: if it's missing/stale, return None (→ "couldn't read your
+    calendar") rather than a misleading empty read from a local calendar that
+    doesn't include the work account. This is exactly the 2026-07-21 bug — the
+    briefing announced "calendar is clear" off an empty local read while the
+    owner had three Google meetings that day.
 
     Respects MORNING_BRIEFING_SKIP_CALENDARS (comma-separated list of
     calendar names to exclude, e.g. "Home,Wedding,Birthdays"). Useful for
     filtering out subscribed shared calendars that clutter the briefing
     (closes #964). Case-insensitive match on calendar name.
     """
+    import os as _os
+
+    cached = _read_calendar_cache()
+    if cached is not None:
+        return cached
+    if _os.environ.get("MORNING_BRIEFING_CALENDAR_SOURCE", "").strip().lower() == "google":
+        # Trusted source expected but unavailable — do NOT fall back to a local
+        # read that can't see the work calendar and would look falsely "clear".
+        print(
+            "  calendar: google source expected but cache missing/stale — reporting unread",
+            file=sys.stderr,
+        )
+        return None
     script = '''
 set theDate to (current date)
 set hours of theDate to 0
@@ -273,9 +337,11 @@ def get_pending_questions() -> list[str]:
         # marked resolved/done/answered is not pending even when its title still
         # reads "[OPEN …]" (mirrors check-pending-questions.py). Without this the
         # briefing miscounts entries kept above the divider whose title wasn't
-        # updated but whose body carries "**Status:** resolved".
+        # updated but whose body carries "**Status:** resolved". `open` counts as
+        # pending (the natural word writers reach for) — kept in lockstep with
+        # check-pending-questions.py so the documented mirror stays truthful.
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
-        if status_m and not status_m.group(1).strip().lower().startswith(('unanswered', 'waiting')):
+        if status_m and not status_m.group(1).strip().lower().startswith(('unanswered', 'waiting', 'open')):
             continue
         questions.append(title[:60])
     return questions
