@@ -324,6 +324,13 @@ The binary auto-compiles on `startup.sh` if missing. To compile manually: `cd sr
 
 It consumes API quota proportional to how much work it finds to do.
 
+Autonomous self-development is enabled by default. To run Sutando in a stable
+product context without idle-time code evolution, set
+`SUTANDO_SELF_DEVELOPMENT_ENABLED=0` in `.env` and restart the core. Sutando
+continues to process owner requests, monitor health, and deliver tasks; it only
+stops choosing and executing autonomous improvement work. An explicit
+owner-requested code change is still allowed.
+
 ---
 
 ## Security
