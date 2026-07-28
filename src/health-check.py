@@ -104,6 +104,117 @@ def _resolve_dotenv() -> Path:
     return resolve_dotenv(REPO_DIR, WORKSPACE_DIR)
 
 
+_VOICE_ENV_KEYS = ("SKIP_VOICE", "GEMINI_VOICE_API_KEY", "GEMINI_API_KEY")
+
+
+def resolve_voice_health_config(
+    env: Optional[dict] = None,
+    env_path: Optional[Path] = None,
+) -> dict:
+    """Resolve whether voice health checks are required.
+
+    Process environment values win over the canonical dotenv file, matching
+    the already-running service configuration that health-check observes.
+    Missing configuration is a supported text-only mode. A present but
+    unreadable or malformed relevant value is an error: failing closed avoids
+    hiding a configured voice outage behind an accidental "disabled" result.
+    """
+    env = os.environ if env is None else env
+    env_path = _resolve_dotenv() if env_path is None else env_path
+    file_values = {}
+    if env_path.exists():
+        try:
+            lines = env_path.read_text().splitlines()
+        except OSError as exc:
+            return {"enabled": True, "error": f"{env_path.name} unreadable ({exc})"}
+        for line_no, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            assignment = line
+            if assignment.startswith("export "):
+                assignment = assignment[len("export "):].lstrip()
+            if "=" not in assignment:
+                if assignment in _VOICE_ENV_KEYS:
+                    return {
+                        "enabled": True,
+                        "error": f"{env_path.name}:{line_no} malformed {assignment} assignment",
+                    }
+                continue
+            key, value = assignment.split("=", 1)
+            key = key.strip()
+            if key not in _VOICE_ENV_KEYS:
+                continue
+            try:
+                parsed = shlex.split(value, comments=True, posix=True)
+            except ValueError as exc:
+                return {
+                    "enabled": True,
+                    "error": f"{env_path.name}:{line_no} malformed {key} value ({exc})",
+                }
+            if len(parsed) > 1:
+                return {
+                    "enabled": True,
+                    "error": f"{env_path.name}:{line_no} malformed {key} value",
+                }
+            file_values[key] = parsed[0] if parsed else ""
+
+    def effective(key: str) -> str:
+        value = env[key] if key in env else file_values.get(key, "")
+        return str(value).strip()
+
+    skip_voice = effective("SKIP_VOICE")
+    if effective("GEMINI_VOICE_API_KEY") or effective("GEMINI_API_KEY"):
+        return {"enabled": True, "detail": "Gemini voice credential configured"}
+    if skip_voice not in ("", "0", "1"):
+        return {"enabled": True, "error": f"invalid SKIP_VOICE={skip_voice!r}"}
+    if skip_voice == "1":
+        return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
+    return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
+
+
+def check_voice_stack(
+    env: Optional[dict] = None,
+    env_path: Optional[Path] = None,
+) -> list[dict]:
+    """Return config-aware voice-agent, watcher, and transport checks."""
+    config = resolve_voice_health_config(env=env, env_path=env_path)
+    if config.get("error"):
+        config_check = {
+            "name": "voice-config",
+            "status": "down",
+            "detail": config["error"],
+        }
+    else:
+        config_check = None
+
+    if not config["enabled"]:
+        detail = config["detail"]
+        return [
+            {"name": "voice-agent", "status": "ok", "detail": detail},
+            {"name": "voice-watchers", "status": "ok", "detail": detail},
+            {"name": "voice-transport", "status": "ok", "detail": detail},
+            {"name": "bodhi-dist", "status": "ok", "detail": detail},
+        ]
+
+    voice_check = check_port(9900, "voice-agent", probe=True)
+    if voice_check["status"] == "ok":
+        mark_stale_if_outdated(
+            voice_check,
+            REPO_DIR / "src" / "voice-agent.ts",
+            "voice-agent.ts",
+        )
+    checks = [
+        voice_check,
+        check_voice_watchers(voice_check),
+        check_voice_transport(voice_check),
+        check_bodhi_dist(),
+    ]
+    if config_check is not None:
+        checks.insert(0, config_check)
+    return checks
+
+
 def _resolved_vault() -> dict:
     """Return the resolved vault config subtree via the canonical resolver
     (`sutando_config.resolve_vault`) — the SINGLE source of truth for
@@ -2654,13 +2765,7 @@ def run_all_checks() -> list[dict]:
     checks = []
 
     # Core services (required)
-    voice_check = check_port(9900, "voice-agent", probe=True)
-    if voice_check["status"] == "ok":
-        mark_stale_if_outdated(voice_check, REPO_DIR / "src" / "voice-agent.ts", "voice-agent.ts")
-    checks.append(voice_check)
-    checks.append(check_voice_watchers(voice_check))
-    checks.append(check_voice_transport(voice_check))
-    checks.append(check_bodhi_dist())
+    checks.extend(check_voice_stack())
 
     web_check = check_port(8080, "web-client", probe=True)
     if web_check["status"] == "ok":
