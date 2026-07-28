@@ -527,6 +527,7 @@ else
         echo "Pushed changes from $(hostname)."
     else
         log "Push failed"
+        PUSH_FAILED=1
     fi
 fi
 
@@ -548,5 +549,10 @@ fi
 
 NOTES_COUNT=$(find notes -type f 2>/dev/null | wc -l | tr -d ' ')
 MEMORY_COUNT=$(ls memory/*.md 2>/dev/null | wc -l | tr -d ' ')
+if [ "${PUSH_FAILED:-0}" = "1" ]; then
+    log "Sync FAILED: git push failed ($MEMORY_COUNT memory, $NOTES_COUNT notes committed locally, NOT pushed)"
+    echo "Sync FAILED: git push failed — changes committed locally but NOT pushed. Memory: $MEMORY_COUNT files, Notes: $NOTES_COUNT files." >&2
+    exit 1
+fi
 log "Sync complete: $MEMORY_COUNT memory, $NOTES_COUNT notes"
 echo "Sync complete. Memory: $MEMORY_COUNT files, Notes: $NOTES_COUNT files."
