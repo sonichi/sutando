@@ -139,14 +139,26 @@ re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
 # It runs BEFORE phase 1 so the freshly-added current command is never swept.
 #
 # OWNERSHIP TEST — the load-bearing part. "Carries our marker" is NOT ownership:
-# an operator hook that invokes the same script (say, with an extra flag) also
-# contains it, and an earlier revision of this sweep deleted exactly those. We
-# therefore sweep only commands matching the SHAPE THIS INSTALLER WRITES: the
-# current command with the repo path replaced by a wildcard, anchored at both
-# ends, compared with quotes normalized away so the quoted and unquoted forms
-# both match. A customized command has extra text and fails the trailing anchor,
-# so it survives. Sweeping a *different clone's* entry is intended — that shape
-# is installer-generated, just not by this checkout.
+# an operator hook that invokes the same script also contains it, and an earlier
+# revision of this sweep deleted exactly those. We sweep only commands matching
+# the SHAPE THIS INSTALLER WRITES, which is three conditions, each added after a
+# real false positive:
+#
+#   1. the hook must EMBED THE REPO PATH at all — otherwise nothing about it can
+#      go stale, so there is nothing to migrate (see the skip below);
+#   2. the region between the command word and the marker must START LIKE A PATH
+#      — optional quote, then a non-space, non-`-` character — so a flag or
+#      wrapper before the path (`bash -x …`) is not swallowed by the wildcard;
+#   3. the text after the marker must match EXACTLY, so customization after the
+#      path fails the trailing anchor.
+#
+# Matching is done on the RAW command. An earlier revision normalized by
+# stripping quote characters; that was lossy — `shq` rewrites `'` as `'\''`, so
+# stripping leaves a stray backslash and the shape stops matching its own output
+# on a path containing an apostrophe. Nothing here pre-processes the candidate.
+#
+# Sweeping a *different clone's* entry is intended — that shape is
+# installer-generated, just not by this checkout.
 for entry in "${HOOKS[@]}"; do
   EVENT="${entry%%|*}"
   REST="${entry#*|}"
