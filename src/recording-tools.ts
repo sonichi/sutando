@@ -43,6 +43,35 @@ export function ffmpegSubtitleCandidates(execPath: string): string[] {
 	];
 }
 
+/**
+ * ffprobe, derived from the ffmpeg candidates rather than hardcoded.
+ *
+ * The duration probe invoked the Apple-Silicon Homebrew ffprobe path directly,
+ * so on an Intel or PATH-only install it threw and the recording reported no
+ * duration. Deriving from ffmpegSubtitleCandidates() reuses the prefixes already
+ * listed there (including the bundled-runtime sibling) instead of restating
+ * them, so there is ONE place to add a prefix when a new install layout appears
+ * — and no second copy to drift. ffprobe ships beside ffmpeg in every
+ * distribution that has it.
+ *
+ * Unlike findFfmpegWithSubtitles this does not probe for a capability — any
+ * ffprobe can report a duration — so it only checks existence, and a bare name
+ * is always kept so PATH resolution still applies.
+ */
+export function ffprobeCandidates(execPath: string): string[] {
+	return ffmpegSubtitleCandidates(execPath).map((p) =>
+		p.replace(/ffmpeg(?=[^/]*$)/, 'ffprobe'),
+	);
+}
+
+let _cachedFfprobe: string | undefined;
+function findFfprobe(): string {
+	if (_cachedFfprobe !== undefined) return _cachedFfprobe;
+	_cachedFfprobe =
+		ffprobeCandidates(process.execPath).find((p) => !p.includes('/') || existsSync(p)) ?? 'ffprobe';
+	return _cachedFfprobe;
+}
+
 let _cachedSubtitleFfmpeg: string | null | undefined;
 function findFfmpegWithSubtitles(): string | null {
 	if (_cachedSubtitleFfmpeg !== undefined) return _cachedSubtitleFfmpeg;
@@ -773,7 +802,7 @@ export const screenRecordTool: ToolDefinition = {
 					// Probe duration once here so open_file (now generic) doesn't need to.
 					try {
 						const dur = execFileSync(
-							'/opt/homebrew/bin/ffprobe',
+							findFfprobe(),
 							['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', files.recommended!],
 							{ timeout: 5_000 }
 						).toString().trim();
