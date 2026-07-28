@@ -75,10 +75,18 @@ def main() -> int:
     empty.write_text("")  # 0 bytes — a producer that has not flushed yet
     os.utime(empty, (old, old))
 
+    # air's #2360 follow-up: a whitespace-only file is NON-zero size but empty
+    # after strip() — a producer that wrote a newline/header then paused. A
+    # size-only check would archive it; the drain would not. The two movers must
+    # agree, so this must ALSO be left in place.
+    whitespace = results / "proactive-whitespace.txt"
+    whitespace.write_text("   \n\t\n")  # size > 0, strip() == ""
+    os.utime(whitespace, (old, old))
+
     fresh_empty = results / "proactive-fresh.txt"
     fresh_empty.write_text("")  # 0 bytes but recent — also must stay
 
-    rc = arch.main()  # in-process → coverage sees the size-0 exclusion branch
+    rc = arch.main()  # in-process → coverage sees the strip-empty exclusion branch
     check("archiver main() returns 0", rc == 0, f"rc={rc}")
 
     archived_names = {p.name for p in results.glob("archive-*/*.txt")}
@@ -89,6 +97,9 @@ def main() -> int:
     check("empty stale .txt is NOT archived — left in place for the drain",
           empty.exists() and "proactive-empty.txt" not in archived_names,
           f"empty exists={empty.exists()} archived={sorted(archived_names)}")
+    check("whitespace-only stale .txt is NOT archived (strip-empty, matches the drain)",
+          whitespace.exists() and "proactive-whitespace.txt" not in archived_names,
+          f"whitespace exists={whitespace.exists()} archived={sorted(archived_names)}")
     check("fresh empty .txt is untouched",
           fresh_empty.exists() and "proactive-fresh.txt" not in archived_names)
 

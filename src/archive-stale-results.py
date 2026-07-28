@@ -73,22 +73,33 @@ def main() -> int:
             continue
         if st.st_mtime >= cutoff:
             continue
-        # NEVER archive an EMPTY .txt on its mtime. A results file can be created
-        # by a producer that then pauses before its first flush — a proactive
-        # nudge held open across a slow turn is the live case. An empty file keeps
-        # its creation mtime while the descriptor stays open, so an mtime horizon
-        # moves the inode out from under that fd and the producer's later flush
-        # lands in the archived copy: silent loss of an owner-facing message.
-        # This is the exact unsound signal the proactive drain stopped trusting
-        # (sonichi/sutando#2324, "a file held open with no write keeps its
-        # creation mtime"); the archiver is the OTHER mtime-keyed mover of these
-        # files, so it must make the same exclusion or the drain's guarantee does
-        # not hold end-to-end. The flood this script prevents is caused by
-        # CONTENTFUL stale files (one DM per file), so skipping 0-byte files does
-        # not weaken it. Genuinely-orphaned 0-byte remnants are left in place and
-        # surfaced by scripts/results-health.sh for deliberate cleanup — never
+        # NEVER archive a NOT-YET-FLUSHED .txt on its mtime. A results file can be
+        # created by a producer that then pauses before its first real write — a
+        # proactive nudge held open across a slow turn is the live case. Such a
+        # file keeps its creation mtime while the descriptor stays open, so an
+        # mtime horizon moves the inode out from under that fd and the producer's
+        # later flush lands in the archived copy: silent loss of an owner-facing
+        # message. This is the exact unsound signal the proactive drain stopped
+        # trusting (sonichi/sutando#2324); the archiver is the OTHER mtime-keyed
+        # mover of these files, so it must make the SAME exclusion or the drain's
+        # guarantee does not hold end-to-end.
+        #
+        # Use the drain's EXACT predicate — content that is empty after strip(),
+        # not merely 0 bytes. A producer that writes a newline or a header and then
+        # pauses leaves a non-zero-size but strip-empty file; a size-only check
+        # (st_size == 0) would move THAT, and the later flush would still land in
+        # the archived inode. Matching body.strip()-empty on both sides closes that
+        # whitespace gap so the two movers agree on "not flushed" (air, #2360
+        # follow-up). An unreadable/undecodable file is likewise NOT moved — a file
+        # we cannot read is exactly one that may be mid-write. The flood this
+        # script prevents is caused by CONTENTFUL stale files (one DM per file), so
+        # skipping empties does not weaken it; genuinely-orphaned empty remnants
+        # are surfaced by scripts/results-health.sh for deliberate cleanup, never
         # moved on age alone.
-        if st.st_size == 0:
+        try:
+            if not f.read_text(encoding="utf-8").strip():
+                continue
+        except (OSError, UnicodeDecodeError):
             continue
         if DRY_RUN:
             print(f"  [retention] would archive {f.name}")
