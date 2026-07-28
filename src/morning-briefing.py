@@ -337,9 +337,11 @@ def get_pending_questions() -> list[str]:
         # marked resolved/done/answered is not pending even when its title still
         # reads "[OPEN …]" (mirrors check-pending-questions.py). Without this the
         # briefing miscounts entries kept above the divider whose title wasn't
-        # updated but whose body carries "**Status:** resolved".
+        # updated but whose body carries "**Status:** resolved". `open` counts as
+        # pending (the natural word writers reach for) — kept in lockstep with
+        # check-pending-questions.py so the documented mirror stays truthful.
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
-        if status_m and not status_m.group(1).strip().lower().startswith(('unanswered', 'waiting')):
+        if status_m and not status_m.group(1).strip().lower().startswith(('unanswered', 'waiting', 'open')):
             continue
         questions.append(title[:60])
     return questions
