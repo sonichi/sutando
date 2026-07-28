@@ -19,6 +19,7 @@ Run: python3 tests/daily-insight-frontmatter-tags.test.py
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -90,6 +91,45 @@ ok("bare comma list without brackets",
    _mod._frontmatter_tags("---\ntags: alpha, beta\n---\n") == ["alpha", "beta"])
 ok("indented tags key",
    _mod._frontmatter_tags("---\n  tags: [x]\n---\n") == ["x"])
+
+
+# 7. INTEGRATION — exercise analyze_note_activity(), the production path, not just
+#    the helper. The first version of this test only called _frontmatter_tags()
+#    directly, so the actual note scan (read each file, increment the counter) was
+#    never executed and the coverage gate correctly flagged it uncovered. A test
+#    that exercises a helper in isolation does not prove the shipped function uses
+#    it — that is the same "test a copy, not what ships" defect this repo has hit
+#    three separate ways today, and I repeated it here.
+with tempfile.TemporaryDirectory() as _td:
+    _notes = Path(_td)
+    # a) a real note with frontmatter tags
+    (_notes / "a-real-note.md").write_text(
+        "---\ntags: [alpha, beta]\ncreated: 2026-07-28\n---\n\n# Body\n\nsome text\n")
+    # b) the poisoning note: NO frontmatter, `tags:` only inside quoted prose
+    (_notes / "b-workflow-quote.md").write_text(POISON)
+    # c) both at once — real frontmatter AND the prose below it. The pre-fix code
+    #    took whichever `tags:` line came first, so this is the case that decides
+    #    whether the scan reads structure or text.
+    (_notes / "c-mixed.md").write_text("---\ntags: [gamma]\n---\n\n" + POISON)
+
+    _orig_dir = _mod.NOTES_DIR
+    _mod.NOTES_DIR = _notes
+    try:
+        _stats = _mod.analyze_note_activity()
+    finally:
+        _mod.NOTES_DIR = _orig_dir
+
+    _tags = {name for name, _count in _stats["top_tags"]}
+    ok("integration: only frontmatter tags are counted",
+       _tags == {"alpha", "beta", "gamma"}, f"got {sorted(_tags)}")
+    ok("integration: no prose fragment leaks into top_tags",
+       not any("ios-release" in n or "workflows" in n or "trigger" in n for n in _tags),
+       f"got {sorted(_tags)}")
+    ok("integration: the mixed note contributes its frontmatter tag",
+       "gamma" in _tags, f"got {sorted(_tags)}")
+    ok("integration: note total counts every .md",
+       _stats["total"] == 3, f"got {_stats['total']}")
+
 
 print(f"daily-insight-frontmatter-tags: {_passed}/{_passed + _failed} passed"
       + (f" — {_failed} FAILED" if _failed else ""))
