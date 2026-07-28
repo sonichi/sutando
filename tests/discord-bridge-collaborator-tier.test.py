@@ -36,6 +36,7 @@ import importlib.util
 import os
 import re
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -85,12 +86,17 @@ def _install_discord_stub():
 
 def load_bridge():
     _install_discord_stub()
-    # The bridge reads a DISCORD_BOT_TOKEN .env at import — seed a stub if absent.
-    env_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "channels" / "discord"
-    env = env_dir / ".env"
-    if not env.exists():
-        env_dir.mkdir(parents=True, exist_ok=True)
-        env.write_text("DISCORD_BOT_TOKEN=test-stub-token\n")
+    # The bridge reads a DISCORD_BOT_TOKEN .env at import, so one must exist.
+    # Seed it into a TEMP CLAUDE_CONFIG_DIR — never the caller's real one.
+    # Writing to the host config fabricates a Discord install on a machine that
+    # has none: health-check then reports "discord-bridge: configured but not
+    # running" forever, and the stub token sits in the user's config dir. Same
+    # host-leakage class as #2204.
+    _tmp_home = tempfile.mkdtemp(prefix="dbct-claude-home-")
+    os.environ["CLAUDE_CONFIG_DIR"] = _tmp_home
+    env_dir = Path(_tmp_home) / "channels" / "discord"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    (env_dir / ".env").write_text("DISCORD_BOT_TOKEN=test-stub-token\n")
     src = BRIDGE.read_text()
     spec = importlib.util.spec_from_loader("bridge", loader=None)
     bridge = importlib.util.module_from_spec(spec)
