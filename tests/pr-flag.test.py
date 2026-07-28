@@ -55,6 +55,15 @@ def main() -> int:
     assert pf._ci_state([{"status": "IN_PROGRESS"}]) == "pending"
     assert pf._ci_state([{"conclusion": "FAILURE"}]) == "failing"
     assert pf._ci_state([{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}]) == "failing"
+    assert pf._ci_state([{"__typename": "StatusContext", "state": "SUCCESS"}]) == "green"
+    assert pf._ci_state([{"__typename": "StatusContext", "state": "PENDING"}]) == "pending"
+    assert pf._ci_state([{"__typename": "StatusContext", "state": "EXPECTED"}]) == "pending"
+    assert pf._ci_state([{"__typename": "StatusContext", "state": "FAILURE"}]) == "failing"
+    assert pf._ci_state([{"__typename": "StatusContext", "state": "ERROR"}]) == "failing"
+    assert pf._ci_state([
+        {"__typename": "CheckRun", "status": "IN_PROGRESS"},
+        {"__typename": "StatusContext", "state": "FAILURE"},
+    ]) == "failing"
     print("  ok  _ci_state collapses correctly")
 
     prs = [

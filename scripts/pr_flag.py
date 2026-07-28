@@ -35,9 +35,17 @@ def _ci_state(rollup) -> str:
     rc = rollup or []
     if not rc:
         return "none"
-    if any((c.get("conclusion") in ("FAILURE", "CANCELLED", "TIMED_OUT")) for c in rc):
+    if any(
+        c.get("conclusion") in ("FAILURE", "CANCELLED", "TIMED_OUT")
+        or c.get("state") in ("FAILURE", "ERROR")
+        for c in rc
+    ):
         return "failing"
-    if any((c.get("status") in ("IN_PROGRESS", "QUEUED", "PENDING")) for c in rc):
+    if any(
+        c.get("status") in ("IN_PROGRESS", "QUEUED", "PENDING")
+        or c.get("state") in ("PENDING", "EXPECTED")
+        for c in rc
+    ):
         return "pending"
     return "green"
 
