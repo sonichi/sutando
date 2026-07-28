@@ -153,19 +153,28 @@ for entry in "${HOOKS[@]}"; do
   MARKER="${REST%%|*}"
   CMD="${REST#*|}"
 
-  # Quotes are stripped for MATCHING ONLY; nothing is ever rewritten from this.
-  CMD_NQ="$(printf '%s' "$CMD" | tr -d "\"'")"
-  if [ "${CMD_NQ#*"$REPO_DIR"}" != "$CMD_NQ" ]; then
-    SHAPE="^$(re_escape "${CMD_NQ%%"$REPO_DIR"*}").*$(re_escape "${CMD_NQ#*"$REPO_DIR"}")\$"
-  else
-    # No repo path in this command (e.g. the $HOME transcript archive) — the
-    # only variant we own is a pure quoting difference.
-    SHAPE="^$(re_escape "$CMD_NQ")\$"
-  fi
+  # Build the shape from the command's STRUCTURE, never by stripping quotes.
+  #
+  # Quote-stripping was lossy and wrong: `shq` escapes an apostrophe in the repo
+  # path as `'\''`, so deleting quote characters leaves a stray backslash. On a
+  # checkout at `/repo'quote` the stripped command and the stripped repo path
+  # then disagree, the split finds nothing, SHAPE collapses to an exact match,
+  # and the stale unquoted entry is never swept — both hooks keep firing. An
+  # apostrophe is legal in a path, so this is a real checkout, not a curiosity.
+  #
+  # Instead: anchor on the command word, the marker (already the stable
+  # structural token), and the literal tail that follows the marker. The path
+  # region is a wildcard and the closing quote is optional, so the quoted and
+  # unquoted forms both match while a customized command — extra flags, extra
+  # words — fails the trailing anchor and survives.
+  CMD_WORD="${CMD%% *}"
+  CMD_TAIL="${CMD#*"$MARKER"}"
+  CMD_TAIL="${CMD_TAIL#[\"\']}"       # drop shq's closing quote, if present
+  SHAPE="^$(re_escape "$CMD_WORD") .*$(re_escape "$MARKER")[\"']?$(re_escape "$CMD_TAIL")\$"
 
   if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" --arg shape "$SHAPE" \
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
-       | map(contains($marker) and (. != $cmd) and ((gsub("[\"'"'"']"; "")) | test($shape)))
+       | map(contains($marker) and (. != $cmd) and test($shape))
        | any' \
       "$SETTINGS" >/dev/null 2>&1; then
     continue
@@ -178,7 +187,7 @@ for entry in "${HOOKS[@]}"; do
         .hooks |= map(select(
           ((.command // "") | contains($marker))
           and ((.command // "") != $cmd)
-          and (((.command // "") | gsub("[\"'"'"']"; "")) | test($shape))
+          and ((.command // "") | test($shape))
           | not
         ))
       )

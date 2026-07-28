@@ -184,6 +184,53 @@ ok "another clone's installer-shaped entry is still swept" \
 ok "sweeping it did not take the operator hooks with it" \
    "$([ "$(cmds SessionEnd | grep -cE -- '--verbose|echo custom|env FOO=1')" = 3 ] && echo 0 || echo 1)"
 
+# --- 8. a checkout path containing an APOSTROPHE ----------------------------
+# An apostrophe is legal in a path, and `shq` escapes it as '\'' — so any
+# matching scheme that "normalizes" by deleting quote characters leaves a stray
+# backslash and silently stops recognising its own output. The symptom is not a
+# crash: the stale entry simply survives and BOTH hooks fire forever.
+# Fixture path has a space AND an apostrophe on purpose.
+AROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks apos.XXXXXX")"
+AREPO="$AROOT/repo'quote with spaces"
+mkdir -p "$AREPO/src" "$AREPO/.claude"
+cp "$INSTALLER" "$AREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\necho "HANDOFF-RAN"\n' > "$AREPO/src/session-handoff.sh"
+printf '#!/bin/bash\necho "PENDING-RAN"\n' > "$AREPO/src/check-pending-tasks.sh"
+chmod +x "$AREPO/src/"*.sh
+echo '{}' > "$AREPO/.claude/settings.json"
+bash "$AREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+
+export A_SETTINGS="$AREPO/.claude/settings.json" A_REPO="$AREPO"
+# Seed the prior UNQUOTED installer variant, exactly as an older revision wrote it.
+python3 - <<'PY'
+import json, os
+p = os.environ['A_SETTINGS']
+d = json.load(open(p))
+d['hooks']['SessionEnd'][0]['hooks'].append(
+    {'type': 'command',
+     'command': 'bash ' + os.environ['A_REPO'] + '/src/session-handoff.sh "$TRANSCRIPT_PATH"'})
+json.dump(d, open(p, 'w'), indent=2)
+PY
+acount() { python3 -c "
+import json, os
+d = json.load(open(os.environ['A_SETTINGS']))
+print(sum(1 for g in d['hooks']['SessionEnd'] for h in g['hooks'] if 'session-handoff' in h['command']))
+"; }
+ok "apostrophe fixture: stale variant present before re-run (sanity)" \
+   "$([ "$(acount)" = 2 ] && echo 0 || echo 1)"
+bash "$AREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+ok "apostrophe path: stale variant IS swept on re-run" \
+   "$([ "$(acount)" = 1 ] && echo 0 || echo 1)"
+A_SURVIVOR="$(python3 -c "
+import json, os
+d = json.load(open(os.environ['A_SETTINGS']))
+print([h['command'] for g in d['hooks']['SessionEnd'] for h in g['hooks']
+       if 'session-handoff' in h['command']][0])
+")"
+ok "apostrophe path: the surviving command actually executes" \
+   "$([ "$(TRANSCRIPT_PATH=/dev/null bash -c "$A_SURVIVOR" 2>&1)" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
+rm -rf "$AROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then
