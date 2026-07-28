@@ -95,8 +95,9 @@ def get_waiting_questions():
     content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
     questions = []
     # Walk each ## section; a section is waiting if its body contains
-    # `Status: unanswered` or `Status: Waiting`, OR has no Status field
-    # at all (free-form prose sections are always unanswered by convention).
+    # `Status: unanswered`, `Status: Waiting` or `Status: open`, OR has no
+    # Status field at all (free-form prose sections are always unanswered by
+    # convention).
     sections = re.split(r'^## ', content, flags=re.MULTILINE)
     for sec in sections[1:]:  # skip pre-header
         title_line, _, body = sec.partition('\n')
@@ -106,9 +107,13 @@ def get_waiting_questions():
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
         if status_m:
             status = status_m.group(1).strip().lower()
-            if not (status.startswith('unanswered') or status.startswith('waiting')):
+            # `open` is the word writers naturally reach for, and it used to
+            # fall through to the skip below — filing a live question as though
+            # it were resolved. The section stayed on disk and readable while
+            # never being surfaced, which is the worst failure mode here.
+            if not status.startswith(('unanswered', 'waiting', 'open')):
                 continue  # explicitly resolved/done/answered — skip
-        # No status field, or status is unanswered/waiting → notify.
+        # No status field, or status is unanswered/waiting/open → notify.
         # Capture first non-empty, non-strikethrough, non-status-metadata body
         # line as a one-line action hint so notifications tell the user what
         # to do, not just that something is waiting (avoids "what do I do
