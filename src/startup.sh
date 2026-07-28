@@ -204,6 +204,14 @@ python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
 source "$REPO/src/startup-runtime.sh"
 configure_startup_runtime
 
+# Harden per-host install-state secrets (state/auth/) on every boot. Factored to
+# src/auth_hardening.sh so the logic is unit-testable (tests/auth-hardening.test.sh)
+# without driving the whole boot. See that file for the why (workspace default is
+# not under ~/Library/Application Support, so 0700 must be ours, not incidental).
+# shellcheck source=auth_hardening.sh
+source "$REPO/src/auth_hardening.sh"
+harden_auth_dir "$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+
 # v0.8 auto-migration helpers (PR #1440 safety hardening — Mini review).
 # Sourced from a sibling file so the four guard functions (_realpath,
 # _same_inode, _is_unsafe_for_migration, _color_warn) can be unit-tested
