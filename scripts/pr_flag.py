@@ -54,9 +54,9 @@ def raw_state(prs: list, owner_login: str) -> list:
     """Objective per-PR state — NO judgement. Sorted by number.
 
     Each record: number, title, author, is_mine, head, ci, mergeable, review,
-    approvals. `approvals` = count of distinct logins whose review state is
-    APPROVED on the current head. These are facts the agent then judges (is it
-    ready? does the owner need it? caveats?).
+    approvals. `approvals` = count of distinct logins whose latest effective
+    formal review state is APPROVED on the current head. These are facts the
+    agent then judges (is it ready? does the owner need it? caveats?).
     """
     out = []
     for pr in prs:
@@ -64,13 +64,24 @@ def raw_state(prs: list, owner_login: str) -> list:
             continue
         author = (pr.get("author") or {}).get("login", "")
         head = pr.get("headRefOid") or ""
+        latest_formal_review = {}
+        for index, review in enumerate(pr.get("reviews") or []):
+            if (review.get("commit") or {}).get("oid") != head:
+                continue
+            state = review.get("state")
+            if state not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+                continue
+            login = (review.get("author") or {}).get("login")
+            if not login:
+                continue
+            order = (review.get("submittedAt") or "", index)
+            if login not in latest_formal_review or order >= latest_formal_review[login][0]:
+                latest_formal_review[login] = (order, state)
         approvers = {
-            (r.get("author") or {}).get("login")
-            for r in (pr.get("reviews") or [])
-            if r.get("state") == "APPROVED"
-            and (r.get("commit") or {}).get("oid") == head
+            login
+            for login, (_, state) in latest_formal_review.items()
+            if state == "APPROVED"
         }
-        approvers.discard(None)
         out.append({
             "number": pr.get("number"),
             "title": pr.get("title", ""),

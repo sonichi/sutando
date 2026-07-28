@@ -108,7 +108,31 @@ def main() -> int:
     assert pf.state_hash(st_head) != h1, "a head change MUST refire"
     stale = pf.raw_state([_pr(15, "peer", approvers=["rui"], stale_approvers=["qingyun"])], OWNER)
     assert stale[0]["approvals"] == 1, "stale-head approvals must not be counted"
-    print("  ok  dedup hash flips on ci / approvals / head; stale approvals excluded")
+
+    effective = _pr(16, "peer")
+    effective["reviews"] = [
+        # Intentionally not API-ordered: submittedAt determines effective state.
+        {"author": {"login": "qingyun"}, "state": "CHANGES_REQUESTED",
+         "submittedAt": "2026-07-28T02:00:00Z", "commit": {"oid": "head-16"}},
+        {"author": {"login": "rui"}, "state": "APPROVED",
+         "submittedAt": "2026-07-28T02:00:00Z", "commit": {"oid": "head-16"}},
+        {"author": {"login": "qingyun"}, "state": "APPROVED",
+         "submittedAt": "2026-07-28T01:00:00Z", "commit": {"oid": "head-16"}},
+        {"author": {"login": "rui"}, "state": "CHANGES_REQUESTED",
+         "submittedAt": "2026-07-28T01:00:00Z", "commit": {"oid": "head-16"}},
+        {"author": {"login": "john"}, "state": "APPROVED",
+         "submittedAt": "2026-07-28T01:00:00Z", "commit": {"oid": "head-16"}},
+        {"author": {"login": "john"}, "state": "DISMISSED",
+         "submittedAt": "2026-07-28T02:00:00Z", "commit": {"oid": "head-16"}},
+        {"author": {"login": "rui"}, "state": "COMMENTED",
+         "submittedAt": "2026-07-28T03:00:00Z", "commit": {"oid": "head-16"}},
+        {"author": {"login": "stale"}, "state": "APPROVED",
+         "submittedAt": "2026-07-28T03:00:00Z", "commit": {"oid": "old-head"}},
+    ]
+    assert pf.raw_state([effective], OWNER)[0]["approvals"] == 1, (
+        "only each reviewer's latest effective current-head formal state counts"
+    )
+    print("  ok  dedup hash flips on ci / approvals / head; effective current-head approvals counted")
 
     # empty repo → empty state, stable hash
     assert pf.raw_state([], OWNER) == []
