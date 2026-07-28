@@ -66,10 +66,16 @@ layer (its CLAUDE.md equivalent) at connect time.
 **Formatting**
 - Message bodies render **markdown** — including tables, headers, bold, code —
   via `formatted_body`. Use a table for status reports/comparisons instead of
-  a wall of text. For interactive UI, attach an `a2ui` block — the block
-  schema is defined by the platform's published A2UI contract (server-side
-  documentation; not shipped in this skill). There is no separate "embed"
-  primitive; markdown IS the rich format.
+  a wall of text. There is no separate "embed" primitive; markdown IS the
+  rich format.
+- **Do NOT attach an `a2ui` block.** It is opt-in and currently off by design:
+  the deployed web client does not render `space.ag2.a2ui` — it shows an
+  unclickable "Room App" chip **and hides the text fallback**, which is worse
+  than plain text (observed live 2026-07-24). The shipped default enforces
+  this (`CardPoster(..., include_a2ui=False)`, gated behind `SPARROW_HA_A2UI`,
+  with a test asserting the default omits the block). Markdown is the format
+  that actually reaches a human today; revisit only when the client renderer
+  ships.
 - Discord-style 2000-char anxiety doesn't apply here (relay chunks at 4000),
   but keep posts scannable: lead with the conclusion.
 
