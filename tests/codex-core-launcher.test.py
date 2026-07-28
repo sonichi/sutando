@@ -14,6 +14,23 @@ from pathlib import Path
 REAL_REPO = Path(__file__).resolve().parents[1]
 
 
+def _read_count(path):
+    """Read the supervisor's counter file, tolerating a mid-write empty read.
+
+    The notifier under test publishes with `printf '%s' "$n" > "$COUNT"`, and the
+    shell truncates on `>` BEFORE printf writes — so the file legitimately exists
+    and is empty for a moment on every increment. A poll that did
+    `path.exists() and int(path.read_text())` raced that window and died with
+    `ValueError: invalid literal for int() with base 10: ''`, reddening unrelated
+    PRs intermittently. Existence is not readiness; an empty read means "not yet
+    written", not a value.
+    """
+    try:
+        return int(path.read_text().strip() or 0)
+    except (ValueError, FileNotFoundError):
+        return 0
+
+
 class CodexCoreLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -333,11 +350,15 @@ exit 23
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             for _ in range(100):
-                if count.exists() and int(count.read_text()) >= 2:
+                observed = _read_count(count)
+                if observed >= 2:
                     break
                 time.sleep(0.01)
             self.assertTrue(count.exists(), "supervisor never started notifier")
-            self.assertGreaterEqual(int(count.read_text()), 2)
+            # Assert the value that satisfied the loop, not a fresh read: a second
+            # read re-enters the same truncate window and can see 0 after the
+            # condition was genuinely met.
+            self.assertGreaterEqual(observed, 2)
             self.assertIsNone(process.poll(), "supervisor exited with its failed child")
         finally:
             process.terminate()
@@ -372,12 +393,17 @@ sleep 60
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
+            observed = 0
             for _ in range(200):
-                if count.exists() and int(count.read_text()) >= 2:
+                observed = _read_count(count)
+                if observed >= 2:
                     break
                 time.sleep(0.01)
             self.assertTrue(count.exists(), "supervisor never started notifier")
-            self.assertGreaterEqual(int(count.read_text()), 2)
+            # Assert the value that satisfied the loop, not a fresh read: a second
+            # read re-enters the same truncate window and can see 0 after the
+            # condition was genuinely met.
+            self.assertGreaterEqual(observed, 2)
             self.assertIsNone(process.poll(), "child kill 0 terminated supervisor")
         finally:
             process.terminate()
