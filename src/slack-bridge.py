@@ -429,12 +429,12 @@ def _ensure_tier_map_seeded() -> bool:
     # access-control file BEFORE writing, so a disk-full / interrupt / partial
     # write can destroy allowFrom — and with fail-closed tier resolution that
     # locks legitimate owners out against a corrupt file, at bridge startup.
-    # Write a sibling temp, chmod it, then os.replace() atomically. The pid+uuid
+    # Write a sibling temp BORN 0600 (write_private_text), then os.replace(). The pid+uuid
     # suffix avoids colliding with a concurrent .tmp; on any failure the original
     # access.json bytes are left intact and the orphan temp is removed.
     tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        write_private_text(tmp, json.dumps(data, indent=2) + "\n")
         os.replace(tmp, ACCESS_FILE)
         _update_access_cache(data)
         print(f"  [tier-map] grandfathered {len(allow)} existing allowFrom member(s) as owner; new additions now default to read-only", flush=True)

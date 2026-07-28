@@ -615,13 +615,13 @@ def ensure_tier_map_seeded() -> bool:
     # access-control file BEFORE writing, so a disk-full / interrupt / partial
     # write can destroy allowFrom — and with fail-closed tier resolution that
     # locks legitimate owners out against a corrupt file, at bridge startup.
-    # Write a sibling temp, chmod it, then os.replace() atomically (mirrors the
+    # Write a sibling temp BORN 0600 (write_private_text), then os.replace() (mirrors the
     # pairing path + the #2222 owner-activity fix). The pid+uuid suffix avoids
     # colliding with a concurrent pairing-path .tmp; on any failure the original
     # access.json bytes are left intact and the orphan temp is removed.
     tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        write_private_text(tmp, json.dumps(data, indent=2) + "\n")
         os.replace(tmp, ACCESS_FILE)
         print(f"  [tier-map] grandfathered {len(allow)} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
         return True
@@ -2757,7 +2757,7 @@ async def _handle_discord_message(message, force=False):
                     # change also closes the lost-update race with the
                     # `/discord:access` skill's read-modify-write.
                     tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
-                    tmp_path.write_text(json.dumps(access_data, indent=2))
+                    write_private_text(tmp_path, json.dumps(access_data, indent=2))
                     os.replace(tmp_path, ACCESS_FILE)
                     # Refresh the gate for THIS message. require_mention was
                     # computed by load_channel_config before the seed existed,
