@@ -494,6 +494,68 @@ def check_memory_dir_override() -> "dict | None":
     }
 
 
+def check_memory_dir_siblings() -> "dict | None":
+    """Flag a populated memory corpus sitting under a DIFFERENT project slug.
+
+    check_memory_dir_override() above catches only one of the two ways this
+    install can end up reading a directory the agent is not writing: an explicit
+    SUTANDO_MEMORY_DIR pointing somewhere stale. It returns None when the var is
+    unset — and the other failure mode needs no env var at all.
+
+    Claude Code derives a project slug from a path. Two different derivations
+    (repo path vs app-support path, or differing rules for spaces and dots)
+    produce two sibling project dirs under the same claude-home, each with its
+    own memory/. Everything that resolves by repo slug then reports on one
+    corpus while the session reads and writes the other. Field-observed on two
+    hosts, once per mechanism: one had the env override (caught), one had the
+    slug split (silent — memory-dir reported "ok, 66 .md files" about a corpus
+    the agent had never written to, while its live corpus held 42).
+
+    Deliberately diagnostic only. Which slug *should* be canonical is an open
+    architectural decision; picking one here would answer it in code and, worse,
+    hide the divergence behind a green check. So: report, never redirect.
+
+    Symlinked twins are NOT a split — resolve before comparing. Two slug strings
+    frequently point at one inode (a compatibility symlink bridging two
+    derivation rules), and reporting that as a divergence would make this check
+    noise on a healthy install.
+    """
+    projects = Path(claude_home_path()) / "projects"
+    if not projects.is_dir():
+        return None
+
+    live = MEMORY_DIR.resolve() if MEMORY_DIR.exists() else MEMORY_DIR
+    seen: "dict[str, tuple[str, int]]" = {}
+    for entry in sorted(projects.iterdir()):
+        mem = entry / "memory"
+        if not mem.is_dir():
+            continue
+        count = len(list(mem.glob("*.md")))
+        if count == 0:
+            continue
+        key = str(mem.resolve())  # collapse symlinked twins onto one entry
+        if key not in seen or count > seen[key][1]:
+            seen[key] = (entry.name, count)
+
+    others = {k: v for k, v in seen.items() if k != str(live)}
+    if not others:
+        return None
+
+    live_count = len(list(MEMORY_DIR.glob("*.md"))) if MEMORY_DIR.is_dir() else 0
+    listed = ", ".join(f"{name} ({n} .md)" for name, n in sorted(others.values(), key=lambda t: -t[1]))
+    return {
+        "name": "memory-dir-siblings",
+        "status": "warn",
+        "detail": (
+            f"{len(others)} other populated memory corpus/corpora exist under "
+            f"{projects}: {listed}. This check reports on {MEMORY_DIR.name}'s parent "
+            f"({live_count} .md) — if the session actually writes one of the others, "
+            "its memories are invisible to every path-derived consumer. Diagnostic "
+            "only; which slug is canonical is an open decision."
+        ),
+    }
+
+
 def check_memory_index_integrity() -> "dict | None":
     """Catch memories that exist on disk but will never load into a session.
 
@@ -2825,6 +2887,10 @@ def run_all_checks() -> list[dict]:
     _mem_override = check_memory_dir_override()
     if _mem_override:
         checks.append(_mem_override)
+
+    _mem_siblings = check_memory_dir_siblings()
+    if _mem_siblings:
+        checks.append(_mem_siblings)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:
