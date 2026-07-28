@@ -68,9 +68,27 @@ def main() -> int:
         if f.suffix != ".txt":
             continue
         try:
-            if f.stat().st_mtime >= cutoff:
-                continue
+            st = f.stat()
         except FileNotFoundError:
+            continue
+        if st.st_mtime >= cutoff:
+            continue
+        # NEVER archive an EMPTY .txt on its mtime. A results file can be created
+        # by a producer that then pauses before its first flush — a proactive
+        # nudge held open across a slow turn is the live case. An empty file keeps
+        # its creation mtime while the descriptor stays open, so an mtime horizon
+        # moves the inode out from under that fd and the producer's later flush
+        # lands in the archived copy: silent loss of an owner-facing message.
+        # This is the exact unsound signal the proactive drain stopped trusting
+        # (sonichi/sutando#2324, "a file held open with no write keeps its
+        # creation mtime"); the archiver is the OTHER mtime-keyed mover of these
+        # files, so it must make the same exclusion or the drain's guarantee does
+        # not hold end-to-end. The flood this script prevents is caused by
+        # CONTENTFUL stale files (one DM per file), so skipping 0-byte files does
+        # not weaken it. Genuinely-orphaned 0-byte remnants are left in place and
+        # surfaced by scripts/results-health.sh for deliberate cleanup — never
+        # moved on age alone.
+        if st.st_size == 0:
             continue
         if DRY_RUN:
             print(f"  [retention] would archive {f.name}")
