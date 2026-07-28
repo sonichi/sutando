@@ -8,7 +8,8 @@
  * to the OAuth1 API path in x-post.py.
  *
  * Profile dir (persists the login) resolves from $X_BROWSER_PROFILE, else
- * ~/.sutando/x-browser-profile. It is per-host and should NOT be synced.
+ * a per-host x-browser-profile dir under the Sutando home. It is per-host
+ * and should NOT be synced.
  *
  * === Keychain consistency (the load-bearing invariant) ===
  * All three commands MUST encrypt/decrypt cookies with the SAME key or the
@@ -39,7 +40,7 @@ import { chromium } from 'playwright';
 import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execSync, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 
 /** The `playwright` npm package pins one Chromium revision, but the installed
  *  build can drift (e.g. package wants chromium-1208, cache has chromium-1228).
@@ -85,7 +86,7 @@ const { app: CHROME_APP, bin: CHROME_BIN } = resolveChromium();
  *  a profile path with quotes/metacharacters can't break or inject a command
  *  (qingyun review, #2133). */
 function pidsForProfile() {
-  let out = '';
+  let out;
   try {
     out = execFileSync('pgrep', ['-fl', 'Google Chrome for Testing'], { encoding: 'utf8' });
   } catch {

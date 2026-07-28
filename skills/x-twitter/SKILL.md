@@ -28,7 +28,7 @@ node skills/x-twitter/x-post-browser.mjs post "Your tweet text" --dry-run
 node skills/x-twitter/x-post-browser.mjs post "Your tweet text"
 ```
 
-- Profile: `~/.sutando/x-browser-profile` (override `$X_BROWSER_PROFILE`). Sign-in
+- Profile: a per-host `x-browser-profile` dir under the Sutando home (override `$X_BROWSER_PROFILE`). Sign-in
   survives ONLY because `check`/`post` strip Playwright's `--use-mock-keychain` so
   cookies decrypt with the real login keychain — see
   `memory/reference_x_browser_signin_oauth_blocked_use_email_phone.md`.
