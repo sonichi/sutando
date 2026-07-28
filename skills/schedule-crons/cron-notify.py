@@ -143,7 +143,9 @@ def _load_gateway(env_path=".env"):
 
 def _post_to_room(room_id, body, env_path=".env"):
     """Send `body` to `room_id` via gateway op:message. Returns event_id or None."""
-    import json, urllib.request, urllib.error
+    import json
+    import urllib.error
+    import urllib.request
     base, secret = _load_gateway(env_path)
     if not base:
         return None
@@ -173,7 +175,8 @@ def main(argv=None):
     Exit 0 = posted; exit 3 = suppressed (not attention-worthy / rate-limited);
     exit 2 = usage/gateway error. --dry-run prints the decision + would-be body
     without sending (and without stamping the rate-limit state)."""
-    import argparse, sys, time
+    import argparse
+    import time
     ap = argparse.ArgumentParser(description="Emit an attention-filtered cron ping to a room.")
     ap.add_argument("--cron", required=True, help="cron name (shown in the ping)")
     ap.add_argument("--summary", required=True, help="one-line update text")

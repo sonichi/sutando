@@ -74,6 +74,52 @@ def main() -> int:
     check("record_ping stamps int", st == {"c": 123})
     check("record_ping tolerates non-dict", cn.record_ping(None, "c", 5) == {"c": 5})
 
+    # ── gateway config + delivery (urllib mocked — no network) ──────────
+    import unittest.mock as um
+    with tempfile.TemporaryDirectory() as d:
+        env = Path(d) / ".env"
+        env.write_text("OTHER=1\nAG2_REMOTE_TOKEN='https://x.example/relay|sekret'\n")
+        base, secret = cn._load_gateway(str(env))
+        check("_load_gateway parses quoted url|secret",
+              base == "https://x.example/relay" and secret == "sekret", (base, secret))
+        env.write_text("AG2_REMOTE_TOKEN=nopipe\n")
+        check("_load_gateway no-pipe → (None, None)", cn._load_gateway(str(env)) == (None, None))
+        check("_load_gateway missing file → (None, None)",
+              cn._load_gateway(str(Path(d) / "absent.env")) == (None, None))
+
+        env.write_text("AG2_REMOTE_TOKEN=https://x.example/relay|sekret\n")
+        resp = um.MagicMock()
+        resp.read.return_value = json.dumps({"event_id": "$evt"}).encode()
+        with um.patch.object(cn, "_load_gateway", return_value=("https://x.example/relay", "sekret")), \
+             um.patch("urllib.request.urlopen", return_value=resp) as uo:
+            eid = cn._post_to_room("!r:x", "hello", str(env))
+            check("_post_to_room returns event_id on 200", eid == "$evt", eid)
+            req = uo.call_args[0][0]
+            check("_post_to_room targets <base>/v1/room",
+                  req.full_url == "https://x.example/relay/v1/room", req.full_url)
+        import urllib.error as ue
+        with um.patch.object(cn, "_load_gateway", return_value=("https://x.example/relay", "s")), \
+             um.patch("urllib.request.urlopen", side_effect=ue.URLError("down")):
+            check("_post_to_room URLError → None", cn._post_to_room("!r:x", "hi", str(env)) is None)
+        with um.patch.object(cn, "_load_gateway", return_value=(None, None)):
+            check("_post_to_room no gateway → None", cn._post_to_room("!r:x", "hi") is None)
+
+    check("_load_state missing file → {}", cn._load_state("/nonexistent/state.json") == {})
+
+    # ── CLI post paths (delivery mocked) ─────────────────────────────────
+    with tempfile.TemporaryDirectory() as d:
+        sf = Path(d) / "state.json"
+        with um.patch.object(cn, "_post_to_room", return_value="$evt"):
+            rc = cn.main(["--cron", "c", "--summary", "news", "--kind", "digest",
+                          "--room", "!r:x", "--state-file", str(sf), "--now", "50000"])
+            check("CLI: successful post exit 0", rc == 0)
+            check("CLI: post stamps rate-limit state",
+                  json.loads(sf.read_text()) == {"c": 50000}, sf.read_text())
+        with um.patch.object(cn, "_post_to_room", return_value=None):
+            rc = cn.main(["--cron", "c2", "--summary", "news", "--kind", "error",
+                          "--room", "!r:x"])
+            check("CLI: failed post exit 2", rc == 2)
+
     # ── CLI non-network paths ────────────────────────────────────────────
     rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "routine", "--room", "!r:x"])
     check("CLI: routine kind suppressed exit 3", rc == 3)
