@@ -110,6 +110,7 @@ jobs:
         run: |
           python3 src/remote-gateway-bridge.test.py
           python3 packages/ag2-sparrow/tests/test_gateway_status.py
+          python3 packages/ag2-sparrow/tests/test_dns_timeout.py
           python3 packages/ag2-sparrow/tests/test_ack_retry.py
           python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
           python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
@@ -117,6 +118,7 @@ jobs:
           python3 packages/ag2-sparrow/tests/test_event_consumer.py
           python3 packages/ag2-sparrow/tests/test_event_wiring.py
           python3 packages/ag2-sparrow/tests/test_human_action.py
+          python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
           python3 packages/ag2-sparrow/tools/test_no_drift.py
           python3 skills/agent-room-ops/test_room_ops.py
           python3 skills/make-viral-video/scripts/test_source_tag.py

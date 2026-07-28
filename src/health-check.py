@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import tempfile
 import socket
@@ -40,7 +41,7 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from util_paths import claude_home_path, shared_personal_path  # noqa: E402
+from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 
@@ -147,6 +148,115 @@ def twilio_configured(env_content: str) -> bool:
         if stripped.startswith("TWILIO_ACCOUNT_SID=") and stripped.split("=", 1)[1].strip():
             return True
     return False
+
+
+def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict:
+    """G1.5 node-bundle: resolve the Node executable the engine's JS services
+    would use, in the same precedence as `sutando-config.sh node-bin`:
+
+      1. $SUTANDO_NODE — exact executable exported by the desktop app.
+      2. $SUTANDO_APP_NODE_DIR/node (or its default app-support home) — the
+         bundled runtime found at rest (launchd jobs without the env var).
+      3. `node` on PATH — dev/OSS hosts.
+
+    Returns {"source": "bundled"|"app-bundle"|"system"|"none", "path": str|None}.
+    Pure over (env, which) for testability.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get("SUTANDO_NODE", "")
+    if explicit:
+        if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return {"source": "bundled", "path": explicit}
+        # Owner review P1-1: SUTANDO_NODE is the desktop's explicit
+        # declaration — set-but-invalid is a packaging error, NOT a case to
+        # silently rescue via PATH. Surface it as its own failure source.
+        return {"source": "invalid-explicit", "path": explicit}
+    app_dir = env.get("SUTANDO_APP_NODE_DIR", "") or os.path.expanduser(
+        "~/Library/Application Support/space.ag2.app/engine/runtime/node/bin"
+    )
+    app_node = os.path.join(app_dir, "node")
+    if os.path.isfile(app_node) and os.access(app_node, os.X_OK):
+        return {"source": "app-bundle", "path": app_node}
+    on_path = which("node")
+    if on_path:
+        # Desktop-managed installs should never end up here (bundled runtime
+        # dir exists but its node is broken/missing) — flag it so the probe
+        # can degrade instead of reporting a false green (owner review).
+        if os.path.isdir(app_dir):
+            return {"source": "system-degraded", "path": on_path}
+        return {"source": "system", "path": on_path}
+    return {"source": "none", "path": None}
+
+
+def check_node_runtime() -> dict:
+    """Surface WHICH node the JS services resolve to — or a loud red line when
+    none exists. The 2026-07-13 outage class: an interactive terminal finding
+    node does NOT mean launchd-/app-spawned services can (credential-proxy sat
+    dead for days on this failure). "none" is a real issue, not a warn: every
+    JS service (voice, phone, proxy, web-client) silently fails to start.
+    """
+    resolved = resolve_node_runtime()
+    if resolved["source"] == "none":
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": "no node found (no SUTANDO_NODE, no app bundle, none on PATH) — JS services cannot start",
+        }
+    if resolved["source"] == "invalid-explicit":
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"SUTANDO_NODE set but not executable: {resolved['path']} — desktop packaging error (fail-closed, no PATH fallback)",
+        }
+    if resolved["source"] == "system-degraded":
+        return {
+            "name": "node-runtime",
+            "status": "warn",
+            "detail": f"bundled runtime dir present but its node is unusable — running on system node {resolved['path']} (pinned-runtime guarantee NOT in effect)",
+        }
+    # Executable permission alone doesn't prove the runtime can launch the
+    # bundled services (Codex re-review F3): a --version that errors or fails
+    # to run means every JS service dies at spawn — that is DOWN, not ok.
+    try:
+        out = subprocess.run(
+            [resolved["path"], "--version"], capture_output=True, text=True, timeout=5
+        )
+        if out.returncode != 0:
+            return {
+                "name": "node-runtime",
+                "status": "down",
+                "detail": f"node at {resolved['path']} failed --version (rc={out.returncode}) — runtime not runnable",
+            }
+        version = out.stdout.strip()
+    except Exception as exc:
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"node at {resolved['path']} could not be executed ({exc}) — runtime not runnable",
+        }
+    # Version floor (external review on #2182): bundled services use node:sqlite,
+    # which needs Node >= 22.5 — an older node passes every other probe here but
+    # crashes those services at import. Unparseable versions degrade to warn
+    # (never block on a formatting surprise), too-old is DOWN with the fix named.
+    floor = (22, 5)
+    parsed = re.match(r"v?(\d+)\.(\d+)", version or "")
+    if parsed is None:
+        return {
+            "name": "node-runtime",
+            "status": "warn",
+            "detail": f"node at {resolved['path']} reported unparseable version {version!r} — cannot verify the >=22.5 floor (node:sqlite)",
+        }
+    if (int(parsed.group(1)), int(parsed.group(2))) < floor:
+        return {
+            "name": "node-runtime",
+            "status": "down",
+            "detail": f"{version} via {resolved['source']} is below the 22.5 floor (node:sqlite) — bundled services will crash; upgrade the runtime",
+        }
+    return {
+        "name": "node-runtime",
+        "status": "ok",
+        "detail": f"{version} via {resolved['source']} ({resolved['path']})",
+    }
 
 
 def check_port(port: int, name: str, probe: bool = False) -> dict:
@@ -774,7 +884,10 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
     Sutando.app), the function ALSO checks whether the binary itself is
     older than the source. A stale binary means the running process —
     however recently relaunched — is executing old code. When this fires,
-    the message tells the user to rebuild, not just restart.
+    the message tells the user to rebuild, not just restart. That branch
+    applies the same `_file_unchanged_since` content cross-check as the
+    process-start path, so a mtime bump from `git checkout` on unchanged
+    content does not read as "rebuild needed".
     """
     if not src_file.exists():
         return
@@ -787,6 +900,14 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
             src_mtime = src_file.stat().st_mtime
             bin_mtime = binary_path.stat().st_mtime
             if src_mtime - bin_mtime > threshold_sec:
+                # Same git cross-check the other two mtime comparisons carry
+                # (PR #253 for the proc_start path below, #255 for the bridges
+                # path). `git checkout` bumps mtime on files whose content is
+                # byte-identical, so a branch switch alone made this branch
+                # report "rebuild needed" for a binary that is in fact built
+                # from exactly the source on disk.
+                if _binary_is_current(binary_path, src_file):
+                    return
                 age_min = int((src_mtime - bin_mtime) / 60)
                 check["status"] = "stale"
                 check["detail"] = f"running, but binary is {age_min} min older than source — rebuild needed"
@@ -887,6 +1008,27 @@ def _filter_pids_this_checkout(pids: list) -> list:
         elif not argv:
             kept.append(pid)  # neither probe answered — fail open
     return kept
+
+
+def _binary_is_current(binary_path: Path, src_file: Path) -> bool:
+    """True if `binary_path` was built from the content now in `src_file`.
+
+    mtime ordering alone is not enough. `git checkout`, `pull`, and `rebase`
+    restamp files whose content is byte-identical, so a branch switch can make
+    a perfectly current binary look stale. Accept two ways: the binary is at
+    least as new as the source, or the source's mtime moved but the content
+    cross-check proves the bump was idempotent.
+
+    Fails safe (False) on any stat error, matching `_file_unchanged_since`:
+    an unresolvable check must never assert a stale binary is current.
+    """
+    try:
+        bin_mtime = binary_path.stat().st_mtime
+        if bin_mtime >= src_file.stat().st_mtime:
+            return True
+    except OSError:
+        return False
+    return _file_unchanged_since(src_file, bin_mtime)
 
 
 def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
@@ -1622,21 +1764,29 @@ def check_disk_space() -> dict:
 
 def check_skill_symlinks() -> dict:
     """Detect skills in the OSS repo checkout that are not symlinked into
-    ~/.claude/skills/. A missing symlink means Claude Code never loads the
-    skill — it's silently invisible until manually linked (bug d920b18b).
+    the Claude home's skills/ dir. A missing symlink means Claude Code never
+    loads the skill — it's silently invisible until manually linked (bug
+    d920b18b).
 
     Scans REPO_DIR/skills/ for directories and checks for a matching entry
-    in ~/.claude/skills/. Reports unlinked skills as 'warn'; in --fix mode,
-    creates the missing symlinks automatically.
+    in <claude-home>/skills/. Reports unlinked skills as 'warn'; in --fix
+    mode, creates the missing symlinks automatically.
+
+    The destination resolves via claude_home_path() (same as
+    _default_memory_dir(), fixed for the identical reason in #1454): a bare
+    Path.home()/".claude" ignores the workspace-scoped CLAUDE_CONFIG_DIR, so
+    on a migrated install this check scanned a stale ~/.claude/skills/ and
+    warned "unlinked" about skills whose symlinks exist — and are loaded —
+    under the workspace claude-home.
     """
     name = "skill-symlinks"
     skills_src = REPO_DIR / "skills"
-    skills_dst = Path.home() / ".claude" / "skills"
+    skills_dst = claude_home_path("skills")
 
     if not skills_src.exists():
         return {"name": name, "status": "ok", "detail": "skills/ dir not found — skipped"}
     if not skills_dst.exists():
-        return {"name": name, "status": "ok", "detail": "~/.claude/skills/ not found — skipped"}
+        return {"name": name, "status": "ok", "detail": f"{skills_dst} not found — skipped"}
 
     # A DANGLING symlink (entry present, target gone) is the case the original
     # condition let through: `exists()` follows the link and is False, but
@@ -1647,6 +1797,12 @@ def check_skill_symlinks() -> dict:
     broken: list[str] = []     # dangling link  -> must be unlinked first
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
+            continue
+        # Mirror skills/install.sh's filter: only dirs WITH a SKILL.md are
+        # slash-invocable skills the installer links. Manifest-loaded and
+        # scripts-only skills (gws-gmail-voice, learned-skills, ...) have no
+        # SKILL.md, are correctly never symlinked, and must not warn here.
+        if not (skill_dir / "SKILL.md").is_file():
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
@@ -1954,6 +2110,296 @@ def check_task_watcher() -> dict:
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 
+def _fresh_local_core_record(
+    workspace: "Optional[Path]" = None,
+    max_age_s: float = 90.0,
+) -> "dict | None":
+    """Return this host's fresh core heartbeat, or None.
+
+    `_any_core_alive()` deliberately accepts remote/shared-workspace heartbeats.
+    The notifier is a local tmux process, so using that fleet-wide signal here
+    could make one host try to inspect or repair another host's session.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    alive_file = workspace / "state" / "cores" / f"{_host_label()}.alive"
+    try:
+        if time.time() - alive_file.stat().st_mtime >= max_age_s:
+            return None
+        record = json.loads(alive_file.read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _run_tmux(socket_path: str, *args: str):
+    """Run one bounded tmux probe against a runtime-authored socket."""
+    try:
+        return subprocess.run(
+            [_resolve_tmux_bin(), "-S", socket_path, *args],
+            env=_resolve_launch_env(),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001 — probe failures become an absent target
+        return None
+
+
+def _codex_runtime_selected() -> bool:
+    """Whether config currently selects Codex (fail closed on invalid config)."""
+    try:
+        return resolve_core_runtime(REPO_DIR) == "codex"
+    except Exception:  # noqa: BLE001 — config check reports the underlying error
+        return False
+
+
+def _local_codex_runtime_target(
+    heartbeat: "dict | None" = None,
+) -> "dict | None":
+    """Resolve a locally recorded Codex target without acting on it."""
+    if heartbeat is None:
+        heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return None
+    socket_path = heartbeat.get("socket")
+    if not isinstance(socket_path, str) or not socket_path:
+        return None
+    try:
+        runtime_state = json.loads(
+            (WORKSPACE_DIR / "state" / "core-runtime.json").read_text()
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(runtime_state, dict) or runtime_state.get("runtime") != "codex":
+        return None
+    session = runtime_state.get("session")
+    if not isinstance(session, str) or not session:
+        return None
+    return {"socket": socket_path, "session": session}
+
+
+def _local_codex_core_target(target: "dict | None" = None) -> "dict | None":
+    """Resolve and verify the local Codex core's socket and exact session.
+
+    The heartbeat supplies the socket, `core-runtime.json` supplies the session,
+    and tmux's own session environment confirms that the live pane is Codex.
+    Requiring all three makes the repair path fail closed on stale/config-drift
+    state instead of accidentally starting or replacing a different core.
+    """
+    if target is None:
+        target = _local_codex_runtime_target()
+    if target is None:
+        return None
+    socket_path = target["socket"]
+    session = target["session"]
+
+    exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
+    if exists is None or exists.returncode != 0:
+        return None
+    runtime = _run_tmux(
+        socket_path,
+        "show-environment",
+        "-t",
+        f"={session}",
+        "SUTANDO_CORE_RUNTIME",
+    )
+    if (
+        runtime is None
+        or runtime.returncode != 0
+        or runtime.stdout.strip() != "SUTANDO_CORE_RUNTIME=codex"
+    ):
+        return None
+    return target
+
+
+def _expected_codex_notifier_entrypoint() -> Path:
+    """Entrypoint for the checkout's notifier topology.
+
+    PR #2280 adds a supervising entrypoint. Accept the direct notifier on
+    versions before that change and require the supervisor once it exists, so
+    rolling upgrades neither false-alarm nor silently keep obsolete topology.
+    """
+    supervisor = (
+        REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
+    )
+    if supervisor.exists():
+        return supervisor
+    return REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier.sh"
+
+
+def _command_runs_script(command: str, expected: Path) -> bool:
+    """Whether tmux started the expected script as the actual command.
+
+    `pane_start_command` is shell-quoted text. Tokenize it instead of searching
+    the raw string: an unrelated wrapper may mention the expected path in an
+    argument, suffix, or comment without running it.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    expected_text = str(expected)
+    if argv[0] == expected_text:
+        return True
+    if Path(argv[0]).name != "bash":
+        return False
+    script_index = 2 if len(argv) > 1 and argv[1] == "--" else 1
+    return len(argv) > script_index and argv[script_index] == expected_text
+
+
+def _probe_codex_task_notifier(target: dict) -> dict:
+    """Inspect the exact managed notifier tmux session for one healthy pane."""
+    name = "codex-task-notifier"
+    socket_path = target["socket"]
+    watcher_session = f"{target['session']}-watcher"
+    exists = _run_tmux(socket_path, "has-session", "-t", f"={watcher_session}")
+    if exists is None or exists.returncode != 0:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"managed tmux session {watcher_session!r} is missing",
+        }
+    panes = _run_tmux(
+        socket_path,
+        "list-panes",
+        "-t",
+        f"={watcher_session}",
+        "-F",
+        "#{pane_dead}\t#{pane_start_command}",
+    )
+    if panes is None or panes.returncode != 0:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"cannot inspect managed tmux session {watcher_session!r}",
+        }
+    rows = [line.split("\t", 1) for line in panes.stdout.splitlines() if line]
+    if len(rows) != 1 or any(len(row) != 2 for row in rows):
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"managed tmux session {watcher_session!r} has {len(rows)} panes; "
+                "expected exactly 1"
+            ),
+        }
+    dead, command = rows[0]
+    if dead != "0":
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"managed tmux session {watcher_session!r} has a dead pane",
+        }
+    expected = _expected_codex_notifier_entrypoint()
+    if not _command_runs_script(command, expected):
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"managed tmux session {watcher_session!r} runs an unexpected "
+                f"command; expected {expected.name}"
+            ),
+        }
+    return {
+        "name": name,
+        "status": "ok",
+        "detail": (
+            f"managed notifier healthy in {watcher_session!r} "
+            f"({expected.name})"
+        ),
+    }
+
+
+def check_codex_task_notifier() -> dict:
+    """Detect a missing managed notifier even when a bare watcher looks alive."""
+    if not _codex_runtime_selected():
+        return {
+            "name": "codex-task-notifier",
+            "status": "ok",
+            "detail": "Codex runtime not selected — notifier not expected",
+        }
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return {
+            "name": "codex-task-notifier",
+            "status": "ok",
+            "detail": "no fresh local core heartbeat — notifier not expected",
+        }
+    recorded_target = _local_codex_runtime_target(heartbeat)
+    if recorded_target is None:
+        return {
+            "name": "codex-task-notifier",
+            "status": "warn",
+            "detail": "fresh local Codex heartbeat has unusable runtime metadata",
+        }
+    target = _local_codex_core_target(recorded_target)
+    if target is None:
+        return {
+            "name": "codex-task-notifier",
+            "status": "warn",
+            "detail": (
+                "fresh local Codex runtime recorded, but its exact live tmux "
+                "session could not be verified"
+            ),
+        }
+    return _probe_codex_task_notifier(target)
+
+
+def fix_codex_task_notifier() -> str:
+    """Delegate notifier-only recovery to the canonical runtime launcher.
+
+    Calling the launcher without `--restart` preserves the verified live Codex
+    core. On current main, the launcher recreates a missing watcher session.
+    Other unhealthy existing-session shapes are still detected, but recovery
+    depends on the launcher's topology support (for example, #2280's stale
+    session replacement); the post-launch probe reports them as not repaired
+    rather than claiming success.
+    """
+    # Re-check config inside the side-effecting function. It may have changed
+    # since run_all_checks() took its snapshot; the dispatcher would otherwise
+    # interpret that drift as a request to restart Core into another runtime.
+    if not _codex_runtime_selected():
+        return "not repaired — Codex runtime is not selected"
+    target = _local_codex_core_target()
+    if target is None:
+        return "not repaired — no verified local Codex core"
+    current = _probe_codex_task_notifier(target)
+    if current["status"] == "ok":
+        return "already healthy"
+    launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"
+    if not launcher.is_file():
+        return "not repaired — canonical launcher is missing"
+    env = _resolve_launch_env()
+    env["SUTANDO_TMUX_SOCKET"] = target["socket"]
+    env["SUTANDO_TMUX_SESSION"] = target["session"]
+    env["SUTANDO_CORE_RUNTIME"] = "codex"
+    try:
+        launched = subprocess.run(
+            ["/bin/bash", str(launcher)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as error:  # noqa: BLE001
+        return f"not repaired — launcher failed ({type(error).__name__})"
+    if launched.returncode != 0:
+        detail = (launched.stderr or launched.stdout).strip().splitlines()
+        suffix = f": {detail[-1][:120]}" if detail else ""
+        return f"not repaired — launcher exited {launched.returncode}{suffix}"
+
+    verified = _local_codex_core_target()
+    if verified != target:
+        return "not repaired — local Codex core changed during repair"
+    after = _probe_codex_task_notifier(target)
+    if after["status"] != "ok":
+        return f"not repaired — {after['detail']}"
+    return "repaired managed notifier; live core session preserved"
+
+
 def check_notes_split_brain() -> "dict | None":
     """Detect notes/ split-brain (#1266): overlapping .md files in both
     <repo>/notes/ and <workspace>/notes/ — fires only when the two paths differ."""
@@ -2196,6 +2642,9 @@ def run_all_checks() -> list[dict]:
     # Quota telemetry — only meaningful when the proxy is actually up.
     checks.append(check_quota_telemetry(proxy_check["status"]))
 
+    # G1.5: which Node would JS services resolve to (bundled/app-bundle/
+    # system), red when none — the silent-dead-services failure class.
+    checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
 
@@ -2542,6 +2991,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_task_watcher())
+    checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_disk_space())
 
@@ -3586,6 +4036,18 @@ def main():
 
     checks = run_all_checks()
     issues = [c for c in checks if c["status"] not in ("ok", "warn")]
+    codex_notifier = (
+        next(
+            (
+                c
+                for c in checks
+                if c["name"] == "codex-task-notifier" and c["status"] == "warn"
+            ),
+            None,
+        )
+        if do_fix
+        else None
+    )
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
@@ -3651,7 +4113,7 @@ def main():
                 pass
             else:
                 sys.exit(1)
-        else:
+        elif codex_notifier is None:
             sys.exit(0)
 
     # Human-readable
@@ -3750,7 +4212,7 @@ def main():
                         and "not running" in (c.get("detail") or "")
                         and binary.exists()
                         and source.exists()
-                        and binary.stat().st_mtime >= source.stat().st_mtime
+                        and _binary_is_current(binary, source)
                     ):
                         try:
                             subprocess.run(["/usr/bin/open", str(binary)],
@@ -3815,6 +4277,13 @@ def main():
                    and "not running" in (c.get("detail") or "")), None)
         if sc:
             print(f"  screen-capture: {fix_screen_capture()}")
+
+    # The managed Codex notifier is warn-only, like the generic task watcher:
+    # a missing bridge does not mean Core itself is down. It is still safe to
+    # repair under --fix because fix_codex_task_notifier() re-verifies the live
+    # local Codex session and delegates topology to the canonical launcher.
+    if codex_notifier:
+        print(f"  codex-task-notifier: {fix_codex_task_notifier()}")
 
     # Channel bridges have the same optional-component shape: "configured but
     # not running" is warn-only, so the fix loop above can't reach a dead

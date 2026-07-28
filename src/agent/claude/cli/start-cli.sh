@@ -66,7 +66,11 @@ tmux_core_session_running() {
 }
 
 core_claude_pids() {
-  pgrep -x claude 2>/dev/null | while read -r pid; do
+  # -a: BSD/macOS pgrep excludes the caller's ANCESTORS by default, so when this
+  # script runs from inside the core (startup.sh via the core's own Bash tool)
+  # the live core is invisible → "core Claude is gone" → heal spawns a duplicate
+  # task consumer. `read -r pid _` tolerates procps -a's "pid cmdline" output.
+  pgrep -ax claude 2>/dev/null | while read -r pid _; do
     args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
     case "$args" in
       *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;

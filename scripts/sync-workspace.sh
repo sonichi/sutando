@@ -585,12 +585,12 @@ _refuse_staged_secrets() {
     return 0
 }
 
-# Snapshot the per-host config that LIVES at $CLAUDE_CONFIG_DIR into
+# Snapshot the per-host config from the canonical Claude config dir into
 # <workspace>/hosts/<host>/ so it's carried by the hosts/*/ vault glob and
-# survives a rebuild. settings.json and channel access.json are owned by Claude
-# Code / the bridges at $CLAUDE_CONFIG_DIR — they can't be relocated, so they're
-# *backed up* here (the live readers keep reading $CLAUDE_CONFIG_DIR; hosts/<host>/
-# is a pure backup → no read/write skew).
+# survives a rebuild. Startup exports this same path as CLAUDE_CONFIG_DIR for
+# Claude Code / the bridges. Resolve it from config here because launchd/cron
+# does not reliably inherit that export; falling back to ~/.claude would copy
+# stale pre-migration access state over the live backup.
 #
 # NOT snapshotted: PERSONAL_CLAUDE.md / stand-identity.json / tab-aliases.json —
 # those follow the RELOCATION model (migrator one-time move + personal_path /
@@ -602,7 +602,7 @@ _refuse_staged_secrets() {
 # returns 0, so a snapshot hiccup can never block the push.
 _snapshot_per_host_config() {
     local _cfg
-    _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path)" || return 0
+    _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-sutando-config-dir)" || return 0
     local _host_dir="$WORKSPACE_DIR/hosts/$(_host)"
     mkdir -p "$_host_dir" 2>/dev/null || return 0
 
