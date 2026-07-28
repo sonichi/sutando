@@ -156,6 +156,29 @@ except Exception as e:  # noqa: BLE001
     check("backup-write failure does not break load", False, str(e))
 rgb._TIER_MAP_BACKUP_FILE = BACKUP  # restore
 
+# ── 9. the backup is BORN 0600 — no world-readable write window (#2354 review) ─
+# A "final mode is 0600" check (guard 1) is blind to a write_text()-then-chmod()
+# sequence: the tmp is created at umask (world-readable) holding the authz data,
+# then narrowed. Discriminator: under a permissive umask AND with BOTH os.chmod
+# and os.fchmod neutralized, only a file created already-restricted (os.open with
+# mode 0o600) stays non-world-readable. A write-then-narrow impl would remain
+# 0o666 here and FAIL — which is exactly the window bug.
+_cold_process()
+rgb._TIER_MAP_BACKUP_FILE = BACKUP
+_rm_backup()
+_old_umask = os.umask(0o000)
+_orig_chmod, _orig_fchmod = os.chmod, os.fchmod
+try:
+    os.chmod = lambda *a, **k: None    # neutralize any post-write narrowing
+    os.fchmod = lambda *a, **k: None
+    rgb._backup_tier_map_to_disk({"@rick:ag2.space": "team"})
+    born_mode = stat.S_IMODE(os.stat(BACKUP).st_mode)
+finally:
+    os.chmod, os.fchmod = _orig_chmod, _orig_fchmod
+    os.umask(_old_umask)
+check("backup is BORN 0600 — no world/group-readable write window",
+      born_mode & 0o077 == 0, oct(born_mode))
+
 if failures:
     print(f"\n{len(failures)} FAILED: {failures}")
     sys.exit(1)

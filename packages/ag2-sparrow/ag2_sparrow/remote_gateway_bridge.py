@@ -453,9 +453,11 @@ def _backup_tier_map_to_disk(tm):
     legitimate owner state (they removed every down-tier), so it IS persisted and
     a later restart restores *that* — not a stale @rick. The good copy is never
     overwritten by a wipe because a wipe/corrupt access.json never reaches here —
-    _load_tier_map() returns on the read error before calling this. Written 0600
-    (the backup holds the same authorization data as access.json; a world-readable
-    copy would be a new exposure introduced by the fix). Atomic via per-PID tmp +
+    _load_tier_map() returns on the read error before calling this. Born 0600
+    (created already-restricted, never written-at-umask-then-narrowed — the backup
+    holds the same authorization data as access.json, so a world-readable copy,
+    even for the write window, would be a new exposure introduced by the fix).
+    Atomic via per-PID tmp +
     os.replace; best-effort — a backup failure must never break tier resolution
     (mirrors the slack allowlist backup, cd5c5db1 / #2163).
 
@@ -476,8 +478,19 @@ def _backup_tier_map_to_disk(tm):
         tmp = _TIER_MAP_BACKUP_FILE.with_name(
             f"{_TIER_MAP_BACKUP_FILE.name}.{os.getpid()}.tmp"
         )
-        tmp.write_text(json.dumps(tm, indent=2, sort_keys=True) + "\n")
-        os.chmod(tmp, 0o600)
+        payload = json.dumps(tm, indent=2, sort_keys=True) + "\n"
+        # Born 0600, NOT written-at-umask-then-chmod'd. A write_text()+os.chmod()
+        # sequence leaves a window where the tmp holds the same authorization data
+        # as access.json while world-readable (default umask → 0644) — a real
+        # exposure that a "final mode is 0600" assertion is blind to (#2354
+        # review, air). os.open with mode 0o600 creates the fd already-restricted
+        # (umask can only clear bits, and 0o600 has none to clear for group/other),
+        # and O_TRUNC empties any stale same-PID tmp before content lands; fchmod
+        # narrows that stale case too, all BEFORE the payload is written.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            os.fchmod(fh.fileno(), 0o600)
+            fh.write(payload)
         os.replace(tmp, _TIER_MAP_BACKUP_FILE)
     except Exception:
         pass
