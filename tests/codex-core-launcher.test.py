@@ -100,6 +100,7 @@ exit 0
 
     def run_launcher(self, *args, env_extra=None):
         env = dict(os.environ)
+        env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -119,6 +120,7 @@ exit 0
 
     def run_launcher_with_tty(self, *args, env_extra=None):
         env = dict(os.environ)
+        env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -165,7 +167,10 @@ exit 0
                 os.close(slave)
 
     def test_launches_codex_and_managed_task_notifier(self):
-        result = self.run_launcher(env_extra={"SUTANDO_CORE_MODEL": "gpt-test"})
+        result = self.run_launcher(env_extra={
+            "SUTANDO_CORE_MODEL": "gpt-test",
+            "SUTANDO_SELF_DEVELOPMENT_ENABLED": "0",
+        })
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text()
         self.assertIn("new-session -d -s sutando-core", calls)
@@ -178,6 +183,7 @@ exit 0
         self.assertIn("task-notifier-supervisor.sh", calls)
         self.assertIn("SUTANDO_NOTIFIER_VERSION=", calls)
         self.assertIn("CODEX_HOME=", calls)
+        self.assertIn("-e SUTANDO_SELF_DEVELOPMENT_ENABLED=0", calls)
         self.assertIn("has-session -t =sutando-core", calls)
         self.assertIn("has-session -t =sutando-core-watcher", calls)
 
@@ -201,6 +207,45 @@ exit 0
         calls = self.log.read_text()
         self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
                         calls.index("new-session -d -s sutando-core"))
+
+    def test_restart_loads_self_development_policy_from_dotenv(self):
+        (self.root / ".env").write_text("SUTANDO_SELF_DEVELOPMENT_ENABLED=0\n")
+        result = self.run_launcher("--restart", env_extra={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=0",
+            self.log.read_text(),
+        )
+
+    def test_ambient_self_development_policy_overrides_dotenv(self):
+        (self.root / ".env").write_text("SUTANDO_SELF_DEVELOPMENT_ENABLED=1\n")
+        result = self.run_launcher("--restart", env_extra={
+            "SUTANDO_SELF_DEVELOPMENT_ENABLED": "0",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=0",
+            self.log.read_text(),
+        )
+        self.assertNotIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=1",
+            self.log.read_text(),
+        )
+
+    def test_empty_ambient_self_development_policy_reaches_core_to_fail_closed(self):
+        (self.root / ".env").write_text("SUTANDO_SELF_DEVELOPMENT_ENABLED=1\n")
+        result = self.run_launcher("--restart", env_extra={
+            "SUTANDO_SELF_DEVELOPMENT_ENABLED": "",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=",
+            self.log.read_text(),
+        )
+        self.assertNotIn(
+            "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=1",
+            self.log.read_text(),
+        )
 
     def test_dispatcher_restarts_when_active_runtime_differs(self):
         result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "claude"})
