@@ -97,8 +97,15 @@ _ORG_HEADING = re.compile(
 # Anchored with ^ and \s* — a marker leads the title or it is not a marker. The
 # closed-bracket grammar (keyword then `]` or whitespace-then-content-then-`]`)
 # rejects `[RESOLVED?]` / `[done-ish]`, which named an open uncertainty.
+# `(?:\d+[.)]\s*)?` — real entries carry an enumeration prefix
+# ("## 2. [RESOLVED 2026-07-03] shipped already"), so the marker leads the title
+# CONTENT, not necessarily character 0. Anchoring at character 0 alone dropped
+# that form (caught by tests/morning-briefing-pending-extract.test.py). It stays
+# anchored otherwise: "render a [DONE] badge" has the bracket mid-sentence and is
+# still a live question.
 _INLINE_RESOLVED = re.compile(
-    r'^\s*\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]', re.IGNORECASE
+    r'^\s*(?:\d+[.)]\s*)?\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]',
+    re.IGNORECASE,
 )
 
 
