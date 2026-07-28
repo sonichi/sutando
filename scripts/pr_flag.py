@@ -42,7 +42,7 @@ def _ci_state(rollup) -> str:
     return "green"
 
 
-def classify_prs(prs: list, owner_login: str) -> list:
+def classify_prs(prs: list, owner_login: str, holds: dict | None = None) -> list:
     """Return the PRs that need the owner's action, each annotated with why+state.
 
     Scope = **PRs authored under the owner's identity** (`author == owner_login`),
@@ -61,6 +61,7 @@ def classify_prs(prs: list, owner_login: str) -> list:
 
     Output is sorted by PR number; each item is a plain dict (JSON-serializable).
     """
+    holds = holds or {}
     out = []
     for pr in prs:
         if pr.get("isDraft"):
@@ -85,10 +86,13 @@ def classify_prs(prs: list, owner_login: str) -> list:
             }
             approvers.discard(None)
             if ci == "green" and decision == "REVIEW_REQUIRED" and len(approvers) >= 1:
+                pcourt = "owner"
+                pwhy = f"peer PR, {len(approvers)} approval(s) — your approval unblocks the merge"
+                if str(num) in holds:  # I flagged issues on it — never show as ready
+                    pcourt, pwhy = "held", "held — " + holds[str(num)]
                 out.append({
                     "number": num, "title": pr.get("title", ""), "author": author,
-                    "court": "owner",
-                    "why": f"peer PR, {len(approvers)} approval(s) — your approval unblocks the merge",
+                    "court": pcourt, "why": pwhy,
                     "ci": ci, "mergeable": mergeable, "review": decision or "none",
                 })
             continue
@@ -112,6 +116,9 @@ def classify_prs(prs: list, owner_login: str) -> list:
             court, why = "owner", "green + approved + mergeable — ready for your merge"
         else:
             court, why = "agent", "open"
+
+        if str(num) in holds:  # I flagged issues — never present a held PR as ready
+            court, why = "held", "held — " + holds[str(num)]
 
         out.append({
             "number": num,
@@ -149,6 +156,7 @@ def render_digest(items: list, mention: str | None) -> str:
         return ""
     who = f"<@{mention}> " if mention else ""
     owner_court = [i for i in items if i["court"] == "owner"]
+    held = [i for i in items if i["court"] == "held"]
     agent_court = [i for i in items if i["court"] == "agent"]
     lines = []
     if owner_court:
@@ -157,6 +165,11 @@ def render_digest(items: list, mention: str | None) -> str:
             lines.append(f"🟢 **#{i['number']}** — {i['title'][:70]} (CI {i['ci']}, {i['review']})")
     else:
         lines.append(f"🚩 {who}**Nothing of mine is ready for your merge right now.**")
+    if held:
+        # PRs that are green/approved on paper but I flagged issues on — never
+        # presented as ready (the #2339 contradiction this prevents).
+        lines.append("\n⏸ **Held (I flagged issues — don't merge yet):** "
+                     + ", ".join(f"#{i['number']} ({i['why'].replace('held — ','')})" for i in held))
     if agent_court:
         lines.append(f"\n_On me ({len(agent_court)}): {', '.join('#'+str(i['number'])+' ('+i['why']+')' for i in agent_court)}_")
     return "\n".join(lines)
@@ -188,7 +201,17 @@ def main() -> int:  # pragma: no cover — CLI + gh/discord/state I/O glue; pure
     args = ap.parse_args()
 
     prs = _fetch_prs(args.repo)
-    items = classify_prs(prs, args.owner)
+    # hold-list: PRs I've flagged content issues on (str number → reason). A held
+    # PR is never shown as "ready", so the digest can't contradict my own review.
+    holds = {}
+    try:
+        ws = subprocess.run(["bash", "scripts/sutando-config.sh", "workspace"],
+                            capture_output=True, text=True, timeout=20).stdout.strip()
+        hp = (Path(ws) / "state" / "pr-flag-holds.json") if ws else Path("state/pr-flag-holds.json")
+        holds = json.loads(hp.read_text())
+    except Exception:
+        holds = {}
+    items = classify_prs(prs, args.owner, holds)
     digest = render_digest(items, args.mention)
     h = state_hash(items)
 

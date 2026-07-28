@@ -100,6 +100,18 @@ def main() -> int:
     assert gp[34]["court"] == "owner" and "2 approval" in gp[34]["why"], gp.get(34)
     print("  ok  peer 'one-approval-from-merge' set surfaces to owner court; rest excluded")
 
+    # HOLD-list: a PR I flagged issues on is never shown as ready — the #2339 contradiction.
+    held_mine = pf.classify_prs([_pr(10, OWNER, ci="green", mergeable="MERGEABLE")], OWNER,
+                                holds={"10": "2 bugs"})
+    assert held_mine[0]["court"] == "held" and "2 bugs" in held_mine[0]["why"], held_mine
+    held_peer = pf.classify_prs([_pr(30, "peer", review="REVIEW_REQUIRED", ci="green", approvers=["q"])], OWNER,
+                                holds={"30": "risky"})
+    assert held_peer[0]["court"] == "held", held_peer
+    d3 = pf.render_digest(held_mine, "999")
+    assert "Held (I flagged issues" in d3 and "#10" in d3, d3
+    assert "Ready for your merge" not in d3, "a held-only set must NOT print a 'ready' section: " + d3
+    print("  ok  held PRs render under 'Held', never as 'ready for merge'")
+
     # cover the remaining agent-court branches of classify_prs
     more = [
         _pr(20, OWNER, ci="failing"),                          # mine, CI failing
