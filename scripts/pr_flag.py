@@ -45,19 +45,22 @@ def _ci_state(rollup) -> str:
 def raw_state(prs: list, owner_login: str) -> list:
     """Objective per-PR state — NO judgement. Sorted by number.
 
-    Each record: number, title, author, is_mine, ci, mergeable, review, approvals.
-    `approvals` = count of distinct logins whose review state is APPROVED. These
-    are facts the agent then judges (is it ready? does the owner need it? caveats?).
+    Each record: number, title, author, is_mine, head, ci, mergeable, review,
+    approvals. `approvals` = count of distinct logins whose review state is
+    APPROVED on the current head. These are facts the agent then judges (is it
+    ready? does the owner need it? caveats?).
     """
     out = []
     for pr in prs:
         if pr.get("isDraft"):
             continue
         author = (pr.get("author") or {}).get("login", "")
+        head = pr.get("headRefOid") or ""
         approvers = {
             (r.get("author") or {}).get("login")
             for r in (pr.get("reviews") or [])
             if r.get("state") == "APPROVED"
+            and (r.get("commit") or {}).get("oid") == head
         }
         approvers.discard(None)
         out.append({
@@ -65,6 +68,7 @@ def raw_state(prs: list, owner_login: str) -> list:
             "title": pr.get("title", ""),
             "author": author,
             "is_mine": author == owner_login,
+            "head": head,
             "ci": _ci_state(pr.get("statusCheckRollup")),
             "mergeable": pr.get("mergeable") or "UNKNOWN",
             "review": pr.get("reviewDecision") or "none",
@@ -76,17 +80,18 @@ def raw_state(prs: list, owner_login: str) -> list:
 
 def state_hash(state: list) -> str:
     """Stable hash of the objective set. Changes when a PR appears/disappears or
-    any actionable field (ci/mergeable/review/approvals) flips; a title edit does
-    not refire."""
-    key = [[s["number"], s["is_mine"], s["ci"], s["mergeable"], s["review"], s["approvals"]]
+    any actionable field (head/ci/mergeable/review/approvals) flips; a title
+    edit does not refire."""
+    key = [[s["number"], s["is_mine"], s["head"], s["ci"], s["mergeable"], s["review"], s["approvals"]]
            for s in state]
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
 
 
-def _fetch_prs(repo: str) -> list:  # pragma: no cover — subprocess/gh glue
+def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
     cmd = [
-        "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "50",
-        "--json", "number,title,author,mergeable,reviewDecision,statusCheckRollup,isDraft,reviews",
+        "gh", "pr", "list", "--repo", repo, "--state", "open",
+        "--author", owner_login, "--limit", "1000",
+        "--json", "number,title,author,headRefOid,mergeable,reviewDecision,statusCheckRollup,isDraft,reviews",
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:
@@ -107,7 +112,7 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     ap.add_argument("--state-file", default=None)
     args = ap.parse_args()
 
-    state = raw_state(_fetch_prs(args.repo), args.owner)
+    state = raw_state(_fetch_prs(args.repo, args.owner), args.owner)
     h = state_hash(state)
 
     # dedup: resolve the stored-hash file the same way every reader does

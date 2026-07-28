@@ -23,7 +23,9 @@ pf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pf)
 
 
-def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=False, title="t", approvers=()):
+def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=False,
+        title="t", head=None, approvers=(), stale_approvers=()):
+    head = head or f"head-{number}"
     rollup = []
     if ci == "green":
         rollup = [{"status": "COMPLETED", "conclusion": "SUCCESS"}]
@@ -34,8 +36,13 @@ def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=Fals
     return {
         "number": number, "title": title, "author": {"login": author},
         "reviewDecision": review, "statusCheckRollup": rollup,
-        "mergeable": mergeable, "isDraft": draft,
-        "reviews": [{"author": {"login": a}, "state": "APPROVED"} for a in approvers],
+        "headRefOid": head, "mergeable": mergeable, "isDraft": draft,
+        "reviews": [
+            *[{"author": {"login": a}, "state": "APPROVED", "commit": {"oid": head}}
+              for a in approvers],
+            *[{"author": {"login": a}, "state": "APPROVED", "commit": {"oid": "old-head"}}
+              for a in stale_approvers],
+        ],
     }
 
 
@@ -63,7 +70,7 @@ def main() -> int:
     # objective fields, NO judgement fields (no court/why/ready/held)
     assert set(got) == {10, 11, 12, 13}, "draft excluded, rest present"
     for s in st:
-        assert set(s) == {"number", "title", "author", "is_mine", "ci", "mergeable", "review", "approvals"}, s
+        assert set(s) == {"number", "title", "author", "is_mine", "head", "ci", "mergeable", "review", "approvals"}, s
         assert "court" not in s and "why" not in s and "ready" not in s, "script must emit NO judgement: " + str(s)
     print("  ok  raw_state emits objective fields only — no judgement")
 
@@ -86,7 +93,13 @@ def main() -> int:
     assert pf.state_hash(st_ci) != h1, "a CI flip MUST refire"
     st_appr = pf.raw_state([(_pr(12, "peer", review="REVIEW_REQUIRED", ci="green", approvers=["qingyun"]) if p["number"] == 12 else p) for p in prs], OWNER)
     assert pf.state_hash(st_appr) != h1, "an approvals change MUST refire"
-    print("  ok  dedup hash: stable on title, flips on ci / approvals change")
+    st_head = pf.raw_state([(_pr(12, "peer", review="REVIEW_REQUIRED", ci="green",
+                                head="new-head", approvers=["qingyun", "rui"])
+                             if p["number"] == 12 else p) for p in prs], OWNER)
+    assert pf.state_hash(st_head) != h1, "a head change MUST refire"
+    stale = pf.raw_state([_pr(15, "peer", approvers=["rui"], stale_approvers=["qingyun"])], OWNER)
+    assert stale[0]["approvals"] == 1, "stale-head approvals must not be counted"
+    print("  ok  dedup hash flips on ci / approvals / head; stale approvals excluded")
 
     # empty repo → empty state, stable hash
     assert pf.raw_state([], OWNER) == []
