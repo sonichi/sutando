@@ -285,6 +285,40 @@ ok "exactly 2 session-handoff hooks remain (ours + the operator's)" \
    "$([ "$(bcount)" = 2 ] && echo 0 || echo 1)"
 rm -rf "$BROOT"
 
+# --- 10. a hook with NO repo path must never be swept ------------------------
+# Phase 0 exists to migrate entries whose PATH went stale. The transcript-archive
+# hook embeds no repo path at all ($HOME only), so nothing about it can go stale
+# and sweeping it can only destroy someone else's command. With a wildcard shape
+# the `.*` spanned the SOURCE ARGUMENT, so an operator archiving from a different
+# variable matched "our shape" and was deleted and replaced on re-run.
+CROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks archive.XXXXXX")"
+CREPO="$CROOT/repo with spaces"
+mkdir -p "$CREPO/src" "$CREPO/.claude"
+cp "$INSTALLER" "$CREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\necho "HANDOFF-RAN"\n' > "$CREPO/src/session-handoff.sh"
+printf '#!/bin/bash\necho "PENDING-RAN"\n' > "$CREPO/src/check-pending-tasks.sh"
+chmod +x "$CREPO/src/"*.sh
+export C_SETTINGS="$CREPO/.claude/settings.json"
+python3 - <<'PY'
+import json, os
+json.dump({"hooks": {"PreCompact": [{"hooks": [{"type": "command", "command":
+    'cp "$CUSTOM_TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'
+}]}]}}, open(os.environ["C_SETTINGS"], "w"), indent=2)
+PY
+bash "$CREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+CCMDS="$(python3 -c "
+import json, os
+d = json.load(open(os.environ['C_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks'].get('PreCompact', []) for h in g['hooks']))
+")"
+ok "operator's custom transcript-archive command survives re-run" \
+   "$(echo "$CCMDS" | grep -q 'CUSTOM_TRANSCRIPT_PATH' && echo 0 || echo 1)"
+ok "our archive hook is still installed alongside it" \
+   "$(echo "$CCMDS" | grep -q '"\$TRANSCRIPT_PATH".*sutando-conversations' && echo 0 || echo 1)"
+ok "and the repo-path hook is still installed on the same event" \
+   "$(echo "$CCMDS" | grep -q 'session-handoff' && echo 0 || echo 1)"
+rm -rf "$CROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then

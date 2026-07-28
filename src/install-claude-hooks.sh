@@ -153,6 +153,37 @@ for entry in "${HOOKS[@]}"; do
   MARKER="${REST%%|*}"
   CMD="${REST#*|}"
 
+  # PHASE 0 ONLY APPLIES TO HOOKS THAT EMBED THE REPO PATH.
+  #
+  # The whole point of the sweep is migrating entries whose *path* is stale — a
+  # legacy $HOME/Desktop clone, an unquoted form, another checkout. A hook with no
+  # repo path in it has nothing that can go stale, so there is nothing to migrate
+  # and sweeping can only ever destroy someone else's command.
+  #
+  # The transcript-archive hook is exactly that case: its marker is only
+  # `sutando-conversations/` and its command is all $HOME. With a wildcard shape,
+  # the `.*` spans the SOURCE ARGUMENT rather than a path, so an operator's
+  #     cp "$CUSTOM_TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/…"
+  # differed from ours only inside the wildcard and was deleted and replaced on
+  # re-run — silently discarding their archival policy. Reproduced on b21d2bf.
+  #
+  # An earlier revision of this file handled this with an explicit "no repo path
+  # → exact match" branch. Rewriting the shape structurally dropped that branch
+  # and applied the wildcard uniformly; this restores the case as a skip, which
+  # states the intent instead of encoding it as an unreachable pattern.
+  # Compare against the ESCAPED body, not the raw path. `shq` wraps in single
+  # quotes and rewrites an internal `'` as `'\''`, so on a checkout at
+  # /repo'quote the command embeds `/repo'\''quote` and a raw `$REPO_DIR` test
+  # never matches — the guard would then skip the sweep for the very hooks it
+  # must run on. That is the same raw-vs-escaped confusion that produced the
+  # apostrophe bug this file already fixed once; it is a property of shq, so
+  # every comparison against an embedded path has to go through it.
+  ESC="$(shq "$REPO_DIR")"; ESC="${ESC#\'}"; ESC="${ESC%\'}"
+  case "$CMD" in
+    *"$ESC"*) ;;
+    *) continue ;;
+  esac
+
   # Build the shape from the command's STRUCTURE, never by stripping quotes.
   #
   # Quote-stripping was lossy and wrong: `shq` escapes an apostrophe in the repo
