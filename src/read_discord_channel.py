@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from util_paths import claude_home_path  # canonical ~/.claude/ resolver (no hand-rolled paths)
+from discord_http import request_json  # 429 Retry-After + 5xx backoff wrapper
 
 ACCESS_FILE = claude_home_path("channels", "discord", "access.json")
 ENV_FILE = claude_home_path("channels", "discord", ".env")
@@ -84,8 +85,8 @@ def _api_get(path, token):
         "Authorization": f"Bot {token}",
         "User-Agent": "DiscordBot (https://github.com/sonichi/sutando, 1.0)",
     })
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read().decode("utf-8"))
+    # 429 Retry-After + transient 5xx backoff so a rate limit doesn't abort the read.
+    return request_json(req, timeout=10)
 
 
 def resolve_guild(target_channel_id, token):
