@@ -80,25 +80,35 @@ if (cmd === 'post' && !arg) {
 
 const { app: CHROME_APP, bin: CHROME_BIN } = resolveChromium();
 
+/** PIDs of Google-Chrome-for-Testing procs holding THIS profile. Argv-safe:
+ *  pgrep runs via execFileSync (no shell), and PROFILE_DIR is matched in JS, so
+ *  a profile path with quotes/metacharacters can't break or inject a command
+ *  (qingyun review, #2133). */
+function pidsForProfile() {
+  let out = '';
+  try {
+    out = execFileSync('pgrep', ['-fl', 'Google Chrome for Testing'], { encoding: 'utf8' });
+  } catch {
+    return []; // pgrep exits 1 when nothing matches
+  }
+  return out
+    .split('\n')
+    .filter((l) => l.includes(`--user-data-dir=${PROFILE_DIR}`) && !l.includes('--type='))
+    .map((l) => l.trim().split(/\s+/)[0])
+    .filter(Boolean);
+}
+
 /** Kill any GCfT holding THIS profile and clear the SingletonLock, so the next
  *  launch (open or Playwright) doesn't collide on the single-instance lock. */
 function releaseProfileLock() {
   try {
-    const out = execSync(
-      `pgrep -fl "Google Chrome for Testing" | grep -F -- "--user-data-dir=${PROFILE_DIR}" | grep -v -- "--type=" | awk '{print $1}'`,
-      { encoding: 'utf8', shell: '/bin/bash' }
-    ).trim();
-    for (const pid of out.split('\n').filter(Boolean)) {
+    for (const pid of pidsForProfile()) {
       try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch {}
     }
   } catch {}
-  try { execSync('sleep 1'); } catch {}
+  try { execFileSync('sleep', ['1']); } catch {}
   try {
-    const out = execSync(
-      `pgrep -fl "Google Chrome for Testing" | grep -F -- "--user-data-dir=${PROFILE_DIR}" | grep -v -- "--type=" | awk '{print $1}'`,
-      { encoding: 'utf8', shell: '/bin/bash' }
-    ).trim();
-    for (const pid of out.split('\n').filter(Boolean)) {
+    for (const pid of pidsForProfile()) {
       try { process.kill(parseInt(pid, 10), 'SIGKILL'); } catch {}
     }
   } catch {}
@@ -163,7 +173,7 @@ if (cmd === 'login') {
   try { rmSync(SENTINEL, { force: true }); } catch {}
   const iters = parseInt(process.env.X_LOGIN_TIMEOUT_ITERS || '120', 10) || 120; // ~10min
   for (let i = 0; i < iters; i++) {
-    execSync('sleep 5');
+    execFileSync('sleep', ['5']);
     if (authTokenOnDisk() >= 1 || existsSync(SENTINEL)) {
       // Cookies are already flushed to disk (that's what we detected). Close the
       // GUI window so `check`/`post` can open the profile without a lock clash.
