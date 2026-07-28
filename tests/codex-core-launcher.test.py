@@ -25,13 +25,20 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
+            "src/util_paths.py",
             "src/watch-tasks-stream.sh",
+            "src/workspace_default.py",
             "src/sutando_config.py",
             "scripts/sutando-config.sh",
         ):
             target = self.root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REAL_REPO / rel, target)
+        reconciler = REAL_REPO / "skills/schedule-crons/scripts/reconcile_launchd.py"
+        if reconciler.exists():
+            target = self.root / "skills/schedule-crons/scripts/reconcile_launchd.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(reconciler, target)
         monitor = self.root / "src/core-input-watch.py"
         monitor.write_text(
             "import os, sys\n"
@@ -57,6 +64,31 @@ class CodexCoreLauncherTests(unittest.TestCase):
         self.bin.mkdir()
         self._write_exe("codex", '#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexit 0\n')
         self._write_exe("fswatch", '#!/bin/bash\nexit 0\n')
+        self._write_exe("uname", '#!/bin/bash\nprintf "Darwin\\n"\n')
+        self._write_exe("launchctl", '''#!/bin/bash
+if [ "${1:-}" = print ]; then
+  [ -f "$LAUNCHCTL_STATE" ]
+  exit
+fi
+exit 0
+''')
+        installer = self.root / "src/install-cron-runner-launchd.sh"
+        installer.write_text(
+            '#!/bin/bash\n'
+            'printf "installed\\n" >> "$INSTALL_LOG"\n'
+            'touch "$LAUNCHCTL_STATE"\n'
+        )
+        installer.chmod(0o755)
+        # Stub the heartbeat writer: the launcher must start it (it is the sole
+        # writer of state/cores/<host>.alive that cron-runner gates fires on).
+        # Record that it ran; exit immediately so no daemon lingers in the test.
+        (self.root / "src/core_heartbeat.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['HEARTBEAT_PID']).write_text(str(os.getpid()))\n"
+            "with open(os.environ['HEARTBEAT_LOG'], 'w') as f:\n"
+            "    f.write('heartbeat-started')\n"
+        )
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
@@ -87,6 +119,20 @@ exit 0
         path.write_text(body)
         path.chmod(0o755)
 
+    def _wait_for_heartbeat_exit(self):
+        pid_file = Path(self.tmp.name) / "heartbeat.pid"
+        deadline = time.monotonic() + 5
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(pid_file.exists(), "heartbeat stub did not record its pid")
+        pid = int(pid_file.read_text())
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.01)
+        self.fail(f"heartbeat stub pid {pid} did not exit")
     def _notifier_version(self):
         first = subprocess.check_output([
             "cksum",
@@ -108,15 +154,22 @@ exit 0
             "HOME": str(Path(self.tmp.name) / "home"),
             "SUTANDO_CORE_RUNTIME": "codex",
             "MONITOR_LOG": str(Path(self.tmp.name) / "monitor.log"),
+            "INSTALL_LOG": str(Path(self.tmp.name) / "install.log"),
+            "LAUNCHCTL_STATE": str(Path(self.tmp.name) / "launchctl-loaded"),
+            "HEARTBEAT_LOG": str(Path(self.tmp.name) / "heartbeat.log"),
+            "HEARTBEAT_PID": str(Path(self.tmp.name) / "heartbeat.pid"),
             "SCHEDULER_LOG": str(Path(self.tmp.name) / "scheduler.log"),
             "SUTANDO_CODEX_SCHEDULER_SCRIPT": str(self.root / "fake-codex-scheduler.py"),
             "SUTANDO_HOST_LABEL": "test-host",
         })
         env.update(env_extra or {})
-        return subprocess.run(
+        result = subprocess.run(
             ["/bin/bash", str(self.root / "src/agent/start-cli.sh"), *args],
             cwd=self.root, env=env, capture_output=True, text=True,
         )
+        if result.returncode == 0:
+            self._wait_for_heartbeat_exit()
+        return result
 
     def run_launcher_with_tty(self, *args, env_extra=None):
         env = dict(os.environ)
@@ -128,6 +181,11 @@ exit 0
             "HOME": str(Path(self.tmp.name) / "home"),
             "SUTANDO_CORE_RUNTIME": "codex",
             "MONITOR_LOG": str(Path(self.tmp.name) / "monitor.log"),
+            "INSTALL_LOG": str(Path(self.tmp.name) / "install.log"),
+            "LAUNCHCTL_STATE": str(Path(self.tmp.name) / "launchctl-loaded"),
+            "HEARTBEAT_LOG": str(Path(self.tmp.name) / "heartbeat.log"),
+            "HEARTBEAT_PID": str(Path(self.tmp.name) / "heartbeat.pid"),
+            "SUTANDO_HOST_LABEL": "test-host",
         })
         env.update(env_extra or {})
         master, slave = pty.openpty()
@@ -160,7 +218,12 @@ exit 0
                 elif process.poll() is not None:
                     break
             returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
-            return subprocess.CompletedProcess(process.args, returncode, output.decode(errors="replace"), "")
+            result = subprocess.CompletedProcess(
+                process.args, returncode, output.decode(errors="replace"), ""
+            )
+            if result.returncode == 0:
+                self._wait_for_heartbeat_exit()
+            return result
         finally:
             os.close(master)
             if slave >= 0:
@@ -200,6 +263,92 @@ exit 0
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
+    def test_reconciles_session_crons_before_codex_launch(self):
+        workspace = self.root / "workspace"
+        config = workspace / "hosts" / "test-host" / "crons.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps([
+            {"name": "main-loop", "cron": "*/5 * * * *", "prompt_skill": "proactive-loop"},
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "run"},
+        ]))
+        before = int(time.time())
+        result = self.run_launcher()
+        after = int(time.time())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = json.loads(config.read_text())
+        self.assertNotIn("launchd", entries[0])
+        self.assertIs(entries[1]["launchd"], True)
+        state = json.loads((workspace / "state/cron-runner-state.json").read_text())
+        self.assertGreaterEqual(state["digest"], before)
+        self.assertLessEqual(state["digest"], after)
+        self.assertEqual(
+            (Path(self.tmp.name) / "install.log").read_text().strip(),
+            "installed",
+        )
+        self.assertIn("durable schedules", result.stdout)
+
+    def test_failed_runner_install_does_not_transfer_schedule_ownership(self):
+        workspace = self.root / "workspace"
+        config = workspace / "hosts" / "test-host" / "crons.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps([
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "run"},
+        ]))
+        installer = self.root / "src/install-cron-runner-launchd.sh"
+        installer.write_text("#!/bin/bash\nexit 1\n")
+        installer.chmod(0o755)
+
+        result = self.run_launcher()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("runner failed to install", result.stderr)
+        self.assertNotIn("launchd", json.loads(config.read_text())[0])
+        self.assertFalse(
+            (workspace / "state/cron-runner-state.json").exists(),
+            "failed installation must not seed launchd-owned runner state",
+        )
+
+    def test_false_success_without_loaded_runner_does_not_transfer_ownership(self):
+        workspace = self.root / "workspace"
+        config = workspace / "hosts" / "test-host" / "crons.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps([
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "run"},
+        ]))
+        installer = self.root / "src/install-cron-runner-launchd.sh"
+        installer.write_text("#!/bin/bash\nexit 0\n")
+        installer.chmod(0o755)
+
+        result = self.run_launcher()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("failed post-install verification", result.stderr)
+        self.assertNotIn("launchd", json.loads(config.read_text())[0])
+        self.assertFalse(
+            (workspace / "state/cron-runner-state.json").exists(),
+            "an absent runner must not receive schedule ownership",
+        )
+
+    def test_starts_core_heartbeat_writer_on_launch(self):
+        # Regression for the missing-heartbeat case: ensure_durable_schedules
+        # installs the cron-runner, which reads state/cores/<host>.alive as its
+        # liveness gate and skips every due fire when it is absent. The launcher
+        # must therefore also start the sole .alive writer (core_heartbeat.py);
+        # otherwise a clean Codex launch migrates schedules then silently
+        # suppresses every fire.
+        marker = Path(self.tmp.name) / "heartbeat.log"
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The writer is backgrounded (&); give it a moment to record it ran.
+        deadline = time.time() + 5
+        while not marker.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(
+            marker.exists(),
+            "launcher did not start the core heartbeat writer",
+        )
+        self.assertEqual(marker.read_text(), "heartbeat-started")
 
     def test_restart_kills_core_and_notifier_before_launch(self):
         result = self.run_launcher("--restart")
