@@ -163,14 +163,25 @@ for entry in "${HOOKS[@]}"; do
   # apostrophe is legal in a path, so this is a real checkout, not a curiosity.
   #
   # Instead: anchor on the command word, the marker (already the stable
-  # structural token), and the literal tail that follows the marker. The path
-  # region is a wildcard and the closing quote is optional, so the quoted and
-  # unquoted forms both match while a customized command — extra flags, extra
-  # words — fails the trailing anchor and survives.
+  # structural token), and the literal tail that follows the marker.
+  #
+  # The region between the command word and the marker is THE PATH AND NOTHING
+  # ELSE. A bare `.*` there was too permissive in one direction: customization
+  # *after* the path fails the trailing anchor and survives, but customization
+  # *before* it — `bash -x <path>/src/session-handoff.sh "$TRANSCRIPT_PATH"` —
+  # was swallowed by the wildcard and swept as installer-owned. Reproduced:
+  # before rerun 2, after rerun 1, operator's `-x` hook gone.
+  #
+  # So the path region must START like a path: an optional opening quote, then a
+  # character that is neither a space nor `-`. That admits every form we write or
+  # have written — `/abs/...`, `'/quoted path/...'`, `'/repo'\''quote/...'`, and
+  # the legacy `$HOME/Desktop/...` — while a flag or wrapper token before the
+  # path fails immediately. Requiring a literal `/` would have been wrong: it
+  # rejects the legacy `$HOME/...` entries this sweep exists to migrate.
   CMD_WORD="${CMD%% *}"
   CMD_TAIL="${CMD#*"$MARKER"}"
   CMD_TAIL="${CMD_TAIL#[\"\']}"       # drop shq's closing quote, if present
-  SHAPE="^$(re_escape "$CMD_WORD") .*$(re_escape "$MARKER")[\"']?$(re_escape "$CMD_TAIL")\$"
+  SHAPE="^$(re_escape "$CMD_WORD") [\"']?[^ -].*$(re_escape "$MARKER")[\"']?$(re_escape "$CMD_TAIL")\$"
 
   if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" --arg shape "$SHAPE" \
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")

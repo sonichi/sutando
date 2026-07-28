@@ -231,6 +231,60 @@ ok "apostrophe path: the surviving command actually executes" \
    "$([ "$(TRANSCRIPT_PATH=/dev/null bash -c "$A_SURVIVOR" 2>&1)" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
 rm -rf "$AROOT"
 
+# --- 9. customization BEFORE the path (flags / wrappers) ---------------------
+# The trailing anchor protects customization that comes AFTER the script path.
+# It says nothing about customization BEFORE it: a bare wildcard between the
+# command word and the marker swallows `-x`, so an operator's `bash -x <path>/…`
+# was classified installer-owned and deleted (reproduced: before 2, after 1).
+# The path region must START like a path, so a flag token fails immediately —
+# while `$HOME/…`, which the legacy migration depends on, still qualifies.
+BROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks flag.XXXXXX")"
+BREPO="$BROOT/repo with spaces"
+mkdir -p "$BREPO/src" "$BREPO/.claude"
+cp "$INSTALLER" "$BREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\necho "HANDOFF-RAN"\n' > "$BREPO/src/session-handoff.sh"
+printf '#!/bin/bash\necho "PENDING-RAN"\n' > "$BREPO/src/check-pending-tasks.sh"
+chmod +x "$BREPO/src/"*.sh
+echo '{}' > "$BREPO/.claude/settings.json"
+bash "$BREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+
+export B_SETTINGS="$BREPO/.claude/settings.json" B_REPO="$BREPO"
+python3 - <<'PY'
+import json, os
+p = os.environ['B_SETTINGS']; repo = os.environ['B_REPO']
+d = json.load(open(p))
+d['hooks']['SessionEnd'][0]['hooks'] += [
+    # (a) operator ran the same script under a shell flag — must SURVIVE.
+    {'type': 'command',
+     'command': 'bash -x ' + repo + '/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+    # (b) legacy installer entry — must still be SWEPT (it starts with `$`,
+    #     so a naive "path must start with /" rule would wrongly spare it).
+    {'type': 'command',
+     'command': 'bash $HOME/Desktop/sutando/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+]
+json.dump(d, open(p, 'w'), indent=2)
+PY
+bcount() { python3 -c "
+import json, os
+d = json.load(open(os.environ['B_SETTINGS']))
+print(sum(1 for g in d['hooks']['SessionEnd'] for h in g['hooks'] if 'session-handoff' in h['command']))
+"; }
+ok "flag fixture: 3 session-handoff hooks before re-run (sanity)" \
+   "$([ "$(bcount)" = 3 ] && echo 0 || echo 1)"
+bash "$BREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+BSURV="$(python3 -c "
+import json, os
+d = json.load(open(os.environ['B_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks']['SessionEnd'] for h in g['hooks']))
+")"
+ok "operator hook with a flag BEFORE the path survives (bash -x)" \
+   "$(echo "$BSURV" | grep -q -- 'bash -x ' && echo 0 || echo 1)"
+ok "legacy \$HOME entry is still swept (rule must not require a literal /)" \
+   "$(echo "$BSURV" | grep -q 'Desktop/sutando/src/session-handoff' && echo 1 || echo 0)"
+ok "exactly 2 session-handoff hooks remain (ours + the operator's)" \
+   "$([ "$(bcount)" = 2 ] && echo 0 || echo 1)"
+rm -rf "$BROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then
