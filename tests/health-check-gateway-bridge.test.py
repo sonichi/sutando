@@ -136,7 +136,9 @@ def main() -> int:
           r["status"] == "warn" and "NOT running" in r["detail"], f"got {r!r}")
 
     # 7) _gateway_serving() parsing branches
-    import json as _json, time as _time, tempfile as _tf
+    import json as _json
+    import tempfile as _tf
+    import time as _time
     def _sc(body):
         f = Path(_tf.mkdtemp()) / "gateway-status.json"
         f.write_text(_json.dumps(body))
