@@ -126,36 +126,60 @@ ADDED=0
 SKIPPED=0
 REMOVED=0
 
-# Phase 0: remove STALE VARIANTS of hooks we own — any command carrying our
-# marker for this event that is not byte-identical to the command we are about
-# to install. This is what makes a re-run a real migration rather than an
-# add-only pass:
+# Escape a literal string so it can be embedded in a jq (Oniguruma) regex.
+re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
+
+# Phase 0: remove STALE VARIANTS of hooks we own. This is what makes a re-run a
+# real migration rather than an add-only pass:
 #   * legacy "$HOME/Desktop/sutando/src/session-handoff.sh" entries;
 #   * the UNQUOTED form written by earlier revisions of this very script, which
 #     an exact-string comparison in phase 1 can never match (so both the broken
 #     and the fixed hook would fire);
 #   * an entry left behind by a different clone of this repo.
 # It runs BEFORE phase 1 so the freshly-added current command is never swept.
-# Scoped by marker, so a hook the operator added by hand is untouched.
+#
+# OWNERSHIP TEST — the load-bearing part. "Carries our marker" is NOT ownership:
+# an operator hook that invokes the same script (say, with an extra flag) also
+# contains it, and an earlier revision of this sweep deleted exactly those. We
+# therefore sweep only commands matching the SHAPE THIS INSTALLER WRITES: the
+# current command with the repo path replaced by a wildcard, anchored at both
+# ends, compared with quotes normalized away so the quoted and unquoted forms
+# both match. A customized command has extra text and fails the trailing anchor,
+# so it survives. Sweeping a *different clone's* entry is intended — that shape
+# is installer-generated, just not by this checkout.
 for entry in "${HOOKS[@]}"; do
   EVENT="${entry%%|*}"
   REST="${entry#*|}"
   MARKER="${REST%%|*}"
   CMD="${REST#*|}"
 
-  if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
+  # Quotes are stripped for MATCHING ONLY; nothing is ever rewritten from this.
+  CMD_NQ="$(printf '%s' "$CMD" | tr -d "\"'")"
+  if [ "${CMD_NQ#*"$REPO_DIR"}" != "$CMD_NQ" ]; then
+    SHAPE="^$(re_escape "${CMD_NQ%%"$REPO_DIR"*}").*$(re_escape "${CMD_NQ#*"$REPO_DIR"}")\$"
+  else
+    # No repo path in this command (e.g. the $HOME transcript archive) — the
+    # only variant we own is a pure quoting difference.
+    SHAPE="^$(re_escape "$CMD_NQ")\$"
+  fi
+
+  if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" --arg shape "$SHAPE" \
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
-       | map(contains($marker) and (. != $cmd)) | any' \
+       | map(contains($marker) and (. != $cmd) and ((gsub("[\"'"'"']"; "")) | test($shape)))
+       | any' \
       "$SETTINGS" >/dev/null 2>&1; then
     continue
   fi
 
   TMP="$(mktemp "${SETTINGS}.XXXXXX")"
-  jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" '
+  jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" --arg shape "$SHAPE" '
     if (.hooks // {})[$event] then
       .hooks[$event] |= map(
         .hooks |= map(select(
-          ((.command // "") | contains($marker)) and ((.command // "") != $cmd) | not
+          ((.command // "") | contains($marker))
+          and ((.command // "") != $cmd)
+          and (((.command // "") | gsub("[\"'"'"']"; "")) | test($shape))
+          | not
         ))
       )
       | .hooks[$event] |= map(select((.hooks // []) | length > 0))

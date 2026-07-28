@@ -126,6 +126,64 @@ ok "unquoted stale variant swept on re-run" \
 ok "the surviving SessionEnd hook is the QUOTED one that runs" \
    "$([ "$(TRANSCRIPT_PATH=/dev/null bash -c "$(cmds SessionEnd | grep session-handoff)" 2>&1)" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
 
+# --- 7. the sweep must not eat hooks it does not own -------------------------
+# Carrying our marker is NOT ownership: an operator hook that invokes the same
+# script with an extra flag also contains it. An earlier revision of the sweep
+# deleted exactly those — silently, since a removed hook leaves no trace. These
+# are the negative controls: without them the sweep only ever demonstrates what
+# it CAN delete, never what it must refuse to.
+python3 - "$SETTINGS" "$REPO" <<'PY'
+import json, sys
+p, repo = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["hooks"]["SessionEnd"][0]["hooks"] += [
+    # (a) same script, operator-customized with a trailing flag.
+    {"type": "command",
+     "command": f'bash {repo}/src/session-handoff.sh "$TRANSCRIPT_PATH" --verbose'},
+    # (b) same marker, entirely different command shape.
+    {"type": "command",
+     "command": f'echo custom && bash {repo}/src/session-handoff.sh'},
+    # (c) same script under a path that is not this clone, wrapped by the operator.
+    {"type": "command",
+     "command": 'env FOO=1 bash "/somewhere else/src/session-handoff.sh" "$TRANSCRIPT_PATH"'},
+]
+json.dump(d, open(p, "w"), indent=2)
+PY
+bash "$REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+SURVIVORS="$(cmds SessionEnd)"
+ok "operator hook with a trailing flag survives the sweep" \
+   "$(echo "$SURVIVORS" | grep -q -- '--verbose' && echo 0 || echo 1)"
+ok "operator hook with a different command shape survives the sweep" \
+   "$(echo "$SURVIVORS" | grep -q 'echo custom' && echo 0 || echo 1)"
+ok "operator-wrapped hook for another path survives the sweep" \
+   "$(echo "$SURVIVORS" | grep -q 'env FOO=1' && echo 0 || echo 1)"
+# Ours = the session-handoff commands that are not one of the three operator
+# fixtures. Counted by subtraction rather than by matching $REPO literally: the
+# installer normalizes its stored path (mktemp can yield a `//`), so a literal
+# comparison against the fixture path fails for a reason that has nothing to do
+# with the sweep.
+ok "our own hook is still installed exactly once alongside them" \
+   "$([ "$(( $(echo "$SURVIVORS" | grep -c session-handoff) - $(echo "$SURVIVORS" | grep -cE -- '--verbose|echo custom|env FOO=1') ))" = 1 ] && echo 0 || echo 1)"
+ok "and ours is still the one that actually executes" \
+   "$([ "$(TRANSCRIPT_PATH=/dev/null bash -c "$(echo "$SURVIVORS" | grep session-handoff | grep -vE -- '--verbose|echo custom|env FOO=1')" 2>&1)" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
+
+# A stale INSTALLER-SHAPED entry from a different clone must still be swept —
+# the fix must not be "stop sweeping", it must be "sweep only our own shapes".
+python3 - "$SETTINGS" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["hooks"]["SessionEnd"][0]["hooks"].append(
+    {"type": "command",
+     "command": 'bash /a different clone/src/session-handoff.sh "$TRANSCRIPT_PATH"'})
+json.dump(d, open(p, "w"), indent=2)
+PY
+bash "$REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+ok "another clone's installer-shaped entry is still swept" \
+   "$(cmds SessionEnd | grep -q 'a different clone' && echo 1 || echo 0)"
+ok "sweeping it did not take the operator hooks with it" \
+   "$([ "$(cmds SessionEnd | grep -cE -- '--verbose|echo custom|env FOO=1')" = 3 ] && echo 0 || echo 1)"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then
