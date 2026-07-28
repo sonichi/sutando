@@ -107,6 +107,39 @@ with tempfile.TemporaryDirectory() as td:
         f"got: {(res_twin or {}).get('detail', '')}",
     )
 
+with tempfile.TemporaryDirectory() as td:
+    # 5. No projects/ dir at all (fresh install) -> silent, not a crash.
+    home = Path(td) / "claude"
+    home.mkdir(parents=True)
+    hc3 = load_hc(home, home / "projects" / "-x" / "memory")
+    check("missing projects/ dir is silent", hc3.check_memory_dir_siblings() is None)
+
+with tempfile.TemporaryDirectory() as td:
+    # 6. A project dir with no memory/ subdir is skipped, not counted.
+    #    (Every project dir Claude Code creates starts this way.)
+    home = Path(td) / "claude"
+    projects = home / "projects"
+    live = seed(projects / "-repo-slug" / "memory", 5)
+    (projects / "-no-memory-subdir").mkdir(parents=True)
+    hc4 = load_hc(home, live)
+    check("project dir without memory/ is skipped", hc4.check_memory_dir_siblings() is None)
+
+with tempfile.TemporaryDirectory() as td:
+    # 7. The live dir itself does not exist yet, but a sibling is populated.
+    #    Must still report, with a live count of 0 rather than crashing — this is
+    #    exactly the shape of a misconfigured MEMORY_DIR, the case worth catching.
+    home = Path(td) / "claude"
+    projects = home / "projects"
+    seed(projects / "-populated-elsewhere" / "memory", 9)
+    hc5 = load_hc(home, projects / "-does-not-exist" / "memory")
+    res5 = hc5.check_memory_dir_siblings()
+    check("missing live dir still reports the sibling", res5 is not None and "9 .md" in res5["detail"])
+    check(
+        "missing live dir reports 0 for itself",
+        res5 is not None and "(0 .md)" in res5["detail"],
+        (res5 or {}).get("detail", ""),
+    )
+
 print()
 if failures:
     print(f"FAILED ({len(failures)}): " + ", ".join(failures))
