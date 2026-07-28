@@ -78,7 +78,15 @@ def _code_part(s):
             q = ch
         elif ch == "#":
             return s[:i]
-        elif ch == "/" and s[i:i + 2] == "//":
+        elif ch == "/" and s[i:i + 2] in ("//", "/*"):
+            # `/*` as well as `//`: handling only the two line-comment syntaxes
+            # left the same bypass open in a third, and a companion promised in
+            # `/* … */` is no more executable than one in `//`. Everything from
+            # the opener onward is dropped rather than matching a closing `*/` —
+            # the question is only "does the CODE run the companion", and text
+            # after a same-line `*/` re-opening code is not a shape this rule
+            # needs to bless. Erring toward less code is safe here: it can only
+            # withhold the exemption, never grant one.
             return s[:i]
         i += 1
     return s

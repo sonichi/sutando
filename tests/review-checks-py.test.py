@@ -232,6 +232,23 @@ ok("paired: a real candidate list is still exempt after comment-stripping",
 ok("paired: candidate list with a trailing comment is still exempt",
    rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
                      "F = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg']  # portable"))
+
+# Handling only `#` and `//` left the identical bypass open in a THIRD syntax:
+# a companion promised inside `/* … */` is no more executable than one after `//`.
+ok("_code_part strips a /* block comment",
+   rc._code_part('X = "/opt/homebrew/bin/ffmpeg"; /* /usr/local/bin/ffmpeg */')
+   == 'X = "/opt/homebrew/bin/ffmpeg"; ')
+ok("paired: companion only in a /* */ comment is NOT exempt",
+   not rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                         'const F = "/opt/homebrew/bin/ffmpeg"; /* fallback: /usr/local/bin/ffmpeg */'))
+ok("_code_part keeps /* inside a string literal",
+   rc._code_part('U = "a/*b"; V = "/usr/local/bin/ffmpeg"')
+   == 'U = "a/*b"; V = "/usr/local/bin/ffmpeg"')
+# Over-narrowing control for this syntax too: a real candidate list followed by
+# a block comment must still qualify — the companion is in the CODE before it.
+ok("paired: candidate list followed by a /* */ comment is still exempt",
+   rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                     "F = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg']  /* portable */"))
 ok("paired: a token with no basename is NOT exempt",
    not rc.paired_allowed("/opt/homebrew/", 'X = "/opt/homebrew/"; Y = "/usr/local/"'))
 ok("paired: an unrelated prefix is untouched by the paired rule",
