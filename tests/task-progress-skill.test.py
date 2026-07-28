@@ -528,7 +528,8 @@ class TestChannelEnvContainment(unittest.TestCase):
         real.write_text("REMOTE_TASK_URL=https://file/relay\nREMOTE_TASK_TOKEN=filetok\n")
         (ch / ".env").symlink_to(real)          # channel entry pointing out of the tree
         self._saved = {k: os.environ.get(k) for k in
-                       ("CLAUDE_CONFIG_DIR", "REMOTE_TASK_URL", "REMOTE_TASK_TOKEN")}
+                       ("CLAUDE_CONFIG_DIR", "REMOTE_TASK_URL", "REMOTE_TASK_TOKEN",
+                        "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")}
         os.environ["CLAUDE_CONFIG_DIR"] = str(self.tmp)
 
     def tearDown(self):
@@ -554,6 +555,27 @@ class TestChannelEnvContainment(unittest.TestCase):
         os.environ["REMOTE_TASK_URL"] = "https://chat.example/relay"
         os.environ["REMOTE_TASK_TOKEN"] = "envtok"
         self.assertFalse(self._refused())
+
+
+    def test_combined_token_only_is_not_refused(self):
+        """Regression for the #2355 review P1: the documented ONE-TOKEN onboarding
+        form (REMOTE_TASK_TOKEN=https://gw|secret, no separate REMOTE_TASK_URL) is a
+        fully env-configured send. Checking only the split URL+TOKEN pair missed it,
+        so a symlinked-out channel .env still refused it over a file never needed."""
+        os.environ.pop("REMOTE_TASK_URL", None)
+        os.environ["REMOTE_TASK_TOKEN"] = "https://env.example/relay|envtok"
+        self.assertFalse(self._refused())
+
+    def test_legacy_alias_combined_token_is_not_refused(self):
+        """Same for the legacy AG2_REMOTE_TOKEN alias — it is resolved before the
+        file too, so it must not trip the containment guard either."""
+        for k in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN"):
+            os.environ.pop(k, None)
+        os.environ["AG2_REMOTE_TOKEN"] = "https://legacy.example/relay|legacytok"
+        try:
+            self.assertFalse(self._refused())
+        finally:
+            os.environ.pop("AG2_REMOTE_TOKEN", None)
 
     def test_guard_still_fires_when_the_file_is_needed(self):
         """The control. Without env values the file IS consulted, so an entry
