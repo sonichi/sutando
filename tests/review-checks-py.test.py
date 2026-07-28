@@ -198,6 +198,40 @@ ok("paired: coincidental companion of a DIFFERENT name is NOT exempt",
 ok("paired: mismatched basename is NOT exempt",
    not rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
                          'A = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffprobe")'))
+
+# --- a companion promised in a COMMENT is not a fallback ----------------------
+# The pairing rule asks "does this line ALSO run the companion?" — only code can
+# answer. Scanning the raw line let a comment satisfy it, so a naked
+# Apple-Silicon-only literal passed the gate with `/usr/local` merely mentioned
+# in prose. That is the exact blind spot the rule exists to close.
+ok("_code_part strips a // comment",
+   rc._code_part('X = "/opt/homebrew/bin/ffmpeg"; // /usr/local/bin/ffmpeg')
+   == 'X = "/opt/homebrew/bin/ffmpeg"; ')
+ok("_code_part strips a # comment",
+   rc._code_part('X = "/opt/homebrew/bin/ffmpeg"  # /usr/local/bin/ffmpeg')
+   == 'X = "/opt/homebrew/bin/ffmpeg"  ')
+# Must NOT truncate on a marker inside a string literal, or a URL would sever
+# the line and silently drop real code from the companion search.
+ok("_code_part keeps // inside a string literal (URL)",
+   rc._code_part('U = "https://x.example/a"; V = "/usr/local/bin/ffmpeg"')
+   == 'U = "https://x.example/a"; V = "/usr/local/bin/ffmpeg"')
+ok("_code_part keeps # inside a string literal (fragment)",
+   rc._code_part('U = "https://x.example/a#frag"')
+   == 'U = "https://x.example/a#frag"')
+ok("paired: companion only in a // comment is NOT exempt",
+   not rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                         'const F = "/opt/homebrew/bin/ffmpeg"; // fallback: /usr/local/bin/ffmpeg'))
+ok("paired: companion only in a # comment is NOT exempt",
+   not rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                         'F = "/opt/homebrew/bin/ffmpeg"  # fallback /usr/local/bin/ffmpeg'))
+# The over-narrowing control: the real candidate list must STILL be exempt.
+# Without this, "stop honouring the pairing at all" would pass every case above.
+ok("paired: a real candidate list is still exempt after comment-stripping",
+   rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                     "FFMPEG = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', 'ffmpeg']"))
+ok("paired: candidate list with a trailing comment is still exempt",
+   rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                     "F = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg']  # portable"))
 ok("paired: a token with no basename is NOT exempt",
    not rc.paired_allowed("/opt/homebrew/", 'X = "/opt/homebrew/"; Y = "/usr/local/"'))
 ok("paired: an unrelated prefix is untouched by the paired rule",

@@ -50,6 +50,40 @@ def _tokens(s):
     return out
 
 
+def _code_part(s):
+    """The line with any trailing comment removed.
+
+    The paired allow asks "does this line ALSO run the companion path?" — a
+    question only executable text can answer. Scanning the raw line let a
+    *comment* satisfy it:
+
+        const FFMPEG = "/opt/homebrew/bin/ffmpeg"; // TODO fallback: /usr/local/bin/ffmpeg
+
+    which passed the gate while the executable value was still
+    Apple-Silicon-only — precisely the blind spot the pairing rule exists to
+    close. Quote-aware so a `#` or `//` inside a string literal (a URL, a
+    fragment) is not mistaken for a comment marker.
+    """
+    q = None
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if q:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+        elif ch == "#":
+            return s[:i]
+        elif ch == "/" and s[i:i + 2] == "//":
+            return s[:i]
+        i += 1
+    return s
+
+
 def paired_allowed(tok, line):
     """Contextual exemption for the portable candidate-list shape.
 
@@ -61,14 +95,18 @@ def paired_allowed(tok, line):
     whenever any unrelated '/usr/local/...' happened to share the line, which
     re-opens the blind spot this rule exists to close. A naked
     `X = "/opt/homebrew/bin/ffmpeg"` has no same-name companion and stays flagged.
+
+    The companion is sought in the line's CODE only (see `_code_part`): a
+    promise in a comment is not a fallback.
     """
     base = tok.rsplit("/", 1)[-1]
     if not base:
         return False
+    code = _code_part(line)
     for prefix, companion in paired:
         if not tok.startswith(prefix):
             continue
-        for other in _tokens(line):
+        for other in _tokens(code):
             if other.startswith(companion) and other.rsplit("/", 1)[-1] == base:
                 return True
     return False
