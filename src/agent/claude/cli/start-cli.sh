@@ -44,6 +44,12 @@ CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
 # where the two watch different tasks/ dirs. Companion to the resolver change
 # (#2094); conditional so non-bundled/OSS installs are untouched.
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
+# Product deployments can disable autonomous repo development while keeping
+# owner tasks, health checks, and the task watcher active. Explicitly forward
+# the override because tmux may use an older server environment.
+if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
+  CORE_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
+fi
 
 tmux_available() {
   command -v tmux > /dev/null 2>&1
