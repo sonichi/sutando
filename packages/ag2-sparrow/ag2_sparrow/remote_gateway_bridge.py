@@ -457,7 +457,18 @@ def _backup_tier_map_to_disk(tm):
     (the backup holds the same authorization data as access.json; a world-readable
     copy would be a new exposure introduced by the fix). Atomic via per-PID tmp +
     os.replace; best-effort — a backup failure must never break tier resolution
-    (mirrors the slack allowlist backup, cd5c5db1 / #2163)."""
+    (mirrors the slack allowlist backup, cd5c5db1 / #2163).
+
+    CHOSEN TRADEOFF (#2354 review): the good copy is preserved by entering the
+    caller's safe branch on a PARSE failure, not on "the map looks empty". So a
+    zero-byte or truncated access.json (the likely wipe shapes) preserves the
+    backup, but a writer that rewrites access.json as VALID JSON with no
+    `tierMap` key (or `tierMap: {}`) DOES clear it — byte-identical in effect to
+    a deliberate clear. This is unavoidable: "an owner's empty map must persist"
+    and "an empty map must never overwrite the backup" are the SAME input; you
+    cannot satisfy both by shape alone. A shape-independent fix would require
+    PROVENANCE (a generation counter or writer identity), out of scope here. A
+    cleared backup after such a write is therefore BY DESIGN, not a bug."""
     if not isinstance(tm, dict):
         return
     try:
