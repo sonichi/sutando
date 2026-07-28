@@ -53,6 +53,19 @@ so an open ask was classified resolved and vanished from notifier AND briefing).
 ## [DONE?] Still waiting for confirmation
 Same shape, second keyword.
 
+## HELD deployment until the owner approves the migration
+- **Status:** open
+
+A real ask whose title merely BEGINS with an organizer keyword. `^HELD\\b` treated
+it as a section shell and deleted it from both surfaces (review 2026-07-28).
+An organizer shell is a keyword plus a SEPARATOR, never a sentence.
+
+## Confirm whether the UI should render a [DONE] badge
+- **Status:** open
+
+A question ABOUT a marker. Searching for `[DONE]` anywhere in the title matched
+it; a resolution marker must LEAD the title or it is not a marker.
+
 # Resolved
 
 ## 2026-07-20T13:14Z — ✅ RESOLVED — this lives below the divider
@@ -73,6 +86,10 @@ MUST_COUNT = [
     # hyphens lets `?` through and silently deletes these from both surfaces.
     "[RESOLVED?] Did this actually ship?",
     "[DONE?] Still waiting",
+    # Shape controls: an organizer keyword that opens a real sentence, and a
+    # marker mentioned mid-title. Both are explicitly Status: open.
+    "HELD deployment until the owner",
+    "render a [DONE] badge",
 ]
 # Must NOT be counted: explicit status, organizer shell, below-divider.
 MUST_NOT_COUNT = ["an entry explicitly marked done", "organizer header",

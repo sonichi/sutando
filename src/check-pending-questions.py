@@ -74,36 +74,31 @@ def voice_client_connected():
 
 
 # A `## ` heading is not always a question. Two forms are structural, and both
-# must be classified HERE rather than by each consumer — morning-briefing.py used
-# to drop them locally, which meant the notifier and the briefing reported
-# different pending counts for the same file (notifier 2, briefing 1 on a corpus
-# with one active `[RESOLVED ...]` entry plus one open ask).
+# must be classified HERE rather than by each consumer, so the notifier and the
+# briefing cannot report different counts for the same file.
 #
-#   * organizer/section shells — "## ACTIVE — 2026-07-05", "## FRESH — …" — group
-#     questions but ask nothing;
-#   * an inline resolution MARKER in the title — "## [RESOLVED 2026-07-03] shipped".
-#     Matched as a bracketed marker, never as a bare substring: `'RESOLVED' in
-#     title` also fires on "design fully resolved, build on your nod" (an open ask)
-#     and on "NOT self-resolved", which asserts the opposite.
+# Both rules are anchored to SHAPE, not to a keyword appearing somewhere. Earlier
+# versions matched the word and each one deleted a live, `Status: open` question:
 #
-# Counting either as waiting re-notifies the owner about questions that are not
-# open, which is the same harm as missing a real one, pointed the other way.
+#   `^HELD\b`            -> "## HELD deployment until the owner approves the
+#                            migration" is a real ask, not a section shell.
+#   `.search()` for the
+#   inline marker        -> "## Confirm whether the UI should render a [DONE]
+#                            badge" is a question ABOUT a badge.
+#
+# So: an organizer shell is a keyword followed by a separator ("## ACTIVE — …",
+# "## FRESH – …", "## HELD: …") — a grouping label, never a sentence. And a
+# resolution marker is a bracketed group at the START of the title
+# ("## [RESOLVED 2026-07-03] shipped"), never one mentioned mid-sentence.
 _ORG_HEADING = re.compile(
-    r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\b', re.IGNORECASE
+    r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\s*(?:[—–\-:]|$)',
+    re.IGNORECASE,
 )
-# The marker must be a CLOSED bracket group, not a keyword plus a guard. Two
-# earlier attempts were both too permissive, each in a way that deleted a live
-# question from BOTH delivery surfaces:
-#   `\bDONE\b`      -> matched `[done-ish] something` (a hyphen is a word boundary)
-#   `(?![\w-])`      -> matched `[RESOLVED?] Did this actually ship?` and `[DONE?]`,
-#                       because `?` is neither a word char nor a hyphen. An open
-#                       uncertainty read as a resolution (review [P1], 2026-07-28).
-# So the grammar is explicit: an opening bracket, an optional ✅, the keyword, then
-# EITHER the closing bracket immediately OR whitespace and content up to the close.
-# Anything else touching the keyword — punctuation, a hyphen, more letters — is not
-# a marker. Question punctuation must never be able to suppress a live ask.
+# Anchored with ^ and \s* — a marker leads the title or it is not a marker. The
+# closed-bracket grammar (keyword then `]` or whitespace-then-content-then-`]`)
+# rejects `[RESOLVED?]` / `[done-ish]`, which named an open uncertainty.
 _INLINE_RESOLVED = re.compile(
-    r'\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]', re.IGNORECASE
+    r'^\s*\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]', re.IGNORECASE
 )
 
 
@@ -138,7 +133,7 @@ def get_waiting_questions():
         title = title_line.strip()
         if not title:
             continue
-        if _ORG_HEADING.match(title) or _INLINE_RESOLVED.search(title):
+        if _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title):
             continue
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
         if status_m:
