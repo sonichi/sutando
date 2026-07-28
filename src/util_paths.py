@@ -342,3 +342,22 @@ def _emit_claude_home_fallback_banner_once() -> None:
         "location post-#1454. Suppress with SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1.",
         file=sys.stderr,
     )
+
+def write_private_text(path: "Path", text: str) -> None:
+    """Write ``text`` to ``path`` as an owner-only (0600) file, with no window.
+
+    ``Path.write_text()`` creates at the process umask — commonly 0644 — so the
+    familiar ``write_text(...)`` + ``os.chmod(..., 0o600)`` pair leaves the file
+    world-readable for the interval between the two calls. For access-control
+    data (allowlists, owner ids, tier maps) that interval is the whole exposure.
+
+    ``os.open`` applies the mode at CREATION, and ``fchmod`` covers the case
+    where the file already existed (the mode argument is ignored then). O_TRUNC
+    rather than O_EXCL deliberately: this is used on best-effort paths wrapped in
+    broad excepts, and O_EXCL would turn a leftover temp file from a crash into a
+    permanent silent failure.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        os.fchmod(fh.fileno(), 0o600)
+        fh.write(text)

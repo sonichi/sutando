@@ -68,7 +68,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
@@ -336,7 +336,7 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         # rename can publish torn JSON. A per-PID temp is never shared, and
         # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
+        write_private_text(tmp, json.dumps(payload))
         os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
@@ -622,7 +622,6 @@ def ensure_tier_map_seeded() -> bool:
     tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(json.dumps(data, indent=2) + "\n")
-        os.chmod(tmp, 0o600)
         os.replace(tmp, ACCESS_FILE)
         print(f"  [tier-map] grandfathered {len(allow)} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
         return True
@@ -2953,8 +2952,7 @@ async def _handle_discord_message(message, force=False):
         # Same pattern the thread-engage seed already uses. chmod the tmp before
         # replace so the final file is never briefly 0644 (it holds owner IDs).
         tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')  # pragma: no cover — async pairing branch; atomicity asserted structurally
-        tmp_path.write_text(json.dumps(access, indent=2))  # pragma: no cover
-        os.chmod(tmp_path, 0o600)  # pragma: no cover
+        write_private_text(tmp_path, json.dumps(access, indent=2))  # pragma: no cover
         os.replace(tmp_path, ACCESS_FILE)  # pragma: no cover
         await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
         print(f"  Pairing requested: @{username} ({sender_id}) code={code}")

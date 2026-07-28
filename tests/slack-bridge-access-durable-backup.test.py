@@ -194,7 +194,10 @@ check("restore returns False when backup is schema-invalid", slack._restore_acce
 
 # restore: valid backup but ACCESS_FILE write fails → False (exception branch)
 slack.ACCESS_BACKUP_FILE.write_text('{"tofuOwner": "U", "allowFrom": ["U"]}')
-with _mock.patch.object(slack.ACCESS_FILE.__class__, "write_text", side_effect=OSError("readonly")):
+# NOTE: the write now goes through util_paths.write_private_text (born-0600), so the
+# failure must be injected at that seam rather than Path.write_text. Same intent:
+# simulate an unwritable access.json and assert the exception branch returns False.
+with _mock.patch.object(slack, "write_private_text", side_effect=OSError("readonly")):
     check("restore returns False when access.json write fails", slack._restore_access_from_disk() is False)
 
 # ── migration states the old tofuOwner predicate left unprotected (CR #2163) ──

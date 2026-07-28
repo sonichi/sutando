@@ -72,7 +72,7 @@ from result_markers import parse_markers  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from util_paths import channel_access_path, claude_home_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
@@ -198,7 +198,7 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         # rename can publish torn JSON. A per-PID temp is never shared, and
         # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
+        write_private_text(tmp, json.dumps(payload))
         os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
@@ -299,8 +299,7 @@ def _backup_access_to_disk(data: dict) -> None:
         return
     try:
         ACCESS_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_BACKUP_FILE.write_text(json.dumps(data, indent=2) + "\n")
-        os.chmod(ACCESS_BACKUP_FILE, 0o600)
+        write_private_text(ACCESS_BACKUP_FILE, json.dumps(data, indent=2) + "\n")
     except OSError:
         pass  # best-effort; backup must never break the write path
 
@@ -317,8 +316,7 @@ def _restore_access_from_disk() -> bool:
         return False
     try:
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_FILE.write_text(json.dumps(backup, indent=2) + "\n")
-        os.chmod(ACCESS_FILE, 0o600)
+        write_private_text(ACCESS_FILE, json.dumps(backup, indent=2) + "\n")
         _update_access_cache(backup)
         print(
             "  [access] restored access.json from durable on-disk backup "
@@ -339,8 +337,7 @@ def _restore_access_from_cache() -> bool:
         return False
     try:
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_FILE.write_text(json.dumps(cached, indent=2) + "\n")
-        os.chmod(ACCESS_FILE, 0o600)
+        write_private_text(ACCESS_FILE, json.dumps(cached, indent=2) + "\n")
         print(
             "  [access] restored access.json from in-memory cache "
             "(external deletion detected — #899)",
@@ -438,7 +435,6 @@ def _ensure_tier_map_seeded() -> bool:
     tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(json.dumps(data, indent=2) + "\n")
-        os.chmod(tmp, 0o600)
         os.replace(tmp, ACCESS_FILE)
         _update_access_cache(data)
         print(f"  [tier-map] grandfathered {len(allow)} existing allowFrom member(s) as owner; new additions now default to read-only", flush=True)
@@ -477,8 +473,7 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
         "tofuOnboardedAt": int(time.time()),
         "tofuOnboardedUsername": username or None,
     }
-    ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
-    os.chmod(ACCESS_FILE, 0o600)
+    write_private_text(ACCESS_FILE, json.dumps(payload, indent=2) + "\n")
     _update_access_cache(payload)
     print(
         f"  TOFU: auto-onboarded @{username} (id={user_id}) as owner — wrote {ACCESS_FILE}",
