@@ -448,6 +448,78 @@ def check_launchd(label: str) -> dict:
         return {"name": label, "status": "error", "detail": str(e)}
 
 
+def check_cron_runner(
+    workspace_dir: Optional[Path] = None,
+    host_label: Optional[str] = None,
+    runtime: Optional[str] = None,
+    launchd_check=None,
+    now: Optional[float] = None,
+) -> dict:
+    """Detect configured schedules that have no durable Codex owner."""
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    host = host_label or _host_label()
+    crons_file = workspace / "hosts" / host / "crons.json"
+    name = "cron-runner"
+    try:
+        crons = json.loads(crons_file.read_text())
+    except FileNotFoundError:
+        return {"name": name, "status": "ok", "detail": "no schedules configured"}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "fail", "detail": f"cannot read crons.json ({exc})"}
+    if not isinstance(crons, list):
+        return {"name": name, "status": "fail", "detail": "crons.json is not a list"}
+
+    def eligible(entry: dict) -> bool:
+        if entry.get("execution") == "codex-task" or entry.get("launchd") is True:
+            return False
+        if entry.get("loop") == "dynamic" or not entry.get("cron"):
+            return False
+        if entry.get("name") == "main-loop" or entry.get("prompt_skill") == "proactive-loop":
+            return False
+        return str(entry.get("prompt") or "").strip() != "/proactive-loop"
+
+    launchd_count = sum(
+        1 for entry in crons if isinstance(entry, dict) and entry.get("launchd") is True
+    )
+    runtime = runtime or resolve_core_runtime(repo_root=REPO_DIR)
+    orphaned = sum(1 for entry in crons if isinstance(entry, dict) and eligible(entry))
+    if runtime == "codex" and orphaned:
+        return {
+            "name": name,
+            "status": "down",
+            "detail": f"{orphaned} configured schedule(s) have no durable Codex owner",
+        }
+    if not launchd_count:
+        return {"name": name, "status": "ok", "detail": "no launchd-owned schedules"}
+
+    probe = (launchd_check or check_launchd)("com.sutando.cron-runner")
+    if probe["status"] != "ok":
+        return {
+            "name": name,
+            "status": "down",
+            "detail": f"{launchd_count} schedule(s) configured but launchd is {probe['status']}",
+        }
+
+    state_file = workspace / "state" / "cron-runner-state.json"
+    try:
+        age = (float(time.time() if now is None else now) - state_file.stat().st_mtime)
+    except FileNotFoundError:
+        return {"name": name, "status": "down", "detail": "runner loaded but state file is missing"}
+    except OSError as exc:
+        return {"name": name, "status": "down", "detail": f"runner state unreadable ({exc})"}
+    if age > 180:
+        return {
+            "name": name,
+            "status": "down",
+            "detail": f"runner state is stale ({int(age)}s; expected <=180s)",
+        }
+    return {
+        "name": name,
+        "status": "ok",
+        "detail": f"{launchd_count} durable schedule(s), state {int(max(age, 0))}s old",
+    }
+
+
 def check_file(path: Path, name: str) -> dict:
     """Check if a file exists and is non-empty."""
     if not path.exists():
@@ -2889,6 +2961,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
+    checks.append(check_cron_runner())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
