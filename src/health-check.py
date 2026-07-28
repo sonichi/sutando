@@ -1721,7 +1721,47 @@ def check_gateway_bridge() -> "dict | None":
             "status": "warn",
             "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})",
         }
+    # A live PROCESS is not a serving CONNECTION. The bridge rewrites
+    # state/gateway-status.json on every poll outcome, so consult it before
+    # calling this ok — otherwise a bridge stuck in a retry/backoff loop (route
+    # gone, endpoint returning non-JSON) reports "running" indefinitely, which
+    # is the very silent-outage class this check was added for. Observed
+    # 2026-07-28: 5h of connected:false reported as ok/running.
+    # Sidecar missing or stale (wedged, or a build too old to emit one) → no
+    # opinion, keep the previous process-only verdict.
+    verdict = _gateway_serving()
+    if verdict is False:
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": "process running but NOT serving — no successful poll; "
+                      "ag2.space mobile messages are not being delivered",
+        }
+    if verdict is True:
+        return {"name": "gateway-bridge", "status": "ok", "detail": "running + connected"}
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
+
+
+GATEWAY_STATUS_MAX_AGE_S = 180.0
+
+
+def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
+    """Whether the gateway bridge's own sidecar says the connection is serving.
+
+    True/False when the sidecar is present and fresh; None (no opinion) when it
+    is absent, unreadable, malformed, or older than GATEWAY_STATUS_MAX_AGE_S.
+    Mirrors core-input-watch._gateway_status() (#2253)."""
+    import time as _time
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    now = _time.time() if now is None else now
+    try:
+        data = json.loads(Path(p).read_text())
+        ts = data.get("ts")
+        if not isinstance(ts, (int, float)) or (now - ts) > GATEWAY_STATUS_MAX_AGE_S:
+            return None
+        return bool(data.get("connected"))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
 
 
 # Free-space thresholds. A full volume is not a slow degradation — it is a hard
