@@ -1301,9 +1301,15 @@ _ORPHAN_MIN_AGE_S = 600
 # exists to remove (review blocker, air 2026-07-28). So there is no abandonment
 # horizon at all: an empty claim is handed back unconditionally, forever, and a
 # flush at ANY later time is delivered on a subsequent pass. A genuinely
-# orphaned 0-byte file (producer crashed before its first write) is a benign
-# zero-byte remnant swept by disk-hygiene — never by this delivery path, which
-# must not be the thing that decides a producer is done.
+# orphaned 0-byte file (producer crashed before its first write) is inert — never
+# delivered, never moved by this path, which must not be the thing that decides a
+# producer is done. There is no automatic sweeper for it (checked: neither
+# disk-hygiene.sh nor results-health.sh delete results files — the latter only
+# REPORTS zero-byte counts). It is surfaced by scripts/results-health.sh for
+# deliberate cleanup, and the mtime-keyed archiver excludes it too
+# (archive-stale-results.py, sonichi/sutando#2360) so the never-moved guarantee
+# holds end-to-end. A slowly-accumulating set of 0-byte remnants is the accepted
+# benign cost of never risking a real message.
 #
 # Producers SHOULD publish atomically (write a temp, then rename into
 # proactive-*.txt) so an empty file is never observed at all — but producers are
@@ -1474,7 +1480,8 @@ def _post_proactive() -> None:
             # Hand the claim back UNCONDITIONALLY (no abandonment horizon) so a
             # flush at any later time is delivered on a subsequent pass; log
             # once per file so a genuinely orphaned 0-byte remnant (producer
-            # crashed pre-flush, swept later by disk-hygiene) does not spam.
+            # crashed pre-flush, reported by results-health.sh for cleanup) does
+            # not spam every pass.
             if f.name not in _EMPTY_LOGGED:
                 _EMPTY_LOGGED.add(f.name)
                 _log(f"proactive {f.name} claimed empty — producer has not "
