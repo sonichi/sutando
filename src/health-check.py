@@ -2046,18 +2046,29 @@ def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> 
     if results_dir is None:
         results_dir = tasks_dir.parent / "results"
     try:
-        archive_dir = results_dir / "archive"
         archived_names = set()
-        for path in archive_dir.glob("*/*.txt"):
-            if path.is_file():
-                archived_names.add(path.name)
-        for path in archive_dir.glob("*.txt"):
+
+        def record_archived(path: Path) -> None:
             if not path.is_file():
-                continue
+                return
             archived_names.add(path.name)
             renamed = re.match(r"^(.+)-[0-9]+\.txt$", path.name)
             if renamed:
                 archived_names.add(f"{renamed.group(1)}.txt")
+
+        archive_dir = results_dir / "archive"
+        for path in archive_dir.glob("*/*.txt"):
+            record_archived(path)
+        for path in archive_dir.glob("*.txt"):
+            record_archived(path)
+        # Startup retention uses sibling archive-YYYY-MM-DD directories.
+        # task-notifier.sh already treats these as completed deliveries; the
+        # health queue and wedge-recovery signal must use the same namespace.
+        for retention_dir in results_dir.glob("archive-*"):
+            if not retention_dir.is_dir():
+                continue
+            for path in retention_dir.glob("*.txt"):
+                record_archived(path)
         return [
             path for path in tasks_dir.glob("*.txt")
             if path.is_file()
