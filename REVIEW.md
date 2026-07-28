@@ -82,6 +82,20 @@ checks:
       - '~/.sutando'
     # ...unless the path token also matches one of these (fixtures / system noise).
     allow:
+      # Standard package-manager prefix, not machine- or user-specific: identical
+      # on every Apple-Silicon Mac with Homebrew, so it does not break on another
+      # host the way rule 6 is written to prevent. It is caught only because the
+      # flag list uses the broad '/opt/' token. The repo already resolves binaries
+      # through candidate lists containing it (src/agent-api.py's tmux lookup,
+      # health-check.py's _resolve_tmux_bin and _BRIDGE_INTERP_CANDIDATES,
+      # skills/voice-agent-test-harness's `rec`) — those pass only because the scan
+      # is diff-scoped, so the convention was effectively unextendable: adding a NEW
+      # candidate list failed while the existing ones sailed. Note the asymmetry it
+      # produced — '/usr/local/bin/ffmpeg' is NOT flagged, so the check permitted
+      # the Intel half of a candidate list and rejected the Apple-Silicon half.
+      # Safe because a path-like allow must match at the TOKEN START (see
+      # scripts/review-checks.py:allowed), so this cannot mask '/Users/...'.
+      - '/opt/homebrew/'
       - '/nonexistent'
       - '/usr/fake'
       - '/tmp/'
