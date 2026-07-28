@@ -37,8 +37,22 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 export function ffmpegSubtitleCandidates(execPath: string): string[] {
 	return [
 		'ffmpeg',
+		// Apple-Silicon Homebrew, then the Intel prefix. Both formulas are listed
+		// per arch: Homebrew installs under /opt/homebrew on arm64 and /usr/local
+		// on x86_64, so an arm64-only list leaves Intel resolving through PATH —
+		// which a launchd/service environment may not have. This is the single
+		// place a new install layout gets added; ffprobeCandidates() derives from
+		// it, so anything missing here is missing there too.
 		'/opt/homebrew/bin/ffmpeg',
 		'/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg',
+		'/usr/local/bin/ffmpeg',
+		// NOTE: the Intel ffmpeg-full formula (/usr/local/opt/ffmpeg-full/bin/ffmpeg)
+		// is deliberately NOT listed here. The repo's hardcoded-path gate flags
+		// '/opt/' as a SUBSTRING, so that path trips it while '/usr/local/bin/ffmpeg'
+		// does not — the gate blocks the Intel half of this symmetry. Adding it needs
+		// a scoped REVIEW.md exception, which is #2369's concern, not this PR's.
+		// Tracked there; an Intel user with only the ffmpeg-full formula still falls
+		// back to /usr/local/bin/ffmpeg or PATH.
 		join(dirname(execPath), 'ffmpeg'),
 	];
 }

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
-import { ffmpegSubtitleCandidates } from '../src/recording-tools.js';
+import { ffmpegSubtitleCandidates, ffprobeCandidates } from '../src/recording-tools.js';
 
 /**
  * Regression guard for the ffmpeg subtitle-probe bundled-runtime fix.
@@ -27,10 +27,62 @@ describe('ffmpegSubtitleCandidates', () => {
 		assert.equal(cands[cands.length - 1], '/opt/homebrew/bin/ffmpeg', 'bundled sibling is last');
 	});
 
-	it('still probes PATH and both Homebrew locations', () => {
+	// Named per ARCH deliberately. This case previously read "both Homebrew
+	// locations" while asserting two /opt/homebrew paths — both Apple-Silicon.
+	// That wording is why a missing Intel prefix went unnoticed: the suite looked
+	// like it covered Homebrew broadly when it covered one architecture twice.
+	it('probes PATH and BOTH Apple-Silicon Homebrew formulas', () => {
 		const cands = ffmpegSubtitleCandidates('/usr/bin/node');
 		assert.ok(cands.includes('ffmpeg'));
 		assert.ok(cands.includes('/opt/homebrew/bin/ffmpeg'));
 		assert.ok(cands.includes('/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg'));
+	});
+
+	it('probes the Intel Homebrew prefix (/usr/local)', () => {
+		const cands = ffmpegSubtitleCandidates('/usr/bin/node');
+		assert.ok(cands.includes('/usr/local/bin/ffmpeg'), 'Intel Homebrew bin');
+	});
+});
+
+/**
+ * ffprobeCandidates derives from ffmpegSubtitleCandidates, so a prefix absent
+ * upstream is absent here too — that is exactly how this PR first shipped an
+ * "Intel portability fix" containing no /usr/local path. These assert the
+ * derived list directly rather than trusting the mapping.
+ */
+describe('ffprobeCandidates', () => {
+	const cands = () => ffprobeCandidates('/usr/bin/node');
+
+	it('keeps a bare name so PATH resolution still applies', () => {
+		assert.equal(cands()[0], 'ffprobe');
+	});
+
+	it('includes the Apple-Silicon Homebrew ffprobe', () => {
+		assert.ok(cands().includes('/opt/homebrew/bin/ffprobe'));
+	});
+
+	it('includes the Intel Homebrew ffprobe (the regression this PR exists for)', () => {
+		assert.ok(cands().includes('/usr/local/bin/ffprobe'));
+	});
+
+	it('includes the bundled-runtime sibling ffprobe', () => {
+		const execPath = '/Applications/Sutando.app/Contents/Resources/runtime/bin/node';
+		assert.ok(
+			ffprobeCandidates(execPath).includes(
+				'/Applications/Sutando.app/Contents/Resources/runtime/bin/ffprobe',
+			),
+		);
+	});
+
+	// The rename is anchored to the LAST path segment: a directory named
+	// `ffmpeg-full` must survive intact. An unanchored replace would produce
+	// `/opt/homebrew/opt/ffprobe-full/bin/ffprobe`, a path that exists nowhere.
+	it('renames only the final segment, leaving an ffmpeg-full DIRECTORY intact', () => {
+		const c = cands();
+		assert.ok(c.includes('/opt/homebrew/opt/ffmpeg-full/bin/ffprobe'), 'arm64 anchored');
+		assert.ok(
+			!c.some((p) => p.includes('ffprobe-full')),
+			'no candidate may contain ffprobe-full',
+		);
 	});
 });
