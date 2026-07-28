@@ -1289,9 +1289,22 @@ def _archive_result(path: Path, tid: str) -> None:
 _ORPHAN_MIN_AGE_S = 600
 
 # An empty body observed right after claiming is far more likely a writer
-# mid-flush than a genuinely empty nudge, so re-queue it until it has been
-# untouched this long. Only then is "empty" treated as final.
-_EMPTY_SETTLE_S = 2.0
+# mid-flush than a genuinely empty nudge, so it is always re-queued.
+#
+# This used to be an mtime age cutoff, which is unsound: mtime cannot tell
+# "created, fd still open, not yet written" from "abandoned" — a file held
+# open with no write keeps its creation mtime. Under the cutoff an unflushed
+# nudge was retired, and the writer's later flush landed in the retired inode
+# where it reads as delivered (review blocker). No age cutoff can be safe, so
+# emptiness is now bounded by how long WE have observed it, not by the file's
+# own timestamps, and the terminal state is a visible dead-letter rather than
+# the archive.
+_EMPTY_ABANDON_S = 300.0
+
+# filename -> first time THIS process observed it claimed-and-empty. Process
+# local on purpose: a restart forgets, which re-extends the retry window
+# rather than shortening it — the safe direction for an undelivered nudge.
+_EMPTY_FIRST_SEEN: "dict[str, float]" = {}
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
@@ -1444,19 +1457,28 @@ def _post_proactive() -> None:
         body = routed_body.strip()
         if not body:
             # NEVER unlink silently — a vanished owner-facing message with no
-            # log line is the exact harm this drain exists to remove. A file
-            # that is still young is most likely a writer mid-flush: hand it
-            # back and let a later pass take it once it has settled.
-            try:
-                if time.time() - claim.stat().st_mtime < _EMPTY_SETTLE_S:
+            # log line is the exact harm this drain exists to remove. Hand the
+            # claim back unconditionally: the file's own timestamps cannot
+            # prove the writer is done (see _EMPTY_ABANDON_S). Bound the retry
+            # by how long we have observed it empty instead.
+            first = _EMPTY_FIRST_SEEN.setdefault(f.name, time.time())
+            if time.time() - first < _EMPTY_ABANDON_S:
+                try:
                     claim.rename(f)
-                    continue
-            except OSError:
+                except OSError:
+                    pass
                 continue
-            _log(f"proactive {f.name} still empty after "
-                 f"{_EMPTY_SETTLE_S}s — archiving rather than dropping")
-            _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
+            _EMPTY_FIRST_SEEN.pop(f.name, None)
+            _log(f"proactive {f.name} still empty {_EMPTY_ABANDON_S}s after "
+                 f"first observation — dead-lettering to undeliverable/")
+            # UNDELIVERABLE, not ARCHIVE: the archive is where delivered
+            # nudges go, so retiring an undelivered one there makes a lost
+            # message look sent.
+            _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
+        # Non-empty now — drop any prior empty observation so a file that
+        # merely flushed late does not inherit an old abandonment clock.
+        _EMPTY_FIRST_SEEN.pop(f.name, None)
         if len(body.encode("utf-8")) > _PROACTIVE_MAX_BODY_B:
             # Every failure branch below re-queues unconditionally, so a body
             # that can NEVER be delivered would retry and log on every loop

@@ -441,21 +441,55 @@ def main() -> int:
     # drop is auditable rather than silent.
     stale = rtc.RESULTS_DIR / "proactive-t3b.txt"
     stale.write_text("   \n")
-    old = time.time() - (rtc._EMPTY_SETTLE_S + 5)
-    os.utime(stale, (old, old))
+    posts_b4 = len(STATE["room_posts"])
+    aged = time.time() - 3600            # an old file is NOT evidence of abandonment
+    os.utime(stale, (aged, aged))
     rtc._post_proactive()
-    check(len(STATE["room_posts"]) == 5 and not stale.exists()
-          and any(p.name.startswith("proactive-t3b")
-                  for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
-          "settled-empty proactive file is archived, never silently unlinked")
+    check(len(STATE["room_posts"]) == posts_b4 and stale.exists(),
+          "an aged empty file is retried, never retired on its mtime alone")
+
+    # Only OUR observation window retires it, and it dead-letters somewhere
+    # visible rather than into the archive beside delivered nudges.
+    rtc._EMPTY_FIRST_SEEN[stale.name] = time.time() - (rtc._EMPTY_ABANDON_S + 1)
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4 and not stale.exists()
+          and any(x.name.startswith("proactive-t3b")
+                  for x in rtc.UNDELIVERABLE_RESULTS_DIR.glob("*.txt")),
+          "empty past the abandonment horizon is dead-lettered, not archived")
+
+    # REGRESSION (review blocker, 2026-07-28): an aged-but-still-open file.
+    # mtime cannot distinguish "created, fd still open, not yet written" from
+    # "abandoned" — a file held open with no write keeps its creation mtime.
+    # The old age cutoff therefore archived a nudge whose writer had not
+    # flushed yet; the late write then landed in the ARCHIVED inode, where it
+    # reads as delivered. Reproduce with a real open descriptor.
+    stalled = rtc.RESULTS_DIR / "proactive-t3d.txt"
+    posts_before = len(STATE["room_posts"])
+    fh = open(stalled, "w", encoding="utf-8")     # writer holds the fd open
+    try:
+        aged = time.time() - 3600                  # far past any age cutoff
+        os.utime(stalled, (aged, aged))
+        rtc._post_proactive()                      # drain sees empty + old
+        check(stalled.exists(),
+              "aged-but-open empty file is handed back, not retired")
+        fh.write("late body that should reach the owner")   # writer flushes
+        fh.flush()
+    finally:
+        fh.close()
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_before + 1
+          and STATE["room_posts"][-1]["body"] == "late body that should reach the owner"
+          and not stalled.exists(),
+          "a body flushed after an AGED empty claim is still delivered")
 
     # Oversized body → dead-lettered once instead of retrying forever, and it
     # lands in archive/undeliverable so "given up on" is not confused with
     # "delivered".
     huge = rtc.RESULTS_DIR / "proactive-t3c.txt"
     huge.write_text("x" * (rtc._PROACTIVE_MAX_BODY_B + 1))
+    posts_b4_huge = len(STATE["room_posts"])
     rtc._post_proactive()
-    check(len(STATE["room_posts"]) == 5 and not huge.exists()
+    check(len(STATE["room_posts"]) == posts_b4_huge and not huge.exists()
           and any(p.name.startswith("proactive-t3c")
                   for p in rtc.UNDELIVERABLE_RESULTS_DIR.glob("*.txt")),
           "oversized proactive body is dead-lettered, not retried forever")
