@@ -12,6 +12,19 @@
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
+// ffmpeg was hardcoded as /opt/homebrew/bin/ffmpeg at both mux call sites. That
+// prefix is Apple-Silicon Homebrew only — Intel installs under /usr/local, and a
+// host without Homebrew has neither. Both sites sit inside try/catch, so on such
+// a host recording still starts and stops but NO *-narrated.mov is ever produced:
+// the narration is captured and then silently discarded at the mux.
+//
+// Same candidate-list shape as record.py in this skill and the rest of the repo
+// (src/agent-api.py's tmux lookup, health-check.py's _resolve_tmux_bin): try the
+// known prefixes, then fall back to a bare name so PATH resolution still applies.
+// Kept local rather than imported — this skill is self-contained by design.
+const FFMPEG = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', 'ffmpeg']
+	.find((p) => !p.includes('/') || existsSync(p)) ?? 'ffmpeg';
+
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 const SCREEN_REC_PID = '/tmp/sutando-screen-record.pid';
 
@@ -39,7 +52,7 @@ export function teeAudio(pcmBuf: Buffer): void {
 					// -map 1:v -map 0:a: use video from the recording (input 1) and audio from
 					// the narration tee (input 0). Without -map, ffmpeg defaults to the video's
 					// own audio track which is silent mic ambient — not the Gemini narration.
-					execFileSync('/opt/homebrew/bin/ffmpeg', [
+					execFileSync(FFMPEG, [
 						'-y', '-f', 's16le', '-ar', '24000', '-ac', '1',
 						'-i', audioFile, '-i', videoFile,
 						'-map', '1:v', '-map', '0:a',
@@ -70,7 +83,7 @@ export function cleanup(): void {
 				// -map 1:v -map 0:a: use video from the recording (input 1) and audio from
 				// the narration tee (input 0). Without -map, ffmpeg defaults to the video's
 				// own audio track which is silent mic ambient — not the Gemini narration.
-				execFileSync('/opt/homebrew/bin/ffmpeg', [
+				execFileSync(FFMPEG, [
 					'-y', '-f', 's16le', '-ar', '24000', '-ac', '1',
 					'-i', audioFile, '-i', videoFile,
 					'-map', '1:v', '-map', '0:a',
