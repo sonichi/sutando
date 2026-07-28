@@ -9,6 +9,10 @@ the archived inode — the exact data-loss the proactive drain removes
 (sonichi/sutando#2324). The archiver is the other mtime-keyed mover of these
 files, so it must make the same exclusion for the guarantee to hold end-to-end.
 
+Runs the archiver IN-PROCESS (import + main()) rather than as a subprocess, so
+the diff-coverage gate instruments the new exclusion branch — a subprocess call
+executes the lines but coverage on the parent process never sees them.
+
 Guards:
   1. a CONTENTFUL stale .txt is archived (flood prevention still works)
   2. an EMPTY stale .txt is NOT archived — left in place for the drain
@@ -18,15 +22,14 @@ Run: python3 tests/archive-stale-results.test.py   (exit 0/1)
 """
 from __future__ import annotations
 
+import importlib.util
 import os
-import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "src" / "archive-stale-results.py"
 fails: list[str] = []
 
 
@@ -36,14 +39,32 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         fails.append(name)
 
 
+def _load_archiver(workspace: Path):
+    # The module resolves its workspace + reads RETENTION_HOURS/DRY_RUN at IMPORT
+    # time, so the env must be set before exec_module. SUTANDO_TEST_MODE lets
+    # resolve_workspace honor SUTANDO_WORKSPACE (post-#1440 it is otherwise
+    # ignored). Import (not subprocess) so coverage instruments main().
+    os.environ["SUTANDO_TEST_MODE"] = "1"
+    os.environ["SUTANDO_WORKSPACE"] = str(workspace)
+    os.environ["RETENTION_HOURS"] = "24"
+    os.environ.pop("DRY_RUN", None)
+    spec = importlib.util.spec_from_file_location(
+        "archiver_ut", REPO / "src" / "archive-stale-results.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="archiver-empty-"))
-    results = tmp / "results"
-    results.mkdir()
     # Pre-satisfy the in-repo migrators so resolve_workspace() at import doesn't
     # relocate this repo's notes/build_log into the throwaway workspace.
     (tmp / ".notes-migrated").touch()
     (tmp / ".build_log-migrated").touch()
+
+    arch = _load_archiver(tmp)
+    results = arch.RESULTS  # = <tmp>/results, captured at import
+    results.mkdir(parents=True, exist_ok=True)
 
     old = time.time() - 48 * 3600  # well past the default 24h retention
     contentful = results / "proactive-contentful.txt"
@@ -57,21 +78,10 @@ def main() -> int:
     fresh_empty = results / "proactive-fresh.txt"
     fresh_empty.write_text("")  # 0 bytes but recent — also must stay
 
-    env = dict(os.environ)
-    env["SUTANDO_TEST_MODE"] = "1"
-    env["SUTANDO_WORKSPACE"] = str(tmp)
-    env.pop("DRY_RUN", None)
-    env["RETENTION_HOURS"] = "24"
-    r = subprocess.run([sys.executable, str(SCRIPT)], env=env,
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stdout); print(r.stderr, file=sys.stderr)
-        check("archiver exits 0", False, f"rc={r.returncode}")
-        print(f"FAIL — {len(fails)}: {fails}")
-        return 1
+    rc = arch.main()  # in-process → coverage sees the size-0 exclusion branch
+    check("archiver main() returns 0", rc == 0, f"rc={rc}")
 
-    archived = list(results.glob("archive-*/*.txt"))
-    archived_names = {p.name for p in archived}
+    archived_names = {p.name for p in results.glob("archive-*/*.txt")}
 
     check("contentful stale .txt is archived (flood prevention intact)",
           "proactive-contentful.txt" in archived_names and not contentful.exists(),
