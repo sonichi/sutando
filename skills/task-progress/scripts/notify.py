@@ -237,13 +237,23 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     # channels directory. The containment root is the realpath of channels/
     # itself (so a symlinked channels dir works), but a channel entry that
     # symlinks OUT of the directory is refused by design.
-    real_env = os.path.realpath(env_path)
-    real_root = os.path.realpath(channels_dir)
-    if not real_env.startswith(real_root + os.sep):
-        print(f"[task-progress] refusing env path outside channels dir: {env_path}",
-              file=sys.stderr)
-        return False
-    env = _env_file(real_env)
+    # The channel .env is a FALLBACK: url/token below prefer os.environ. When the
+    # environment already supplies both, the file is never read, so refusing on
+    # its location would veto a correctly-configured operator for a file we do
+    # not need. Resolve+guard the file only when we actually have to open it —
+    # the containment check itself is unchanged and still refuses whenever the
+    # file IS consulted.
+    _env_url = os.environ.get("REMOTE_TASK_URL", "").strip()
+    _env_token = os.environ.get("REMOTE_TASK_TOKEN", "").strip()
+    env = {}
+    if not (_env_url and _env_token):
+        real_env = os.path.realpath(env_path)
+        real_root = os.path.realpath(channels_dir)
+        if not real_env.startswith(real_root + os.sep):
+            print(f"[task-progress] refusing env path outside channels dir: {env_path}",
+                  file=sys.stderr)
+            return False
+        env = _env_file(real_env)
     url = (os.environ.get("REMOTE_TASK_URL") or env.get("REMOTE_TASK_URL", "")).rstrip("/")
     token = os.environ.get("REMOTE_TASK_TOKEN", "").strip() or env.get("REMOTE_TASK_TOKEN", "")
     # One-token onboarding: REMOTE_TASK_TOKEN (or the legacy AG2_REMOTE_TOKEN
