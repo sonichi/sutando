@@ -273,9 +273,11 @@ def get_pending_questions() -> list[str]:
         # marked resolved/done/answered is not pending even when its title still
         # reads "[OPEN …]" (mirrors check-pending-questions.py). Without this the
         # briefing miscounts entries kept above the divider whose title wasn't
-        # updated but whose body carries "**Status:** resolved".
+        # updated but whose body carries "**Status:** resolved". `open` counts as
+        # pending (the natural word writers reach for) — kept in lockstep with
+        # check-pending-questions.py so the documented mirror stays truthful.
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
-        if status_m and not status_m.group(1).strip().lower().startswith(('unanswered', 'waiting')):
+        if status_m and not status_m.group(1).strip().lower().startswith(('unanswered', 'waiting', 'open')):
             continue
         questions.append(title[:60])
     return questions
@@ -453,7 +455,12 @@ def main():
     ts = int(time.time() * 1000)
     result_file = RESULTS_DIR / f"proactive-morning-{ts}.txt"
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    result_file.write_text(narrative)
+    # Privacy: the briefing carries calendar + email — private data that must
+    # go to the owner's DM only. The `[dm-only]` marker forces DM delivery and
+    # suppresses any `[channel:]` redirect at the bridge, so this can never be
+    # posted to a shared channel (result_markers.parse_markers). The marker is
+    # stripped before delivery/voice, so the owner never sees it.
+    result_file.write_text(f"[dm-only]\n{narrative}")
     print(f"  → {result_file.name}")
 
     # Mark as done today

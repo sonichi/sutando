@@ -52,10 +52,13 @@ def _pgrep(returncode, stdout):
     return _side_effect
 
 
-def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=False):
+def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=False, serving=None):
     """Call check_gateway_bridge() with env, the channel-.env path, and the
     pgrep result all controlled. env=None means the token vars are cleared.
-    pgrep_raises=True makes subprocess.run raise (the except-branch path)."""
+    pgrep_raises=True makes subprocess.run raise (the except-branch path).
+    `serving` pins the gateway-status sidecar verdict (None = no opinion) so no
+    case depends on whether the host running the tests happens to have a live
+    sidecar — without it, "one process -> ok" flips to warn on a real host."""
     env = env or {}
     # Clear both token vars, then apply the requested env.
     base = {k: v for k, v in hc.os.environ.items()
@@ -66,7 +69,8 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
          unittest.mock.patch.object(hc, "claude_home_path", return_value=gw_env_path), \
          unittest.mock.patch.object(hc.subprocess, "run", run_mock):
-        return hc.check_gateway_bridge()
+        with unittest.mock.patch.object(hc, "_gateway_serving", lambda *a, **k: serving):
+            return hc.check_gateway_bridge()
 
 
 def main() -> int:
@@ -113,6 +117,43 @@ def main() -> int:
     bad_env.read_text.side_effect = OSError("cannot read .env")
     r = _run(env={}, gw_env_path=bad_env)
     check("config read raises → None", r is None, f"got {r!r}")
+
+    # 6) sidecar precedence — a live PROCESS is not a serving CONNECTION.
+    r = _run(env={"REMOTE_TASK_TOKEN": "x"}, pgrep_rc=0, pgrep_out="4242\n", serving=False)
+    check("running process + sidecar NOT connected → warn",
+          r["status"] == "warn" and "NOT serving" in r["detail"], f"got {r!r}")
+
+    r = _run(env={"REMOTE_TASK_TOKEN": "x"}, pgrep_rc=0, pgrep_out="4242\n", serving=True)
+    check("running process + sidecar connected → ok",
+          r["status"] == "ok" and "connected" in r["detail"], f"got {r!r}")
+
+    r = _run(env={"REMOTE_TASK_TOKEN": "x"}, pgrep_rc=0, pgrep_out="4242\n", serving=None)
+    check("running process + no sidecar opinion → ok (pre-sidecar behaviour)",
+          r["status"] == "ok" and r["detail"] == "running", f"got {r!r}")
+
+    r = _run(env={"REMOTE_TASK_TOKEN": "x"}, pgrep_rc=1, pgrep_out="", serving=True)
+    check("no process still warns even if a sidecar claims connected",
+          r["status"] == "warn" and "NOT running" in r["detail"], f"got {r!r}")
+
+    # 7) _gateway_serving() parsing branches
+    import json as _json
+    import tempfile as _tf
+    import time as _time
+    def _sc(body):
+        f = Path(_tf.mkdtemp()) / "gateway-status.json"
+        f.write_text(_json.dumps(body))
+        return f
+    now = _time.time()
+    check("_gateway_serving: fresh + connected → True",
+          hc._gateway_serving(_sc({"connected": True, "ts": now}), now) is True)
+    check("_gateway_serving: fresh + disconnected → False",
+          hc._gateway_serving(_sc({"connected": False, "ts": now}), now) is False)
+    check("_gateway_serving: stale → None (no opinion)",
+          hc._gateway_serving(_sc({"connected": True, "ts": now - 10000}), now) is None)
+    check("_gateway_serving: missing ts → None",
+          hc._gateway_serving(_sc({"connected": True}), now) is None)
+    check("_gateway_serving: absent file → None",
+          hc._gateway_serving(Path(_tf.mkdtemp()) / "nope.json", now) is None)
 
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
