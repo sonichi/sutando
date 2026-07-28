@@ -83,6 +83,14 @@ def main() -> int:
     whitespace.write_text("   \n\t\n")  # size > 0, strip() == ""
     os.utime(whitespace, (old, old))
 
+    # John's #2360 ask: an invalid-UTF-8 stale file exercises the fail-safe
+    # OSError/UnicodeDecodeError branch (src/archive-stale-results.py:102-103). A
+    # file we cannot decode is exactly one that may be mid-write, so read_text()
+    # raising must leave it in place, never archive it on age.
+    undecodable = results / "proactive-binary.txt"
+    undecodable.write_bytes(b"\xff\xfe\x00\x80 partial write")  # invalid UTF-8
+    os.utime(undecodable, (old, old))
+
     fresh_empty = results / "proactive-fresh.txt"
     fresh_empty.write_text("")  # 0 bytes but recent — also must stay
 
@@ -100,6 +108,9 @@ def main() -> int:
     check("whitespace-only stale .txt is NOT archived (strip-empty, matches the drain)",
           whitespace.exists() and "proactive-whitespace.txt" not in archived_names,
           f"whitespace exists={whitespace.exists()} archived={sorted(archived_names)}")
+    check("invalid-UTF-8 stale .txt is NOT archived (fail-safe branch: may be mid-write)",
+          undecodable.exists() and "proactive-binary.txt" not in archived_names,
+          f"undecodable exists={undecodable.exists()} archived={sorted(archived_names)}")
     check("fresh empty .txt is untouched",
           fresh_empty.exists() and "proactive-fresh.txt" not in archived_names)
 
