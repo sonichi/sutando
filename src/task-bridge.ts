@@ -813,7 +813,17 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 			for (const file of files) {
 				if (_deliveredResults.has(file)) continue;
 				const path = join(RESULT_DIR, file);
-				const result = readFileSync(path, 'utf-8').trim();
+				// `[dm-only]` is a Discord-routing privacy marker (see
+				// src/result_markers.py) — on the Python bridge side it suppresses
+				// any [channel:] redirect on the same body (so a body carrying
+				// private data can't be redirected out to a shared channel). It does
+				// NOT by itself force DM delivery — routing to the owner's DM stays
+				// the consumer's job (for a proactive-* result the default
+				// destination already is the owner's DM). It has no meaning for the
+				// voice/task path, so strip it on read: this keeps voice from ever
+				// speaking "dm only" and keeps it out of logs. Parity with Python
+				// parse_markers(), which strips it before delivery.
+				const result = readFileSync(path, 'utf-8').replace(/\[dm-only\]\s*/gi, '').trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
 
