@@ -8,6 +8,28 @@ import os
 import time
 import json
 
+# ffmpeg was hardcoded as /opt/homebrew/bin/ffmpeg at all three call sites. That
+# prefix is Apple-Silicon Homebrew only: Intel Macs install under /usr/local, and
+# a host without Homebrew has neither. The failures were mostly SILENT —
+# _audio_devices() swallows the exception and returns [], so a recording proceeds
+# with no audio and no explanation, and the volumedetect guard sits inside
+# `except Exception: pass`, so the silence warning it exists to emit would itself
+# never fire. Only start() surfaced anything, as a raw FileNotFoundError.
+#
+# Same shape the rest of the repo already uses for homebrew binaries (agent-api's
+# tmux lookup, health-check's _resolve_tmux_bin and _BRIDGE_INTERP_CANDIDATES,
+# skills/voice-agent-test-harness's `rec`): try the known prefixes, then fall back
+# to a bare name so PATH resolution still applies. A bare name is always a valid
+# candidate; absolute paths only when they exist.
+#
+# Deliberately local rather than imported from src/: this skill is standalone
+# (stdlib only, no main-repo imports) and must keep working against any checkout.
+FFMPEG = next(
+    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")
+     if os.path.sep not in _p or os.path.exists(_p)),
+    "ffmpeg",
+)
+
 PID_FILE = "/tmp/sutando-screen-record.pid"
 INDICATOR_PID_FILE = "/tmp/sutando-rec-indicator.pid"
 
@@ -56,7 +78,7 @@ def _list_audio_devices():
     Returns [] if no devices or ffmpeg fails."""
     try:
         result = subprocess.run(
-            ["/opt/homebrew/bin/ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            [FFMPEG, "-f", "avfoundation", "-list_devices", "true", "-i", ""],
             capture_output=True, text=True, timeout=5,
         )
         out = result.stderr
@@ -149,7 +171,7 @@ def start():
     log_path = path + ".ffmpeg.log"
     log_fh = open(log_path, "w")
     proc = subprocess.Popen(
-        ["/opt/homebrew/bin/ffmpeg", "-f", "avfoundation",
+        [FFMPEG, "-f", "avfoundation",
          "-i", input_spec,
          "-r", "15", "-pix_fmt", "yuv420p", "-y", path],
         stdin=subprocess.DEVNULL,
@@ -201,7 +223,7 @@ def stop():
     if exists and size > 1024:  # skip vanishingly-small files
         try:
             r = subprocess.run(
-                ["/opt/homebrew/bin/ffmpeg", "-i", path, "-af", "volumedetect", "-vn", "-f", "null", "/dev/null"],
+                [FFMPEG, "-i", path, "-af", "volumedetect", "-vn", "-f", "null", "/dev/null"],
                 capture_output=True, text=True, timeout=10,
             )
             mean_db = None
