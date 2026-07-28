@@ -104,6 +104,117 @@ def _resolve_dotenv() -> Path:
     return resolve_dotenv(REPO_DIR, WORKSPACE_DIR)
 
 
+_VOICE_ENV_KEYS = ("SKIP_VOICE", "GEMINI_VOICE_API_KEY", "GEMINI_API_KEY")
+
+
+def resolve_voice_health_config(
+    env: Optional[dict] = None,
+    env_path: Optional[Path] = None,
+) -> dict:
+    """Resolve whether voice health checks are required.
+
+    Process environment values win over the canonical dotenv file, matching
+    the already-running service configuration that health-check observes.
+    Missing configuration is a supported text-only mode. A present but
+    unreadable or malformed relevant value is an error: failing closed avoids
+    hiding a configured voice outage behind an accidental "disabled" result.
+    """
+    env = os.environ if env is None else env
+    env_path = _resolve_dotenv() if env_path is None else env_path
+    file_values = {}
+    if env_path.exists():
+        try:
+            lines = env_path.read_text().splitlines()
+        except OSError as exc:
+            return {"enabled": True, "error": f"{env_path.name} unreadable ({exc})"}
+        for line_no, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            assignment = line
+            if assignment.startswith("export "):
+                assignment = assignment[len("export "):].lstrip()
+            if "=" not in assignment:
+                if assignment in _VOICE_ENV_KEYS:
+                    return {
+                        "enabled": True,
+                        "error": f"{env_path.name}:{line_no} malformed {assignment} assignment",
+                    }
+                continue
+            key, value = assignment.split("=", 1)
+            key = key.strip()
+            if key not in _VOICE_ENV_KEYS:
+                continue
+            try:
+                parsed = shlex.split(value, comments=True, posix=True)
+            except ValueError as exc:
+                return {
+                    "enabled": True,
+                    "error": f"{env_path.name}:{line_no} malformed {key} value ({exc})",
+                }
+            if len(parsed) > 1:
+                return {
+                    "enabled": True,
+                    "error": f"{env_path.name}:{line_no} malformed {key} value",
+                }
+            file_values[key] = parsed[0] if parsed else ""
+
+    def effective(key: str) -> str:
+        value = env[key] if key in env else file_values.get(key, "")
+        return str(value).strip()
+
+    skip_voice = effective("SKIP_VOICE")
+    if effective("GEMINI_VOICE_API_KEY") or effective("GEMINI_API_KEY"):
+        return {"enabled": True, "detail": "Gemini voice credential configured"}
+    if skip_voice not in ("", "0", "1"):
+        return {"enabled": True, "error": f"invalid SKIP_VOICE={skip_voice!r}"}
+    if skip_voice == "1":
+        return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
+    return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
+
+
+def check_voice_stack(
+    env: Optional[dict] = None,
+    env_path: Optional[Path] = None,
+) -> list[dict]:
+    """Return config-aware voice-agent, watcher, and transport checks."""
+    config = resolve_voice_health_config(env=env, env_path=env_path)
+    if config.get("error"):
+        config_check = {
+            "name": "voice-config",
+            "status": "down",
+            "detail": config["error"],
+        }
+    else:
+        config_check = None
+
+    if not config["enabled"]:
+        detail = config["detail"]
+        return [
+            {"name": "voice-agent", "status": "ok", "detail": detail},
+            {"name": "voice-watchers", "status": "ok", "detail": detail},
+            {"name": "voice-transport", "status": "ok", "detail": detail},
+            {"name": "bodhi-dist", "status": "ok", "detail": detail},
+        ]
+
+    voice_check = check_port(9900, "voice-agent", probe=True)
+    if voice_check["status"] == "ok":
+        mark_stale_if_outdated(
+            voice_check,
+            REPO_DIR / "src" / "voice-agent.ts",
+            "voice-agent.ts",
+        )
+    checks = [
+        voice_check,
+        check_voice_watchers(voice_check),
+        check_voice_transport(voice_check),
+        check_bodhi_dist(),
+    ]
+    if config_check is not None:
+        checks.insert(0, config_check)
+    return checks
+
+
 def _resolved_vault() -> dict:
     """Return the resolved vault config subtree via the canonical resolver
     (`sutando_config.resolve_vault`) — the SINGLE source of truth for
@@ -337,6 +448,78 @@ def check_launchd(label: str) -> dict:
         return {"name": label, "status": "error", "detail": str(e)}
 
 
+def check_cron_runner(
+    workspace_dir: Optional[Path] = None,
+    host_label: Optional[str] = None,
+    runtime: Optional[str] = None,
+    launchd_check=None,
+    now: Optional[float] = None,
+) -> dict:
+    """Detect configured schedules that have no durable Codex owner."""
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    host = host_label or _host_label()
+    crons_file = workspace / "hosts" / host / "crons.json"
+    name = "cron-runner"
+    try:
+        crons = json.loads(crons_file.read_text())
+    except FileNotFoundError:
+        return {"name": name, "status": "ok", "detail": "no schedules configured"}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "fail", "detail": f"cannot read crons.json ({exc})"}
+    if not isinstance(crons, list):
+        return {"name": name, "status": "fail", "detail": "crons.json is not a list"}
+
+    def eligible(entry: dict) -> bool:
+        if entry.get("execution") == "codex-task" or entry.get("launchd") is True:
+            return False
+        if entry.get("loop") == "dynamic" or not entry.get("cron"):
+            return False
+        if entry.get("name") == "main-loop" or entry.get("prompt_skill") == "proactive-loop":
+            return False
+        return str(entry.get("prompt") or "").strip() != "/proactive-loop"
+
+    launchd_count = sum(
+        1 for entry in crons if isinstance(entry, dict) and entry.get("launchd") is True
+    )
+    runtime = runtime or resolve_core_runtime(repo_root=REPO_DIR)
+    orphaned = sum(1 for entry in crons if isinstance(entry, dict) and eligible(entry))
+    if runtime == "codex" and orphaned:
+        return {
+            "name": name,
+            "status": "down",
+            "detail": f"{orphaned} configured schedule(s) have no durable Codex owner",
+        }
+    if not launchd_count:
+        return {"name": name, "status": "ok", "detail": "no launchd-owned schedules"}
+
+    probe = (launchd_check or check_launchd)("com.sutando.cron-runner")
+    if probe["status"] != "ok":
+        return {
+            "name": name,
+            "status": "down",
+            "detail": f"{launchd_count} schedule(s) configured but launchd is {probe['status']}",
+        }
+
+    state_file = workspace / "state" / "cron-runner-state.json"
+    try:
+        age = (float(time.time() if now is None else now) - state_file.stat().st_mtime)
+    except FileNotFoundError:
+        return {"name": name, "status": "down", "detail": "runner loaded but state file is missing"}
+    except OSError as exc:
+        return {"name": name, "status": "down", "detail": f"runner state unreadable ({exc})"}
+    if age > 180:
+        return {
+            "name": name,
+            "status": "down",
+            "detail": f"runner state is stale ({int(age)}s; expected <=180s)",
+        }
+    return {
+        "name": name,
+        "status": "ok",
+        "detail": f"{launchd_count} durable schedule(s), state {int(max(age, 0))}s old",
+    }
+
+
 def check_file(path: Path, name: str) -> dict:
     """Check if a file exists and is non-empty."""
     if not path.exists():
@@ -379,6 +562,92 @@ def check_memory_dir_override() -> "dict | None":
             f"SUTANDO_MEMORY_DIR={override} differs from the computed "
             f"default ({default}) — verify this is still intentional, not "
             "a stale pre-#1454 leftover"
+        ),
+    }
+
+
+def _slug_derivation_key(name: str) -> str:
+    """Collapse a Claude project slug to a derivation-INDEPENDENT key.
+
+    Claude Code slugifies a filesystem path, and the derivations differ only in
+    how they map ``.``, spaces and repeated separators. So two slugs describing
+    the SAME path agree once every run of non-alphanumerics is collapsed to one
+    ``-`` and case is folded, while an unrelated project does not collide:
+
+        -Users-me-Library-Application-Support-space.ag2.app-engine-sutando
+        -Users-me-Library-Application-Support-space-ag2-app-engine-sutando
+            -> users-me-library-application-support-space-ag2-app-engine-sutando   (same)
+        -Users-me-Documents-unrelated-repo
+            -> users-me-documents-unrelated-repo                                    (different)
+    """
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def check_memory_dir_siblings() -> "dict | None":
+    """Flag a populated memory corpus sitting under a DIFFERENT project slug.
+
+    check_memory_dir_override() above catches only one of the two ways this
+    install can end up reading a directory the agent is not writing: an explicit
+    SUTANDO_MEMORY_DIR pointing somewhere stale. It returns None when the var is
+    unset — and the other failure mode needs no env var at all.
+
+    Claude Code derives a project slug from a path. Two different derivations
+    (repo path vs app-support path, or differing rules for spaces and dots)
+    produce two sibling project dirs under the same claude-home, each with its
+    own memory/. Everything that resolves by repo slug then reports on one
+    corpus while the session reads and writes the other. Field-observed on two
+    hosts, once per mechanism: one had the env override (caught), one had the
+    slug split (silent — memory-dir reported "ok, 66 .md files" about a corpus
+    the agent had never written to, while its live corpus held 42).
+
+    Deliberately diagnostic only. Which slug *should* be canonical is an open
+    architectural decision; picking one here would answer it in code and, worse,
+    hide the divergence behind a green check. So: report, never redirect.
+
+    Symlinked twins are NOT a split — resolve before comparing. Two slug strings
+    frequently point at one inode (a compatibility symlink bridging two
+    derivation rules), and reporting that as a divergence would make this check
+    noise on a healthy install.
+    """
+    projects = Path(claude_home_path()) / "projects"
+    if not projects.is_dir():
+        return None
+
+    live = MEMORY_DIR.resolve() if MEMORY_DIR.exists() else MEMORY_DIR
+    # Only ALTERNATE DERIVATIONS OF THIS PROJECT are candidates. Warning on any
+    # populated corpus would fire on every normal multi-project home — a
+    # permanent false warning that teaches people to ignore the health signal,
+    # which costs more than the split it is trying to surface (#2353 review).
+    live_key = _slug_derivation_key(MEMORY_DIR.parent.name)
+    seen: "dict[str, tuple[str, int]]" = {}
+    for entry in sorted(projects.iterdir()):
+        mem = entry / "memory"
+        if not mem.is_dir():
+            continue
+        if _slug_derivation_key(entry.name) != live_key:
+            continue  # unrelated project, not a slug split
+        count = len(list(mem.glob("*.md")))
+        if count == 0:
+            continue
+        key = str(mem.resolve())  # collapse symlinked twins onto one entry
+        if key not in seen or count > seen[key][1]:
+            seen[key] = (entry.name, count)
+
+    others = {k: v for k, v in seen.items() if k != str(live)}
+    if not others:
+        return None
+
+    live_count = len(list(MEMORY_DIR.glob("*.md"))) if MEMORY_DIR.is_dir() else 0
+    listed = ", ".join(f"{name} ({n} .md)" for name, n in sorted(others.values(), key=lambda t: -t[1]))
+    return {
+        "name": "memory-dir-siblings",
+        "status": "warn",
+        "detail": (
+            f"{len(others)} other populated memory corpus/corpora exist under "
+            f"{projects}: {listed}. This check reports on {MEMORY_DIR.name}'s parent "
+            f"({live_count} .md) — if the session actually writes one of the others, "
+            "its memories are invisible to every path-derived consumer. Diagnostic "
+            "only; which slug is canonical is an open decision."
         ),
     }
 
@@ -1721,7 +1990,47 @@ def check_gateway_bridge() -> "dict | None":
             "status": "warn",
             "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})",
         }
+    # A live PROCESS is not a serving CONNECTION. The bridge rewrites
+    # state/gateway-status.json on every poll outcome, so consult it before
+    # calling this ok — otherwise a bridge stuck in a retry/backoff loop (route
+    # gone, endpoint returning non-JSON) reports "running" indefinitely, which
+    # is the very silent-outage class this check was added for. Observed
+    # 2026-07-28: 5h of connected:false reported as ok/running.
+    # Sidecar missing or stale (wedged, or a build too old to emit one) → no
+    # opinion, keep the previous process-only verdict.
+    verdict = _gateway_serving()
+    if verdict is False:
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": "process running but NOT serving — no successful poll; "
+                      "ag2.space mobile messages are not being delivered",
+        }
+    if verdict is True:
+        return {"name": "gateway-bridge", "status": "ok", "detail": "running + connected"}
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
+
+
+GATEWAY_STATUS_MAX_AGE_S = 180.0
+
+
+def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
+    """Whether the gateway bridge's own sidecar says the connection is serving.
+
+    True/False when the sidecar is present and fresh; None (no opinion) when it
+    is absent, unreadable, malformed, or older than GATEWAY_STATUS_MAX_AGE_S.
+    Mirrors core-input-watch._gateway_status() (#2253)."""
+    import time as _time
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    now = _time.time() if now is None else now
+    try:
+        data = json.loads(Path(p).read_text())
+        ts = data.get("ts")
+        if not isinstance(ts, (int, float)) or (now - ts) > GATEWAY_STATUS_MAX_AGE_S:
+            return None
+        return bool(data.get("connected"))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
 
 
 # Free-space thresholds. A full volume is not a slow degradation — it is a hard
@@ -1895,18 +2204,29 @@ def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> 
     if results_dir is None:
         results_dir = tasks_dir.parent / "results"
     try:
-        archive_dir = results_dir / "archive"
         archived_names = set()
-        for path in archive_dir.glob("*/*.txt"):
-            if path.is_file():
-                archived_names.add(path.name)
-        for path in archive_dir.glob("*.txt"):
+
+        def record_archived(path: Path) -> None:
             if not path.is_file():
-                continue
+                return
             archived_names.add(path.name)
             renamed = re.match(r"^(.+)-[0-9]+\.txt$", path.name)
             if renamed:
                 archived_names.add(f"{renamed.group(1)}.txt")
+
+        archive_dir = results_dir / "archive"
+        for path in archive_dir.glob("*/*.txt"):
+            record_archived(path)
+        for path in archive_dir.glob("*.txt"):
+            record_archived(path)
+        # Startup retention uses sibling archive-YYYY-MM-DD directories.
+        # task-notifier.sh already treats these as completed deliveries; the
+        # health queue and wedge-recovery signal must use the same namespace.
+        for retention_dir in results_dir.glob("archive-*"):
+            if not retention_dir.is_dir():
+                continue
+            for path in retention_dir.glob("*.txt"):
+                record_archived(path)
         return [
             path for path in tasks_dir.glob("*.txt")
             if path.is_file()
@@ -2603,13 +2923,7 @@ def run_all_checks() -> list[dict]:
     checks = []
 
     # Core services (required)
-    voice_check = check_port(9900, "voice-agent", probe=True)
-    if voice_check["status"] == "ok":
-        mark_stale_if_outdated(voice_check, REPO_DIR / "src" / "voice-agent.ts", "voice-agent.ts")
-    checks.append(voice_check)
-    checks.append(check_voice_watchers(voice_check))
-    checks.append(check_voice_transport(voice_check))
-    checks.append(check_bodhi_dist())
+    checks.extend(check_voice_stack())
 
     web_check = check_port(8080, "web-client", probe=True)
     if web_check["status"] == "ok":
@@ -2647,6 +2961,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
+    checks.append(check_cron_runner())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -2669,6 +2984,10 @@ def run_all_checks() -> list[dict]:
     _mem_override = check_memory_dir_override()
     if _mem_override:
         checks.append(_mem_override)
+
+    _mem_siblings = check_memory_dir_siblings()
+    if _mem_siblings:
+        checks.append(_mem_siblings)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:
