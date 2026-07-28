@@ -704,7 +704,7 @@ def _stale_safe(cached):
 
 
 def _load_tier_map():
-    """Return cached caps; read errors preserve only safe entries.
+    """Preserve safe caps on same-path faults, but never across path switches.
     An absent launcher config explicitly clears the cache."""
     path = _ag2space_access_path()
     if not path:
@@ -717,7 +717,13 @@ def _load_tier_map():
     try:
         st = os.stat(path)
     except OSError:
-        # Absent/unstattable → keep last-known-good (initially {} before any load).
+        # Keep last-known-good only for the same configured path. Carrying a
+        # map across a path switch would leak trust decisions between installs.
+        if path != _TIER_MAP_CACHE["path"]:
+            _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE[
+                "map"
+            ] = (path, None, {})
+            return {}
         return _stale_safe(_TIER_MAP_CACHE["map"])
     # Size and inode supplement nanosecond mtime so same-timestamp rewrites are detected.
     ident = (st.st_mtime_ns, st.st_size, st.st_ino)
@@ -739,8 +745,13 @@ def _load_tier_map():
             if isinstance(who, str) and t in ("owner", "team", "guest", "other"):
                 tm[who.strip()] = _normalized_tier(t)
     except Exception:
-        # Malformed / mid-write → keep last-known-good; don't advance mtime so a
-        # later successful read of the fixed file is still picked up.
+        # As above, fail closed across config switches but retain the same
+        # path's safe caps for a malformed or mid-write file.
+        if path != _TIER_MAP_CACHE["path"]:
+            _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE[
+                "map"
+            ] = (path, None, {})
+            return {}
         return _stale_safe(_TIER_MAP_CACHE["map"])
     _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = (
         path,

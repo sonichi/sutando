@@ -126,6 +126,34 @@ try:
         bridge._tier_for("@teammate:ag2.space", "owner") == "team",
     )
 
+    # A different configured path is a different trust boundary. If its map is
+    # absent, never reuse the prior install's cached decisions.
+    missing_channel = root / "missing" / "channels" / "ag2space"
+    missing_channel.mkdir(parents=True)
+    missing_env = missing_channel / ".env"
+    missing_env.write_text("REMOTE_TASK_TOKEN='https://gw.example/relay|missing'\n")
+    os.environ["AG2_DEVICE_ENV"] = str(missing_env)
+    check(
+        "missing map after path switch clears the previous install's tiers",
+        bridge._tier_for("@teammate:ag2.space", "owner") == bridge.LOCAL_TIER,
+    )
+
+    # Once this configured path has loaded successfully, a transient same-path
+    # read failure retains its own last-known-good map.
+    missing_access = missing_channel / "access.json"
+    missing_access.write_text(
+        json.dumps({"tierMap": {"@teammate:ag2.space": "other"}})
+    )
+    check(
+        "new path loads after its map appears",
+        bridge._tier_for("@teammate:ag2.space", "owner") == "guest",
+    )
+    missing_access.unlink()
+    check(
+        "same-path transient failure retains its own last-known-good map",
+        bridge._tier_for("@teammate:ag2.space", "owner") == "guest",
+    )
+
     # Removing both launcher pointers is an explicit disable, not a transient
     # read failure, so no prior trust decision may survive it.
     os.environ.pop("AG2_DEVICE_ENV")
@@ -147,4 +175,4 @@ if failures:
     for failure in failures:
         print(" - " + failure)
     raise SystemExit(1)
-print(f"\nPASS — {7} access-path checks")
+print(f"\nPASS — {10} access-path checks")
