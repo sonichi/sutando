@@ -1288,23 +1288,33 @@ def _archive_result(path: Path, tid: str) -> None:
 # so it supersedes rather than complements this threshold.
 _ORPHAN_MIN_AGE_S = 600
 
-# An empty body observed right after claiming is far more likely a writer
-# mid-flush than a genuinely empty nudge, so it is always re-queued.
+# An empty body observed right after claiming is a writer mid-flush, so it is
+# always re-queued — and NEVER moved to a terminal resting place.
 #
-# This used to be an mtime age cutoff, which is unsound: mtime cannot tell
-# "created, fd still open, not yet written" from "abandoned" — a file held
-# open with no write keeps its creation mtime. Under the cutoff an unflushed
-# nudge was retired, and the writer's later flush landed in the retired inode
-# where it reads as delivered (review blocker). No age cutoff can be safe, so
-# emptiness is now bounded by how long WE have observed it, not by the file's
-# own timestamps, and the terminal state is a visible dead-letter rather than
-# the archive.
-_EMPTY_ABANDON_S = 300.0
+# History: this was first an mtime age cutoff, then an observation-time cutoff
+# (_EMPTY_ABANDON_S). Both are unsound for the same reason: NOTHING observable
+# from outside the writer — mtime, size, or how long WE have watched it empty —
+# proves the producer has closed its descriptor. A file held open with no write
+# keeps its creation mtime AND stays empty for as long as the writer is paused,
+# so any finite cutoff dead-letters a still-open writer; its later flush then
+# lands in the moved inode and is silently lost — the exact harm this drain
+# exists to remove (review blocker, air 2026-07-28). So there is no abandonment
+# horizon at all: an empty claim is handed back unconditionally, forever, and a
+# flush at ANY later time is delivered on a subsequent pass. A genuinely
+# orphaned 0-byte file (producer crashed before its first write) is a benign
+# zero-byte remnant swept by disk-hygiene — never by this delivery path, which
+# must not be the thing that decides a producer is done.
+#
+# Producers SHOULD publish atomically (write a temp, then rename into
+# proactive-*.txt) so an empty file is never observed at all — but producers are
+# heterogeneous (voice-agent.ts, morning-briefing.py, task-bridge.ts, and the
+# core agent writing ad-hoc), with no single chokepoint to enforce that, so the
+# drain stays correct for the ones that don't.
 
-# filename -> first time THIS process observed it claimed-and-empty. Process
-# local on purpose: a restart forgets, which re-extends the retry window
-# rather than shortening it — the safe direction for an undelivered nudge.
-_EMPTY_FIRST_SEEN: "dict[str, float]" = {}
+# Filenames THIS process has already logged as claimed-empty, so a genuinely
+# orphaned nudge is noted once instead of on every pass. Discarded when the file
+# gains a body (so a later empty re-observation logs again).
+_EMPTY_LOGGED: "set[str]" = set()
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
@@ -1456,29 +1466,28 @@ def _post_proactive() -> None:
             continue
         body = routed_body.strip()
         if not body:
-            # NEVER unlink silently — a vanished owner-facing message with no
-            # log line is the exact harm this drain exists to remove. Hand the
-            # claim back unconditionally: the file's own timestamps cannot
-            # prove the writer is done (see _EMPTY_ABANDON_S). Bound the retry
-            # by how long we have observed it empty instead.
-            first = _EMPTY_FIRST_SEEN.setdefault(f.name, time.time())
-            if time.time() - first < _EMPTY_ABANDON_S:
-                try:
-                    claim.rename(f)
-                except OSError:
-                    pass
-                continue
-            _EMPTY_FIRST_SEEN.pop(f.name, None)
-            _log(f"proactive {f.name} still empty {_EMPTY_ABANDON_S}s after "
-                 f"first observation — dead-lettering to undeliverable/")
-            # UNDELIVERABLE, not ARCHIVE: the archive is where delivered
-            # nudges go, so retiring an undelivered one there makes a lost
-            # message look sent.
-            _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
+            # An empty claim means the producer has not flushed the body yet.
+            # NEVER move this inode: no observable signal proves the writer is
+            # done, so a dead-letter (rename to undeliverable/) would strand a
+            # slow/paused writer's later flush in the moved inode and silently
+            # lose an owner-facing nudge — the exact harm this drain removes.
+            # Hand the claim back UNCONDITIONALLY (no abandonment horizon) so a
+            # flush at any later time is delivered on a subsequent pass; log
+            # once per file so a genuinely orphaned 0-byte remnant (producer
+            # crashed pre-flush, swept later by disk-hygiene) does not spam.
+            if f.name not in _EMPTY_LOGGED:
+                _EMPTY_LOGGED.add(f.name)
+                _log(f"proactive {f.name} claimed empty — producer has not "
+                     f"flushed yet; handing back (never dead-lettered, a late "
+                     f"flush must still deliver)")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
             continue
-        # Non-empty now — drop any prior empty observation so a file that
-        # merely flushed late does not inherit an old abandonment clock.
-        _EMPTY_FIRST_SEEN.pop(f.name, None)
+        # Non-empty now — drop any prior empty observation so a file that merely
+        # flushed late can log again if it is ever re-observed empty.
+        _EMPTY_LOGGED.discard(f.name)
         if len(body.encode("utf-8")) > _PROACTIVE_MAX_BODY_B:
             # Every failure branch below re-queues unconditionally, so a body
             # that can NEVER be delivered would retry and log on every loop

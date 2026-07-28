@@ -448,14 +448,26 @@ def main() -> int:
     check(len(STATE["room_posts"]) == posts_b4 and stale.exists(),
           "an aged empty file is retried, never retired on its mtime alone")
 
-    # Only OUR observation window retires it, and it dead-letters somewhere
-    # visible rather than into the archive beside delivered nudges.
-    rtc._EMPTY_FIRST_SEEN[stale.name] = time.time() - (rtc._EMPTY_ABANDON_S + 1)
+    # No abandonment horizon (review blocker, air 2026-07-28): even after many
+    # observations of the same empty file, it is STILL handed back, NEVER
+    # dead-lettered. No amount of watching proves the writer closed its fd; the
+    # old code retired it after _EMPTY_ABANDON_S, which stranded a slow writer's
+    # later flush in the moved inode.
+    for _ in range(5):
+        rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4 and stale.exists()
+          and not any(x.name.startswith("proactive-t3b")
+                      for x in rtc.UNDELIVERABLE_RESULTS_DIR.glob("*.txt")),
+          "an empty file is never dead-lettered, however long it is observed")
+
+    # And its late flush still delivers — into the SAME inode that was never
+    # moved. This is the data-loss race the removed horizon reintroduced.
+    stale.write_text("t3b late body")
     rtc._post_proactive()
-    check(len(STATE["room_posts"]) == posts_b4 and not stale.exists()
-          and any(x.name.startswith("proactive-t3b")
-                  for x in rtc.UNDELIVERABLE_RESULTS_DIR.glob("*.txt")),
-          "empty past the abandonment horizon is dead-lettered, not archived")
+    check(len(STATE["room_posts"]) == posts_b4 + 1
+          and STATE["room_posts"][-1]["body"] == "t3b late body"
+          and not stale.exists(),
+          "the late flush of a long-empty file is delivered, never lost")
 
     # REGRESSION (review blocker, 2026-07-28): an aged-but-still-open file.
     # mtime cannot distinguish "created, fd still open, not yet written" from
@@ -469,9 +481,14 @@ def main() -> int:
     try:
         aged = time.time() - 3600                  # far past any age cutoff
         os.utime(stalled, (aged, aged))
-        rtc._post_proactive()                      # drain sees empty + old
+        # Hammer the drain many times while the descriptor stays open and empty
+        # — simulating a writer paused well beyond the old _EMPTY_ABANDON_S
+        # horizon. With no horizon the inode is never moved, so the still-open
+        # fd keeps pointing at the live proactive-*.txt.
+        for _ in range(8):
+            rtc._post_proactive()                  # drain sees empty + old
         check(stalled.exists(),
-              "aged-but-open empty file is handed back, not retired")
+              "aged-but-open empty file is handed back over many passes, not retired")
         fh.write("late body that should reach the owner")   # writer flushes
         fh.flush()
     finally:
