@@ -55,6 +55,29 @@ out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-non-tas
 [ "$out" = "ran-non-task-ok" ] || fail "non-task file: expected 'ran-non-task-ok', got '$out'"
 ok "non-task-*.txt files do not trigger deferral"
 
+# --- task-cron-*.txt (cron-runner emission) does NOT count -------------------
+# Regression: a cron-gate-wrapped entry migrated to launchd is delivered as its
+# own task-cron-<name>-<ms>.txt file; that file must not make the gate defer, or
+# the entry defers on its own delivery vehicle forever.
+touch "$TMPDIR/tasks/task-cron-sync-workspace-1785114482357.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-cron-emit echo 'ran-despite-cron-file' 2>&1)"
+[ "$out" = "ran-despite-cron-file" ] || fail "task-cron-* file: expected 'ran-despite-cron-file', got '$out'"
+ok "task-cron-*.txt (cron-runner emission) does not trigger deferral"
+
+# --- but a genuine owner task-*.txt alongside it STILL defers -----------------
+touch "$TMPDIR/tasks/task-9876543210987.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-owner-plus-cron echo 'should-not-run' 2>&1)"
+case "$out" in
+  *"deferring test-owner-plus-cron"*) : ;;
+  *) fail "owner+cron: expected deferral, got '$out'" ;;
+esac
+case "$out" in
+  *"should-not-run"*) fail "owner+cron: wrapped command ran" ;;
+  *) : ;;
+esac
+ok "genuine owner task still defers even when a task-cron-* file is present"
+rm -f "$TMPDIR/tasks/task-cron-sync-workspace-1785114482357.txt" "$TMPDIR/tasks/task-9876543210987.txt"
+
 # --- usage error: no command → exit 2 -----------------------------------------
 set +e
 SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-usage >/dev/null 2>&1
@@ -72,4 +95,4 @@ set -e
 ok "wrapped command exit code propagates via exec"
 
 echo
-echo "OK — 7/7 cron-gate tests passed"
+echo "OK — 9/9 cron-gate tests passed"

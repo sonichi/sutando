@@ -148,6 +148,14 @@ def _epoch(y, mo, d, h, mi):
     return int(time.mktime((y, mo, d, h, mi, 0, 0, 0, -1)))
 
 
+def _mark_core_alive(root: Path, now: int) -> None:
+    cr.CORE_ALIVE_FILE = root / "state" / "cores" / "test.alive"
+    cr.CORE_ALIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    cr.CORE_ALIVE_FILE.write_text("{}")
+    import os
+    os.utime(cr.CORE_ALIVE_FILE, (now, now))
+
+
 def test_due_since_catchup():
     fire = _epoch(2026, 7, 2, 6, 2)  # 06:02 digest fire
     # Machine "woke" at 06:10; last recorded fire was yesterday 06:03.
@@ -256,6 +264,7 @@ def test_run_only_fires_launchd_entries():
             "digest": _epoch(2026, 7, 2, 6, 1),
             "session-loop": _epoch(2026, 7, 2, 6, 1),
         }))
+        _mark_core_alive(root, now)
         emitted = cr.run(now_epoch=now)
         check(emitted == ["digest"], "only the launchd entry fires, session entry skipped")
         files = list(cr.TASKS_DIR.glob("task-cron-*.txt"))
@@ -353,9 +362,102 @@ def test_run_no_state_catches_up():
         cr.CRONS_FILE.write_text(json.dumps([
             {"name": "daily", "cron": "0 6 * * *", "prompt": "brief", "launchd": True},
         ]))
+        _mark_core_alive(root, now)
         # No state file → first run; must catch up within MAX_CATCHUP_SECONDS.
         emitted = cr.run(now_epoch=now)
         check(emitted == ["daily"], "no-state first run catches up the missed daily cron")
+
+
+def test_run_does_not_queue_for_dead_core_and_recovers_recent_slot():
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.CORE_ALIVE_FILE = root / "state" / "cores" / "test.alive"
+        now = _epoch(2026, 7, 2, 6, 2)
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        prior = _epoch(2026, 7, 2, 6, 1)
+        cr.STATE_FILE.write_text(json.dumps({"digest": prior}))
+
+        emitted = cr.run(now_epoch=now)
+        check(emitted == [], "dead core receives no cron task")
+        check(not cr.TASKS_DIR.exists(), "dead core leaves no queued task file")
+        check(
+            json.loads(cr.STATE_FILE.read_text())["digest"] == prior,
+            "dead-core tick preserves boundary for short catch-up",
+        )
+
+        _mark_core_alive(root, now + 60)
+        emitted = cr.run(now_epoch=now + 60)
+        check(emitted == ["digest"], "recent missed slot recovers after core returns")
+
+
+def test_run_drops_stale_catchup_slot():
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        fire = _epoch(2026, 7, 2, 6, 0)
+        now = fire + cr.MAX_EMIT_LATENESS_SECONDS + 60
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({"briefing": fire - 60}))
+        _mark_core_alive(root, now)
+        stderr = io.StringIO()
+        import contextlib
+        with contextlib.redirect_stderr(stderr):
+            emitted = cr.run(now_epoch=now)
+        check(emitted == [], "stale catch-up slot is not emitted")
+        check("dropping stale slot for briefing" in stderr.getvalue(),
+              "stale drop is observable")
+        check(not cr.TASKS_DIR.exists(), "stale slot leaves no task file")
+
+
+def test_run_acquires_shared_state_lock():
+    """run() must take the shared state lock around its read-modify-write, so a
+    concurrent Codex reconciler can neither clobber the tick's state write-back
+    nor have its just-seeded migration boundary dropped. Proven by holding the
+    same lock and observing run() block until it is released."""
+    import json
+    import threading
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        now = _epoch(2026, 7, 2, 6, 2)
+        _mark_core_alive(root, now)
+        completed = threading.Event()
+
+        def tick():
+            cr.run(now_epoch=now)
+            completed.set()
+
+        # Hold the shared lock; run() must block before it can read/write state.
+        with cr._state_lock(cr.STATE_FILE):
+            worker = threading.Thread(target=tick)
+            worker.start()
+            check(not completed.wait(0.3),
+                  "run() blocks while the shared state lock is held")
+        worker.join(2)
+        check(completed.is_set(), "run() completes once the shared lock is released")
+        # And the tick still did its job once unblocked.
+        files = list(cr.TASKS_DIR.glob("task-cron-*.txt"))
+        check(len(files) == 1, "run() emits the due entry after acquiring the lock")
 
 
 def _run_all():

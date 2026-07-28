@@ -41,12 +41,82 @@ export SUTANDO_ROOT="$REPO"
 # such hosts (web-client outage 2026-07-17).
 _APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
 [ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
-_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin)"
+# `|| true`: tsx-bin prints nothing AND returns nonzero on a bare bundled
+# runtime (no tsx anywhere) — under set -e that exited startup at this line
+# before the bundled-mode gate could run (Codex blocking finding #2).
+_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin || true)"
 run_tsx() {
   if [ -n "$_TSX_BIN" ]; then
     "$_TSX_BIN" "$@"
   else
     npx tsx "$@"
+  fi
+}
+
+# G1.5 node-bundle (owner-adopted design + owner review 2026-07-19).
+# Bundled and dev are MUTUALLY EXCLUSIVE modes, not a preference (P1-2):
+#   BUNDLED = the desktop-managed runtime is present — SUTANDO_NODE exported
+#   (fail-closed if invalid, see node-bin) OR the bundled runtime discovered
+#   at its canonical home (app-node-dir; covers launchd jobs without the env
+#   var) — AND dist artifacts are shipped. Services run dist/<name>.js under
+#   the pinned node; a missing artifact is an explicit PACKAGING ERROR, never
+#   a tsx fallback (tsx/npm/node_modules deliberately don't exist here).
+#   DEV = everything else; tsx-over-src exactly as before, so a stale dist/
+#   can never shadow live src edits.
+_NODE_BIN="$(bash "$REPO/scripts/sutando-config.sh" node-bin)" || {
+  echo "✗ SUTANDO_NODE is set but invalid — desktop packaging error; refusing PATH fallback (G1.5 fail-closed)"
+  exit 1
+}
+# At-rest discovery is scoped to the PACKAGED ENGINE COPY ONLY: the checkout
+# must itself live inside the engine root that owns the runtime
+# (<engine-root>/runtime/node/bin + <engine-root>/.../this repo). A dev
+# checkout on a machine that merely HAS the app installed must stay dev even
+# after `npm run build:bundle` — stale dist can never shadow live src
+# (Codex finding #3).
+_APP_ENGINE_ROOT="${_APP_NODE_DIR%/node/bin}"
+_APP_ENGINE_ROOT="${_APP_ENGINE_ROOT%/runtime}"
+# Mode comes from the MANAGED-RUNTIME SIGNAL ALONE (Codex re-review F2):
+# explicit SUTANDO_NODE, or the at-rest runtime discovered while running AS
+# the packaged engine copy. Artifact presence is then VALIDATED separately —
+# a managed runtime with missing dist is a packaging error that fails closed,
+# never a silent slide into dev/npm/tsx.
+BUNDLED_MODE=0
+if [ -n "${SUTANDO_NODE:-}" ]; then
+  BUNDLED_MODE=1
+elif [ -x "$_APP_NODE_DIR/node" ] && [ "${REPO#"$_APP_ENGINE_ROOT"/}" != "$REPO" ]; then
+  BUNDLED_MODE=1
+fi
+if [ "$BUNDLED_MODE" = "1" ]; then
+  # Validate EVERY artifact of the build:bundle contract, not a representative
+  # one (external review on #2182): a missing voice/proxy/etc artifact would
+  # otherwise fail inside a background job while boot still prints ✓.
+  _MISSING_DIST=""
+  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers; do
+    [ -f "$REPO/dist/$_artifact.js" ] || _MISSING_DIST="$_MISSING_DIST $_artifact.js"
+  done
+  if [ -n "$_MISSING_DIST" ]; then
+    echo "✗ bundled mode: required dist artifacts missing ($REPO/dist:$_MISSING_DIST) — desktop packaging error; refusing dev fallback (G1.5 fail-closed)"
+    exit 1
+  fi
+fi
+if [ -n "${SUTANDO_NODE:-}" ]; then
+  _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
+  case ":$PATH:" in *":$_SUTANDO_NODE_DIR:"*) ;; *) PATH="$_SUTANDO_NODE_DIR:$PATH"; export PATH ;; esac
+fi
+run_node_service() {
+  # $1 = dist basename (build-bundle artifact), $2 = ts entry (as run_tsx
+  # expects it today — relative or absolute), rest = service args.
+  _rns_dist="$REPO/dist/$1.js"
+  _rns_entry="$2"
+  shift 2
+  if [ "$BUNDLED_MODE" = "1" ]; then
+    if [ ! -f "$_rns_dist" ]; then
+      echo "  ✗ bundled mode: dist artifact missing: $_rns_dist (packaging error — refusing tsx fallback)"
+      return 1
+    fi
+    "$_NODE_BIN" "$_rns_dist" "$@"
+  else
+    run_tsx "$_rns_entry" "$@"
   fi
 }
 
@@ -383,8 +453,18 @@ echo ""
 # things piece by piece.
 bash "$REPO/src/init.sh" --preflight | tail -1
 
-# Install dependencies if needed
-if [ ! -d node_modules ]; then
+# Bundled mode (G1.5): BUNDLED_MODE is computed ONCE next to
+# run_node_service (single source of truth — owner review P1-2: app-node-dir
+# discovery counts as bundled too, not just the env var). The npm bootstrap
+# + node/npx prereq blocks below are gated on it because a bundled runtime
+# deliberately has NO npm/npx/node_modules (Codex finding #1).
+if [ "$BUNDLED_MODE" = "1" ]; then
+  echo "  ✓ bundled mode (pinned runtime + dist artifacts) — skipping dependency bootstrap"
+fi
+
+# Install dependencies if needed (dev/source mode only — bundled installs
+# run dist artifacts under the pinned node and need no node_modules).
+if [ "$BUNDLED_MODE" != "1" ] && [ ! -d node_modules ]; then
   if command -v npm > /dev/null 2>&1 && npm install 2>/dev/null; then
     echo "  ✓ Dependencies installed (npm)"
   elif command -v pnpm > /dev/null 2>&1 && pnpm install 2>/dev/null; then
@@ -401,9 +481,13 @@ fi
 
 # Check CLI prerequisites. node/npx/python3, the selected core runtime, and
 # fswatch are checked here because they are not needed for init.sh bootstrap.
+# Bundled mode: node is $SUTANDO_NODE (its dir already heads PATH) and npx is
+# intentionally absent (bare-node runtime, dist-first services) — skip both.
 missing=0
-if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
-if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
+if [ "$BUNDLED_MODE" != "1" ]; then
+  if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
+  if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
+fi
 if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; missing=1; fi
 core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)"
 if ! command -v "$core_runtime" > /dev/null 2>&1; then
@@ -584,10 +668,18 @@ fi
 _PROXY_LABEL="com.sutando.credential-proxy"
 _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
 if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
-  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1; then
-    echo "  ✓ credential proxy (launchd-supervised, already loaded)"
+  # Upgrade path (Codex re-review F1): an already-loaded job may carry a plist
+  # generated BEFORE SUTANDO_NODE existed (or with a different runtime) — a
+  # KeepAlive restart would then lose the pinned runtime. Compare the loaded
+  # plist's managed runtime to the current one and reinstall on drift (the
+  # installer bootout_if_loaded+bootstraps, so re-running over a live job is
+  # safe).
+  _PROXY_PLIST_DEST="$HOME/Library/LaunchAgents/$_PROXY_LABEL.plist"
+  _PROXY_PLIST_NODE="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:SUTANDO_NODE" "$_PROXY_PLIST_DEST" 2>/dev/null || true)"
+  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1 && [ "$_PROXY_PLIST_NODE" = "${SUTANDO_NODE:-}" ]; then
+    echo "  ✓ credential proxy (launchd-supervised, already loaded, runtime current)"
   else
-    echo "  Installing launchd-supervised credential proxy..."
+    echo "  Installing launchd-supervised credential proxy (fresh or runtime drift)..."
     if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
       # Wait for the supervised proxy to bind before the legacy-launch guard.
       for _ in $(seq 1 10); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
@@ -599,8 +691,16 @@ if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ];
 fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
-  _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
-  run_tsx "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
+  # Same dist-only contract as the wrapper and the installer: a bundled host
+  # ships dist/ and has no quota-tracker skill dir, so resolving the TS source
+  # here would hand run_node_service a path that does not exist and leave the
+  # host with no proxy at all ("Claude will connect directly").
+  if [ "$BUNDLED_MODE" = "1" ]; then
+    _PROXY_SCRIPT="$REPO/dist/credential-proxy.js"
+  else
+    _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+  fi
+  run_node_service credential-proxy "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"
@@ -628,7 +728,7 @@ if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
-      run_tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
+      run_node_service boot "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
     echo "  ✓ obs collector"
   else
     echo "  ✓ obs collector (already running on $OBS_PORT)"
@@ -693,7 +793,7 @@ else
     fi
   elif ! lsof -i :9900 > /dev/null 2>&1; then
     echo "  Starting voice agent (port 9900)..."
-    run_tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
+    run_node_service voice-agent src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
     echo "  ✓ voice agent"
   else
     echo "  ✓ voice agent (already running)"
@@ -708,7 +808,7 @@ fi
 # back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
 # advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
 # post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
-run_tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+run_node_service emit-call-tiers src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
 echo "  ✓ call-tiers advertisement (re-emit 60s)"
 
 # 2. Web client (port 8080 by default; CLIENT_PORT may avoid a local conflict)
@@ -733,7 +833,7 @@ if [ "$WEB_CLIENT_PORT" = "8080" ] && launchctl print "gui/$(id -u)/com.sutando.
   fi
 elif ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
   echo "  Starting web client (port $WEB_CLIENT_PORT)..."
-  run_tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
+  run_node_service web-client src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running on $WEB_CLIENT_PORT)"
@@ -982,9 +1082,20 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # would export a value and the bridge's default never fires. A shared /
   # multi-user gateway sets REMOTE_TASK_TIER=team explicitly.
   REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
-  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
+  # AG2 Space's gateway tags inbound image/file markers `ag2space-media` (its
+  # media-proxy at {gateway}/v1/media/...). The provider-neutral bridge defaults
+  # its marker tag to `remote-media`, so without this the marker never matches and
+  # the media URL lands in the task body unresolved — the core can't see the image
+  # (owner-reported 2026-07-25). Default it to the AG2 tag here, in the AG2-specific
+  # launch block, so the generic package carries no provider string. Explicit
+  # REMOTE_MEDIA_MARKER (e.g. from the channel .env) still wins.
+  REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
+  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
   if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
-    python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+    # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
+    # the redirect below); the bridge stamps launched_via into gateway-status
+    # and skips its own bare-launch file log. See remote_gateway_bridge._log.
+    SUTANDO_SUPERVISED=1 python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
     echo "  ✓ gateway bridge"
   else
     echo "  ✓ gateway bridge (already running)"
@@ -1076,7 +1187,7 @@ elif ! phone_stack_enabled; then
 elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
-    run_tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
+    run_node_service conversation-server skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
     echo "  ✓ conversation server (port 3100)"
   else
     echo "  ✓ conversation server (already running)"
