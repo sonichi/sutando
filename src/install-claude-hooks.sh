@@ -66,11 +66,38 @@ SETTINGS="$REPO_DIR/.claude/settings.json"
 # installed by this script would point at a directory that does not exist and
 # fail silently on each fire. REPO_DIR was already derived correctly on the line
 # above and simply was not used.
+
+# Single-quote a string for safe embedding in a stored shell command.
+# REPO_DIR is expanded at install time, so its literal text lands in
+# settings.json and is re-parsed by a shell at hook-run time. Unquoted, a clone
+# under "Library/Application Support/..." is split on the space and the hook
+# dies with `bash: /Users/you/Library: No such file or directory` — the exact
+# path this fix targets. Single quotes (with '\'' escaping) are metacharacter-
+# proof, unlike double quotes which would still interpolate $ and `.
+shq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Hook specs: each line is "<event>|<marker>|<command>".  Order = install order.
+#
+# <marker> is a stable substring identifying a hook THIS script owns, used by
+# the stale-variant sweep below. It must not match a sibling hook: note
+# "src/session-handoff.sh" cannot match the archive hook's
+# "sutando-conversations/", so migrating one never disturbs the other.
+#
+# $REPO_DIR is expanded HERE, at install time, so the command written into
+# settings.json carries this clone's absolute path — quoted via shq(). It used
+# to hardcode $HOME/Desktop/sutando escaped, so it landed in settings.json
+# literally and was expanded at HOOK-RUN time, resolving to that one path on
+# every host. This clone is at "Library/Application Support/space.ag2.app/
+# engine/sutando" and a sibling is at "Documents/github/sutando"; neither is
+# ~/Desktop, so every hook installed by the old script pointed at a directory
+# that does not exist and failed silently on each fire.
 HOOKS=(
-  "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
-  "PreCompact|bash $REPO_DIR/src/session-handoff.sh \"\$TRANSCRIPT_PATH\""
-  "SessionEnd|bash $REPO_DIR/src/session-handoff.sh \"\$TRANSCRIPT_PATH\""
-  "Stop|bash $REPO_DIR/src/check-pending-tasks.sh"
+  "PreCompact|sutando-conversations/|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+  "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
+  "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
+  "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
 )
 
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
@@ -99,10 +126,50 @@ ADDED=0
 SKIPPED=0
 REMOVED=0
 
+# Phase 0: remove STALE VARIANTS of hooks we own — any command carrying our
+# marker for this event that is not byte-identical to the command we are about
+# to install. This is what makes a re-run a real migration rather than an
+# add-only pass:
+#   * legacy "$HOME/Desktop/sutando/src/session-handoff.sh" entries;
+#   * the UNQUOTED form written by earlier revisions of this very script, which
+#     an exact-string comparison in phase 1 can never match (so both the broken
+#     and the fixed hook would fire);
+#   * an entry left behind by a different clone of this repo.
+# It runs BEFORE phase 1 so the freshly-added current command is never swept.
+# Scoped by marker, so a hook the operator added by hand is untouched.
+for entry in "${HOOKS[@]}"; do
+  EVENT="${entry%%|*}"
+  REST="${entry#*|}"
+  MARKER="${REST%%|*}"
+  CMD="${REST#*|}"
+
+  if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
+      '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
+       | map(contains($marker) and (. != $cmd)) | any' \
+      "$SETTINGS" >/dev/null 2>&1; then
+    continue
+  fi
+
+  TMP="$(mktemp "${SETTINGS}.XXXXXX")"
+  jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" '
+    if (.hooks // {})[$event] then
+      .hooks[$event] |= map(
+        .hooks |= map(select(
+          ((.command // "") | contains($marker)) and ((.command // "") != $cmd) | not
+        ))
+      )
+      | .hooks[$event] |= map(select((.hooks // []) | length > 0))
+    else . end
+  ' "$SETTINGS" > "$TMP" || { echo "error: jq stale-variant sweep failed on $EVENT" >&2; rm -f "$TMP"; exit 1; }
+  mv "$TMP" "$SETTINGS"
+  REMOVED=$((REMOVED + 1))
+done
+
 # Phase 1: install missing current hooks.
 for entry in "${HOOKS[@]}"; do
   EVENT="${entry%%|*}"
-  CMD="${entry#*|}"
+  REST="${entry#*|}"
+  CMD="${REST#*|}"
 
   # Detect existing entry by command-string match within this event's hooks list.
   if jq -e --arg event "$EVENT" --arg cmd "$CMD" \
