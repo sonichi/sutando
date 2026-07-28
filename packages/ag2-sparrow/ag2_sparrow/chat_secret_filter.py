@@ -16,6 +16,12 @@ from typing import Iterable, Tuple
 _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     ("AWS Access Key", re.compile(r"AKIA[A-Z0-9]{16}")),
     ("GitHub Token", re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}")),
+    # Google/Gemini API keys. This repo's own load-bearing GEMINI_API_KEY has
+    # this shape, so without it an owner could paste the key into a room and
+    # have it persisted to the task file and owner-activity state despite the
+    # documented "tokens, keys" redaction guarantee. The 35-char tail makes it
+    # high-precision: prose mentioning "AIza" cannot reach the length.
+    ("Google API Key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
     # Fine-grained PATs (2022+) use a distinct prefix + longer body — the
     # legacy ghp_/gho_/… pattern above never matches them (review P1).
     ("GitHub Fine-Grained PAT", re.compile(r"github_pat_[A-Za-z0-9_]{36,}")),
