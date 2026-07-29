@@ -1047,7 +1047,14 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	} catch { /* siblings root unreadable — skip */ }
 	const owner: ToolDefinition[] = [];
 	const anyCaller: ToolDefinition[] = [];
-	const setups: SkillSetup[] = [];
+	// Keyed by stable skill identity (manifest.name || dirName) so the SAME skill
+	// scanned from two roots (public/workspace/private/external/sibling) registers
+	// its setup() hook ONCE, with the same last-write-wins precedence as the tool
+	// dedup below. Without this, a duplicated manifest across roots would attach
+	// the same session handler twice (e.g. talk-highlight's turn.end advancing a
+	// slide twice). Identity is the skill, not the tool name: two DIFFERENT skills
+	// each exporting setup() both survive — only same-skill copies collapse.
+	const setups = new Map<string, SkillSetup>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -1081,7 +1088,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
 				}
 				if (typeof mod.setup === 'function') {
-					setups.push(mod.setup as SkillSetup);
+					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
 					console.log(`[skill-loader] registered setup() hook from ${manifest.name || dirName}`);
 				}
 			} catch (err) {
@@ -1100,7 +1107,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		for (const t of arr) byName.set(t.name, t);
 		return [...byName.values()];
 	};
-	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups };
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()] };
 }
 const personalTools = await loadSkillManifestTools();
 // Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
