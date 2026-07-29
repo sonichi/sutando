@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release"
+  short_description: "Prepare evidence-backed Sutando releases"
+  default_prompt: "Use $release to prepare a release proposal and verify its documentation and release gates."
