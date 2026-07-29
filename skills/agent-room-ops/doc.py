@@ -16,6 +16,7 @@ gateway — the client passes them through verbatim.
 from __future__ import annotations
 
 import base64
+import json
 import os
 
 from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason,
@@ -46,7 +47,22 @@ def _call(op, room_id, agent_mxid, gate, extra):
     try:
         _status, res = http_json("POST", f"{base}/v1/room", headers, payload)
     except HTTPError as e:
-        return _result(False, room_id=room_id, reason=degrade_reason(e.code))
+        # A 4xx may carry a structured {"error": ...} body — e.g. a genuine
+        # "<folder>/<name> not found" for a missing doc, which is distinct from
+        # an unimplemented verb. degrade_reason() alone flattens every 404 to
+        # "verb unimplemented (404)", which misreports an absent doc as a dead
+        # doc backend (observed 2026-07-28: a missing plan doc read as "verb
+        # unimplemented", masking that prep_get was in fact working). Prefer the
+        # server's own error string when it sent one; fall back to degrade_reason.
+        reason = degrade_reason(e.code)
+        try:
+            parsed = json.loads(e.read().decode("utf-8") or "{}")
+            if isinstance(parsed, dict) and parsed.get("error"):
+                reason = str(parsed["error"])
+        except Exception:
+            pass
+        return _result(False, room_id=room_id, folder=extra.get("folder"),
+                       name=extra.get("filename"), reason=reason)
     except (URLError, TimeoutError) as e:
         return _result(False, room_id=room_id, reason=f"network error: {e}")
     if isinstance(res, dict) and res.get("error"):
