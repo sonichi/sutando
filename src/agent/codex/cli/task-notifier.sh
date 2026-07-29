@@ -13,6 +13,8 @@ fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
+CORE_READY_TIMEOUT=300
+CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
 
 has_result() {
   local filename="$1" stem archive_dir
@@ -35,6 +37,53 @@ has_result() {
       return 0
     fi
   done
+  return 1
+}
+
+core_is_idle() {
+  [ -f "$CORE_STATUS_FILE" ] || return 1
+  grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' "$CORE_STATUS_FILE" 2>/dev/null
+}
+
+wait_for_core_idle() {
+  local started
+  started="$(date +%s)"
+  while ! core_is_idle; do
+    if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
+      return 1
+    fi
+    if [ $(( $(date +%s) - started )) -ge "$CORE_READY_TIMEOUT" ]; then
+      echo "task-notifier: core did not become idle within ${CORE_READY_TIMEOUT}s; restarting notifier without submitting" >&2
+      return 1
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+next_pending_task() {
+  local candidate
+  while IFS= read -r candidate; do
+    case "$candidate" in
+      ""|*/*|*..*) continue ;;
+    esac
+    if ! has_result "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(
+    python3 - "$REPO/src" "$TASKS_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from task_priority import sort_tasks_by_priority
+
+tasks_dir = Path(sys.argv[2])
+for task in sort_tasks_by_priority(tasks_dir.glob("*.txt")):
+    if task.is_file():
+        print(task.name)
+PY
+  )
   return 1
 }
 
@@ -89,6 +138,15 @@ fi
 
 bash "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" | while IFS= read -r event; do
   case "$event" in
-    "TASK_FILE: "*) submit_task "${event#TASK_FILE: }" 1 ;;
+    "TASK_FILE: "*)
+      # Watcher output is a wake signal, not queue order. While the core is
+      # busy, keep every task durable on disk instead of typing into Codex's
+      # non-durable interactive input. Once idle, re-scan the whole queue and
+      # select urgent/normal/low priority with FIFO only inside each tier.
+      next_pending_task >/dev/null || continue
+      wait_for_core_idle || exit 1
+      filename="$(next_pending_task)" || continue
+      submit_task "$filename" 1
+      ;;
   esac
 done

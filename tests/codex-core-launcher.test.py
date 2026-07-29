@@ -11,7 +11,9 @@ import unittest
 import pty
 from pathlib import Path
 
-REAL_REPO = Path(__file__).resolve().parents[1]
+REAL_REPO = Path(os.environ.get(
+    "SUTANDO_TEST_REPO", Path(__file__).resolve().parents[1]
+)).resolve()
 
 
 class CodexCoreLauncherTests(unittest.TestCase):
@@ -25,6 +27,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
+            "src/local_task_protocol.py",
+            "src/task_priority.py",
             "src/util_paths.py",
             "src/watch-tasks-stream.sh",
             "src/workspace_default.py",
@@ -652,6 +656,9 @@ exit 0
         results = workspace / "results"
         tasks.mkdir(exist_ok=True)
         results.mkdir(exist_ok=True)
+        (workspace / "state" / "core-status.json").write_text(
+            '{"status":"idle","ts":1}\n'
+        )
         for name in ("task-one.txt", "task-two.txt"):
             (tasks / name).write_text(f"task: {name}\n")
         watcher = self.root / "src/watch-tasks-stream.sh"
@@ -686,6 +693,68 @@ exit 0
         self.assertLess(calls.index("task-one.txt"), calls.index("task-two.txt"))
         self.assertTrue((results / "task-one.txt").exists())
         self.assertTrue((results / "task-two.txt").exists())
+
+    def test_managed_notifier_waits_for_idle_then_prioritizes_owner_task(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        status = workspace / "state" / "core-status.json"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        status.write_text('{"status":"running","ts":1}\n')
+        low = tasks / "task-low.txt"
+        normal = tasks / "task-owner.txt"
+        low.write_text("priority: low\ntask: scheduled maintenance\n")
+        normal.write_text("priority: normal\ntask: owner message\n")
+        now = time.time()
+        os.utime(low, (now - 10, now - 10))
+        os.utime(normal, (now, now))
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text(
+            "#!/bin/bash\n"
+            "printf 'TASK_FILE: task-low.txt\\nTASK_FILE: task-owner.txt\\n'\n"
+        )
+        watcher.chmod(0o755)
+        early = Path(self.tmp.name) / "submitted-while-busy"
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
+  grep -q '"status":"running"' "$SUTANDO_CORE_STATUS_FILE" && touch "$EARLY_SUBMIT"
+  prompt=$(grep 'Sutando task ready:' "$TMUX_LOG" | tail -1)
+  name=${prompt#*Sutando task ready: }
+  name=${name%%.*}.txt
+  touch "$SUTANDO_RESULTS_DIR/$name"
+fi
+exit 0
+''')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   EARLY_SUBMIT=str(early), SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
+                   SUTANDO_RESULTS_DIR=str(results), SUTANDO_CORE_STATUS_FILE=str(status),
+                   SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+                   SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        process = subprocess.Popen(["/bin/bash", str(script)], env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 2
+        while not self.log.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(self.log.exists(), "notifier never observed the live core")
+        calls_while_busy = self.log.read_text()
+        status.write_text('{"status":"idle","ts":2}\n')
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr or stdout)
+        self.assertNotIn(
+            "send-keys", calls_while_busy,
+            "notifier submitted while core status was running",
+        )
+        self.assertFalse(early.exists(), "notifier submitted before core became idle")
+        calls = self.log.read_text()
+        self.assertLess(calls.index("task-owner.txt"), calls.index("task-low.txt"))
+        self.assertTrue((results / "task-owner.txt").exists())
+        self.assertTrue((results / "task-low.txt").exists())
 
 
 if __name__ == "__main__":
