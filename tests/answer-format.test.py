@@ -26,6 +26,11 @@ def check(name, got, want):
 check("word-million", nz.normalize_number("100 million"), "100000000")
 check("word-billion-decimal", nz.normalize_number("3.5 billion"), "3500000000")
 check("word-thousand", nz.normalize_number("2 thousand"), "2000")
+# Exact decimal arithmetic — binary float would emit 2009999.9999999998 etc.
+check("decimal-magnitude-exact", nz.normalize_number("2.01 million"), "2010000")
+check("decimal-magnitude-half", nz.normalize_number("1.5 million"), "1500000")
+check("decimal-magnitude-quarter-billion", nz.normalize_number("0.25 billion"), "250000000")
+check("decimal-magnitude-nonwhole", nz.normalize_number("1.2345 thousand"), "1234.5")
 check("word-case-plural", nz.normalize_number("5 Millions"), "5000000")
 check("commas-stripped", nz.normalize_number("1,234,567"), "1234567")
 check("commas-decimal", nz.normalize_number("12,345.67"), "12345.67")

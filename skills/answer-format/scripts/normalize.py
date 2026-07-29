@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from decimal import Decimal, InvalidOperation
 
 _WORD_MAGNITUDES = {
     "hundred": 100,
@@ -42,9 +43,18 @@ def _expand_magnitude(text: str) -> str | None:
     m = _MAGNITUDE_RE.match(text)
     if not m:
         return None
-    value = float(m.group(1)) * _WORD_MAGNITUDES[m.group(2).lower()]
-    # Emit an integer when the result is whole (the common case), else a plain decimal.
-    return str(int(value)) if value == int(value) else repr(value)
+    # Exact decimal arithmetic — binary float would emit artifacts like
+    # "2.01 million" -> 2009999.9999999998 instead of 2010000.
+    try:
+        value = Decimal(m.group(1)) * _WORD_MAGNITUDES[m.group(2).lower()]
+    except InvalidOperation:
+        return None
+    # Emit a bare integer when whole (the common case), else a plain decimal
+    # with no exponent or trailing zeros (Decimal.normalize can yield "2E+6").
+    if value == value.to_integral_value():
+        return str(int(value))
+    normalized = value.normalize()
+    return f"{normalized:f}"
 
 
 def normalize_number(text: str) -> str:
