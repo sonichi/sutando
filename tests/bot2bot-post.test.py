@@ -122,6 +122,23 @@ try:
           b2b.resolve_other_bot(ACCESS, MEMBER_SELF, BOT2BOT) is None)
     check("resolve_other_bot: 1 peer → that peer",
           b2b.resolve_other_bot(single_access, MEMBER_SELF, BOT2BOT) == MEMBER_A)
+
+    # legacy configs: owner+bot share the top-level allowFrom, so the
+    # not-in-global heuristic yields no bot_candidates. Same no-guess rule.
+    legacy_single = {
+        "allowFrom": [MEMBER_A, MEMBER_SELF],
+        "groups": {"chan_bot2bot": {"role": "bot2bot",
+                                    "allowFrom": [MEMBER_A, MEMBER_SELF]}},
+    }
+    check("resolve_other_bot: legacy 1 non-self id → that id",
+          b2b.resolve_other_bot(legacy_single, MEMBER_SELF, BOT2BOT) == MEMBER_A)
+    legacy_multi = {
+        "allowFrom": [MEMBER_A, MEMBER_B, MEMBER_SELF],
+        "groups": {"chan_bot2bot": {"role": "bot2bot",
+                                    "allowFrom": [MEMBER_A, MEMBER_B, MEMBER_SELF]}},
+    }
+    check("resolve_other_bot: legacy 2 non-self ids → None (no guess)",
+          b2b.resolve_other_bot(legacy_multi, MEMBER_SELF, BOT2BOT) is None)
 finally:
     _restore()
 
