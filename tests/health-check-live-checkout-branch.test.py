@@ -14,6 +14,11 @@ Covers:
   d) not a git repo                    → ok (degrade, no false alarm)
   e) SUTANDO_EXPECTED_BRANCH override  → ok on the pinned branch
   f) git not runnable (OSError)        → ok (degrade, no false alarm)
+  g) core.expected_branch in sutando.config.local.json → ok on the pinned
+     branch (durable pin for launchd/Sutando.app callers, no env needed)
+  h) env override wins over config     → warn when they disagree
+  i) malformed config JSON             → falls back to "main" (probe still
+     runs; a broken config must not kill the health check)
 
 Run: python3 tests/health-check-live-checkout-branch.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -39,6 +44,14 @@ def check(cond: bool, msg: str) -> None:
     print(("  ok   " if cond else "  FAIL ") + msg)
     if not cond:
         FAILS.append(msg)
+
+
+def _reset_config_cache() -> None:
+    """load_config memoizes per-process; clear it so each case reads its own
+    temp-repo config (the exposed test seam — see sutando_config)."""
+    sys.path.insert(0, str(REPO / "src"))
+    import sutando_config  # noqa: PLC0415
+    sutando_config._reset_cache_for_tests()
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -113,6 +126,49 @@ def main() -> int:
             hc.subprocess.run = real_run
         check(r["status"] == "ok" and "not runnable" in r["detail"],
               f"f) git raising OSError -> ok degrade, got {r}")
+
+    # g) durable config pin: core.expected_branch in sutando.config.local.json
+    #    must be honored with NO env var set — this is the launchd/Sutando.app
+    #    caller path, which never inherits an interactive shell's exports.
+    with tempfile.TemporaryDirectory() as td:
+        repo = _mk_repo(Path(td), branch="pinned-branch")
+        (repo / "sutando.config.local.json").write_text(
+            '{"core": {"expected_branch": "pinned-branch"}}\n')
+        _reset_config_cache()
+        try:
+            r = hc.check_live_checkout_branch(repo)
+        finally:
+            _reset_config_cache()
+        check(r["status"] == "ok" and "pinned-branch" in r["detail"],
+              f"g) config core.expected_branch pin honored, got {r}")
+
+    # h) precedence: env override beats the config pin when they disagree.
+    with tempfile.TemporaryDirectory() as td:
+        repo = _mk_repo(Path(td), branch="pinned-branch")
+        (repo / "sutando.config.local.json").write_text(
+            '{"core": {"expected_branch": "pinned-branch"}}\n')
+        os.environ["SUTANDO_EXPECTED_BRANCH"] = "other-branch"
+        _reset_config_cache()
+        try:
+            r = hc.check_live_checkout_branch(repo)
+        finally:
+            os.environ.pop("SUTANDO_EXPECTED_BRANCH", None)
+            _reset_config_cache()
+        check(r["status"] == "warn" and "'other-branch'" in r["detail"],
+              f"h) env override wins over config pin, got {r}")
+
+    # i) malformed config JSON: load_config raises → probe falls back to the
+    #    "main" default instead of crashing the health check.
+    with tempfile.TemporaryDirectory() as td:
+        repo = _mk_repo(Path(td))
+        (repo / "sutando.config.local.json").write_text('{not valid json')
+        _reset_config_cache()
+        try:
+            r = hc.check_live_checkout_branch(repo)
+        finally:
+            _reset_config_cache()
+        check(r["status"] == "ok" and "'main'" in r["detail"],
+              f"i) malformed config -> default 'main', got {r}")
 
     if FAILS:
         print(f"\n{len(FAILS)} failure(s)")

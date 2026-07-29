@@ -976,14 +976,26 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     back" doesn't survive session death).
 
     Expected branch defaults to ``main``; nodes intentionally pinned elsewhere
-    (e.g. the dual-run pinned hosts) can set ``SUTANDO_EXPECTED_BRANCH``.
+    (e.g. the dual-run pinned hosts) declare it durably in
+    ``sutando.config.local.json`` as ``{"core": {"expected_branch": "..."}}``
+    — read via the canonical loader so launchd/Sutando.app callers (which
+    never inherit an interactive shell's exports) honor the pin across
+    restarts. ``SUTANDO_EXPECTED_BRANCH`` remains as a per-invocation env
+    override (wins over config; useful for tests/one-offs).
     Read-only; warn (never fail) — an intentional short-lived checkout should
     nag, not page. Degrades to ok when git/branch state can't be read (CI
     tarballs, detached tooling contexts) rather than false-alarming.
     """
     name = "live-checkout-branch"
-    expected = os.environ.get("SUTANDO_EXPECTED_BRANCH", "main")
     repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    expected = os.environ.get("SUTANDO_EXPECTED_BRANCH")
+    if not expected:
+        try:
+            from sutando_config import load_config  # noqa: PLC0415
+            expected = (load_config(repo_root=repo).get("core") or {}).get("expected_branch")
+        except Exception:
+            expected = None  # config unreadable — fall through to the default
+    expected = expected or "main"
     try:
         out = subprocess.run(
             ["git", "-C", str(repo), "branch", "--show-current"],
