@@ -62,6 +62,34 @@ def _strictly_older_than_boundary(msg, until):
     return (msg.get("timestamp", "") or "")[:len(until)] < until
 
 
+def format_timestamp(raw, owner_tz=None):
+    """Render a Discord UTC ISO timestamp in the owner's timezone.
+
+    Discord API timestamps are UTC ISO strings. Render in the USER'S timezone
+    (Susan 2026-07-21 "改成 user config 的 timezone", after raw UTC here led the
+    agent to say "1am, goodnight" at 7:47pm local). Resolution: owner_tz (the
+    caller passes OWNER_TZ env — existing convention, phone-conversation
+    server) > the host OS timezone (the user's own system setting). Label
+    comes from %Z so it's always explicit (EDT/EST/PST/...); any failure —
+    garbage input, unknown timezone name — falls back to the raw UTC prefix
+    labeled UTC, never a bare ambiguous time. A naive-but-valid timestamp is
+    treated as UTC (what Discord actually sends).
+    """
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if owner_tz:
+            from zoneinfo import ZoneInfo
+            local = dt.astimezone(ZoneInfo(owner_tz))
+        else:
+            local = dt.astimezone()  # host OS timezone = the user's configured tz
+        return local.strftime("%Y-%m-%dT%H:%M:%S %Z")
+    except Exception:
+        return raw[:19] + " UTC"
+
+
 def _parse_args(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("channel_id")
@@ -109,7 +137,7 @@ def main(argv=None):
             continue
         author = msg.get("author", {}).get("username", "?")
         content = msg.get("content", "")[:200]
-        ts = msg.get("timestamp", "")[:19]
+        ts = format_timestamp(msg.get("timestamp", ""), os.environ.get("OWNER_TZ"))
         print(f"[{ts}] {author}: {content}")
     return 0
 
