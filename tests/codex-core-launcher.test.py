@@ -763,6 +763,59 @@ exit 0
         self.assertTrue((results / "task-owner.txt").exists())
         self.assertTrue((results / "task-low.txt").exists())
 
+    def test_managed_notifier_recovers_from_stale_running_status_when_pane_is_idle(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        status = workspace / "state" / "core-status.json"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        status.write_text('{"status":"running","step":"interrupted","ts":1}\n')
+        (tasks / "task-owner.txt").write_text(
+            "priority: normal\ntask: owner message\n"
+        )
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-owner.txt\\n'\n")
+        watcher.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then
+  printf '› idle prompt\\n'
+  exit 0
+fi
+if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
+  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+fi
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_CORE_STATUS_FILE=str(status),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        calls = self.log.read_text()
+        self.assertIn("capture-pane", calls)
+        self.assertIn("task-owner.txt", calls)
+        self.assertTrue((results / "task-owner.txt").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

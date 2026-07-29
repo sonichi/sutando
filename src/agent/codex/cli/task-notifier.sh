@@ -14,6 +14,7 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT=300
+CORE_STATUS_STALE_SEC=90
 CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
 
 has_result() {
@@ -47,9 +48,18 @@ core_pane_is_busy() {
 }
 
 core_is_idle() {
+  local now status_ts
   [ -f "$CORE_STATUS_FILE" ] || return 1
+  core_pane_is_busy && return 1
   grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' "$CORE_STATUS_FILE" 2>/dev/null \
-    && ! core_pane_is_busy
+    && return 0
+  grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "$CORE_STATUS_FILE" 2>/dev/null \
+    || return 1
+  status_ts="$(sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CORE_STATUS_FILE" \
+    | head -1)"
+  [ -n "$status_ts" ] || return 1
+  now="$(date +%s)"
+  [ $((now - status_ts)) -gt "$CORE_STATUS_STALE_SEC" ]
 }
 
 wait_for_core_idle() {
