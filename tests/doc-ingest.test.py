@@ -9,10 +9,13 @@ Run: python3 tests/doc-ingest.test.py
 import importlib.util
 import io
 import json
+import sys
 import tempfile
+import types
 import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 _ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location(
@@ -84,16 +87,23 @@ with tempfile.TemporaryDirectory() as td:
     except ImportError:
         print("SKIP xlsx-sheet (openpyxl not installed)")
 
-    # 5. DOCX when python-docx is available (else skip).
+    # 5. DOCX when python-docx is available (else skip) — with a table too.
     try:
         import docx
 
         d = docx.Document()
         d.add_paragraph("Quarterly summary paragraph.")
+        table = d.add_table(rows=2, cols=2)
+        table.rows[0].cells[0].text = "region"
+        table.rows[0].cells[1].text = "sales"
+        table.rows[1].cells[0].text = "west"
+        table.rows[1].cells[1].text = "10"
         docxf = tmp / "report.docx"
         d.save(str(docxf))
         code, out, _ = run_cli([str(docxf)])
-        check("docx-paragraph", code == 0 and "Quarterly summary paragraph." in out)
+        check("docx-paragraph",
+              code == 0 and "Quarterly summary paragraph." in out
+              and "| region | sales |" in out)
     except ImportError:
         print("SKIP docx-paragraph (python-docx not installed)")
 
@@ -142,5 +152,107 @@ with tempfile.TemporaryDirectory() as td:
           code == 0 and "Archive contents" in out and "| a | b |" in out
           and "hello archive" in out and "handled natively" in out,
           out[:300])
+
+    # 13. Empty table → sentinel (helper branch).
+    check("empty-table", ingest._rows_to_markdown([], 500) == "(empty table)")
+
+    # 14. Unknown suffix → best-effort text read ("text?" kind).
+    weird = tmp / "note.xyz"
+    weird.write_text("payload body")
+    kind, text = ingest.extract(weird, 500)
+    check("unknown-suffix", kind == "text?" and "payload body" in text)
+
+    # 15. PDF with no extractor available → RuntimeError naming the gap.
+    #     Force pdftotext absent; pypdf/fitz import is stubbed to fail.
+    pdf = tmp / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.4 not-really")
+    with mock.patch.object(ingest.shutil, "which", return_value=None), \
+         mock.patch.dict(sys.modules, {"pypdf": None, "fitz": None}):
+        try:
+            ingest.extract_pdf(pdf)
+            check("pdf-no-extractor", False, "expected RuntimeError")
+        except RuntimeError as exc:
+            check("pdf-no-extractor", "no PDF extractor" in str(exc))
+
+    # 16. PDF pypdf fallback path: inject a fake pypdf whose reader yields text.
+    fake_pypdf = types.ModuleType("pypdf")
+    fake_pypdf.PdfReader = lambda _p: types.SimpleNamespace(
+        pages=[types.SimpleNamespace(extract_text=lambda: "page one text")])
+    with mock.patch.object(ingest.shutil, "which", return_value=None), \
+         mock.patch.dict(sys.modules, {"pypdf": fake_pypdf}):
+        check("pdf-pypdf-fallback", "page one text" in ingest.extract_pdf(pdf))
+
+    # 17. XLSX fallback (openpyxl missing) → shared-strings zip scrape.
+    fake_xlsx = tmp / "f.xlsx"
+    with zipfile.ZipFile(fake_xlsx, "w") as zf:
+        zf.writestr("xl/sharedStrings.xml",
+                    '<sst><si><t>CellFromSharedStrings</t></si></sst>')
+    with mock.patch.dict(sys.modules, {"openpyxl": None}):
+        check("xlsx-fallback",
+              "CellFromSharedStrings" in ingest.extract_xlsx(fake_xlsx, 500))
+
+    # 18. DOCX fallback (python-docx + textutil missing) → document.xml scrape.
+    fake_docx = tmp / "f.docx"
+    with zipfile.ZipFile(fake_docx, "w") as zf:
+        zf.writestr("word/document.xml",
+                    '<w:document><w:body><w:p >ParaFromXml</w:p></w:body></w:document>')
+    with mock.patch.dict(sys.modules, {"docx": None}), \
+         mock.patch.object(ingest.shutil, "which", return_value=None):
+        check("docx-fallback", "ParaFromXml" in ingest.extract_docx(fake_docx, 500))
+
+    # 19. RTF via textutil unavailable → clear RuntimeError.
+    rtf = tmp / "x.rtf"
+    rtf.write_text("{\\rtf1 hi}")
+    with mock.patch.object(ingest.shutil, "which", return_value=None):
+        try:
+            ingest.extract_textutil(rtf)
+            check("textutil-missing", False, "expected RuntimeError")
+        except RuntimeError as exc:
+            check("textutil-missing", "textutil unavailable" in str(exc))
+
+    # 20. --max-rows flag parsed; bad value → exit 2.
+    manyrows = tmp / "big.csv"
+    manyrows.write_text("h\n" + "\n".join(str(i) for i in range(10)) + "\n")
+    code, out, _ = run_cli([str(manyrows), "--max-rows", "3"])
+    check("max-rows-flag", code == 0 and "showing 3 of" in out, out[-120:])
+    code, _, err = run_cli([str(manyrows), "--max-rows", "notanint"])
+    check("max-rows-bad", code == 2 and "needs an integer" in err)
+
+    # 21. ZIP member cap: >cap members truncates with a notice.
+    bigzip = tmp / "many.zip"
+    with zipfile.ZipFile(bigzip, "w") as zf:
+        for i in range(25):
+            zf.writestr(f"f{i}.txt", f"content {i}")
+    text = ingest.extract_zip(bigzip, 500, member_cap=20)
+    check("zip-member-cap", "extracted first 20 of 25 members" in text, text[-160:])
+
+    # 22. ZIP member whose extraction raises → reported inline, archive survives.
+    badzip = tmp / "badmember.zip"
+    with zipfile.ZipFile(badzip, "w") as zf:
+        zf.writestr("ok.txt", "fine")
+        zf.writestr("broken.pdf", "not a real pdf")  # forces extract_pdf failure
+    with mock.patch.object(ingest.shutil, "which", return_value=None), \
+         mock.patch.dict(sys.modules, {"pypdf": None, "fitz": None}):
+        text = ingest.extract_zip(badzip, 500)
+    check("zip-bad-member", "fine" in text and "extraction failed" in text, text[-200:])
+
+    # 23. RTF/.doc dispatch → textutil success path (mock which + subprocess).
+    rtf2 = tmp / "y.rtf"
+    rtf2.write_text("{\\rtf1 body}")
+    fake_proc = types.SimpleNamespace(returncode=0, stdout="converted rtf text", stderr="")
+    with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/textutil"), \
+         mock.patch.object(ingest.subprocess, "run", return_value=fake_proc):
+        kind, text = ingest.extract(rtf2, 500)
+    check("rtf-textutil-success", kind == "textutil" and "converted rtf text" in text)
+
+    # 24. textutil non-zero return → RuntimeError naming the failure.
+    fail_proc = types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
+    with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/textutil"), \
+         mock.patch.object(ingest.subprocess, "run", return_value=fail_proc):
+        try:
+            ingest.extract_textutil(rtf2)
+            check("textutil-nonzero", False, "expected RuntimeError")
+        except RuntimeError as exc:
+            check("textutil-nonzero", "textutil failed" in str(exc))
 
 print(f"OK — {len(passed)} checks passed: {', '.join(passed)}")
