@@ -566,6 +566,92 @@ def check_memory_dir_override() -> "dict | None":
     }
 
 
+def _slug_derivation_key(name: str) -> str:
+    """Collapse a Claude project slug to a derivation-INDEPENDENT key.
+
+    Claude Code slugifies a filesystem path, and the derivations differ only in
+    how they map ``.``, spaces and repeated separators. So two slugs describing
+    the SAME path agree once every run of non-alphanumerics is collapsed to one
+    ``-`` and case is folded, while an unrelated project does not collide:
+
+        -Users-me-Library-Application-Support-space.ag2.app-engine-sutando
+        -Users-me-Library-Application-Support-space-ag2-app-engine-sutando
+            -> users-me-library-application-support-space-ag2-app-engine-sutando   (same)
+        -Users-me-Documents-unrelated-repo
+            -> users-me-documents-unrelated-repo                                    (different)
+    """
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def check_memory_dir_siblings() -> "dict | None":
+    """Flag a populated memory corpus sitting under a DIFFERENT project slug.
+
+    check_memory_dir_override() above catches only one of the two ways this
+    install can end up reading a directory the agent is not writing: an explicit
+    SUTANDO_MEMORY_DIR pointing somewhere stale. It returns None when the var is
+    unset — and the other failure mode needs no env var at all.
+
+    Claude Code derives a project slug from a path. Two different derivations
+    (repo path vs app-support path, or differing rules for spaces and dots)
+    produce two sibling project dirs under the same claude-home, each with its
+    own memory/. Everything that resolves by repo slug then reports on one
+    corpus while the session reads and writes the other. Field-observed on two
+    hosts, once per mechanism: one had the env override (caught), one had the
+    slug split (silent — memory-dir reported "ok, 66 .md files" about a corpus
+    the agent had never written to, while its live corpus held 42).
+
+    Deliberately diagnostic only. Which slug *should* be canonical is an open
+    architectural decision; picking one here would answer it in code and, worse,
+    hide the divergence behind a green check. So: report, never redirect.
+
+    Symlinked twins are NOT a split — resolve before comparing. Two slug strings
+    frequently point at one inode (a compatibility symlink bridging two
+    derivation rules), and reporting that as a divergence would make this check
+    noise on a healthy install.
+    """
+    projects = Path(claude_home_path()) / "projects"
+    if not projects.is_dir():
+        return None
+
+    live = MEMORY_DIR.resolve() if MEMORY_DIR.exists() else MEMORY_DIR
+    # Only ALTERNATE DERIVATIONS OF THIS PROJECT are candidates. Warning on any
+    # populated corpus would fire on every normal multi-project home — a
+    # permanent false warning that teaches people to ignore the health signal,
+    # which costs more than the split it is trying to surface (#2353 review).
+    live_key = _slug_derivation_key(MEMORY_DIR.parent.name)
+    seen: "dict[str, tuple[str, int]]" = {}
+    for entry in sorted(projects.iterdir()):
+        mem = entry / "memory"
+        if not mem.is_dir():
+            continue
+        if _slug_derivation_key(entry.name) != live_key:
+            continue  # unrelated project, not a slug split
+        count = len(list(mem.glob("*.md")))
+        if count == 0:
+            continue
+        key = str(mem.resolve())  # collapse symlinked twins onto one entry
+        if key not in seen or count > seen[key][1]:
+            seen[key] = (entry.name, count)
+
+    others = {k: v for k, v in seen.items() if k != str(live)}
+    if not others:
+        return None
+
+    live_count = len(list(MEMORY_DIR.glob("*.md"))) if MEMORY_DIR.is_dir() else 0
+    listed = ", ".join(f"{name} ({n} .md)" for name, n in sorted(others.values(), key=lambda t: -t[1]))
+    return {
+        "name": "memory-dir-siblings",
+        "status": "warn",
+        "detail": (
+            f"{len(others)} other populated memory corpus/corpora exist under "
+            f"{projects}: {listed}. This check reports on {MEMORY_DIR.name}'s parent "
+            f"({live_count} .md) — if the session actually writes one of the others, "
+            "its memories are invisible to every path-derived consumer. Diagnostic "
+            "only; which slug is canonical is an open decision."
+        ),
+    }
+
+
 def check_memory_index_integrity() -> "dict | None":
     """Catch memories that exist on disk but will never load into a session.
 
@@ -2898,6 +2984,10 @@ def run_all_checks() -> list[dict]:
     _mem_override = check_memory_dir_override()
     if _mem_override:
         checks.append(_mem_override)
+
+    _mem_siblings = check_memory_dir_siblings()
+    if _mem_siblings:
+        checks.append(_mem_siblings)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:
