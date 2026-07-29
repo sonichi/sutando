@@ -3,7 +3,7 @@
 **Status:** Draft for review. Design + skeleton; voice-transport integration points are stubbed.
 **Date:** 2026-06-05
 **Owner:** Vasiliy Radostev
-**Companion:** [test-plan.md](test-plan.md) — broader system test plan. This doc is the *voice-responsiveness* slice of it.
+**Scope:** This document is the voice-responsiveness slice of Sutando's test strategy. The broader historical system test plan is not tracked in this repository.
 
 ---
 
