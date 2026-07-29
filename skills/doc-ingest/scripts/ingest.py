@@ -73,12 +73,79 @@ def extract_pdf(path: Path) -> str:
             continue
         tried.append(mod)
         try:
-            return call(extractor)
+            text = call(extractor)
         except Exception:  # noqa: BLE001 — fall through to the next extractor
             continue
+        if text.strip():
+            return text
+        # An extractor that returns no text has NOT succeeded — a no-text-layer
+        # or image-only PDF must fall through to the next extractor and then
+        # fail honestly, never return an empty string as a successful result.
     if tried:
-        raise RuntimeError(f"PDF extraction failed (tried: {', '.join(tried)}) — file may be corrupt or image-only")
+        raise RuntimeError(f"PDF extraction failed (tried: {', '.join(tried)}) — no text extracted; file may be image-only or corrupt")
     raise RuntimeError("no PDF extractor available (need poppler's pdftotext, pypdf, or PyMuPDF)")
+
+
+def _col_index(cell_ref: str) -> int:
+    """'B2' -> 1 (0-based column). Falls back to 0 if the ref has no letters."""
+    letters = re.match(r"[A-Za-z]+", cell_ref or "")
+    if not letters:
+        return 0
+    idx = 0
+    for ch in letters.group(0).upper():
+        idx = idx * 26 + (ord(ch) - 64)
+    return idx - 1
+
+
+def _xlsx_zip_fallback(path: Path, max_rows: int) -> str:
+    """Dependency-free worksheet parse (no openpyxl): reads shared strings,
+    inline strings, and numeric/raw cell values, placing each cell by its
+    column reference so sparse rows stay aligned. This is the extraction the
+    skill promises — the old shared-strings-only path silently dropped inline
+    strings and numeric cells."""
+    import xml.etree.ElementTree as ET  # noqa: PLC0415 — stdlib, lazy for import cost
+
+    def local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in names:
+            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in root:
+                shared.append("".join(t.text or "" for t in si.iter() if local(t.tag) == "t"))
+
+        sheets = sorted(n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
+        parts: list[str] = []
+        for i, sheet_name in enumerate(sheets, 1):
+            root = ET.fromstring(zf.read(sheet_name))
+            sheet_data = next((c for c in root if local(c.tag) == "sheetData"), None)
+            rows: list[list[str]] = []
+            for row in sheet_data or []:
+                cells: dict[int, str] = {}
+                for c in row:
+                    if local(c.tag) != "c":
+                        continue
+                    col = _col_index(c.get("r", ""))
+                    ctype = c.get("t")
+                    if ctype == "s":  # shared string: <v> holds the index
+                        v = next((x for x in c if local(x.tag) == "v"), None)
+                        try:
+                            val = shared[int(v.text)] if v is not None and v.text else ""
+                        except (ValueError, IndexError):
+                            val = ""
+                    elif ctype == "inlineStr":  # inline: <is><t>…</t></is>
+                        val = "".join(x.text or "" for x in c.iter() if local(x.tag) == "t")
+                    else:  # numeric/boolean/raw: <v>
+                        v = next((x for x in c if local(x.tag) == "v"), None)
+                        val = (v.text or "") if v is not None else ""
+                    cells[col] = val
+                width = max(cells) + 1 if cells else 0
+                rows.append([cells.get(j, "") for j in range(width)])
+            body = _rows_to_markdown(rows, max_rows) if rows else "(empty sheet)"
+            parts.append(f"## Sheet {i}\n\n{body}")
+        return "\n\n".join(parts) if parts else "(xlsx: no worksheet data found)"
 
 
 def extract_xlsx(path: Path, max_rows: int) -> str:
@@ -92,9 +159,7 @@ def extract_xlsx(path: Path, max_rows: int) -> str:
             parts.append(f"## Sheet: {ws.title}\n\n" + _rows_to_markdown(rows, max_rows))
         return "\n\n".join(parts)
     except ImportError:
-        with zipfile.ZipFile(path) as zf:
-            shared = "".join(_xml_text(zf.read(n)) for n in zf.namelist() if n == "xl/sharedStrings.xml")
-            return shared or "(xlsx: openpyxl not installed; only shared strings extracted)"
+        return _xlsx_zip_fallback(path, max_rows)
 
 
 def extract_csv(path: Path, max_rows: int) -> str:
@@ -131,15 +196,30 @@ def extract_pptx(path: Path) -> str:
         return "\n\n".join(f"## Slide {i + 1}\n\n{_xml_text(zf.read(n))}" for i, n in enumerate(slides))
 
 
-def extract_zip(path: Path, max_rows: int, member_cap: int = 20) -> str:
+def extract_zip(path: Path, max_rows: int, member_cap: int = 20,
+                total_budget: int = 64 * 1024 * 1024) -> str:
     # Archive → manifest + recursive extraction of the first N supported members.
+    # RESOURCE BOUNDS (attachments are untrusted): cap the member count AND the
+    # cumulative uncompressed bytes we materialize, so a zip-bomb / oversized
+    # archive can't exhaust the host's disk or memory. A member whose declared
+    # uncompressed size would blow the budget is skipped, not written.
     with zipfile.ZipFile(path) as zf:
-        names = [n for n in zf.namelist() if not n.endswith("/")]
+        infos = [inf for inf in zf.infolist() if not inf.filename.endswith("/")]
+        names = [inf.filename for inf in infos]
         parts = ["## Archive contents\n\n" + "\n".join(f"- {n}" for n in names[:200])]
         import tempfile  # noqa: PLC0415
 
+        spent = 0
+        stopped = False
         with tempfile.TemporaryDirectory() as td:
-            for name in names[:member_cap]:
+            for inf in infos[:member_cap]:
+                name = inf.filename
+                if spent + inf.file_size > total_budget:
+                    parts.append(f"## {name}\n\n[skipped — archive extraction budget "
+                                 f"({total_budget // (1024 * 1024)} MiB) reached]")
+                    stopped = True
+                    break
+                spent += inf.file_size
                 target = Path(td) / Path(name).name  # flatten: zip-slip-safe, basename only
                 target.write_bytes(zf.read(name))
                 try:
@@ -150,7 +230,7 @@ def extract_zip(path: Path, max_rows: int, member_cap: int = 20) -> str:
                         parts.append(f"## {name} ({kind})\n\n{text}")
                 except Exception as exc:  # noqa: BLE001 — one bad member must not sink the archive
                     parts.append(f"## {name}\n\n[extraction failed: {exc}]")
-        if len(names) > member_cap:
+        if len(names) > member_cap and not stopped:
             parts.append(f"[doc-ingest: extracted first {member_cap} of {len(names)} members]")
     return "\n\n".join(parts)
 
@@ -240,9 +320,13 @@ def main(argv: list[str]) -> int:
         else:
             print(f"doc-ingest: {name}: {result['error']}", file=sys.stderr)
 
+    # Aggregate exit status must reflect the per-file results: any hard failure
+    # dominates (1); otherwise any pointer-only result (image/audio, ok:false)
+    # yields 3 — even in a mixed batch, so a caller never reads exit 0 while a
+    # record is ok:false. All-extracted → 0.
     if had_failure:
         return 1
-    return 3 if had_pointer and len(args) == 1 else 0
+    return 3 if had_pointer else 0
 
 
 if __name__ == "__main__":

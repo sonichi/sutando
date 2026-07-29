@@ -140,6 +140,10 @@ with tempfile.TemporaryDirectory() as td:
           and lines[1]["kind"] == "image",
           out[:200])
 
+    # 10b. Mixed batch exit status must reflect per-file results: a pointer
+    #      (image, ok:false) in the batch yields exit 3, never a silent 0.
+    check("mixed-exit-matches-results", code == 3, f"code={code}")
+
     # 11. Bad invocation (no files) → usage + exit 2.
     code, out, err = run_cli([])
     check("usage-exit-2", code == 2 and "usage:" in err)
@@ -209,14 +213,39 @@ with tempfile.TemporaryDirectory() as td:
         except RuntimeError as exc:
             check("pdf-all-fail", "PDF extraction failed" in str(exc))
 
-    # 17. XLSX fallback (openpyxl missing) → shared-strings zip scrape.
-    fake_xlsx = tmp / "f.xlsx"
-    with zipfile.ZipFile(fake_xlsx, "w") as zf:
-        zf.writestr("xl/sharedStrings.xml",
-                    '<sst><si><t>CellFromSharedStrings</t></si></sst>')
+    # 16d. An extractor that returns NO text has not succeeded — a no-text-layer
+    #      PDF must fail honestly, never return "" as a successful extraction
+    #      (review finding). pdftotext absent; fake pypdf yields empty pages.
+    blank_pypdf = types.ModuleType("pypdf")
+    blank_pypdf.PdfReader = lambda _p: types.SimpleNamespace(
+        pages=[types.SimpleNamespace(extract_text=lambda: "")])
+    with mock.patch.object(ingest.shutil, "which", return_value=None), \
+         mock.patch.dict(sys.modules, {"pypdf": blank_pypdf, "fitz": None}):
+        try:
+            ingest.extract_pdf(pdf)
+            check("pdf-empty-not-success", False, "expected RuntimeError, got empty success")
+        except RuntimeError as exc:
+            check("pdf-empty-not-success", "no text extracted" in str(exc))
+
+    # 17. XLSX fallback (openpyxl missing) → real worksheet parse: shared
+    #     strings, inline strings, AND numeric cells, column-aligned. The old
+    #     fallback dropped inline/numeric data (review finding); this asserts
+    #     the actual table survives with openpyxl absent.
+    real_xlsx = tmp / "real.xlsx"
+    sheet = (
+        '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData>'
+        '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t>qty</t></is></c></row>'
+        '<row r="2"><c r="A2" t="inlineStr"><is><t>bolt</t></is></c><c r="B2"><v>42</v></c></row>'
+        '</sheetData></worksheet>'
+    )
+    with zipfile.ZipFile(real_xlsx, "w") as zf:
+        zf.writestr("xl/sharedStrings.xml", '<sst><si><t>item</t></si></sst>')
+        zf.writestr("xl/worksheets/sheet1.xml", sheet)
     with mock.patch.dict(sys.modules, {"openpyxl": None}):
-        check("xlsx-fallback",
-              "CellFromSharedStrings" in ingest.extract_xlsx(fake_xlsx, 500))
+        out = ingest.extract_xlsx(real_xlsx, 500)
+    check("xlsx-fallback-real",
+          "| item | qty |" in out and "| bolt | 42 |" in out, out[:300])
 
     # 18. DOCX fallback (python-docx + textutil missing) → document.xml scrape.
     fake_docx = tmp / "f.docx"
@@ -259,6 +288,17 @@ with tempfile.TemporaryDirectory() as td:
             zf.writestr(f"f{i}.txt", f"content {i}")
     text = ingest.extract_zip(bigzip, 500, member_cap=20)
     check("zip-member-cap", "extracted first 20 of 25 members" in text, text[-160:])
+
+    # 21b. ZIP byte budget: a member exceeding the cumulative budget is skipped,
+    #      not written — untrusted archives can't exhaust the host.
+    budgetzip = tmp / "budget.zip"
+    with zipfile.ZipFile(budgetzip, "w") as zf:
+        zf.writestr("small.txt", "ok")
+        zf.writestr("big.txt", "X" * 5000)
+    text = ingest.extract_zip(budgetzip, 500, total_budget=1000)
+    check("zip-byte-budget",
+          "ok" in text and "extraction budget" in text and "X" * 5000 not in text,
+          text[-200:])
 
     # 22. ZIP member whose extraction raises → reported inline, archive survives.
     badzip = tmp / "badmember.zip"
