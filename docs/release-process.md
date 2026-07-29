@@ -9,6 +9,11 @@ ratified_in: v0.1.0 (engine release infrastructure) + v0.3.0 (workspace migratio
 
 > **Canonical reference for the Sutando release process + workspace migration framework.** Ratified and in-effect since v0.1.0 (release infrastructure) and v0.3.0 (workspace migration framework, M0+M1+M2 + sync-workspace). The original RFC was authored on PR #906; promotion to canonical landed in PR #1472 as part of the v0.3.0 docs sweep. The original draft and the two co-authored halves (`docs/release-process-proposal-mini.md` + `docs/release-process-proposal-qingyun-sutando.md`) are preserved in git history.
 
+**Operational entry point:** [`skills/release/SKILL.md`](../skills/release/SKILL.md)
+prepares the release PR, documentation-impact inventory, gate evidence, and
+proposal from this policy. It requires explicit owner confirmation before any
+tag or GitHub Release is published.
+
 ## Overview — what this RFC defines and why
 
 Two intertwined pieces of release infrastructure that don't exist in the engine repo today:
