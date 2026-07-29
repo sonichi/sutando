@@ -21,6 +21,12 @@ jobs:
       - name: UTC timestamp check
         run: python3 scripts/check-utc-z-strftime.py
 
+      # Keep the documentation hub, metadata catalog, and repository-local
+      # Markdown links complete. The release skill uses the same audit during
+      # its docs-impact pass, so local preparation and CI enforce one contract.
+      - name: Documentation audit
+        run: python3 skills/release/scripts/docs_audit.py
+
       # Fails if vault.sync.include carries a per-host-prone path without a
       # hostname qualifier (would collapse across hosts on pull-merge).
       # See docs/workspace-per-host-paths.md.
