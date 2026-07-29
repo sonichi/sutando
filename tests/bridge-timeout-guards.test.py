@@ -42,6 +42,11 @@ TELEGRAM_SRC = REPO / "src" / "telegram-bridge.py"
 os.environ["SUTANDO_WORKSPACE"] = tempfile.mkdtemp()
 os.environ["SUTANDO_TEST_MODE"] = "1"
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
+# Isolate the Claude config surface BEFORE the telegram-bridge import below:
+# on import the bridge resolves claude_home_path("channels","telegram",".env")
+# and, if present, chmods + reads it. Without this, the committed test touches
+# the developer's real ~/.claude credential file (qingyun repro, PR #1886).
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-timeout-guards-")
 
 failures: list[str] = []
 
