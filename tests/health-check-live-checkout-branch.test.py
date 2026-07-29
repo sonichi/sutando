@@ -13,6 +13,7 @@ Covers:
   c) detached HEAD                     → warn (drift, unnamed branch)
   d) not a git repo                    → ok (degrade, no false alarm)
   e) SUTANDO_EXPECTED_BRANCH override  → ok on the pinned branch
+  f) git not runnable (OSError)        → ok (degrade, no false alarm)
 
 Run: python3 tests/health-check-live-checkout-branch.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -97,6 +98,21 @@ def main() -> int:
             os.environ.pop("SUTANDO_EXPECTED_BRANCH", None)
         check(r["status"] == "ok" and "pinned-branch" in r["detail"],
               f"e) SUTANDO_EXPECTED_BRANCH override honored, got {r}")
+
+    with tempfile.TemporaryDirectory() as td:
+        repo = _mk_repo(Path(td))
+        real_run = hc.subprocess.run
+
+        def _boom(*_a, **_k):
+            raise OSError("git binary missing")
+
+        hc.subprocess.run = _boom
+        try:
+            r = hc.check_live_checkout_branch(repo)
+        finally:
+            hc.subprocess.run = real_run
+        check(r["status"] == "ok" and "not runnable" in r["detail"],
+              f"f) git raising OSError -> ok degrade, got {r}")
 
     if FAILS:
         print(f"\n{len(FAILS)} failure(s)")
