@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import signal
 import select
 import subprocess
 import tempfile
@@ -782,7 +783,7 @@ printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = capture-pane ]; then
-  printf '› idle prompt\\n'
+  printf '›\\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\\n'
   exit 0
 fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
@@ -815,6 +816,63 @@ exit 0
         self.assertIn("capture-pane", calls)
         self.assertIn("task-owner.txt", calls)
         self.assertTrue((results / "task-owner.txt").exists())
+
+    def test_managed_notifier_does_not_treat_stale_running_no_affordance_as_idle(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        status = workspace / "state" / "core-status.json"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        status.write_text('{"status":"running","step":"interrupted","ts":1}\n')
+        (tasks / "task-owner.txt").write_text(
+            "priority: normal\ntask: owner message\n"
+        )
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-owner.txt\\n'\n")
+        watcher.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then
+  printf 'Compacting context…\\n'
+  exit 0
+fi
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_CORE_STATUS_FILE=str(status),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        process = subprocess.Popen(
+            ["/bin/bash", str(script)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                process.communicate(timeout=1)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.communicate(timeout=2)
+        calls = self.log.read_text()
+        self.assertIn("capture-pane", calls)
+        self.assertNotIn("send-keys", calls)
+        self.assertFalse((results / "task-owner.txt").exists())
 
 
 if __name__ == "__main__":

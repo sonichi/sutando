@@ -47,19 +47,33 @@ core_pane_is_busy() {
   printf '%s\n' "$pane" | tail -12 | grep -Fq 'esc to interrupt'
 }
 
+core_pane_is_idle_ready() {
+  local pane tail
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
+  tail="$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d' | tail -14)"
+  # Keep this positive-idle contract aligned with core-input-watch.py's
+  # _is_idle_ready(): the known Codex footer must be present, and no active
+  # gate signature or live-working marker may share the tail.
+  printf '%s\n' "$tail" \
+    | grep -Eiq '⏵⏵[[:space:]]*bypass permissions on|for agents([^[:alpha:]]|$)' \
+    || return 1
+  ! printf '%s\n' "$tail" | grep -Eiq \
+    "esc to interrupt|trust the files in this folder|Do you trust|Bypass Permissions mode|Yes, I accept|Select login method|Paste code here|Browser didn.?t open|Press Enter to continue|❯[[:space:]]*[0-9]+\\.|Do you want to (proceed|allow)|Allow this action|permission to"
+}
+
 core_is_idle() {
   local now status_ts
   [ -f "$CORE_STATUS_FILE" ] || return 1
-  core_pane_is_busy && return 1
   grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' "$CORE_STATUS_FILE" 2>/dev/null \
-    && return 0
+    && ! core_pane_is_busy && return 0
   grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "$CORE_STATUS_FILE" 2>/dev/null \
     || return 1
   status_ts="$(sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CORE_STATUS_FILE" \
     | head -1)"
   [ -n "$status_ts" ] || return 1
   now="$(date +%s)"
-  [ $((now - status_ts)) -gt "$CORE_STATUS_STALE_SEC" ]
+  [ $((now - status_ts)) -gt "$CORE_STATUS_STALE_SEC" ] \
+    && core_pane_is_idle_ready
 }
 
 wait_for_core_idle() {
