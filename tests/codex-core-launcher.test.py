@@ -701,7 +701,7 @@ exit 0
         status = workspace / "state" / "core-status.json"
         tasks.mkdir(exist_ok=True)
         results.mkdir(exist_ok=True)
-        status.write_text('{"status":"running","ts":1}\n')
+        status.write_text('{"status":"idle","ts":1}\n')
         low = tasks / "task-low.txt"
         normal = tasks / "task-owner.txt"
         low.write_text("priority: low\ntask: scheduled maintenance\n")
@@ -716,12 +716,18 @@ exit 0
         )
         watcher.chmod(0o755)
         early = Path(self.tmp.name) / "submitted-while-busy"
+        busy = Path(self.tmp.name) / "pane-busy"
+        busy.touch()
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then
+  [ -f "$BUSY_MARKER" ] && printf '◦ Working (2m • esc to interrupt)\\n'
+  exit 0
+fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  grep -q '"status":"running"' "$SUTANDO_CORE_STATUS_FILE" && touch "$EARLY_SUBMIT"
+  [ -f "$BUSY_MARKER" ] && touch "$EARLY_SUBMIT"
   prompt=$(grep 'Sutando task ready:' "$TMUX_LOG" | tail -1)
   name=${prompt#*Sutando task ready: }
   name=${name%%.*}.txt
@@ -730,7 +736,8 @@ fi
 exit 0
 ''')
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   EARLY_SUBMIT=str(early), SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   EARLY_SUBMIT=str(early), BUSY_MARKER=str(busy),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
                    SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_RESULTS_DIR=str(results), SUTANDO_CORE_STATUS_FILE=str(status),
                    SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
@@ -743,12 +750,12 @@ exit 0
             time.sleep(0.01)
         self.assertTrue(self.log.exists(), "notifier never observed the live core")
         calls_while_busy = self.log.read_text()
-        status.write_text('{"status":"idle","ts":2}\n')
+        busy.unlink()
         stdout, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 0, stderr or stdout)
         self.assertNotIn(
             "send-keys", calls_while_busy,
-            "notifier submitted while core status was running",
+            "notifier submitted while Codex pane was visibly working",
         )
         self.assertFalse(early.exists(), "notifier submitted before core became idle")
         calls = self.log.read_text()

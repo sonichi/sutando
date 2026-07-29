@@ -40,9 +40,16 @@ has_result() {
   return 1
 }
 
+core_pane_is_busy() {
+  local pane
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 0
+  printf '%s\n' "$pane" | tail -12 | grep -Fq 'esc to interrupt'
+}
+
 core_is_idle() {
   [ -f "$CORE_STATUS_FILE" ] || return 1
-  grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' "$CORE_STATUS_FILE" 2>/dev/null
+  grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' "$CORE_STATUS_FILE" 2>/dev/null \
+    && ! core_pane_is_busy
 }
 
 wait_for_core_idle() {
