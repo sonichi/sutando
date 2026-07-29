@@ -78,11 +78,28 @@ export function ffprobeCandidates(execPath: string): string[] {
 	);
 }
 
+/**
+ * Pick an ffprobe from `cands`: prefer an ABSOLUTE candidate that actually
+ * exists, then fall back to the first bare name (so PATH resolution still
+ * applies), then the literal `ffprobe`.
+ *
+ * Exported + `exists`-injected so the ordering is testable. An earlier finder
+ * used `find((p) => !p.includes('/') || existsSync(p))`, which accepted the
+ * leading bare name immediately and short-circuited before any absolute path
+ * was tried — making the absolute candidates dead code (flagged reviewing #2370).
+ */
+export function selectFfprobe(cands: string[], exists: (p: string) => boolean): string {
+	return (
+		cands.find((p) => p.includes('/') && exists(p)) ??
+		cands.find((p) => !p.includes('/')) ??
+		'ffprobe'
+	);
+}
+
 let _cachedFfprobe: string | undefined;
 function findFfprobe(): string {
 	if (_cachedFfprobe !== undefined) return _cachedFfprobe;
-	_cachedFfprobe =
-		ffprobeCandidates(process.execPath).find((p) => !p.includes('/') || existsSync(p)) ?? 'ffprobe';
+	_cachedFfprobe = selectFfprobe(ffprobeCandidates(process.execPath), existsSync);
 	return _cachedFfprobe;
 }
 

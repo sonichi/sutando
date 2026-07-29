@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
-import { ffmpegSubtitleCandidates, ffprobeCandidates } from '../src/recording-tools.js';
+import { ffmpegSubtitleCandidates, ffprobeCandidates, selectFfprobe } from '../src/recording-tools.js';
 
 /**
  * Regression guard for the ffmpeg subtitle-probe bundled-runtime fix.
@@ -84,5 +84,34 @@ describe('ffprobeCandidates', () => {
 			!c.some((p) => p.includes('ffprobe-full')),
 			'no candidate may contain ffprobe-full',
 		);
+	});
+});
+
+// The finder must actually REACH the absolute candidates. A prior version
+// (`find((p) => !p.includes('/') || existsSync(p))`) accepted the leading bare
+// `ffprobe` immediately, so the absolute Homebrew/bundled paths were never
+// tried — dead code on the exact install (Intel / PATH-less launchd) the PR
+// targets. This pins the ordering that fix restores (review of #2370).
+describe('selectFfprobe', () => {
+	const cands = ffprobeCandidates('/usr/bin/node'); // [ 'ffprobe', '/opt/homebrew/bin/ffprobe', ... ]
+
+	it('returns an existing ABSOLUTE candidate before the bare name', () => {
+		const exists = (p: string) => p === '/opt/homebrew/bin/ffprobe';
+		assert.equal(selectFfprobe(cands, exists), '/opt/homebrew/bin/ffprobe');
+	});
+
+	it('does not short-circuit on the leading bare name when an absolute exists', () => {
+		// The Intel path exists but arm64 does not — the finder must skip the bare
+		// name AND the absent arm64 path and land on the one that exists.
+		const exists = (p: string) => p === '/usr/local/bin/ffprobe';
+		assert.equal(selectFfprobe(cands, exists), '/usr/local/bin/ffprobe');
+	});
+
+	it('falls back to the bare name for PATH resolution when no absolute exists', () => {
+		assert.equal(selectFfprobe(cands, () => false), 'ffprobe');
+	});
+
+	it('returns the literal ffprobe when there is neither an absolute nor a bare candidate', () => {
+		assert.equal(selectFfprobe(['/opt/x/ffprobe'], () => false), 'ffprobe');
 	});
 });
