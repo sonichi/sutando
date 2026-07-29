@@ -2311,32 +2311,46 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     if not results_dir.exists():
         return {"name": name, "status": "ok", "detail": "results/ not yet created"}
     now = time.time()
-    orphans: list[tuple[str, int]] = []
     try:
-        for path in results_dir.glob("task-*.txt"):
-            if not path.is_file():
-                continue
-            try:
-                age = now - path.stat().st_mtime
-            except OSError:
-                continue
-            if age < threshold_age_sec:
-                continue
-            # Task still queued -> the consumer has not reached this pair yet.
-            if (tasks_dir / path.name).is_file():
-                continue
-            orphans.append((path.name, int(age)))
+        entries = list(results_dir.glob("task-*.txt"))
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn", "detail": f"could not scan results/: {e}"}
+    orphans: list[tuple[str, int]] = []
+    unreadable = 0
+    for path in entries:
+        # Per-file isolation on purpose. One unreadable entry must not decide
+        # the answer for the whole directory: with the guard around the loop
+        # instead, a single EACCES/EIO aborted the scan and any real orphan
+        # sitting beside it went unreported. Note pathlib only swallows a
+        # specific errno set (ENOENT/ENOTDIR/EBADF/ELOOP), so `is_file()` does
+        # raise for the rest and belongs inside the guard too.
+        try:
+            if not path.is_file():
+                continue
+            age = now - path.stat().st_mtime
+        except OSError:
+            unreadable += 1
+            continue
+        if age < threshold_age_sec:
+            continue
+        # Task still queued -> the consumer has not reached this pair yet.
+        if (tasks_dir / path.name).is_file():
+            continue
+        orphans.append((path.name, int(age)))
+    # Coverage is part of the verdict: say what could not be measured rather
+    # than let it round down into a clean result.
+    partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
     if not orphans:
-        return {"name": name, "status": "ok", "detail": "no undeliverable results"}
+        status = "warn" if unreadable else "ok"
+        return {"name": name, "status": status,
+                "detail": f"no undeliverable results{partial}"}
     orphans.sort(key=lambda item: -item[1])
     oldest_name, oldest_age = orphans[0]
     return {
         "name": name,
         "status": "warn",
         "detail": (f"{len(orphans)} result(s) whose task is already archived — never delivered; "
-                   f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"),
+                   f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m){partial}"),
     }
 
 

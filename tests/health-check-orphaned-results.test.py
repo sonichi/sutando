@@ -21,6 +21,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -93,6 +94,67 @@ class OrphanedResultsTest(unittest.TestCase):
         self._write("results/question-1.txt", TWO_HOURS_AGO)
         self._write("results/proactive-1.txt", TWO_HOURS_AGO)
         self.assertEqual(hc.check_orphaned_results()["status"], "ok")
+
+    # --- the "cannot answer" paths ---------------------------------------
+    #
+    # These are the branches that decide what happens when the probe itself
+    # fails. Left untested they are exactly where a check quietly starts
+    # reporting "ok" about a directory it never managed to read.
+
+    def test_non_file_entry_is_skipped(self):
+        """A directory that happens to match the glob is not a result."""
+        (self.ws / "results" / "task-adir.txt").mkdir()
+        self.assertEqual(hc.check_orphaned_results()["status"], "ok")
+
+    def test_one_unreadable_entry_does_not_hide_a_real_orphan(self):
+        """A single bad entry must not decide the answer for the directory.
+
+        The first cut wrapped the whole loop in one try/except, so one
+        unreadable file aborted the scan and returned "could not scan" — a real
+        orphan sitting beside it went unreported. pathlib only swallows a
+        specific errno set, so `is_file()` genuinely raises for the rest.
+        """
+        self._write("results/task-bad.txt", TWO_HOURS_AGO)
+        self._write("results/task-realorphan.txt", TWO_HOURS_AGO)
+        real_stat = Path.stat
+
+        def boom(self_path, *a, **kw):
+            if self_path.name == "task-bad.txt":
+                raise OSError("permission denied")
+            return real_stat(self_path, *a, **kw)
+
+        with mock.patch.object(Path, "stat", boom):
+            result = hc.check_orphaned_results()
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("task-realorphan.txt", result["detail"])
+        self.assertIn("1 entry unreadable", result["detail"])
+
+    def test_unreadable_entry_alone_still_warns_never_reports_clean(self):
+        """No orphans found, but the scan was incomplete — say so, do not round to ok."""
+        self._write("results/task-bad.txt", TWO_HOURS_AGO)
+        real_stat = Path.stat
+
+        def boom(self_path, *a, **kw):
+            if self_path.name == "task-bad.txt":
+                raise OSError("permission denied")
+            return real_stat(self_path, *a, **kw)
+
+        with mock.patch.object(Path, "stat", boom):
+            result = hc.check_orphaned_results()
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("unreadable", result["detail"])
+
+    def test_unscannable_results_dir_warns_rather_than_reporting_clean(self):
+        """A directory we could not read is UNKNOWN, and must say so out loud.
+
+        The failure mode this guards against is the silent one: swallowing the
+        error and returning "no undeliverable results" would claim evidence of
+        delivery from a scan that never happened.
+        """
+        with mock.patch.object(Path, "glob", side_effect=OSError("permission denied")):
+            result = hc.check_orphaned_results()
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("could not scan", result["detail"])
 
     def test_missing_results_dir_is_ok(self):
         for entry in (self.ws / "results").iterdir():
