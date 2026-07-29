@@ -239,6 +239,59 @@ let sessionRef: VoiceSession | null = null;
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
 // =============================================================================
+// Crash-handler safety
+// =============================================================================
+//
+// If the supervising process dies (app quit/crash), this orphaned voice-agent
+// loses its stdout/stderr pipes — every console.* call then throws, and a
+// "log the error and stay alive" crash handler becomes an infinite
+// throw→log→throw loop pinned at 100% CPU (observed 2026-07-29: an orphan
+// with fds 0-2 closed burned 18h of CPU while its stale pidfile blocked every
+// replacement instance). Three layers prevent a recurrence:
+//   1. stdout/stderr get no-op 'error' handlers — a dead pipe degrades to
+//      silent log loss instead of an uncaught 'error' event.
+//   2. All logging from crash/shutdown paths goes through safeLog/safeError,
+//      which can never throw; the uncaughtException/unhandledRejection
+//      handlers also trip a rate-limit breaker that exits the process when
+//      exceptions arrive faster than any real workload produces them.
+//   3. An orphan watchdog (wired next to the signal handlers in main())
+//      shuts down cleanly when the spawning parent dies.
+process.stdout.on('error', () => {});
+process.stderr.on('error', () => {});
+
+function safeLog(...args: unknown[]): void {
+	try { console.log(...args); } catch { /* dead pipe — drop the line */ }
+}
+function safeError(...args: unknown[]): void {
+	try { console.error(...args); } catch { /* dead pipe — drop the line */ }
+}
+
+const CRASH_LOOP_WINDOW_MS = 5_000;
+const CRASH_LOOP_LIMIT = 25;
+let crashWindowStart = 0;
+let crashWindowCount = 0;
+/** Exit if crash-handler invocations arrive in a tight loop. Called BEFORE
+ * the handler logs, so a logging path that itself throws still hits the
+ * breaker on the next iteration instead of recursing forever. */
+function crashLoopBreaker(kind: string): void {
+	const now = Date.now();
+	if (now - crashWindowStart > CRASH_LOOP_WINDOW_MS) {
+		crashWindowStart = now;
+		crashWindowCount = 0;
+	}
+	if (++crashWindowCount < CRASH_LOOP_LIMIT) return;
+	// Last gasp goes to the workspace log file — stdout may be the very thing
+	// that's broken. Best effort only.
+	try {
+		appendFileSync(
+			join(WORKSPACE_DIR, 'logs', 'voice-agent.log'),
+			`${ts()} [FATAL] ${kind} storm: ${crashWindowCount} in ${CRASH_LOOP_WINDOW_MS}ms — exiting to break the loop\n`,
+		);
+	} catch { /* best effort */ }
+	process.exit(1);
+}
+
+// =============================================================================
 // Pending tool call tracker
 // =============================================================================
 
@@ -988,7 +1041,7 @@ async function main() {
 	session.eventBus.subscribe('turn.interrupted', () => _duck('off'));
 
 	const shutdown = async () => {
-		console.log(`\n${ts()} Shutting down...`);
+		safeLog(`\n${ts()} Shutting down...`);
 		recorder.flush();
 		setVisionSession(null);
 		setSessionToolUpdater(null, []);
@@ -999,6 +1052,7 @@ async function main() {
 	process.on('SIGINT', shutdown);
 	process.on('SIGTERM', shutdown);
 	process.on('uncaughtException', (err) => {
+		crashLoopBreaker('uncaughtException');
 		// EADDRINUSE on the WS port means another voice-agent (typically the
 		// launchd-managed one) already owns it. The existing process is the
 		// one with the live Gemini transport — the duplicate that tripped
@@ -1008,15 +1062,34 @@ async function main() {
 		// control port and exit so the launchd voice-agent (or the next
 		// restart) can claim 7847 with a live session.
 		if ((err as NodeJS.ErrnoException)?.code === 'EADDRINUSE') {
-			console.error(`${ts()} [FATAL] EADDRINUSE on :${PORT} — another voice-agent is listening; exiting so the live one keeps the vision control port.`);
+			safeError(`${ts()} [FATAL] EADDRINUSE on :${PORT} — another voice-agent is listening; exiting so the live one keeps the vision control port.`);
 			try { stopVisionControlServer(); } catch {}
 			process.exit(1);
 		}
-		console.error(`${ts()} [FATAL] uncaught exception (staying alive):`, err);
+		safeError(`${ts()} [FATAL] uncaught exception (staying alive):`, err);
 	});
 	process.on('unhandledRejection', (err) => {
-		console.error(`${ts()} [FATAL] unhandled rejection (staying alive):`, err);
+		crashLoopBreaker('unhandledRejection');
+		safeError(`${ts()} [FATAL] unhandled rejection (staying alive):`, err);
 	});
+
+	// Orphan watchdog — when the spawning parent (backend supervisor / app)
+	// dies, this process gets reparented (macOS: to launchd, ppid 1). An
+	// orphan has no log sink and no supervisor, but still holds the pidfile
+	// and ports :9900/:7847, blocking every replacement instance. Detect the
+	// reparent and shut down cleanly. Skipped when we STARTED under pid 1 —
+	// that's the legitimate launchd-managed deployment.
+	const initialPpid = process.ppid;
+	if (initialPpid !== 1) {
+		setInterval(() => {
+			if (process.ppid === initialPpid) return;
+			safeError(`${ts()} [Orphan] Parent ${initialPpid} is gone (ppid now ${process.ppid}) — shutting down to release pidfile and ports`);
+			// shutdown() awaits session.close(); if the transport hangs, force
+			// the exit — an orphan has nothing left to lose.
+			setTimeout(() => process.exit(1), 10_000).unref();
+			void shutdown();
+		}, 30_000).unref();
+	}
 
 	voiceSessionRef = session;
 
