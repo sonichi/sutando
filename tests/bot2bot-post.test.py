@@ -91,6 +91,37 @@ try:
     b2b.main()
     check("main: --to member → posts to bot2bot channel", _posted.get("channel") == BOT2BOT)
     check("main: member post carries the mention", _posted.get("text", "").startswith(f"<@{MEMBER_B}> "))
+
+    # --- multi-peer NO-GUESS (2026-07-29 double misfire regression) ---
+    # With 2+ peer bots allowlisted and no --to, the old code picked
+    # bot_candidates[0] arbitrarily (Pro pinged Air meaning Mini; Mini pinged
+    # Air meaning Pro; each stray ping triggered the target's team-tier
+    # auto-refusal). New contract: post WITHOUT any mention.
+    _posted.clear()
+    sys.argv = ["post.py", "ping", "who is around"]
+    b2b.main()
+    check("main: no --to with 2 peers → posts WITHOUT a mention",
+          _posted.get("text", "").startswith("ping: ") and "<@" not in _posted.get("text", ""))
+
+    # single-peer fleets keep the convenient auto-mention
+    single_access = {
+        "allowFrom": ["1"],
+        "groups": {"chan_bot2bot": {"role": "bot2bot",
+                                    "allowFrom": [MEMBER_A, MEMBER_SELF]}},
+    }
+    b2b.load_access = lambda: single_access
+    _posted.clear()
+    sys.argv = ["post.py", "ping", "you there?"]
+    b2b.main()
+    check("main: no --to with exactly 1 peer → auto-mentions that peer",
+          _posted.get("text", "").startswith(f"<@{MEMBER_A}> "))
+    b2b.load_access = lambda: ACCESS
+
+    # resolve_other_bot unit view: multi-peer → None, single-peer → the peer
+    check("resolve_other_bot: 2 peers → None (no guess)",
+          b2b.resolve_other_bot(ACCESS, MEMBER_SELF, BOT2BOT) is None)
+    check("resolve_other_bot: 1 peer → that peer",
+          b2b.resolve_other_bot(single_access, MEMBER_SELF, BOT2BOT) == MEMBER_A)
 finally:
     _restore()
 
