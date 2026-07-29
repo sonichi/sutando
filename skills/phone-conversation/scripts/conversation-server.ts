@@ -419,6 +419,19 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\nsource: phone\ninteraction_type: realtime_audio\nmedia_form: live_stream\ncallSid: ${callSession.callSid}\ncaller: ${confineUserContent(callSession.callerNumber || 'unknown')}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${confineUserContent(taskDescription)}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${confineUserContent(fullTranscript)}\n`;
 	writeFileSync(taskPath, content);
 
+	// Anonymous, opt-out product telemetry: count the phone surface. The
+	// discord/slack/telegram bridges emit task_processed at their own accept
+	// points; phone tasks (and the co-located voice/chat paths) were the gap.
+	// Shell out to src/telemetry.py — one source of truth, no-ops when opted
+	// out / unconfigured. Fire-and-forget: detached + unref so it never blocks
+	// or delays the live call; source is always "phone" here.
+	try {
+		const telemetryPy = join(dirname(_phoneSkillDir), '..', 'src', 'telemetry.py');
+		spawn('python3', [telemetryPy, 'task_processed', 'phone'], { detached: true, stdio: 'ignore' })
+			.on('error', () => { /* telemetry must never break the call */ })
+			.unref();
+	} catch { /* telemetry must never break the call */ }
+
 	// Poll for result in background, inject when ready — don't block Gemini
 	const POLL_TIMEOUT_MS = 300_000; // 5 min — watcher gaps can cause delays
 	const startTime = Date.now();
