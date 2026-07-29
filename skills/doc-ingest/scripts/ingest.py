@@ -18,6 +18,7 @@ from pathlib import Path
 
 DEFAULT_MAX_CHARS = 200_000
 DEFAULT_MAX_ROWS = 500
+MAX_ARCHIVE_DEPTH = 8
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".heic"}
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus"}
@@ -197,33 +198,57 @@ def extract_pptx(path: Path) -> str:
 
 
 def extract_zip(path: Path, max_rows: int, member_cap: int = 20,
-                total_budget: int = 64 * 1024 * 1024) -> str:
+                total_budget: int = 64 * 1024 * 1024,
+                _budget: dict[str, int] | None = None, _depth: int = 0) -> str:
     # Archive → manifest + recursive extraction of the first N supported members.
     # RESOURCE BOUNDS (attachments are untrusted): cap the member count AND the
     # cumulative uncompressed bytes we materialize, so a zip-bomb / oversized
     # archive can't exhaust the host's disk or memory. A member whose declared
     # uncompressed size would blow the budget is skipped, not written.
+    if _depth >= MAX_ARCHIVE_DEPTH:
+        return f"[skipped — archive nesting exceeds {MAX_ARCHIVE_DEPTH} levels]"
+    budget = _budget if _budget is not None else {
+        "members": member_cap,
+        "bytes": total_budget,
+    }
     with zipfile.ZipFile(path) as zf:
         infos = [inf for inf in zf.infolist() if not inf.filename.endswith("/")]
         names = [inf.filename for inf in infos]
         parts = ["## Archive contents\n\n" + "\n".join(f"- {n}" for n in names[:200])]
         import tempfile  # noqa: PLC0415
 
-        spent = 0
         stopped = False
+        processed = 0
         with tempfile.TemporaryDirectory() as td:
-            for inf in infos[:member_cap]:
+            for inf in infos:
                 name = inf.filename
-                if spent + inf.file_size > total_budget:
-                    parts.append(f"## {name}\n\n[skipped — archive extraction budget "
+                if budget["members"] <= 0:
+                    if _depth == 0 and processed == member_cap:
+                        parts.append(
+                            f"[doc-ingest: extracted first {member_cap} of "
+                            f"{len(names)} members — shared archive member budget reached]"
+                        )
+                    else:
+                        parts.append(f"[doc-ingest: shared archive member budget "
+                                     f"({member_cap}) reached]")
+                    stopped = True
+                    break
+                if inf.file_size > budget["bytes"]:
+                    parts.append(f"## {name}\n\n[skipped — shared archive extraction budget "
                                  f"({total_budget // (1024 * 1024)} MiB) reached]")
                     stopped = True
                     break
-                spent += inf.file_size
+                budget["members"] -= 1
+                budget["bytes"] -= inf.file_size
+                processed += 1
                 target = Path(td) / Path(name).name  # flatten: zip-slip-safe, basename only
                 target.write_bytes(zf.read(name))
                 try:
-                    kind, text = extract(target, max_rows)
+                    kind, text = extract(
+                        target, max_rows,
+                        _archive_budget=budget,
+                        _archive_depth=_depth + 1,
+                    )
                     if kind in {"image", "audio"}:
                         parts.append(f"## {name}\n\n[{kind} member — handled natively, not extracted]")
                     else:
@@ -245,7 +270,9 @@ def extract_textutil(path: Path) -> str:
     return proc.stdout
 
 
-def extract(path: Path, max_rows: int) -> tuple[str, str]:
+def extract(path: Path, max_rows: int,
+            _archive_budget: dict[str, int] | None = None,
+            _archive_depth: int = 0) -> tuple[str, str]:
     """Returns (kind, text). Raises on failure; special kinds 'image'/'audio' carry a pointer."""
     suffix = path.suffix.lower()
     if suffix in IMAGE_SUFFIXES:
@@ -263,7 +290,11 @@ def extract(path: Path, max_rows: int) -> tuple[str, str]:
     if suffix == ".pptx":
         return "pptx", extract_pptx(path)
     if suffix == ".zip":
-        return "zip", extract_zip(path, max_rows)
+        return "zip", extract_zip(
+            path, max_rows,
+            _budget=_archive_budget,
+            _depth=_archive_depth,
+        )
     if suffix in {".rtf", ".doc"}:
         return "textutil", extract_textutil(path)
     if suffix in TEXT_SUFFIXES or not suffix:

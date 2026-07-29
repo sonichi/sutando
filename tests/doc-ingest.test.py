@@ -300,6 +300,32 @@ with tempfile.TemporaryDirectory() as td:
           "ok" in text and "extraction budget" in text and "X" * 5000 not in text,
           text[-200:])
 
+    # 21c. Recursive ZIPs share one traversal budget. Previously every nested
+    #      extract_zip() reset both counters, allowing exponential work from a
+    #      tiny binary-tree archive.
+    leaf = tmp / "leaf.zip"
+    with zipfile.ZipFile(leaf, "w") as zf:
+        zf.writestr("payload.txt", "leaf payload")
+    middle = tmp / "middle.zip"
+    with zipfile.ZipFile(middle, "w") as zf:
+        zf.writestr("left.zip", leaf.read_bytes())
+        zf.writestr("right.zip", leaf.read_bytes())
+    outer = tmp / "outer.zip"
+    with zipfile.ZipFile(outer, "w") as zf:
+        zf.writestr("branch-a.zip", middle.read_bytes())
+        zf.writestr("branch-b.zip", middle.read_bytes())
+    text = ingest.extract_zip(outer, 500, member_cap=3)
+    check("zip-recursive-shared-member-budget",
+          text.count("leaf payload") == 1
+          and text.count("## Archive contents") == 3
+          and "shared archive member budget" in text,
+          text[-500:])
+
+    # 21d. Nesting has an independent hard ceiling even with budget remaining.
+    text = ingest.extract_zip(leaf, 500, _depth=ingest.MAX_ARCHIVE_DEPTH)
+    check("zip-recursion-depth-cap",
+          "nesting exceeds" in text and "leaf payload" not in text, text)
+
     # 22. ZIP member whose extraction raises → reported inline, archive survives.
     badzip = tmp / "badmember.zip"
     with zipfile.ZipFile(badzip, "w") as zf:
