@@ -29,9 +29,33 @@
  */
 
 import { writeFileSync, readdirSync, readFileSync, accessSync, constants, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
+
+// Anonymous, opt-out product telemetry for locally-created tasks (voice, chat,
+// context-drop). The Python bridges (discord/slack/telegram) emit task_processed
+// at their own accept points; the co-located voice-agent path is the gap this
+// closes. We shell out to src/telemetry.py (sibling of this module) rather than
+// re-implement the PostHog client in TS — one source of truth, and it no-ops
+// cleanly when telemetry is opted out / unconfigured. Fire-and-forget: never
+// blocks or throws into task submission. Source is read from the task file's own
+// `source:` header, so every surface is tagged with exactly what it wrote.
+const _TELEMETRY_PY = join(dirname(fileURLToPath(import.meta.url)), 'telemetry.py');
+/** Read the coarse surface bucket from a task file's own `source:` header —
+ * `voice` / `chat` / `context-drop` / … — falling back to `unknown` when the
+ * header is absent. Pure + exported so the tag is unit-tested without spawning. */
+export function parseTaskSource(content: string): string {
+	const m = content.match(/^source:\s*(\S+)/m);
+	return m ? m[1] : 'unknown';
+}
+export function emitTaskProcessed(content: string): void {
+	try {
+		execFile('python3', [_TELEMETRY_PY, 'task_processed', parseTaskSource(content)], () => { /* fire-and-forget */ });
+	} catch { /* telemetry must never break task submission */ }
+}
 
 export interface TaskDelegationService {
 	readonly mode: 'local' | 'relay';
@@ -60,6 +84,7 @@ export class LocalTaskBackend implements TaskDelegationService {
 
 	submitTask(taskId: string, content: string): void {
 		writeFileSync(join(this.taskDir, `${taskId}.txt`), content);
+		emitTaskProcessed(content);
 	}
 
 	listResultFiles(): string[] {

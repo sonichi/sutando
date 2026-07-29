@@ -292,7 +292,28 @@ def emit_task(name: str, entry: dict) -> Path:
                 pass
     path = TASKS_DIR / f"{task_id}.txt"
     path.write_text(body)
+    _emit_cron_telemetry()
     return path
+
+
+def _emit_cron_telemetry() -> None:
+    """Fire-and-forget product telemetry: count `cron` as a task source so
+    DAU/WAU includes cron-driven activity. PR #2274 added `cron` to the
+    telemetry allowlist but this writer never emitted, so the bucket could
+    never fire (CR by liususan091219). Mirrors the discord/slack/telegram
+    bridges + agent-api, which emit at their own accept points. Never blocks or
+    breaks task emission; no-op when telemetry is opted out. Never carries task
+    content or ids.
+    """
+    try:  # pragma: no cover — fire-and-forget glue; logic in tests/telemetry.test.py
+        from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+        # cron-runner is a one-shot launchd process, so a daemon-thread send
+        # can be killed as soon as this process exits. Bound the synchronous
+        # flush in telemetry.capture() so the event is handed off first.
+        task_processed("cron", flush=True)
+    except Exception:  # pragma: no cover — telemetry must never break cron emission
+        pass
 
 
 def run(now_epoch: Optional[int] = None) -> list:
