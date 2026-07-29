@@ -386,6 +386,66 @@ _test_do_post_confines_issue_body()
 
 
 # ---------------------------------------------------------------------------
+# (i) do_POST emits task_processed("github") — PR #2274 CR (liususan091219):
+# the telemetry allowlist added `github` but this writer never emitted, so
+# webhook-driven activity was uncounted and the bucket could never fire.
+# ---------------------------------------------------------------------------
+
+def _test_do_post_emits_github_telemetry():
+    import io as _io
+    import hashlib as _hl
+    import hmac as _hm
+    import telemetry
+
+    def run(td: Path):
+        _mod.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        orig_secret = _mod.WEBHOOK_SECRET
+        orig_conf = _mod._verification_confirmed
+        orig_emit = telemetry.task_processed
+        calls: list[str] = []
+        telemetry.task_processed = lambda source, **kw: calls.append(source)
+        _mod.WEBHOOK_SECRET = "testsecret"
+        _mod._verification_confirmed = True
+        try:
+            payload = {
+                "action": "opened",
+                "issue": {"number": 7, "title": "a bug", "body": "details",
+                          "user": {"login": "reporter"}},
+                "sender": {"login": "reporter"},
+                "repository": {"full_name": "o/r"},
+            }
+            body = json.dumps(payload).encode()
+            sig = "sha256=" + _hm.new(b"testsecret", body, _hl.sha256).hexdigest()
+
+            h = _mod.WebhookHandler.__new__(_mod.WebhookHandler)
+            h.headers = {
+                "Content-Length": str(len(body)),
+                "X-Hub-Signature-256": sig,
+                "X-GitHub-Event": "issues",
+            }
+            h.rfile = _io.BytesIO(body)
+            h.wfile = _io.BytesIO()
+            h.send_response = lambda *a, **k: None
+            h.send_header = lambda *a, **k: None
+            h.end_headers = lambda *a, **k: None
+            h.do_POST()
+
+            files = list(_mod.TASKS_DIR.glob("*.txt"))
+            _check("gh-telemetry-task-written", len(files) == 1, f"files={files}")
+            _check("gh-telemetry-emits-github", calls == ["github"],
+                   f"expected ['github'], got {calls!r}")
+        finally:
+            _mod.WEBHOOK_SECRET = orig_secret
+            _mod._verification_confirmed = orig_conf
+            telemetry.task_processed = orig_emit
+
+    _with_tmp_tasks(run)
+
+
+_test_do_post_emits_github_telemetry()
+
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 
