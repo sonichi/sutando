@@ -71,41 +71,44 @@ with tempfile.TemporaryDirectory() as td:
     code, out, _ = run_cli([str(pptx)])
     check("pptx-slide-text", code == 0 and "Hello from slide one" in out and "Slide 1" in out)
 
-    # 4. XLSX when openpyxl is available (else skip — fallback covered by pptx path).
-    try:
-        import openpyxl
+    # 4. XLSX primary path (openpyxl) — driven with a fake module so it runs on
+    #    ANY host (CI has no openpyxl; a skip there left the primary path uncovered).
+    xlsx = tmp / "inv.xlsx"
+    xlsx.write_bytes(b"PK\x03\x04fake")  # openpyxl is faked, so contents are irrelevant
+    fake_openpyxl = types.ModuleType("openpyxl")
 
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Inventory"
-        ws.append(["part", "count"])
-        ws.append(["bolt", 42])
-        xlsx = tmp / "inv.xlsx"
-        wb.save(str(xlsx))
+    class _WS:
+        title = "Inventory"
+
+        def iter_rows(self, values_only=True):
+            return iter([("part", "count"), ("bolt", 42)])
+
+    fake_openpyxl.load_workbook = lambda *a, **k: types.SimpleNamespace(worksheets=[_WS()])
+    with mock.patch.dict(sys.modules, {"openpyxl": fake_openpyxl}):
         code, out, _ = run_cli([str(xlsx)])
-        check("xlsx-sheet", code == 0 and "Sheet: Inventory" in out and "| bolt | 42 |" in out)
-    except ImportError:
-        print("SKIP xlsx-sheet (openpyxl not installed)")
+    check("xlsx-sheet", code == 0 and "Sheet: Inventory" in out and "| bolt | 42 |" in out, out[:200])
 
-    # 5. DOCX when python-docx is available (else skip) — with a table too.
-    try:
-        import docx
+    # 5. DOCX primary path (python-docx) — fake module, host-independent.
+    docxf = tmp / "report.docx"
+    docxf.write_bytes(b"PK\x03\x04fake")
+    fake_docx = types.ModuleType("docx")
 
-        d = docx.Document()
-        d.add_paragraph("Quarterly summary paragraph.")
-        table = d.add_table(rows=2, cols=2)
-        table.rows[0].cells[0].text = "region"
-        table.rows[0].cells[1].text = "sales"
-        table.rows[1].cells[0].text = "west"
-        table.rows[1].cells[1].text = "10"
-        docxf = tmp / "report.docx"
-        d.save(str(docxf))
+    def _fake_document(_p):
+        para = types.SimpleNamespace(text="Quarterly summary paragraph.")
+        cell = lambda t: types.SimpleNamespace(text=t)  # noqa: E731
+        row = lambda cells: types.SimpleNamespace(cells=cells)  # noqa: E731
+        table = types.SimpleNamespace(rows=[
+            row([cell("region"), cell("sales")]),
+            row([cell("west"), cell("10")]),
+        ])
+        return types.SimpleNamespace(paragraphs=[para], tables=[table])
+
+    fake_docx.Document = _fake_document
+    with mock.patch.dict(sys.modules, {"docx": fake_docx}):
         code, out, _ = run_cli([str(docxf)])
-        check("docx-paragraph",
-              code == 0 and "Quarterly summary paragraph." in out
-              and "| region | sales |" in out)
-    except ImportError:
-        print("SKIP docx-paragraph (python-docx not installed)")
+    check("docx-paragraph",
+          code == 0 and "Quarterly summary paragraph." in out and "| region | sales |" in out,
+          out[:200])
 
     # 6. Image → pointer to native reading, exit 3, nothing on stdout.
     img = tmp / "shot.png"
@@ -182,6 +185,30 @@ with tempfile.TemporaryDirectory() as td:
          mock.patch.dict(sys.modules, {"pypdf": fake_pypdf}):
         check("pdf-pypdf-fallback", "page one text" in ingest.extract_pdf(pdf))
 
+    # 16b. pdftotext SUCCESS path (CI has no poppler) — mock which + subprocess.
+    ok_proc = types.SimpleNamespace(returncode=0, stdout="poppler extracted text", stderr="")
+    with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/pdftotext"), \
+         mock.patch.object(ingest.subprocess, "run", return_value=ok_proc):
+        check("pdf-pdftotext-success", "poppler extracted text" in ingest.extract_pdf(pdf))
+
+    # 16c. pdftotext returns empty → fall through to a raising fake pypdf → next
+    #      extractor absent → RuntimeError from the tried-non-empty branch.
+    empty_proc = types.SimpleNamespace(returncode=0, stdout="   ", stderr="")
+    raising_pypdf = types.ModuleType("pypdf")
+
+    def _boom(_p):
+        raise ValueError("bad pdf")
+
+    raising_pypdf.PdfReader = _boom
+    with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/pdftotext"), \
+         mock.patch.object(ingest.subprocess, "run", return_value=empty_proc), \
+         mock.patch.dict(sys.modules, {"pypdf": raising_pypdf, "fitz": None}):
+        try:
+            ingest.extract_pdf(pdf)
+            check("pdf-all-fail", False, "expected RuntimeError")
+        except RuntimeError as exc:
+            check("pdf-all-fail", "PDF extraction failed" in str(exc))
+
     # 17. XLSX fallback (openpyxl missing) → shared-strings zip scrape.
     fake_xlsx = tmp / "f.xlsx"
     with zipfile.ZipFile(fake_xlsx, "w") as zf:
@@ -199,6 +226,13 @@ with tempfile.TemporaryDirectory() as td:
     with mock.patch.dict(sys.modules, {"docx": None}), \
          mock.patch.object(ingest.shutil, "which", return_value=None):
         check("docx-fallback", "ParaFromXml" in ingest.extract_docx(fake_docx, 500))
+
+    # 18b. DOCX fallback via textutil (docx absent, textutil present) — mocked.
+    tu_proc = types.SimpleNamespace(returncode=0, stdout="textutil docx text", stderr="")
+    with mock.patch.dict(sys.modules, {"docx": None}), \
+         mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/textutil"), \
+         mock.patch.object(ingest.subprocess, "run", return_value=tu_proc):
+        check("docx-textutil", "textutil docx text" in ingest.extract_docx(fake_docx, 500))
 
     # 19. RTF via textutil unavailable → clear RuntimeError.
     rtf = tmp / "x.rtf"
