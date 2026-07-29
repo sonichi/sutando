@@ -23,6 +23,7 @@ Covers:
   j) durable drift + pending differs    → warn (pending doesn't mask real drift)
   k) malformed JSON, bytes differ       → warn (raw-byte fallback)
   l) malformed JSON, bytes identical    → ok (raw-byte fallback)
+  m) resolves canonical tree, not env ~/.claude → ok (no false all-clear; #2277 review)
 
 Run: python3 tests/health-check-per-host-config-backup.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -35,44 +36,54 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
 spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
+import sutando_config  # noqa: E402 — patched by _Harness so the probe's local import resolves to the temp tree
 
 
 class _Harness:
-    """Point the probe at a temp claude-home + workspace hosts/ tree.
+    """Point the probe at a temp canonical config dir + workspace hosts/ tree.
 
-    Overrides the three collaborators the probe reads:
-      - hc.claude_home_path (live channels source)
+    The probe resolves the LIVE channels source via
+    `sutando_config.resolve_claude_sutando_config_dir()` — the SAME canonical
+    resolver the snapshot writer uses (#2277 review) — so we patch that, not the
+    env-based `claude_home_path`. Overrides:
+      - sutando_config.resolve_claude_sutando_config_dir (canonical live source)
+      - hc.claude_home_path (kept patched so a regression to the old env-based
+        resolver would read `home_divergent` — an EMPTY tree — and fail loudly)
       - hc.WORKSPACE_DIR    (carrier base is WORKSPACE_DIR/hosts/<host>/channels)
       - hc._host_label      (which host subtree is the carrier)
     """
 
     def __init__(self, tmp: Path):
         self.tmp = tmp
-        self.home = tmp / "claude-home"
+        self.home = tmp / "canonical-config"        # resolve_claude_sutando_config_dir() target
+        self.home_divergent = tmp / "legacy-home"   # what the old claude_home_path fallback would hit
         self.ws = tmp / "workspace"
         self._saved = {}
 
     def __enter__(self):
         self._saved = {
-            "claude_home_path": hc.claude_home_path,
-            "WORKSPACE_DIR": hc.WORKSPACE_DIR,
-            "_host_label": hc._host_label,
+            "hc.claude_home_path": hc.claude_home_path,
+            "hc.WORKSPACE_DIR": hc.WORKSPACE_DIR,
+            "hc._host_label": hc._host_label,
+            "sc.resolve_claude_sutando_config_dir": sutando_config.resolve_claude_sutando_config_dir,
         }
-
-        def _chp(*parts):
-            return self.home.joinpath(*parts)
-
-        hc.claude_home_path = _chp
+        # canonical resolver → temp config dir (this is where write_live seeds)
+        sutando_config.resolve_claude_sutando_config_dir = lambda *a, **k: self.home
+        # old env-based path → a SEPARATE empty tree, so a regression to it reads nothing
+        hc.claude_home_path = lambda *parts: self.home_divergent.joinpath(*parts)
         hc.WORKSPACE_DIR = self.ws
         hc._host_label = lambda: "TestHost"
         return self
 
     def __exit__(self, *a):
-        for k, v in self._saved.items():
-            setattr(hc, k, v)
+        hc.claude_home_path = self._saved["hc.claude_home_path"]
+        hc.WORKSPACE_DIR = self._saved["hc.WORKSPACE_DIR"]
+        hc._host_label = self._saved["hc._host_label"]
+        sutando_config.resolve_claude_sutando_config_dir = self._saved["sc.resolve_claude_sutando_config_dir"]
 
     def write_live(self, svc: str, content: bytes):
         d = self.home / "channels" / svc
@@ -128,16 +139,18 @@ def case_d_no_channels_ok() -> list[str]:
     return []
 
 
-def case_e_unresolvable_home_ok() -> list[str]:
-    """claude_home_path raising must degrade to ok, never crash the run."""
+def case_e_unresolvable_config_ok() -> list[str]:
+    """The canonical config resolver raising must degrade to ok, never crash the
+    run. (Now patches resolve_claude_sutando_config_dir — the resolver the probe
+    actually uses post-#2277 — not the old env-based claude_home_path.)"""
     with tempfile.TemporaryDirectory() as td:
         with _Harness(Path(td)) as h:
-            def _boom(*_a):
-                raise RuntimeError("no home")
-            hc.claude_home_path = _boom
+            def _boom(*_a, **_k):
+                raise RuntimeError("no config dir")
+            sutando_config.resolve_claude_sutando_config_dir = _boom
             r = hc.check_per_host_config_backup()
     if r["status"] != "ok" or "resolvable" not in r["detail"]:
-        return [f"e) unresolvable claude-home should be ok, got {r}"]
+        return [f"e) unresolvable config dir should degrade to ok, got {r}"]
     return []
 
 
@@ -237,13 +250,36 @@ def case_l_malformed_but_byte_identical_ok() -> list[str]:
     return []
 
 
+def case_m_reads_canonical_tree_not_env_home() -> list[str]:
+    """The probe must resolve live channels from the canonical resolver
+    (`resolve_claude_sutando_config_dir`, what the snapshot writer uses), NOT the
+    env-based `claude_home_path` that falls back to ~/.claude when
+    CLAUDE_CONFIG_DIR is unset. Regression for the #2277 false-green: under
+    Sutando.app's runHealthCheck() / the fallback launchd plist (neither injects
+    CLAUDE_CONFIG_DIR), the old probe read ~/.claude, found nothing, and reported
+    a false "no channels" all-clear — hiding the very stale-backup failure this
+    check exists to detect. Here the channel is seeded ONLY in the canonical tree
+    while the harness points claude_home_path at a SEPARATE empty tree; a
+    regression to the env-based resolver would read empty → "no channels"."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            h.write_live("discord", b'{"allowFrom":["123"]}')      # canonical tree only
+            h.write_carrier("discord", b'{"allowFrom":["123"]}')
+            # sanity: the env-based fallback tree is genuinely empty
+            assert not (h.home_divergent / "channels").exists()
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "ok" or "backup(s) current" not in r["detail"]:
+        return [f"m) probe must read the canonical tree (not env ~/.claude); got {r}"]
+    return []
+
+
 def main() -> int:
     cases = [
         ("a", case_a_identical_ok),
         ("b", case_b_diff_warn),
         ("c", case_c_missing_warn),
         ("d", case_d_no_channels_ok),
-        ("e", case_e_unresolvable_home_ok),
+        ("e", case_e_unresolvable_config_ok),
         ("f", case_f_channels_dir_but_no_access_ok),
         ("g", case_g_unreadable_carrier_warn),
         ("h", case_h_unreadable_live_warn),
@@ -251,6 +287,7 @@ def main() -> int:
         ("j", case_j_durable_drift_despite_pending_warn),
         ("k", case_k_malformed_json_raw_fallback_warn),
         ("l", case_l_malformed_but_byte_identical_ok),
+        ("m", case_m_reads_canonical_tree_not_env_home),
     ]
     failures = []
     for label, fn in cases:

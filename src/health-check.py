@@ -901,7 +901,18 @@ def check_per_host_config_backup() -> dict:
     """
     name = "per-host-config-backup"
     try:
-        channels_dir = Path(claude_home_path("channels"))
+        # Resolve the live channels source from the SAME canonical resolver the
+        # snapshot WRITER uses — sync-workspace's `_snapshot_per_host_config`
+        # reads `sutando-config.sh claude-sutando-config-dir`, i.e.
+        # resolve_claude_sutando_config_dir(). The old claude_home_path() fell
+        # back to ~/.claude whenever CLAUDE_CONFIG_DIR was unset, but Sutando.app's
+        # runHealthCheck() subprocess and the fallback launchd plist don't inject
+        # it — so the probe read a DIFFERENT tree than the writer and false-greened
+        # "no channels" on exactly the app/launchd paths this check exists to
+        # cover (qingyun, #2277 review). The canonical resolver honors deliberate
+        # config-based overrides (core_config_dirs) that the writer also respects.
+        from sutando_config import resolve_claude_sutando_config_dir  # noqa: PLC0415
+        channels_dir = resolve_claude_sutando_config_dir() / "channels"
     except Exception:
         return {"name": name, "status": "ok", "detail": "no channels dir resolvable"}
     if not channels_dir.is_dir():
