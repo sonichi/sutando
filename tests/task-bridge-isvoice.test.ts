@@ -1,6 +1,6 @@
-import { describe, it, before, after, afterEach } from 'node:test';
+import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, existsSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
+import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../src/workspace_default.js';
 import { _isVoiceTask } from '../src/task-bridge.js';
@@ -37,6 +37,17 @@ source: discord
 channel_id: 1490906927675474030
 task: hello world
 `;
+// interaction-model 4D step 1.5 (scope A): voice tasks now carry a
+// `media_form: live_stream` header BEFORE `task:`. The stamp is additive —
+// _isVoiceTask keys on source/channel_id, so the verdict must stay true.
+const VOICE_BODY_LIVESTREAM = `id: task-isvoice-test-ls-aaa
+timestamp: 2026-07-07T00:00:00Z
+source: voice
+interaction_type: realtime_audio
+media_form: live_stream
+channel_id: local-voice
+task: hello world
+`;
 
 const created: string[] = [];
 function writeTask(path: string, body: string) {
@@ -55,6 +66,12 @@ describe('_isVoiceTask — archive-path coverage', () => {
 	it('returns true for a voice task in the live tasks/ dir', () => {
 		const id = 'task-isvoice-test-live-aaa';
 		writeTask(join(TASK_DIR, `${id}.txt`), VOICE_BODY);
+		assert.equal(_isVoiceTask(id), true);
+	});
+
+	it('returns true for a scope-A voice task carrying media_form: live_stream (stamp is additive)', () => {
+		const id = 'task-isvoice-test-ls-aaa';
+		writeTask(join(TASK_DIR, `${id}.txt`), VOICE_BODY_LIVESTREAM);
 		assert.equal(_isVoiceTask(id), true);
 	});
 

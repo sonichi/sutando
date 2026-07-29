@@ -10,7 +10,15 @@ is the path the POC actually proved.
 Usage: resolver.py "where do I commit here?"
 Emits  /tmp/pointer-cmd.json : {"nx","ny","label","say","ts"}
 """
-import base64, json, os, re, subprocess, sys, time, urllib.request, urllib.error
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
 
 CMD = "/tmp/pointer-cmd.json"
 MODEL = "gemini-3-flash-preview"
@@ -29,7 +37,12 @@ key or die("no GEMINI_API_KEY")
 
 # 1. capture main display via the production :7845 server
 t0 = time.time()
-cap = json.load(urllib.request.urlopen("http://localhost:7845/capture?display=1", timeout=8))
+_tok_path = os.path.expanduser("~/.config/sutando/screen-capture-token")
+_cap_tok = open(_tok_path).read().strip() if os.path.exists(_tok_path) else None
+_cap_req = urllib.request.Request("http://localhost:7845/capture?display=1")
+if _cap_tok:
+    _cap_req.add_header("X-Sutando-Capture-Token", _cap_tok)
+cap = json.load(urllib.request.urlopen(_cap_req, timeout=8))
 cap.get("status") == "ok" or die(f"capture failed: {cap}")
 shot = cap["path"]
 small = "/tmp/pointer-shot.jpg"

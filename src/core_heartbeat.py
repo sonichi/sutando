@@ -78,6 +78,28 @@ def _alive_path() -> Path:
     return CORES_DIR / f"{_hostname()}.alive"
 
 
+def _locality() -> dict[str, str]:
+    """The core's locality — self-reported (Track 10, owner 2026-07-10).
+
+    `kind`: ``local`` when this core runs on one of the owner's own machines
+    (a normal ``startup.sh`` launch), ``cloud`` when spawned by the hosted
+    spawn-user-core template. The template sets ``$SUTANDO_CORE_LOCALITY=cloud``;
+    an absent or unrecognized value defaults to ``local`` (a hand-started core
+    is local by construction — fail toward the safe, common case). ``host`` is
+    the per-host label, so a client can render WHICH machine ("MacBook Pro
+    (yours)" vs "mac-mini (yours, remote)").
+
+    Consumed downstream by the broker presence sweep → ``space.ag2.presence`` →
+    a client locality badge (the remaining two Track-10 slices). Self-reported
+    v1; attestation is a Track 2/4 tie-in. Same runtime-authored-state pattern
+    as ``socket`` above — the answer lives in the core's own environment.
+    """
+    kind = os.environ.get("SUTANDO_CORE_LOCALITY", "local").strip().lower()
+    if kind not in ("local", "cloud"):
+        kind = "local"
+    return {"kind": kind, "host": _hostname()}
+
+
 def write_beat(status: str = "running") -> None:
     """Write one heartbeat record. Atomic-via-tmp-then-rename so a concurrent
     reader never sees a partial file."""
@@ -89,7 +111,18 @@ def write_beat(status: str = "running") -> None:
         "started_at": _STARTED_AT,
         "last_beat_at": time.time(),
         "status": status,
-        "schema_version": 1,
+        # The tmux socket THIS core actually runs on. Recorded here — in the
+        # core's own environment — so it is the authoritative, runtime-authored
+        # answer to "which socket?" for readers that cannot reconstruct the
+        # launch env (e.g. `sutando-config.sh runtime` invoked by the desktop
+        # app, whose ambient SUTANDO_TMUX_SOCKET points at a *different* bundled
+        # socket). Mirrors start-cli.sh's resolution exactly.
+        "socket": os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
+        # Self-reported locality (Track 10): {kind: local|cloud, host}. Additive
+        # and informational — mtime remains the liveness signal — so readers
+        # that don't know the field are unaffected.
+        "locality": _locality(),
+        "schema_version": 2,
     }
     tmp = target.with_suffix(".alive.tmp")
     tmp.write_text(json.dumps(payload, indent=2))
@@ -146,6 +179,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         write_beat(status=args.status)
         return 0
+    # Anonymous, opt-out product telemetry: one event per real core boot so
+    # maintainers can count active installs (OSS + desktop). No-op when opted
+    # out or no key is configured. Never blocks; see src/telemetry.py + TELEMETRY.md.
+    try:  # pragma: no cover — fire-and-forget glue; telemetry logic tested in tests/telemetry.test.py
+        from telemetry import capture  # sibling module (src/ already on sys.path)
+
+        capture("core_started", {"interval_s": args.interval})
+    except Exception:  # pragma: no cover — telemetry must never break the core
+        pass
     return run_forever(interval=args.interval, status=args.status)
 
 

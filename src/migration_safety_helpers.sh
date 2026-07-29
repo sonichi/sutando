@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # PR #1440 — auto-migration safety helpers (Mini review).
 #
 # Sourced by src/startup.sh's v0.8 SUTANDO_WORKSPACE auto-migration block and
@@ -28,16 +29,20 @@ _realpath() {
 }
 
 _same_inode() {
-  # Cross-platform device:inode equality: stat -f '%d:%i' (macOS BSD) /
-  # -c '%d:%i' (Linux GNU). Use -L on both so symlinks are followed to their
-  # target (BSD stat's default is lstat-semantics; -L flips it to stat-
+  # Cross-platform device:inode equality: stat -c '%d:%i' (GNU/Linux) /
+  # stat -f '%d:%i' (macOS BSD). Use -L on both so symlinks are followed to
+  # their target (BSD stat's default is lstat-semantics; -L flips it to stat-
   # semantics, matching GNU). Per Mini's PR #1440 v1 review (2026-06-04
   # 02:30Z): comparing inode alone false-positives across unrelated file
   # systems that happen to reuse the same inode number — the device id is
   # what makes the pair globally unique.
+  #
+  # GNU stat first: on GNU/Linux, -f means --file-system (not format), so
+  # `stat -f '%d:%i' file` would treat '%d:%i' as a filename arg and fail;
+  # try -c (GNU format flag) first, fall back to -f (BSD format flag).
   local a b
-  a=$(stat -L -f '%d:%i' "$1" 2>/dev/null || stat -L -c '%d:%i' "$1" 2>/dev/null)
-  b=$(stat -L -f '%d:%i' "$2" 2>/dev/null || stat -L -c '%d:%i' "$2" 2>/dev/null)
+  a=$(stat -L -c '%d:%i' "$1" 2>/dev/null || stat -L -f '%d:%i' "$1" 2>/dev/null)
+  b=$(stat -L -c '%d:%i' "$2" 2>/dev/null || stat -L -f '%d:%i' "$2" 2>/dev/null)
   [ -n "$a" ] && [ -n "$b" ] && [ "$a" = "$b" ]
 }
 

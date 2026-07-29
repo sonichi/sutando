@@ -178,7 +178,7 @@ The three migration symptoms below were observed pre-v0.3.0 and all shipped fixe
 ## Troubleshooting
 
 - **`sync-workspace: vault.remote_url not set` / `--vault-url missing`** — configure per the Setup section above.
-- **`Another sync already in progress, exiting.`** — A previous cron tick is still running. The script self-clears stale locks after 10 minutes; if you see this repeatedly, check `/tmp/sync-workspace.log` for the previous tick's error.
+- **`Another sync already in progress, exiting.`** — A previous cron tick is still running. The script self-clears stale locks after 10 minutes; if you see this repeatedly, check `$TMPDIR/sync-workspace.log` (or `$SYNC_WORKSPACE_LOG` if you override it; legacy location was `/tmp/sync-workspace.log`) for the previous tick's error.
 - **`refusing to push to non-host branch '...'`** — Someone manually `git checkout`-ed a feature branch in the workspace clone. Switch back to your `host/<host>/<wsId>` branch.
 - **Push fails with auth error** — Check that your machine has push access to the vault repo (`gh auth status` if you use the GitHub CLI). Read-only clones won't push.
 - **Push fails with macOS Keychain error `-25308` over SSH or plain cron** — `gh auth` stores the GitHub token in macOS Keychain, which is bound to a GUI session by default. Plain SSH sessions / system-level crontabs can't unlock it. Three fixes (pick one):

@@ -29,10 +29,16 @@ else
   fail "Node.js not found (brew install node)"
 fi
 
-if command -v claude &>/dev/null; then
-  pass "Claude Code CLI"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CORE_RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || echo claude)"
+if command -v "$CORE_RUNTIME" &>/dev/null; then
+  if [ "$CORE_RUNTIME" = "codex" ] && ! codex login status >/dev/null 2>&1; then
+    fail "Codex CLI is not authenticated (run: codex login)"
+  else
+    pass "$CORE_RUNTIME core CLI"
+  fi
 else
-  fail "Claude Code CLI not found (npm install -g @anthropic-ai/claude-code)"
+  fail "$CORE_RUNTIME core CLI not found"
 fi
 
 if command -v fswatch &>/dev/null; then
@@ -55,7 +61,7 @@ if [ -f .env ]; then
   if grep -q "^GEMINI_API_KEY=" .env && ! grep -q "^GEMINI_API_KEY=$" .env; then
     pass "GEMINI_API_KEY set"
   else
-    fail "GEMINI_API_KEY not set in .env"
+    warn "GEMINI_API_KEY not set in .env (optional — voice disabled)"
   fi
   if grep -q "^GMAIL_ADDRESS=" .env && ! grep -q "^#.*GMAIL_ADDRESS" .env; then
     pass "Gmail configured"
@@ -92,7 +98,7 @@ if [ -f .env ]; then
     warn "Slack not configured (optional — run /slack:configure)"
   fi
 else
-  fail ".env file missing (cp .env.example .env and edit)"
+  warn ".env file missing (optional for text-only + core operation)"
 fi
 
 # 3. Dependencies

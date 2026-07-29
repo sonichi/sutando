@@ -25,7 +25,10 @@ export const summonTool: ToolDefinition = {
 	description:
 		'Summon Sutando\'s screen — opens Zoom with screen sharing so the user can see and control remotely. ' +
 		'Use when user says "summon", "share my screen", "start zoom", "let me see your screen". ' +
-		'Instant — do NOT use work for this.' +
+		'Instant — do NOT use work for this. ' +
+		'Call this ONLY on one of those explicit requests. A complaint that something is not visible ' +
+		'("I don\'t see the slides", "you\'re not showing it") is NOT a summon request — fix the display ' +
+		'through the display/navigation tools instead. Never fire on filler or when unsure — fire nothing.' +
 		(getZoomPMI() ? ` Default meeting: ${getZoomPMI()}.` : ''),
 	parameters: z.object({
 		meetingId: z.string().optional().describe('Zoom meeting ID. Omit for personal room.'),
@@ -40,7 +43,7 @@ export const summonTool: ToolDefinition = {
 	// readiness/Join-retry loop + share script 15s + mute/cleanup 10s + dial-in
 	// host wait 20s). 120s gives meaningful margin without being absurd.
 	timeout: 120_000,
-	async execute(args, ctx) {
+	async execute(args, _ctx) {
 		const { meetingId, passcode, shareScreen = getShareScreen(), dialIn = false } = args as { meetingId?: string; passcode?: string; shareScreen?: boolean; dialIn?: boolean };
 		const pwd = passcode ?? getZoomPasscode();
 		const cleanId = (meetingId ?? getZoomPMI()).replace(/\D/g, '');

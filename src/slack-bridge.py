@@ -37,12 +37,26 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import uuid
 import re
+import secrets
+import shlex
+import shutil
 import sys
 import threading
 import time
 import urllib.request
+from collections import deque
 from pathlib import Path
+
+# startup.sh redirects stdout to a log file, which makes CPython block-buffer
+# it — diagnostic prints without flush=True sit invisible in the buffer, and
+# SIGTERM kills the process without flushing, losing them entirely. Unlike
+# discord-bridge, this bridge isn't even launched with PYTHONUNBUFFERED=1 —
+# line-buffer structurally so every print lands in the log as it happens.
+# Same fix as telegram-bridge (#1926).
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
@@ -55,12 +69,18 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
+from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
+import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
+from slack_owner import resolve_proactive_owner_id  # noqa: E402
+from slack_proactive_receipts import mark_delivered as mark_proactive_delivered  # noqa: E402
+from slack_proactive_receipts import was_delivered as proactive_was_delivered  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -77,6 +97,18 @@ INBOX_DIR = REPO / "slack-inbox"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
+_THREAD_CONTEXT_MAX_MESSAGES = 20
+_THREAD_CONTEXT_MESSAGE_MAX_CHARS = 500
+_THREAD_CONTEXT_PAGE_SIZE = 100
+_THREAD_CONTEXT_MAX_PAGES = 10
+# Durable on-disk backup of the Slack access allowlist. The in-memory
+# _access_cache restores access.json after an intermittent wipe (#899) ONLY
+# while the process lives; a wipe + process restart (observed 2026-07-17 —
+# the bridge booted into TOFU and would have enrolled the next DM'er as owner)
+# loses the cache. This backup lives under state/auth/ (per CLAUDE.md, the
+# cleanup-exempt per-host install-state dir) so a restart can restore the
+# allowlist from disk instead of falling through to a security-exposing TOFU.
+ACCESS_BACKUP_FILE = STATE_DIR / "auth" / "slack-access-backup.json"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,14 +120,23 @@ APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
 # the child env from process.env + workspace .env only — it relies on each bridge
 # self-loading its channel .env (discord/telegram already do). Without this, the
 # supervisor-spawned bridge crash-loops on "not set". Mirrors discord-bridge.py.
-if not BOT_TOKEN or not APP_TOKEN:
-    channels_env = claude_home_path("channels", "slack", ".env")
-    if channels_env.exists():
-        for line in channels_env.read_text().splitlines():
-            if line.startswith("SLACK_BOT_TOKEN=") and not BOT_TOKEN:
-                BOT_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
-            elif line.startswith("SLACK_APP_TOKEN=") and not APP_TOKEN:
-                APP_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
+# Tighten perms whenever the token file exists — even when the tokens are already
+# in process env — so a world-readable .env never survives startup.
+channels_env = claude_home_path("channels", "slack", ".env")
+if channels_env.exists():
+    try:
+        os.chmod(channels_env, 0o600)  # token file — enforce owner-only, mirrors access.json treatment
+    except OSError as e:
+        # Best-effort hardening: a read-only volume, wrong ownership after a
+        # restore/sync, or an ACL-restricted file must NOT crash the bridge at
+        # startup — the file may still be perfectly readable. Warn and continue.
+        print(f"  [startup] warning: could not chmod 0600 {channels_env}: {e}", flush=True)
+if (not BOT_TOKEN or not APP_TOKEN) and channels_env.exists():
+    for line in channels_env.read_text().splitlines():
+        if line.startswith("SLACK_BOT_TOKEN=") and not BOT_TOKEN:
+            BOT_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
+        elif line.startswith("SLACK_APP_TOKEN=") and not APP_TOKEN:
+            APP_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
 if not BOT_TOKEN or not APP_TOKEN:
     print("SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN not set", file=sys.stderr)
     sys.exit(1)
@@ -140,7 +181,7 @@ def _is_path_sendable(fpath: str) -> bool:
     return False
 
 
-def write_owner_activity(channel: str, summary: str) -> None:
+def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     """Record owner activity — same schema as src/discord-bridge.py."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -149,9 +190,16 @@ def write_owner_activity(channel: str, summary: str) -> None:
             "channel": channel,
             "summary": summary[:80],
         }
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        if channel_id:
+            payload["channel_id"] = str(channel_id)
+        # Per-PID staging name: this file is written by four processes (this
+        # bridge + discord/telegram/sparrow). A shared ".json.tmp" name lets two
+        # concurrent writers truncate and interleave the same temp file, so the
+        # rename can publish torn JSON. A per-PID temp is never shared, and
+        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
 
@@ -195,6 +243,14 @@ def presenter_mode_active() -> bool:
 
 ACCESS_FILE = channel_access_path("slack")
 
+# TOFU enrollment code — set at startup when access.json doesn't exist.
+# The first DM must include this code to become owner. RETAINED for the whole
+# process lifetime (never cleared) so the gate stays armed if access.json is
+# deleted externally later (#899). None only when access.json already existed
+# at startup (bridge already enrolled). See telegram-bridge.py for the same
+# mechanism.
+_TOFU_ENROLLMENT_CODE: str | None = None
+
 # In-memory mirror of access.json. Updated on every successful read.
 # Used by tofu_onboard() to detect and recover from external deletions
 # (#899: Sutando.app Settings or another process can delete the file
@@ -214,6 +270,65 @@ def _update_access_cache(data: dict) -> None:
     with _access_cache_lock:
         _access_cache = data
         _access_cache_mtime = mtime
+    _backup_access_to_disk(data)
+
+
+def _is_valid_access_doc(data) -> bool:
+    """A structurally valid access-control document worth backing up / restoring.
+
+    The core schema is an ``allowFrom`` list. Three states qualify and MUST be
+    protected, none of which ``tofuOwner`` alone covers (CR #2163, qingyun-wu):
+      - a TOFU-enrolled allowlist (has ``tofuOwner``);
+      - a legacy populated allowlist enrolled before ``tofuOwner`` existed;
+      - the intentional locked-down state ``allowFrom: []``.
+    Only a transient/partial wipe — a non-dict, a parse failure, or a
+    missing/non-list ``allowFrom`` — is rejected, so it can't overwrite a good
+    backup. (A slack wipe deletes access.json rather than rewriting it to empty,
+    so an empty allowlist reaches this path only when it was written on purpose.)
+    """
+    return isinstance(data, dict) and isinstance(data.get("allowFrom"), list)
+
+
+def _backup_access_to_disk(data: dict) -> None:
+    """Persist a copy of a VALID access-control document to the durable backup.
+    Backs up any structurally valid state (see ``_is_valid_access_doc``) —
+    including a legacy populated allowlist or an intentional empty lockdown —
+    but never a transient/partial wipe, so a wipe can't overwrite the good
+    backup."""
+    if not _is_valid_access_doc(data):
+        return
+    try:
+        ACCESS_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCESS_BACKUP_FILE.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(ACCESS_BACKUP_FILE, 0o600)
+    except OSError:
+        pass  # best-effort; backup must never break the write path
+
+
+def _restore_access_from_disk() -> bool:
+    """Restore access.json from the durable on-disk backup. Survives process
+    death (unlike the in-memory cache), closing the wipe+restart -> TOFU
+    exposure. Returns True if restored."""
+    try:
+        backup = json.loads(ACCESS_BACKUP_FILE.read_text())
+    except Exception:
+        return False
+    if not _is_valid_access_doc(backup):
+        return False
+    try:
+        ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCESS_FILE.write_text(json.dumps(backup, indent=2) + "\n")
+        os.chmod(ACCESS_FILE, 0o600)
+        _update_access_cache(backup)
+        print(
+            "  [access] restored access.json from durable on-disk backup "
+            "(wipe survived a restart — #899 defense-in-depth)",
+            flush=True,
+        )
+        return True
+    except Exception as e:
+        print(f"  [access] disk-backup restore failed: {e}", flush=True)
+        return False
 
 
 def _restore_access_from_cache() -> bool:
@@ -255,23 +370,86 @@ def load_allowed():
 def load_tier_map() -> dict:
     """Return the per-user-id → tier map from access.json `tierMap`, or
     empty dict if missing. Recognized tiers: "owner", "team", "other".
-    Unmapped users default to "owner" — preserves the pre-tierMap behavior
-    where every entry in `allowFrom` was treated as owner-tier."""
+    Unmapped users are resolved by the caller as "other" (fail-safe): owner
+    comes STRICTLY from membership in a successfully-persisted map.
+    `_ensure_tier_map_seeded()` grandfathers existing members into a non-empty
+    map, so a legacy no-tierMap config still resolves its members to owner via
+    that seeded map — while an empty/unconfirmed map (seed could not persist)
+    fails closed to "other" rather than escalating to owner (#2161)."""
     with _access_cache_lock:
         cached = _access_cache
         cached_mtime = _access_cache_mtime
     if cached is not None:
         try:
             if ACCESS_FILE.stat().st_mtime == cached_mtime:
-                return cached.get("tierMap") or {}
+                tier_map = cached.get("tierMap")
+                return tier_map if isinstance(tier_map, dict) else {}
         except OSError:
             pass  # file deleted — fall through to re-read (will return {})
     try:
         data = json.loads(ACCESS_FILE.read_text())
         _update_access_cache(data)
-        return data.get("tierMap") or {}
+        tier_map = data.get("tierMap")
+        return tier_map if isinstance(tier_map, dict) else {}
     except Exception:
         return {}
+
+
+def _ensure_tier_map_seeded() -> bool:
+    """One-time migration: if access.json has a populated allowFrom but no
+    tierMap, seed tierMap from allowFrom (all existing members -> owner) and
+    persist. Idempotent: does nothing once a tierMap exists. This flips the
+    default for FUTURE allowlist additions to read-only (they'll be missing
+    from tierMap -> resolved as "other") without demoting anyone already
+    trusted. Owner request 2026-07-17: allowlist default should be read-only.
+
+    Returns True when a tierMap is reliably in place afterward (already
+    present, just persisted, or nothing to seed); False when a seed was
+    needed but could NOT be persisted/read. On False the caller MUST fail
+    closed — never grant owner off an empty/unconfirmed map (#2161 CR:
+    a transient read/write error must not silently escalate every
+    allowlisted user to owner).
+    """
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception as e:
+        print(f"  [tier-map] WARNING: access.json unreadable ({e}); allowlisted users resolve read-only (other) until the tierMap can be read", flush=True)
+        return False
+    allow = data.get("allowFrom") or []
+    # Test key PRESENCE, not truthiness. An explicitly-empty tierMap ({}) is a
+    # deliberate "nobody is owner via tierMap" state — treating it as falsy
+    # here would re-seed every allowFrom member as owner, escalating read-only
+    # users (#2161 CR: {"allowFrom":["U"],"tierMap":{}} must NOT become
+    # {"U":"owner"}). Only a genuinely ABSENT key (never-seeded legacy file)
+    # triggers first-run grandfathering below. A present-but-empty map returns
+    # here, so the allowlisted user is missing from the map and resolves other.
+    if "tierMap" in data:
+        return True
+    if not allow:
+        return True  # nothing to grandfather — an empty map is legitimate here
+    data["tierMap"] = {uid: "owner" for uid in allow}
+    # Atomic write: a bare ACCESS_FILE.write_text() truncates the live
+    # access-control file BEFORE writing, so a disk-full / interrupt / partial
+    # write can destroy allowFrom — and with fail-closed tier resolution that
+    # locks legitimate owners out against a corrupt file, at bridge startup.
+    # Write a sibling temp, chmod it, then os.replace() atomically. The pid+uuid
+    # suffix avoids colliding with a concurrent .tmp; on any failure the original
+    # access.json bytes are left intact and the orphan temp is removed.
+    tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ACCESS_FILE)
+        _update_access_cache(data)
+        print(f"  [tier-map] grandfathered {len(allow)} existing allowFrom member(s) as owner; new additions now default to read-only", flush=True)
+        return True
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        print(f"  [tier-map] WARNING: failed to persist grandfather tierMap ({e}); allowlisted users resolve read-only (other) until seeded", flush=True)
+        return False
 
 
 def tofu_onboard(user_id: str, username: str | None) -> set:
@@ -285,10 +463,16 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
     # File is missing. Was it externally deleted after a prior onboarding?
     if _restore_access_from_cache():
         return load_allowed() or set()
+    # In-memory cache is empty too (e.g. this is a fresh process after a
+    # wipe + restart). Try the durable on-disk backup before enrolling —
+    # otherwise a wiped allowlist would TOFU-enroll the next DM'er as owner.
+    if _restore_access_from_disk():
+        return load_allowed() or set()
     # Genuine first-time TOFU.
     ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "allowFrom": [user_id],
+        "tierMap": {user_id: "owner"},  # TOFU enrollee is the owner; explicit
         "tofuOwner": user_id,
         "tofuOnboardedAt": int(time.time()),
         "tofuOnboardedUsername": username or None,
@@ -304,11 +488,91 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
 
 
 # Track which Slack channel/thread to reply into for each task we wrote.
-# Keyed by task_id; value is {channel, thread_ts, submitted_at, timed_out}
-# so we can reply in-thread for @mentions and at top-level for DMs, and so
-# the result_watcher can detect tasks the core never answered.
-pending_replies: dict[str, dict] = {}
+# This map must survive bridge restarts: task/result files are durable, and a
+# restarted bridge still needs the original channel + thread timestamp to route
+# a late result. Discord already persists the equivalent map for this reason.
+PENDING_REPLIES_FILE = STATE_DIR / "slack-pending-replies.json"
+
+
+def _atomic_write_pending_replies(data: dict) -> None:
+    """Persist reply routing without exposing a truncated JSON file on crash."""
+    try:
+        PENDING_REPLIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PENDING_REPLIES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(PENDING_REPLIES_FILE)
+    except Exception as e:
+        print(f"  [recovery] could not persist Slack pending replies: {e}", flush=True)
+
+
+def load_pending_replies_from_disk() -> dict:
+    """Restore reply routing on startup, aging out entries older than 7 days."""
+    try:
+        if not PENDING_REPLIES_FILE.exists():
+            return {}
+        data = json.loads(PENDING_REPLIES_FILE.read_text())
+        if not isinstance(data, dict):
+            return {}
+        now_ms = int(time.time() * 1000)
+        max_age_ms = 7 * 86400 * 1000
+        aged_out = []
+        for task_id, info in list(data.items()):
+            if not isinstance(info, dict) or not info.get("channel"):
+                del data[task_id]
+                continue
+            try:
+                ts_ms = int(task_id.split("-")[1])
+                if now_ms - ts_ms > max_age_ms:
+                    aged_out.append(task_id)
+                    del data[task_id]
+            except (ValueError, IndexError):
+                pass
+        if aged_out:
+            print(f"  [recovery] aged out {len(aged_out)} Slack pending replies > 7d", flush=True)
+        _atomic_write_pending_replies(data)
+        return data
+    except Exception as e:
+        print(f"  [recovery] could not load Slack pending replies: {e}", flush=True)
+        return {}
+
+
+# Keyed by task_id; value is {channel, thread_ts, submitted_at, timed_out,
+# access_tier}. Loading happens before the watcher starts, so any result that
+# landed while the bridge was down is delivered on its first poll.
+pending_replies: dict[str, dict] = load_pending_replies_from_disk()
 pending_replies_lock = threading.Lock()
+
+
+def _set_pending_reply(task_id: str, info: dict) -> None:
+    with pending_replies_lock:
+        pending_replies[task_id] = info
+        _atomic_write_pending_replies(dict(pending_replies))
+
+
+def _pop_pending_reply(task_id: str):
+    with pending_replies_lock:
+        target = pending_replies.pop(task_id, None)
+        _atomic_write_pending_replies(dict(pending_replies))
+    return target
+
+
+def _mark_pending_timed_out(task_id: str) -> None:
+    with pending_replies_lock:
+        entry = pending_replies.get(task_id)
+        if entry is None:
+            return
+        entry["timed_out"] = True
+        _atomic_write_pending_replies(dict(pending_replies))
+
+
+def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) -> None:
+    """Persist the Slack route before exposing its task file to the core."""
+    _set_pending_reply(task_id, info)
+    try:
+        task_file.write_text(content)
+    except Exception:
+        _pop_pending_reply(task_id)
+        raise
 
 # Per-task timeout. Mirrors task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (10 min):
 # if the core session wedges (e.g. hits the 1M-context usage-credit gate and
@@ -357,12 +621,48 @@ def _download_slack_file(file_dict: dict) -> str | None:
         req = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {BOT_TOKEN}"}
         )
-        with urllib.request.urlopen(req, timeout=30) as resp, open(local_path, "wb") as f:
-            f.write(resp.read())
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            # Read only the small prefix needed for the HTML/login-page guard,
+            # then stream the remainder. This preserves the bounded-memory fix
+            # while retaining main's files:read failure detection.
+            head = resp.read(64)
+            # When the bot token lacks the files:read scope (or the file is
+            # otherwise unauthorized), Slack does NOT error — it 200s with an
+            # HTML sign-in page. Persisting that page as e.g. a ".m4a" silently
+            # corrupts the attachment: downstream transcription/parsing then
+            # chokes on a login page. Detect it and fail cleanly instead so the
+            # caller surfaces "no attachment" rather than feeding garbage on.
+            ctype = (getattr(resp, "headers", {}).get("Content-Type") or "").lower()
+            looks_html = ctype.startswith("text/html") or head.lstrip()[:14].lower() == b"<!doctype html"
+            if looks_html:
+                print(
+                    f"  [file] download for {name_hint} returned an HTML page, "
+                    f"not the file — the Slack bot token is almost certainly "
+                    f"missing the 'files:read' scope (add it at api.slack.com/apps "
+                    f"→ OAuth & Permissions → Bot Token Scopes, then Reinstall).",
+                    flush=True,
+                )
+                return None
+            with open(local_path, "wb") as f:
+                f.write(head)
+                shutil.copyfileobj(resp, f)
         return str(local_path)
     except Exception as e:
         print(f"  [file] download failed for {name_hint}: {e}", flush=True)
         return None
+
+
+def _ref_from_slack_file(file_dict: dict, local_path: str) -> "local_task_protocol.AttachmentRef":
+    """Build an AttachmentRef from a Slack file object + its saved local path
+    (interaction-model 4D, step 1.5). Reads Slack's `mimetype`/`name`/`size`
+    defensively; falls back to the saved basename when `name` is absent. Pure —
+    kept separate from the async handler so the field-reading is testable."""
+    return local_task_protocol.AttachmentRef(
+        locator=local_path,
+        mime=(file_dict.get("mimetype", "") or ""),
+        filename=(file_dict.get("name", "") or os.path.basename(local_path)),
+        size=(file_dict.get("size", 0) or 0),
+    )
 
 
 def _transcribe_via_skill(local_path: str) -> str | None:
@@ -373,7 +673,7 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     transcription failure must never block task delivery.
     """
     import subprocess
-    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
     if not skill_script.exists():
         return None
     try:
@@ -386,6 +686,174 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     except Exception as e:
         print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
     return None
+
+
+# When a sender ADDRESSES the bot (a DM, or an @mention — every _write_task call
+# is one of those, per handle_mention/handle_message) but isn't on the allowlist,
+# the access gate below drops the message. Historically that drop was silent, so
+# the sender never knew their message wasn't received (owner ask 2026-07-15).
+# Ack once, rate-limited per sender, before dropping. Mirrors discord-bridge.py.
+_NOT_ALLOWLISTED_ACK_COOLDOWN_S = 3600
+_not_allowlisted_ack_at: dict[str, float] = {}
+_NOT_ALLOWLISTED_ACK_TEXT = (
+    "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
+    "can't act on it. Ask the owner to add you. _(automated notice)_"
+)
+
+
+def _ack_not_allowlisted(event: dict, user_id: str) -> None:
+    """One-line 'not on the allowlist' reply so an addressed-but-dropped Slack
+    message isn't silent. Rate-limited per sender (in-memory; resets on restart)."""
+    now = time.time()
+    if now - _not_allowlisted_ack_at.get(user_id, 0.0) < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
+        return  # already acked this sender recently — don't spam / echo
+    _not_allowlisted_ack_at[user_id] = now
+    channel = event.get("channel", "")
+    # in-thread for a channel @mention, top-level for a DM (mirrors _write_task)
+    thread_ts = None if event.get("channel_type") == "im" else (event.get("thread_ts") or event.get("ts"))
+    try:
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=_NOT_ALLOWLISTED_ACK_TEXT)
+        print(f"  [not-allowlisted-ack] sent to {user_id}", flush=True)
+    except Exception as e:
+        print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
+
+
+def _slack_actor_label(message: dict) -> str:
+    """Return a compact, identity-resolved label for one Slack message."""
+    user_id = str(message.get("user") or "")
+    fallback = str(message.get("username") or message.get("bot_id") or user_id or "?")
+    display_name = _resolve_username(user_id) if user_id else None
+    clean_name = " ".join((display_name or fallback).split()) or "?"
+    return f"@{clean_name}" + (f" ({user_id})" if user_id else "")
+
+
+def _resolve_slack_mentions(text: str) -> str:
+    """Add display names beside Slack user mentions without dropping their IDs."""
+
+    def _replace(match: re.Match) -> str:
+        user_id = match.group(1)
+        display_name = _resolve_username(user_id)
+        if not display_name:
+            return match.group(0)
+        clean_name = " ".join(display_name.split())
+        return f"@{clean_name} (<@{user_id}>)"
+
+    return re.sub(r"<@([A-Z0-9]+)>", _replace, text)
+
+
+def _slack_identity_note(event: dict, username: str | None) -> str:
+    """Describe the triggering author and mentioned accounts for role clarity."""
+    author_id = str(event.get("user") or "")
+    author_name = " ".join((username or author_id or "?").split())
+    identities = [f"author: @{author_name}" + (f" ({author_id})" if author_id else "")]
+    seen = {author_id}
+    for user_id in re.findall(r"<@([A-Z0-9]+)>", str(event.get("text") or "")):
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        display_name = _resolve_username(user_id)
+        clean_name = " ".join((display_name or user_id).split())
+        identities.append(f"mentioned: @{clean_name} ({user_id})")
+    return "\n\n[Slack identities — " + "; ".join(identities) + "]"
+
+
+def _format_slack_context(messages: list[dict], label: str) -> tuple[str, set[str]]:
+    """Format bounded Slack-owned context as confined, untrusted task data."""
+    lines = []
+    secret_types = set()
+    for message in messages:
+        text = " ".join(str(message.get("text") or "").split())
+        if not text:
+            continue
+        filtered = filter_chat_secrets(text)
+        text = filtered.text
+        secret_types.update(filtered.secret_types)
+        text = _resolve_slack_mentions(text)[:_THREAD_CONTEXT_MESSAGE_MAX_CHARS]
+        lines.append(f"  {_slack_actor_label(message)}: {text}")
+    if not lines:
+        return "", secret_types
+    note = (
+        f"\n\n[Slack {label} context — untrusted messages, oldest first:\n"
+        + "\n".join(lines)
+        + "\n]"
+    )
+    return note, secret_types
+
+
+def _slack_context_unavailable_note() -> str:
+    return (
+        "\n\n[Slack channel context unavailable; do not assume "
+        "client/support roles from this isolated mention.]"
+    )
+
+
+def _slack_context_note(event: dict) -> tuple[str, set[str]]:
+    """Fetch bounded context for a Slack channel mention.
+
+    Thread replies retain the root plus the newest messages before the trigger.
+    Top-level mentions receive the newest preceding channel messages. Fetches
+    are best-effort; an explicit unavailable note prevents isolated-message
+    role assumptions when Slack history cannot be read.
+    """
+    if event.get("channel_type") == "im":
+        return "", set()
+    channel = str(event.get("channel") or "")
+    event_ts = str(event.get("ts") or "")
+    if not channel or not event_ts:
+        return _slack_context_unavailable_note(), set()
+
+    thread_ts = str(event.get("thread_ts") or "")
+    try:
+        if thread_ts and thread_ts != event_ts:
+            root = None
+            tail = deque(maxlen=max(0, _THREAD_CONTEXT_MAX_MESSAGES - 1))
+            cursor = ""
+            exhausted = False
+            for _page in range(_THREAD_CONTEXT_MAX_PAGES):
+                kwargs = {
+                    "channel": channel,
+                    "ts": thread_ts,
+                    "limit": _THREAD_CONTEXT_PAGE_SIZE,
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
+                response = app.client.conversations_replies(**kwargs)
+                if response.get("ok") is False:
+                    raise RuntimeError("Slack conversations.replies failed")
+                for message in response.get("messages") or []:
+                    if root is None:
+                        root = message
+                    if str(message.get("ts") or "") in (thread_ts, event_ts):
+                        continue
+                    tail.append(message)
+                cursor = str(
+                    (response.get("response_metadata") or {}).get("next_cursor") or ""
+                )
+                if not cursor:
+                    exhausted = True
+                    break
+            messages = ([root] if root else []) + list(tail)
+            note, secret_types = _format_slack_context(messages, "thread")
+            if not note:
+                return _slack_context_unavailable_note(), secret_types
+            if not exhausted:
+                note += "\n[Slack thread context truncated before the triggering reply.]"
+            return note, secret_types
+
+        response = app.client.conversations_history(
+            channel=channel,
+            latest=event_ts,
+            inclusive=False,
+            limit=_THREAD_CONTEXT_MAX_MESSAGES,
+        )
+        if response.get("ok") is False:
+            raise RuntimeError("Slack conversations.history failed")
+        # conversations.history is newest-first; task context reads oldest-first.
+        messages = list(reversed(response.get("messages") or []))
+        note, secret_types = _format_slack_context(messages, "channel")
+        return (note or _slack_context_unavailable_note()), secret_types
+    except Exception:
+        return _slack_context_unavailable_note(), set()
 
 
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
@@ -410,20 +878,54 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         pass
 
     # Access control via TOFU
+    global _TOFU_ENROLLMENT_CODE
     allowed = load_allowed()
     if allowed is None:
+        # TOFU state — require enrollment code before auto-onboarding as owner,
+        # so an attacker who can DM the bot can't claim ownership first.
+        # Enrollment is DM-only: channel @mentions also route here but carry no
+        # channel_type=="im", so drop them — a leaked code must not be claimable
+        # from a shared channel.
+        if event.get("channel_type") != "im":
+            print(f"  TOFU: ignored non-DM event from {user_id} — enrollment is DM-only", flush=True)
+            return None
+        channel = event.get("channel") or user_id
+        if _TOFU_ENROLLMENT_CODE and _TOFU_ENROLLMENT_CODE not in (text or ""):
+            try:
+                app.client.chat_postMessage(
+                    channel=channel,
+                    text=(
+                        "Enrollment code required.\n"
+                        "Check the bridge startup log for your code and send it here."
+                    ),
+                )
+            except Exception:
+                pass
+            print(f"  TOFU: rejected enrollment from {user_id} — code not presented", flush=True)
+            return None
         allowed = tofu_onboard(user_id, username)
+        # Keep _TOFU_ENROLLMENT_CODE valid for the process lifetime (do NOT clear
+        # it) so the gate stays armed if access.json is deleted externally later
+        # (#899), instead of falling through to an unguarded tofu_onboard().
+    # Every _write_task call is a DM (handle_message) or an @mention
+    # (handle_mention), so a non-allowlisted sender here DID address the bot —
+    # ack them (rate-limited) before the fail-closed drop so it isn't silent.
     if user_id not in allowed:
         print(f"  Dropped message from non-allowed user {user_id}", flush=True)
+        _ack_not_allowlisted(event, user_id)
         return None
 
     # Download any attached files BEFORE writing the task, so the task body
     # carries the local paths. Skips silently on failure — task still goes
     # through with whatever files did download.
     attachment_lines = []
+    # Structured refs (interaction-model 4D, step 1.5) — accumulated alongside
+    # the legacy [File attached:] body line (dual-write, additive).
+    attachment_refs: list = []  # pragma: no cover
     for file_dict in event.get("files") or []:
         local_path = _download_slack_file(file_dict)
         if local_path:
+            attachment_refs.append(_ref_from_slack_file(file_dict, local_path))  # pragma: no cover
             transcript = _transcribe_via_skill(local_path)
             if transcript:
                 attachment_lines.append(f"[Voice transcript: {transcript}]")
@@ -434,7 +936,17 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not text and not attachment_note:
         return None
 
-    write_owner_activity("slack", text or attachment_note)
+    # Owner-activity state is persisted before tier/vault handling below. Use a
+    # redacted preview so an ordinary pasted token never lands in state JSON.
+    initial_secret_filter = filter_chat_secrets(text)
+    detected_secret_types = set(initial_secret_filter.secret_types)
+    safe_attachment = filter_chat_secrets(attachment_note)
+    detected_secret_types.update(safe_attachment.secret_types)
+    write_owner_activity(
+        "slack",
+        initial_secret_filter.text or safe_attachment.text,
+        channel_id=event.get("channel"),
+    )
 
     channel = event.get("channel", "")
     # Reply in-thread for channel @mentions, top-level for DMs. parens for
@@ -445,25 +957,34 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     else:
         thread_ts = None
 
-    # Resolve access_tier from `tierMap`.
-    # Two cases for unmapped users:
-    #   1. tierMap absent (pre-tierMap config) → "owner" (backward compat)
-    #   2. tierMap present but uid missing → "other" (fail-safe, prevents
-    #      silent privilege escalation when operator forgets a tierMap line)
-    # See #893 for the rationale behind the split default.
+    # Resolve access_tier from `tierMap`. Owner comes STRICTLY from membership
+    # in a successfully-persisted map:
+    #   1. uid present in tierMap        → its recorded tier (owner/team/other)
+    #   2. tierMap present, uid missing  → "other" (a new allowlist addition;
+    #      prevents silent privilege escalation when the operator forgets a
+    #      tierMap line)
+    #   3. tierMap empty/unconfirmed     → "other" (fail CLOSED). A legit
+    #      pre-tierMap config is grandfathered into a NON-empty map by
+    #      _ensure_tier_map_seeded above, so an empty map here means the seed
+    #      could not persist/read — never grant owner off that (#2161 CR:
+    #      a transient error must not escalate every allowlisted user to owner).
+    # See #893 for the split-default rationale; #2161 for the fail-closed fix.
+    seeded_ok = _ensure_tier_map_seeded()
     tier_map = load_tier_map()
     if user_id in tier_map:
         access_tier = tier_map[user_id]
-    elif tier_map:
-        # tierMap exists but uid is missing — degrade to "other"
-        print(
-            f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
-            flush=True,
-        )
-        access_tier = "other"
     else:
-        # tierMap absent entirely — pre-tierMap config, all users are owner
-        access_tier = "owner"
+        access_tier = "other"
+        if tier_map:
+            print(
+                f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
+                flush=True,
+            )
+        elif not seeded_ok:  # pragma: no cover — rare seed-failure warning; the empty-map→other fail-closed resolution is unit-tested in tests/bridges-allowlist-default-readonly.test.py
+            print(
+                f"  [tier-map] WARNING: grandfather seed unavailable; {user_id} resolved read-only (other), not owner",
+                flush=True,
+            )
     if access_tier not in ("owner", "team", "other"):
         # Unknown tier value in config → degrade safely to "other" rather
         # than treating as owner.
@@ -484,19 +1005,38 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         else:
             text = redact_vault_commands(text)
 
+    # Generic chat-secret detection is deliberately AFTER explicit vault
+    # interception: named `vault set` values still reach Keychain, while any
+    # other pasted token is redacted before task/prompt persistence.
+    filtered_text = filter_chat_secrets(text)
+    text = filtered_text.text
+    detected_secret_types.update(filtered_text.secret_types)
+    attachment_note = safe_attachment.text
     # Prepend an in-band system instruction for non-owner tiers so the
     # core agent cannot accidentally process a downgraded task with full
     # capabilities. Mirrors the Discord bridge's tier-specific instruction
     # block (see discord-bridge.py around `===SUTANDO SYSTEM INSTRUCTIONS===`).
     # Kept short here because Slack's downgrade surface today is just
-    # "delegate to sandboxed read-only agent" — no Slack-state-prefetch
-    # path equivalent to Discord's `_prefetch_discord_state_refs`.
+    # "delegate to sandboxed read-only agent". Thread context is prefetched
+    # below because that sandbox intentionally has no Slack token or network.
     # Confine the user-derived portion BEFORE the bridge appends its own
     # `===SUTANDO SYSTEM INSTRUCTIONS===` block below — so a forged field/fence
     # in the message can't escalate tier or inject instructions, while the
     # bridge's legitimate fence (added next) stays intact. See task_body_guard.
+
+    # Channel mentions carry bounded Slack-owned context plus an explicit
+    # identity map. The entire substrate remains confined as untrusted task
+    # data before any trusted tier instruction is appended.
+    _identity_note = (
+        "" if event.get("channel_type") == "im"
+        else _slack_identity_note(event, username)
+    )
+    _context_note, _context_secret_types = _slack_context_note(event)
+    detected_secret_types.update(_context_secret_types)
+    secret_notice = secret_handling_instruction("Slack", detected_secret_types)
     user_task_text = confine_user_content(
         f"[{prefix} @{username or user_id}] {text}{attachment_note}"
+        f"{_identity_note}{_context_note}"
     )
     if access_tier != "owner":
         user_task_text = (
@@ -518,18 +1058,20 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # Inject skill instructions so the agent follows the notify-before-work and
     # transcription protocol even after conversation compaction wipes context.
     # Only injected for owner tasks when the referenced skills are installed.
-    # CCD-resolved (PR #1525 pattern): never hardcode ~/.claude — nodes may relocate
-    # the config dir via $CLAUDE_CONFIG_DIR.
-    _claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-    _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
-    _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
+    # Use claude_home_path() — honours $CLAUDE_CONFIG_DIR → $CLAUDE_HOME → ~/.claude
+    # resolution order (inline os.environ.get misses the $CLAUDE_HOME fallback).
+    # Behaviorally covered by tests/bridge-skill-path-resolution.test.py (CLAUDE_CONFIG_DIR resolution).
+    _notify_py = claude_home_path("skills", "task-progress", "scripts", "notify.py")
+    _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")
+    _claude_config_dir = claude_home_path()
     skill_hints = ""
     if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
         if _notify_py.exists():
             notify_cmd = (
-                f"python3 {_notify_py}"
+                f"env CLAUDE_CONFIG_DIR={shlex.quote(str(_claude_config_dir))} "
+                f"python3 {shlex.quote(str(_notify_py))}"
                 f" --source slack --channel-id {channel}"
                 f' --message "On it — back in a moment."'
             )
@@ -540,7 +1082,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
                 attached_path = ap.replace("[File attached: ", "").rstrip("]")
                 if _notify_py.exists():
                     hints_lines.append(
-                        f'   Update notify message to: --message "Got your voice message, give me a moment."'
+                        '   Update notify message to: --message "Got your voice message, give me a moment."'
                     )
                 hints_lines.append(
                     f"{step}. TRANSCRIBE: python3 {_transcribe_py} '{attached_path}'"
@@ -549,25 +1091,37 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         hints_lines.append(f"{step}. Then process and write result to results/{task_id}.txt")
         skill_hints = "\n" + "\n".join(hints_lines) + "\n"
 
-    task_file.write_text(
+    # interaction-model 4D, step 1.5: structured media headers alongside the
+    # legacy [File attached:] body line (dual-write). Real headers after `task:`,
+    # so confine_user_content defangs a forged body copy while these authentic
+    # ones pass through. Uses the shared local_task_protocol helper (slack is the
+    # third bridge; discord/telegram fold onto it in a follow-up dedup).
+    media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
+        attachment_refs, bool(text and text.strip()))
+    pending_info = {
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "access_tier": access_tier,  # threaded to the outbound obs event
+        "submitted_at": time.time(),
+        "timed_out": False,
+    }
+    task_content = (
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-        f"task: {user_task_text}\n"
         f"source: slack\n"
+        f"interaction_type: message\n"
+        f"{media_headers}"
         f"channel_id: {channel}\n"
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
+        f"task: {user_task_text}\n"
         f"{skill_hints}"
+        f"{secret_notice}"
     )
-    with pending_replies_lock:
-        pending_replies[task_id] = {
-            "channel": channel,
-            "thread_ts": thread_ts,
-            "access_tier": access_tier,  # threaded to the outbound obs event
-            "submitted_at": time.time(),
-            "timed_out": False,
-        }
+    # If the bridge dies immediately after creation, the next process can still
+    # route the result. The helper rolls the route back if task writing fails.
+    _write_routed_task(task_file, task_content, task_id, pending_info)
 
     global _event_count
     with _event_count_lock:
@@ -586,6 +1140,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
             "is_thread": bool(thread_ts),
         },
     )
+    # Anonymous, opt-out product telemetry: one bucketed event per accepted
+    # task, tagged only with the inbound surface. No-op when opted out / no key;
+    # never task content or ids. See src/telemetry.py + TELEMETRY.md.
+    try:  # pragma: no cover — fire-and-forget glue; logic tested in tests/telemetry.test.py
+        from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+        task_processed("slack")
+    except Exception:  # pragma: no cover — telemetry must never break the bridge
+        pass
     return task_id
 
 
@@ -692,10 +1255,12 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     # [channel:] redirect — for cross-channel posting (e.g., reply to a DM
     # task by sending into a public channel instead). Drop thread_ts since
     # we're moving to a new channel.
+    redirected = False
     for action in parsed.actions:
         if action.kind == "redirect":
             channel = action.value
             thread_ts = None
+            redirected = True
             break
 
     file_paths = [a.value for a in parsed.actions if a.kind == "attach"]
@@ -705,12 +1270,16 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     delivered_ok = True
     sent_files = 0
 
-    # Post the text body in 4000-char chunks (Slack's per-message limit is
-    # 40k chars but readability suffers above ~4k).
+    # Post the text body in <=4000-char chunks (Slack's per-message limit is
+    # 40k chars but readability suffers above ~4k). Use the shared fence-aware
+    # chunker (Result Router S3) instead of a naive byte-slice: Slack posts
+    # default to mrkdwn, so slicing mid-``` split a code block across two
+    # messages and broke the rendering. chunk_message closes+reopens the fence
+    # at each boundary so every chunk renders as a well-formed block.
     if clean_text:
         all_chunks_sent = True
-        for i in range(0, len(clean_text), 4000):
-            kwargs = {"channel": channel, "text": clean_text[i:i + 4000]}
+        for chunk in chunk_message(clean_text, 4000):
+            kwargs = {"channel": channel, "text": chunk}
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             try:
@@ -782,6 +1351,30 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             },
         )
 
+    # §7 audit ledger (Result Router S5): one line per resolved delivery so
+    # "did the user ever see this?" is answerable without grepping bridge logs.
+    # Guarded + never-raising — auditing must not block or crash delivery.
+    if clean_text or file_paths:
+        try:
+            import result_audit
+            result_audit.record(
+                task_id or "",
+                "failed" if not delivered_ok else ("redirected" if redirected else "delivered"),
+                "slack",
+            )
+        except Exception:  # pragma: no cover  (defensive: result_audit import is safe + record() never raises)
+            pass
+
+
+def _record_skip_audit(task_id: str, skip_value: str) -> None:
+    """Record §7 audit disposition for a skip-marked result (no_send / deduped)."""
+    try:
+        import result_audit as _ra
+        _disp = "deduped" if skip_value == "deduped" else "no_send"
+        _ra.record(task_id or "", _disp, "slack")
+    except Exception:  # pragma: no cover  (defensive: record() never raises in practice)
+        pass
+
 
 def _check_task_timeouts() -> None:
     """Post a one-time reply for tasks the core never answered in time.
@@ -829,10 +1422,7 @@ def _check_task_timeouts() -> None:
         # Notified once, successfully. Mark so we don't repeat. The entry may
         # have been popped by result_watcher if a real result landed meanwhile
         # — guard with get() so we don't resurrect a delivered task.
-        with pending_replies_lock:
-            entry = pending_replies.get(task_id)
-            if entry is not None:
-                entry["timed_out"] = True
+        _mark_pending_timed_out(task_id)
         print(f"  [timeout] notified Slack for {task_id} after {TASK_TIMEOUT_SEC}s", flush=True)
 
 
@@ -853,8 +1443,10 @@ def result_watcher():
                 if not result_file.exists():
                     continue
                 reply_text = result_file.read_text().strip()
+                if not reply_text:
+                    continue
                 with pending_replies_lock:
-                    target = pending_replies.pop(task_id, None)
+                    target = pending_replies.get(task_id)
                 if not target:
                     continue
 
@@ -863,15 +1455,23 @@ def result_watcher():
                 # truth so future skip markers added in result_markers.py
                 # automatically apply here.
                 _skip_parsed = parse_markers(reply_text)
-                if any(a.kind == "skip" for a in _skip_parsed.actions):
+                _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
+                if _skip_action is not None:
                     print(f"  Skipped (marker): {task_id}", flush=True)
+                    # §7 audit ledger: skip-marked results are resolved deliveries
+                    # (no_send / deduped), not silent voids. One line per result.
+                    _record_skip_audit(task_id, _skip_action.value)
                 else:
                     try:
                         _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
                         print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
                     except Exception as e:
                         print(f"[Slack] reply error: {e}", flush=True)
+                        # Keep both the durable route and result file so the
+                        # next poll (or restarted bridge) can retry delivery.
+                        continue  # pragma: no cover - watcher loop retry; helper state is unit-tested
 
+                _pop_pending_reply(task_id)
                 archive_file(result_file, "results", task_id)
                 archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
 
@@ -879,6 +1479,16 @@ def result_watcher():
             if not presenter_mode_active():
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
+                        continue
+                    delivery_id = f.name
+                    # A producer may recreate the same deterministic result
+                    # filename after the watcher successfully sends and removes
+                    # it. Keep a durable receipt so that file-existence checks or
+                    # retries cannot turn one schedule fire into duplicate DMs.
+                    if proactive_was_delivered(STATE_DIR, delivery_id):
+                        print(f"  [proactive] duplicate suppressed: {delivery_id}", flush=True)
+                        _record_skip_audit(delivery_id, "deduped")
+                        f.unlink(missing_ok=True)
                         continue
                     # Peek before claiming: skip Discord-targeted proactive files.
                     # [channel: <17-20 digit snowflake>] is a Discord-only marker;
@@ -900,17 +1510,23 @@ def result_watcher():
                     if not text:
                         claim.unlink(missing_ok=True)
                         continue
-                    owner_ids = load_allowed()
-                    if owner_ids:
-                        owner_id = next(iter(owner_ids))
+                    try:
+                        access_data = json.loads(ACCESS_FILE.read_text())
+                    except Exception:
+                        access_data = {}
+                    owner_id = resolve_proactive_owner_id(access_data)
+                    if owner_id is not None:
                         # Open a DM channel to the owner (idempotent).
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
                             _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
+                            mark_proactive_delivered(STATE_DIR, delivery_id)
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                         except Exception as e:
                             print(f"  [proactive] failed: {e}", flush=True)
+                    else:
+                        print(f"  [proactive] no owner in allowFrom, skipping {claim.name}", flush=True)
                     claim.unlink(missing_ok=True)
 
             # Heartbeat (used by health-check.py)
@@ -1001,13 +1617,35 @@ def _recover_orphan_sending_files() -> int:
         print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
     return recovered
 
-def main():
+def main():  # pragma: no cover
+    global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("slack-bridge")
     print("Slack bridge started. Socket Mode connecting...", flush=True)
     _recover_orphan_sending_files()
     # Prime the in-memory access cache so tofu_onboard() can detect external
     # deletions even on the very first inbound message after a restart (#899).
     load_allowed()
+
+    # Seed the tier-map grandfather snapshot at STARTUP, before the first
+    # inbound message — otherwise a fresh (pre-migration) install where the
+    # owner adds a NEW allowFrom id would grandfather that new id as owner the
+    # first time it messages (the on-demand seed captures whoever is in
+    # allowFrom at that moment). Seeding at boot pins the snapshot to the
+    # allowFrom present at upgrade, so post-upgrade additions default read-only
+    # (owner CR #2161). Idempotent: no-op once a tierMap exists.
+    _ensure_tier_map_seeded()
+
+    # TOFU enrollment code: generated when access.json doesn't exist so
+    # the first DM must present it before being auto-enrolled as owner.
+    if not ACCESS_FILE.exists():
+        _TOFU_ENROLLMENT_CODE = secrets.token_hex(3)  # 6-char hex, 16M combinations
+        print("", flush=True)
+        print("  *** TOFU enrollment required ***", flush=True)
+        print(f"  Enrollment code: {_TOFU_ENROLLMENT_CODE}", flush=True)
+        print("  Send this code in your first DM to register as owner.", flush=True)
+        print("  Anyone who sends this code first becomes owner — keep it private.", flush=True)
+        print("", flush=True)
+
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()
     handler = SocketModeHandler(app, APP_TOKEN)
@@ -1016,4 +1654,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

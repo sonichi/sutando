@@ -152,7 +152,7 @@ describe('client → collector POST', () => {
 	beforeEach(() => {
 		calls = [];
 		process.env.SUTANDO_OBS_ENDPOINT = 'http://localhost:4000';
-		// @ts-expect-error test stub
+		// @ts-expect-error - minimal fetch stub, not the full DOM fetch signature
 		globalThis.fetch = (url: string, init?: { body?: string }) => {
 			calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
 			return Promise.resolve({ ok: true });
