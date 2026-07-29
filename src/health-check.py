@@ -2280,6 +2280,66 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
 
+def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
+    """Detect results that no consumer will ever claim.
+
+    Normal flow: a result is written to `results/task-<id>.txt` while
+    `tasks/task-<id>.txt` is still present; the consuming bridge delivers and
+    archives both. So a result whose task is already gone from `tasks/` was
+    written AFTER that task was archived — and every consumer keys off either a
+    tracked task_id or a `task-*` glob it has already retired. Nothing claims
+    the file, and the reply is silently never delivered.
+
+    Observed 2026-07-29: a reply sat in `results/` for 2h22m while its task sat
+    in `tasks/archive/`, and the conversation read as one-sided to the other
+    party because the answer existed on disk but was never sent. Writing a
+    result is not answering a task, and until now nothing noticed the
+    difference — `check_task_queue` watches the inbound side only, so a queue
+    that drains perfectly can still be losing every late reply.
+
+    Scope is deliberately narrow:
+      * top-level `task-*.txt` only. `<channel-key>.task-<id>.txt` is the pull
+        namespace, claimed by a consumer that did not delegate the work (e.g.
+        the phone conversation-server), so its lifetime is not ours to judge.
+      * `question-*` / `proactive-*` have their own delivery lifecycles.
+      * age-gated, because between our write and the consumer's claim the task
+        is legitimately still present for a few seconds.
+    """
+    name = "orphaned-results"
+    results_dir = WORKSPACE_DIR / "results"
+    tasks_dir = WORKSPACE_DIR / "tasks"
+    if not results_dir.exists():
+        return {"name": name, "status": "ok", "detail": "results/ not yet created"}
+    now = time.time()
+    orphans: list[tuple[str, int]] = []
+    try:
+        for path in results_dir.glob("task-*.txt"):
+            if not path.is_file():
+                continue
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < threshold_age_sec:
+                continue
+            # Task still queued -> the consumer has not reached this pair yet.
+            if (tasks_dir / path.name).is_file():
+                continue
+            orphans.append((path.name, int(age)))
+    except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
+        return {"name": name, "status": "warn", "detail": f"could not scan results/: {e}"}
+    if not orphans:
+        return {"name": name, "status": "ok", "detail": "no undeliverable results"}
+    orphans.sort(key=lambda item: -item[1])
+    oldest_name, oldest_age = orphans[0]
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{len(orphans)} result(s) whose task is already archived — never delivered; "
+                   f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"),
+    }
+
+
 def _proc_argv(pid: int) -> str:
     """argv of `pid`, or "" if no such process.
 
@@ -3309,6 +3369,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_orphaned_results())
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
