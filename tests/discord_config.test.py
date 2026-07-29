@@ -8,6 +8,7 @@ Exercised paths:
 - `auto_seed_if_missing` for the 4 seed-source branches (explicit owner,
   tierMap tag, allowFrom[0] WARN, empty)
 - `auto_seed_if_missing` is idempotent — no overwrite if file exists
+- `sync_thread_seed_mode` persists fleet intent and never downgrades it
 - Both site callers (bridge + dm-result) share the helper — covered by
   the symmetric test fixtures from Lucy's #1147 watch-point #1.
 
@@ -319,6 +320,69 @@ def test_load_returns_empty_on_corrupt_file():
         expect_in("failed to read", joined, "WARN must surface read failure")
 
 
+def test_sync_thread_seed_mode_persists_fleet():
+    with workspace_env() as (ws, records):
+        write_config(ws, {"owner": "owner-id"})
+        cfg = discord_config.sync_thread_seed_mode(
+            {"siblingBots": ["111", 222, "111"]},
+            "111",
+        )
+        expect_eq(
+            cfg.get("threadAutoSeedMode"),
+            "addressed",
+            "observed fleet must persist addressed-only mode",
+        )
+        expect_eq(
+            cfg.get("siblingBots"),
+            ["111", "222"],
+            "sibling snapshot must be normalized and deduplicated",
+        )
+        on_disk = json.loads(
+            (ws / "state" / discord_config.CONFIG_FILENAME).read_text()
+        )
+        expect_eq(on_disk, cfg, "fleet mode must be durable on disk")
+        msgs = [r.getMessage() for r in records]
+        if not any("addressed-only thread seeding" in m for m in msgs):
+            fail(f"expected persistence INFO log; got: {msgs!r}")
+
+
+def test_sync_thread_seed_mode_never_downgrades():
+    with workspace_env() as (ws, _):
+        existing = {
+            "owner": "owner-id",
+            "threadAutoSeedMode": "addressed",
+            "siblingBots": ["111", "222"],
+        }
+        write_config(ws, existing)
+        for access in ({}, {"siblingBots": None}, {"siblingBots": "222"}):
+            expect_eq(
+                discord_config.sync_thread_seed_mode(access, "111"),
+                existing,
+                "missing/malformed access state must not downgrade fleet mode",
+            )
+        expect_eq(
+            json.loads(
+                (ws / "state" / discord_config.CONFIG_FILENAME).read_text()
+            ),
+            existing,
+            "durable fleet config must remain unchanged",
+        )
+
+
+def test_sync_thread_seed_mode_ignores_self_only():
+    with workspace_env() as (ws, _):
+        write_config(ws, {"owner": "owner-id"})
+        cfg = discord_config.sync_thread_seed_mode(
+            {"siblingBots": ["111"]},
+            "111",
+        )
+        expect_eq(
+            cfg,
+            {"owner": "owner-id"},
+            "self-only declaration is not a fleet",
+        )
+
+
 # ----- runner -------------------------------------------------------------
 
 
@@ -340,6 +404,9 @@ def main() -> int:
         test_seed_is_idempotent,
         test_save_load_roundtrip,
         test_load_returns_empty_on_corrupt_file,
+        test_sync_thread_seed_mode_persists_fleet,
+        test_sync_thread_seed_mode_never_downgrades,
+        test_sync_thread_seed_mode_ignores_self_only,
     ]
     for t in tests:
         try:

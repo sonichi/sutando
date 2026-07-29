@@ -16,6 +16,10 @@ This module is the single source of truth they both call into. The drift
 class that bit us with #846's tierMap (one site got the read, the other
 didn't) is fixed by funneling both through `resolve_owner_id` here.
 
+It also persists multi-bot thread-seed intent outside plugin-owned
+`access.json`. Once a sibling fleet is observed, `threadAutoSeedMode` stays
+`"addressed"` even if that mutable file is later reset or rewritten.
+
 Resolution order (config-driven; returns None if exhausted):
   1. SUTANDO_DM_OWNER_ID env var (operator override)
   2. discord-config.json["owner"]                       — Sutando, this file
@@ -77,6 +81,51 @@ def save_config(data: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
+
+
+def sync_thread_seed_mode(
+    access_data: dict,
+    self_id: object,
+    *,
+    config: Optional[dict] = None,
+    logger_=None,
+) -> dict:
+    """Persist an observed sibling fleet as addressed-only thread seeding.
+
+    `access.json` is plugin-owned mutable state, so its Sutando-specific
+    `siblingBots` extension can disappear during a reset or rewrite. A valid
+    peer declaration upgrades workspace-owned config to
+    `threadAutoSeedMode="addressed"` and snapshots the normalized peer ids.
+    Missing or malformed legacy data never downgrades an existing mode.
+
+    Unknown installs are left unchanged. The bridge's legacy fallback then
+    preserves single-bot auto-seeding until a fleet is explicitly observed.
+    """
+    log = logger_ or logger
+    cfg = dict(config) if config is not None else load_config()
+    siblings = access_data.get("siblingBots")
+    if not isinstance(siblings, (list, tuple, set)):
+        return cfg
+
+    normalized = sorted({str(item) for item in siblings if str(item)})
+    peers = set(normalized) - {str(self_id)}
+    if not peers:
+        return cfg
+
+    changed = (
+        cfg.get("threadAutoSeedMode") != "addressed"
+        or cfg.get("siblingBots") != normalized
+    )
+    cfg["threadAutoSeedMode"] = "addressed"
+    cfg["siblingBots"] = normalized
+    if changed:
+        save_config(cfg)
+        log.info(
+            "discord-config: persisted addressed-only thread seeding for "
+            "%d sibling bot(s)",
+            len(peers),
+        )
+    return cfg
 
 
 def resolve_owner_id(

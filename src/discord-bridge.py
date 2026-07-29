@@ -745,6 +745,24 @@ def _has_sibling_bots(access_data, self_id):
     except Exception:
         return False
 
+def _thread_seed_requires_addressing(access_data, self_id, config=None):
+    """True when new Discord threads must address this bot before auto-seed.
+
+    Workspace-owned `threadAutoSeedMode` is authoritative so a plugin rewrite
+    that drops `access.json["siblingBots"]` cannot silently turn a fleet bot
+    back into grab-every-thread mode. Unknown installs retain the legacy
+    access.json check and therefore preserve single-bot behavior.
+    """
+    cfg = config if config is not None else discord_config.load_config()
+    mode = cfg.get("threadAutoSeedMode")
+    if mode == "addressed":
+        return True
+    if mode == "any":
+        return False
+    if _has_sibling_bots(cfg, self_id):
+        return True
+    return _has_sibling_bots(access_data, self_id)
+
 def _format_seed_notice(owner_id, author_mention, parent_label, thread_id_str):
     """Inline notice posted to a freshly auto-seeded thread. Pure (no I/O)."""
     return (
@@ -2367,6 +2385,10 @@ async def on_ready():
         _initial_access = {}
     try:
         discord_config.auto_seed_if_missing(_initial_access)
+        discord_config.sync_thread_seed_mode(
+            _initial_access,
+            getattr(client.user, "id", None),
+        )
     except Exception as _seed_exc:
         print(f"  [discord-config] auto-seed failed (non-fatal): {_seed_exc}")
     # Seed the tier-map grandfather snapshot at STARTUP, before any message is
@@ -2728,17 +2750,20 @@ async def _handle_discord_message(message, force=False):
                 access_data = json.loads(ACCESS_FILE.read_text())
                 access_groups = access_data.setdefault('groups', {})
                 thread_id_str = str(message.channel.id)
-                # Multi-bot-safe seed gate. In a fleet deployment (siblingBots
-                # declared), seed ONLY when THIS bot is the addressed one
+                # Multi-bot-safe seed gate. In a fleet deployment (persisted
+                # addressed-only mode), seed ONLY when THIS bot is addressed
                 # (direct @-mention or a sutando-role @) — otherwise every
                 # sibling bot seeds the same thread, posts its own 🌱 notice
                 # pinging its own owner (the seed storm), and then grabs every
-                # unaddressed follow-up (the 2026-07-02 #1823 pile-up). In a
-                # single-bot deployment (no siblingBots) seed on any first
+                # unaddressed follow-up (the 2026-07-02 #1823 pile-up). For an
+                # unknown/single-bot deployment seed on any first
                 # message, preserving the #1498 ep013 first-message-drop fix.
                 _seed_ok = (
                     bot_mentioned or role_mentioned
-                    or not _has_sibling_bots(access_data, getattr(client.user, "id", None))
+                    or not _thread_seed_requires_addressing(
+                        access_data,
+                        getattr(client.user, "id", None),
+                    )
                 )
                 if thread_id_str not in access_groups and _seed_ok:
                     parent_id_str = str(message.channel.parent_id) if message.channel.parent_id else None
