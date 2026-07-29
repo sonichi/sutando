@@ -913,6 +913,13 @@ def check_per_host_config_backup() -> dict:
         try:
             live_bytes = live.read_bytes()
         except OSError:
+            # An unreadable LIVE access.json is the exact failure this probe
+            # exists to surface — never silently skip it. Skipping let a lone
+            # unreadable live file fall through to checked==0 → a false
+            # "no channel access.json to back up" all-clear (qingyun, #2277
+            # review). Count + flag it; the probe stays non-fatal (warn).
+            drift.append(f"{svc} (live unreadable)")
+            checked += 1
             continue
         checked += 1
         carrier = carrier_base / svc / "access.json"

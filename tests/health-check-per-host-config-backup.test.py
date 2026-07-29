@@ -18,6 +18,7 @@ Covers:
   b) durable backup content differs     → warn (stale)
   c) backup file missing                → warn (no backup)
   d) no channels dir at all             → ok (nothing to back up)
+  h) unreadable LIVE access.json        → warn (never a false all-clear; #2277 review)
   i) only volatile `pending` differs    → ok (durable config matches; #2277 review)
   j) durable drift + pending differs    → warn (pending doesn't mask real drift)
   k) malformed JSON, bytes differ       → warn (raw-byte fallback)
@@ -164,16 +165,19 @@ def case_g_unreadable_carrier_warn() -> list[str]:
     return []
 
 
-def case_h_unreadable_live_skipped_ok() -> list[str]:
-    """A live access.json that can't be read (a directory) is skipped, not fatal."""
+def case_h_unreadable_live_warn() -> list[str]:
+    """A live access.json that can't be read (here: a directory in its place) must
+    WARN, not be silently skipped. This is the lone-unreadable-live entry: skipping
+    it let checked fall to 0 → a false 'no channel access.json to back up' all-clear,
+    masking the exact failure this probe exists to surface (qingyun, #2277 review).
+    Non-fatal: it flags as drift, never crashes the run."""
     with tempfile.TemporaryDirectory() as td:
         with _Harness(Path(td)) as h:
-            # live path is a directory → read_bytes raises → that entry is skipped
+            # live path is a directory → read_bytes raises OSError
             (h.home / "channels" / "discord" / "access.json").mkdir(parents=True)
             r = hc.check_per_host_config_backup()
-    # skipped → nothing checked → ok (no channel access.json to back up)
-    if r["status"] != "ok":
-        return [f"h) unreadable live entry should be skipped (ok), got {r}"]
+    if r["status"] != "warn" or "live unreadable" not in r["detail"]:
+        return [f"h) unreadable live entry should warn 'live unreadable', got {r}"]
     return []
 
 
@@ -242,7 +246,7 @@ def main() -> int:
         ("e", case_e_unresolvable_home_ok),
         ("f", case_f_channels_dir_but_no_access_ok),
         ("g", case_g_unreadable_carrier_warn),
-        ("h", case_h_unreadable_live_skipped_ok),
+        ("h", case_h_unreadable_live_warn),
         ("i", case_i_pending_only_diff_ok),
         ("j", case_j_durable_drift_despite_pending_warn),
         ("k", case_k_malformed_json_raw_fallback_warn),
