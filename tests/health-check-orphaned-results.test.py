@@ -80,6 +80,26 @@ class OrphanedResultsTest(unittest.TestCase):
         self._write("tasks/task-abc.txt", TWO_HOURS_AGO)
         self.assertEqual(hc.check_orphaned_results()["status"], "ok")
 
+    def test_claimed_task_is_still_a_live_task(self):
+        """`claim_task.py` renames a claimed task — a bare-name test calls it archived.
+
+        This is the peer-review finding on the first cut: a still-live claimed
+        task with an older result was reported "never delivered", so a valid
+        in-flight/retrying delivery raised the same high-severity signal as a
+        genuinely stranded reply — which is how a detector teaches its readers
+        to ignore it. The question is "does a task with this id exist", not "is
+        there a file with this exact name".
+        """
+        self._write("results/task-abc.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-abc.claimed-core-1.txt", TWO_HOURS_AGO)
+        self.assertEqual(hc.check_orphaned_results()["status"], "ok")
+
+    def test_claimed_by_a_different_core_is_also_live(self):
+        """The claim suffix carries a core number — do not match only core-1."""
+        self._write("results/task-xyz.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-xyz.claimed-core-7.txt", TWO_HOURS_AGO)
+        self.assertEqual(hc.check_orphaned_results()["status"], "ok")
+
     def test_fresh_result_is_not_an_orphan(self):
         """Between our write and the claim, a few seconds of absence is normal."""
         self._write("results/task-abc.txt")

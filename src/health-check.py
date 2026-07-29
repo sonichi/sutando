@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -2333,8 +2334,16 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
             continue
         if age < threshold_age_sec:
             continue
-        # Task still queued -> the consumer has not reached this pair yet.
-        if (tasks_dir / path.name).is_file():
+        # Task still present -> the consumer has not reached this pair yet.
+        #
+        # Must ask "does a task with this id exist", NOT "is there a file with
+        # this exact name". `claim_task.py` renames a claimed task to
+        # `task-<id>.claimed-core-N.txt`, so a bare-name test reports a LIVE,
+        # in-flight task as archived — a valid retrying delivery raising the
+        # same signal as a genuinely stranded reply, which is how a detector
+        # trains its readers to ignore it. `find_task_file()` is the canonical
+        # locator (it is what the bridge archive paths already use).
+        if find_task_file(tasks_dir, path.stem) is not None:
             continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
