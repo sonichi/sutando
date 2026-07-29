@@ -15,7 +15,11 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { claudeHomePath } from './util_paths.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
-import { selectBackend, type TaskDelegationService } from './task-delegation.js';
+import {
+	emitTaskProcessed,
+	selectBackend,
+	type TaskDelegationService,
+} from './task-delegation.js';
 
 const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
@@ -567,8 +571,7 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					// `task:` last so the (multi-line) context-drop body can't
 					// forge header fields. Same shape as the voice/chat task
 					// writers and agent-api.py's /task endpoint per PR #982.
-					writeFileSync(
-						join(TASK_DIR, `${taskId}.txt`),
+					const taskContent =
 						`id: ${taskId}\n` +
 						`timestamp: ${new Date().toISOString()}\n` +
 						`source: context-drop\n` +
@@ -577,8 +580,12 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 						`user_id: ${ownerId}\n` +
 						`access_tier: owner\n` +
 						`priority: normal\n` +
-						`task: User dropped context via hotkey. Process this:\n${confineUserContent(content)}\n`,
+						`task: User dropped context via hotkey. Process this:\n${confineUserContent(content)}\n`;
+					writeFileSync(
+						join(TASK_DIR, `${taskId}.txt`),
+						taskContent,
 					);
+					emitTaskProcessed(taskContent);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available
 					onContextDrop(content);
