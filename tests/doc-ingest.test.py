@@ -131,4 +131,16 @@ with tempfile.TemporaryDirectory() as td:
     code, out, err = run_cli([])
     check("usage-exit-2", code == 2 and "usage:" in err)
 
+    # 12. ZIP → manifest + recursive member extraction; image members deferred.
+    zipf = tmp / "bundle.zip"
+    with zipfile.ZipFile(zipf, "w") as zf:
+        zf.writestr("inner/data.csv", "a,b\n1,2\n")
+        zf.writestr("readme.txt", "hello archive")
+        zf.writestr("pic.png", "\x89PNG")
+    code, out, _ = run_cli([str(zipf)])
+    check("zip-recursive",
+          code == 0 and "Archive contents" in out and "| a | b |" in out
+          and "hello archive" in out and "handled natively" in out,
+          out[:300])
+
 print(f"OK — {len(passed)} checks passed: {', '.join(passed)}")

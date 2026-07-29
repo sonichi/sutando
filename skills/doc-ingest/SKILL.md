@@ -28,6 +28,7 @@ Not for:
 | `.csv` `.tsv` | stdlib `csv` → markdown table (row-capped) | — |
 | `.docx` | `python-docx` (paragraphs + tables) | `textutil -convert txt` (macOS), else zip XML extraction |
 | `.pptx` | zip XML extraction (per-slide text, dependency-free) | — |
+| `.zip` | member manifest + recursive extraction of the first 20 supported members (flattened basenames — zip-slip safe) | — |
 | `.txt` `.md` `.json` `.jsonl` `.xml` `.html` code files | direct read (UTF-8, errors replaced) | — |
 | `.rtf` `.doc` | `textutil -convert txt` (macOS) | error naming the gap |
 

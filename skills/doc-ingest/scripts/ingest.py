@@ -131,6 +131,30 @@ def extract_pptx(path: Path) -> str:
         return "\n\n".join(f"## Slide {i + 1}\n\n{_xml_text(zf.read(n))}" for i, n in enumerate(slides))
 
 
+def extract_zip(path: Path, max_rows: int, member_cap: int = 20) -> str:
+    # Archive → manifest + recursive extraction of the first N supported members.
+    with zipfile.ZipFile(path) as zf:
+        names = [n for n in zf.namelist() if not n.endswith("/")]
+        parts = ["## Archive contents\n\n" + "\n".join(f"- {n}" for n in names[:200])]
+        import tempfile  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as td:
+            for name in names[:member_cap]:
+                target = Path(td) / Path(name).name  # flatten: zip-slip-safe, basename only
+                target.write_bytes(zf.read(name))
+                try:
+                    kind, text = extract(target, max_rows)
+                    if kind in {"image", "audio"}:
+                        parts.append(f"## {name}\n\n[{kind} member — handled natively, not extracted]")
+                    else:
+                        parts.append(f"## {name} ({kind})\n\n{text}")
+                except Exception as exc:  # noqa: BLE001 — one bad member must not sink the archive
+                    parts.append(f"## {name}\n\n[extraction failed: {exc}]")
+        if len(names) > member_cap:
+            parts.append(f"[doc-ingest: extracted first {member_cap} of {len(names)} members]")
+    return "\n\n".join(parts)
+
+
 def extract_textutil(path: Path) -> str:
     if not shutil.which("textutil"):
         raise RuntimeError(f"no extractor for {path.suffix} (textutil unavailable on this host)")
@@ -158,6 +182,8 @@ def extract(path: Path, max_rows: int) -> tuple[str, str]:
         return "docx", extract_docx(path, max_rows)
     if suffix == ".pptx":
         return "pptx", extract_pptx(path)
+    if suffix == ".zip":
+        return "zip", extract_zip(path, max_rows)
     if suffix in {".rtf", ".doc"}:
         return "textutil", extract_textutil(path)
     if suffix in TEXT_SUFFIXES or not suffix:
