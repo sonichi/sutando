@@ -33,6 +33,7 @@ import importlib.util
 import json
 import shutil
 import sys
+import types
 import tempfile
 from pathlib import Path
 
@@ -61,15 +62,36 @@ hook = load_hook()
 # Block the import the hook performs, which is the same observable state as any
 # resolver exception: workspace_default missing, unimportable, or raising.
 class _Blocker:
-    """Make `from workspace_default import resolve_workspace` raise."""
-    def find_module(self, name, path=None):
-        return self if name == "workspace_default" else None
+    """Make `from workspace_default import resolve_workspace` raise.
 
-    def load_module(self, name):
-        raise ImportError("blocked for test")
+    PEP 451 `find_spec`, NOT the legacy `find_module`/`load_module` pair. Those
+    were deprecated in 3.4 and REMOVED from the import system in 3.12, so a
+    meta_path finder offering only them is simply never consulted there: the real
+    workspace_default imports, the premise silently evaporates, and the hook
+    performs the very repo-local write this file exists to forbid. Measured on
+    3.12.13 — 3 checks failed, including the premise guard.
+
+    Belt and braces: `sys.modules` is ALSO pre-seeded with a module whose
+    `resolve_workspace` raises, which needs no import-system cooperation at all
+    and so cannot be undone by a future protocol change. Either mechanism alone
+    would do; together they are version-proof.
+    """
+    def find_spec(self, name, path=None, target=None):
+        if name == "workspace_default":
+            raise ImportError("blocked for test")
+        return None
 
 
 sys.modules.pop("workspace_default", None)
+_stub = types.ModuleType("workspace_default")
+
+
+def _raise(*_a, **_k):
+    raise RuntimeError("resolver unavailable (blocked for test)")
+
+
+_stub.resolve_workspace = _raise
+sys.modules["workspace_default"] = _stub
 sys.meta_path.insert(0, _Blocker())
 try:
     ws = hook.workspace()
@@ -99,6 +121,18 @@ try:
 finally:
     sys.meta_path.pop(0)
     sys.modules.pop("workspace_default", None)
+    # Clean the fixture this block can create. When the premise breaks (as it did
+    # on 3.12 before the find_spec fix) the hook DOES perform the repo-local
+    # write, leaving an untracked workspace/state/skill-usage-log.jsonl in the
+    # tree — a test that forbids a write must not leave that write behind when it
+    # fails. Only remove what we created: if the file existed before, leave it.
+    try:
+        if not before and repo_local.exists():
+            repo_local.unlink()
+    except NameError:
+        pass  # failed before `before`/`repo_local` were bound
+    except OSError:
+        pass
 
 # --- resolver WORKS: the hook must still write, to the RESOLVED location -------
 # Without this the block above would pass on a hook that never writes at all.
