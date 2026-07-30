@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 DEFAULT_MAX_CHARS = 200_000
@@ -35,18 +36,36 @@ def _truncate(text: str, max_chars: int) -> str:
     return text
 
 
-def _fmt_num(x: float) -> str:
-    """Render a float without a trailing '.0' when it is integral."""
-    return str(int(x)) if x == int(x) else repr(x)
+def _parse_number(cell: str):
+    """Exact numeric parse of a cell → a *finite* Decimal, else None.
+
+    Uses Decimal (not float) so integers beyond IEEE-754 precision (>2**53) keep
+    their exact value instead of silently rounding. Decimal ALSO parses 'NaN' /
+    'Infinity', so non-finite results are explicitly rejected (→ None): otherwise
+    a single 'NaN'/'inf' text cell would crash the digest or poison an aggregate."""
+    try:
+        d = Decimal(cell.replace(",", ""))
+    except InvalidOperation:
+        return None
+    return d if d.is_finite() else None
+
+
+def _fmt_num(x: Decimal) -> str:
+    """Exact decimal string for a finite Decimal; drop a trailing '.0' when integral
+    and never emit exponent notation (fixed-point, so a solver reads a plain number)."""
+    integral = x.to_integral_value()
+    return str(integral) if x == integral else format(x.normalize(), "f")
 
 
 def _table_summary(rows: list[list[str]]) -> str:
     """Computed structural digest of a data table, over the FULL row set (not the
     display-truncated view). Row 0 is treated as the header. For each column:
-    non-empty count, and — when every non-empty cell parses as a number — count,
-    sum, min, max. This grounds count/sum/aggregate questions in *computed* facts
-    instead of a solver visually counting a long rendered table (the failure mode
-    on GAIA spreadsheet tasks). General tabular-reasoning aid, not a benchmark trick."""
+    non-empty count, and — when every non-empty cell parses as a *finite* number —
+    exact sum, min, max. This grounds count/sum/aggregate questions in *computed*
+    facts instead of a solver visually counting a long rendered table (the failure
+    mode on GAIA spreadsheet tasks). General tabular-reasoning aid, not a benchmark
+    trick. Non-finite / non-numeric cells make the column report as plain text — the
+    digest never crashes extraction and never rounds a large exact integer."""
     if len(rows) < 2:
         return ""
     header, body = rows[0], rows[1:]
@@ -56,14 +75,15 @@ def _table_summary(rows: list[list[str]]) -> str:
         col = [str(r[j]).strip() for r in body if j < len(r)]
         nonempty = [c for c in col if c]
         name = str(header[j]).strip() if j < len(header) and str(header[j]).strip() else f"col{j + 1}"
-        nums = []
+        nums, all_numeric = [], bool(nonempty)
         for c in nonempty:
-            try:
-                nums.append(float(c.replace(",", "")))
-            except ValueError:
+            d = _parse_number(c)
+            if d is None:
+                all_numeric = False
                 break
+            nums.append(d)
         seg = f"- **{name}**: {len(nonempty)} non-empty"
-        if nums and len(nums) == len(nonempty):
+        if all_numeric:
             seg += (f"; numeric → sum {_fmt_num(sum(nums))}, "
                     f"min {_fmt_num(min(nums))}, max {_fmt_num(max(nums))}")
         out.append(seg)

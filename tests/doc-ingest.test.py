@@ -372,7 +372,30 @@ with tempfile.TemporaryDirectory() as td:
     # 26. A header-only (or empty) table has no data digest.
     check("table-summary-too-small",
           ingest._table_summary([["only", "header"]]) == "" and ingest._table_summary([]) == "")
-    # 27. _fmt_num strips a trailing .0 only when the value is integral.
-    check("fmt-num", ingest._fmt_num(60.0) == "60" and ingest._fmt_num(0.5) == "0.5")
+    # 27. _fmt_num strips a trailing .0 only when the value is integral, and never
+    #     rounds a large exact integer or emits exponent notation (Decimal in/out).
+    D = ingest.Decimal
+    check("fmt-num",
+          ingest._fmt_num(D("60")) == "60" and ingest._fmt_num(D("0.50")) == "0.5"
+          and ingest._fmt_num(D("9007199254740993")) == "9007199254740993")
+    # 28. Numeric domain (P1 review, qingyun-wu): a non-finite text cell (NaN/inf)
+    #     must NOT crash and must NOT be treated as numeric; the column reports as text.
+    nan_digest = ingest._table_summary([["value"], ["NaN"], ["3"]])
+    check("table-summary-nan",
+          "**value**: 2 non-empty" in nan_digest and "numeric" not in nan_digest, nan_digest)
+    inf_digest = ingest._table_summary([["value"], ["Infinity"], ["3"]])
+    check("table-summary-inf", "numeric" not in inf_digest, inf_digest)
+    # 29. Integers beyond IEEE-754 precision keep exact value in the aggregate.
+    big_digest = ingest._table_summary([["value"], ["9007199254740993"], ["1"]])
+    check("table-summary-bigint",
+          "numeric → sum 9007199254740994, min 1, max 9007199254740993" in big_digest, big_digest)
+    # 30. End-to-end CSV regression: NaN cell → column stays readable (no crash, exit 0);
+    #     large-integer column aggregates exactly.
+    numf = tmp / "nums.csv"
+    numf.write_text("id,amount\n1,9007199254740993\n2,NaN\n")
+    code, out, _ = run_cli([str(numf)])
+    check("csv-summary-numeric-domain",
+          code == 0 and "**amount**: 2 non-empty" in out and "amount**: 2 non-empty; numeric" not in out
+          and "**id**: 2 non-empty; numeric → sum 3, min 1, max 2" in out, out[:400])
 
 print(f"OK — {len(passed)} checks passed: {', '.join(passed)}")
