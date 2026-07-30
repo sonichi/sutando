@@ -472,7 +472,10 @@ exit 1
         notifier.write_text('''#!/bin/bash
 n=0
 [ -f "$SUPERVISOR_COUNT" ] && n=$(cat "$SUPERVISOR_COUNT")
-printf '%s' "$((n + 1))" > "$SUPERVISOR_COUNT"
+n=$((n + 1))
+tmp="${SUPERVISOR_COUNT}.$$"
+printf '%s' "$n" > "$tmp"
+mv "$tmp" "$SUPERVISOR_COUNT"
 exit 23
 ''')
         notifier.chmod(0o755)
@@ -509,7 +512,9 @@ exit 1
 n=0
 [ -f "$SUPERVISOR_COUNT" ] && n=$(cat "$SUPERVISOR_COUNT")
 n=$((n + 1))
-printf '%s' "$n" > "$SUPERVISOR_COUNT"
+tmp="${SUPERVISOR_COUNT}.$$"
+printf '%s' "$n" > "$tmp"
+mv "$tmp" "$SUPERVISOR_COUNT"
 if [ "$n" = 1 ]; then
   kill -TERM 0
 fi
