@@ -168,10 +168,24 @@ except ImportError:
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 os.environ.setdefault("SUTANDO_TEST_MODE", "1")
 
+# Hermetic config isolation (qingyun P1 on #2426): the bridge's import-time
+# token hardening resolves claude_home_path("channels", "discord", ".env") and
+# chmods it if it exists. Without isolation that touches the OPERATOR'S REAL
+# token file. Point both resolution env vars at a temp root BEFORE exec_module
+# so every config path the module computes stays inside it.
+_cfg_root = tempfile.mkdtemp(prefix="progress-stream-test-cfg-")
+os.environ["CLAUDE_CONFIG_DIR"] = _cfg_root
+os.environ["CLAUDE_HOME"] = _cfg_root
+
 _REPO = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("dbridge_outage", _REPO / "src" / "discord-bridge.py")
 _db = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_db)
+
+# Assert the isolation actually took — the module's resolved token-file path
+# must live under the temp root, never the operator's real config dir.
+check("bridge: channels_env confined to temp config root",
+      str(_db.channels_env).startswith(_cfg_root))
 
 with tempfile.TemporaryDirectory() as d:
     ws = Path(d)
