@@ -95,12 +95,54 @@ check(
     lint.classify(write(tmpdir, 'import os\nos.environ["HOME"] = "/tmp/x"\n' + IMPORTS_BRIDGE))
     == lint.CLEAN,
 )
-# The regression that matters most: comments must not satisfy the predicate.
+# --- the two adversarial bypasses (qingyun, #2429 P1) ----------------------
+# Both defeated the original regex predicate and are why detection is AST-based.
 check(
     "violation: a COMMENT naming CLAUDE_CONFIG_DIR is NOT isolation",
     lint.classify(
         write(tmpdir, "# Hermetic: CLAUDE_CONFIG_DIR is handled, honest.\n" + IMPORTS_BRIDGE)
     )
+    == lint.VIOLATION,
+)
+check(
+    "BYPASS 1: an assignment-SHAPED comment is NOT isolation",
+    lint.classify(
+        write(
+            tmpdir,
+            '# os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n' + IMPORTS_BRIDGE,
+        )
+    )
+    == lint.VIOLATION,
+    "regex matched comment text; AST never sees comments",
+)
+check(
+    "BYPASS 2: a REAL assignment AFTER exec_module is NOT isolation",
+    lint.classify(
+        write(
+            tmpdir,
+            IMPORTS_BRIDGE + '\nimport os, tempfile\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n',
+        )
+    )
+    == lint.VIOLATION,
+    "isolation after the import leaves module-level resolution already done",
+)
+check(
+    "ordering: the SAME assignment placed BEFORE exec_module is clean",
+    lint.classify(
+        write(
+            tmpdir,
+            'import os, tempfile\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n' + IMPORTS_BRIDGE,
+        )
+    )
+    == lint.CLEAN,
+)
+check(
+    "unparseable file is a VIOLATION, never a silent pass",
+    lint.classify(write(tmpdir, "def broken(:\n" + IMPORTS_BRIDGE)) == lint.VIOLATION,
+)
+check(
+    "late HOME assignment is also rejected",
+    lint.classify(write(tmpdir, IMPORTS_BRIDGE + '\nimport os\nos.environ["HOME"] = "/tmp/x"\n'))
     == lint.VIOLATION,
 )
 check(

@@ -29,12 +29,19 @@ THE FIX a test must apply (before `exec_module`):
     _cfg.mkdir(parents=True, exist_ok=True)
     (_cfg / "access.json").write_text('{"allowFrom": []}')
 
-DETECTION NOTES (both learned the hard way)
--------------------------------------------
-1. Require an **assignment**, not a mention. A first pass keyed on the substring
-   `CLAUDE_CONFIG_DIR` and wrongly exonerated three files that only name it in a comment —
-   including `tests/bridge-audit-wiring.test.py`, whose comment *claimed* hermeticity while
-   the test read live config. A comment is not isolation.
+DETECTION NOTES (all learned the hard way)
+------------------------------------------
+1. Detection is **AST-based, not regex**, and order-aware. Two earlier text-scanning drafts
+   were bypassable, both demonstrated by qingyun on #2429:
+     * an assignment-SHAPED comment (`# os.environ["CLAUDE_CONFIG_DIR"] = ...`) matched the
+       regex — comments never reach the AST;
+     * a REAL assignment placed AFTER `exec_module()` matched too — isolation that executes
+       after the import is useless, because the module-level resolution already ran.
+   Isolation now counts only when an executable assignment precedes the bridge import.
+   This is not theoretical: `tests/bridge-env-token-perms.test.py` sets CLAUDE_CONFIG_DIR at
+   line 179 but calls exec_module at line 124, and the regex draft called it clean.
+   An unparseable file is treated as a VIOLATION — a file that cannot be analysed is not
+   proven clean.
 2. Recognize **post-import mitigation**. `tests/slack-bridge-tier-map.test.py` reassigns
    `mod.ACCESS_FILE` to a temp path after `exec_module`, deliberately, so its destructive
    write/unlink cannot touch the operator's real file. The import still resolves host config,
@@ -54,6 +61,7 @@ would have reddened main on its merge.)
 """
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -67,27 +75,18 @@ REPO = Path(
 )
 
 BRIDGE_IMPORT = re.compile(r"(discord|slack|telegram)-bridge\.py")
-# An ASSIGNMENT to the config-dir env var — a comment mentioning it does not count.
-ISOLATES = re.compile(
-    r"""os\.environ\[\s*["'](?:CLAUDE_CONFIG_DIR|CLAUDE_HOME)["']\s*\]\s*=|"""
-    r"""os\.environ\.setdefault\(\s*["'](?:CLAUDE_CONFIG_DIR|CLAUDE_HOME)["']|"""
-    r"""monkeypatch\.setenv\(\s*["'](?:CLAUDE_CONFIG_DIR|CLAUDE_HOME)["']"""
-)
-# Equivalent isolation by other means.
-ALT_ISOLATES = re.compile(
-    r"""os\.environ\[\s*["']HOME["']\s*\]\s*=|util_paths\.|patch\([^)]*channel_access_path"""
-)
-# Post-import damage control: rebinding the resolved path to a temp location.
-MITIGATES = re.compile(r"""\.\s*ACCESS_FILE\s*=|\.\s*channels_env\s*=""")
 
 # Grandfathered: known-unisolated at the time this lint landed. Mini's shared-helper
 # migration removes these; the stale-entry check below forces the list to shrink.
-# Measured on origin/main @ 749f7e79 (2026-07-30). `tests/bridge-audit-wiring.test.py`
-# is absent because PR #2428 fixes it.
+# Measured on origin/main @ 749f7e79 (2026-07-30) with the AST classifier. The count rose
+# from 26 to 27 when detection moved off regex: two files the regex called clean were real
+# bypasses (assignment-shaped comment / assignment after exec_module), which is exactly the
+# P1 qingyun raised on #2429.
 KNOWN_UNISOLATED = frozenset(
     """
 tests/audio-transcribe-skill.test.py
 tests/bridge-audit-wiring.test.py
+tests/bridge-env-token-perms.test.py
 tests/bridge-restart-intercept.test.py
 tests/bridges-sending-orphan-recovery.test.py
 tests/discord-bridge-delivery-sentinel.test.py
@@ -124,6 +123,70 @@ CLEAN, MITIGATED, VIOLATION = "clean", "mitigated", "violation"
 SELF_EXEMPT = {"tests/lint-hermetic-bridge-tests.test.py"}
 
 
+CONFIG_KEYS = {"CLAUDE_CONFIG_DIR", "CLAUDE_HOME"}
+ISOLATION_KEYS = CONFIG_KEYS | {"HOME"}
+
+
+def _const_str(node) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _isolation_line(tree: ast.AST) -> int | None:
+    """Earliest line that EXECUTES an isolation of the config dir, or None.
+
+    AST-based on purpose. A regex over raw text accepts two bypasses qingyun demonstrated
+    on #2429: an assignment-shaped string inside a comment, and a real assignment placed
+    after the import. Comments never reach the AST, and node.lineno gives the ordering the
+    regex could not express.
+    """
+    best = None
+    for node in ast.walk(tree):
+        line = None
+        # os.environ["CLAUDE_CONFIG_DIR"] = ...  /  os.environ.update({...})
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Subscript) and _const_str(tgt.slice) in ISOLATION_KEYS:
+                    line = node.lineno
+        # os.environ.setdefault("CLAUDE_CONFIG_DIR", ...) / monkeypatch.setenv(...)
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name in {"setdefault", "setenv", "patch_env"} and node.args:
+                if _const_str(node.args[0]) in ISOLATION_KEYS:
+                    line = node.lineno
+            # patch("...channel_access_path") style
+            elif name in {"patch", "patch_object"} and node.args:
+                arg = _const_str(node.args[0]) or ""
+                if "channel_access_path" in arg or "claude_home_path" in arg:
+                    line = node.lineno
+        if line is not None and (best is None or line < best):
+            best = line
+    return best
+
+
+def _exec_module_line(tree: ast.AST) -> int | None:
+    """Earliest line that calls .exec_module(...)."""
+    best = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "exec_module":
+                if best is None or node.lineno < best:
+                    best = node.lineno
+    return best
+
+
+def _mitigation_line(tree: ast.AST) -> int | None:
+    """Earliest post-import rebind of the resolved path (mod.ACCESS_FILE = ...)."""
+    best = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Attribute) and tgt.attr in {"ACCESS_FILE", "channels_env"}:
+                    if best is None or node.lineno < best:
+                        best = node.lineno
+    return best
+
+
 def classify(path: Path) -> str | None:
     """Return a verdict, or None when the file is out of scope."""
     try:
@@ -138,9 +201,22 @@ def classify(path: Path) -> str | None:
         return None
     if "exec_module" not in text or not BRIDGE_IMPORT.search(text):
         return None
-    if ISOLATES.search(text) or ALT_ISOLATES.search(text):
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        # Unparseable test file: fall back to the conservative verdict rather than
+        # silently passing it. A file that cannot be analysed is not proven clean.
+        return VIOLATION
+
+    exec_line = _exec_module_line(tree)
+    if exec_line is None:
+        return None
+    iso_line = _isolation_line(tree)
+    # Isolation only counts when it EXECUTES BEFORE the bridge import. Setting the env
+    # afterwards leaves the module-level resolution already done against host config.
+    if iso_line is not None and iso_line < exec_line:
         return CLEAN
-    return MITIGATED if MITIGATES.search(text) else VIOLATION
+    return MITIGATED if _mitigation_line(tree) is not None else VIOLATION
 
 
 def scan(paths) -> dict[str, str]:
