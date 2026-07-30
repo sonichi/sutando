@@ -93,17 +93,23 @@ class TestWriteConsume(unittest.TestCase):
                 json.dump(["restart"], f)
             self.assertIsNone(_mod.consume_intent(ws))
 
-    def test_unlink_failure_still_returns_action(self):
-        # Consume-first delete failing (e.g. permissions race) must not lose
-        # the action — the read already succeeded; delete is best-effort.
+    def test_unlink_failure_fails_closed(self):
+        # qingyun #2408 P1: if the delete fails, the file survives and the
+        # next 5s poll would replay the same action — a restart LOOP. No
+        # positive consume → NO action, ever.
         with tempfile.TemporaryDirectory() as ws:
-            _mod.write_intent(ws, "restart", "test")
+            p = _mod.write_intent(ws, "restart", "test")
             orig = os.unlink
-            os.unlink = lambda p: (_ for _ in ()).throw(OSError("locked"))
+            os.unlink = lambda pth: (_ for _ in ()).throw(OSError("locked"))
             try:
-                self.assertEqual(_mod.consume_intent(ws), "restart")
+                self.assertIsNone(_mod.consume_intent(ws))   # fail closed
+                self.assertIsNone(_mod.consume_intent(ws))   # and stays closed
             finally:
                 os.unlink = orig
+            self.assertTrue(os.path.exists(p))  # file intact for manual removal
+            # once deletable again, the (non-stale) intent acts exactly once
+            self.assertEqual(_mod.consume_intent(ws), "restart")
+            self.assertIsNone(_mod.consume_intent(ws))
 
     def test_missing_requested_at_is_stale(self):
         with tempfile.TemporaryDirectory() as ws:

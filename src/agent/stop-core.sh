@@ -9,15 +9,17 @@
 # Stop means stop (owner decision on #2401): nothing anywhere relaunches a
 # stopped core automatically. Idempotent — exits 0 when no session exists.
 #
-# Socket resolution matches start-cli.sh: $SUTANDO_TMUX_SOCKET, else the
-# default socket path.
+# Socket + session resolution match start-cli.sh: $SUTANDO_TMUX_SOCKET /
+# $SUTANDO_TMUX_SESSION, else the defaults. Selectors use tmux exact-match
+# (=name) so a similarly-prefixed session (e.g. sutando-core-debug) is never
+# probe-matched or killed (john-the-dev review, #2408).
 
 set -e
 
-SESSION="sutando-core"
+SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 
-if ! tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
   echo "stop-core: no $SESSION session on $TMUX_SOCKET — nothing to stop"
   exit 0
 fi
@@ -25,5 +27,5 @@ fi
 # Kill the watcher sibling first if present (same cleanup start-cli.sh does on
 # --restart), then the core session itself.
 tmux -S "$TMUX_SOCKET" kill-session -t "=${SESSION}-watcher" 2>/dev/null || true
-tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION"
+tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION"
 echo "stop-core: $SESSION stopped (socket $TMUX_SOCKET)"

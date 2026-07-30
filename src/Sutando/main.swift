@@ -2527,12 +2527,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Consume <workspace>/state/core-restart-requested.json and perform the
     /// requested action in THIS (GUI) session. Mirrors core_restart_intent.py:
-    /// delete-before-act, unknown/malformed/stale (>600s) intents dropped.
+    /// delete-before-act, unknown/malformed/stale (>600s) intents dropped —
+    /// and the delete must SUCCEED before any dispatch: an undeletable file
+    /// would re-fire the same action every 5s poll, so fail closed instead
+    /// (qingyun review, #2408).
     func pollRestartIntent() {
         let path = workspace + "/state/core-restart-requested.json"
         guard FileManager.default.fileExists(atPath: path) else { return }
         let raw = try? String(contentsOfFile: path, encoding: .utf8)
-        try? FileManager.default.removeItem(atPath: path)  // consume FIRST
+        do {
+            try FileManager.default.removeItem(atPath: path)  // consume FIRST
+        } catch {
+            notify("Sutando", "Restart request file couldn't be consumed — NOT acting (would loop). Remove it manually: \(path)")
+            return
+        }
         guard let raw = raw,
               let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

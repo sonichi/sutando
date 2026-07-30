@@ -15,8 +15,10 @@ File: <workspace>/state/core-restart-requested.json
 Schema: {"action": "restart"|"stop", "requested_at": <epoch>, "source": "..."}
 
 Consume semantics: read-and-delete BEFORE acting (a crash mid-action must not
-replay the intent on the next poll). Intents older than STALE_SEC are consumed
-and dropped — an ancient file left by a dead executor must not fire a surprise
+replay the intent on the next poll), and the delete must SUCCEED before any
+action — an undeletable file means the next poll would replay it, so the
+consumer fails closed and does nothing. Intents older than STALE_SEC are
+consumed and dropped — an ancient file left by a dead executor must not fire a surprise
 restart when the app next boots.
 """
 from __future__ import annotations
@@ -90,7 +92,10 @@ def consume_intent(workspace: str | None, now: float | None = None) -> str | Non
     try:
         os.unlink(path)  # consume FIRST — crash mid-action must not replay
     except OSError:
-        pass
+        # FAIL CLOSED (qingyun review, #2408): if the file can't be removed,
+        # the next 5s poll would see it again — acting now would replay the
+        # same restart every poll. No positive consume → no action.
+        return None
     try:
         d = json.loads(raw)
     except ValueError:
