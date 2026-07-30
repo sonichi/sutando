@@ -58,6 +58,43 @@ class TestHeartbeatStale(unittest.TestCase):
             self.assertTrue(_mod.heartbeat_stale(p, 90, now=now + 91))
 
 
+class TestSessionGone(unittest.TestCase):
+    """Exercise session_gone's real body with subprocess.run stubbed at the
+    module level — spawning a real tmux server in tests is the flake class
+    #1428 warns about, but the decision paths still need coverage."""
+
+    class _R:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    def _with_run(self, fake, *call):
+        import subprocess as sp
+        orig = sp.run
+        sp.run = fake
+        try:
+            return _mod.session_gone(*call)
+        finally:
+            sp.run = orig
+
+    def test_session_present(self):
+        self.assertFalse(self._with_run(lambda *a, **k: self._R(0), "s.sock", "core"))
+
+    def test_session_absent(self):
+        self.assertTrue(self._with_run(lambda *a, **k: self._R(1), "s.sock", "core"))
+
+    def test_tmux_timeout_treated_as_gone(self):
+        import subprocess as sp
+
+        def boom(*a, **k):
+            raise sp.TimeoutExpired(cmd="tmux", timeout=10)
+        self.assertTrue(self._with_run(boom, "s.sock", "core"))
+
+    def test_tmux_missing_treated_as_gone(self):
+        def boom(*a, **k):
+            raise OSError("no tmux binary")
+        self.assertTrue(self._with_run(boom, "s.sock", "core"))
+
+
 class TestOperatorIntent(unittest.TestCase):
     def test_absent_and_present(self):
         with tempfile.TemporaryDirectory() as td:
@@ -127,6 +164,29 @@ class TestSustainedStreakCli(unittest.TestCase):
             for _ in range(3):
                 rc, s = _tick(td, alive_age=600, session_exists=False, sentinel=True)
                 self.assertEqual((rc, s), (0, 0))
+
+    def test_live_relaunch_executes_cmd(self):
+        # Without --dry-run, a sustained trip must actually spawn the relaunch
+        # command (detached). Marker file proves execution.
+        with tempfile.TemporaryDirectory() as td:
+            marker = os.path.join(td, "ran")
+            alive = os.path.join(td, "h.alive")
+            open(alive, "w").close()
+            os.utime(alive, (time.time() - 600,) * 2)
+            orig = _mod.session_gone
+            _mod.session_gone = lambda socket, session: True
+            try:
+                args = ["tick", "--alive", alive, "--socket", "s", "--state-file",
+                        os.path.join(td, "gate.state"), "--sustain", "1",
+                        "--relaunch-cmd", f"touch {marker}"]
+                self.assertEqual(_mod.main(args), 3)
+            finally:
+                _mod.session_gone = orig
+            for _ in range(30):  # Popen is detached; poll briefly
+                if os.path.exists(marker):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(os.path.exists(marker))
 
     def test_dry_run_never_executes(self):
         # relaunch-cmd absent + dry-run: exit 3 but nothing spawned (the cmd
