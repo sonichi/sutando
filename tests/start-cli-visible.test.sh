@@ -30,14 +30,12 @@ grep -q 'uname)" = "Darwin"' "$LAUNCHER" \
   && say ok "Darwin-guarded" || say FAIL "missing Darwin guard"
 
 # --- runtime parity (#2412 review): the codex adapter carries the SAME contract ---
-for f in "$CODEX_LAUNCHER"; do
-  grep -q 'VISIBLE=1' "$f" && grep -q 'open_visible_terminal()' "$f" \
-    && say ok "codex adapter: flag + helper present" || say FAIL "codex adapter missing flag/helper"
-  n=$(grep -c '^\s*open_visible_terminal$' "$f")
-  [ "$n" -eq 2 ] && say ok "codex adapter: both call sites" || say FAIL "codex adapter call sites: $n"
-  grep -q "exec tmux -S '\$TMUX_SOCKET' attach -t '\$SESSION'" "$f" \
-    && say ok "codex adapter: generator matches contract" || say FAIL "codex generator drifted"
-done
+grep -q 'VISIBLE=1' "$CODEX_LAUNCHER" && grep -q 'open_visible_terminal()' "$CODEX_LAUNCHER" \
+  && say ok "codex adapter: flag + helper present" || say FAIL "codex adapter missing flag/helper"
+n=$(grep -c '^\s*open_visible_terminal$' "$CODEX_LAUNCHER")
+[ "$n" -eq 2 ] && say ok "codex adapter: both call sites" || say FAIL "codex adapter call sites: $n"
+grep -q "exec tmux -S '\$TMUX_SOCKET' attach -t '\$SESSION'" "$CODEX_LAUNCHER" \
+  && say ok "codex adapter: generator matches contract" || say FAIL "codex generator drifted"
 
 # --- behavior: mirrored generator block against a temp workspace ---
 TMUX_SOCKET="/tmp/test-visible.sock"
