@@ -107,6 +107,37 @@ def _resolve_dotenv() -> Path:
 _VOICE_ENV_KEYS = ("SKIP_VOICE", "GEMINI_VOICE_API_KEY", "GEMINI_API_KEY")
 
 
+def managed_voice_credential_present(path: Optional[Path] = None) -> bool:
+    """True when the managed-credentials file carries a usable voice key.
+
+    Mirrors `_managed_voice_credential_present` in startup-runtime.sh, including
+    its fallback order (`CAPABILITY_FALLBACKS['gemini-voice']`) and its
+    malformed-file contract: an unreadable or malformed file SKIPS the tier
+    rather than raising, matching readManaged()'s try/catch.
+
+    Deliberately NOT fail-closed, unlike the dotenv parsing above. The two cases
+    differ: a malformed SKIP_VOICE means someone configured voice and we cannot
+    tell how, so hiding it would mask an outage. A malformed managed file means
+    the managed tier is unusable, so startup will not boot voice either — and
+    reporting "enabled" there would invent an outage that cannot exist. Match
+    the launcher, because the whole bug was the two disagreeing.
+    """
+    if path is None:
+        path = WORKSPACE_DIR / "state" / "auth" / "managed-credentials.json"
+    try:
+        caps = (json.loads(Path(path).read_text()) or {}).get("capabilities") or {}
+        if not isinstance(caps, dict):
+            return False
+    except Exception:
+        return False
+    for slot in ("gemini-voice", "gemini-text"):
+        entry = caps.get(slot)
+        key = entry.get("key") if isinstance(entry, dict) else None
+        if isinstance(key, str) and key:
+            return True
+    return False
+
+
 def resolve_voice_health_config(
     env: Optional[dict] = None,
     env_path: Optional[Path] = None,
@@ -170,6 +201,15 @@ def resolve_voice_health_config(
         return {"enabled": True, "error": f"invalid SKIP_VOICE={skip_voice!r}"}
     if skip_voice == "1":
         return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
+    # The MANAGED tier, checked in the same order startup-runtime.sh uses: BYO env
+    # first, then managed. Without this the two disagree — startup-runtime.sh:52-58
+    # boots voice on a managed credential while this returned "disabled", so all
+    # four voice checks reported `ok — disabled` over a running-and-broken voice
+    # agent. A health check that reports "disabled" about a service that is
+    # actually running is worse than no check: it converts an outage into a green
+    # light. (#2197 review blocker, john-the-dev 2026-07-30T01:53.)
+    if managed_voice_credential_present():
+        return {"enabled": True, "detail": "managed voice credential configured"}
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
 
 

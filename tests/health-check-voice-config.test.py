@@ -22,6 +22,71 @@ class VoiceHealthConfigTests(unittest.TestCase):
         temp.close()
         return Path(temp.name)
 
+    def write_managed(self, content: str) -> Path:
+        """Write a managed-credentials.json and point WORKSPACE_DIR at its tree."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, root, ignore_errors=True)
+        auth = root / "state" / "auth"
+        auth.mkdir(parents=True)
+        (auth / "managed-credentials.json").write_text(content)
+        prior = hc.WORKSPACE_DIR
+        hc.WORKSPACE_DIR = root
+        self.addCleanup(setattr, hc, "WORKSPACE_DIR", prior)
+        return root
+
+    @property
+    def _no_dotenv(self) -> Path:
+        missing = Path(tempfile.gettempdir()) / "sutando-health-missing-dotenv"
+        missing.unlink(missing_ok=True)
+        return missing
+
+    # --- the MANAGED tier ----------------------------------------------------
+    # #2197 review blocker (john-the-dev 2026-07-30T01:53): startup-runtime.sh
+    # boots voice on a managed credential, while this resolver read only
+    # SKIP_VOICE / GEMINI_VOICE_API_KEY / GEMINI_API_KEY. A managed-only install
+    # therefore ran voice while all four checks reported `ok — disabled` — an
+    # outage rendered as a green light, which is worse than having no check.
+    def test_managed_voice_slot_enables_checks(self) -> None:
+        self.write_managed('{"capabilities": {"gemini-voice": {"key": "k"}}}')
+        cfg = hc.resolve_voice_health_config(env={}, env_path=self._no_dotenv)
+        self.assertTrue(cfg["enabled"])
+        self.assertIn("managed", cfg["detail"])
+
+    def test_managed_text_slot_is_the_documented_fallback(self) -> None:
+        # Mirrors CAPABILITY_FALLBACKS['gemini-voice'] = ['gemini-voice','gemini-text'],
+        # the same order startup-runtime.sh accepts. Diverging here would
+        # re-open the disagreement in the other direction.
+        self.write_managed('{"capabilities": {"gemini-text": {"key": "k"}}}')
+        self.assertTrue(hc.resolve_voice_health_config(
+            env={}, env_path=self._no_dotenv)["enabled"])
+
+    def test_no_managed_file_stays_disabled(self) -> None:
+        root = self.write_managed("{}")
+        (root / "state" / "auth" / "managed-credentials.json").unlink()
+        self.assertFalse(hc.resolve_voice_health_config(
+            env={}, env_path=self._no_dotenv)["enabled"])
+
+    def test_empty_managed_key_is_not_a_credential(self) -> None:
+        self.write_managed('{"capabilities": {"gemini-voice": {"key": ""}}}')
+        self.assertFalse(hc.resolve_voice_health_config(
+            env={}, env_path=self._no_dotenv)["enabled"])
+
+    def test_malformed_managed_file_skips_the_tier_matching_the_launcher(self) -> None:
+        # Deliberately NOT fail-closed, unlike the dotenv parsing: a malformed
+        # managed file means the managed tier is unusable, so startup will not
+        # boot voice either — reporting "enabled" would invent an outage that
+        # cannot exist. Match the launcher; the bug was the two disagreeing.
+        self.write_managed("{not json")
+        self.assertFalse(hc.resolve_voice_health_config(
+            env={}, env_path=self._no_dotenv)["enabled"])
+
+    def test_skip_voice_still_wins_over_a_managed_credential(self) -> None:
+        self.write_managed('{"capabilities": {"gemini-voice": {"key": "k"}}}')
+        cfg = hc.resolve_voice_health_config(
+            env={"SKIP_VOICE": "1"}, env_path=self._no_dotenv)
+        self.assertFalse(cfg["enabled"])
+        self.assertIn("SKIP_VOICE=1", cfg["detail"])
+
     def test_missing_or_empty_config_disables_voice_checks(self) -> None:
         missing = Path(tempfile.gettempdir()) / "sutando-health-missing-dotenv"
         missing.unlink(missing_ok=True)
