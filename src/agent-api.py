@@ -112,6 +112,7 @@ PORT = 7843
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
+from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 
 
@@ -215,7 +216,6 @@ def _remember_done_result_file(result_file: Path) -> None:
 # **Status:** markers) while the writer still required a **Status:**/**Options:**
 # line, so every free-form question was listed but unanswerable — POST /answer
 # 404'd on every id. Both paths stay on this function.
-PQ_ARCHIVE_RE = re.compile(r'^#[ \t]+Resolved[ \t\r]*$', re.MULTILINE)
 PQ_SECTION_RE = re.compile(r'^## ', re.MULTILINE)
 PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', re.IGNORECASE)
 PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')
@@ -246,8 +246,7 @@ def parse_pending_questions(content: str) -> list[dict]:
     Sections below the `# Resolved` divider are the audit trail, not open
     questions (same cut as check-pending-questions.py:95).
     """
-    archive = PQ_ARCHIVE_RE.search(content)
-    active = content[:archive.start()] if archive else content
+    active = active_region(content)
     starts = [m.start() for m in PQ_SECTION_RE.finditer(active)]
     questions: list[dict] = []
     for n, start in enumerate(starts):

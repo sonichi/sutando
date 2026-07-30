@@ -22,6 +22,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path, personal_path, shared_personal_path  # noqa: E402
+from pending_questions_md import DIVIDER_OR_DONE_RE, active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 WORKSPACE = resolve_workspace()
@@ -44,7 +45,7 @@ def check_pending_questions():
         return []
 
     # Discard resolved section (below a `# Resolved` / `# Done` divider).
-    content = re.split(r'^#[ \t]+(?:Resolved|Done)[ \t\r]*$', content, maxsplit=1, flags=re.MULTILINE)[0]
+    content = active_region(content, DIVIDER_OR_DONE_RE)
 
     _RESOLVED_STATUS = re.compile(
         r'\*\*Status:\*\*\s*(?:resolved|answered|done|complete)',

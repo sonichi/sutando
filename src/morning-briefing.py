@@ -22,6 +22,7 @@ from urllib.error import URLError
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import personal_path  # noqa: E402
+from pending_questions_md import active_region  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
@@ -313,7 +314,7 @@ def get_pending_questions() -> list[str]:
     # top-level "# Resolved" divider (audit trail), not deleted — without
     # this cut the briefing speaks every resolved entry as still-pending.
     # No-op when there is no such divider.
-    content = re.split(r'^#[ \t]+Resolved[ \t\r]*$', content, maxsplit=1, flags=re.MULTILINE)[0]
+    content = active_region(content)
     # Organizer/section-shell headers (e.g. "## FRESH — 2026-07-05 [wu-air]",
     # "## ACTIVE — ...", "## SURFACED — ...") group questions but are not
     # themselves questions — skip them so the briefing's "top item" is a real

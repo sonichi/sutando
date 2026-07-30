@@ -1,35 +1,29 @@
 #!/usr/bin/env python3
-"""The `# Resolved` divider anchor must not match its own documentation.
+"""Locating the `# Resolved` divider — one definition, and it must survive both hosts.
 
-REAL OUTAGE, 2026-07-30. `pending-questions.md` opens with an HTML-comment
-banner warning writers not to append at EOF, and that banner *quotes the rule
-it documents*:
+REAL OUTAGE, 2026-07-30, in two opposite directions from the SAME loose anchor
+(`r'^#\\s+Resolved\\b'`, independently copied into four readers):
 
-    `check-pending-questions.py` truncates at the first `
-    # Resolved` heading
-    (src/check-pending-questions.py:95) and only counts sections ABOVE it.
+  * **under-count.** `pending-questions.md` opens with a banner warning writers not
+    to append at EOF, and it *quotes the rule it documents*, putting
+    `` # Resolved` heading `` line-initial inside an HTML comment. `\\b` is satisfied
+    by the backtick, so the split fired in the banner, the active region collapsed to
+    the banner, and all 89 real sections were counted as resolved. Measured on the
+    live host: **0 open while 43 were open**, for ~11h.
+  * **over-count.** On a host whose file has no clean divider, the split is a no-op
+    and the audit trail is counted as pending. Measured: **101**.
 
-The anchor was `r'^#\\s+Resolved\\b'`, and `\\b` is satisfied by the backtick
-that follows. So the split fired on line 23 — inside the banner — the "active
-region" collapsed to the banner itself, and all 44 real sections landed
-"below the divider" and were counted as resolved. Measured on the live host:
-`get_waiting_questions()` returned **0** while 43 questions were open.
+The first fix anchored the divider to end-of-line (`^#[ \\t]+Resolved[ \\t\\r]*$`).
+It killed the under-count and **introduced a regression**: `# Resolved (archive)` is a
+legitimate divider that stops matching, so its entire audit trail is counted as open.
+And because a stricter anchor can only make the active region LARGER, it can never
+fix an over-count either — that direction was never addressed. Case B below is the
+guard for exactly that; it is the case a green suite would otherwise have hidden.
 
-The file's own warning about the divider is what disarmed the divider. A
-self-documenting file necessarily contains its delimiter twice, so the consumer
-must anchor on a delimiter only a REAL divider can satisfy: end-of-line.
-
-Why this went unnoticed for ~11h: `main()` opens with `if not questions: return`
-— a SILENT return. The cooldown and presenter-mode branches both print a
-diagnostic; the zero branch prints nothing, so a broken parse is indistinguishable
-from a quiet day. Worse, `deliver()` already carries an `undrained_proactive_files()`
-detector built to catch exactly this class of "claimed an outcome it never
-achieved" — but it sits DOWNSTREAM of that early return, so the guard was
-unreachable via the bug that mattered.
-
-Failure direction of the fix: a legitimate divider written `# Resolved (archive)`
-is no longer matched, so resolved entries get counted as open — the owner is
-over-notified. Loud, and self-correcting. The old behavior failed silent.
+So the discriminator is not how the divider ENDS — it is whether the match sits inside
+a comment. A real divider never does; documentation of the divider always does.
+`active_region` masks comment bodies (preserving length and line count, so offsets stay
+valid for callers that slice) and then matches a suffix-permissive anchor.
 
 Run: python3 tests/pending-questions-divider-anchor.test.py
 """
@@ -41,8 +35,11 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+from pending_questions_md import (  # noqa: E402
+    DIVIDER_OR_DONE_RE, active_region, mask_html_comments)
 
-OLD_ANCHOR = r'^#\s+Resolved\b'          # the buggy one, for the control
+OLD_ANCHOR = r'^#\s+Resolved\b'              # the original bug
+EOL_ANCHOR = r'^#[ \t]+Resolved[ \t\r]*$'    # the first fix, which regressed case B
 CASES = []
 
 
@@ -50,87 +47,100 @@ def check(name, got, want=True):
     CASES.append((name, bool(got) is want))
 
 
-# The live banner, reduced to the part that matters: a line that begins with
-# "# Resolved" and continues. Reproduced verbatim in shape from the real file.
-FIXTURE = """<!-- ============================================================================
-     ⚠ WRITERS READ THIS FIRST — do NOT append new questions to the END.
-     `check-pending-questions.py` truncates at the first `
-# Resolved` heading
-     (src/check-pending-questions.py:95) and only counts sections ABOVE it.
-============================================================================ -->
+def n_sections(text, divider=None):
+    region = active_region(text, divider) if divider else active_region(text)
+    return len(re.findall(r'^## ', region, re.MULTILINE))
 
-## Open question one
 
-Some prose with no Status marker, which counts as unanswered by convention.
+BANNER = ("<!-- =====\n"
+          "  `check-pending-questions.py` truncates at the first `\n"
+          "# Resolved` heading\n"
+          "  and only counts sections ABOVE it.\n"
+          "===== -->\n")
 
-## Open question two
+FIXTURES = {
+    # name                              text                                     want
+    "no divider at all (over-count host)":
+        ("# Pending owner decisions\n\n## q1\n\nx\n\n## q2\n\nx\n", 2),
+    "suffixed divider '# Resolved (archive)'  <-- EOL-anchor regression guard":
+        ("## q1\n\nx\n\n# Resolved (archive)\n\n## old1\n\nx\n\n## old2\n\nx\n", 1),
+    "clean divider":
+        ("## q1\n\nx\n\n# Resolved\n\n## old1\n\nx\n", 1),
+    "decoy inside HTML comment (the live outage)":
+        (BANNER + "\n## q1\n\nx\n\n# Resolved\n\n## old1\n\nx\n", 1),
+    "bare '#' then 'Resolved' on the next line must NOT match":
+        ("## q1\n\nx\n#\n\nResolved discussion\n\n## q2\n\nx\n", 2),
+    "CRLF divider":
+        ("## q1\n\nx\n\n# Resolved\r\n\n## old1\n\nx\n", 1),
+}
 
-More prose.
+# --- PREMISE: the decoy fixture must actually contain a line-initial in-comment
+#     decoy that PRECEDES the real divider, else that case is vacuous.
+decoy_text = FIXTURES["decoy inside HTML comment (the live outage)"][0]
+lines = decoy_text.splitlines()
+decoy = [i for i, l in enumerate(lines, 1) if re.match(OLD_ANCHOR, l) and l.strip() != "# Resolved"]
+real = [i for i, l in enumerate(lines, 1) if l.strip() == "# Resolved"]
+assert decoy and real and decoy[0] < real[0], (
+    "PREMISE FAILED: decoy fixture must hold an in-comment decoy before the real divider")
+assert mask_html_comments(decoy_text).count("# Resolved") == 1, (
+    "PREMISE FAILED: masking must hide the decoy and keep the real divider")
+print(f"premise ok — decoy line {decoy[0]}, real divider line {real[0]}\n")
 
-# Resolved
+# --- CONTROLS (known-positive): both PRIOR implementations must get a case wrong,
+#     otherwise these fixtures do not reproduce the bugs they claim to guard.
+def sections_with(pat, text):
+    return len(re.findall(r'^## ', re.split(pat, text, maxsplit=1, flags=re.MULTILINE)[0],
+                          re.MULTILINE))
 
-## An old answered thing
+check("CONTROL: the ORIGINAL anchor under-counts the decoy file (0, not 1)",
+      sections_with(OLD_ANCHOR, decoy_text) == 0)
+suffixed = FIXTURES["suffixed divider '# Resolved (archive)'  <-- EOL-anchor regression guard"][0]
+check("CONTROL: the EOL anchor over-counts a suffixed divider (3, not 1)",
+      sections_with(EOL_ANCHOR, suffixed) == 3)
 
-Prose.
-"""
+# --- The shipped helper on every fixture.
+for name, (text, want) in FIXTURES.items():
+    got = n_sections(text)
+    check(f"{name} -> {want}", got == want)
 
-# --- PREMISE: the fixture must actually contain the decoy, else every assertion
-#     below is vacuous (it would just be testing an ordinary file).
-decoy = [i for i, l in enumerate(FIXTURE.splitlines(), 1)
-         if re.match(OLD_ANCHOR, l) and l.strip() != "# Resolved"]
-real = [i for i, l in enumerate(FIXTURE.splitlines(), 1) if l.strip() == "# Resolved"]
-assert decoy, "PREMISE FAILED: fixture has no in-prose '# Resolved' decoy — test is vacuous"
-assert real, "PREMISE FAILED: fixture has no real '# Resolved' divider — test is vacuous"
-assert decoy[0] < real[0], "PREMISE FAILED: decoy must precede the real divider"
-print(f"premise ok — decoy at line {decoy[0]}, real divider at line {real[0]}\n")
+# friction-detector's variant treats `# Done` as an archive divider too.
+check("'# Done' divider honored for friction-detector",
+      n_sections("## q1\n\nx\n\n# Done\n\n## old1\n\nx\n", DIVIDER_OR_DONE_RE) == 1)
 
-# --- CONTROL (known-positive): the OLD anchor must get this WRONG. Without this,
-#     a green suite proves nothing — the fixture might not reproduce the bug.
-old_region = re.split(OLD_ANCHOR, FIXTURE, maxsplit=1, flags=re.MULTILINE)[0]
-old_count = len(re.findall(r'^## ', old_region, re.MULTILINE))
-check(f"CONTROL: old anchor truncates at the banner (found {old_count} sections, expected 0)",
-      old_count == 0)
+# --- Masking must preserve offsets, or agent-api's slice-by-offset silently shifts
+#     and question identity (derived from section bodies) changes.
+sample = BANNER + "\n## q1\n\nbody\n"
+masked = mask_html_comments(sample)
+check("masking preserves length (offsets stay valid for slicing)", len(masked) == len(sample))
+check("masking preserves line count", masked.count("\n") == sample.count("\n"))
 
-# --- The shipped predicate, pointed at the fixture.
+# --- The shipped predicate end-to-end, through the real notifier.
 spec = importlib.util.spec_from_file_location(
     "cpq", REPO / "src" / "check-pending-questions.py")
 cpq = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cpq)
-
 with tempfile.TemporaryDirectory() as td:
     pq = pathlib.Path(td) / "pending-questions.md"
-    pq.write_text(FIXTURE)
+    pq.write_text(BANNER + "\n## Open one\n\nprose\n\n## Open two\n\nprose\n\n"
+                           "# Resolved\n\n## Old\n\nprose\n")
     cpq.PQ_FILE = pq
     got = cpq.get_waiting_questions()
-
 titles = [q.get("title", "") for q in got]
-check(f"shipped predicate sees both open questions (got {len(got)})", len(got) == 2)
-check("the resolved section below the real divider is excluded",
-      not any("old answered" in t.lower() for t in titles))
-check("both open titles are present",
-      any("one" in t.lower() for t in titles) and any("two" in t.lower() for t in titles))
+check(f"notifier sees both open questions through the banner (got {len(got)})", len(got) == 2)
+check("resolved section excluded", not any("old" in t.lower() for t in titles))
 
-# --- A file with NO divider at all must still work (the anchor is a no-op there).
-with tempfile.TemporaryDirectory() as td:
-    pq = pathlib.Path(td) / "pending-questions.md"
-    pq.write_text("## Only question\n\nProse.\n")
-    cpq.PQ_FILE = pq
-    check("no-divider file still counts its sections", len(cpq.get_waiting_questions()) == 1)
-
-# --- RATCHET: no consumer may reintroduce the loose anchor. Four independent
-#     copies existed (agent-api, morning-briefing, check-pending-questions,
-#     friction-detector); a fifth would silently go dark the same way.
-loose = []
-scanned = 0
+# --- RATCHET: exactly ONE definition of the divider. Four independent copies is what
+#     produced this outage; a fifth would go dark the same way.
+offenders, scanned = [], 0
 for py in sorted((REPO / "src").glob("*.py")):
+    if py.name == "pending_questions_md.py":
+        continue
     scanned += 1
-    for n, line in enumerate(py.read_text().splitlines(), 1):
-        if re.search(r'(?:Resolved|Done\))\\b', line):
-            loose.append(f"{py.name}:{n}")
-# Report SCOPE alongside the result: a zero from a scan that read nothing is
-# not a pass.
-check(f"no loose divider anchor in src/ (scanned {scanned} files; found {loose or 'none'})",
-      scanned > 20 and not loose)
+    for i, line in enumerate(py.read_text().splitlines(), 1):
+        if re.search(r'(?:Resolved|Done)\b[^\n]*', line) and re.search(r'r[\'"]\^#', line):
+            offenders.append(f"{py.name}:{i}")
+check(f"no second divider definition in src/ (scanned {scanned} files; found {offenders or 'none'})",
+      scanned > 20 and not offenders)
 
 passed = sum(ok for _, ok in CASES)
 for name, ok in CASES:
