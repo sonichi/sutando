@@ -35,7 +35,42 @@ def _truncate(text: str, max_chars: int) -> str:
     return text
 
 
-def _rows_to_markdown(rows: list[list[str]], max_rows: int) -> str:
+def _fmt_num(x: float) -> str:
+    """Render a float without a trailing '.0' when it is integral."""
+    return str(int(x)) if x == int(x) else repr(x)
+
+
+def _table_summary(rows: list[list[str]]) -> str:
+    """Computed structural digest of a data table, over the FULL row set (not the
+    display-truncated view). Row 0 is treated as the header. For each column:
+    non-empty count, and — when every non-empty cell parses as a number — count,
+    sum, min, max. This grounds count/sum/aggregate questions in *computed* facts
+    instead of a solver visually counting a long rendered table (the failure mode
+    on GAIA spreadsheet tasks). General tabular-reasoning aid, not a benchmark trick."""
+    if len(rows) < 2:
+        return ""
+    header, body = rows[0], rows[1:]
+    width = max((len(r) for r in rows), default=0)
+    out = [f"**Table summary:** {len(body)} data rows × {width} columns."]
+    for j in range(width):
+        col = [str(r[j]).strip() for r in body if j < len(r)]
+        nonempty = [c for c in col if c]
+        name = str(header[j]).strip() if j < len(header) and str(header[j]).strip() else f"col{j + 1}"
+        nums = []
+        for c in nonempty:
+            try:
+                nums.append(float(c.replace(",", "")))
+            except ValueError:
+                break
+        seg = f"- **{name}**: {len(nonempty)} non-empty"
+        if nums and len(nums) == len(nonempty):
+            seg += (f"; numeric → sum {_fmt_num(sum(nums))}, "
+                    f"min {_fmt_num(min(nums))}, max {_fmt_num(max(nums))}")
+        out.append(seg)
+    return "\n".join(out)
+
+
+def _rows_to_markdown(rows: list[list[str]], max_rows: int, *, summary: bool = False) -> str:
     if not rows:
         return "(empty table)"
     shown = rows[: max_rows or None]
@@ -46,7 +81,12 @@ def _rows_to_markdown(rows: list[list[str]], max_rows: int) -> str:
     lines += ["| " + " | ".join(str(c) for c in r) + " |" for r in norm[1:]]
     if max_rows and len(rows) > max_rows:
         lines.append(f"\n[doc-ingest: showing {max_rows} of {len(rows)} rows]")
-    return "\n".join(lines)
+    table = "\n".join(lines)
+    if summary:
+        digest = _table_summary(rows)
+        if digest:
+            return digest + "\n\n" + table
+    return table
 
 
 def _xml_text(payload: bytes) -> str:
@@ -144,7 +184,7 @@ def _xlsx_zip_fallback(path: Path, max_rows: int) -> str:
                     cells[col] = val
                 width = max(cells) + 1 if cells else 0
                 rows.append([cells.get(j, "") for j in range(width)])
-            body = _rows_to_markdown(rows, max_rows) if rows else "(empty sheet)"
+            body = _rows_to_markdown(rows, max_rows, summary=True) if rows else "(empty sheet)"
             parts.append(f"## Sheet {i}\n\n{body}")
         return "\n\n".join(parts) if parts else "(xlsx: no worksheet data found)"
 
@@ -157,7 +197,7 @@ def extract_xlsx(path: Path, max_rows: int) -> str:
         parts = []
         for ws in wb.worksheets:
             rows = [["" if c is None else c for c in row] for row in ws.iter_rows(values_only=True)]
-            parts.append(f"## Sheet: {ws.title}\n\n" + _rows_to_markdown(rows, max_rows))
+            parts.append(f"## Sheet: {ws.title}\n\n" + _rows_to_markdown(rows, max_rows, summary=True))
         return "\n\n".join(parts)
     except ImportError:
         return _xlsx_zip_fallback(path, max_rows)
@@ -167,7 +207,7 @@ def extract_csv(path: Path, max_rows: int) -> str:
     delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
     with open(path, newline="", encoding="utf-8", errors="replace") as fh:
         rows = [list(r) for r in csv.reader(fh, delimiter=delimiter)]
-    return _rows_to_markdown(rows, max_rows)
+    return _rows_to_markdown(rows, max_rows, summary=True)
 
 
 def extract_docx(path: Path, max_rows: int) -> str:

@@ -64,6 +64,11 @@ with tempfile.TemporaryDirectory() as td:
     check("csv-table", code == 0 and "| name | qty |" in out and "| gadget | 5 |" in out)
     code, out, _ = run_cli([str(csvf), "--max-rows", "2"])
     check("csv-row-cap", "showing 2 of 4 rows" in out, out[-120:])
+    # Table summary rides on data-table paths (csv/xlsx): computed digest over the
+    # FULL row set — qty column sums 3+5+7=15 even though only a rendered table follows.
+    code, out, _ = run_cli([str(csvf)])
+    check("csv-table-summary", "**Table summary:** 3 data rows × 2 columns." in out
+          and "**qty**: 3 non-empty; numeric → sum 15, min 3, max 7" in out, out[:300])
 
     # 3. PPTX via the dependency-free zip-XML path (always runs).
     pptx = tmp / "deck.pptx"
@@ -354,5 +359,20 @@ with tempfile.TemporaryDirectory() as td:
             check("textutil-nonzero", False, "expected RuntimeError")
         except RuntimeError as exc:
             check("textutil-nonzero", "textutil failed" in str(exc))
+
+    # 25. _table_summary unit — numeric column reports aggregates; text column does not.
+    digest = ingest._table_summary([["id", "name", "qty"],
+                                    ["1", "widget", "3"],
+                                    ["2", "gadget", "5,000"]])
+    check("table-summary-numeric",
+          "2 data rows × 3 columns" in digest
+          and "**qty**: 2 non-empty; numeric → sum 5003, min 3, max 5000" in digest
+          and "**name**: 2 non-empty" in digest and "name**: 2 non-empty; numeric" not in digest,
+          digest)
+    # 26. A header-only (or empty) table has no data digest.
+    check("table-summary-too-small",
+          ingest._table_summary([["only", "header"]]) == "" and ingest._table_summary([]) == "")
+    # 27. _fmt_num strips a trailing .0 only when the value is integral.
+    check("fmt-num", ingest._fmt_num(60.0) == "60" and ingest._fmt_num(0.5) == "0.5")
 
 print(f"OK — {len(passed)} checks passed: {', '.join(passed)}")
