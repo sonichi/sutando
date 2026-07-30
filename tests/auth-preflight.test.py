@@ -43,6 +43,27 @@ class TestDecision(unittest.TestCase):
             self.assertIn("GUI /login", r["remedy"])
             self.assertIn("restart.sh", r["remedy"])
 
+    def test_remedy_reaches_login_without_looping_through_the_gate(self):
+        # Regression (#2413 review blocker): the pre-gate remedy said
+        # restart-then-login, but this branch's boot gate makes restart.sh
+        # (→ startup.sh → auth-preflight-gate.sh) abort on login_required —
+        # so that remedy looped back into the gate and never reached a
+        # login-capable CLI. Pin the non-circular shape end-to-end: the
+        # FIRST actionable command is a bare CLI launch under the probed
+        # config dir (no services, gate never runs), and restart.sh appears
+        # only AFTER /login.
+        with tempfile.TemporaryDirectory() as td:
+            r = check_auth_state(td, keychain_check=lambda: False, env={})
+            self.assertEqual(r["verdict"], "login_required")
+            remedy = r["remedy"]
+            self.assertIn(f"CLAUDE_CONFIG_DIR={td} claude", remedy)
+            self.assertLess(remedy.index(" claude`"), remedy.index("restart.sh"),
+                            "bare-CLI launch must precede the restart step")
+            self.assertLess(remedy.index("/login"), remedy.index("restart.sh"),
+                            "/login must precede the restart step")
+            self.assertNotIn("run `bash src/restart.sh` from the repo, then complete /login",
+                             remedy)  # the exact circular phrasing, never again
+
     def test_oauth_plus_credentials_file_ok(self):
         with tempfile.TemporaryDirectory() as td:
             _mkconfig(td, oauth=True, creds=True)
