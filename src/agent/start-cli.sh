@@ -63,7 +63,8 @@ if command -v tmux >/dev/null 2>&1 && tmux -S "$tmux_socket" has-session -t "=$s
     case "$pane_command" in claude|codex) active_runtime="$pane_command" ;; esac
   fi
 fi
-if [ -n "$active_runtime" ] && [ "$active_runtime" != "$runtime" ] && [ "${1:-}" != "--restart" ]; then
+if [ -n "$active_runtime" ] && [ "$active_runtime" != "$runtime" ] \
+   && [ "${1:-}" != "--restart" ] && [ "${1:-}" != "--force-restart" ]; then
   echo "Core runtime changed ($active_runtime → $runtime); restarting canonical session."
   set -- --restart "$@"
 fi
