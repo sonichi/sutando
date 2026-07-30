@@ -118,8 +118,20 @@ tests/telegram-writeside-attachments.test.py
 CLEAN, MITIGATED, VIOLATION = "clean", "mitigated", "violation"
 
 
+# This lint's own test builds fixture strings containing `exec_module` and a bridge path,
+# so a naive scan classifies the test file itself as in-scope. Exempt it, the same way
+# scripts/lint-claude-home-path.sh exempts itself for quoting the pattern it forbids.
+SELF_EXEMPT = {"tests/lint-hermetic-bridge-tests.test.py"}
+
+
 def classify(path: Path) -> str | None:
     """Return a verdict, or None when the file is out of scope."""
+    try:
+        rel = path.resolve().relative_to(REPO.resolve()).as_posix()
+    except (ValueError, OSError):
+        rel = path.as_posix()
+    if rel in SELF_EXEMPT:
+        return None
     try:
         text = path.read_text(errors="ignore")
     except OSError:
