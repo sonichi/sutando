@@ -153,8 +153,13 @@ def _tick(td, alive_age, gone, sentinel=False, sustain=2):
     finally:
         _mod.session_gone = orig
     with open(os.path.join(td, "gate.state")) as f:
-        streak = json.load(f)["streak"]
-    return rc, streak
+        st = json.load(f)
+    return rc, st["streak"]
+
+
+def _reported(td):
+    with open(os.path.join(td, "gate.state")) as f:
+        return json.load(f).get("reported", False)
 
 
 class TestSustainedStreakCli(unittest.TestCase):
@@ -165,7 +170,7 @@ class TestSustainedStreakCli(unittest.TestCase):
             self.assertEqual((rc1, s1), (0, 1))  # first tick holds
             rc2, s2 = _tick(td, alive_age=600, gone=True)
             self.assertEqual(rc2, 3)             # sustained → CORE-DEAD report
-            self.assertEqual(s2, 0)              # reported once, re-armed
+            self.assertTrue(_reported(td))       # latch set — same outage won't re-notify
 
     def test_probe_unknown_holds_at_cli_level(self):
         # Blocker (1) end-to-end: stale heartbeat + UNKNOWN probe → hold forever.
@@ -193,6 +198,40 @@ class TestSustainedStreakCli(unittest.TestCase):
             for _ in range(3):
                 rc, s = _tick(td, alive_age=600, gone=True, sentinel=True)
                 self.assertEqual((rc, s), (0, 0))
+
+    def test_persistent_outage_reports_exactly_once(self):
+        # qingyun + john-the-dev #2404 (2026-07-30): without a reported latch,
+        # a persistent outage re-earned the threshold and exited 3 every
+        # --sustain ticks (their 4-tick repro: rc 0,3,0,3). One outage must
+        # notify exactly once.
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(_tick(td, alive_age=600, gone=True)[0], 0)   # earn
+            self.assertEqual(_tick(td, alive_age=600, gone=True)[0], 3)   # report
+            for _ in range(4):                                            # same outage continues
+                rc, _s = _tick(td, alive_age=600, gone=True)
+                self.assertEqual(rc, 0)                                   # silent — no storm
+                self.assertTrue(_reported(td))
+
+    def test_recovery_clears_latch_and_new_death_reports_again(self):
+        # sustained death → one report → healthy reset → NEW sustained death
+        # must report once again (the full cycle both reviewers asked pinned).
+        with tempfile.TemporaryDirectory() as td:
+            _tick(td, alive_age=600, gone=True)
+            self.assertEqual(_tick(td, alive_age=600, gone=True)[0], 3)   # outage 1 reported
+            rc, s = _tick(td, alive_age=0, gone=False)                    # core back
+            self.assertEqual((rc, s), (0, 0))
+            self.assertFalse(_reported(td))                               # latch cleared
+            self.assertEqual(_tick(td, alive_age=600, gone=True), (0, 1))  # re-earn
+            self.assertEqual(_tick(td, alive_age=600, gone=True)[0], 3)   # outage 2 reports once
+
+    def test_probe_unknown_hold_clears_latch(self):
+        # Reviewers: "until a healthy or HOLDING observation clears it" — an
+        # UNKNOWN-probe hold also ends the reported outage window.
+        with tempfile.TemporaryDirectory() as td:
+            _tick(td, alive_age=600, gone=True)
+            self.assertEqual(_tick(td, alive_age=600, gone=True)[0], 3)
+            self.assertEqual(_tick(td, alive_age=600, gone=None)[0], 0)   # holding tick
+            self.assertFalse(_reported(td))
 
     def test_report_executes_nothing(self):
         # The module must have NO execution capability at all: a sustained

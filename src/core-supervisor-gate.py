@@ -94,28 +94,35 @@ def operator_intent(sentinel_path: str) -> bool:
     return bool(sentinel_path) and os.path.exists(sentinel_path)
 
 
-# ---- sustained-streak persistence ---- #
-def load_streak(state_file: str) -> int:
+# ---- sustained-streak + reported-latch persistence ---- #
+def load_state(state_file: str) -> tuple[int, bool]:
+    """Returns (streak, reported). reported=True means the CURRENT outage has
+    already been surfaced — it latches until a healthy/holding tick clears it,
+    so one persistent outage can never notify more than once (qingyun +
+    john-the-dev review, #2404)."""
     try:
         with open(state_file) as f:
             d = json.load(f)
-        return int(d.get("streak", 0)) if isinstance(d, dict) else 0
+        if not isinstance(d, dict):
+            return 0, False
+        return int(d.get("streak", 0)), bool(d.get("reported", False))
     except (OSError, ValueError):
-        return 0
+        return 0, False
 
 
-def save_streak(state_file: str, streak: int) -> None:
+def save_state(state_file: str, streak: int, reported: bool) -> None:
     d = os.path.dirname(state_file)
     if d:
         os.makedirs(d, exist_ok=True)
     tmp = state_file + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"streak": streak, "ts": time.time()}, f)
+        json.dump({"streak": streak, "reported": reported, "ts": time.time()}, f)
     os.replace(tmp, state_file)
 
 
 def tick(args) -> int:
-    """One evaluation. Returns the exit code (0 hold, 3 tripped)."""
+    """One evaluation. Returns the exit code (0 hold/already-reported, 3 =
+    NEW sustained trip — reported exactly once per outage)."""
     hb = heartbeat_stale(args.alive, args.stale_sec)
     gone = session_gone(args.socket, args.session)
     intent = operator_intent(args.restart_sentinel)
@@ -123,20 +130,35 @@ def tick(args) -> int:
     if gone is None:
         print("gate: session probe UNKNOWN (tmux error) — holding, not confirmed death")
 
-    streak = load_streak(args.state_file) + 1 if tripped_now else 0
+    prev_streak, reported = load_state(args.state_file)
+    streak = prev_streak + 1 if tripped_now else 0
     verdict = "TRIP" if tripped_now else "healthy"
     print(f"gate: hb_stale={hb} session_gone={gone} operator_intent={intent} "
-          f"→ {verdict} (streak {streak}/{args.sustain})")
+          f"→ {verdict} (streak {streak}/{args.sustain}, reported={reported})")
 
-    if streak < args.sustain:
-        save_streak(args.state_file, streak)
+    if not tripped_now:
+        # Healthy or holding observation: clears the streak AND the reported
+        # latch, so the NEXT sustained death is a new outage and reports again.
+        save_state(args.state_file, 0, False)
         return 0
 
-    # Sustained trip → report once, then reset so the next death re-arms
-    # cleanly. NOTIFICATION-ONLY by owner decision on #2401: this gate never
-    # executes a relaunch — exit 3 is the signal the notification layer (and
-    # a human-triggered restart, #2408) act on.
-    save_streak(args.state_file, 0)
+    if streak < args.sustain:
+        save_state(args.state_file, streak, reported)
+        return 0
+
+    if reported:
+        # Same outage, already surfaced — stay silent. Without this latch a
+        # persistent outage would re-earn the threshold and notify every
+        # --sustain ticks (the notification-storm case both reviewers repro'd).
+        save_state(args.state_file, streak, True)
+        print("gate: sustained death CONTINUES (already reported — not re-notifying)")
+        return 0
+
+    # NEW sustained trip → report exactly once; the latch holds until a
+    # healthy/holding tick clears it. NOTIFICATION-ONLY by owner decision on
+    # #2401: this gate never executes a relaunch — exit 3 is the signal the
+    # notification layer (and a human-triggered restart, #2408) act on.
+    save_state(args.state_file, streak, True)
     print("CORE-DEAD: sustained compound signal — notify the owner; "
           "restart is human-triggered (menu / 'restart core' chat command)")
     return 3
