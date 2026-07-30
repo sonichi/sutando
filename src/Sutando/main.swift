@@ -343,6 +343,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Stop Core CLI", action: #selector(stopCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart Sutando App", action: #selector(restartSelf), keyEquivalent: ""))
@@ -410,6 +411,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // rather than waiting 30min.
         DispatchQueue.global(qos: .background).async { [weak self] in
             self?.runHealthCheck()
+        }
+
+        // Easy-restart intent poller (sonichi#2401): every 5s, consume
+        // <workspace>/state/core-restart-requested.json (written by a bridge
+        // on the owner's "restart core" / "stop core" chat command — bridges
+        // survive core death, which is exactly when this matters) and run the
+        // action HERE, in the GUI login session, so the relaunch comes up
+        // authenticated (no SSH keychain wall — the 2026-07-29 outage class).
+        // Human-triggered only: nothing writes this file autonomously, and a
+        // consumed "stop" has no auto-restart anywhere. Consume-before-act +
+        // 10-min staleness drop mirror core_restart_intent.py exactly.
+        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.pollRestartIntent()
         }
 
         // Presenter mode: poll iclr-highlight server for on/off state.
@@ -1733,7 +1747,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let action = starting ? "start" : "stop"
         notify("Sutando", starting ? "● Recording screen + mic — press ⌃⇧R again to stop" : "Stopping recording…")
 
-        guard let url = URL(string: "http://localhost:7845/capture-video?action=\(action)") else { return }
+        // User-stopped recordings get the server's 4h cap, not the 600s default (#2279 added ?max; this caller never sent it).
+        let maxParam = starting ? "&max=14400" : ""
+        guard let url = URL(string: "http://localhost:7845/capture-video?action=\(action)\(maxParam)") else { return }
         var req = URLRequest(url: url)
         // /capture-video requires a shared token (the server writes it to a 0600
         // file a web page can't read; a browser also can't set a custom header on
@@ -2467,6 +2483,79 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let preview = String(errStr.prefix(200))
                 self?.notify("Sutando", "Core restart failed (exit \(proc.terminationStatus)): \(preview)")
             }
+        }
+    }
+
+    /// Stop ONLY the core CLI session (sonichi#2401 "stop means stop"):
+    /// bridges and services keep running, and nothing relaunches the core
+    /// until the user asks (menu or chat command).
+    @objc func stopCore() {
+        notify("Sutando", "Stopping Core CLI…")
+        runCoreAction(script: repoRoot + "/src/agent/stop-core.sh", args: [],
+                      okMessage: "Core stopped. It stays stopped until you restart it.",
+                      failVerb: "Core stop")
+    }
+
+    /// Shared runner for core start/stop scripts: detached bash, stderr
+    /// surfaced via notify on failure (same contract as restartCore).
+    private func runCoreAction(script: String, args: [String],
+                               okMessage: String, failVerb: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script] + args
+        let errPipe = Pipe()
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = errPipe
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                try proc.run()
+            } catch {
+                self?.notify("Sutando", "\(failVerb) failed to start: \(error.localizedDescription)")
+                return
+            }
+            proc.waitUntilExit()
+            if proc.terminationStatus == 0 {
+                self?.notify("Sutando", okMessage)
+            } else {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8) ?? ""
+                let preview = String(errStr.prefix(200))
+                self?.notify("Sutando", "\(failVerb) failed (exit \(proc.terminationStatus)): \(preview)")
+            }
+        }
+    }
+
+    /// Consume <workspace>/state/core-restart-requested.json and perform the
+    /// requested action in THIS (GUI) session. Mirrors core_restart_intent.py:
+    /// delete-before-act, unknown/malformed/stale (>600s) intents dropped —
+    /// and the delete must SUCCEED before any dispatch: an undeletable file
+    /// would re-fire the same action every 5s poll, so fail closed instead
+    /// (qingyun review, #2408).
+    func pollRestartIntent() {
+        let path = workspace + "/state/core-restart-requested.json"
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        let raw = try? String(contentsOfFile: path, encoding: .utf8)
+        do {
+            try FileManager.default.removeItem(atPath: path)  // consume FIRST
+        } catch {
+            notify("Sutando", "Restart request file couldn't be consumed — NOT acting (would loop). Remove it manually: \(path)")
+            return
+        }
+        guard let raw = raw,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let action = obj["action"] as? String,
+              let requestedAt = obj["requested_at"] as? Double,
+              Date().timeIntervalSince1970 - requestedAt <= 600 else { return }
+        switch action {
+        case "restart":
+            notify("Sutando", "Chat-requested core restart — relaunching…")
+            restartCore()
+        case "stop":
+            notify("Sutando", "Chat-requested core stop.")
+            stopCore()
+        default:
+            return
         }
     }
 

@@ -197,6 +197,14 @@ class TestMain(unittest.TestCase):
             self._run(["--title", "hello", "--no-logs"])
         self.assertEqual(uo.call_count, 1)
 
+    def test_successful_post_sets_explicit_user_agent(self):
+        with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:
+            self._run(["--title", "hello", "--no-logs"])
+
+        request = uo.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"), "Sutando-Feedback/1.0")
+
     def test_successful_post_attaches_logs(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)

@@ -161,6 +161,19 @@ def raw_post(path, raw, token="test-token-123"):
 check("malformed JSON to submit (400)", raw_post("/delegation/tasks", b"not json{") == 400)
 check("malformed JSON to archive (400)", raw_post("/delegation/archive", b"],![") == 400)
 
+# 5d. POST /task success path — the agent-to-agent submit endpoint writes a
+# `source: api` task file and fires the anonymous task_processed emit at the
+# write site (the telemetry coverage added for API-created tasks; the messaging
+# bridges already emitted, this surface didn't). No callback_url → skips the
+# SSRF branch. Served on the main thread by req(), so the write + emit lines are
+# traced for the coverage gate.
+code, data = req("POST", "/task", {"from": "agent-2", "task": "research the thing"})
+check("POST /task accepted", code == 200 and data.get("ok") is True, str(data))
+_api_tasks = [p for p in api.TASK_DIR.glob("task-*.txt")
+              if "source: api" in p.read_text() and "from: agent-2" in p.read_text()]
+check("POST /task wrote a source: api task file", len(_api_tasks) == 1,
+      f"found {len(_api_tasks)} matching task files")
+
 # 6. No-token-configured core refuses delegation entirely (403), every route.
 api.API_TOKEN = ""
 code, data = req("POST", "/delegation/tasks", {"id": "task-e2e-2", "content": "x"}, token=None)

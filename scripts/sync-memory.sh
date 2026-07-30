@@ -517,11 +517,17 @@ else
         exit 1
     fi
     git commit -m "Sync $(hostname) $(date +%Y-%m-%dT%H:%M)" 2>&1 | tee -a "$LOG" >/dev/null
-    if git push 2>&1 | tee -a "$LOG" >/dev/null; then
+    # NOTE: do not test a `cmd | tee` pipeline — without pipefail the if sees
+    # tee's exit status (always 0) and a FAILED push prints "Pushed changes"
+    # (observed 2026-07-28: 115-commit backlog reported as pushed while the
+    # origin was unreachable). tee's stdout went to /dev/null anyway, so a
+    # plain append-redirect keeps the log and tests git push itself.
+    if git push >>"$LOG" 2>&1; then
         log "Pushed changes"
         echo "Pushed changes from $(hostname)."
     else
         log "Push failed"
+        PUSH_FAILED=1
     fi
 fi
 
@@ -543,5 +549,10 @@ fi
 
 NOTES_COUNT=$(find notes -type f 2>/dev/null | wc -l | tr -d ' ')
 MEMORY_COUNT=$(ls memory/*.md 2>/dev/null | wc -l | tr -d ' ')
+if [ "${PUSH_FAILED:-0}" = "1" ]; then
+    log "Sync FAILED: git push failed ($MEMORY_COUNT memory, $NOTES_COUNT notes committed locally, NOT pushed)"
+    echo "Sync FAILED: git push failed — changes committed locally but NOT pushed. Memory: $MEMORY_COUNT files, Notes: $NOTES_COUNT files." >&2
+    exit 1
+fi
 log "Sync complete: $MEMORY_COUNT memory, $NOTES_COUNT notes"
 echo "Sync complete. Memory: $MEMORY_COUNT files, Notes: $NOTES_COUNT files."

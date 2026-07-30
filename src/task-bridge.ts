@@ -15,7 +15,11 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { claudeHomePath } from './util_paths.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
-import { selectBackend, type TaskDelegationService } from './task-delegation.js';
+import {
+	emitTaskProcessed,
+	selectBackend,
+	type TaskDelegationService,
+} from './task-delegation.js';
 
 const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
@@ -567,8 +571,7 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					// `task:` last so the (multi-line) context-drop body can't
 					// forge header fields. Same shape as the voice/chat task
 					// writers and agent-api.py's /task endpoint per PR #982.
-					writeFileSync(
-						join(TASK_DIR, `${taskId}.txt`),
+					const taskContent =
 						`id: ${taskId}\n` +
 						`timestamp: ${new Date().toISOString()}\n` +
 						`source: context-drop\n` +
@@ -577,8 +580,12 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 						`user_id: ${ownerId}\n` +
 						`access_tier: owner\n` +
 						`priority: normal\n` +
-						`task: User dropped context via hotkey. Process this:\n${confineUserContent(content)}\n`,
+						`task: User dropped context via hotkey. Process this:\n${confineUserContent(content)}\n`;
+					writeFileSync(
+						join(TASK_DIR, `${taskId}.txt`),
+						taskContent,
 					);
+					emitTaskProcessed(taskContent);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available
 					onContextDrop(content);
@@ -813,7 +820,17 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 			for (const file of files) {
 				if (_deliveredResults.has(file)) continue;
 				const path = join(RESULT_DIR, file);
-				const result = readFileSync(path, 'utf-8').trim();
+				// `[dm-only]` is a Discord-routing privacy marker (see
+				// src/result_markers.py) — on the Python bridge side it suppresses
+				// any [channel:] redirect on the same body (so a body carrying
+				// private data can't be redirected out to a shared channel). It does
+				// NOT by itself force DM delivery — routing to the owner's DM stays
+				// the consumer's job (for a proactive-* result the default
+				// destination already is the owner's DM). It has no meaning for the
+				// voice/task path, so strip it on read: this keeps voice from ever
+				// speaking "dm only" and keeps it out of logs. Parity with Python
+				// parse_markers(), which strips it before delivery.
+				const result = readFileSync(path, 'utf-8').replace(/\[dm-only\]\s*/gi, '').trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
 

@@ -34,9 +34,19 @@ WORKSPACE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
 reason="$1"
 shift
 
-# Defer if any task-*.txt is queued (top-level only; archive/processed subdirs
-# don't count). find is safer than ls + glob for empty-dir / non-existent-dir.
-if [ -d "$WORKSPACE/tasks" ] && [ -n "$(find "$WORKSPACE/tasks" -maxdepth 1 -name 'task-*.txt' -print -quit 2>/dev/null)" ]; then
+# Defer if any OWNER task-*.txt is queued (top-level only; archive/processed
+# subdirs don't count). find is safer than ls + glob for empty-dir /
+# non-existent-dir.
+#
+# Exclude task-cron-*.txt: those are emitted by src/cron-runner.py (the launchd
+# cron owner) as its delivery vehicle for `launchd: true` entries, carrying
+# user_id: cron-runner / priority: low — machine work, never the human-owner
+# DMs/voice this gate exists to yield to. Without the exclusion a cron-gate-
+# wrapped entry that has been migrated to launchd defers on its own emitted
+# file every fire, silently and permanently. This is the gate-side (root) half
+# of the fix; the eligibility-side half (don't migrate gated entries) landed in
+# reconcile_launchd.py.
+if [ -d "$WORKSPACE/tasks" ] && [ -n "$(find "$WORKSPACE/tasks" -maxdepth 1 -name 'task-*.txt' ! -name 'task-cron-*.txt' -print -quit 2>/dev/null)" ]; then
   echo "cron-gate: owner tasks queued — deferring $reason (will retry next fire)"
   exit 0
 fi
