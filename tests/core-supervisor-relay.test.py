@@ -89,7 +89,26 @@ class TestComposeMessage(unittest.TestCase):
     def test_handles_no_prompt(self):
         m = compose_message(_LOGGED_OUT)
         self.assertIn("not authenticated", m)
-        self.assertTrue(m.endswith("resolve."))
+        self.assertTrue(m.endswith("resolve this."))
+
+    # Login-class states (sonichi#2397): the remedy is a GUI /login on the host —
+    # "reply here or open the app" prescribes actions that cannot clear them.
+    def test_logged_out_names_gui_login_remedy(self):
+        m = compose_message(_LOGGED_OUT)
+        self.assertIn("GUI /login", m)
+        self.assertNotIn("reply here or open the app", m)
+
+    def test_login_prompt_names_gui_login_remedy(self):
+        m = compose_message(_LOGIN)
+        self.assertIn("GUI /login", m)
+        self.assertNotIn("reply here or open the app", m)
+
+    def test_non_login_blocker_keeps_reply_here_remedy(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user: selection",
+               "prompt": "pick one", "kind": "selection"}
+        m = compose_message(sig)
+        self.assertIn("reply here or open the app to resolve.", m)
+        self.assertNotIn("GUI /login", m)
 
     def test_truncates_long_prompt(self):
         big = {"state": "blocked-human", "detail": "awaiting user: unknown",
