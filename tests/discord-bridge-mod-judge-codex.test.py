@@ -19,6 +19,8 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "tests" / "_helpers"))
+from discord_env import seed_discord_token  # noqa: E402
 
 # Stub minimal discord module
 _discord_stub = types.ModuleType("discord")
@@ -56,11 +58,11 @@ sys.modules["discord"] = _discord_stub
 
 def load_bridge():
     src = (REPO / "src" / "discord-bridge.py").read_text()
-    fake_env_dir = Path.home() / ".claude" / "channels" / "discord"
-    fake_env = fake_env_dir / ".env"
-    if not fake_env.exists():
-        fake_env_dir.mkdir(parents=True, exist_ok=True)
-        fake_env.write_text("DISCORD_BOT_TOKEN=test-stub-token\n")
+    # Seed under the CONFIG ROOT the bridge actually reads ($CLAUDE_CONFIG_DIR,
+    # else ~/.claude). Hardcoding Path.home()/".claude" here was wrong whenever
+    # CLAUDE_CONFIG_DIR is set, and only passed because a sibling fixture leaked
+    # its temp config root into the process (#2357).
+    seed_discord_token()
     spec = importlib.util.spec_from_loader("bridge", loader=None)
     bridge = importlib.util.module_from_spec(spec)
     bridge.__file__ = str(REPO / "src" / "discord-bridge.py")
