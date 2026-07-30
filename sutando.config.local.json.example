@@ -19,6 +19,7 @@
     "sync": {
       "include": [
         "notes/",
+        "hosts/*/",
         "memory/"
       ]
     }
