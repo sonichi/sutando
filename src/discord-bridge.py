@@ -88,6 +88,7 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
@@ -3251,6 +3252,31 @@ async def _handle_discord_message(message, force=False):
     if access_tier != "owner" and TEAM_TIER_OWNER and LOCAL_MACHINE != TEAM_TIER_OWNER:
         print(f"  [tier-ownership] dropping {access_tier}-tier task from @{username} — owner is {TEAM_TIER_OWNER}, this node is {LOCAL_MACHINE or 'unknown'}")
         return
+
+    # Owner easy-restart command (sonichi#2401): "restart core" / "stop core"
+    # is handled by the BRIDGE, not the core — the whole point is that it works
+    # while the core is dead. Write the intent file for the GUI-session
+    # executor (Sutando.app poller) and ack; no task file is created. Owner
+    # tier only — never team/other, and parse is exact-match so prose that
+    # merely mentions restarting can't trigger it.
+    if text and access_tier == "owner":
+        _restart_action = parse_restart_command(text)
+        if _restart_action:
+            try:
+                write_intent(str(REPO), _restart_action, "discord")
+                _ack = ("Restart requested — the app will relaunch the core in a few "
+                        "seconds (authenticated, GUI session). I'll be back once it's up."
+                        if _restart_action == "restart" else
+                        "Stop requested — the app will stop the core in a few seconds. "
+                        "It stays stopped until you say `restart core`.")
+            except Exception as _ri_exc:
+                _ack = f"Couldn't write the {_restart_action} request ({type(_ri_exc).__name__}) — not queued."
+            print(f"  [core-restart] owner {_restart_action} command from @{username}", flush=True)
+            try:
+                await message.channel.send(_ack)
+            except Exception as _ri_send_exc:
+                print(f"  [core-restart] ack send failed: {_ri_send_exc}", flush=True)
+            return
 
     # Write as task
     ts = int(time.time() * 1000)
