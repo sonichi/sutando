@@ -78,14 +78,13 @@ BRIDGE_IMPORT = re.compile(r"(discord|slack|telegram)-bridge\.py")
 
 # Grandfathered: known-unisolated at the time this lint landed. Mini's shared-helper
 # migration removes these; the stale-entry check below forces the list to shrink.
-# Measured on origin/main @ 749f7e79 (2026-07-30) with the AST classifier. The count rose
+# Measured on origin/main (2026-07-30, post-#2428-merge) with the AST classifier. The count rose
 # from 26 to 27 when detection moved off regex: two files the regex called clean were real
 # bypasses (assignment-shaped comment / assignment after exec_module), which is exactly the
 # P1 qingyun raised on #2429.
 KNOWN_UNISOLATED = frozenset(
     """
 tests/audio-transcribe-skill.test.py
-tests/bridge-audit-wiring.test.py
 tests/bridge-env-token-perms.test.py
 tests/bridge-not-allowlisted-ack.test.py
 tests/bridge-restart-intercept.test.py
