@@ -36,18 +36,33 @@ def _truncate(text: str, max_chars: int) -> str:
     return text
 
 
+# A numeric cell whose exact decimal expansion would be enormous is not
+# meaningful tabular data. Because the summary is built BEFORE _truncate() runs,
+# rendering (or aggregating) such a value on an untrusted attachment is a
+# resource-exhaustion vector — e.g. a cell of "1e-100000" expands to ~300k chars.
+# Cap both the order of magnitude and the significant-digit count so any accepted
+# number renders in O(cap) chars; anything past the cap falls back to plain text.
+_NUM_MAGNITUDE_CAP = 1000
+
+
 def _parse_number(cell: str):
-    """Exact numeric parse of a cell → a *finite* Decimal, else None.
+    """Exact, *bounded* numeric parse of a cell → a finite Decimal, else None.
 
     Uses Decimal (not float) so integers beyond IEEE-754 precision (>2**53) keep
-    their exact value instead of silently rounding. Decimal ALSO parses 'NaN' /
-    'Infinity', so non-finite results are explicitly rejected (→ None): otherwise
-    a single 'NaN'/'inf' text cell would crash the digest or poison an aggregate."""
+    their exact value instead of silently rounding. Rejects (→ None, treated as
+    text) anything that isn't a safe numeric datum: Decimal ALSO parses 'NaN' /
+    'Infinity' (→ reject via is_finite), and a finite value whose magnitude or
+    digit count exceeds _NUM_MAGNITUDE_CAP is rejected so a degenerate exponent
+    like '1e-100000' can't blow the summary up before truncation."""
     try:
         d = Decimal(cell.replace(",", ""))
     except InvalidOperation:
         return None
-    return d if d.is_finite() else None
+    if not d.is_finite():
+        return None
+    if abs(d.adjusted()) > _NUM_MAGNITUDE_CAP or len(d.as_tuple().digits) > _NUM_MAGNITUDE_CAP:
+        return None
+    return d
 
 
 def _fmt_num(x: Decimal) -> str:

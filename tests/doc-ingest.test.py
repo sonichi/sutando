@@ -397,5 +397,16 @@ with tempfile.TemporaryDirectory() as td:
     check("csv-summary-numeric-domain",
           code == 0 and "**amount**: 2 non-empty" in out and "amount**: 2 non-empty; numeric" not in out
           and "**id**: 2 non-empty; numeric → sum 3, min 1, max 2" in out, out[:400])
+    # 31. Resource-exhaustion guard (P1 review, qingyun-wu): an extreme finite exponent
+    #     must NOT expand to a giant fixed-point string — it falls back to text, bounded.
+    check("table-summary-extreme-exponent",
+          "numeric" not in ingest._table_summary([["value"], ["1e-100000"], ["3"]])
+          and "numeric" not in ingest._table_summary([["value"], ["1e100000"]])
+          and len(ingest._table_summary([["value"], ["1e-100000"]])) < 200)
+    ext = tmp / "ext.csv"
+    ext.write_text("value\n1e-100000\n")
+    code, out, _ = run_cli([str(ext)])
+    check("csv-extreme-exponent-bounded",
+          code == 0 and "numeric" not in out and len(out) < 500, f"len={len(out)}")
 
 print(f"OK — {len(passed)} checks passed: {', '.join(passed)}")
