@@ -131,9 +131,15 @@ check("resolved section excluded", not any("old" in t.lower() for t in titles))
 
 # --- RATCHET: exactly ONE definition of the divider. Four independent copies is what
 #     produced this outage; a fifth would go dark the same way.
+#     SCOPE, not just pattern: a flat src/*.py glob would not see a divider parser
+#     added under src/<subdir>/, scripts/ or skills/. Nothing lives there today
+#     (verified repo-wide across 347 .py/.ts/.sh files, with a known-positive control
+#     that the query does find dashboard.py:126 when reinstated) — so this widening
+#     keeps that true by construction rather than by luck.
 offenders, scanned = [], 0
-for py in sorted((REPO / "src").glob("*.py")):
-    if py.name == "pending_questions_md.py":
+roots = [REPO / "src", REPO / "scripts", REPO / "skills"]
+for py in sorted(f for r in roots if r.is_dir() for f in r.rglob("*.py")):
+    if py.name == "pending_questions_md.py" or "node_modules" in py.parts:
         continue
     scanned += 1
     for i, line in enumerate(py.read_text().splitlines(), 1):
@@ -146,7 +152,7 @@ for py in sorted((REPO / "src").glob("*.py")):
                 re.search(r'r[\'"]\^#', line)
                 or re.search(r'\.(?:partition|split|find|index)\(', line)):
             offenders.append(f"{py.name}:{i}")
-check(f"no second divider definition in src/ (scanned {scanned} files; found {offenders or 'none'})",
+check(f"no second divider definition in src/, scripts/ or skills/ (scanned {scanned} files; found {offenders or 'none'})",
       scanned > 20 and not offenders)
 
 passed = sum(ok for _, ok in CASES)
