@@ -67,12 +67,20 @@ def normalize_number(text: str) -> str:
     # "1,234,567" -> "1234567" (only when the whole token is a comma-grouped number)
     if _PURE_NUMBER_COMMAS.match(s):
         return s.replace(",", "")
-    # "$1234" / "1234%" -> strip a single leading/trailing symbol when the rest is numeric
+    # "$1234" / "$1,000" / "1,000%" -> strip a single leading/trailing symbol
+    # when the rest is numeric — plain OR comma-grouped. The symbol strip and
+    # the thousands-separator removal must COMPOSE (qingyun CR on #2382:
+    # '$1,000' previously survived number mode intact and, worse, auto mode
+    # list-split it into '$1, 000'). Order: symbol, percent, then commas.
     stripped = s
-    if stripped[:1] in "$€£¥" and re.fullmatch(r"-?\d+(?:\.\d+)?", stripped[1:]):
+    if stripped[:1] in "$€£¥" and (
+            re.fullmatch(r"-?\d+(?:\.\d+)?", stripped[1:]) or _PURE_NUMBER_COMMAS.match(stripped[1:])):
         stripped = stripped[1:]
-    if stripped[-1:] == "%" and re.fullmatch(r"-?\d+(?:\.\d+)?", stripped[:-1]):
+    if stripped[-1:] == "%" and (
+            re.fullmatch(r"-?\d+(?:\.\d+)?", stripped[:-1]) or _PURE_NUMBER_COMMAS.match(stripped[:-1])):
         stripped = stripped[:-1]
+    if _PURE_NUMBER_COMMAS.match(stripped):
+        stripped = stripped.replace(",", "")
     return stripped
 
 
@@ -117,7 +125,16 @@ def normalize_answer(text: str, kind: str | None = None, *,
 
 def _infer_kind(text: str) -> str:
     s = text.strip()
-    if "," in s and not _PURE_NUMBER_COMMAS.match(s):
+    # Comma-grouped numbers must dodge list classification even when wrapped in
+    # the supported symbol forms — '$1,000' is a number, not the list ['$1','000']
+    # (qingyun CR on #2382). Strip the one leading symbol / trailing percent the
+    # number path itself supports, then test the grouped-number core.
+    core = s
+    if core[:1] in "$€£¥":
+        core = core[1:]
+    if core[-1:] == "%":
+        core = core[:-1]
+    if "," in s and not _PURE_NUMBER_COMMAS.match(core):
         return "list"
     if _MAGNITUDE_RE.match(s) or re.fullmatch(r"[-$€£¥]?\d[\d,]*(?:\.\d+)?%?", s):
         return "number"

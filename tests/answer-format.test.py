@@ -67,6 +67,15 @@ check("auto-unknown-kind-passthru", nz.normalize_answer("whatever", kind="other"
 # --- the exact GAIA L3 miss this recovers ---
 check("gaia-100m-miss", nz.normalize_answer("100 million", kind="number"), "100000000")
 
+# --- currency symbol × thousands separator must COMPOSE (qingyun CR on #2382:
+# auto('$1,000') list-split to '$1, 000'; number('$1,000') passed through intact) ---
+check("currency-grouped-auto", nz.normalize_answer("$1,000"), "1000")
+check("currency-grouped-number", nz.normalize_answer("$1,000", kind="number"), "1000")
+check("currency-grouped-euro-decimal", nz.normalize_answer("€1,234,567.89"), "1234567.89")
+check("percent-grouped-compose", nz.normalize_answer("1,000%"), "1000")
+check("currency-grouped-not-list", nz._infer_kind("$1,000"), "number")
+check("real-list-still-list", nz._infer_kind("pears, bananas"), "list")
+
 # --- CLI ---
 def run(argv):
     out = io.StringIO()
