@@ -381,28 +381,53 @@ def zero_reason():
         return f"0 pending questions — no file at {PQ_FILE}"
 
     text = PQ_FILE.read_text()
-    total = len(re.findall(r'^## ', text, flags=re.MULTILINE))
     active_text = active_region(text)
-    active = len(re.findall(r'^## ', active_text, flags=re.MULTILINE))
-    # get_waiting_questions also recognizes the free-form `- **[label]** ...` bullets,
-    # so a file can be non-empty in a way the section count alone would not show.
-    bullets = len(re.findall(r'^\s*-\s+\*\*\[', text, flags=re.MULTILINE))
 
-    if total == 0 and bullets == 0:
+    # The denominator must cover the SAME populations the numerator counts.
+    # get_waiting_questions() recognizes BOTH `## ` sections and the free-form
+    # `- **[label]** ...` bullets the proactive loop writes in practice, so counting
+    # only sections leaves the bullet-only file — a real, supported shape — able to
+    # report a trusted-looking zero in exactly the situation this function exists to
+    # flag. Found in review of the first revision, with a reproduction: a file that is
+    # nothing but `# Resolved` + one bullet yielded "every one is explicitly
+    # resolved/answered", which is the opposite of the intended signal.
+    SECTION_RE = r'^## '
+    BULLET_RE = r'^\s*-\s+\*\*\['
+
+    def _tally(s: str) -> tuple[int, int]:
+        return (len(re.findall(SECTION_RE, s, flags=re.MULTILINE)),
+                len(re.findall(BULLET_RE, s, flags=re.MULTILINE)))
+
+    file_secs, file_bullets = _tally(text)
+    act_secs, act_bullets = _tally(active_text)
+    file_total = file_secs + file_bullets
+    act_total = act_secs + act_bullets
+
+    def _describe(secs: int, bullets: int) -> str:
+        parts = []
+        if secs:
+            parts.append(f"{secs} '## ' section(s)")
+        if bullets:
+            parts.append(f"{bullets} bullet entr(ies)")
+        return " + ".join(parts) if parts else "nothing"
+
+    if file_total == 0:
         return "0 pending questions — the file holds no sections or bullets at all"
 
-    if active == 0 and total > 0:
+    # Suspicious shape: the file has entries, the ACTIVE region has none. Fires for
+    # sections, bullets, or any mix — the population that vanished does not matter.
+    if act_total == 0:
         return (
-            f"0 pending questions, but {PQ_FILE.name} holds {total} '## ' section(s) and "
-            f"NONE of them are in the active region (above the archive divider). "
+            f"0 pending questions, but {PQ_FILE.name} holds {_describe(file_secs, file_bullets)} "
+            f"and NONE are in the active region (above the archive divider). "
             f"That is the shape of a parse fault, not a quiet day — check the "
             f"'# Resolved' divider before trusting this zero."
         )
 
     return (
-        f"0 pending questions — {active} of {total} '## ' section(s) are above the "
-        f"divider and every one is explicitly resolved/answered"
-        + (f"; {bullets} bullet-format entr(ies) also all resolved" if bullets else "")
+        f"0 pending questions — the active region holds "
+        f"{_describe(act_secs, act_bullets)} (of {_describe(file_secs, file_bullets)} "
+        f"in the file) and every one is explicitly resolved/answered"
     )
 
 

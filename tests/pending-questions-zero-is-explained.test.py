@@ -83,6 +83,31 @@ check("quiet day still reports the denominator", "of 2 '## ' section(s)" in quie
 check("empty file is described as empty", "no sections or bullets" in empty)
 check("missing file is described as missing", "no file at" in missing)
 
+# --- REVIEW REGRESSION (raised on the first revision, with a reproduction).
+#     get_waiting_questions() counts BOTH `## ` sections and free-form
+#     `- **[label]**` bullets, but the first zero_reason() computed its denominator
+#     from sections alone and only entered the suspicious branch when
+#     `active == 0 and total > 0`. A bullet-only file with a lost active region
+#     therefore printed "every one is explicitly resolved/answered" — a
+#     trusted-looking zero in precisely the shape this function exists to flag.
+#     The denominator must cover the same populations the numerator counts.
+BULLET_ONLY_FAULT = "# Resolved\n\n- **[OPEN-ALPHA, 2026-07-30]** still waiting\n"
+MIXED_FAULT = "# Resolved\n\n## Q1\n\nprose\n\n- **[OPEN-BETA, 2026-07-30]** waiting\n"
+
+bullet_fault = reason_for("bullet_fault", BULLET_ONLY_FAULT)
+mixed_fault = reason_for("mixed_fault", MIXED_FAULT)
+
+check("bullet-only file with a lost active region is NAMED a parse fault",
+      "parse fault" in bullet_fault)
+check("bullet-only fault must NOT claim everything is resolved",
+      "resolved/answered" not in bullet_fault)
+check("bullet-only fault reports the bullet denominator",
+      "1 bullet entr(ies)" in bullet_fault)
+check("mixed sections+bullets with a lost active region is a parse fault",
+      "parse fault" in mixed_fault)
+check("mixed fault reports BOTH populations",
+      "'## ' section(s)" in mixed_fault and "bullet entr(ies)" in mixed_fault)
+
 # --- CONTROL: the message must DISCRIMINATE. A diagnostic that says the same thing
 #     in both cases is decoration, not a signal.
 check("fault and quiet-day messages differ", fault != quiet)
