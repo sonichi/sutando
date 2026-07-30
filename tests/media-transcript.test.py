@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Tests for skills/media-transcript — hermetic, NO network.
+
+The end-to-end path is exercised against a STUB yt-dlp placed first on PATH
+(it writes a canned VTT into the -o target dir), so orchestration, language
+preference, dedupe parsing and JSON mode all run without touching the network.
+The parser is additionally unit-tested against a rolling-caption VTT (the
+auto-caption shape that triples text when joined naively).
+
+Run: python3 tests/media-transcript.test.py   (exit 0 pass / 1 fail)
+"""
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import os
+import stat
+import sys
+import tempfile
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location(
+    "media_transcript", REPO / "skills" / "media-transcript" / "scripts" / "transcript.py")
+mt = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mt)
+
+failures: list[str] = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    print(("ok   " if cond else "FAIL ") + name + ("" if cond else f" — {detail}"))
+    if not cond:
+        failures.append(name)
+
+
+def run_main(argv, env=None):
+    out, err = io.StringIO(), io.StringIO()
+    old_env = dict(os.environ)
+    if env is not None:
+        os.environ.clear()
+        os.environ.update(env)
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = mt.main(argv)
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+    return rc, out.getvalue(), err.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# parse_vtt — rolling-caption dedupe (the auto-caption shape)
+# ---------------------------------------------------------------------------
+ROLLING_VTT = """WEBVTT
+Kind: captions
+Language: en
+
+00:00:01.000 --> 00:00:03.000
+in the future machines will think
+
+00:00:03.000 --> 00:00:05.000
+in the future machines will think
+perhaps in ten or fifteen years
+
+00:00:05.000 --> 00:00:07.000
+perhaps in ten or fifteen years
+one hundred million users
+"""
+
+flat = mt.parse_vtt(ROLLING_VTT)
+check("vtt: rolling windows deduped",
+      flat.splitlines() == ["in the future machines will think",
+                            "perhaps in ten or fifteen years",
+                            "one hundred million users"], repr(flat))
+ts = mt.parse_vtt(ROLLING_VTT, timestamps=True)
+check("vtt: timestamps mode prefixes cue starts", ts.startswith("[00:01] "), repr(ts[:40]))
+check("vtt: later fresh line timestamped", "[00:03] perhaps" in ts or "perhaps" in ts, repr(ts))
+
+TAGGED_VTT = """WEBVTT
+
+00:01:02.000 --> 00:01:04.000
+<c.colorE5E5E5>dinosaurs</c> first appeared &amp; thrived
+"""
+check("vtt: tags and entities stripped",
+      mt.parse_vtt(TAGGED_VTT) == "dinosaurs first appeared & thrived",
+      repr(mt.parse_vtt(TAGGED_VTT)))
+check("vtt: hour-long cue formats h:mm:ss",
+      mt.parse_vtt("WEBVTT\n\n01:02:03.000 --> 01:02:04.000\nhello\n",
+                   timestamps=True) == "[1:02:03] hello",
+      repr(mt.parse_vtt("WEBVTT\n\n01:02:03.000 --> 01:02:04.000\nhello\n", timestamps=True)))
+
+# ---------------------------------------------------------------------------
+# end-to-end with a STUB yt-dlp on PATH (no network)
+# ---------------------------------------------------------------------------
+def make_stub_bin(vtt_body: str, fail: bool = False) -> str:
+    d = tempfile.mkdtemp(prefix="mt-stub-")
+    stub = Path(d) / "yt-dlp"
+    if fail:
+        stub.write_text("#!/bin/bash\necho 'ERROR: Video unavailable' >&2\nexit 1\n")
+    else:
+        # find the value after -o, write the vtt next to it
+        stub.write_text(
+            "#!/bin/bash\n"
+            "out=''\n"
+            "prev=''\n"
+            "for a in \"$@\"; do if [ \"$prev\" = '-o' ]; then out=\"$a\"; fi; prev=\"$a\"; done\n"
+            "dir=$(dirname \"$out\")\n"
+            f"cat > \"$dir/sub.en.vtt\" << 'VTT'\n{vtt_body}\nVTT\n"
+            "exit 0\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    return d
+
+
+BASE_ENV = {k: v for k, v in os.environ.items() if k in ("HOME", "TMPDIR", "LANG")}
+
+stub_dir = make_stub_bin(ROLLING_VTT)
+rc, out, err = run_main(["https://youtube.com/watch?v=fake"],
+                        env={**BASE_ENV, "PATH": f"{stub_dir}:/usr/bin:/bin"})
+check("e2e: stub yt-dlp → transcript printed, exit 0",
+      rc == 0 and "machines will think" in out, f"rc={rc} err={err.strip()[:120]}")
+
+rc, out, err = run_main(["https://youtube.com/watch?v=fake", "--json"],
+                        env={**BASE_ENV, "PATH": f"{stub_dir}:/usr/bin:/bin"})
+check("e2e: --json shape", rc == 0 and json.loads(out.strip())["ok"] is True
+      and "machines" in json.loads(out.strip())["text"], out[:120])
+
+stub_fail = make_stub_bin("", fail=True)
+rc, out, err = run_main(["https://youtube.com/watch?v=gone"],
+                        env={**BASE_ENV, "PATH": f"{stub_fail}:/usr/bin:/bin"})
+check("e2e: extractor failure → exit 1 with its message",
+      rc == 1 and "Video unavailable" in err, f"rc={rc} err={err.strip()[:120]}")
+
+# yt-dlp entirely absent (PATH empty and module import blocked)
+import builtins
+real_import = builtins.__import__
+def _no_ytdlp(name, *a, **k):
+    if name == "yt_dlp":
+        raise ImportError("blocked for test")
+    return real_import(name, *a, **k)
+builtins.__import__ = _no_ytdlp
+try:
+    rc, out, err = run_main(["https://youtube.com/watch?v=x"],
+                            env={**BASE_ENV, "PATH": tempfile.mkdtemp(prefix="mt-empty-")})
+finally:
+    builtins.__import__ = real_import
+check("no yt-dlp anywhere → actionable install error, exit 1",
+      rc == 1 and "yt-dlp not found" in err and "brew install" in err, err.strip()[:140])
+
+# ---------------------------------------------------------------------------
+# invocation + pointer paths
+# ---------------------------------------------------------------------------
+rc, _, err = run_main([])
+check("no args → usage, exit 2", rc == 2 and "usage:" in err)
+
+rc, _, err = run_main(["--lang"])
+check("--lang without value → exit 2", rc == 2)
+
+local = Path(tempfile.mkdtemp(prefix="mt-local-")) / "clip.mp4"
+local.write_bytes(b"\x00")
+rc, out, err = run_main([str(local)])
+check("local media file → audio-transcribe pointer, exit 3",
+      rc == 3 and "audio-transcribe" in err, f"rc={rc} err={err.strip()[:100]}")
+rc, out, _ = run_main([str(local), "--json"])
+check("local media pointer in --json mode",
+      rc == 3 and json.loads(out.strip())["ok"] is False)
+
+print()
+if failures:
+    print(f"{len(failures)} FAILURE(S): {failures}")
+    sys.exit(1)
+print("All media-transcript checks passed.")
