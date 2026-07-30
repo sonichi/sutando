@@ -28,11 +28,27 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+# Isolate the channel config BEFORE the bridge import: _ag2space_access_path()
+# resolves under $CLAUDE_CONFIG_DIR (falling back to the real ~/.claude), and
+# _write_task() reads the tierMap from it at write time — without this, the
+# suite depends on the operator's REAL AG2 Space tier map (qingyun-wu CR on
+# #2432 round 2, P1-2: a controlled tierMap mapping the fixture sender to
+# "team" made the owner-activity assertion fail on an operator box).
+_CFG_ROOT = Path(tempfile.mkdtemp(prefix="rgb-telem-cfg-"))
+os.environ["CLAUDE_CONFIG_DIR"] = str(_CFG_ROOT)
+_ACCESS = _CFG_ROOT / "channels" / "ag2space" / "access.json"
+_ACCESS.parent.mkdir(parents=True, exist_ok=True)
+_ACCESS.write_text('{"allowFrom": [], "tierMap": {}}')
+
 # Import the exact module this PR modifies as a proper package import (same
 # rationale as tests/gateway-per-sender-tier.test.py — no shim indirection).
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 import ag2_sparrow.remote_gateway_bridge as rgb  # noqa: E402
 from ag2_sparrow._dirs import set_dirs  # noqa: E402
+from ag2_sparrow.event_consumer import TaskifyHandler  # noqa: E402
+
+# Deterministic local trust default regardless of the host's REMOTE_LOCAL_TIER.
+rgb.LOCAL_TIER = "owner"
 
 failures = []
 
@@ -58,6 +74,11 @@ def _fresh_dirs():
     rgb.TASKS_DIR.mkdir(parents=True, exist_ok=True)
     rgb.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     (tmp / "state").mkdir(parents=True, exist_ok=True)
+    # Reset the tierMap to the seeded EMPTY config and drop the mtime cache so
+    # no case inherits another case's (or the host's) tier state.
+    _ACCESS.write_text('{"allowFrom": [], "tierMap": {}}')
+    rgb._TIER_MAP_CACHE["mtime"] = None
+    rgb._TIER_MAP_CACHE["map"] = {}
     return tmp
 
 
@@ -210,11 +231,43 @@ check("owner-activity stamp under temp root",
       and rgb.OWNER_ACTIVITY_FILE.exists(),
       f"OWNER_ACTIVITY_FILE={rgb.OWNER_ACTIVITY_FILE}")
 
-# 7b. taskify promotion source survives the real pipeline too (PR-body claim).
-_t, payloads = _write_with_real_telemetry(
-    {"id": "task-telem7b", "task": "[taskify] observed", "source": "events-promotion"})
+# 7b. the REAL taskify path: TaskifyHandler._promote() writes its task file
+#     directly (never through _write_task), so it carries its own emit — test
+#     through the actual handler, not a hand-fed _write_task call (qingyun-wu
+#     CR on #2432 round 2, P1-1: the previous case proved the allowlist bucket
+#     but the production promotion path emitted nothing).
+tmp7b = Path(tempfile.mkdtemp(prefix="rgb-taskify-"))
+real = _load_real_telemetry(tmp7b / "telem-state")
+payloads = []
+real._post = lambda payload: payloads.append(payload)
+_prev = sys.modules.get("telemetry")
+sys.modules["telemetry"] = real
+try:
+    handler = TaskifyHandler(str(tmp7b / "tasks"), "@sutando-rui:ag2.space",
+                             threshold=1, log=lambda *a, **k: None)
+    before = set(threading.enumerate())
+    handler.offer({"event_id": "$e1", "type": "message.created",
+                   "actor_id": "@member:ag2.space", "room_id": "!room:ag2.space",
+                   "content": {"body": "observed message"}, "cursor": 1})
+    # idempotent re-drain of the SAME settled event must not double-count
+    handler.offer({"event_id": "$e1", "type": "message.created",
+                   "actor_id": "@member:ag2.space", "room_id": "!room:ag2.space",
+                   "content": {"body": "observed message"}, "cursor": 1})
+    for th in set(threading.enumerate()) - before:
+        th.join(timeout=2)
+finally:
+    if _prev is None:
+        sys.modules.pop("telemetry", None)
+    else:
+        sys.modules["telemetry"] = _prev
 tp = [p for p in payloads if p.get("event") == "task_processed"]
-check("events-promotion survives _coarse_source",
+check("taskify promotion wrote its task file",
+      handler.last_path is not None and Path(handler.last_path).exists()
+      and Path(handler.last_path).is_relative_to(tmp7b),
+      f"last_path={handler.last_path}")
+check("REAL taskify path emits task_processed once",
+      len(tp) == 1, repr(payloads))
+check("taskify emit tagged events-promotion",
       bool(tp) and tp[0]["properties"].get("source") == "events-promotion",
       repr(tp and tp[0]["properties"]))
 
@@ -226,6 +279,37 @@ tp = [p for p in payloads if p.get("event") == "task_processed"]
 check("unknown source still collapses to unknown",
       bool(tp) and tp[0]["properties"].get("source") == "unknown",
       repr(tp and tp[0]["properties"]))
+
+# 7d. hostile-tier control (P1-2 regression pin): with the CONTROLLED temp
+#     access.json down-tiering the fixture sender to "team", production must
+#     suppress the owner-activity stamp — and the suite must keep passing,
+#     proving no assertion secretly depends on the host's ambient tierMap.
+tmp7d = _fresh_dirs()
+_ACCESS.write_text('{"allowFrom": [], "tierMap": {"@rui:ag2.space": "team"}}')
+rgb._TIER_MAP_CACHE["mtime"] = None  # force re-read of the hostile map
+real = _load_real_telemetry(tmp7d / "telem-state")
+payloads = []
+real._post = lambda payload: payloads.append(payload)
+_prev = sys.modules.get("telemetry")
+sys.modules["telemetry"] = real
+try:
+    before = set(threading.enumerate())
+    rgb._write_task({"id": "task-telem7d", "task": "hi", "source": "ag2space",
+                     "user_id": "@rui:ag2.space", "channel_id": "!room:ag2.space"})
+    for th in set(threading.enumerate()) - before:
+        th.join(timeout=2)
+finally:
+    if _prev is None:
+        sys.modules.pop("telemetry", None)
+    else:
+        sys.modules["telemetry"] = _prev
+tp = [p for p in payloads if p.get("event") == "task_processed"]
+check("hostile tier: telemetry still emits (tier-independent)",
+      bool(tp) and tp[0]["properties"].get("source") == "ag2space", repr(payloads))
+check("hostile tier: task written with access_tier team",
+      "access_tier: team" in (tmp7d / "tasks" / "task-telem7d.txt").read_text())
+check("hostile tier: owner-activity stamp suppressed for non-owner",
+      not (tmp7d / "state" / "last-owner-activity.json").exists())
 
 print()
 if failures:
