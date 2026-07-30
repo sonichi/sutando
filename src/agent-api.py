@@ -215,7 +215,7 @@ def _remember_done_result_file(result_file: Path) -> None:
 # **Status:** markers) while the writer still required a **Status:**/**Options:**
 # line, so every free-form question was listed but unanswerable — POST /answer
 # 404'd on every id. Both paths stay on this function.
-PQ_ARCHIVE_RE = re.compile(r'^#\s+Resolved\b', re.MULTILINE)
+PQ_ARCHIVE_RE = re.compile(r'^#[ \t]+Resolved[ \t\r]*$', re.MULTILINE)
 PQ_SECTION_RE = re.compile(r'^## ', re.MULTILINE)
 PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', re.IGNORECASE)
 PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')

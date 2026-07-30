@@ -313,7 +313,7 @@ def get_pending_questions() -> list[str]:
     # top-level "# Resolved" divider (audit trail), not deleted — without
     # this cut the briefing speaks every resolved entry as still-pending.
     # No-op when there is no such divider.
-    content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
+    content = re.split(r'^#[ \t]+Resolved[ \t\r]*$', content, maxsplit=1, flags=re.MULTILINE)[0]
     # Organizer/section-shell headers (e.g. "## FRESH — 2026-07-05 [wu-air]",
     # "## ACTIVE — ...", "## SURFACED — ...") group questions but are not
     # themselves questions — skip them so the briefing's "top item" is a real

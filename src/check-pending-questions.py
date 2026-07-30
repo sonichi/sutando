@@ -92,7 +92,7 @@ def get_waiting_questions():
     # this cut the heading-agnostic split below sweeps the whole file and
     # every resolved entry is miscounted as pending, re-notifying the owner
     # about already-answered questions. No-op when there is no such divider.
-    content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
+    content = re.split(r'^#[ \t]+Resolved[ \t\r]*$', content, maxsplit=1, flags=re.MULTILINE)[0]
     questions = []
     # Walk each ## section; a section is waiting if its body contains
     # `Status: unanswered`, `Status: Waiting` or `Status: open`, OR has no

@@ -44,7 +44,7 @@ def check_pending_questions():
         return []
 
     # Discard resolved section (below a `# Resolved` / `# Done` divider).
-    content = re.split(r'^#\s+(?:Resolved|Done)\b', content, maxsplit=1, flags=re.MULTILINE)[0]
+    content = re.split(r'^#[ \t]+(?:Resolved|Done)[ \t\r]*$', content, maxsplit=1, flags=re.MULTILINE)[0]
 
     _RESOLVED_STATUS = re.compile(
         r'\*\*Status:\*\*\s*(?:resolved|answered|done|complete)',
