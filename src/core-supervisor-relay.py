@@ -41,6 +41,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import subprocess
 import sys
 
@@ -73,6 +74,12 @@ def should_escalate(signal: dict, last_hash):
     return True, h
 
 
+def _is_login_class(signal: dict) -> bool:
+    """Auth blockers need a GUI /login on the host — no reply or app tap can
+    clear them (an SSH-spawned boot inherits a locked keychain, sonichi#2397)."""
+    return signal.get("state") == "logged-out" or signal.get("kind") == "login"
+
+
 def compose_message(signal: dict) -> str:
     """The owner-facing 'action needed' line: what's stuck + a prompt excerpt."""
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
@@ -86,7 +93,13 @@ def compose_message(signal: dict) -> str:
     msg = " ".join(parts)
     if excerpt:
         msg += f": {excerpt[:160]}"
-    msg += " — reply here or open the app to resolve."
+    if _is_login_class(signal):
+        host = platform.node().split(".")[0] or "the host"
+        msg += (f" — needs GUI /login on {host}: open Terminal there, run"
+                " `bash src/startup.sh` from the repo, then complete /login."
+                " A chat reply can't resolve this.")
+    else:
+        msg += " — reply here or open the app to resolve."
     return msg
 
 
