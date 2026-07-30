@@ -210,6 +210,14 @@ def _isolation_line(tree: ast.Module) -> int | None:
                 return node.lineno
     return None
 
+# A seed is a WRITE. Two call shapes exist in this repo and both really occur:
+#   method style : (dir / "access.json").write_text(...)
+#   helper style : write_private_text(dir / "access.json", ...)   (#2356)
+# The helper takes the path as an ARGUMENT, so a receiver-only check misses it.
+_WRITE_METHODS = {"write_text", "write_bytes"}
+_WRITE_HELPERS = {"write_private_text"}
+
+
 def _access_seed_line(tree: ast.Module) -> "int | None":
     """Earliest module-level WRITE that creates a `channels/<ch>/access.json`.
 
@@ -243,11 +251,24 @@ def _access_seed_line(tree: ast.Module) -> "int | None":
 
     for node in tree.body:
         for sub in ast.walk(node):
-            if not (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)):
+            if not isinstance(sub, ast.Call):
                 continue
-            if sub.func.attr not in {"write_text", "write_bytes"}:
-                continue
-            if _is_access_receiver(sub.func.value):
+            # Method style: (dir / "access.json").write_text(...) — path is the RECEIVER.
+            if isinstance(sub.func, ast.Attribute):
+                if sub.func.attr in _WRITE_METHODS and _is_access_receiver(sub.func.value):
+                    return node.lineno
+            # Helper style: write_private_text(dir / "access.json", data) — path is an
+            # ARGUMENT. #2356 makes this the canonical way access files are written, so
+            # a receiver-only check would start false-flagging correctly-seeded tests
+            # the moment it lands. Accept it called bare or via a module attribute.
+            name = (
+                sub.func.attr if isinstance(sub.func, ast.Attribute)
+                else sub.func.id if isinstance(sub.func, ast.Name)
+                else None
+            )
+            if name in _WRITE_HELPERS and any(
+                _is_access_receiver(a) for a in sub.args
+            ):
                 return node.lineno
     return None
 
