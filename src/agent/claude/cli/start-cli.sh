@@ -353,20 +353,76 @@ fi
 # Safe callers: Sutando.app menu, terminal one-off, future health-check
 # emit-task. Unsafe: a future agent processing a "restart core" task by
 # exec'ing this script from within sutando-core. Per Mini's #608 review.
-if [ "${1:-}" = "--restart" ]; then
+# Two modes, per sonichi's "force restart should be separate from restart":
+#   --restart       graceful: SIGTERM + wait; if the core won't stop cleanly it
+#                   ABORTS (it may be mid-task) — never SIGKILLs on its own.
+#   --force-restart SIGTERM → SIGKILL escalation for a wedged/unresponsive core.
+# Both then fall through to the create path, which verifies the new core is live
+# before exit 0 (no silent false-success). Every attempt is logged (timestamped)
+# to logs/restart-attempts.log so a failed restart is diagnosable even when the
+# caller (Sutando.app) routes our stdout to /dev/null — the gap that made the
+# 2026-07-30 outage invisible.
+RESTART_REQUESTED=""
+FORCE_RESTART=""
+case "${1:-}" in
+  --restart)       RESTART_REQUESTED=1 ;;
+  --force-restart) RESTART_REQUESTED=1; FORCE_RESTART=1 ;;
+esac
+log_restart_attempt() {
+  local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$ws" ] || return 0
+  mkdir -p "$ws/logs" 2>/dev/null || true
+  printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
+    >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
+}
+if [ -n "$RESTART_REQUESTED" ]; then
+  log_restart_attempt "begin (session=$(tmux_session_exists && echo up || echo none) core=$(core_claude_running && echo up || echo none))"
   if tmux_session_exists || core_claude_running; then
     echo "Killing existing $SESSION session..."
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
     core_claude_pids | while read -r pid; do
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
-    # Poll for actual shutdown — robust on slow machines, faster on fast
-    # ones (~1s ceiling) than a fixed sleep.
-    for _ in 1 2 3 4 5; do
+    # Graceful window: Claude Code flushes telemetry/state on shutdown and can
+    # take several seconds — longer than the old ~1s (5×0.2s) ceiling that let a
+    # still-dying core slip into the "orphan reuse → exit 0" guard below. Poll ~3s.
+    for _ in $(seq 1 15); do
       tmux_session_exists || core_claude_running || break
       sleep 0.2
     done
+    if tmux_session_exists || core_claude_running; then
+      if [ -n "$FORCE_RESTART" ]; then
+        # force-restart: the core is wedged; escalate to SIGKILL, then poll ~3s.
+        echo "  core still alive ~3s after SIGTERM — force-restart escalating to SIGKILL" >&2
+        tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+        core_claude_pids | while read -r pid; do
+          [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+        done
+        for _ in $(seq 1 15); do
+          tmux_session_exists || core_claude_running || break
+          sleep 0.2
+        done
+      else
+        # plain restart must NOT hammer: the core may be legitimately mid-task.
+        # Abort loud and point at force-restart rather than risk killing work.
+        echo "  ⚠ $SESSION core did not stop within ~3s of SIGTERM." >&2
+        echo "    'restart' won't SIGKILL a busy/wedged core — it may be mid-task." >&2
+        echo "    Re-run as: bash $0 --force-restart   (or wait and retry)." >&2
+        log_restart_attempt "abort: core would not stop gracefully (needs --force-restart)"
+        exit 1
+      fi
+    fi
+    # After force escalation, still alive → hard abort rather than stack a second
+    # core on a survivor (double task-consumer) or exit-0 a half-torn-down state.
+    if tmux_session_exists || core_claude_running; then
+      echo "  ⚠ $SESSION core did not die after SIGKILL — aborting force-restart." >&2
+      echo "    Investigate the stuck pid; rerun once it's gone." >&2
+      log_restart_attempt "abort: core survived SIGKILL"
+      exit 1
+    fi
   fi
+  log_restart_attempt "kill-complete; creating fresh core"
 fi
 
 # Sutando-friendly tmux defaults (mouse scrollback + alt-screen wheel fix).
@@ -461,7 +517,12 @@ fi
 # child claude survived). Adopt it: do NOT start a second core, which would
 # double the task-consumer count. On a non-restart start we reuse the existing
 # process; the operator can `--restart` to cleanly recycle it.
-if core_claude_running; then
+#
+# Under --restart, do NOT adopt an orphan: we just tore the core down, so a
+# claude seen here is either still dying (the SIGKILL escalation above should
+# have reaped it) or one a competing launcher spawned in the race window.
+# Reusing it would defeat the restart and re-introduce the false-success path.
+if [ -z "$RESTART_REQUESTED" ] && core_claude_running; then
   echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
   echo "To recycle it cleanly: bash $0 --restart"
   exit 0
@@ -561,6 +622,22 @@ else
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
+  # Verify the core actually came up before reporting success. Without this a
+  # failed launch (tmux server refusal, claude crash-on-start, a bad flag) still
+  # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
+  # the same false-success class as the --restart kill race above. Poll ~5s for
+  # the session AND a live `claude --name` under it; exit non-zero otherwise so
+  # the caller surfaces a real failure instead of a silent dead core.
+  for _ in $(seq 1 25); do
+    tmux_core_session_running && break
+    sleep 0.2
+  done
+  if ! tmux_core_session_running; then
+    echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
+    exit 1
+  fi
+  [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   echo "Started $SESSION detached. Attach via Open Core CLI in menu bar, or:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"
