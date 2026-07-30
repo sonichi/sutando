@@ -101,3 +101,45 @@ if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
     sys.exit(1)
 print("all tests passed")
+
+
+# --- outage-aware placeholder (sonichi#2398) ---
+NOW = 1_000_000.0
+_run = {"status": "running", "step": "SESSION RESTART in flight", "ts": NOW - 300}
+_fresh_run = {"status": "running", "step": "building", "ts": NOW - 30}
+_idle_old = {"status": "idle", "ts": NOW - 9999}
+
+check("status_age_s computes age", ps.status_age_s(_run, NOW) == 300)
+check("status_age_s None on missing ts", ps.status_age_s({"status": "running", "step": "x"}, NOW) is None)
+check("status_age_s None on bool ts", ps.status_age_s({"status": "running", "step": "x", "ts": True}, NOW) is None)
+check("status_age_s None on non-dict", ps.status_age_s(None, NOW) is None)
+
+check("frozen non-idle status is stale", ps.status_is_stale(_run, NOW))
+check("fresh non-idle status not stale", not ps.status_is_stale(_fresh_run, NOW))
+check("old IDLE status never stale", not ps.status_is_stale(_idle_old, NOW))
+check("unknowable age never stale", not ps.status_is_stale({"status": "running", "step": "x"}, NOW))
+
+check("absent heartbeat is stale", ps.heartbeat_is_stale(None, NOW))
+check("old heartbeat is stale", ps.heartbeat_is_stale(NOW - 120, NOW))
+check("fresh heartbeat not stale", not ps.heartbeat_is_stale(NOW - 30, NOW))
+
+check("down = frozen status AND stale heartbeat", ps.core_looks_down(_run, None, NOW))
+check("long step + fresh heartbeat NOT down", not ps.core_looks_down(_run, NOW - 10, NOW))
+check("fresh status + dead heartbeat NOT down", not ps.core_looks_down(_fresh_run, None, NOW))
+check("idle + dead heartbeat NOT down (nothing to misreport)", not ps.core_looks_down(_idle_old, None, NOW))
+
+_out = ps.format_outage(300, 35)
+check("outage copy names frozen minutes", "5m" in _out)
+check("outage copy names queue depth", "35 task(s) queued" in _out)
+check("outage copy names the restart remedy", "restart.sh" in _out and "Restart Core" in _out)
+check("outage copy warns, not progress", _out.startswith("⚠️") and "in flight" not in _out)
+check("outage copy unknown age renders ?", "frozen for ?m" in ps.format_outage(None, 0))
+check("outage copy sub-minute clamps to 1m", "frozen for 1m" in ps.format_outage(45, 1))
+check("outage copy caps length", len(ps.format_outage(300, 10**9, max_len=120)) <= 120)
+
+# Re-gate: the block above runs after the original summary, so it needs its
+# own exit check — otherwise a failing outage-test could still exit 0.
+if _fails:
+    print(f"{len(_fails)} test(s) FAILED: {_fails}")
+    sys.exit(1)
+print("outage-block tests passed")
