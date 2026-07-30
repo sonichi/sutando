@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-175 modules indexed.
+177 modules indexed.
 
 ## `src/`
 
@@ -32,6 +32,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`core-input-watch.py`** — core-input-watch.py — the core supervisor MONITOR (M1).
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
+- **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
 - **`credential-resolver.ts`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
@@ -143,6 +144,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 ## `src/agent/`
 
 - **`start-cli.sh`** — Canonical persistent-core launcher.
+- **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 
 ## `src/agent/claude/cli/`
 
