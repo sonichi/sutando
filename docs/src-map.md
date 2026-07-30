@@ -32,6 +32,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
 - **`conversation-store.ts`** — SQLite mirror of conversation.log — per-surface tables.
 - **`core-input-watch.py`** — core-input-watch.py — the core supervisor MONITOR (M1).
+- **`core-supervisor-gate.py`** — core-supervisor-gate.py — the RECOVER decision gate (sonichi#2401 prototype).
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
