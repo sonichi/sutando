@@ -35,6 +35,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
+from pending_questions_md import active_region  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
@@ -123,7 +124,14 @@ def get_pending_count() -> dict:
     # #1265) and moved below a top-level `# Resolved` divider once answered. The
     # old `**Status:** Waiting/Answered` regex matched neither and always returned
     # 0/0 for the format actually in use — count `## ` sections per region instead.
-    active, _, resolved = content.partition('\n# Resolved')
+    # Must use the shared locator, not a bare partition: a line-initial
+    # `# Resolved` inside the file's own HTML banner (which documents the divider)
+    # matches first, so the active region collapses and every open question is
+    # counted as resolved. Measured on the decoy shape: partition gave open=0
+    # done=3 where the truth is open=2 done=1 — and this surface is public via
+    # /json, so it was reporting a confident zero.
+    active = active_region(content)
+    resolved = content[len(active):]
     open_count = len(re.findall(r'^## ', active, flags=re.MULTILINE))
     done_count = len(re.findall(r'^## ', resolved, flags=re.MULTILINE))
     return {"open": open_count, "done": done_count}

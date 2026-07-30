@@ -137,7 +137,14 @@ for py in sorted((REPO / "src").glob("*.py")):
         continue
     scanned += 1
     for i, line in enumerate(py.read_text().splitlines(), 1):
-        if re.search(r'(?:Resolved|Done)\b[^\n]*', line) and re.search(r'r[\'"]\^#', line):
+        # Match the PROPERTY — any local divider location — not one spelling of it.
+        # The first version required a REGEX literal and so missed
+        # dashboard.py's `content.partition('\n# Resolved')`: a string method doing
+        # the same job, on the public /json surface. That is the substring-vs-structure
+        # error this very change is about, committed inside the guard against it.
+        if re.search(r'(?:Resolved|Done)', line) and (
+                re.search(r'r[\'"]\^#', line)
+                or re.search(r'\.(?:partition|split|find|index)\(', line)):
             offenders.append(f"{py.name}:{i}")
 check(f"no second divider definition in src/ (scanned {scanned} files; found {offenders or 'none'})",
       scanned > 20 and not offenders)

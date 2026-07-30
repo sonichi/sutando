@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""All four pending-questions readers must agree on where the archive begins.
+"""All five pending-questions readers must agree on where the archive begins.
 
 The 2026-07-30 outage was not one bug in one place: `r'^#\\s+Resolved\\b'` had been
 independently copied into four readers — the notifier, morning-briefing, agent-api
@@ -111,17 +111,32 @@ fd = load("friction-detector")
 fd.personal_path = lambda *a, **k: pq_path
 results["friction-detector"] = blob(fd.check_pending_questions())
 
+# 5. dashboard — the public /json surface. Missed by the first version of this
+#    guard AND by the ratchet, because it located the divider with
+#    `content.partition('\n# Resolved')` — a STRING method, while the ratchet only
+#    looked for a regex literal. On the decoy shape it reported open=0 done=3 where
+#    the truth is 2 and 1: a confident zero on a surface users read.
+dash = load("dashboard")
+dash.personal_path = lambda *a, **k: pq_path
+results["dashboard"] = blob([f"{k}={v}" for k, v in dash.get_pending_count().items()])
+
 # --- Every reader must see through the banner to the open questions, and none may
 #     count the archived one.
 for reader, seen in results.items():
+    if reader == "dashboard":
+        # Counts, not titles: 2 open sections above the divider, 1 below it.
+        check(f"dashboard: open=2 past the banner decoy (got {seen})", "open=2" in seen)
+        check(f"dashboard: done=1, not the whole file (got {seen})", "done=1" in seen)
+        continue
     check(f"{reader}: sees the open questions past the banner decoy",
           all(o in seen for o in OPEN))
     check(f"{reader}: does NOT count the archived section",
           ARCHIVED not in seen)
 
 # --- And they must agree with each other, not merely each be self-consistent.
-open_seen = {r: tuple(o for o in OPEN if o in b) for r, b in results.items()}
-check(f"all four readers agree on the open set ({open_seen})",
+open_seen = {r: tuple(o for o in OPEN if o in b)
+             for r, b in results.items() if r != "dashboard"}
+check(f"all readers agree on the open set ({open_seen})",
       len(set(open_seen.values())) == 1)
 
 passed = sum(ok for _, ok in CASES)
