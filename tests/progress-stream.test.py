@@ -143,3 +143,87 @@ if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
     sys.exit(1)
 print("outage-block tests passed")
+
+
+# --- bridge-side wiring (in-process, covers the discord-bridge helpers) ---
+# Same load pattern as tests/bridge-audit-wiring.test.py: stub `discord`,
+# hermetic token via env, spec_from_file_location for the hyphenated module.
+# The three helpers under test are pure over module-level dirs, which we
+# repoint at a temp workspace after load.
+import importlib.util  # noqa: E402
+import time  # noqa: E402
+import types  # noqa: E402
+
+try:
+    import discord  # noqa: F401
+except ImportError:
+    stub = types.ModuleType("discord")
+    stub.Intents = type("Intents", (), {"default": staticmethod(lambda: type("I", (), {"message_content": False})())})
+    stub.Client = type("Client", (), {"__init__": lambda self, **kw: None, "event": staticmethod(lambda fn: fn)})
+    stub.File = type("File", (), {})
+    stub.Message = type("Message", (), {})
+    stub.DMChannel = type("DMChannel", (), {})
+    sys.modules["discord"] = stub
+
+os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
+os.environ.setdefault("SUTANDO_TEST_MODE", "1")
+
+_REPO = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location("dbridge_outage", _REPO / "src" / "discord-bridge.py")
+_db = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_db)
+
+with tempfile.TemporaryDirectory() as d:
+    ws = Path(d)
+    (ws / "state" / "cores").mkdir(parents=True)
+    (ws / "tasks").mkdir()
+    _db.STATE_DIR = ws / "state"
+    _db.TASKS_DIR = ws / "tasks"
+    now = time.time()
+
+    # _newest_alive_mtime
+    check("bridge: no .alive files -> None", _db._newest_alive_mtime() is None)
+    a = ws / "state" / "cores" / "hostA.alive"
+    a.write_text("{}")
+    os.utime(a, (now - 200, now - 200))
+    b = ws / "state" / "cores" / "hostB.alive"
+    b.write_text("{}")
+    os.utime(b, (now - 20, now - 20))
+    got = _db._newest_alive_mtime()
+    check("bridge: newest .alive mtime wins", got is not None and abs(got - (now - 20)) < 2)
+
+    # _queued_task_count
+    check("bridge: empty tasks dir -> 0", _db._queued_task_count() == 0)
+    (ws / "tasks" / "task-1.txt").write_text("x")
+    (ws / "tasks" / "task-2.txt").write_text("x")
+    (ws / "tasks" / "not-a-task.log").write_text("x")
+    check("bridge: counts only task-*.txt", _db._queued_task_count() == 2)
+
+    # _render_progress_content — live core → normal progress copy
+    (ws / "state" / "core-status.json").write_text(
+        json.dumps({"status": "running", "step": "building", "ts": now - 10}))
+    out_live = _db._render_progress_content(now, 42)
+    check("bridge: live core renders progress copy", out_live.startswith("⏳") and "building" in out_live and "(42s)" in out_live)
+
+    # _render_progress_content — frozen status + only-stale heartbeats → outage copy
+    (ws / "state" / "core-status.json").write_text(
+        json.dumps({"status": "running", "step": "processing task", "ts": now - 300}))
+    b.unlink()  # newest remaining .alive is 200s old -> stale
+    out_down = _db._render_progress_content(now, 42)
+    check("bridge: down core renders outage copy", out_down.startswith("⚠️") and "unresponsive" in out_down)
+    check("bridge: outage copy carries live queue depth", "2 task(s) queued" in out_down)
+    check("bridge: outage copy never claims progress", "in flight" not in out_down and "(42s)" not in out_down)
+
+    # Fail-soft branches: helper errors must degrade, never raise into the
+    # gateway loop (a broken dirs object stands in for any resolution failure).
+    _db.STATE_DIR = None
+    _db.TASKS_DIR = None
+    check("bridge: alive-mtime fail-soft -> None", _db._newest_alive_mtime() is None)
+    check("bridge: queue-count fail-soft -> 0", _db._queued_task_count() == 0)
+    _db.STATE_DIR = ws / "state"
+    _db.TASKS_DIR = ws / "tasks"
+
+if _fails:
+    print(f"{len(_fails)} test(s) FAILED: {_fails}")
+    sys.exit(1)
+print("bridge-wiring tests passed")
