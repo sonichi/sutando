@@ -862,6 +862,108 @@ def check_host_subtrees() -> dict:
     return {"name": name, "status": "ok", "detail": f"{fresh} host subtree(s), all synced <{stale_days:.0f}d"}
 
 
+def _durable_access_bytes(raw: bytes) -> "bytes | None":
+    """Normalized, comparable view of an access.json for backup-drift detection.
+
+    Drops the volatile ``pending`` block — short-lived pairing codes created on
+    any non-owner DM that expire ~1h later (see #2260). Live grows and ages
+    these out constantly, so a byte-for-byte compare would flag a perfectly
+    healthy backup as "stale" on nearly every run. Comparing only the durable
+    keys (``allowFrom`` / ``tierMap`` / …) makes the probe fire on real
+    allowlist/tier drift, not pairing-code churn.
+
+    Returns stable-sorted JSON bytes of the durable keys, or ``None`` when the
+    payload is not parseable JSON — the caller then falls back to a raw byte
+    compare (can't normalize, so stay conservative and flag any difference).
+    """
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict):
+        data = {k: v for k, v in data.items() if k != "pending"}
+    return json.dumps(data, sort_keys=True).encode()
+
+
+def check_per_host_config_backup() -> dict:
+    """Warn when a channel's access.json vault backup has drifted from live.
+
+    sync-workspace's `_snapshot_per_host_config` copies each live
+    <claude-home>/channels/<svc>/access.json into
+    hosts/<host>/channels/<svc>/access.json — a pure backup carried by the vault
+    (nothing reads the carrier live, so there's no read/write skew). If that
+    snapshot silently stops refreshing, the vault copy drifts stale: the owner's
+    allowlist LOOKS synced but recent changes never reach the vault. Observed
+    2026-07-22 — a discord access.json backup 6 weeks stale while live had
+    changed, so the owner asking "is my access.json synced?" got a misleading
+    "there's a committed copy" when that copy was long out of date. This probe
+    makes the drift a first-class, glanceable signal. Read-only: content compare,
+    warn on divergence; never mutates either file.
+    """
+    name = "per-host-config-backup"
+    try:
+        # Resolve the live channels source from the SAME canonical resolver the
+        # snapshot WRITER uses — sync-workspace's `_snapshot_per_host_config`
+        # reads `sutando-config.sh claude-sutando-config-dir`, i.e.
+        # resolve_claude_sutando_config_dir(). The old claude_home_path() fell
+        # back to ~/.claude whenever CLAUDE_CONFIG_DIR was unset, but Sutando.app's
+        # runHealthCheck() subprocess and the fallback launchd plist don't inject
+        # it — so the probe read a DIFFERENT tree than the writer and false-greened
+        # "no channels" on exactly the app/launchd paths this check exists to
+        # cover (qingyun, #2277 review). The canonical resolver honors deliberate
+        # config-based overrides (core_config_dirs) that the writer also respects.
+        from sutando_config import resolve_claude_sutando_config_dir  # noqa: PLC0415
+        channels_dir = resolve_claude_sutando_config_dir() / "channels"
+    except Exception:
+        return {"name": name, "status": "ok", "detail": "no channels dir resolvable"}
+    if not channels_dir.is_dir():
+        return {"name": name, "status": "ok", "detail": "no channels configured"}
+    carrier_base = WORKSPACE_DIR / "hosts" / _host_label() / "channels"
+    drift, checked = [], 0
+    for live in sorted(channels_dir.glob("*/access.json")):
+        svc = live.parent.name
+        try:
+            live_bytes = live.read_bytes()
+        except OSError:
+            # An unreadable LIVE access.json is the exact failure this probe
+            # exists to surface — never silently skip it. Skipping let a lone
+            # unreadable live file fall through to checked==0 → a false
+            # "no channel access.json to back up" all-clear (qingyun, #2277
+            # review). Count + flag it; the probe stays non-fatal (warn).
+            drift.append(f"{svc} (live unreadable)")
+            checked += 1
+            continue
+        checked += 1
+        carrier = carrier_base / svc / "access.json"
+        if not carrier.exists():
+            drift.append(f"{svc} (no backup)")
+            continue
+        try:
+            carrier_bytes = carrier.read_bytes()
+        except OSError:
+            drift.append(f"{svc} (unreadable backup)")
+            continue
+        # Compare only the durable config — the volatile `pending` pairing-code
+        # block churns ~hourly and would otherwise flag every healthy backup
+        # (john, #2277 review). Raw-byte fallback when either side is malformed.
+        live_norm = _durable_access_bytes(live_bytes)
+        carrier_norm = _durable_access_bytes(carrier_bytes)
+        if live_norm is None or carrier_norm is None:
+            if carrier_bytes != live_bytes:
+                drift.append(f"{svc} (stale)")
+        elif live_norm != carrier_norm:
+            drift.append(f"{svc} (stale)")
+        # else: durable config matches — any pending-only diff is healthy churn.
+    if checked == 0:
+        return {"name": name, "status": "ok", "detail": "no channel access.json to back up"}
+    if drift:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(drift)} channel access.json backup(s) drifted from live: "
+                          f"{', '.join(drift)} — vault copy stale; a full sync-workspace "
+                          f"(_snapshot_per_host_config) should refresh it"}
+    return {"name": name, "status": "ok", "detail": f"{checked} channel access.json backup(s) current"}
+
+
 def check_migrate_reader_contract() -> dict:
     """Verify migration CLASS_RULES are compatible with reader resolution chains (issue #1543).
 
@@ -3093,6 +3195,8 @@ def run_all_checks() -> list[dict]:
 
     # Per-host subtree freshness (hosts/<host>/ stopped syncing?)
     checks.append(check_host_subtrees())
+    # Per-host channel access.json backup drift (live vs vault-carried copy)
+    checks.append(check_per_host_config_backup())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
