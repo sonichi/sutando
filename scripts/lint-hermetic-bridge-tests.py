@@ -88,21 +88,42 @@ tests/audio-transcribe-skill.test.py
 tests/bridge-env-token-perms.test.py
 tests/bridge-not-allowlisted-ack.test.py
 tests/bridge-restart-intercept.test.py
+tests/bridge-skill-path-resolution.test.py
 tests/bridges-allowlist-default-readonly.test.py
 tests/bridges-sending-orphan-recovery.test.py
+tests/discord-bridge-access-no-clobber.test.py
 tests/discord-bridge-attachment-filename-sanitize.test.py
+tests/discord-bridge-codex-subprocess-argv.test.py
+tests/discord-bridge-collaborator-tier.test.py
 tests/discord-bridge-delivery-failure-visible.test.py
 tests/discord-bridge-delivery-sentinel.test.py
+tests/discord-bridge-discord-state-detection.test.py
 tests/discord-bridge-dm-catchup.test.py
+tests/discord-bridge-dm-fallback-source-guard.test.py
 tests/discord-bridge-file-markers.test.py
+tests/discord-bridge-mod-judge-actions.test.py
+tests/discord-bridge-mod-judge-buffer.test.py
+tests/discord-bridge-mod-judge-codex.test.py
+tests/discord-bridge-mod-judge-dispatcher.test.py
+tests/discord-bridge-mod-judge-integration.test.py
+tests/discord-bridge-mod-judge-trackers.test.py
+tests/discord-bridge-mod-judge.test.py
+tests/discord-bridge-mod-server-config.test.py
+tests/discord-bridge-multibot-seed-gate.test.py
+tests/discord-bridge-reply-directive.test.py
+tests/discord-bridge-state-prefetch.test.py
 tests/discord-bridge-task-write-instrument.test.py
+tests/discord-bridge-thread-seed-owner-notice.test.py
+tests/discord-bridge-welcome-on-first-post.test.py
 tests/discord-chunker.test.py
 tests/discord-task-source-invariance.test.py
 tests/discord-writeside-attachments.test.py
 tests/dm-result-multipart-upload.test.py
 tests/health-check-fix-down-bridges.test.py
+tests/owner-activity-channel-id.test.py
 tests/slack-bridge-access-durable-backup.test.py
 tests/slack-bridge-allowlist.test.py
+tests/slack-bridge-channel-context.test.py
 tests/slack-bridge-chunking.test.py
 tests/slack-bridge-download-html-guard.test.py
 tests/slack-bridge-download-stream.test.py
@@ -111,9 +132,11 @@ tests/slack-bridge-pending-recovery.test.py
 tests/slack-bridge-task-timeout.test.py
 tests/slack-bridge-tier-map.test.py
 tests/slack-bridge-tofu-enroll.test.py
+tests/slack-bridge-write-task.test.py
 tests/slack-proactive-delivery-idempotency.test.py
 tests/slack-proactive-owner-resolution.test.py
 tests/slack-writeside-attachments.test.py
+tests/telegram-bridge-access.test.py
 tests/telegram-bridge-forward-attribution.test.py
 tests/telegram-bridge-proactive-owner-resolution.test.py
 tests/telegram-bridge-progress-stream.test.py
@@ -187,19 +210,71 @@ def _isolation_line(tree: ast.Module) -> int | None:
                 return node.lineno
     return None
 
-def _exec_module_call(tree: ast.AST):
-    """(lineno, module_var_name) of the earliest `.exec_module(<name>)`, else (None, None).
+def _access_seed_line(tree: ast.Module) -> "int | None":
+    """Earliest module-level WRITE that creates a `channels/<ch>/access.json`.
 
-    The variable name matters: a mitigation only counts when it rebinds THAT module object.
+    Required in addition to the CLAUDE_CONFIG_DIR assignment, because pointing the env
+    var at an EMPTY temp dir is not isolation: `channel_access_path()` falls back to the
+    LEGACY real-home `~/.claude/channels/<ch>/access.json` when the canonical path is
+    missing, so the operator's real allowlist is still what gets read. This is the exact
+    thing my own #2428 fix had to add, and my first predicate then failed to require it —
+    john caught it on tests/discord-bridge-public-notice-suppression.test.py, which sets
+    the env var and seeds only `.env`.
+
+    A WRITE, never a mention: that file names "access.json" in its module docstring, and
+    a constant-substring check would have called it isolated. Same shape as
+    "a comment is not isolation".
     """
-    best, name = None, None
+    for node in tree.body:
+        for sub in ast.walk(node):
+            if not (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)):
+                continue
+            if sub.func.attr not in {"write_text", "write_bytes"}:
+                continue
+            for c in ast.walk(sub.func.value):
+                if isinstance(c, ast.Constant) and isinstance(c.value, str) and "access.json" in c.value:
+                    return node.lineno
+    return None
+
+
+def _bridge_load_call(tree: ast.AST):
+    """(lineno, namespace_var) of the earliest call that EXECUTES the bridge source.
+
+    Two mechanisms are recognized, because both really occur in this repo:
+      * `spec.loader.exec_module(mod)` — the importlib path;
+      * `exec(src, ns.__dict__)` / `exec(src, ns)` — reading the bridge with
+        read_text() and exec'ing it into a namespace.
+
+    Recognizing only exec_module was a scope hole, not a strictness choice: a file
+    loading the bridge via exec() returned None ("out of scope") and was never checked
+    at all. qingyun and john both hit it on #2429 with
+    tests/discord-bridge-public-notice-suppression.test.py, which execs the bridge and
+    seeds only `.env` — so channel_access_path()'s legacy fallback still resolved the
+    operator's real access.json at import. Out-of-scope is a SILENT PASS, which is the
+    worst verdict a gate can give.
+    """
+    best, ns = None, None
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr == "exec_module" and (best is None or node.lineno < best):
-                best = node.lineno
-                arg = node.args[0] if node.args else None
-                name = arg.id if isinstance(arg, ast.Name) else None
-    return best, name
+        if not isinstance(node, ast.Call):
+            continue
+        line, cand = None, None
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr == "exec_module":
+            line = node.lineno
+            a = node.args[0] if node.args else None
+            cand = a.id if isinstance(a, ast.Name) else None
+        elif isinstance(fn, ast.Name) and fn.id == "exec" and len(node.args) >= 2:
+            line = node.lineno
+            g = node.args[1]
+            if isinstance(g, ast.Attribute) and g.attr == "__dict__" and isinstance(g.value, ast.Name):
+                cand = g.value.id          # exec(src, bridge.__dict__)
+            elif isinstance(g, ast.Name):
+                cand = g.id                # exec(src, ns)
+        if line is not None and (best is None or line < best):
+            best, ns = line, cand
+    return best, ns
+
+
 
 
 def _mitigation_line(tree: ast.Module, exec_line: int, mod_var: "str | None") -> "int | None":
@@ -238,7 +313,9 @@ def classify(path: Path) -> str | None:
         text = path.read_text(errors="ignore")
     except OSError:
         return None
-    if "exec_module" not in text or not BRIDGE_IMPORT.search(text):
+    if not BRIDGE_IMPORT.search(text):
+        return None
+    if "exec_module" not in text and "exec(" not in text:
         return None
     try:
         tree = ast.parse(text)
@@ -247,13 +324,22 @@ def classify(path: Path) -> str | None:
         # silently passing it. A file that cannot be analysed is not proven clean.
         return VIOLATION
 
-    exec_line, mod_var = _exec_module_call(tree)
+    exec_line, mod_var = _bridge_load_call(tree)
     if exec_line is None:
         return None
     iso_line = _isolation_line(tree)
     # Isolation only counts when it EXECUTES BEFORE the bridge import. Setting the env
     # afterwards leaves the module-level resolution already done against host config.
-    if iso_line is not None and iso_line < exec_line:
+    seed_line = _access_seed_line(tree)
+    # CLEAN needs BOTH, both before the load: the env override AND a seeded canonical
+    # access.json. Env-var-only leaves channel_access_path() on its legacy real-home
+    # fallback, which is the very read this gate exists to prevent.
+    if (
+        iso_line is not None
+        and iso_line < exec_line
+        and seed_line is not None
+        and seed_line < exec_line
+    ):
         return CLEAN
     return MITIGATED if _mitigation_line(tree, exec_line, mod_var) is not None else VIOLATION
 

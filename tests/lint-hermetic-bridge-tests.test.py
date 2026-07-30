@@ -69,10 +69,16 @@ check(
     "violation: imports bridge, no isolation",
     lint.classify(write(tmpdir, IMPORTS_BRIDGE)) == lint.VIOLATION,
 )
+# Was asserted CLEAN until review 8. It is not: the env var alone leaves
+# channel_access_path() on its legacy real-home fallback. This assertion had encoded
+# the very defect the gate exists to catch.
 check(
-    "clean: os.environ[CLAUDE_CONFIG_DIR] assignment",
+    "clean: CLAUDE_CONFIG_DIR assignment PLUS a seeded access.json, both before the load",
     lint.classify(
-        write(tmpdir, 'import os\nos.environ["CLAUDE_CONFIG_DIR"] = "/tmp/x"\n' + IMPORTS_BRIDGE)
+        write(tmpdir,
+              'import os, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = "/tmp/x"\n'
+              'pathlib.Path("channels/discord").mkdir(parents=True, exist_ok=True)\n'
+              '(pathlib.Path("channels/discord") / "access.json").write_text("{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
 )
@@ -122,6 +128,50 @@ check(
 check(
     "a never-called function containing the rebind is NOT mitigation",
     lint.classify(write(tmpdir, 'def unused():\n    m.ACCESS_FILE = "/tmp/a"\n' + IMPORTS_BRIDGE))
+    == lint.VIOLATION,
+)
+
+# --- scope + seed bypasses (qingyun + Rui/john-the-dev, #2429 review 8) ----
+SEED = ('import os, tempfile, pathlib\n'
+        'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+        'pathlib.Path("channels/discord").mkdir(parents=True, exist_ok=True)\n'
+        '(pathlib.Path("channels/discord") / "access.json").write_text("{}")\n')
+EXEC_LOAD = ('src = open("src/discord-bridge.py").read()\n'
+             'import types\nbridge = types.ModuleType("b")\n'
+             'exec(src, bridge.__dict__)\n')
+check(
+    "BYPASS 8: a bridge loaded via exec() is IN SCOPE (was silently unscanned)",
+    lint.classify(write(tmpdir, EXEC_LOAD)) == lint.VIOLATION,
+    "exec_module-only scope gate returned None = silent pass",
+)
+check(
+    "exec()-loaded WITH env + seed before the load is clean",
+    lint.classify(write(tmpdir, SEED + EXEC_LOAD)) == lint.CLEAN,
+)
+check(
+    "BYPASS 9: CLAUDE_CONFIG_DIR set but access.json NOT seeded is NOT isolation",
+    lint.classify(
+        write(tmpdir, 'import os, tempfile\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "empty temp dir leaves channel_access_path() on its legacy real-home fallback",
+)
+check(
+    "BYPASS 9b: access.json named only in a docstring is NOT a seed",
+    lint.classify(
+        write(tmpdir,
+              '"""Seeds channels/discord/access.json somewhere else."""\n'
+              'import os, tempfile\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "a mention is not a write",
+)
+check(
+    "seed AFTER the load does not count",
+    lint.classify(
+        write(tmpdir, 'import os, tempfile, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+              + IMPORTS_BRIDGE + '\n(pathlib.Path("x") / "access.json").write_text("{}")\n')
+    )
     == lint.VIOLATION,
 )
 
@@ -189,11 +239,13 @@ check(
     "isolation after the import leaves module-level resolution already done",
 )
 check(
-    "ordering: the SAME assignment placed BEFORE exec_module is clean",
+    "ordering: a COMPLETE isolation (env + seed) placed BEFORE the load is clean",
     lint.classify(
         write(
             tmpdir,
-            'import os, tempfile\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n' + IMPORTS_BRIDGE,
+            'import os, tempfile, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+            'pathlib.Path("channels/discord").mkdir(parents=True, exist_ok=True)\n'
+            '(pathlib.Path("channels/discord") / "access.json").write_text("{}")\n' + IMPORTS_BRIDGE,
         )
     )
     == lint.CLEAN,
