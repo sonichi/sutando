@@ -126,11 +126,12 @@ case "$cmd" in
         _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
             | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
         _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
-        # Persist the install-time Claude config dir (resolved, not raw — an
-        # unset var must pin the ~/.claude default we validated against, not
-        # an empty string the wrapper would treat as unset). Same XML+sed
-        # escaping as SUTANDO_NODE: caller-controlled, lands in plist XML.
-        _ccd_resolved="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+        # Persist the install-time Claude config dir (resolved via the M0
+        # helper, not raw — an unset var must pin the same default the
+        # install validated against, not an empty string the wrapper would
+        # treat as unset). Same XML+sed escaping as SUTANDO_NODE:
+        # caller-controlled, lands in plist XML.
+        _ccd_resolved="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path)"
         _ccd_xml="$(printf '%s' "$_ccd_resolved" \
             | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
         _ccd_sed="$(printf '%s' "$_ccd_xml" | sed -e 's/[\\&|]/\\&/g')"
