@@ -66,6 +66,14 @@ fi
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   CORE_ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
 fi
+# Test probe: dump the assembled core env forwarding and exit — lets the
+# regression suite assert the proxy-routing policy (live listener forwards,
+# dead port omits, caller preset wins) against the REAL CORE_ENV_ARGS under
+# a stubbed lsof, without touching tmux. No production caller passes this.
+if [ "${1:-}" = "--print-core-env" ]; then
+  printf '%s\n' ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"}
+  exit 0
+fi
 
 tmux_available() {
   command -v tmux > /dev/null 2>&1
