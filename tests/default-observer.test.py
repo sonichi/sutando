@@ -269,6 +269,82 @@ def _start_and_grab_handler(m):
     return grabbed.get("handler")
 
 
+
+def test_unrelated_shared_room_message_gets_no_reaction_by_default():
+    """The #2319 review's exact ask: prove that enabling the event plane does
+    NOT react to an unrelated shared-room message by default.
+
+    Asserted on BEHAVIOUR, not on the wrapper type. The sibling wiring test
+    checks which handler is installed, which is a proxy: a future refactor
+    could keep ReactObserverHandler in the chain and gate the POST elsewhere,
+    and a type assertion would not notice. What the other room's participants
+    actually care about is whether a request reaches /react — so this drives a
+    real message.created from another actor through the started consumer and
+    asserts the network stayed silent.
+
+    Deliberately no SPARROW_OBSERVE_REACT in the environment: the default is
+    the thing under test. AGENT_MXID *is* set, so the observer is not merely
+    off for want of an identity — that is the other reason it could stay quiet,
+    and it would make this test pass for the wrong reason.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        m = _load_bridge(pathlib.Path(d))
+        net = _Net()
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = net
+        try:
+            os.environ["SPARROW_EVENTS"] = "1"
+            os.environ["AGENT_MXID"] = "@me:hs"
+            os.environ.pop("SPARROW_OBSERVE_REACT", None)
+            for k in ("SPARROW_HA_OWNER", "SPARROW_HA_ROOM"):
+                os.environ.pop(k, None)
+            h = _start_and_grab_handler(m)
+            # A human in a shared room this agent merely subscribes to.
+            h.offer(_msg(eid="shared-1", actor="@someone-else:hs",
+                         room="!busy-shared-room:hs", mid="msg-1"))
+            reacts = [c for c in net.calls
+                      if str(getattr(c, "full_url", "")).endswith("/react")]
+            check(reacts == [],
+                  "default: unrelated shared-room message gets NO react POST")
+        finally:
+            urllib.request.urlopen = orig
+            os.environ.pop("SPARROW_EVENTS", None)
+            os.environ.pop("AGENT_MXID", None)
+
+
+def test_opted_in_still_reacts_so_the_default_test_is_not_vacuous():
+    """POSITIVE CONTROL for the test above.
+
+    Without this, `reacts == []` would also hold if the harness simply never
+    delivers events, or if _Net stopped recording — i.e. the default test could
+    pass while proving nothing. Same setup, SPARROW_OBSERVE_REACT=1, and the
+    react MUST appear.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        m = _load_bridge(pathlib.Path(d))
+        net = _Net()
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = net
+        try:
+            os.environ["SPARROW_EVENTS"] = "1"
+            os.environ["AGENT_MXID"] = "@me:hs"
+            os.environ["SPARROW_OBSERVE_REACT"] = "1"
+            for k in ("SPARROW_HA_OWNER", "SPARROW_HA_ROOM"):
+                os.environ.pop(k, None)
+            h = _start_and_grab_handler(m)
+            h.offer(_msg(eid="shared-2", actor="@someone-else:hs",
+                         room="!busy-shared-room:hs", mid="msg-2"))
+            if hasattr(h, "flush"):
+                h.flush(5)
+            reacts = [c for c in net.calls
+                      if str(getattr(c, "full_url", "")).endswith("/react")]
+            check(len(reacts) == 1,
+                  "opted in: the same message DOES get exactly one react POST")
+        finally:
+            urllib.request.urlopen = orig
+            for k in ("SPARROW_EVENTS", "AGENT_MXID", "SPARROW_OBSERVE_REACT"):
+                os.environ.pop(k, None)
+
 def test_catchup_guard_skips_backlog():
     import time as _time
     # Old event (beyond max_age) → marked seen, NOT reacted; a redelivery of
@@ -302,7 +378,7 @@ def test_catchup_guard_skips_backlog():
         urllib.request.urlopen = orig2
 
 
-def test_bridge_wiring_default_on_optout_and_no_mxid():
+def test_bridge_wiring_is_OPT_IN_not_default_on():
     with tempfile.TemporaryDirectory() as d:
         m = _load_bridge(pathlib.Path(d))
         os.environ["SPARROW_EVENTS"] = "1"
@@ -312,13 +388,19 @@ def test_bridge_wiring_default_on_optout_and_no_mxid():
         os.environ["AGENT_MXID"] = "@me:hs"
         os.environ.pop("SPARROW_OBSERVE_REACT", None)
         h = _start_and_grab_handler(m)
-        check(type(h).__name__ == "ReactObserverHandler",
-              "wiring: env unset → observer wraps handler (DEFAULT ON)")
+        check(type(h).__name__ == "TaskifyHandler",
+              "wiring: env unset → observer OFF (opt-in, #2319 review)")
 
         os.environ["SPARROW_OBSERVE_REACT"] = "0"
         h = _start_and_grab_handler(m)
         check(type(h).__name__ == "TaskifyHandler",
-              "wiring: SPARROW_OBSERVE_REACT=0 → plain taskify handler (opt-out)")
+              "wiring: SPARROW_OBSERVE_REACT=0 → still off")
+
+        os.environ["SPARROW_OBSERVE_REACT"] = "1"
+        h = _start_and_grab_handler(m)
+        check(type(h).__name__ == "ReactObserverHandler",
+              "wiring: SPARROW_OBSERVE_REACT=1 → observer wraps handler (explicit opt-in)")
+        os.environ.pop("SPARROW_OBSERVE_REACT", None)
 
         os.environ.pop("SPARROW_OBSERVE_REACT", None)
         os.environ.pop("AGENT_MXID", None)
@@ -330,9 +412,11 @@ def test_bridge_wiring_default_on_optout_and_no_mxid():
         # AGENT_ID fallback (live-deployment finding: a real install's durable
         # env names the id AGENT_ID — "default-on" must hold there too).
         os.environ["AGENT_ID"] = "@me:hs"
+        os.environ["SPARROW_OBSERVE_REACT"] = "1"
         h = _start_and_grab_handler(m)
         check(type(h).__name__ == "ReactObserverHandler",
-              "wiring: AGENT_ID alone arms the observer (fallback name)")
+              "wiring: AGENT_ID is still honored as the fallback name when opted in")
+        os.environ.pop("SPARROW_OBSERVE_REACT", None)
         os.environ.pop("AGENT_ID", None)
 
         os.environ.pop("SPARROW_EVENTS", None)
@@ -348,6 +432,8 @@ if __name__ == "__main__":
     test_slow_reaction_never_delays_inner()
     test_queue_overflow_drops_never_blocks()
     test_catchup_guard_skips_backlog()
-    test_bridge_wiring_default_on_optout_and_no_mxid()
+    test_unrelated_shared_room_message_gets_no_reaction_by_default()
+    test_opted_in_still_reacts_so_the_default_test_is_not_vacuous()
+    test_bridge_wiring_is_OPT_IN_not_default_on()
     print(("PASS" if not FAILS else f"FAIL ({len(FAILS)})"))
     sys.exit(1 if FAILS else 0)

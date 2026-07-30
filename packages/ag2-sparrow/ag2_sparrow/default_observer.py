@@ -1,9 +1,17 @@
-"""default_observer — the built-in 👀 observed-receipt (default-on with events).
+"""default_observer — the built-in 👀 observed-receipt (OPT-IN).
 
 When the event channel is running, every `message.created` authored by someone
 OTHER than this agent gets a 👀 reaction posted back to the room — the visible
-"this agent saw it" receipt, with zero per-user setup. Default ON whenever
-SPARROW_EVENTS is enabled; disable with SPARROW_OBSERVE_REACT=0.
+"this agent saw it" receipt. Enable with SPARROW_OBSERVE_REACT=1; OFF by
+default even when SPARROW_EVENTS is on.
+
+Why opt-in and not default-on (#2319 review): this module scopes reactions by
+the incoming room_id alone — no owner/DM restriction, no per-room allowlist, no
+membership-size bound, no addressed/mention test. Default-on would therefore
+make enabling the event plane post visible reactions to every human message in
+every subscribed SHARED room, where the other participants gave no consent and
+have no opt-out. Until that scoping policy is decided, the default must not be
+able to surprise a room.
 
 Why client-side (and not a server default): the receipt's meaning is "THIS
 agent's consumer observed the event", so it must live and die with the agent's
