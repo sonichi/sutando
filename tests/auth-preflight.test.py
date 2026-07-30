@@ -129,6 +129,64 @@ class TestCli(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("OK", buf.getvalue())
 
+    def test_human_output_login_required_prints_reasons_and_remedy(self):
+        with tempfile.TemporaryDirectory() as td:
+            orig = auth_preflight.keychain_has_credentials
+            auth_preflight.keychain_has_credentials = lambda: False
+            try:
+                import io
+                from contextlib import redirect_stdout
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = main(["--config-dir", td])
+            finally:
+                auth_preflight.keychain_has_credentials = orig
+            out = buf.getvalue()
+            self.assertEqual(rc, 2)
+            self.assertIn("LOGIN_REQUIRED", out)
+            self.assertIn("- no oauthAccount", out)
+            self.assertIn("remedy: ", out)
+
+    def test_live_probe_failure_downgrades_static_ok(self):
+        # Static PASS but ground truth fails (expired token class): verdict
+        # must downgrade, carry the live detail as a reason, and gain a remedy.
+        with tempfile.TemporaryDirectory() as td:
+            _mkconfig(td, oauth=True, creds=True)
+            orig = auth_preflight.live_probe
+            auth_preflight.live_probe = lambda d, timeout=90: (False, "claude -p exited 1: auth expired")
+            try:
+                import io
+                from contextlib import redirect_stdout
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = main(["--config-dir", td, "--live", "--json"])
+            finally:
+                auth_preflight.live_probe = orig
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 2)
+            self.assertEqual(out["verdict"], "login_required")
+            self.assertFalse(out["live"]["ok"])
+            self.assertTrue(any("live probe failed" in r for r in out["reasons"]))
+            self.assertIn("GUI /login", out["remedy"])
+
+    def test_live_probe_success_keeps_ok(self):
+        with tempfile.TemporaryDirectory() as td:
+            _mkconfig(td, oauth=True, creds=True)
+            orig = auth_preflight.live_probe
+            auth_preflight.live_probe = lambda d, timeout=90: (True, "claude -p ok succeeded")
+            try:
+                import io
+                from contextlib import redirect_stdout
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = main(["--config-dir", td, "--live", "--json"])
+            finally:
+                auth_preflight.live_probe = orig
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0)
+            self.assertEqual(out["verdict"], "ok")
+            self.assertTrue(out["live"]["ok"])
+
     def test_exit_3_without_config_dir(self):
         env_had = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         try:

@@ -89,14 +89,20 @@ def check_auth_state(config_dir: str, *, keychain_check=keychain_has_credentials
         return {"verdict": "ok", "reasons": [], "remedy": None, "ssh": ssh,
                 "config_dir": config_dir}
 
+    return {"verdict": "login_required", "reasons": reasons,
+            "remedy": _login_remedy(ssh), "ssh": ssh, "config_dir": config_dir}
+
+
+def _login_remedy(ssh: bool) -> str:
+    """The exact owner-facing fix for a login-class state (matches the
+    core-supervisor-relay copy shipped in #2403)."""
     host = platform.node().split(".")[0] or "the host"
     remedy = (f"needs GUI /login on {host}: open Terminal there, run"
               " `bash src/restart.sh` from the repo, then complete /login.")
     if ssh:
         remedy = ("SSH session detected — a locked keychain cannot be unlocked"
                   " from here, so /login WILL stall if started over SSH. " + remedy)
-    return {"verdict": "login_required", "reasons": reasons, "remedy": remedy,
-            "ssh": ssh, "config_dir": config_dir}
+    return remedy
 
 
 def live_probe(config_dir: str, timeout: int = 90):  # pragma: no cover - spawns the real CLI
@@ -133,10 +139,12 @@ def main(argv=None):
         ok, detail = live_probe(a.config_dir)
         result["live"] = {"ok": ok, "detail": detail}
         if not ok and result["verdict"] == "ok":
+            # Static PASS was a false positive (expired token class): downgrade
+            # and build the remedy directly — recomputing the static check
+            # cannot yield one when the on-disk state still looks fine.
             result["verdict"] = "login_required"
             result["reasons"].append(f"live probe failed: {detail}")
-            result["remedy"] = check_auth_state(
-                a.config_dir, keychain_check=lambda: False)["remedy"]
+            result["remedy"] = _login_remedy(result["ssh"])
 
     if a.json:
         print(json.dumps(result, indent=2))
