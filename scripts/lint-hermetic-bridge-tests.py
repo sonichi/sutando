@@ -224,17 +224,62 @@ def _access_seed_line(tree: ast.Module) -> "int | None":
     A WRITE, never a mention: that file names "access.json" in its module docstring, and
     a constant-substring check would have called it isolated. Same shape as
     "a comment is not isolation".
+
+    The receiver may be an inline expression OR a variable the path was built into
+    first — `p = chan / "access.json"; p.write_text(...)` seeds exactly as much as
+    `(chan / "access.json").write_text(...)`. Binding a path to a name is not a
+    behavioral difference, so `_access_path_names` propagates the taint through
+    module-level assignments and both shapes count.
     """
+    tainted = _access_path_names(tree)
+
+    def _is_access_receiver(expr: ast.AST) -> bool:
+        for c in ast.walk(expr):
+            if isinstance(c, ast.Constant) and isinstance(c.value, str) and "access.json" in c.value:
+                return True
+            if isinstance(c, ast.Name) and c.id in tainted:
+                return True
+        return False
+
     for node in tree.body:
         for sub in ast.walk(node):
             if not (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)):
                 continue
             if sub.func.attr not in {"write_text", "write_bytes"}:
                 continue
-            for c in ast.walk(sub.func.value):
-                if isinstance(c, ast.Constant) and isinstance(c.value, str) and "access.json" in c.value:
-                    return node.lineno
+            if _is_access_receiver(sub.func.value):
+                return node.lineno
     return None
+
+
+def _access_path_names(tree: ast.Module) -> "set[str]":
+    """Module-level names whose value carries an `access.json` path.
+
+    Straight-line propagation to a fixpoint, so a name built from another tainted
+    name is tainted too (`ACCESS = "access.json"` → `p = chan / ACCESS` → `p`).
+    Module level only: a name bound inside a function or an `if` body has not
+    necessarily been bound by the time the bridge loads, and unbound-at-load is
+    exactly the reachability failure this gate refuses to guess about.
+    """
+    tainted: set[str] = set()
+    while True:
+        grew = False
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            carries = any(
+                (isinstance(c, ast.Constant) and isinstance(c.value, str) and "access.json" in c.value)
+                or (isinstance(c, ast.Name) and c.id in tainted)
+                for c in ast.walk(node.value)
+            )
+            if not carries:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id not in tainted:
+                    tainted.add(target.id)
+                    grew = True
+        if not grew:
+            return tainted
 
 
 def _bridge_load_call(tree: ast.AST):

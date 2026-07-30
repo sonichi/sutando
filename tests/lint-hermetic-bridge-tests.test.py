@@ -175,6 +175,49 @@ check(
     == lint.VIOLATION,
 )
 
+# --- seed through a variable (#2429 review 9) -------------------------------
+# The seed check first recognized "access.json" only INSIDE the write call's own
+# receiver expression, so building the path into a name first read as no-seed.
+# Binding a path to a variable is not a behavioral difference — a false VIOLATION
+# is the sound direction, but it would have flagged correctly-seeded files and
+# inflated the migration denominator.
+_ENV = 'import os, tempfile, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+check(
+    "seed via an intermediate variable counts (p = chan / 'access.json'; p.write_text)",
+    lint.classify(
+        write(tmpdir, _ENV + 'chan = pathlib.Path("/tmp/x") / "channels" / "discord"\n'
+              'p = chan / "access.json"\np.write_text("{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+)
+check(
+    "seed taint propagates two hops (ACCESS = 'access.json'; p = d / ACCESS)",
+    lint.classify(
+        write(tmpdir, _ENV + 'ACCESS = "access.json"\n'
+              'p = pathlib.Path("/tmp/x") / "channels" / "discord" / ACCESS\n'
+              'p.write_text("{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+)
+check(
+    "a seed bound ONLY inside a function is not a module-level seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'def s():\n    p = pathlib.Path("/tmp/x") / "access.json"\n'
+              '    p.write_text("{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "unbound-at-load is the reachability case the gate must not guess about",
+)
+check(
+    "a variable that never carries access.json is not a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'p = pathlib.Path("/tmp/x") / "channels" / "discord" / ".env"\n'
+              'p.write_text("{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "taint must track the path, not any written variable",
+)
+
 # --- receiver + ordering bypasses (qingyun, #2429 review 7) ----------------
 # MITIGATED is non-fatal, so a false mitigation silently downgrades a real violation.
 check(
