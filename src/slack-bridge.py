@@ -1074,7 +1074,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
                 f"python3 {shlex.quote(str(_notify_py))}"
                 f" --source slack --channel-id {channel}"
                 + (f" --thread-ts {thread_ts}" if thread_ts else "")
-                + f' --message "On it — back in a moment."'
+                + ' --message "On it — back in a moment."'
             )
             hints_lines.append(f"{step}. NOTIFY FIRST: {notify_cmd}")
             step += 1
