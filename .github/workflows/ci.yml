@@ -187,7 +187,11 @@ jobs:
             fi
           done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
           if [ "$failed" -ne 0 ]; then
-            echo "::error::${#failed_files[@]} python test file(s) failed:"
+            # `::notice::`, not `::error::` — the per-file lines above are the real
+            # annotations. Making the summary an error too would double every failure
+            # in GitHub's annotation count, so the badge would misreport how many
+            # tests actually failed. Review nit, and a correct one.
+            echo "::notice::${#failed_files[@]} python test file(s) failed:"
             printf '  %s\n' "${failed_files[@]}"
           fi
           exit "$failed"
