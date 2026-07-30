@@ -54,6 +54,13 @@ def _positive_int(v: str) -> int:
     return n
 
 
+def _positive_float(v: str) -> float:
+    n = float(v)
+    if n <= 0:
+        raise argparse.ArgumentTypeError("--stale-sec must be > 0")
+    return n
+
+
 def evaluate(hb_stale: bool, session_gone: bool | None, operator_intent: bool) -> bool:
     """Pure compound gate: dead-heartbeat AND CONFIRMED-dead-session AND no
     operator intent. session_gone=None (probe unknown) never trips."""
@@ -144,7 +151,8 @@ def main(argv=None) -> int:
     t.add_argument("--session", default="sutando-core", help="tmux session name")
     t.add_argument("--restart-sentinel", default="", help="operator-intent sentinel path")
     t.add_argument("--state-file", required=True, help="streak persistence path")
-    t.add_argument("--stale-sec", type=float, default=90.0)
+    t.add_argument("--stale-sec", type=_positive_float, default=90.0,
+                   help="heartbeat staleness threshold in seconds (> 0)")
     t.add_argument("--sustain", type=_positive_int, default=2,
                    help="consecutive tripped ticks required before reporting (>=1)")
     args = ap.parse_args(argv)

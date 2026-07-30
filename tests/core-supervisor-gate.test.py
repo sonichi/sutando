@@ -117,6 +117,15 @@ class TestSustainValidation(unittest.TestCase):
             _mod.main(["tick", "--alive", "/nonexistent", "--socket", "s",
                        "--state-file", "/tmp/x", "--sustain", "0"])
 
+    def test_stale_sec_zero_and_negative_rejected(self):
+        # qingyun #2404 P1 round 2: a non-positive --stale-sec classifies a
+        # FRESH heartbeat as stale (now - mtime > 0 always), letting a
+        # confirmed-absent session report CORE-DEAD immediately. Refuse it.
+        for bad in ("0", "-5", "-0.1"):
+            with self.assertRaises(SystemExit):
+                _mod.main(["tick", "--alive", "/nonexistent", "--socket", "s",
+                           "--state-file", "/tmp/x", "--stale-sec", bad])
+
     def test_sustain_negative_rejected(self):
         with self.assertRaises(SystemExit):
             _mod.main(["tick", "--alive", "/nonexistent", "--socket", "s",
