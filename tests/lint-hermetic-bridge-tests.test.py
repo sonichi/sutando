@@ -145,6 +145,40 @@ check(
     lint.classify(write(tmpdir, IMPORTS_BRIDGE + '\nimport os\nos.environ["HOME"] = "/tmp/x"\n'))
     == lint.VIOLATION,
 )
+# BYPASS 3 (qingyun, #2429 second review): the old ALT_ISOLATES accepted any `util_paths.`
+# substring, so a COMMENT promising isolation counted as isolation — the very hole this lint
+# exists to close. The AST rewrite dropped that predicate; these pin it shut.
+check(
+    "BYPASS 3: a comment mentioning util_paths.channel_access_path is NOT isolation",
+    lint.classify(
+        write(
+            tmpdir,
+            "# util_paths.channel_access_path isolates this later\n" + IMPORTS_BRIDGE,
+        )
+    )
+    == lint.VIOLATION,
+)
+check(
+    "BYPASS 3b: same comment placed after the import is still NOT isolation",
+    lint.classify(
+        write(
+            tmpdir,
+            IMPORTS_BRIDGE + "\n# util_paths.channel_access_path isolates this later\n",
+        )
+    )
+    == lint.VIOLATION,
+)
+check(
+    "a REAL patch of channel_access_path before the import IS isolation",
+    lint.classify(
+        write(
+            tmpdir,
+            'from unittest.mock import patch\nwith patch("util_paths.channel_access_path"):\n    pass\n'
+            + IMPORTS_BRIDGE,
+        )
+    )
+    == lint.CLEAN,
+)
 check(
     "mitigated: post-import ACCESS_FILE rebind",
     lint.classify(write(tmpdir, IMPORTS_BRIDGE + '\nm.ACCESS_FILE = "/tmp/a.json"\n'))
