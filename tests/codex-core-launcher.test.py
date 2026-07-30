@@ -553,6 +553,66 @@ sleep 60
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(count.exists(), "notifier started without a live core")
 
+    def test_notifier_timeout_reaps_watcher_so_supervisor_can_restart(self):
+        tasks = self.root / "workspace" / "tasks"
+        results = self.root / "workspace" / "results"
+        status = self.root / "workspace" / "state" / "core-status.json"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        task = tasks / "task-owner.txt"
+        task.write_text("priority: normal\ntask: owner message\n")
+        status.write_text(
+            f'{{"status":"running","step":"busy","ts":{int(time.time())}}}\n'
+        )
+        watcher_pid_file = Path(self.tmp.name) / "watcher-pid"
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text(f'''#!/bin/bash
+printf '%s' "$$" > "{watcher_pid_file}"
+printf 'TASK_FILE: task-owner.txt\\n'
+sleep 60
+''')
+        watcher.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then
+  printf '◦ Working (2m • esc to interrupt)\\n'
+  exit 0
+fi
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_CORE_STATUS_FILE=str(status),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_CORE_READY_TIMEOUT="1",
+        )
+        notifier = self.root / "src/agent/codex/cli/task-notifier.sh"
+        process = subprocess.Popen(
+            ["/bin/bash", str(notifier)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=2)
+            self.fail("notifier remained blocked on its surviving watcher")
+        self.assertNotEqual(process.returncode, 0, stdout or stderr)
+        self.assertIn("core did not become idle within 1s", stderr)
+        watcher_pid = int(watcher_pid_file.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(watcher_pid, 0)
+
     def test_notifier_submits_literal_safe_prompt(self):
         # The one-event mode tests the adapter without starting fswatch.
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),

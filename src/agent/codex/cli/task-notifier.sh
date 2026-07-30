@@ -13,9 +13,31 @@ fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
-CORE_READY_TIMEOUT=300
+CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
 CORE_STATUS_STALE_SEC=90
 CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
+watcher_pid=""
+event_dir=""
+
+stop_watcher() {
+  [ -n "$watcher_pid" ] || return 0
+  kill -TERM "-$watcher_pid" 2>/dev/null \
+    || kill -TERM "$watcher_pid" 2>/dev/null \
+    || true
+  wait "$watcher_pid" 2>/dev/null || true
+  watcher_pid=""
+}
+
+cleanup_notifier() {
+  stop_watcher
+  if [ -n "$event_dir" ]; then
+    rm -f "$event_dir/events"
+    rmdir "$event_dir" 2>/dev/null || true
+  fi
+}
+
+trap cleanup_notifier EXIT
+trap 'exit 0' HUP INT TERM
 
 has_result() {
   local filename="$1" stem archive_dir
@@ -167,7 +189,14 @@ if [ "${1:-}" = "--event" ]; then
   exit 0
 fi
 
-bash "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" | while IFS= read -r event; do
+event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-notifier.XXXXXX")"
+mkfifo "$event_dir/events"
+python3 -c \
+  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
+  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
+watcher_pid=$!
+
+while IFS= read -r event; do
   case "$event" in
     "TASK_FILE: "*)
       # Watcher output is a wake signal, not queue order. While the core is
@@ -180,4 +209,4 @@ bash "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" | while IFS= read -r event; 
       submit_task "$filename" 1
       ;;
   esac
-done
+done < "$event_dir/events"
