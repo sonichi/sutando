@@ -353,19 +353,49 @@ fi
 # Safe callers: Sutando.app menu, terminal one-off, future health-check
 # emit-task. Unsafe: a future agent processing a "restart core" task by
 # exec'ing this script from within sutando-core. Per Mini's #608 review.
+RESTART_REQUESTED=""
 if [ "${1:-}" = "--restart" ]; then
+  RESTART_REQUESTED=1
   if tmux_session_exists || core_claude_running; then
     echo "Killing existing $SESSION session..."
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
     core_claude_pids | while read -r pid; do
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
-    # Poll for actual shutdown — robust on slow machines, faster on fast
-    # ones (~1s ceiling) than a fixed sleep.
-    for _ in 1 2 3 4 5; do
+    # Wait for the core to ACTUALLY exit before falling through to the create
+    # path. Claude Code flushes telemetry/state on shutdown and can take several
+    # seconds — longer than the old ~1s (5×0.2s) ceiling. When the poll gave up
+    # early while the process was still dying, execution fell into the "orphan
+    # claude already running → reuse it → exit 0" guard below: the script
+    # returned SUCCESS without creating a fresh core, the zombie then finished
+    # dying, and the session was left with no core at all — a silent outage the
+    # caller (Sutando.app menu) reported as a successful "Core restarted". Poll
+    # ~3s here for a graceful exit.
+    for _ in $(seq 1 15); do
       tmux_session_exists || core_claude_running || break
       sleep 0.2
     done
+    # SIGTERM didn't take within ~3s → escalate to SIGKILL, then poll ~3s more.
+    if tmux_session_exists || core_claude_running; then
+      echo "  core still alive ~3s after SIGTERM — escalating to SIGKILL" >&2
+      tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+      core_claude_pids | while read -r pid; do
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+      done
+      for _ in $(seq 1 15); do
+        tmux_session_exists || core_claude_running || break
+        sleep 0.2
+      done
+    fi
+    # Still alive after SIGKILL → abort rather than stack a second core on top of
+    # a survivor (double task-consumer) or exit-0 a half-torn-down state. Exiting
+    # non-zero lets the caller (Sutando.app restartCore) surface a real failure
+    # instead of a false success.
+    if tmux_session_exists || core_claude_running; then
+      echo "  ⚠ $SESSION core did not die after SIGKILL — aborting restart." >&2
+      echo "    Investigate the stuck pid; rerun --restart once it's gone." >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -461,7 +491,12 @@ fi
 # child claude survived). Adopt it: do NOT start a second core, which would
 # double the task-consumer count. On a non-restart start we reuse the existing
 # process; the operator can `--restart` to cleanly recycle it.
-if core_claude_running; then
+#
+# Under --restart, do NOT adopt an orphan: we just tore the core down, so a
+# claude seen here is either still dying (the SIGKILL escalation above should
+# have reaped it) or one a competing launcher spawned in the race window.
+# Reusing it would defeat the restart and re-introduce the false-success path.
+if [ -z "$RESTART_REQUESTED" ] && core_claude_running; then
   echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
   echo "To recycle it cleanly: bash $0 --restart"
   exit 0
@@ -561,6 +596,20 @@ else
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/schedule-crons"
+  # Verify the core actually came up before reporting success. Without this a
+  # failed launch (tmux server refusal, claude crash-on-start, a bad flag) still
+  # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
+  # the same false-success class as the --restart kill race above. Poll ~5s for
+  # the session AND a live `claude --name` under it; exit non-zero otherwise so
+  # the caller surfaces a real failure instead of a silent dead core.
+  for _ in $(seq 1 25); do
+    tmux_core_session_running && break
+    sleep 0.2
+  done
+  if ! tmux_core_session_running; then
+    echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
+    exit 1
+  fi
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   echo "Started $SESSION detached. Attach via Open Core CLI in menu bar, or:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"
