@@ -89,6 +89,7 @@ tests/bridge-audit-wiring.test.py
 tests/bridge-env-token-perms.test.py
 tests/bridge-not-allowlisted-ack.test.py
 tests/bridge-restart-intercept.test.py
+tests/bridges-allowlist-default-readonly.test.py
 tests/bridges-sending-orphan-recovery.test.py
 tests/discord-bridge-attachment-filename-sanitize.test.py
 tests/discord-bridge-delivery-failure-visible.test.py
@@ -101,6 +102,7 @@ tests/discord-task-source-invariance.test.py
 tests/discord-writeside-attachments.test.py
 tests/dm-result-multipart-upload.test.py
 tests/health-check-fix-down-bridges.test.py
+tests/slack-bridge-access-durable-backup.test.py
 tests/slack-bridge-allowlist.test.py
 tests/slack-bridge-chunking.test.py
 tests/slack-bridge-download-html-guard.test.py
@@ -136,10 +138,20 @@ def _const_str(node) -> str | None:
 
 
 def _is_os_environ(node) -> bool:
-    """True only for `os.environ` / `environ` as the assignment receiver."""
-    if isinstance(node, ast.Attribute):
-        return node.attr == "environ"
-    return isinstance(node, ast.Name) and node.id == "environ"
+    """True only for a literal `os.environ` receiver.
+
+    Deliberately does NOT accept a bare `environ`, nor any attribute merely NAMED environ.
+    qingyun demonstrated both bypasses on #2429: `fake.environ["CLAUDE_CONFIG_DIR"] = ...` and
+    a shadowed `environ = {}` each classified clean while the real inherited CLAUDE_CONFIG_DIR
+    stayed active. Proving a bare `environ` is `from os import environ` AND unshadowed is more
+    analysis than this gate needs; requiring the explicit form costs a test author nothing.
+    """
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    )
 
 
 def _isolation_line(tree: ast.Module) -> int | None:
@@ -176,24 +188,42 @@ def _isolation_line(tree: ast.Module) -> int | None:
                 return node.lineno
     return None
 
-def _exec_module_line(tree: ast.AST) -> int | None:
-    """Earliest line that calls .exec_module(...)."""
-    best = None
+def _exec_module_call(tree: ast.AST):
+    """(lineno, module_var_name) of the earliest `.exec_module(<name>)`, else (None, None).
+
+    The variable name matters: a mitigation only counts when it rebinds THAT module object.
+    """
+    best, name = None, None
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr == "exec_module":
-                if best is None or node.lineno < best:
-                    best = node.lineno
-    return best
+            if node.func.attr == "exec_module" and (best is None or node.lineno < best):
+                best = node.lineno
+                arg = node.args[0] if node.args else None
+                name = arg.id if isinstance(arg, ast.Name) else None
+    return best, name
 
 
-def _mitigation_line(tree: ast.AST) -> int | None:
-    """Earliest post-import rebind of the resolved path (mod.ACCESS_FILE = ...)."""
+def _mitigation_line(tree: ast.Module, exec_line: int, mod_var: "str | None") -> "int | None":
+    """Module-level `<mod>.ACCESS_FILE = ...` that runs AFTER the bridge import, else None.
+
+    Both extra conditions are qingyun's (#2429): without the receiver check, an unrelated
+    `cfg.ACCESS_FILE = ...` counted; without the ordering check, a rebind BEFORE exec_module
+    counted even though the import then re-resolves against host config. MITIGATED is
+    non-fatal, so a false mitigation silently downgrades a real violation.
+    """
+    if mod_var is None:
+        return None
     for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for tgt in node.targets:
-                if isinstance(tgt, ast.Attribute) and tgt.attr in {"ACCESS_FILE", "channels_env"}:
-                    return node.lineno
+        if not isinstance(node, ast.Assign) or node.lineno <= exec_line:
+            continue
+        for tgt in node.targets:
+            if (
+                isinstance(tgt, ast.Attribute)
+                and tgt.attr in {"ACCESS_FILE", "channels_env"}
+                and isinstance(tgt.value, ast.Name)
+                and tgt.value.id == mod_var
+            ):
+                return node.lineno
     return None
 
 
@@ -218,7 +248,7 @@ def classify(path: Path) -> str | None:
         # silently passing it. A file that cannot be analysed is not proven clean.
         return VIOLATION
 
-    exec_line = _exec_module_line(tree)
+    exec_line, mod_var = _exec_module_call(tree)
     if exec_line is None:
         return None
     iso_line = _isolation_line(tree)
@@ -226,7 +256,7 @@ def classify(path: Path) -> str | None:
     # afterwards leaves the module-level resolution already done against host config.
     if iso_line is not None and iso_line < exec_line:
         return CLEAN
-    return MITIGATED if _mitigation_line(tree) is not None else VIOLATION
+    return MITIGATED if _mitigation_line(tree, exec_line, mod_var) is not None else VIOLATION
 
 
 def scan(paths) -> dict[str, str]:

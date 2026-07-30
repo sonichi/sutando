@@ -125,6 +125,38 @@ check(
     == lint.VIOLATION,
 )
 
+# --- receiver + ordering bypasses (qingyun, #2429 review 7) ----------------
+# MITIGATED is non-fatal, so a false mitigation silently downgrades a real violation.
+check(
+    "BYPASS 4: an attribute merely NAMED environ is NOT os.environ",
+    lint.classify(
+        write(tmpdir, 'import fake\nfake.environ["CLAUDE_CONFIG_DIR"] = "/tmp/x"\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+)
+check(
+    "BYPASS 5: a shadowed bare `environ` dict is NOT os.environ",
+    lint.classify(
+        write(tmpdir, 'environ = {}\nenviron["CLAUDE_CONFIG_DIR"] = "/tmp/x"\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+)
+check(
+    "BYPASS 6: a rebind on an UNRELATED object is not mitigation (receiver checked)",
+    lint.classify(write(tmpdir, IMPORTS_BRIDGE + '\ncfg = object()\ncfg.ACCESS_FILE = "/tmp/a"\n'))
+    == lint.VIOLATION,
+)
+check(
+    "BYPASS 7: a rebind BEFORE the import is not mitigation (import re-resolves after it)",
+    lint.classify(write(tmpdir, 'm = object()\nm.ACCESS_FILE = "/tmp/a"\n' + IMPORTS_BRIDGE))
+    == lint.VIOLATION,
+)
+check(
+    "positive: rebinding the ACTUAL imported module AFTER the import is still mitigated",
+    lint.classify(write(tmpdir, IMPORTS_BRIDGE + '\nm.ACCESS_FILE = "/tmp/a.json"\n'))
+    == lint.MITIGATED,
+)
+
 # --- the two adversarial bypasses (qingyun, #2429 P1) ----------------------
 # Both defeated the original regex predicate and are why detection is AST-based.
 check(
@@ -251,6 +283,31 @@ check("whole-tree run reports the scan summary", "bridge-importing tests scanned
 
 rc, out = run_main(["lint", "--diff"])
 check("--diff exits 0 when nothing relevant changed or all changed files are clean", rc == 0, out[-300:])
+
+# --- remaining early-return paths ------------------------------------------
+check(
+    "exec_module with a non-Name arg -> no module var -> cannot be mitigated",
+    lint.classify(write(tmpdir, IMPORTS_BRIDGE.replace("exec_module(m)", "exec_module(mods[0])")))
+    == lint.VIOLATION,
+)
+check(
+    "mitigation helper returns None when there is no module var",
+    lint._mitigation_line(__import__("ast").parse("x.ACCESS_FILE = 1\n"), 0, None) is None,
+)
+check(
+    "isolation helper returns None when nothing qualifies",
+    lint._isolation_line(__import__("ast").parse("x = 1\n")) is None,
+)
+
+# --diff with no changed test files takes the early-exit path.
+import subprocess as _sp
+_rc, _out = run_main(["lint", "--diff"])
+check("--diff early-exit or clean run exits 0", _rc == 0, _out[-200:])
+
+# MITIGATED note path: classify a real mitigation via scan() so main() prints the note.
+_mit = tmpdir / "mitigated_sample.test.py"
+_mit.write_text(IMPORTS_BRIDGE + '\nm.ACCESS_FILE = "/tmp/a.json"\n')
+check("scan() reports a real mitigation", lint.scan([str(_mit)]) .get(str(_mit)) == lint.MITIGATED)
 
 # --- failure branches ------------------------------------------------------
 # Exercise the paths that only fire on a red tree, by swapping the grandfather list.
