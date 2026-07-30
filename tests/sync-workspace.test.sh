@@ -236,6 +236,31 @@ else
   echo "  FAIL: host/${HOST}/${WS_ID} branch NOT in vault"; fail=$((fail+1))
 fi
 
+# Regression: launchd/cron does not inherit CLAUDE_CONFIG_DIR. The snapshot
+# must still read the workspace-scoped Claude config used by startup, not a
+# stale legacy ~/.claude tree.
+echo
+echo "==== Test 2b: per-host config snapshot resolves canonical Claude config without env ===="
+SNAPSHOT_HOME="$TEST_ROOT/snapshot-home"
+LIVE_CCD="$FIXTURE_WS/.claude-sutando"
+mkdir -p "$SNAPSHOT_HOME/.claude/channels/discord" "$LIVE_CCD/channels/discord"
+printf '%s\n' '{"allowFrom":["owner-live"],"tierMap":{"owner-live":"owner"}}' \
+  > "$LIVE_CCD/channels/discord/access.json"
+printf '%s\n' '{"allowFrom":["member-stale"],"tierMap":{"member-stale":"team"}}' \
+  > "$SNAPSHOT_HOME/.claude/channels/discord/access.json"
+snapshot_out=$(env -u CLAUDE_CONFIG_DIR -u CLAUDE_HOME \
+  HOME="$SNAPSHOT_HOME" "${COMMON_ENV[@]}" \
+  bash "$SYNC" --vault-url "$FIXTURE_VAULT" --push-only 2>&1)
+SNAPSHOT_BACKUP="$FIXTURE_WS/hosts/$HOST/channels/discord/access.json"
+if cmp -s "$LIVE_CCD/channels/discord/access.json" "$SNAPSHOT_BACKUP"; then
+  echo "  OK: snapshot preserved live owner tierMap without CLAUDE_CONFIG_DIR"; pass=$((pass+1))
+else
+  echo "  FAIL: snapshot used legacy HOME instead of canonical Claude config"
+  [ -f "$SNAPSHOT_BACKUP" ] && sed -n '1p' "$SNAPSHOT_BACKUP"
+  echo "  INFO: push-only output: $snapshot_out"
+  fail=$((fail+1))
+fi
+
 # ============================================================================
 echo
 echo "==== Test 3: idempotent re-init ===="

@@ -1072,7 +1072,10 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
   if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
-    python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+    # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
+    # the redirect below); the bridge stamps launched_via into gateway-status
+    # and skips its own bare-launch file log. See remote_gateway_bridge._log.
+    SUTANDO_SUPERVISED=1 python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
     echo "  ✓ gateway bridge"
   else
     echo "  ✓ gateway bridge (already running)"

@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-172 modules indexed.
+174 modules indexed.
 
 ## `src/`
 
@@ -132,6 +132,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_lock.py`** — Atomic per-workspace role lock for sutando singleton enforcement (MC1).
 - **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts.
+- **`write_calendar_cache.py`** — Producer for the morning-briefing Google-calendar cache (PR #2256).
 
 ## `src/Sutando/`
 
@@ -151,6 +152,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 ## `src/agent/codex/cli/`
 
 - **`start-cli.sh`** — Persistent Codex CLI implementation of the Sutando core.
+- **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
 
 ## `src/launchd/`
