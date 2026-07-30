@@ -47,6 +47,15 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
 # and, if present, chmods + reads it. Without this, the committed test touches
 # the developer's real ~/.claude credential file (qingyun repro, PR #1886).
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-timeout-guards-")
+# ...and seed the CANONICAL access file inside it. Setting CLAUDE_CONFIG_DIR alone is not
+# enough: the bridge also calls channel_access_path("telegram"), which falls back to the
+# LEGACY real-home ~/.claude/channels/telegram/access.json when the canonical path is
+# missing. That left tg.ACCESS_FILE pointing at the operator's real allowlist inside a unit
+# test and emitted a `[util_paths] DEPRECATION: using legacy …` warning (qingyun, #1886).
+# Creating an empty allowlist here makes the import hermetic — no host state, no real file.
+_ccd_tg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
+_ccd_tg.mkdir(parents=True, exist_ok=True)
+(_ccd_tg / "access.json").write_text('{"allowFrom": []}')
 
 failures: list[str] = []
 
