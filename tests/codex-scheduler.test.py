@@ -185,6 +185,47 @@ def test_enqueue_retry_complete_and_no_duplicate():
         assert state["jobs"]["daily-news"]["current"] is None
 
 
+def test_terminal_live_result_is_archived_without_voice_task_bridge():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        config(ws)
+        scheduler.tick(ws, "test-host", at(6, 0))
+        task = next((ws / "tasks").glob("*.txt"))
+        result = ws / "results" / task.name
+        result.parent.mkdir(parents=True, exist_ok=True)
+        result.write_text("[no-send]\n")
+
+        done = scheduler.tick(ws, "test-host", at(6, 1))
+
+        assert done["events"] == [{"job": "daily-news", "event": "completed"}]
+        archived_result = ws / "results" / "archive" / "2026-07" / result.name
+        archived_task = ws / "tasks" / "archive" / "2026-07" / task.name
+        assert archived_result.read_text() == "[no-send]\n"
+        assert archived_task.exists()
+        assert not result.exists()
+        assert not task.exists()
+        state = json.loads((ws / "state" / "schedules" / "codex-scheduler.json").read_text())
+        assert state["jobs"]["daily-news"]["last_result"] == str(archived_result)
+
+
+def test_nonterminal_live_result_remains_for_delivery_consumer():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        config(ws)
+        scheduler.tick(ws, "test-host", at(6, 0))
+        task = next((ws / "tasks").glob("*.txt"))
+        result = ws / "results" / task.name
+        result.parent.mkdir(parents=True, exist_ok=True)
+        result.write_text("owner-facing result\n")
+
+        done = scheduler.tick(ws, "test-host", at(6, 1))
+
+        assert done["events"] == [{"job": "daily-news", "event": "completed"}]
+        assert result.exists()
+        assert task.exists()
+        assert not (ws / "results" / "archive").exists()
+
+
 def test_failure_alert_and_health():
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td)
@@ -321,6 +362,8 @@ def main():
         test_codex_runtime_owns_legacy_main_loop_without_mutating_config,
         test_helpers_and_config_validation,
         test_enqueue_retry_complete_and_no_duplicate,
+        test_terminal_live_result_is_archived_without_voice_task_bridge,
+        test_nonterminal_live_result_remains_for_delivery_consumer,
         test_failure_alert_and_health,
         test_stale_active_task_fails_instead_of_stalling_or_duplicating,
         test_wake_catchup_and_timezone,

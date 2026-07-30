@@ -25,7 +25,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from task_body_guard import confine_user_content  # noqa: E402
+from result_markers import parse_markers  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
 
 
 LABEL = "com.sutando.codex-schedules"
@@ -296,6 +298,66 @@ def _find_result(workspace: Path, task_ids: list[str]) -> Path | None:
     return None
 
 
+def _archive_terminal_result(
+    workspace: Path, result_path: Path, now: datetime
+) -> Path:
+    """Archive a live skip-marker result and its matching task.
+
+    Scheduled ``[no-send]`` acknowledgements must not depend on optional
+    voice-agent/task-bridge being present. Only terminal protocol markers are
+    consumed here; an ordinary result remains available to its delivery
+    bridge.
+    """
+    live_results = workspace / "results"
+    if result_path.parent != live_results:
+        return result_path
+    try:
+        parsed = parse_markers(result_path.read_text())
+    except (OSError, UnicodeError):
+        return result_path
+    if not any(action.kind == "skip" for action in parsed.actions):
+        return result_path
+
+    task_id = result_path.stem
+    month = now.astimezone(timezone.utc).strftime("%Y-%m")
+    result_archive = live_results / "archive" / month
+    task_archive = workspace / "tasks" / "archive" / month
+    result_archive.mkdir(parents=True, exist_ok=True)
+    task_archive.mkdir(parents=True, exist_ok=True)
+
+    archived_result = result_archive / result_path.name
+    try:
+        if archived_result.exists():
+            archived_result = result_archive / (
+                f"{task_id}-{int(now.timestamp())}-{os.getpid()}.txt"
+            )
+        os.replace(result_path, archived_result)
+    except FileNotFoundError:
+        # A bridge won the race. Prefer its canonical archive path if present.
+        canonical = result_archive / result_path.name
+        if canonical.exists():
+            archived_result = canonical
+        else:
+            return result_path
+    except OSError:
+        # Cleanup must never turn a successfully completed schedule into a
+        # failed tick. Leave the live marker for a later consumer/retry.
+        return result_path
+
+    task_path = find_task_file(workspace / "tasks", task_id)
+    if task_path is not None:
+        archived_task = task_archive / f"{task_id}.txt"
+        try:
+            if archived_task.exists():
+                archived_task = task_archive / (
+                    f"{task_id}-{int(now.timestamp())}-{os.getpid()}.txt"
+                )
+            os.replace(task_path, archived_task)
+        except OSError:
+            pass
+    return archived_result
+
+
 def _task_is_active(workspace: Path, task_ids: list[str]) -> bool:
     tasks = workspace / "tasks"
     for task_id in task_ids:
@@ -369,6 +431,7 @@ def tick(
                 task_ids = _current_task_ids(current)
                 result_path = _find_result(workspace, task_ids)
                 if result_path is not None:
+                    result_path = _archive_terminal_result(workspace, result_path, now)
                     job_state["last_success_at"] = iso(now)
                     job_state["last_success_slot"] = current["slot"]
                     job_state["last_result"] = str(result_path)
