@@ -126,11 +126,20 @@ case "$cmd" in
         _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
             | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
         _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
+        # Persist the install-time Claude config dir (resolved, not raw — an
+        # unset var must pin the ~/.claude default we validated against, not
+        # an empty string the wrapper would treat as unset). Same XML+sed
+        # escaping as SUTANDO_NODE: caller-controlled, lands in plist XML.
+        _ccd_resolved="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+        _ccd_xml="$(printf '%s' "$_ccd_resolved" \
+            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+        _ccd_sed="$(printf '%s' "$_ccd_xml" | sed -e 's/[\\&|]/\\&/g')"
         sed \
             -e "s|__REPO__|$REPO|g" \
             -e "s|__WORKSPACE__|$WORKSPACE|g" \
             -e "s|__BREW_BIN__|$BREW_BIN|g" \
             -e "s|__SUTANDO_NODE__|${_node_sed}|g" \
+            -e "s|__CLAUDE_CONFIG_DIR__|${_ccd_sed}|g" \
             -e "s|__HOME__|$HOME|g" \
             "$TEMPLATE" > "$DEST"
         bootout_if_loaded

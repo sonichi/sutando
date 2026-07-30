@@ -53,6 +53,14 @@ if [ ! -f "$PROXY_SCRIPT" ]; then
     PROXY_SCRIPT="$(bash "$REPO_ROOT/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
 fi
 
+# Test probe: print the resolved proxy target and exit — lets the regression
+# suite assert launchd-env resolution (env -i + plist EnvironmentVariables)
+# without exec'ing a real proxy. No production caller passes arguments.
+if [ "${1:-}" = "--resolve-only" ]; then
+    echo "$PROXY_SCRIPT"
+    exit 0
+fi
+
 # Resolve npx — launchd doesn't inherit the user's shell PATH.
 resolve_npx() {
     for p in \
