@@ -32,6 +32,15 @@ if grep -q 'voice agent disabled' <<<"$with_voice_key"; then
   exit 1
 fi
 
+printf 'SKIP_VOICE=1\nGEMINI_API_KEY=file-key\n' > "$TMP/.env"
+with_key_and_skip="$(run_runtime_config)"
+rm "$TMP/.env"
+grep -q 'SKIP_VOICE=0' <<<"$with_key_and_skip"
+if grep -q 'voice agent disabled' <<<"$with_key_and_skip"; then
+  echo "voice was disabled despite a configured credential overriding SKIP_VOICE" >&2
+  exit 1
+fi
+
 # The phone stack shares the Gemini voice session and must stay down when
 # credential-free startup sets SKIP_VOICE, even if Twilio is configured.
 phone_gate="$(env -i PATH="/usr/bin:/bin" bash -c '

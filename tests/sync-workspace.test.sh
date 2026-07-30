@@ -115,7 +115,13 @@ COMMON_ENV=(
 )
 
 SYNC="$FIXTURE_REPO/scripts/sync-workspace.sh"
-HOST=$(hostname | sed 's/\..*//')
+# Must match sync-workspace.sh's own _host() precedence (scutil LocalHostName
+# before raw `hostname`, #1745) — not the naive `hostname | sed` recipe, which
+# can diverge from it on this exact machine and make this assertion fail
+# against a script that's actually behaving correctly. Resolved via the real
+# repo (not $FIXTURE_REPO, which doesn't carry src/util_paths.py) since this
+# is a fact about the machine, not the fixture.
+HOST=$(bash "$REPO/scripts/sutando-config.sh" host-label)
 # Post-wsId branch shape (`host/<hostname>/<wsId>`). WS_ID matches the override
 # set in COMMON_ENV above, so test assertions know the exact ref.
 WS_ID=t01ws1
@@ -228,6 +234,31 @@ if git --git-dir="$FIXTURE_VAULT" rev-parse "$HOST_BRANCH" >/dev/null 2>&1; then
   echo "  OK: host/${HOST}/${WS_ID} branch pushed to vault"; pass=$((pass+1))
 else
   echo "  FAIL: host/${HOST}/${WS_ID} branch NOT in vault"; fail=$((fail+1))
+fi
+
+# Regression: launchd/cron does not inherit CLAUDE_CONFIG_DIR. The snapshot
+# must still read the workspace-scoped Claude config used by startup, not a
+# stale legacy ~/.claude tree.
+echo
+echo "==== Test 2b: per-host config snapshot resolves canonical Claude config without env ===="
+SNAPSHOT_HOME="$TEST_ROOT/snapshot-home"
+LIVE_CCD="$FIXTURE_WS/.claude-sutando"
+mkdir -p "$SNAPSHOT_HOME/.claude/channels/discord" "$LIVE_CCD/channels/discord"
+printf '%s\n' '{"allowFrom":["owner-live"],"tierMap":{"owner-live":"owner"}}' \
+  > "$LIVE_CCD/channels/discord/access.json"
+printf '%s\n' '{"allowFrom":["member-stale"],"tierMap":{"member-stale":"team"}}' \
+  > "$SNAPSHOT_HOME/.claude/channels/discord/access.json"
+snapshot_out=$(env -u CLAUDE_CONFIG_DIR -u CLAUDE_HOME \
+  HOME="$SNAPSHOT_HOME" "${COMMON_ENV[@]}" \
+  bash "$SYNC" --vault-url "$FIXTURE_VAULT" --push-only 2>&1)
+SNAPSHOT_BACKUP="$FIXTURE_WS/hosts/$HOST/channels/discord/access.json"
+if cmp -s "$LIVE_CCD/channels/discord/access.json" "$SNAPSHOT_BACKUP"; then
+  echo "  OK: snapshot preserved live owner tierMap without CLAUDE_CONFIG_DIR"; pass=$((pass+1))
+else
+  echo "  FAIL: snapshot used legacy HOME instead of canonical Claude config"
+  [ -f "$SNAPSHOT_BACKUP" ] && sed -n '1p' "$SNAPSHOT_BACKUP"
+  echo "  INFO: push-only output: $snapshot_out"
+  fail=$((fail+1))
 fi
 
 # ============================================================================

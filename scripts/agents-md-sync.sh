@@ -7,7 +7,7 @@
 # Substitutions applied (order matters: longer-match-first):
 #   1. "Claude Code default" → "Codex default"
 #   2. "Claude Code"         → "Codex"
-#   3. "pgrep -f claude"     → "pgrep -f Codex"
+#   3. "pgrep -f claude"     → "pgrep -f codex"
 #   4. "CLAUDE.md"           → "AGENTS.md"
 #
 # Usage:
@@ -30,11 +30,22 @@ CHECK_ONLY=0
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
+# PERSONAL_CLAUDE.md is a REAL FILENAME on disk, not a reference to this doc, so
+# it must survive the CLAUDE.md -> AGENTS.md rename. Without the guard below the
+# final substitution rewrote it to PERSONAL_AGENTS.md and AGENTS.md instructed
+# the agent to read a file that nothing writes, nothing reads, and for which the
+# repo ships no example — src/personal-claude-compact-hint.sh resolves
+# personal_path("PERSONAL_CLAUDE.md"), and the template is PERSONAL_CLAUDE.md.example.
+#
+# Done by placeholder rather than a word-boundary match because `\b` is GNU sed
+# only — this script has to run on the BSD sed that ships with macOS.
 sed \
+  -e 's/PERSONAL_CLAUDE\.md/@@SUTANDO_PERSONAL_DOC@@/g' \
   -e 's/ (Claude Code default)//g' \
   -e 's/Claude Code/Codex/g' \
   -e 's/pgrep -f claude/pgrep -f codex/g' \
   -e 's/CLAUDE\.md/AGENTS.md/g' \
+  -e 's/@@SUTANDO_PERSONAL_DOC@@/PERSONAL_CLAUDE.md/g' \
   "$src" > "$tmp"
 
 # Regression guard: verify expected markers are present in output.

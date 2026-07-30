@@ -1581,7 +1581,7 @@ commit_main() {
         echo "  If you want to commit + delete in one step on a fresh state, run --commit first (no-delete)," >&2
         echo "  observe ~7d for straggler writers, then re-run with --commit --delete-source --backup-id <id-from-step-1>." >&2
         echo "  Available backups:" >&2
-        ls -1 "$DEST_REAL/state/migration-backup-"*.tar 2>/dev/null "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null \
+        ls -1 "$DEST_REAL/state/migration-backup-"*.tar "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null \
             | sed -E 's@.*migration-backup-(.+)\.tar(\.gz)?$@    \1@' >&2 || echo "    (none)" >&2
         exit 2
     fi
@@ -1949,7 +1949,7 @@ rollback_main() {
         echo "rollback: --backup-id <id> required. Available backups:" >&2
         # Bug #3 (2026-06-06): backups can be .tar.gz OR .tar (uncompressed
         # for media-heavy workspaces). List both shapes.
-        ls -1 "$DEST_REAL/state/migration-backup-"*.tar 2>/dev/null "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null \
+        ls -1 "$DEST_REAL/state/migration-backup-"*.tar "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null \
             | sed -E 's@.*migration-backup-(.+)\.tar(\.gz)?$@  \1@' >&2
         exit 2
     }

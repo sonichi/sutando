@@ -4,6 +4,30 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# Direct restarts (menu bar, health-check recovery, and manual --restart) do
+# not pass through startup.sh. Load the same repo configuration here so policy
+# switches such as SUTANDO_SELF_DEVELOPMENT_ENABLED survive every launch path.
+# Preserve an explicit ambient override (including an empty/invalid value): the
+# skill-config contract puts process env above .env, and invalid values must
+# reach the policy helper so it can fail closed instead of using the enabled
+# manifest default.
+if [ -f "$REPO/.env" ]; then
+  _self_dev_was_set=0
+  if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
+    _self_dev_was_set=1
+    _self_dev_ambient="$SUTANDO_SELF_DEVELOPMENT_ENABLED"
+  fi
+  set -a
+  # shellcheck disable=SC1091
+  source "$REPO/.env"
+  set +a
+  if [ "$_self_dev_was_set" = 1 ]; then
+    export SUTANDO_SELF_DEVELOPMENT_ENABLED="$_self_dev_ambient"
+  fi
+  unset _self_dev_was_set _self_dev_ambient
+fi
+
 runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
   echo "start-cli: failed to resolve core runtime" >&2
   exit 1
@@ -39,7 +63,8 @@ if command -v tmux >/dev/null 2>&1 && tmux -S "$tmux_socket" has-session -t "=$s
     case "$pane_command" in claude|codex) active_runtime="$pane_command" ;; esac
   fi
 fi
-if [ -n "$active_runtime" ] && [ "$active_runtime" != "$runtime" ] && [ "${1:-}" != "--restart" ]; then
+if [ -n "$active_runtime" ] && [ "$active_runtime" != "$runtime" ] \
+   && [ "${1:-}" != "--restart" ] && [ "${1:-}" != "--force-restart" ]; then
   echo "Core runtime changed ($active_runtime → $runtime); restarting canonical session."
   set -- --restart "$@"
 fi
