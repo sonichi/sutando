@@ -80,6 +80,25 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
+3.5. **Apply the self-development policy gate.** Run:
+
+   ```bash
+   python3 skills/proactive-loop/scripts/self-development-enabled.py
+   ```
+
+   The command prints `enabled` or `disabled`. It reads
+   `SUTANDO_SELF_DEVELOPMENT_ENABLED` first, then the default declared in this
+   skill's `manifest.json`. The shipped default is enabled (`1`). Product
+   deployments can set the environment variable to `0`.
+
+   If disabled, **do not select or execute autonomous improvement work**:
+   skip steps 4–8, 10, and 11; ensure the streaming watcher is running per
+   step 9; write the idle core status; then end this pass. Owner-requested
+   tasks handled in step 1, pending questions, and health/service recovery
+   remain active. Disabling self-development does not turn Sutando off and
+   does not prevent the owner from explicitly asking it to change code.
+   Manual `/proactive-loop` invocation does not override the policy.
+
 4. **Read the build log** (`$WORKSPACE/build_log.md`) — understand what exists. Do not rebuild what works.
 
 5. **Pick the highest-ROI available work.** Priority order when choosing from step 6's menu:

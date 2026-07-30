@@ -10,13 +10,14 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-165 modules indexed.
+178 modules indexed.
 
 ## `src/`
 
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
+- **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
@@ -30,8 +31,10 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
 - **`conversation-store.ts`** — SQLite mirror of conversation.log — per-surface tables.
 - **`core-input-watch.py`** — core-input-watch.py — the core supervisor MONITOR (M1).
+- **`core-supervisor-gate.py`** — core-supervisor-gate.py — the RECOVER decision gate (sonichi#2401 prototype).
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
+- **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
@@ -39,6 +42,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
 - **`discord_config.py`** — Workspace-local Sutando-specific Discord configuration (closes #1147).
+- **`discord_http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
@@ -131,6 +135,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_lock.py`** — Atomic per-workspace role lock for sutando singleton enforcement (MC1).
 - **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts.
+- **`write_calendar_cache.py`** — Producer for the morning-briefing Google-calendar cache (PR #2256).
 
 ## `src/Sutando/`
 
@@ -140,6 +145,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 ## `src/agent/`
 
 - **`start-cli.sh`** — Canonical persistent-core launcher.
+- **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 
 ## `src/agent/claude/cli/`
 
@@ -150,6 +156,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 ## `src/agent/codex/cli/`
 
 - **`start-cli.sh`** — Persistent Codex CLI implementation of the Sutando core.
+- **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
 
 ## `src/launchd/`
@@ -206,3 +213,15 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`collector.ts`** — Collector — the single, source-agnostic local ingestion point.
 - **`normalizer.ts`** — Normalizer — turns ONE source's raw payload into the universal spine vocabulary (ObsEvent / UsageRecord).
 - **`server.ts`** — HTTP shell for the Collector — the long-running local daemon.
+
+## `src/runtime-api/`
+
+- **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
+- **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
+- **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.
+- **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py) and the CLI (src/runtime-cli/sutando-runtime.py).
+- **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).
+
+## `src/runtime-cli/`
+
+- **`sutando-runtime.py`** — sutando-runtime — CLI face of the local runtime API (v0).
