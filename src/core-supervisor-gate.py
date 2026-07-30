@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """core-supervisor-gate.py — the RECOVER decision gate (sonichi#2401 prototype).
 
-Decides whether a fully-dead core should be relaunched, with the compound
-signal #2246 asks for. Relaunch is warranted ONLY when ALL THREE hold:
+Decides whether a fully-dead core should be REPORTED as dead, with the
+compound signal #2246 asks for. A death verdict requires ALL THREE:
 
   1. heartbeat stale — `state/cores/<host>.alive` mtime older than --stale-sec
      (default 90, the documented staleness threshold every reader trusts)
@@ -23,15 +23,19 @@ so a relaunch under an unchanged, already-authenticated CLAUDE_CONFIG_DIR
 comes up authenticated. A planned fire that CHANGES the config dir is the
 #2402 pre-fire preflight's job; no supervisor can /login for the user.
 
+NOTIFICATION-ONLY (owner redirect on #2401): a sustained trip exits 3 and
+prints CORE-DEAD for the caller to surface as a notification. This module
+never restarts anything — restart is human-triggered (app menu / chat
+command, PR #2408).
+
 Usage (one tick; caller crons it ~60s):
   core-supervisor-gate.py tick --alive <ws>/state/cores/<host>.alive \
       --socket /tmp/sutando-tmux.sock --session sutando-core \
       --restart-sentinel <ws>/state/restart-in-progress.sentinel \
-      --state-file <ws>/state/core-supervisor-gate.state \
-      [--relaunch-cmd 'bash src/startup.sh'] [--dry-run]
+      --state-file <ws>/state/core-supervisor-gate.state
 
-Exit codes: 0 = healthy/holding (no action), 3 = gate tripped (dry-run
-printed WOULD-RELAUNCH, or relaunch-cmd was executed).
+Exit codes: 0 = healthy/holding (no action), 3 = sustained trip
+(CORE-DEAD printed — the caller surfaces it as a notification).
 """
 from __future__ import annotations
 
@@ -43,9 +47,17 @@ import sys
 import time
 
 
-def evaluate(hb_stale: bool, session_gone: bool, operator_intent: bool) -> bool:
-    """Pure compound gate: dead-heartbeat AND dead-session AND no operator intent."""
-    return hb_stale and session_gone and not operator_intent
+def _positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--sustain must be >= 1")
+    return n
+
+
+def evaluate(hb_stale: bool, session_gone: bool | None, operator_intent: bool) -> bool:
+    """Pure compound gate: dead-heartbeat AND CONFIRMED-dead-session AND no
+    operator intent. session_gone=None (probe unknown) never trips."""
+    return hb_stale and session_gone is True and not operator_intent
 
 
 # ---- signal collectors (thin, each independently overridable in tests) ---- #
@@ -58,16 +70,17 @@ def heartbeat_stale(alive_path: str, stale_sec: float, now: float | None = None)
     return ((now if now is not None else time.time()) - mtime) > stale_sec
 
 
-def session_gone(socket: str, session: str) -> bool:
-    """True when tmux reports no such session (or no server at the socket)."""
+def session_gone(socket: str, session: str) -> bool | None:
+    """True = session definitely absent, False = definitely present,
+    None = probe failed (tmux missing/hung) — UNKNOWN, never confirmed death.
+    The gate holds on None (fail-closed): a broken probe must not classify a
+    possibly-running core as dead (john-the-dev review, #2404)."""
     try:
         r = subprocess.run(["tmux", "-S", socket, "has-session", "-t", session],
                            capture_output=True, timeout=10)
         return r.returncode != 0
     except (OSError, subprocess.TimeoutExpired):
-        # tmux binary missing/hung: can't prove the session exists → treat as
-        # gone, but the heartbeat leg still gates (both must agree to trip).
-        return True
+        return None
 
 
 def operator_intent(sentinel_path: str) -> bool:
@@ -100,6 +113,8 @@ def tick(args) -> int:
     gone = session_gone(args.socket, args.session)
     intent = operator_intent(args.restart_sentinel)
     tripped_now = evaluate(hb, gone, intent)
+    if gone is None:
+        print("gate: session probe UNKNOWN (tmux error) — holding, not confirmed death")
 
     streak = load_streak(args.state_file) + 1 if tripped_now else 0
     verdict = "TRIP" if tripped_now else "healthy"
@@ -110,15 +125,13 @@ def tick(args) -> int:
         save_streak(args.state_file, streak)
         return 0
 
-    # Sustained trip → act once, then reset so the next death re-arms cleanly.
+    # Sustained trip → report once, then reset so the next death re-arms
+    # cleanly. NOTIFICATION-ONLY by owner decision on #2401: this gate never
+    # executes a relaunch — exit 3 is the signal the notification layer (and
+    # a human-triggered restart, #2408) act on.
     save_streak(args.state_file, 0)
-    if args.dry_run or not args.relaunch_cmd:
-        print(f"WOULD-RELAUNCH: {args.relaunch_cmd or '<no relaunch-cmd configured>'}")
-        return 3
-    print(f"RELAUNCH: {args.relaunch_cmd}")
-    subprocess.Popen(["bash", "-c", args.relaunch_cmd],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    print("CORE-DEAD: sustained compound signal — notify the owner; "
+          "restart is human-triggered (menu / 'restart core' chat command)")
     return 3
 
 
@@ -132,11 +145,8 @@ def main(argv=None) -> int:
     t.add_argument("--restart-sentinel", default="", help="operator-intent sentinel path")
     t.add_argument("--state-file", required=True, help="streak persistence path")
     t.add_argument("--stale-sec", type=float, default=90.0)
-    t.add_argument("--sustain", type=int, default=2,
-                   help="consecutive tripped ticks required before acting")
-    t.add_argument("--relaunch-cmd", default="", help="command to run on sustained trip")
-    t.add_argument("--dry-run", action="store_true",
-                   help="print WOULD-RELAUNCH instead of executing")
+    t.add_argument("--sustain", type=_positive_int, default=2,
+                   help="consecutive tripped ticks required before reporting (>=1)")
     args = ap.parse_args(argv)
     return tick(args)
 
