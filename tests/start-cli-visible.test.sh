@@ -11,6 +11,7 @@ set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 LAUNCHER="$REPO/src/agent/claude/cli/start-cli.sh"
+CODEX_LAUNCHER="$REPO/src/agent/codex/cli/start-cli.sh"
 fails=0
 say() { echo "$1  $2"; if [ "$1" = "FAIL" ]; then fails=$((fails+1)); fi; return 0; }
 
@@ -27,6 +28,16 @@ grep -q 'open -a Terminal "\$cmdfile"' "$LAUNCHER" \
   && say ok "opens via open -a Terminal (TCC-free path)" || say FAIL "open call missing"
 grep -q 'uname)" = "Darwin"' "$LAUNCHER" \
   && say ok "Darwin-guarded" || say FAIL "missing Darwin guard"
+
+# --- runtime parity (#2412 review): the codex adapter carries the SAME contract ---
+for f in "$CODEX_LAUNCHER"; do
+  grep -q 'VISIBLE=1' "$f" && grep -q 'open_visible_terminal()' "$f" \
+    && say ok "codex adapter: flag + helper present" || say FAIL "codex adapter missing flag/helper"
+  n=$(grep -c '^\s*open_visible_terminal$' "$f")
+  [ "$n" -eq 2 ] && say ok "codex adapter: both call sites" || say FAIL "codex adapter call sites: $n"
+  grep -q "exec tmux -S '\$TMUX_SOCKET' attach -t '\$SESSION'" "$f" \
+    && say ok "codex adapter: generator matches contract" || say FAIL "codex generator drifted"
+done
 
 # --- behavior: mirrored generator block against a temp workspace ---
 TMUX_SOCKET="/tmp/test-visible.sock"
