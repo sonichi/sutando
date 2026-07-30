@@ -363,10 +363,55 @@ def deliver(questions, count, titles):
     return summary
 
 
+def zero_reason():
+    """Explain a zero so a parse fault cannot look like a quiet day.
+
+    Every other early return in main() prints something; this one did not, and on
+    2026-07-30 that cost ~11 hours. A divider-anchor bug made the active region
+    collapse to the file's own header, `get_waiting_questions()` returned 0 while 43
+    questions were open, and each hourly run exited in silence. The silence was
+    indistinguishable from "nothing to report" — worse, it was misread as the
+    cooldown branch, which actually does print.
+
+    The tell was available the whole time: **zero out of a 5000-line file is a
+    suspicious answer.** So report the denominator, not just the verdict. A count is
+    only meaningful next to what was counted.
+    """
+    if not PQ_FILE.exists():
+        return f"0 pending questions — no file at {PQ_FILE}"
+
+    text = PQ_FILE.read_text()
+    total = len(re.findall(r'^## ', text, flags=re.MULTILINE))
+    active_text = active_region(text)
+    active = len(re.findall(r'^## ', active_text, flags=re.MULTILINE))
+    # get_waiting_questions also recognizes the free-form `- **[label]** ...` bullets,
+    # so a file can be non-empty in a way the section count alone would not show.
+    bullets = len(re.findall(r'^\s*-\s+\*\*\[', text, flags=re.MULTILINE))
+
+    if total == 0 and bullets == 0:
+        return "0 pending questions — the file holds no sections or bullets at all"
+
+    if active == 0 and total > 0:
+        return (
+            f"0 pending questions, but {PQ_FILE.name} holds {total} '## ' section(s) and "
+            f"NONE of them are in the active region (above the archive divider). "
+            f"That is the shape of a parse fault, not a quiet day — check the "
+            f"'# Resolved' divider before trusting this zero."
+        )
+
+    return (
+        f"0 pending questions — {active} of {total} '## ' section(s) are above the "
+        f"divider and every one is explicitly resolved/answered"
+        + (f"; {bullets} bullet-format entr(ies) also all resolved" if bullets else "")
+    )
+
+
 def main():
     force = "--force" in sys.argv
     questions = get_waiting_questions()
     if not questions:
+        # Never return silently: see zero_reason.__doc__.
+        print(zero_reason())
         return
 
     if not force and presenter_mode_active(WORKSPACE):
