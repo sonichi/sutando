@@ -87,8 +87,11 @@ KNOWN_UNISOLATED = frozenset(
 tests/audio-transcribe-skill.test.py
 tests/bridge-audit-wiring.test.py
 tests/bridge-env-token-perms.test.py
+tests/bridge-not-allowlisted-ack.test.py
 tests/bridge-restart-intercept.test.py
 tests/bridges-sending-orphan-recovery.test.py
+tests/discord-bridge-attachment-filename-sanitize.test.py
+tests/discord-bridge-delivery-failure-visible.test.py
 tests/discord-bridge-delivery-sentinel.test.py
 tests/discord-bridge-dm-catchup.test.py
 tests/discord-bridge-file-markers.test.py
@@ -105,11 +108,16 @@ tests/slack-bridge-download-stream.test.py
 tests/slack-bridge-orphan-recovery.test.py
 tests/slack-bridge-pending-recovery.test.py
 tests/slack-bridge-task-timeout.test.py
+tests/slack-bridge-tier-map.test.py
+tests/slack-bridge-tofu-enroll.test.py
+tests/slack-proactive-delivery-idempotency.test.py
+tests/slack-proactive-owner-resolution.test.py
 tests/slack-writeside-attachments.test.py
 tests/telegram-bridge-forward-attribution.test.py
 tests/telegram-bridge-proactive-owner-resolution.test.py
 tests/telegram-bridge-progress-stream.test.py
 tests/telegram-bridge-tofu-enroll.test.py
+tests/telegram-bridge-tofu.test.py
 tests/telegram-writeside-attachments.test.py
 """.split()
 )
@@ -123,46 +131,50 @@ CLEAN, MITIGATED, VIOLATION = "clean", "mitigated", "violation"
 SELF_EXEMPT = {"tests/lint-hermetic-bridge-tests.test.py"}
 
 
-CONFIG_KEYS = {"CLAUDE_CONFIG_DIR", "CLAUDE_HOME"}
-ISOLATION_KEYS = CONFIG_KEYS | {"HOME"}
-
-
 def _const_str(node) -> str | None:
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
 
 
-def _isolation_line(tree: ast.AST) -> int | None:
-    """Earliest line that EXECUTES an isolation of the config dir, or None.
+def _is_os_environ(node) -> bool:
+    """True only for `os.environ` / `environ` as the assignment receiver."""
+    if isinstance(node, ast.Attribute):
+        return node.attr == "environ"
+    return isinstance(node, ast.Name) and node.id == "environ"
 
-    AST-based on purpose. A regex over raw text accepts two bypasses qingyun demonstrated
-    on #2429: an assignment-shaped string inside a comment, and a real assignment placed
-    after the import. Comments never reach the AST, and node.lineno gives the ordering the
-    regex could not express.
+
+def _isolation_line(tree: ast.Module) -> int | None:
+    """Earliest MODULE-LEVEL `os.environ["CLAUDE_CONFIG_DIR"] = ...`, else None.
+
+    Deliberately narrow. Proving a test is hermetic is hard — env precedence, execution
+    context and reachability all matter — so this does not try. It recognizes exactly the
+    one documented fix and treats everything else as unproven. Under-approximating CLEAN is
+    safe; over-approximating it makes the gate worthless, and every hole qingyun found on
+    #2429 was a false CLEAN:
+
+      * `cfg["CLAUDE_CONFIG_DIR"] = ...` — a dict that is not the environment. Receiver is
+        now checked, not just the key.
+      * `os.environ.setdefault("CLAUDE_CONFIG_DIR", ...)` — a NO-OP when the developer
+        already has the var set, which is precisely the case the lint exists to catch.
+      * `HOME` / `CLAUDE_HOME` only — lower precedence than an inherited CLAUDE_CONFIG_DIR,
+        so it does not guarantee anything.
+      * `with patch(...): pass` before the import — the patch has EXPIRED by the time
+        exec_module runs. Statically proving a patch is active at the import is not
+        something line numbers can do, so patch-based isolation is no longer accepted.
+
+    Module level is required so the assignment is guaranteed to execute: a body nested in a
+    function, branch or with-block may never run, or may run after the import.
     """
-    best = None
-    for node in ast.walk(tree):
-        line = None
-        # os.environ["CLAUDE_CONFIG_DIR"] = ...  /  os.environ.update({...})
-        if isinstance(node, ast.Assign):
-            for tgt in node.targets:
-                if isinstance(tgt, ast.Subscript) and _const_str(tgt.slice) in ISOLATION_KEYS:
-                    line = node.lineno
-        # os.environ.setdefault("CLAUDE_CONFIG_DIR", ...) / monkeypatch.setenv(...)
-        elif isinstance(node, ast.Call):
-            fn = node.func
-            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
-            if name in {"setdefault", "setenv", "patch_env"} and node.args:
-                if _const_str(node.args[0]) in ISOLATION_KEYS:
-                    line = node.lineno
-            # patch("...channel_access_path") style
-            elif name in {"patch", "patch_object"} and node.args:
-                arg = _const_str(node.args[0]) or ""
-                if "channel_access_path" in arg or "claude_home_path" in arg:
-                    line = node.lineno
-        if line is not None and (best is None or line < best):
-            best = line
-    return best
-
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for tgt in node.targets:
+            if (
+                isinstance(tgt, ast.Subscript)
+                and _is_os_environ(tgt.value)
+                and _const_str(tgt.slice) == "CLAUDE_CONFIG_DIR"
+            ):
+                return node.lineno
+    return None
 
 def _exec_module_line(tree: ast.AST) -> int | None:
     """Earliest line that calls .exec_module(...)."""
@@ -177,14 +189,12 @@ def _exec_module_line(tree: ast.AST) -> int | None:
 
 def _mitigation_line(tree: ast.AST) -> int | None:
     """Earliest post-import rebind of the resolved path (mod.ACCESS_FILE = ...)."""
-    best = None
-    for node in ast.walk(tree):
+    for node in tree.body:
         if isinstance(node, ast.Assign):
             for tgt in node.targets:
                 if isinstance(tgt, ast.Attribute) and tgt.attr in {"ACCESS_FILE", "channels_env"}:
-                    if best is None or node.lineno < best:
-                        best = node.lineno
-    return best
+                    return node.lineno
+    return None
 
 
 def classify(path: Path) -> str | None:

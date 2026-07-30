@@ -76,25 +76,55 @@ check(
     )
     == lint.CLEAN,
 )
+# The narrowing (qingyun, #2429 reviews 5-6): these shapes are NO LONGER clean, because
+# none of them guarantees the import avoids an inherited CLAUDE_CONFIG_DIR.
 check(
-    "clean: os.environ.setdefault(CLAUDE_CONFIG_DIR, ...)",
+    "setdefault is NOT isolation — it is a no-op when the var is already inherited",
     lint.classify(
         write(tmpdir, 'import os\nos.environ.setdefault("CLAUDE_CONFIG_DIR", "/tmp/x")\n' + IMPORTS_BRIDGE)
     )
-    == lint.CLEAN,
+    == lint.VIOLATION,
 )
 check(
-    "clean: CLAUDE_HOME counts too",
-    lint.classify(
-        write(tmpdir, 'import os\nos.environ["CLAUDE_HOME"] = "/tmp/x"\n' + IMPORTS_BRIDGE)
-    )
-    == lint.CLEAN,
+    "CLAUDE_HOME alone is NOT isolation — lower precedence than CLAUDE_CONFIG_DIR",
+    lint.classify(write(tmpdir, 'import os\nos.environ["CLAUDE_HOME"] = "/tmp/x"\n' + IMPORTS_BRIDGE))
+    == lint.VIOLATION,
 )
 check(
-    "clean: alt isolation via HOME",
+    "HOME alone is NOT isolation",
     lint.classify(write(tmpdir, 'import os\nos.environ["HOME"] = "/tmp/x"\n' + IMPORTS_BRIDGE))
-    == lint.CLEAN,
+    == lint.VIOLATION,
 )
+check(
+    "a dict that is not os.environ is NOT isolation (receiver is checked)",
+    lint.classify(write(tmpdir, 'cfg = {}\ncfg["CLAUDE_CONFIG_DIR"] = "/tmp/x"\n' + IMPORTS_BRIDGE))
+    == lint.VIOLATION,
+)
+check(
+    "isolation inside a dead branch is NOT isolation (module level required)",
+    lint.classify(
+        write(tmpdir, 'import os\nif False:\n    os.environ["CLAUDE_CONFIG_DIR"] = "/tmp/x"\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+)
+check(
+    "an EXPIRED patch context before the import is NOT isolation",
+    lint.classify(
+        write(
+            tmpdir,
+            'from unittest.mock import patch\nwith patch("util_paths.channel_access_path"):\n    pass\n'
+            + IMPORTS_BRIDGE,
+        )
+    )
+    == lint.VIOLATION,
+    "patch had exited before exec_module ran",
+)
+check(
+    "a never-called function containing the rebind is NOT mitigation",
+    lint.classify(write(tmpdir, 'def unused():\n    m.ACCESS_FILE = "/tmp/a"\n' + IMPORTS_BRIDGE))
+    == lint.VIOLATION,
+)
+
 # --- the two adversarial bypasses (qingyun, #2429 P1) ----------------------
 # Both defeated the original regex predicate and are why detection is AST-based.
 check(
@@ -167,17 +197,6 @@ check(
         )
     )
     == lint.VIOLATION,
-)
-check(
-    "a REAL patch of channel_access_path before the import IS isolation",
-    lint.classify(
-        write(
-            tmpdir,
-            'from unittest.mock import patch\nwith patch("util_paths.channel_access_path"):\n    pass\n'
-            + IMPORTS_BRIDGE,
-        )
-    )
-    == lint.CLEAN,
 )
 check(
     "mitigated: post-import ACCESS_FILE rebind",
