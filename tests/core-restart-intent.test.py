@@ -11,11 +11,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "src"))  # sibling workspace_default import
 _SRC = os.path.join(_HERE, "..", "src", "core_restart_intent.py")
 _spec = importlib.util.spec_from_file_location("core_restart_intent", _SRC)
 _mod = importlib.util.module_from_spec(_spec)

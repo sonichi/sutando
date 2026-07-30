@@ -25,6 +25,11 @@ import json
 import os
 import time
 
+# Canonical workspace resolution (state-paths adoption lint): callers may pass
+# an explicit workspace (bridges already hold one; tests pass temp dirs), and
+# omitting it falls back to the resolver — never a hand-rolled path.
+from workspace_default import resolve_workspace
+
 INTENT_BASENAME = "core-restart-requested.json"
 STALE_SEC = 600
 _ACTIONS = ("restart", "stop")
@@ -50,11 +55,12 @@ def parse_restart_command(text) -> str | None:
     return _COMMANDS.get(t)
 
 
-def intent_path(workspace: str) -> str:
-    return os.path.join(workspace, "state", INTENT_BASENAME)
+def intent_path(workspace: str | None = None) -> str:
+    ws = workspace if workspace is not None else str(resolve_workspace())
+    return os.path.join(ws, "state", INTENT_BASENAME)
 
 
-def write_intent(workspace: str, action: str, source: str) -> str:
+def write_intent(workspace: str | None, action: str, source: str) -> str:
     """Atomically write the intent file; returns its path. Raises ValueError
     on an unknown action — callers never write arbitrary strings."""
     if action not in _ACTIONS:
@@ -68,7 +74,7 @@ def write_intent(workspace: str, action: str, source: str) -> str:
     return path
 
 
-def consume_intent(workspace: str, now: float | None = None) -> str | None:
+def consume_intent(workspace: str | None, now: float | None = None) -> str | None:
     """Read-and-DELETE the intent; return its action, or None.
 
     None when: no file, malformed JSON, unknown action, or stale
