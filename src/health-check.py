@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
+from task_archive import find_task_file  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -2382,6 +2383,88 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
 
+def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
+    """Detect results that no consumer will ever claim.
+
+    Normal flow: a result is written to `results/task-<id>.txt` while
+    `tasks/task-<id>.txt` is still present; the consuming bridge delivers and
+    archives both. So a result whose task is already gone from `tasks/` was
+    written AFTER that task was archived — and every consumer keys off either a
+    tracked task_id or a `task-*` glob it has already retired. Nothing claims
+    the file, and the reply is silently never delivered.
+
+    Observed 2026-07-29: a reply sat in `results/` for 2h22m while its task sat
+    in `tasks/archive/`, and the conversation read as one-sided to the other
+    party because the answer existed on disk but was never sent. Writing a
+    result is not answering a task, and until now nothing noticed the
+    difference — `check_task_queue` watches the inbound side only, so a queue
+    that drains perfectly can still be losing every late reply.
+
+    Scope is deliberately narrow:
+      * top-level `task-*.txt` only. `<channel-key>.task-<id>.txt` is the pull
+        namespace, claimed by a consumer that did not delegate the work (e.g.
+        the phone conversation-server), so its lifetime is not ours to judge.
+      * `question-*` / `proactive-*` have their own delivery lifecycles.
+      * age-gated, because between our write and the consumer's claim the task
+        is legitimately still present for a few seconds.
+    """
+    name = "orphaned-results"
+    results_dir = WORKSPACE_DIR / "results"
+    tasks_dir = WORKSPACE_DIR / "tasks"
+    if not results_dir.exists():
+        return {"name": name, "status": "ok", "detail": "results/ not yet created"}
+    now = time.time()
+    try:
+        entries = list(results_dir.glob("task-*.txt"))
+    except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
+        return {"name": name, "status": "warn", "detail": f"could not scan results/: {e}"}
+    orphans: list[tuple[str, int]] = []
+    unreadable = 0
+    for path in entries:
+        # Per-file isolation on purpose. One unreadable entry must not decide
+        # the answer for the whole directory: with the guard around the loop
+        # instead, a single EACCES/EIO aborted the scan and any real orphan
+        # sitting beside it went unreported. Note pathlib only swallows a
+        # specific errno set (ENOENT/ENOTDIR/EBADF/ELOOP), so `is_file()` does
+        # raise for the rest and belongs inside the guard too.
+        try:
+            if not path.is_file():
+                continue
+            age = now - path.stat().st_mtime
+        except OSError:
+            unreadable += 1
+            continue
+        if age < threshold_age_sec:
+            continue
+        # Task still present -> the consumer has not reached this pair yet.
+        #
+        # Must ask "does a task with this id exist", NOT "is there a file with
+        # this exact name". `claim_task.py` renames a claimed task to
+        # `task-<id>.claimed-core-N.txt`, so a bare-name test reports a LIVE,
+        # in-flight task as archived — a valid retrying delivery raising the
+        # same signal as a genuinely stranded reply, which is how a detector
+        # trains its readers to ignore it. `find_task_file()` is the canonical
+        # locator (it is what the bridge archive paths already use).
+        if find_task_file(tasks_dir, path.stem) is not None:
+            continue
+        orphans.append((path.name, int(age)))
+    # Coverage is part of the verdict: say what could not be measured rather
+    # than let it round down into a clean result.
+    partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
+    if not orphans:
+        status = "warn" if unreadable else "ok"
+        return {"name": name, "status": status,
+                "detail": f"no undeliverable results{partial}"}
+    orphans.sort(key=lambda item: -item[1])
+    oldest_name, oldest_age = orphans[0]
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{len(orphans)} result(s) whose task is already archived — never delivered; "
+                   f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m){partial}"),
+    }
+
+
 def _proc_argv(pid: int) -> str:
     """argv of `pid`, or "" if no such process.
 
@@ -3413,6 +3496,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_orphaned_results())
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
