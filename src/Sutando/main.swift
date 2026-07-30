@@ -343,6 +343,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Force Restart Core CLI", action: #selector(forceRestartCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Stop Core CLI", action: #selector(stopCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
@@ -2484,6 +2485,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.notify("Sutando", "Core restart failed (exit \(proc.terminationStatus)): \(preview)")
             }
         }
+    }
+
+    /// Force-restart the core CLI: SIGTERM → SIGKILL escalation for a wedged /
+    /// unresponsive core that plain "Restart Core CLI" (graceful) refuses to
+    /// hammer. Separate menu item per sonichi's review — the default restart
+    /// never SIGKILLs a possibly-mid-task core; this one does, explicitly.
+    /// Same detached-bash + stderr-on-failure contract as restartCore.
+    @objc func forceRestartCore() {
+        notify("Sutando", "Force-restarting Core CLI…")
+        runCoreAction(script: repoRoot + "/src/agent/start-cli.sh", args: ["--force-restart"],
+                      okMessage: "Core force-restarted. Attach via Open Core CLI in menu.",
+                      failVerb: "Core force-restart")
     }
 
     /// Stop ONLY the core CLI session (sonichi#2401 "stop means stop"):
