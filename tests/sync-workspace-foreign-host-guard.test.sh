@@ -131,7 +131,42 @@ check "peer file remains in the remote host branch" \
         refs/heads/host/local-host/guard1:hosts/peer-host/state.json
 
 echo
-echo "Test 2: foreign-host deletion guard survives customized exclude rules"
+echo "Test 2: operator host patterns and dot segments are never auto-widened"
+for custom_scope in 'hosts/team?/' 'hosts/[ab]/' 'hosts/../'; do
+    fixture_name="$(
+        printf '%s' "$custom_scope" | tr -c '[:alnum:]' '-'
+    )"
+    setup_fixture "custom-$fixture_name"
+    sed "s|hosts/local-host/|$custom_scope|" \
+        "$FIXTURE_REPO/sutando.config.local.json" \
+        > "$FIXTURE_REPO/sutando.config.local.json.custom"
+    mv "$FIXTURE_REPO/sutando.config.local.json.custom" \
+        "$FIXTURE_REPO/sutando.config.local.json"
+    sed \
+        -e "s|^!hosts/local-host/$|!$custom_scope|" \
+        -e "s|^!hosts/local-host/\\*\\*$|!${custom_scope}**|" \
+        "$FIXTURE_WS/.git/info/exclude" \
+        > "$FIXTURE_WS/.git/info/exclude.custom"
+    mv "$FIXTURE_WS/.git/info/exclude.custom" \
+        "$FIXTURE_WS/.git/info/exclude"
+
+    env "${SYNC_ENV[@]}" bash "$SYNC" \
+        --vault-url "$FIXTURE_VAULT" --push-only \
+        >/dev/null 2>&1 || true
+
+    check "$custom_scope remains operator-authored" \
+        grep -qFx "!$custom_scope" "$FIXTURE_WS/.git/info/exclude"
+    if grep -qFx '!hosts/*/' "$FIXTURE_WS/.git/info/exclude"; then
+        echo "FAIL: $custom_scope was silently widened"
+        fail=$((fail + 1))
+    else
+        echo "OK: $custom_scope was not widened"
+        pass=$((pass + 1))
+    fi
+done
+
+echo
+echo "Test 3: foreign-host deletion guard survives customized exclude rules"
 setup_fixture "push-guard"
 printf '%s\n' '# operator customization' \
     >> "$FIXTURE_WS/.git/info/exclude"
@@ -154,7 +189,7 @@ check "refused push leaves peer file in the remote host branch" \
         refs/heads/host/local-host/guard1:hosts/peer-host/state.json
 
 echo
-echo "Test 3: guard permits the owning host to delete its own state"
+echo "Test 4: guard permits the owning host to delete its own state"
 setup_fixture "own-host-delete"
 rm "$FIXTURE_WS/hosts/local-host/state.json"
 set +e

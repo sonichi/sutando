@@ -359,20 +359,28 @@ _emit_exclude_lines() {
     fi
 }
 
-# A pre-multi-host local config may still scope the carrier to exactly one
-# `hosts/<label>/` directory. That shape is unsafe now that peer subtrees form
-# one durable aggregate: after a pull, carrier enforcement interprets every
-# peer path as newly excluded and propagates its deletion. Widen only this
-# exact legacy shape; nested paths such as hosts/<label>/channels/ retain their
-# explicit meaning.
+# Return success only for a literal host label that is safe to compare as a
+# path segment. In particular, reject gitignore glob metacharacters and dot
+# segments: vault.sync.include intentionally accepts patterns, and those are
+# operator customizations rather than legacy per-host labels.
+_is_literal_host_label() {
+    local label="$1"
+    [ "$label" != "." ] \
+        && [ "$label" != ".." ] \
+        && [[ "$label" =~ ^[[:alnum:]_.-]+$ ]]
+}
+
+# A pre-multi-host local config may still scope the carrier to exactly this
+# machine's `hosts/<label>/` directory. That shape is unsafe now that peer
+# subtrees form one durable aggregate: after a pull, carrier enforcement
+# interprets every peer path as newly excluded and propagates its deletion.
+# Widen only the literal validated current host label; gitignore patterns and
+# nested paths retain their explicit operator-authored meaning.
 _normalize_include_path() {
-    local path="$1" stripped relative
-    stripped="${path%/}"
-    relative="${stripped#hosts/}"
-    if [ "$stripped" != "$path" ] \
-        && [ "$relative" != "$stripped" ] \
-        && [ "$relative" != "*" ] \
-        && [[ "$relative" != */* ]]; then
+    local path="$1" own_host
+    own_host="$(_host)"
+    if _is_literal_host_label "$own_host" \
+        && [ "$path" = "hosts/$own_host/" ]; then
         printf '%s\n' "hosts/*/"
         return 0
     fi
@@ -460,12 +468,21 @@ _compose_exclude_content() {
 # operator-edit protection while allowing the #2391 safety migration to heal
 # automatically on the next sync tick.
 _is_safe_legacy_host_scope_widening() {
-    local existing="$1" desired="$2"
+    local existing="$1" desired="$2" own_host
+    own_host="$(_host)"
+    _is_literal_host_label "$own_host" || return 1
     cmp -s <(
-        sed -E \
-            -e 's|^!hosts/[^*/][^/]*/$|!hosts/*/|' \
-            -e 's|^!hosts/[^*/][^/]*/\*\*$|!hosts/*/**|' \
-            "$existing"
+        awk -v host="$own_host" '
+            $0 == "!hosts/" host "/" {
+                print "!hosts/*/"
+                next
+            }
+            $0 == "!hosts/" host "/**" {
+                print "!hosts/*/**"
+                next
+            }
+            { print }
+        ' "$existing"
     ) "$desired"
 }
 
