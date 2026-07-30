@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import platform
+import shlex
 import subprocess
 import sys
 
@@ -103,8 +104,11 @@ def _login_remedy(ssh: bool, config_dir: str) -> str:
     gate: a bare CLI launch runs no services, so there is nothing to
     abort; restart comes only after login succeeds."""
     host = platform.node().split(".")[0] or "the host"
+    # shlex.quote: the remedy is copy/paste shell syntax — an unquoted
+    # config dir with spaces/metacharacters splits the assignment and
+    # breaks the recovery path exactly when the operator needs it.
     remedy = (f"needs GUI /login on {host}: open Terminal there and run"
-              f" `CLAUDE_CONFIG_DIR={config_dir} claude` (bare CLI, no"
+              f" `CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} claude` (bare CLI, no"
               " services — the boot gate does not run, so this cannot loop"
               " back here), complete /login, then run `bash src/restart.sh`"
               " to bring the core up.")

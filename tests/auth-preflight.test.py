@@ -64,6 +64,23 @@ class TestDecision(unittest.TestCase):
             self.assertNotIn("run `bash src/restart.sh` from the repo, then complete /login",
                              remedy)  # the exact circular phrasing, never again
 
+    def test_remedy_shell_quotes_config_dir_with_spaces(self):
+        # Regression (#2413 review P1): the remedy is copy/paste shell
+        # syntax — a config dir containing spaces must be shell-quoted or
+        # the assignment splits at the first space and the recovery path
+        # breaks exactly when the operator needs it.
+        import shlex
+        with tempfile.TemporaryDirectory() as td:
+            spaced = os.path.join(td, "ccd path with spaces")
+            os.makedirs(spaced)
+            r = auth_preflight.check_auth_state(
+                spaced, keychain_check=lambda: False, env={})
+            self.assertEqual(r["verdict"], "login_required")
+            self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(spaced)} claude",
+                          r["remedy"])
+            self.assertNotIn(f"CLAUDE_CONFIG_DIR={spaced} claude", r["remedy"],
+                             "unquoted spaced path must not appear as the command")
+
     def test_oauth_plus_credentials_file_ok(self):
         with tempfile.TemporaryDirectory() as td:
             _mkconfig(td, oauth=True, creds=True)
