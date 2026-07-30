@@ -262,6 +262,53 @@ enum SutandoConfig {
         return resolved
     }
 
+    /// Per-host directory label for `hosts/<label>/` paths, mirroring
+    /// `src/util_paths.py:_host_label()` (the single source of truth; #1745).
+    /// Precedence: $SUTANDO_HOST_LABEL (or legacy $SUTANDO_HOST_OVERRIDE) →
+    /// `scutil --get LocalHostName` (stable Bonjour name) → short hostname.
+    /// scutil ranks above hostname because a DHCP lease can drift the
+    /// hostname and split per-host paths from the stable label.
+    static func hostLabel() -> String {
+        let env = ProcessInfo.processInfo.environment
+        for key in ["SUTANDO_HOST_LABEL", "SUTANDO_HOST_OVERRIDE"] {
+            if let v = env[key]?.trimmingCharacters(in: .whitespaces), !v.isEmpty {
+                return v
+            }
+        }
+        let scutil = Process()
+        scutil.executableURL = URL(fileURLWithPath: "/usr/sbin/scutil")
+        scutil.arguments = ["--get", "LocalHostName"]
+        let pipe = Pipe()
+        scutil.standardOutput = pipe
+        scutil.standardError = FileHandle.nullDevice
+        if (try? scutil.run()) != nil {
+            scutil.waitUntilExit()
+            if scutil.terminationStatus == 0,
+               let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                                encoding: .utf8) {
+                let name = out.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty { return name }
+            }
+        }
+        let short = ProcessInfo.processInfo.hostName
+        return short.split(separator: ".").first.map(String.init) ?? short
+    }
+
+    /// Resolve a per-host personal asset, mirroring the relevant subset of
+    /// `src/util_paths.py:personal_path()`: the per-host home
+    /// `<workspace>/hosts/<label>/<name>` (#1717) is probed first, then the
+    /// legacy `<workspace>/assets/<name>` location. Returns the first
+    /// existing path, or the per-host path when neither exists (the caller's
+    /// existence check then fails gracefully — same contract as the Python
+    /// helper).
+    static func personalAssetPath(_ name: String, workspace: String) -> String {
+        let candidates = [
+            (workspace as NSString).appendingPathComponent("hosts/\(hostLabel())/\(name)"),
+            (workspace as NSString).appendingPathComponent("assets/\(name)"),
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? candidates[0]
+    }
+
     /// Scan the repo's `.env` for SUTANDO_WORKSPACE=. Best-effort.
     static func detectEnvWorkspaceInDotenv(repoRoot explicitRoot: String? = nil) -> String? {
         let root: String?
