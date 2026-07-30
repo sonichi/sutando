@@ -41,8 +41,21 @@ def main() -> int:
         from workspace_default import resolve_workspace  # type: ignore
 
         ws = Path(resolve_workspace())
-    except Exception:
-        ws = root / "workspace"
+    except Exception as exc:
+        # No ad-hoc fallback: `root / "workspace"` would defeat configured
+        # resolution and read/create a second telemetry store inside the
+        # checkout (#2180 review). resolve_workspace() already defaults to
+        # <repo>/workspace/ when nothing is configured, so a local fallback can
+        # only DISAGREE with it, never add capability.
+        #
+        # Exit 0 with state untouched: this runs from a cron/hook context where a
+        # non-zero exit is noise, and there is nothing to report if we cannot
+        # find the log. Print to stderr so the reason is visible rather than
+        # silent — the failure mode being fixed was invisibility, so swallowing
+        # this quietly would trade one blind spot for another.
+        print(f"report-usage: workspace unresolved ({exc}) — nothing reported",
+              file=sys.stderr)
+        return 0
 
     log = ws / "state" / "skill-usage-log.jsonl"
     pending = log.with_suffix(".jsonl.reporting")

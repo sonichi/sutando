@@ -21,7 +21,25 @@ def repo_root() -> Path:
     return Path(os.path.realpath(__file__)).parents[3]
 
 
-def workspace() -> Path:
+def workspace() -> "Path | None":
+    """The canonical workspace, or None when the resolver cannot answer.
+
+    Returns None rather than inventing `root / "workspace"`. The old fallback
+    defeated configured workspace resolution: a malformed config or a resolver
+    regression silently created a SECOND telemetry store inside the checkout,
+    which then diverged from the real one. Repro from the #2180 review — set
+    `sutando.config.local.json` to `{"workspace": {"path": 42}}`, and
+    resolve_workspace() raises TypeError while the hook still wrote
+    `<worktree>/workspace/state/skill-usage-log.jsonl`.
+
+    The workspace contract is explicit: use the shared helper, do not reinvent
+    its fallback. `resolve_workspace()` ALREADY has the correct default
+    (`<repo>/workspace/` when nothing is configured), so a local fallback can
+    only ever disagree with it — it adds no capability, only divergence.
+
+    Fail-open is preserved by the caller writing nothing. Losing one telemetry
+    line is the right trade against writing it somewhere no reader looks.
+    """
     root = repo_root()
     sys.path.insert(0, str(root / "src"))
     try:
@@ -29,7 +47,7 @@ def workspace() -> Path:
 
         return Path(resolve_workspace())
     except Exception:
-        return root / "workspace"
+        return None
 
 
 def main() -> int:
@@ -47,8 +65,14 @@ def main() -> int:
     slug = slug.split(":")[-1].strip()
     if not slug:
         return 0
+    ws = workspace()
+    if ws is None:
+        # Resolver could not answer. Write NOTHING — the hook stays fail-open
+        # (exit 0, never blocks the tool call), but it does not fabricate a
+        # workspace to write into.
+        return 0
     try:
-        log = workspace() / "state" / "skill-usage-log.jsonl"
+        log = ws / "state" / "skill-usage-log.jsonl"
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"slug": slug, "ts": int(time.time())}) + "\n")
