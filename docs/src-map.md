@@ -10,13 +10,14 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-176 modules indexed.
+178 modules indexed.
 
 ## `src/`
 
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
+- **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
@@ -30,6 +31,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
 - **`conversation-store.ts`** — SQLite mirror of conversation.log — per-surface tables.
 - **`core-input-watch.py`** — core-input-watch.py — the core supervisor MONITOR (M1).
+- **`core-supervisor-gate.py`** — core-supervisor-gate.py — the RECOVER decision gate (sonichi#2401 prototype).
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
