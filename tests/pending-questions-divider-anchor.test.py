@@ -72,6 +72,18 @@ FIXTURES = {
         ("## q1\n\nx\n#\n\nResolved discussion\n\n## q2\n\nx\n", 2),
     "CRLF divider":
         ("## q1\n\nx\n\n# Resolved\r\n\n## old1\n\nx\n", 1),
+    # --- Recovered from an abandoned local branch (2026-07-29) that fixed the same
+    #     dashboard bug and was never pushed. The helper already handles all four
+    #     correctly; none of them was covered, so the behavior was right by
+    #     construction and unguarded. The cases were the salvageable part.
+    "divider indented with two spaces":
+        ("## q1\n\nx\n\n#  Resolved\n\n## old1\n\nx\n", 1),
+    "divider separated by a tab":
+        ("## q1\n\nx\n\n#\tResolved\n\n## old1\n\nx\n", 1),
+    "'# ResolvedIssues' is NOT the divider (word boundary)":
+        ("## q1\n\nx\n\n# ResolvedIssues\n\nx\n\n## q2\n\nx\n", 2),
+    "prose QUOTING the delimiter must not truncate":
+        ("## q1\n\nsee the `# Resolved` divider\n\n## q2\n\nx\n\n# Resolved\n\n## old1\n\nx\n", 2),
 }
 
 # --- PREMISE: the decoy fixture must actually contain a line-initial in-comment
