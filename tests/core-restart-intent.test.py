@@ -93,6 +93,18 @@ class TestWriteConsume(unittest.TestCase):
                 json.dump(["restart"], f)
             self.assertIsNone(_mod.consume_intent(ws))
 
+    def test_unlink_failure_still_returns_action(self):
+        # Consume-first delete failing (e.g. permissions race) must not lose
+        # the action — the read already succeeded; delete is best-effort.
+        with tempfile.TemporaryDirectory() as ws:
+            _mod.write_intent(ws, "restart", "test")
+            orig = os.unlink
+            os.unlink = lambda p: (_ for _ in ()).throw(OSError("locked"))
+            try:
+                self.assertEqual(_mod.consume_intent(ws), "restart")
+            finally:
+                os.unlink = orig
+
     def test_missing_requested_at_is_stale(self):
         with tempfile.TemporaryDirectory() as ws:
             p = _mod.intent_path(ws)

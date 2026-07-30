@@ -2569,6 +2569,36 @@ def select_rulebook_key(access_tier, is_collaborator):
     return "team-collaborator" if is_collaborator else access_tier
 
 
+async def _handle_restart_command(message, text, access_tier, username, workspace) -> bool:
+    """Owner easy-restart command (sonichi#2401): "restart core" / "stop core"
+    is handled by the BRIDGE, not the core — the whole point is that it works
+    while the core is dead. Writes the intent file for the GUI-session
+    executor (Sutando.app poller) and acks in-channel; no task file. Returns
+    True when the message was a restart command (caller stops processing).
+    Owner tier only — never team/other — and parse is exact-match so prose
+    that merely mentions restarting can't trigger it."""
+    if not text or access_tier != "owner":
+        return False
+    action = parse_restart_command(text)
+    if not action:
+        return False
+    try:
+        write_intent(workspace, action, "discord")
+        ack = ("Restart requested — the app will relaunch the core in a few "
+               "seconds (authenticated, GUI session). I'll be back once it's up."
+               if action == "restart" else
+               "Stop requested — the app will stop the core in a few seconds. "
+               "It stays stopped until you say `restart core`.")
+    except Exception as exc:
+        ack = f"Couldn't write the {action} request ({type(exc).__name__}) — not queued."
+    print(f"  [core-restart] owner {action} command from @{username}", flush=True)
+    try:
+        await message.channel.send(ack)
+    except Exception as send_exc:
+        print(f"  [core-restart] ack send failed: {send_exc}", flush=True)
+    return True
+
+
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
@@ -3253,30 +3283,9 @@ async def _handle_discord_message(message, force=False):
         print(f"  [tier-ownership] dropping {access_tier}-tier task from @{username} — owner is {TEAM_TIER_OWNER}, this node is {LOCAL_MACHINE or 'unknown'}")
         return
 
-    # Owner easy-restart command (sonichi#2401): "restart core" / "stop core"
-    # is handled by the BRIDGE, not the core — the whole point is that it works
-    # while the core is dead. Write the intent file for the GUI-session
-    # executor (Sutando.app poller) and ack; no task file is created. Owner
-    # tier only — never team/other, and parse is exact-match so prose that
-    # merely mentions restarting can't trigger it.
-    if text and access_tier == "owner":
-        _restart_action = parse_restart_command(text)
-        if _restart_action:
-            try:
-                write_intent(str(REPO), _restart_action, "discord")
-                _ack = ("Restart requested — the app will relaunch the core in a few "
-                        "seconds (authenticated, GUI session). I'll be back once it's up."
-                        if _restart_action == "restart" else
-                        "Stop requested — the app will stop the core in a few seconds. "
-                        "It stays stopped until you say `restart core`.")
-            except Exception as _ri_exc:
-                _ack = f"Couldn't write the {_restart_action} request ({type(_ri_exc).__name__}) — not queued."
-            print(f"  [core-restart] owner {_restart_action} command from @{username}", flush=True)
-            try:
-                await message.channel.send(_ack)
-            except Exception as _ri_send_exc:
-                print(f"  [core-restart] ack send failed: {_ri_send_exc}", flush=True)
-            return
+    # Owner easy-restart command (sonichi#2401) — see _handle_restart_command.
+    if await _handle_restart_command(message, text, access_tier, username, str(REPO)):
+        return
 
     # Write as task
     ts = int(time.time() * 1000)
