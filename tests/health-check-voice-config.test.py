@@ -80,6 +80,20 @@ class VoiceHealthConfigTests(unittest.TestCase):
         self.assertFalse(hc.resolve_voice_health_config(
             env={}, env_path=self._no_dotenv)["enabled"])
 
+    def test_non_object_capabilities_skips_the_tier(self) -> None:
+        # `capabilities` present but not an object. Mirrors the launcher, which
+        # raises ValueError("capabilities is not an object") and skips the tier.
+        # Verified reachable before writing this: `.get("capabilities") or {}`
+        # coerces FALSY values to {}, so `null` never reaches the isinstance
+        # branch — only a truthy non-dict like 42 or [1,2] does. The coverage gate
+        # flagged this line as untested on my first push, and it was right: none
+        # of the other five cases can reach it.
+        for bad in ('{"capabilities": 42}', '{"capabilities": [1, 2]}'):
+            with self.subTest(bad=bad):
+                self.write_managed(bad)
+                self.assertFalse(hc.resolve_voice_health_config(
+                    env={}, env_path=self._no_dotenv)["enabled"])
+
     def test_skip_voice_still_wins_over_a_managed_credential(self) -> None:
         self.write_managed('{"capabilities": {"gemini-voice": {"key": "k"}}}')
         cfg = hc.resolve_voice_health_config(
