@@ -142,7 +142,7 @@ jobs:
       - name: Run Python standalone tests
         run: |
           failed=0
-          failed_files=""
+          failed_files=()
           while IFS= read -r f; do
             echo "→ $f"
             # `if ! assignment=$(...)` exempts the command from `bash -e` (GitHub's
@@ -182,13 +182,13 @@ jobs:
               else
                 echo "  (this test produced NO output — exited $rc silently)"
               fi
-              failed_files="${failed_files}  ${f}\n"
+              failed_files+=("$f")
               failed=1
             fi
           done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
           if [ "$failed" -ne 0 ]; then
-            echo "::error::python standalone tests failed:"
-            printf "%b" "$failed_files"
+            echo "::error::${#failed_files[@]} python test file(s) failed:"
+            printf '  %s\n' "${failed_files[@]}"
           fi
           exit "$failed"
 
