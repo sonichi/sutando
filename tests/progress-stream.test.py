@@ -177,15 +177,29 @@ _cfg_root = tempfile.mkdtemp(prefix="progress-stream-test-cfg-")
 os.environ["CLAUDE_CONFIG_DIR"] = _cfg_root
 os.environ["CLAUDE_HOME"] = _cfg_root
 
+# Seed a canonical access.json under the temp root BEFORE import (qingyun P1
+# round 2 on #2426): channel_access_path falls back to the operator's real
+# ~/.claude/channels/discord/access.json (30-day legacy reader-fallback, with
+# a deprecation warning) when the temp root lacks the file — which imports the
+# operator's live allowlist and makes the test machine-dependent. A present
+# file pins resolution inside the temp root.
+_chan_dir = Path(_cfg_root) / "channels" / "discord"
+_chan_dir.mkdir(parents=True)
+(_chan_dir / "access.json").write_text(json.dumps(
+    {"dmPolicy": "pairing", "allowFrom": ["0"], "groups": {}}))
+
 _REPO = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("dbridge_outage", _REPO / "src" / "discord-bridge.py")
 _db = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_db)
 
-# Assert the isolation actually took — the module's resolved token-file path
-# must live under the temp root, never the operator's real config dir.
+# Assert the isolation actually took — every config path the module resolved
+# at import time must live under the temp root, never the operator's real
+# config dir (token file AND access file).
 check("bridge: channels_env confined to temp config root",
       str(_db.channels_env).startswith(_cfg_root))
+check("bridge: ACCESS_FILE confined to temp config root",
+      str(_db.ACCESS_FILE).startswith(_cfg_root))
 
 with tempfile.TemporaryDirectory() as d:
     ws = Path(d)
