@@ -1,9 +1,9 @@
 #!/bin/bash
 # Graceful-restart Phase-1 prep (design: notes/graceful-restart-design.md).
 #
-# Invoked by the AGENT when it picks up a `RESTART_PREP restart_id=<id>` task
-# (written by graceful-restart.sh). Runs the pre-kill work while the core is
-# still alive, then writes a TERMINAL sentinel so the orchestrator can proceed:
+# Invoked DIRECTLY by graceful-restart.sh once its quiet gate opens (no
+# task-queue/LLM handoff — prep is mechanical). Runs the pre-kill work, then
+# writes a TERMINAL sentinel so the orchestrator can proceed:
 #   success -> state/restart-ready.json {restart_id, ts, synced, branch, dirty, queue}
 #   failure -> state/restart-prep-failed.json {restart_id, ts, reason}
 #
@@ -48,8 +48,17 @@ queue_n="$(ls "$WS/tasks/"task-*.txt 2>/dev/null | grep -v "task-restart-prep-" 
 log "checkpoint: $queue_n non-prep task(s) in queue"
 
 # Step 2 — sync workspace (push memory/notes/state before the kill). Bounded.
-SYNC_CMD="${GR_SYNC_CMD:-bash $REPO/scripts/sync-workspace.sh}"   # GR_SYNC_CMD: test-only override
-if bounded "$STEP_TIMEOUT" $SYNC_CMD >/dev/null 2>&1; then
+# Production passes explicit argv (each element quoted), so a checkout path
+# containing spaces stays ONE argument — never word-split into fragments.
+# The GR_SYNC_CMD test seam is a single shell string run via `bash -c`, so a
+# test can also carry space-containing paths by quoting them inside the string.
+sync_ok=0
+if [ -n "${GR_SYNC_CMD:-}" ]; then                                # GR_SYNC_CMD: test-only override
+  if bounded "$STEP_TIMEOUT" bash -c "$GR_SYNC_CMD" >/dev/null 2>&1; then sync_ok=1; fi
+else
+  if bounded "$STEP_TIMEOUT" bash "$REPO/scripts/sync-workspace.sh" >/dev/null 2>&1; then sync_ok=1; fi
+fi
+if [ "$sync_ok" = 1 ]; then
   synced=true
 else
   # A sync failure is a real signal — surface it, don't silently proceed to a kill.
