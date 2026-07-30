@@ -762,6 +762,55 @@ def main() -> int:
     check("AGENTS.md" not in _ro_only and "room-ops metadata" not in _ro_only.lower(),
           "metadata-only task file carries no injected block (empty task body)")
 
+    # #2267 parity: a token pasted into a room message must never persist —
+    # not in the task file, not in the owner-presence summary.
+    _secret = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2  # GitHub-token shaped
+    rtc._write_task({**TASK, "id": "task-SECRET",
+                     "task": f"[AG2Space @qingyun] deploy with {_secret} please"})
+    _sec_body = (rtc.TASKS_DIR / "task-SECRET.txt").read_text()
+    check(_secret not in _sec_body and "deploy with" in _sec_body,
+          "pasted GitHub token REDACTED from persisted task body (#2267 parity)")
+    check("REDACTED" in _sec_body or "[" in _sec_body,
+          "redaction leaves an explicit placeholder, not silent deletion")
+    _oa = getattr(rtc, "OWNER_ACTIVITY_FILE", None)
+    if _oa is not None and _oa.exists():
+        check(_secret not in _oa.read_text(),
+              "pasted token never reaches last-owner-activity summary")
+    # #2267 parity second half: the in-band security notice rides the task so
+    # the core neither reproduces nor re-requests the value — and stays absent
+    # from clean tasks. access_tier must still parse as the LAST header line.
+    check("SUTANDO SECURITY NOTICE" in _sec_body,
+          "security notice appended when a secret was redacted")
+    # Fine-grained PATs use a different prefix the legacy pattern misses
+    # (review P1): github_pat_ + 22-char id + _ + 59-char body in the wild;
+    # any 36+ [A-Za-z0-9_] run after the prefix must redact.
+    _fg = "github_pat_" + "11AAAAAAA" + "0" * 13 + "_" + "a" * 40
+    rtc._write_task({**TASK, "id": "task-FGPAT",
+                     "task": f"[AG2Space @qingyun] use {_fg} for the repo"})
+    _fg_body = (rtc.TASKS_DIR / "task-FGPAT.txt").read_text()
+    check(_fg not in _fg_body and "github_pat_" not in _fg_body.replace(
+              "GitHub Fine-Grained PAT", ""),
+          "fine-grained github_pat_ token REDACTED from persisted body")
+    check("SUTANDO SECURITY NOTICE" in _fg_body,
+          "fine-grained PAT redaction also carries the security notice")
+    # Relay/onboarding tokens carry the separator in BOTH forms — the desktop
+    # connect flow writes the URL-encoded one — so redaction must match what
+    # `_SEPARATOR_RE` accepts. Matching only the literal `|` let a valid
+    # `…/relay%7C<secret>` paste reach disk unredacted (review blocker).
+    for _sep_label, _sep in (("literal", "|"), ("upper", "%7C"), ("lower", "%7c")):
+        _rt = "https://chat.ag2.space/relay" + _sep + ("a" * 24)
+        rtc._write_task({**TASK, "id": f"task-RELAY{_sep_label.upper()}",
+                         "task": f"[AG2Space @qingyun] token is {_rt}"})
+        _rt_body = (rtc.TASKS_DIR / f"task-RELAY{_sep_label.upper()}.txt").read_text()
+        check(_rt not in _rt_body and "SUTANDO SECURITY NOTICE" in _rt_body,
+              f"relay token with {_sep_label} separator REDACTED from persisted body")
+    rtc._write_task({**TASK, "id": "task-CLEANBODY",
+                     "task": "[AG2Space @qingyun] plain request, nothing secret"})
+    check("SUTANDO SECURITY NOTICE" not in
+          (rtc.TASKS_DIR / "task-CLEANBODY.txt").read_text(),
+          "no security notice on clean tasks")
+    _hdrs = [ln for ln in _sec_body.split("\n") if ln.startswith("access_tier: ")]
+    check(len(_hdrs) == 1, "notice introduces no second access_tier line")
     # Onboarding-token parse: the combined "url|secret" form, and the %7C-encoded
     # separator the desktop connect flow emits (ag2space-cinny-desktop#231). A
     # %7C token must decode so URL is populated — otherwise it parses as a bare
