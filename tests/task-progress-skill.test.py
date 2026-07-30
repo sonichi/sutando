@@ -2,7 +2,9 @@
 """Tests for skills/task-progress/scripts/notify.py."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -148,11 +150,16 @@ class TestSendDiscord(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
 
+    @staticmethod
+    def _response(body):
+        response = MagicMock()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+        response.read.return_value = json.dumps(body).encode()
+        return response
+
     def test_success(self):
-        mock_resp = MagicMock()
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = b'{"id": "msg123"}'
+        mock_resp = self._response({"id": "msg123", "mentions": []})
         with patch.object(self.mod, "_token", return_value="Bot-fake"), \
              patch("urllib.request.urlopen", return_value=mock_resp):
             result = self.mod.send_discord("111222333", "hello")
@@ -162,6 +169,130 @@ class TestSendDiscord(unittest.TestCase):
         with patch.object(self.mod, "_token", return_value=""):
             result = self.mod.send_discord("111", "hello")
         self.assertFalse(result)
+
+    def test_discord_request_api_error_returns_none(self):
+        with patch("urllib.request.urlopen", side_effect=Exception("timeout")), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod._discord_request(
+                "https://discord.com/api/v10/users/123",
+                "Bot-fake",
+            )
+        self.assertIsNone(result)
+        self.assertIn("Discord request failed: timeout", stderr.getvalue())
+
+    def test_post_failure_returns_false(self):
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(self.mod, "_discord_request", return_value=None):
+            result = self.mod.send_discord("111", "hello")
+        self.assertFalse(result)
+
+    def test_plain_at_handle_is_rejected_before_post(self):
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(self.mod, "_discord_request") as request, \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod.send_discord("111", "Please review, @qingyun-wu")
+        self.assertFalse(result)
+        request.assert_not_called()
+        self.assertIn("unresolved Discord mention(s): @qingyun-wu", stderr.getvalue())
+
+    def test_email_address_is_not_treated_as_a_mention(self):
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 return_value={"id": "msg123", "mentions": []},
+             ) as request:
+            result = self.mod.send_discord("111", "Email dev@example.com")
+        self.assertTrue(result)
+        self.assertEqual(request.call_count, 1)
+
+    def test_structured_mention_is_preflighted_and_verified(self):
+        user_id = "1025828152183885925"
+        posted = {
+            "id": "msg123",
+            "mentions": [{"id": user_id, "username": "qingyunwu"}],
+        }
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 side_effect=[{"id": user_id}, posted],
+             ) as request:
+            result = self.mod.send_discord("111", f"Please review, <@{user_id}>")
+        self.assertTrue(result)
+        self.assertEqual(request.call_count, 2)
+        payload = request.call_args_list[1].args[2]
+        self.assertEqual(payload["allowed_mentions"]["parse"], [])
+        self.assertEqual(payload["allowed_mentions"]["users"], [user_id])
+
+    def test_unresolvable_structured_mention_is_not_posted(self):
+        user_id = "999999999999999999"
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 return_value=None,
+             ) as request, \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod.send_discord("111", f"Please review, <@{user_id}>")
+        self.assertFalse(result)
+        self.assertEqual(request.call_count, 1)
+        self.assertIn("message was not sent", stderr.getvalue())
+
+    def test_missing_mention_in_post_response_returns_error(self):
+        user_id = "1025828152183885925"
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 side_effect=[{"id": user_id}, {"id": "msg123", "mentions": []}],
+             ), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod.send_discord("111", f"Please review, <@{user_id}>")
+        self.assertFalse(result)
+        self.assertIn("did not resolve expected mention", stderr.getvalue())
+
+    def test_validation_can_be_disabled_for_plain_text_handle(self):
+        with patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 return_value={"id": "msg123", "mentions": []},
+             ) as request:
+            result = self.mod.send_discord(
+                "111",
+                "GitHub author @qingyun-wu",
+                validate_mentions=False,
+            )
+        self.assertTrue(result)
+        self.assertEqual(request.call_count, 1)
+
+    def test_cli_defaults_to_validation_and_returns_agent_visible_error(self):
+        with patch("sys.argv", [
+            "notify.py", "--source", "discord", "--channel-id", "111",
+            "--message", "Please review, @qingyun-wu",
+        ]), patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(self.mod, "_discord_request") as request, \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            result = self.mod.main()
+        self.assertEqual(result, 1)
+        request.assert_not_called()
+        self.assertIn("Use <@USER_ID>", stderr.getvalue())
+
+    def test_cli_opt_out_allows_intentional_plain_text_handle(self):
+        with patch("sys.argv", [
+            "notify.py", "--source", "discord", "--channel-id", "111",
+            "--message", "GitHub author @qingyun-wu",
+            "--no-validate-mentions",
+        ]), patch.object(self.mod, "_token", return_value="Bot-fake"), \
+             patch.object(
+                 self.mod,
+                 "_discord_request",
+                 return_value={"id": "msg123", "mentions": []},
+             ) as request:
+            result = self.mod.main()
+        self.assertEqual(result, 0)
+        self.assertEqual(request.call_count, 1)
 
 
 class TestSendTelegram(unittest.TestCase):
@@ -409,6 +540,83 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("progress update is too long", r.stderr)
         self.assertNotIn("SLACK_BOT_TOKEN", r.stderr)
+
+
+class TestChannelEnvContainment(unittest.TestCase):
+    """The channels/<source>/.env is a FALLBACK — os.environ wins (notify.py:171-172).
+
+    So the containment guard must gate only the case where the file is actually
+    read. Guarding it unconditionally refuses an operator who exported both
+    REMOTE_TASK_URL and REMOTE_TASK_TOKEN, for a file that would never be opened.
+    """
+
+    def setUp(self):
+        self.mod = _load()
+        self.tmp = Path(tempfile.mkdtemp())
+        ch = self.tmp / "channels" / "ag2space"
+        ch.mkdir(parents=True)
+        outside = self.tmp / "elsewhere"
+        outside.mkdir()
+        real = outside / ".env"
+        real.write_text("REMOTE_TASK_URL=https://file/relay\nREMOTE_TASK_TOKEN=filetok\n")
+        (ch / ".env").symlink_to(real)          # channel entry pointing out of the tree
+        self._saved = {k: os.environ.get(k) for k in
+                       ("CLAUDE_CONFIG_DIR", "REMOTE_TASK_URL", "REMOTE_TASK_TOKEN",
+                        "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")}
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.tmp)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _refused(self) -> bool:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                self.mod.send_remote_gateway("ag2space", "!r:ag2.space", "hi")
+            except Exception:
+                pass
+        return "refusing env path outside channels dir" in err.getvalue()
+
+    def test_env_configured_is_not_refused(self):
+        """Both values in os.environ -> the .env is never read, so its location
+        must not veto the send. Regression: this refused, and the documented
+        'notify before long work' ack silently failed on that channel."""
+        os.environ["REMOTE_TASK_URL"] = "https://chat.example/relay"
+        os.environ["REMOTE_TASK_TOKEN"] = "envtok"
+        self.assertFalse(self._refused())
+
+
+    def test_combined_token_only_is_not_refused(self):
+        """Regression for the #2355 review P1: the documented ONE-TOKEN onboarding
+        form (REMOTE_TASK_TOKEN=https://gw|secret, no separate REMOTE_TASK_URL) is a
+        fully env-configured send. Checking only the split URL+TOKEN pair missed it,
+        so a symlinked-out channel .env still refused it over a file never needed."""
+        os.environ.pop("REMOTE_TASK_URL", None)
+        os.environ["REMOTE_TASK_TOKEN"] = "https://env.example/relay|envtok"
+        self.assertFalse(self._refused())
+
+    def test_legacy_alias_combined_token_is_not_refused(self):
+        """Same for the legacy AG2_REMOTE_TOKEN alias — it is resolved before the
+        file too, so it must not trip the containment guard either."""
+        for k in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN"):
+            os.environ.pop(k, None)
+        os.environ["AG2_REMOTE_TOKEN"] = "https://legacy.example/relay|legacytok"
+        try:
+            self.assertFalse(self._refused())
+        finally:
+            os.environ.pop("AG2_REMOTE_TOKEN", None)
+
+    def test_guard_still_fires_when_the_file_is_needed(self):
+        """The control. Without env values the file IS consulted, so an entry
+        symlinked out of channels/ must still be refused — the security check is
+        unchanged, not relaxed. If this ever passes, the fix went too far."""
+        os.environ.pop("REMOTE_TASK_URL", None)
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        self.assertTrue(self._refused())
 
 
 if __name__ == "__main__":

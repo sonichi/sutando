@@ -12,6 +12,7 @@
 // double-escaping, optional-dependency @ts-ignore) appear in all three trees.
 
 import js from '@eslint/js';
+import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
@@ -40,10 +41,16 @@ export default tseslint.config(
       // caller. 84 hits at baseline, essentially all intentional.
       'no-empty': ['error', { allowEmptyCatch: true }],
 
-      // `any` is worth tracking but not worth blocking on: it sits mostly at
-      // the untyped SDK / IPC boundaries. Warn so the count is visible and can
-      // ratchet down, without failing the build today.
-      '@typescript-eslint/no-explicit-any': 'warn',
+      // Ratcheted: ERROR everywhere by default, downgraded to a warning only for
+      // the files that already carry `any` (the allowlist at the bottom of this
+      // file). 142 of 161 files are clean, so this locks in the clean majority —
+      // a new `any` in any of them, or in any NEW file, fails the build.
+      //
+      // Deliberately not a mass retype: the remaining 114 sit at untyped SDK and
+      // IPC boundaries (bodhi VoiceSession, Gemini payloads, fetch stubs).
+      // Replacing them properly is a typing exercise per call site, not a
+      // find-and-replace, and does not belong in a lint PR.
+      '@typescript-eslint/no-explicit-any': 'error',
 
       // Both flag correct, deliberate code: ANSI/control-character stripping in
       // inline-tools.ts and task-bridge.ts, and an emoji-aware character class
@@ -74,5 +81,86 @@ export default tseslint.config(
         { 'ts-ignore': 'allow-with-description', minimumDescriptionLength: 10 },
       ],
     },
+  },
+
+  // --- Plain JavaScript ------------------------------------------------------
+  // Build/utility scripts and the Electron overlay app. These are NOT compiled
+  // by tsc (the tsconfigs are .ts-only), so before this block they had no static
+  // checking of any kind — not even the unused-import and undefined-variable
+  // checks the TypeScript tree gets for free.
+  //
+  // typescript-eslint is deliberately not applied here: these are real .js/.mjs
+  // files, so the base ESLint rules are the correct tool. That means the base
+  // `no-unused-vars` (not the @typescript-eslint/ variant) and, crucially,
+  // `no-undef` — which is off for TS (tsc owns it) but is the main value here.
+  {
+    files: ['**/*.mjs', '**/*.js'],
+    extends: [js.configs.recommended],
+    languageOptions: {
+      ecmaVersion: 2023,
+      sourceType: 'module',
+      globals: { ...globals.node },
+    },
+    rules: {
+      'no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
+      ],
+      'no-empty': ['error', { allowEmptyCatch: true }],
+      'no-useless-escape': 'off',
+    },
+  },
+
+  // Electron main process + preload are CommonJS (`require`, `module.exports`),
+  // not ESM — parsing them as modules makes `require` an undefined global.
+  {
+    files: ['skills/overlay-apps/app/main.js', 'skills/overlay-apps/app/preload.js', 'skills/overlay-apps/app/control-server.js'],
+    languageOptions: { sourceType: 'commonjs', globals: { ...globals.node } },
+  },
+
+  // Renderer-process scripts run in a browser context: `document`, `window`,
+  // and the `overlay` bridge that preload.js exposes via contextBridge.
+  {
+    files: ['skills/overlay-apps/app/stats-renderer.js', 'skills/overlay-apps/app/stats.js'],
+    languageOptions: { sourceType: 'script', globals: { ...globals.browser } },
+  },
+  // --- no-explicit-any ratchet allowlist --------------------------------------
+  // THIS LIST ONLY SHRINKS. It is the set of files that already contained `any`
+  // when the rule was promoted to an error; for them the rule stays a warning so
+  // the build is not held hostage to a boundary-typing refactor.
+  //
+  // Everywhere else `no-explicit-any` is an ERROR — so a new `any` cannot enter
+  // a clean file, and a brand-new file starts out held to the strict rule.
+  //
+  // To clear an entry: type the call sites in that file, then delete its line.
+  // Do not add entries. If a new file needs `any` at a genuine boundary, use a
+  // scoped `// eslint-disable-next-line @typescript-eslint/no-explicit-any` with
+  // a reason, so the exception is visible at the call site rather than here.
+  //
+  // Counts are at the time of writing (114 total) and are documentation, not
+  // enforcement — the linter does not check them.
+  {
+    files: [
+      'skills/phone-conversation/scripts/conversation-server.ts',      // 14
+      'src/browser-tools.ts',                                          // 3
+      'src/cartesia-stt-provider.ts',                                  // 1
+      'src/observability/claude/jsonl-tail.ts',                        // 2
+      'src/recording-tools.ts',                                        // 8
+      'src/voice-agent.ts',                                            // 16
+      'src/web-client.ts',                                             // 5
+      'src/web-voice-transport.ts',                                    // 4
+      'tests/active-artifact.test.ts',                                 // 6
+      'tests/agent-state-endpoint.test.ts',                            // 1
+      'tests/agent/claude/cli/build-core-settings.test.ts',            // 1
+      'tests/cartesia-stt-provider.test.ts',                           // 18
+      'tests/get-core-status-tool.test.ts',                            // 1
+      'tests/observability/claude/hooks/build-hook-settings.test.ts',  // 3
+      'tests/reachability-endpoints.test.ts',                          // 8
+      'tests/result-channel-key.test.ts',                              // 1
+      'tests/screen-companion-vision-query.test.ts',                   // 18
+      'tests/screen-companion-work-retained.test.ts',                  // 3
+      'tests/web-voice-transport.test.ts',                             // 1
+    ],
+    rules: { '@typescript-eslint/no-explicit-any': 'warn' },
   },
 );

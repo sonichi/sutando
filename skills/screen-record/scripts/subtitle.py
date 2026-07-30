@@ -85,7 +85,7 @@ def main():
         print(json.dumps({"error": "Transcription failed — no speech detected or Whisper error"}))
         return
 
-    print(f"Burning subtitles...", file=sys.stderr)
+    print("Burning subtitles...", file=sys.stderr)
     out_path, size_mb = burn_subtitles(video_path, srt_path)
     if not out_path:
         print(json.dumps({"error": "ffmpeg subtitle burn failed"}))

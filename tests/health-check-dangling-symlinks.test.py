@@ -51,9 +51,12 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         self.src.mkdir(parents=True)
         self.dst.mkdir(parents=True)
         self.hc.REPO_DIR = self.repo
-        # check_skill_symlinks hardcodes Path.home(); redirect it.
+        # check_skill_symlinks resolves its destination via claude_home_path()
+        # (CLAUDE_CONFIG_DIR-aware); point it at the sandbox claude-home.
         self._home = root / "home"
-        self.hc.Path.home = staticmethod(lambda: self._home)
+        self.hc.claude_home_path = (
+            lambda *sub: self._home.joinpath(".claude", *sub)
+        )
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -143,6 +146,19 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
             r = self.hc.check_skill_symlinks()
         self.assertEqual(r["status"], "ok", r["detail"])
         self.assertEqual(r.get("_orphaned", []), [])
+
+    def test_skillmd_less_dir_is_not_reported_unlinked(self):
+        """Manifest-loaded / scripts-only skills have no SKILL.md and are
+        correctly never symlinked by skills/install.sh — the probe must apply
+        the installer's own filter instead of warning about them."""
+        d = self.src / "manifest-only"
+        d.mkdir()
+        (d / "manifest.json").write_text("{}\n")
+        self._skill("real-skill")  # has SKILL.md, genuinely unlinked
+        r = self.hc.check_skill_symlinks()
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("real-skill", r["detail"])
+        self.assertNotIn("manifest-only", r["detail"])
 
 
 if __name__ == "__main__":

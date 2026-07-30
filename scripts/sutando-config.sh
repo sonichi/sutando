@@ -254,6 +254,38 @@ print(_host_label(), end='')
     printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
     ;;
 
+  node-bin)
+    # SINGLE SOURCE OF TRUTH for the Node executable (G1.5 node-bundle,
+    # owner-adopted design + owner review 2026-07-19). Precedence:
+    #   1. $SUTANDO_NODE — the EXACT executable, exported by the desktop app.
+    #      AUTHORITATIVE ONCE SET: if it is set but not executable, that is a
+    #      desktop packaging error — FAIL CLOSED (stderr + exit 1) instead of
+    #      silently rescuing via whatever node the host happens to have, which
+    #      would mask the packaging bug and void the deterministic-runtime
+    #      guarantee (owner review P1-1).
+    #   2. app-node-dir/node — the bundled runtime at its canonical home
+    #      <engine-root>/runtime/node/bin (covers launchd jobs whose plist
+    #      doesn't export SUTANDO_NODE).
+    #   3. first `node` on PATH — dev/OSS hosts, unchanged behavior.
+    # Prints the resolved path; empty output + exit 0 when nothing resolves
+    # (caller decides), exit 1 ONLY for the invalid-explicit case.
+    if [ -n "${SUTANDO_NODE:-}" ]; then
+      if [ -x "${SUTANDO_NODE}" ]; then
+        printf '%s' "$SUTANDO_NODE"
+      else
+        echo "sutando-config: SUTANDO_NODE is set but not an executable: $SUTANDO_NODE (desktop packaging error — refusing PATH fallback)" >&2
+        exit 1
+      fi
+    else
+      _app_node="${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}/node"
+      if [ -x "$_app_node" ]; then
+        printf '%s' "$_app_node"
+      else
+        command -v node 2>/dev/null || true
+      fi
+    fi
+    ;;
+
   tsx-bin)
     # SINGLE SOURCE OF TRUTH for tsx resolution — the launchd wrapper and
     # src/startup.sh both call this instead of each duplicating the candidate
@@ -317,6 +349,38 @@ print(_host_label(), end='')
     # which pins to the default OSS socket. This getter honors the ambient env
     # and is meant for same-runtime callers.
     printf '%s' "${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
+    ;;
+
+  run-dir)
+    # The runtime run-dir — where the per-runtime sockets/pids live. MIRRORS
+    # #2325's ag2space runtime-api rundir.py EXACTLY, so the shell (this getter,
+    # start-cli, health-check) and the daemon/CLI can never disagree on the path.
+    # Resolution order (must match rundir.py.run_dir()):
+    #   1. SUTANDO_RUN_DIR                                   explicit override
+    #   2. darwin: ~/Library/Application Support/space.ag2.app/run   (Desktop root)
+    #   3. $XDG_RUNTIME_DIR/sutando                          Linux/systemd per-user
+    #   4. ~/.sutando/run                                    portable fallback
+    if [ -n "${SUTANDO_RUN_DIR:-}" ]; then
+      printf '%s' "$SUTANDO_RUN_DIR"
+    elif [ "$(uname -s)" = "Darwin" ]; then
+      printf '%s' "$HOME/Library/Application Support/space.ag2.app/run"
+    elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+      printf '%s' "$XDG_RUNTIME_DIR/sutando"
+    else
+      printf '%s' "$HOME/.sutando/run"
+    fi
+    ;;
+
+  runtime-socket)
+    # The runtime-API daemon's Unix socket. MIRRORS #2325's rundir.py
+    # socket_path(): SUTANDO_RUNTIME_SOCKET override wins, else
+    # <run-dir>/sutando-runtime.sock. (Filename is sutando-runtime.sock — NOT
+    # runtime-api.sock; #2325 ships that default and both ends interpret it here.)
+    if [ -n "${SUTANDO_RUNTIME_SOCKET:-}" ]; then
+      printf '%s' "$SUTANDO_RUNTIME_SOCKET"
+    else
+      printf '%s/sutando-runtime.sock' "$(bash "$0" run-dir)"
+    fi
     ;;
 
   runtime)
@@ -476,6 +540,28 @@ code = {
     'tree_sha': _git('rev-parse', 'HEAD^{tree}'),
     'dirty': bool(_git('status', '--porcelain')),
 }
+# run-dir + runtime-api socket: mirror #2325 rundir.py (same policy as the
+# run-dir / runtime-socket subcommands). This is a second copy of the chain (the
+# bash subcommand is the other); the resolver test asserts the descriptor
+# runtimeSocket equals the runtime-socket subcommand, so the two cannot drift
+# silently (review nit). NOTE: no shell-active chars in this comment block -- the
+# python runs inside a bash double-quoted -c string, so a dollar-var or backtick
+# here would be bash-expanded and break the program.
+_run_dir_env = os.environ.get('SUTANDO_RUN_DIR')
+if _run_dir_env:
+    _rundir = _run_dir_env
+elif sys.platform == 'darwin':
+    _rundir = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'space.ag2.app', 'run')
+elif os.environ.get('XDG_RUNTIME_DIR'):
+    _rundir = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'sutando')
+else:
+    _rundir = os.path.join(os.path.expanduser('~'), '.sutando', 'run')
+_runtime_socket = os.environ.get('SUTANDO_RUNTIME_SOCKET') or os.path.join(_rundir, 'sutando-runtime.sock')
+# runtimeRoot = parent of run/ when run-dir is <root>/run (darwin App-Support,
+# portable dot-sutando); for the XDG case the run-dir (XDG_RUNTIME_DIR/sutando) IS
+# the app dir (its parent is the shared XDG base), so use the run-dir itself.
+_runtime_root = os.path.dirname(_rundir) if os.path.basename(_rundir) == 'run' else _rundir
+
 print(json.dumps({
     'alive': bool(h.get('core_running', False)),
     'repo': repo,
@@ -503,12 +589,31 @@ print(json.dumps({
     'call_tiers': probe_call_tiers,
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
+    # ── additive runtime-standardization fields (standard.md task A P1; air
+    # confirmed ADDITIVE 2026-07-26). Old readers ignore unknown keys, and the
+    # existing socket/session fields stay for desktop back-compat. The components
+    # field (the 4-window topology) is intentionally NOT emitted yet — it lands in P2
+    # (NOTE: no backticks/$-vars anywhere in this python -c comment block — it runs
+    # inside a bash double-quoted -c string, so a backtick would command-substitute
+    # and a $-var would expand; both break the program / execute PATH binaries.)
+    # with the session rename (sutando-core -> sutando + core/gateway/runtime-api/
+    # monitor windows); emitting it now would misrepresent the single current
+    # session.
+    'schemaVersion': 1,
+    'runtimeId': os.environ.get('SUTANDO_RUNTIME_ID', 'primary'),
+    'runtimeRoot': _runtime_root,
+    'runtimeSocket': _runtime_socket,
+    'backend': {
+        'type': 'tmux',
+        'socket': h.get('tmux_socket') or probe_socket,
+        'session': h.get('session', 'sutando-core'),
+    },
 }))
 "
     ;;
 
   *)
-    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

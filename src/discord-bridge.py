@@ -88,6 +88,7 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
@@ -566,6 +567,73 @@ def load_policy():
     except Exception:
         return "pairing"
 
+
+def load_tier_map() -> dict:
+    """Per-user-id -> tier ("owner"|"team"|"other") from access.json `tierMap`.
+    Empty dict if absent. Mirrors slack-bridge.load_tier_map so the two
+    bridges share one access-control model."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        tier_map = data.get("tierMap")
+        return tier_map if isinstance(tier_map, dict) else {}
+    except Exception:
+        return {}
+
+
+def ensure_tier_map_seeded() -> bool:
+    """One-time migration (owner request 2026-07-17: allowlist default =
+    read-only). If access.json has a populated global allowFrom but no
+    tierMap, seed tierMap = {existing -> owner} once and persist. Existing
+    members are grandfathered as owner; any NEW allowFrom addition is then
+    missing from tierMap and resolves to team (read-only, sandboxed) instead
+    of the previous unconditional owner. Idempotent once a tierMap exists.
+
+    Returns True when a tierMap is reliably in place afterward (already
+    present, just persisted, or nothing to seed); False when a seed was
+    needed but could NOT be persisted/read. On False the caller MUST fail
+    closed — never grant owner off an empty/unconfirmed map (#2161 CR:
+    a transient read/write error must not silently escalate every
+    allowlisted sender to owner)."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception as e:
+        print(f"  [tier-map] WARNING: access.json unreadable ({e}); allowlisted senders resolve read-only (team) until the tierMap can be read", flush=True)
+        return False
+    allow = data.get("allowFrom") or []
+    # Test key PRESENCE, not truthiness. An explicitly-empty tierMap ({}) is a
+    # deliberate "nobody is owner via tierMap" state — treating it as falsy
+    # here would re-seed every allowFrom member as owner, escalating read-only
+    # users (#2161 CR: {"allowFrom":["U"],"tierMap":{}} must NOT become
+    # {"U":"owner"}). Only a genuinely ABSENT key (never-seeded legacy file)
+    # triggers first-run grandfathering below. A present-but-empty map returns
+    # here, so the allowlisted user is missing from the map and resolves team.
+    if "tierMap" in data:
+        return True
+    if not allow:
+        return True  # nothing to grandfather — an empty map is legitimate here
+    data["tierMap"] = {uid: "owner" for uid in allow}
+    # Atomic write: a bare ACCESS_FILE.write_text() truncates the live
+    # access-control file BEFORE writing, so a disk-full / interrupt / partial
+    # write can destroy allowFrom — and with fail-closed tier resolution that
+    # locks legitimate owners out against a corrupt file, at bridge startup.
+    # Write a sibling temp, chmod it, then os.replace() atomically (mirrors the
+    # pairing path + the #2222 owner-activity fix). The pid+uuid suffix avoids
+    # colliding with a concurrent pairing-path .tmp; on any failure the original
+    # access.json bytes are left intact and the orphan temp is removed.
+    tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ACCESS_FILE)
+        print(f"  [tier-map] grandfathered {len(allow)} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
+        return True
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        print(f"  [tier-map] WARNING: failed to persist grandfather tierMap ({e}); allowlisted senders resolve read-only (team) until seeded", flush=True)
+        return False
 
 def read_access_for_seed(path):
     """Read access.json for a path that is about to WRITE it back (pairing seed).
@@ -2302,6 +2370,15 @@ async def on_ready():
         discord_config.auto_seed_if_missing(_initial_access)
     except Exception as _seed_exc:
         print(f"  [discord-config] auto-seed failed (non-fatal): {_seed_exc}")
+    # Seed the tier-map grandfather snapshot at STARTUP, before any message is
+    # processed — otherwise a fresh (pre-migration) install where the owner
+    # adds a NEW allowFrom id would grandfather that new id as owner the first
+    # time it messages (the seed runs on-demand and captures whoever is in
+    # allowFrom at that moment). Seeding at boot pins the snapshot to the
+    # allowFrom present at upgrade, so post-upgrade additions default read-only
+    # (owner CR #2161). Idempotent: no-op once a tierMap exists, so firing on
+    # every reconnect is harmless.
+    ensure_tier_map_seeded()  # pragma: no cover — startup call-site glue in on_ready; the seed fn is unit-tested (bridges-allowlist-default-readonly.test.py) and already swallows its own FS errors internally
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loops start. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
@@ -2490,6 +2567,36 @@ def select_rulebook_key(access_tier, is_collaborator):
     enforcement surface the core agent follows) swaps.
     """
     return "team-collaborator" if is_collaborator else access_tier
+
+
+async def _handle_restart_command(message, text, access_tier, username, workspace) -> bool:
+    """Owner easy-restart command (sonichi#2401): "restart core" / "stop core"
+    is handled by the BRIDGE, not the core — the whole point is that it works
+    while the core is dead. Writes the intent file for the GUI-session
+    executor (Sutando.app poller) and acks in-channel; no task file. Returns
+    True when the message was a restart command (caller stops processing).
+    Owner tier only — never team/other — and parse is exact-match so prose
+    that merely mentions restarting can't trigger it."""
+    if not text or access_tier != "owner":
+        return False
+    action = parse_restart_command(text)
+    if not action:
+        return False
+    try:
+        write_intent(workspace, action, "discord")
+        ack = ("Restart requested — the app will relaunch the core in a few "
+               "seconds (authenticated, GUI session). I'll be back once it's up."
+               if action == "restart" else
+               "Stop requested — the app will stop the core in a few seconds. "
+               "It stays stopped until you say `restart core`.")
+    except Exception as exc:
+        ack = f"Couldn't write the {action} request ({type(exc).__name__}) — not queued."
+    print(f"  [core-restart] owner {action} command from @{username}", flush=True)
+    try:
+        await message.channel.send(ack)
+    except Exception as send_exc:
+        print(f"  [core-restart] ack send failed: {send_exc}", flush=True)
+    return True
 
 
 async def _handle_discord_message(message, force=False):
@@ -3095,10 +3202,26 @@ async def _handle_discord_message(message, force=False):
     # owner. Scope is strictly per-channel (keyed on the serving channel_id).
     is_collaborator = False
     if sender_id in allowed:
-        access_tier = "owner"
-        # Record owner activity for status-aware-pivot in proactive loop
-        write_owner_activity("discord", filter_chat_secrets(text).text,
-                             channel_id=getattr(message.channel, "id", None))
+        # Global-allowlist members are owner ONLY if a successfully-persisted
+        # tierMap says so. Seed-on-first-run grandfathers everyone currently
+        # trusted; any newly-added allowFrom id is missing from tierMap and
+        # resolves to "team" (read-only, sandboxed) — the owner-requested
+        # default. Owner comes strictly from map MEMBERSHIP: if the seed could
+        # not persist/read (empty/unconfirmed map), fail CLOSED to team rather
+        # than granting owner off the empty map (#2161 CR — a transient error
+        # must not silently escalate every allowlisted sender to owner).
+        seeded_ok = ensure_tier_map_seeded()
+        _tier_map = load_tier_map()
+        if sender_id in _tier_map:
+            access_tier = _tier_map[sender_id]
+        else:  # pragma: no cover — fail-closed branch inside the async handler mega-function; the seed-failure→team resolution logic is unit-tested in tests/bridges-allowlist-default-readonly.test.py
+            access_tier = "team"
+            if not seeded_ok and not _tier_map:
+                print(f"  [tier-map] WARNING: grandfather seed unavailable; @{username} resolved read-only (team), not owner", flush=True)
+        if access_tier == "owner":
+            # Record owner activity for status-aware-pivot in proactive loop
+            write_owner_activity("discord", filter_chat_secrets(text).text,
+                                 channel_id=getattr(message.channel, "id", None))
     else:
         # Check if team member (from channel allowlists)
         try:
@@ -3158,6 +3281,10 @@ async def _handle_discord_message(message, force=False):
     # always processed locally regardless of this setting.
     if access_tier != "owner" and TEAM_TIER_OWNER and LOCAL_MACHINE != TEAM_TIER_OWNER:
         print(f"  [tier-ownership] dropping {access_tier}-tier task from @{username} — owner is {TEAM_TIER_OWNER}, this node is {LOCAL_MACHINE or 'unknown'}")
+        return
+
+    # Owner easy-restart command (sonichi#2401) — see _handle_restart_command.
+    if await _handle_restart_command(message, text, access_tier, username, str(REPO)):
         return
 
     # Write as task
