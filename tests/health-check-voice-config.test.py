@@ -146,6 +146,48 @@ class VoiceHealthConfigTests(unittest.TestCase):
         self.assertEqual(checks, [voice_ok, watcher_ok, transport_ok, bodhi_ok])
         mark_stale.assert_called_once()
 
+    def test_managed_only_install_runs_the_REAL_probe_path(self) -> None:
+        """A managed-only install must actually PROBE, not just resolve enabled.
+
+        This is the specific regression asked for in the #2197 review
+        ("add a managed-only regression proving the real probe path executes"),
+        and the existing cases did not cover it. They prove the two halves
+        SEPARATELY: the managed cases assert `resolve_voice_health_config()`
+        returns enabled, and `test_enabled_voice_preserves_full_probe_path`
+        asserts the four probes run — but that one enables voice with a dotenv
+        `GEMINI_API_KEY`, never a managed credential.
+
+        The seam between them is where the original bug lived: if
+        `check_voice_stack` ever consults a different predicate than the
+        resolver, a managed-only install short-circuits to four
+        "ok - disabled" results — a real outage reported as healthy — and every
+        pre-existing test still passes. So this asserts the composition, with
+        NO voice env key and NO dotenv anywhere: managed credential alone must
+        reach `check_port` and friends.
+        """
+        self.write_managed('{"capabilities": {"gemini-voice": {"key": "k"}}}')
+        voice_ok = {"name": "voice-agent", "status": "down", "detail": "port 9900"}
+        watcher_ok = {"name": "voice-watchers", "status": "ok", "detail": "active"}
+        transport_ok = {"name": "voice-transport", "status": "ok", "detail": "healthy"}
+        bodhi_ok = {"name": "bodhi-dist", "status": "ok", "detail": "current"}
+        with mock.patch.dict(hc.os.environ, {}, clear=True), \
+             mock.patch.object(hc, "check_port", return_value=voice_ok) as probe, \
+             mock.patch.object(hc, "mark_stale_if_outdated"), \
+             mock.patch.object(hc, "check_voice_watchers", return_value=watcher_ok), \
+             mock.patch.object(hc, "check_voice_transport", return_value=transport_ok), \
+             mock.patch.object(hc, "check_bodhi_dist", return_value=bodhi_ok):
+            checks = hc.check_voice_stack(env={}, env_path=self._no_dotenv)
+
+        # The probe ran at all — the assertion the "disabled" bug would break.
+        probe.assert_called_once()
+        # And a DOWN result survives to the caller rather than being masked as
+        # "ok - disabled". Deliberately using status=down: an all-ok expectation
+        # would also be satisfied by the disabled path, which returns ok.
+        self.assertEqual(checks, [voice_ok, watcher_ok, transport_ok, bodhi_ok])
+        self.assertEqual(checks[0]["status"], "down")
+        for c in checks:
+            self.assertNotIn("disabled", c["detail"])
+
     def test_configured_key_wins_over_explicit_skip_like_startup(self) -> None:
         path = self.write_env("SKIP_VOICE=1\nGEMINI_API_KEY=file-key\n")
         with mock.patch.object(hc, "check_port", return_value={
