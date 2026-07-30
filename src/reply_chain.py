@@ -118,3 +118,84 @@ def format_reply_chain(
     author = str(parent.get("author", "unknown"))
     ts = str(parent.get("ts", ""))
     return f"\n\n[Replying to {author} ({ts}): {content}]"
+
+
+async def walk_reply_chain(
+    seed,
+    fetch_message,
+    *,
+    max_content_depth: int,
+    max_ids_depth: int,
+    strip_mention: str = "",
+):
+    """Walk a reply chain from ``seed`` toward the thread root.
+
+    Extracted from ``discord-bridge.py`` (PR #2310 review 2) so the two failure
+    modes reviewers flagged are reachable by a test. Inside the bridge handler
+    this walk sat behind ``# pragma: no cover`` — meaning the depth cap and the
+    unfetchable-ancestor path, the exact cases where context is silently lost,
+    were the only ones never exercised. Assertions could not fix that; the walk
+    had to become callable.
+
+    ``fetch_message`` is an async ``id -> message | None`` (the bridge passes
+    ``channel.fetch_message``); raising is treated the same as returning None,
+    because an unfetchable ancestor and a failing fetch are the same event to
+    the caller.
+
+    Returns ``(chain, chain_ids, reached_root)``:
+      * ``chain``      — content dicts, immediate-parent-first, capped at
+        ``max_content_depth``. Only ``chain[0]`` is inlined by the bridge.
+      * ``chain_ids``  — id spine, immediate-parent-first, walked past the
+        content cap to ``max_ids_depth`` so the spine can still reach the root
+        question when the content cap has already stopped collecting bodies.
+      * ``reached_root`` — True ONLY on a clean stop (an ancestor with no
+        further reference). Depth exhaustion and an unfetchable ancestor both
+        leave it False, so the caller emits the truncation marker. Defaulting
+        this to False on any non-clean stop is deliberate: an unmarked partial
+        chain is the original bug (a reply whose root question vanished with no
+        visible sign), so "not proven complete" must never render as complete.
+    """
+    chain: list = []
+    chain_ids: list = []
+    cur = seed
+    depth = 0
+    reached_root = False
+
+    while cur is not None and depth < max_ids_depth:
+        cid = getattr(cur, "id", None)
+        if depth < max_content_depth:
+            content = (getattr(cur, "content", "") or "").strip()
+            if strip_mention:
+                content = content.replace(strip_mention, "")
+            created = getattr(cur, "created_at", None)
+            chain.append(
+                {
+                    "id": cid,
+                    "author": str(getattr(cur, "author", "")),
+                    "ts": created.strftime("%Y-%m-%d %H:%M") if created else "",
+                    "content": content,
+                }
+            )
+        if cid is not None:
+            chain_ids.append(cid)
+
+        nref = getattr(cur, "reference", None)
+        if not (nref and getattr(nref, "message_id", None)):
+            reached_root = True
+            break
+
+        nxt = getattr(nref, "resolved", None)
+        if nxt is None:
+            try:
+                nxt = await fetch_message(nref.message_id)
+            except Exception:
+                nxt = None
+        if nxt is None:
+            # Unfetchable ancestor: older context exists but is unreachable.
+            # Leave reached_root False so the marker names the oldest id we DID
+            # reach, giving the agent a precise fetch handle instead of silence.
+            break
+        cur = nxt
+        depth += 1
+
+    return chain, chain_ids, reached_root

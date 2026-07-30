@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
-from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
 # depth 0). Only the immediate parent is inlined, so beyond this there is no
@@ -3124,48 +3124,23 @@ async def _handle_discord_message(message, force=False):
                 # collect the ancestor IDS for the `reply_chain_ids` spine, so a
                 # deeper ancestor can be fetched precisely on demand rather than
                 # bloating every task file with the whole thread's content.
-                chain = []                       # pragma: no cover — content, immediate-parent-first (only [0] inlined); bridge-only glue, formatting covered in reply_chain.py
-                chain_ids = []                   # pragma: no cover — id spine, immediate-parent-first, walked toward root (bounded)
-                cur = ref_msg                    # pragma: no cover
-                depth = 0                        # pragma: no cover
-                reached_root = False             # pragma: no cover
                 # Keep collecting ids toward the root past the CONTENT cap so the
                 # `reply_chain_ids` spine reaches the root question, not just the
                 # nearest REPLY_CHAIN_MAX_DEPTH ancestors. Content is only kept
                 # for the inlined depth; ids continue to REPLY_CHAIN_IDS_MAX_DEPTH.
-                while cur is not None and depth < REPLY_CHAIN_IDS_MAX_DEPTH:  # pragma: no cover
-                    cid = getattr(cur, "id", None)
-                    if depth < REPLY_CHAIN_MAX_DEPTH:
-                        c = (cur.content or "").strip().replace(
-                            f"<@{client.user.id}>", ""
-                        )
-                        chain.append(
-                            {
-                                "id": cid,
-                                "author": str(cur.author),
-                                "ts": cur.created_at.strftime("%Y-%m-%d %H:%M"),
-                                "content": c,
-                            }
-                        )
-                    if cid is not None:
-                        chain_ids.append(cid)
-                    nref = getattr(cur, "reference", None)
-                    if not (nref and getattr(nref, "message_id", None)):
-                        reached_root = True
-                        break
-                    nxt = nref.resolved
-                    if nxt is None:
-                        try:
-                            nxt = await message.channel.fetch_message(nref.message_id)
-                        except Exception:
-                            nxt = None
-                    if nxt is None:
-                        # Can't walk further (unfetchable ancestor). Not a clean
-                        # root — leave reached_root False so the truncation marker
-                        # surfaces the older, now-unreachable context.
-                        break
-                    cur = nxt
-                    depth += 1
+                #
+                # The walk itself lives in reply_chain.walk_reply_chain so the
+                # depth-cap and unfetchable-ancestor paths are unit-testable —
+                # inline here they sat behind `pragma: no cover`, so the two
+                # cases where context is silently lost were the only ones never
+                # exercised (PR #2310 review 2).
+                chain, chain_ids, reached_root = await walk_reply_chain(
+                    ref_msg,
+                    message.channel.fetch_message,
+                    max_content_depth=REPLY_CHAIN_MAX_DEPTH,
+                    max_ids_depth=REPLY_CHAIN_IDS_MAX_DEPTH,
+                    strip_mention=f"<@{client.user.id}>",
+                )
                 reply_context = format_reply_chain(chain)  # pragma: no cover
                 reply_context += format_reply_chain_truncation(  # pragma: no cover
                     reached_root, chain_ids[-1] if chain_ids else None

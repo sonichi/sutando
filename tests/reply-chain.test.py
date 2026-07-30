@@ -94,6 +94,113 @@ check("truncated marker is a single leading-newline line",
 # defensive: no oldest id (empty walk) → nothing to anchor → no marker
 check("truncated but no id -> no marker", rc.format_reply_chain_truncation(False, None) == "")
 
+# --- walk_reply_chain: the two cases reviewers flagged as untested -----------
+# Both were previously inside the bridge handler behind `pragma: no cover`, so
+# the paths where reply context is SILENTLY lost were the only ones never
+# exercised. asyncio.run is used directly to keep this suite dependency-free
+# and in-process (the diff-coverage gate does not trace subprocesses).
+import asyncio
+
+
+class _Ref:
+    def __init__(self, message_id, resolved=None):
+        self.message_id = message_id
+        self.resolved = resolved
+
+
+class _Msg:
+    """Minimal stand-in for a discord.Message (only what the walk touches)."""
+
+    def __init__(self, mid, content="body", parent_id=None):
+        self.id = mid
+        self.content = content
+        self.author = f"user{mid}"
+        self.created_at = None          # walk must tolerate a missing timestamp
+        self.reference = _Ref(parent_id) if parent_id is not None else None
+
+
+def _linear(n):
+    """n messages, ids 1..n, each replying to the next (n = the root)."""
+    return {i: _Msg(i, f"msg{i}", parent_id=(i + 1 if i < n else None)) for i in range(1, n + 1)}
+
+
+def _fetcher(store, missing=()):
+    async def fetch(mid):
+        if mid in missing:
+            raise RuntimeError("unfetchable")
+        return store.get(mid)
+    return fetch
+
+
+# 1. Deeper than the CONTENT cap: content stops at 8, the id spine keeps going
+#    to the root. This is the case that proves the spine is not merely a copy
+#    of the inlined chain.
+store = _linear(20)
+chain, ids, reached = asyncio.run(rc.walk_reply_chain(
+    store[1], _fetcher(store), max_content_depth=8, max_ids_depth=64))
+check(">8 ancestors: content capped at max_content_depth", len(chain) == 8)
+check(">8 ancestors: id spine walks past the content cap", len(ids) == 20)
+check(">8 ancestors: spine reaches the true root", ids[-1] == 20)
+check(">8 ancestors: clean root -> reached_root True", reached is True)
+check(">8 ancestors: complete spine emits NO truncation marker",
+      rc.format_reply_chain_truncation(reached, ids[-1]) == "")
+
+# 2. Deeper than the ID cap too -> NOT a clean root, so the marker must fire.
+chain, ids, reached = asyncio.run(rc.walk_reply_chain(
+    store[1], _fetcher(store), max_content_depth=8, max_ids_depth=5))
+check("id-cap exhausted: spine bounded", len(ids) == 5)
+check("id-cap exhausted: reached_root False", reached is False)
+check("id-cap exhausted: marker fires with oldest reached id",
+      str(ids[-1]) in rc.format_reply_chain_truncation(reached, ids[-1]))
+
+# 3. Unfetchable ancestor mid-walk: older context exists but is unreachable.
+#    Must NOT read as a clean root — that silent-complete render is the bug.
+store = _linear(10)
+chain, ids, reached = asyncio.run(rc.walk_reply_chain(
+    store[1], _fetcher(store, missing={4}), max_content_depth=8, max_ids_depth=64))
+check("unfetchable ancestor: walk stops at the gap", ids == [1, 2, 3])
+check("unfetchable ancestor: NOT reported as root", reached is False)
+check("unfetchable ancestor: marker names the oldest REACHED id",
+      "3" in rc.format_reply_chain_truncation(reached, ids[-1]))
+
+# a fetch returning None (rather than raising) is the same event to the caller
+async def _none_fetch(mid):
+    return None
+
+chain, ids, reached = asyncio.run(rc.walk_reply_chain(
+    store[1], _none_fetch, max_content_depth=8, max_ids_depth=64))
+check("fetch returning None == unfetchable", reached is False and ids == [1])
+
+# 4. A resolved ancestor is used without any fetch at all (the common path).
+root = _Msg(99, "root question")
+kid = _Msg(1, "reply", parent_id=99)
+kid.reference.resolved = root
+
+
+async def _explode(mid):
+    raise AssertionError("fetch must not be called when reference.resolved is set")
+
+chain, ids, reached = asyncio.run(rc.walk_reply_chain(
+    kid, _explode, max_content_depth=8, max_ids_depth=64))
+check("resolved ancestor avoids a fetch", ids == [1, 99] and reached is True)
+
+# 5. Single message, no reference -> immediately a clean root.
+chain, ids, reached = asyncio.run(rc.walk_reply_chain(
+    _Msg(7, "solo"), _none_fetch, max_content_depth=8, max_ids_depth=64))
+check("no reference -> clean root, no marker",
+      reached is True and ids == [7] and rc.format_reply_chain_truncation(reached, 7) == "")
+
+# 6. The mention strip and a missing created_at both survive the walk.
+chain, _, _ = asyncio.run(rc.walk_reply_chain(
+    _Msg(1, "<@42> hello"), _none_fetch, max_content_depth=8, max_ids_depth=64,
+    strip_mention="<@42>"))
+# Behavior parity, deliberately: the bridge did `.strip()` BEFORE `.replace()`,
+# so removing a LEADING mention leaves the separating space behind. That is
+# pre-existing behavior; tightening it here would smuggle a behavior change into
+# an extraction refactor, so the test pins what the bridge actually did.
+check("mention stripped from walked content", chain[0]["content"] == " hello")
+check("missing created_at renders as empty ts", chain[0]["ts"] == "")
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
