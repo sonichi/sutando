@@ -13,9 +13,10 @@
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
 	detectEnvWorkspaceInDotenv,
@@ -448,6 +449,36 @@ describe('sutando_config loader', () => {
 			loadConfig(repo);
 			const combined = writes.join('');
 			assert.ok(!combined.includes('does not read'), 'stderr should be silent on the happy path');
+		} finally {
+			process.stderr.write = origWrite;
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('the REPO-TRACKED sutando.config.json loads without an unknown-key warning', () => {
+		// The test above proves `health_check` is a known key using a SYNTHETIC config.
+		// That cannot catch the actual drift this PR is about: a key added to the shipped
+		// sutando.config.json but registered only in the Python loader. This one reads the
+		// real tracked file, so any future top-level key that the TS twin does not know
+		// fails here instead of warning on every TS service's first config load.
+		const trackedPath = resolve(
+			fileURLToPath(new URL('.', import.meta.url)), '..', 'sutando.config.json');
+		const tracked = JSON.parse(readFileSync(trackedPath, 'utf8'));
+		writeConfig(repo, 'sutando.config.json', tracked);
+
+		const writes: string[] = [];
+		const origWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+			writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			loadConfig(repo);
+			const combined = writes.join('');
+			assert.ok(
+				!combined.includes('does not read'),
+				`tracked sutando.config.json emitted an unknown-key warning: ${combined}`,
+			);
 		} finally {
 			process.stderr.write = origWrite;
 			restoreEnvAndRepo();
