@@ -142,6 +142,25 @@ try:
 finally:
     _restore()
 
+# --- contract-drift guard: the shipped agent-facing docs must describe the
+# no-guess contract this suite pins. If someone reverts the behavior (or the
+# docs) without the other, these assertions catch the divergence.
+_SKILL_DIR = _POST.parent
+_skill_md = (_SKILL_DIR / "SKILL.md").read_text()
+_manifest = (_SKILL_DIR / "manifest.json").read_text()
+check("SKILL.md documents --to targeting", "--to <peer|id>" in _skill_md)
+check("SKILL.md documents multi-peer no-guess (no mention + NOTE)",
+      "without any mention" in _skill_md and "never guesses" in _skill_md)
+check("SKILL.md documents single-peer auto-mention",
+      "exactly ONE peer" in _skill_md and "auto-mentions that peer" in _skill_md)
+check("SKILL.md documents the member-guard refusal", "REFUSES" in _skill_md)
+check("SKILL.md documents the peers.json roster", "peers.json" in _skill_md)
+check("manifest description matches the no-guess contract",
+      "--to" in _manifest and "never guess" in _manifest)
+check("stale auto-mention contract is gone from the docs",
+      "the other Sutando node" not in _skill_md.split("\n---")[0]
+      and "@-mentioning the other Sutando node" not in _manifest)
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
