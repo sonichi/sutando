@@ -215,7 +215,7 @@ def main() -> int:
             print(f"  {p}")
         print(
             "\nThe bridge resolves channel config at import, so this reads the developer's real\n"
-            "~/.claude channel allowlist. Set CLAUDE_CONFIG_DIR to a temp dir and seed\n"
+            "per-user channel allowlist. Set CLAUDE_CONFIG_DIR to a temp dir and seed\n"
             "channels/<ch>/access.json BEFORE exec_module. A token env var is not enough,\n"
             "and a comment saying 'hermetic' is not isolation."
         )
