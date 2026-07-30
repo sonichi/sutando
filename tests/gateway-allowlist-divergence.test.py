@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Allowlist-divergence warning in the ag2-sparrow gateway bridge.
+
+TWO layers gate an AG2 Space sender: the broker registry decides whose room
+messages become tasks at all; the local access.json only re-tiers arrived
+tasks. Adding a teammate locally therefore silently drops their messages at
+the broker (live incident 2026-07-30: @mark's @-mentions never became tasks).
+Agents can't edit their own broker record, so the bridge now DETECTS the
+divergence and warns the owner with the exact fleet-sibling command.
+
+Hermetic — no network: _req is monkeypatched; config/state under temp roots
+(CLAUDE_CONFIG_DIR seeded BEFORE import per the #2429 isolation rule).
+
+Covers:
+  1. pure divergence body: missing sender named + exact fix command; None when aligned
+  2. own agent-id / blank entries never count as divergence
+  3. hook end-to-end: local access.json + fake broker → ONE [dm-only] proactive file
+  4. dedup: unchanged divergence never warns twice; a NEW divergence re-warns
+  5. broker read failure → no warning, no mtime consumption (retries next loop)
+  6. realignment clears the warned-hash (future divergence warns again)
+
+Run: python3 tests/gateway-allowlist-divergence.test.py   (exit 0 / 1)
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+# Isolate channel config BEFORE the bridge import (#2429 rule): access path +
+# agent identity both resolve under this temp root, never the operator's real one.
+_CFG = Path(tempfile.mkdtemp(prefix="allowdiv-cfg-"))
+os.environ["CLAUDE_CONFIG_DIR"] = str(_CFG)
+_CH = _CFG / "channels" / "ag2space"
+_CH.mkdir(parents=True, exist_ok=True)
+(_CH / ".env").write_text("AGENT_ID=@sutando-test:ag2.space\n")
+os.environ.pop("AGENT_ID", None)
+os.environ.pop("AG2_DEVICE_ENV", None)
+
+sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+import ag2_sparrow.remote_gateway_bridge as rgb  # noqa: E402
+from ag2_sparrow._dirs import set_dirs  # noqa: E402
+
+failures: list[str] = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    print(("ok   " if cond else "FAIL ") + name + ("" if cond else f" — {detail}"))
+    if not cond:
+        failures.append(name)
+
+
+AGENT = "@sutando-test:ag2.space"
+
+# ---------------------------------------------------------------------------
+# 1–2. pure body
+# ---------------------------------------------------------------------------
+body = rgb.allowlist_divergence(["@rui:hs", "@mark:hs"], ["@rui:hs"], AGENT)
+check("divergence names the missing sender", body is not None and "@mark:hs" in body, repr(body)[:80])
+check("divergence carries the exact fix command",
+      body is not None and f"agent_access.py set {AGENT} --allow-add @mark:hs" in body, repr(body)[-120:])
+check("divergence is dm-only", body is not None and body.startswith("[dm-only]"))
+check("aligned → None", rgb.allowlist_divergence(["@rui:hs"], ["@rui:hs"], AGENT) is None)
+check("broker superset → None (only silent-drop direction warns)",
+      rgb.allowlist_divergence(["@rui:hs"], ["@rui:hs", "@extra:hs"], AGENT) is None)
+check("own id/blank entries ignored",
+      rgb.allowlist_divergence([AGENT, "  ", "@rui:hs"], ["@rui:hs"], AGENT) is None)
+
+# ---------------------------------------------------------------------------
+# hook end-to-end with fake broker + temp dirs
+# ---------------------------------------------------------------------------
+def fresh():
+    tmp = Path(tempfile.mkdtemp(prefix="allowdiv-ws-"))
+    set_dirs(task_dir=tmp / "tasks", result_dir=tmp / "results", state_dir=tmp / "state")
+    rgb.RESULTS_DIR = tmp / "results"
+    rgb._ALLOWDIV_STATE["mtime"] = None
+    rgb._ALLOWDIV_STATE["warned_hash"] = None
+    return tmp
+
+
+def write_access(allow):
+    p = Path(rgb._ag2space_access_path())
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"allowFrom": allow}))
+    # mtime granularity is coarse — force a distinct value per write
+    t = time.time() + write_access._bump
+    write_access._bump += 2
+    os.utime(p, (t, t))
+
+
+write_access._bump = 0
+
+_orig_req = rgb._req
+
+
+def fake_req_factory(agents_payload=None, fail=False):
+    def _fake(method, path, payload=None, timeout=35):
+        if path == "/v1/agents":
+            if fail:
+                raise OSError("broker down")
+            return {"agents": agents_payload or []}
+        raise AssertionError(f"unexpected {method} {path}")
+    return _fake
+
+
+def proactive_files(tmp):
+    return sorted((tmp / "results").glob("proactive-allowdiv-*.txt"))
+
+
+# 3. divergence → exactly one [dm-only] proactive file
+tmp = fresh()
+write_access(["@rui:hs", "@mark:hs"])
+rgb._req = fake_req_factory([{"id": AGENT, "allowFrom": ["@rui:hs"]}])
+try:
+    rgb._maybe_warn_allowlist_divergence()
+    files = proactive_files(tmp)
+    check("hook writes one proactive warning", len(files) == 1, repr(files))
+    body = files[0].read_text() if files else ""
+    check("warning body has sender + command",
+          "@mark:hs" in body and "agent_access.py set" in body, body[:100])
+
+    # 4a. same divergence, another loop pass → no second file
+    rgb._maybe_warn_allowlist_divergence()
+    check("unchanged divergence not re-warned", len(proactive_files(tmp)) == 1)
+
+    # 4b. access.json touched but SAME divergence set → still no second file
+    write_access(["@rui:hs", "@mark:hs"])
+    rgb._maybe_warn_allowlist_divergence()
+    check("same set after touch not re-warned (hash dedup)", len(proactive_files(tmp)) == 1)
+
+    # 4c. a NEW divergence (another sender) → second warning
+    write_access(["@rui:hs", "@mark:hs", "@sam:hs"])
+    rgb._maybe_warn_allowlist_divergence()
+    check("new divergence set re-warns", len(proactive_files(tmp)) == 2,
+          repr(proactive_files(tmp)))
+finally:
+    rgb._req = _orig_req
+
+# 5. broker read failure → no warning, retried (mtime not consumed)
+tmp = fresh()
+write_access(["@rui:hs", "@mark:hs"])
+rgb._req = fake_req_factory(fail=True)
+try:
+    rgb._maybe_warn_allowlist_divergence()
+    check("broker failure → no warning", len(proactive_files(tmp)) == 0)
+    # now broker comes back — same mtime must be retried
+    rgb._req = fake_req_factory([{"id": AGENT, "allowFrom": ["@rui:hs"]}])
+    rgb._maybe_warn_allowlist_divergence()
+    check("retry after broker recovery warns", len(proactive_files(tmp)) == 1)
+finally:
+    rgb._req = _orig_req
+
+# 6. realignment clears warned-hash → later divergence warns again
+tmp = fresh()
+write_access(["@rui:hs", "@mark:hs"])
+rgb._req = fake_req_factory([{"id": AGENT, "allowFrom": ["@rui:hs"]}])
+try:
+    rgb._maybe_warn_allowlist_divergence()
+    write_access(["@rui:hs"])                      # aligned now
+    rgb._maybe_warn_allowlist_divergence()
+    write_access(["@rui:hs", "@mark:hs"])          # diverges again
+    rgb._maybe_warn_allowlist_divergence()
+    check("realign then re-diverge warns twice total", len(proactive_files(tmp)) == 2,
+          repr(proactive_files(tmp)))
+finally:
+    rgb._req = _orig_req
+
+# agent-id resolution from the seeded .env (no $AGENT_ID in env)
+check("agent id read from channel .env", rgb._agent_id() == AGENT, rgb._agent_id())
+
+print()
+if failures:
+    print(f"{len(failures)} FAILURE(S): {failures}")
+    sys.exit(1)
+print("All gateway allowlist-divergence checks passed.")

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import hashlib
 import json
 import os
 import uuid
@@ -482,6 +483,123 @@ def _tier_for(user_id):
             local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
             return mapped if _TIER_RANK[mapped] <= local_rank else LOCAL_TIER
     return LOCAL_TIER
+
+
+# ── allowlist divergence warning (local access.json vs broker registry) ──────
+# TWO layers gate a sender: the BROKER's agent registry decides whose room
+# messages become tasks AT ALL; the local access.json above only re-tiers tasks
+# that already arrived. An owner who adds a teammate locally (the natural place
+# to look) gets silent message-drop at the broker — live incident 2026-07-30:
+# @mark added to local allowFrom, his @-mentions never generated tasks. Agents
+# cannot edit their OWN broker record (relay's anti-self-escalation rule), so
+# the best the bridge can do is DETECT the divergence and hand the owner the
+# exact fleet-sibling command. Checked on startup and whenever access.json
+# changes (mtime); warned once per distinct divergence set.
+
+_ALLOWDIV_STATE = {"mtime": None, "warned_hash": None}
+
+
+def allowlist_divergence(local_allow, broker_allow, agent_id):
+    """Owner-warning body when LOCAL allowFrom names senders the BROKER
+    registry lacks (their room messages silently never become tasks); None when
+    aligned. Pure — no I/O. Only the local-minus-broker direction warns: that
+    is the silent-drop case; broker-extra senders still get tasks and are
+    tier-clamped locally by _tier_for."""
+    local = {str(x).strip() for x in (local_allow or []) if str(x).strip()}
+    broker = {str(x).strip() for x in (broker_allow or []) if str(x).strip()}
+    missing = sorted(m for m in local - broker if m != str(agent_id).strip())
+    if not missing:
+        return None
+    adds = " ".join(f"--allow-add {m}" for m in missing)
+    return (
+        "[dm-only] ⚠️ AG2 Space allowlist divergence: local access.json allows "
+        f"{', '.join(missing)}, but the BROKER registry for {agent_id} does not — "
+        "their room messages (including @-mentions) are dropped before this agent "
+        "ever sees them. Agents can't edit their own broker record; run from a "
+        "fleet sibling (its bearer in env):\n"
+        f"  agent_access.py set {agent_id} {adds}"
+    )
+
+
+def _agent_id():
+    """This agent's mxid: $AGENT_ID, else the same channel .env files the token
+    reader uses. '' when unknowable (divergence check silently disabled)."""
+    env_id = (os.environ.get("AGENT_ID") or "").strip()
+    if env_id:
+        return env_id
+    candidates = [os.environ.get("AG2_DEVICE_ENV")]
+    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _cfg:
+        candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for ln in fh.read().splitlines():
+                    ln = ln.strip()
+                    if ln.startswith("AGENT_ID="):
+                        return ln.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
+    return ""
+
+
+def _local_allow_from():
+    try:
+        with open(_ag2space_access_path(), encoding="utf-8") as f:
+            return [str(x) for x in (json.load(f) or {}).get("allowFrom") or []]
+    except Exception:
+        return []
+
+
+def _broker_allow_for(agent_id):
+    """GET /v1/agents (own bearer → the owner's fleet, safe metadata only) →
+    this agent's allowFrom, or None when unreadable. None is fail-OPEN for the
+    warning (no divergence spam off a flaky read) — the mtime is left unmarked
+    so the next loop retries."""
+    try:
+        resp = _req("GET", "/v1/agents", timeout=15)
+        for rec in (resp or {}).get("agents", []):
+            if str(rec.get("id", "")).strip().lower() == str(agent_id).strip().lower():
+                return [str(x) for x in rec.get("allowFrom") or []]
+        _log(f"allowlist-divergence: own record {agent_id} not in /v1/agents — skipping")
+    except Exception as e:  # noqa: BLE001 — diagnostics only; never disturb the task loop
+        _log(f"allowlist-divergence: broker read failed ({e}) — will retry")
+    return None
+
+
+def _maybe_warn_allowlist_divergence():
+    """Cheap per-loop hook: does work only on first run / access.json change."""
+    agent_id = _agent_id()
+    if not agent_id:
+        return
+    try:
+        mt = os.path.getmtime(_ag2space_access_path())
+    except OSError:
+        return  # no local access.json → nothing to diverge
+    if mt == _ALLOWDIV_STATE["mtime"]:
+        return
+    broker = _broker_allow_for(agent_id)
+    if broker is None:
+        return  # read failed — mtime unmarked, retried next loop
+    _ALLOWDIV_STATE["mtime"] = mt
+    body = allowlist_divergence(_local_allow_from(), broker, agent_id)
+    if body is None:
+        _ALLOWDIV_STATE["warned_hash"] = None  # aligned again → future divergence re-warns
+        return
+    h = hashlib.sha1(body.encode()).hexdigest()
+    if h == _ALLOWDIV_STATE["warned_hash"]:
+        return
+    _ALLOWDIV_STATE["warned_hash"] = h
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # uuid suffix: two distinct warnings inside one second must not collide on
+    # the epoch filename (os.replace would silently clobber the first).
+    out = RESULTS_DIR / f"proactive-allowdiv-{int(time.time())}-{uuid.uuid4().hex[:6]}.txt"
+    tmp = out.with_suffix(".tmp")
+    tmp.write_text(body + "\n", encoding="utf-8")
+    os.replace(tmp, out)  # atomic — the proactive drain never sees a torn file
+    _log(f"allowlist-divergence: owner warned → {out.name}")
 
 
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
@@ -1595,6 +1713,9 @@ def main() -> None:
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
             _emit_gateway_status(True)
+            # Diagnostics only, after the healthy round-trip so a broken
+            # gateway never turns a task-loop error into divergence spam.
+            _maybe_warn_allowlist_divergence()
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
