@@ -48,8 +48,10 @@ case "$sub" in
   # new-session models a launch that creates the SESSION but whose core never
   # comes up (CORE_MARK intentionally NOT created) — the failure under test.
   new-session) touch "$SESS_MARK"; exit 0 ;;
-  # killing the session kills its core → clear both markers.
-  kill-session) rm -f "$SESS_MARK" "$CORE_MARK"; exit 0 ;;
+  # killing the session normally kills its core → clear both markers. When
+  # $WEDGED is set, model an unresponsive core: the session drops but the
+  # `claude` process refuses to die (CORE_MARK stays) — so SIGTERM "doesn't take".
+  kill-session) rm -f "$SESS_MARK"; [ -n "$WEDGED" ] || rm -f "$CORE_MARK"; exit 0 ;;
   *) exit 0 ;;  # start-server/set-option/bind/select-window/new-window/attach
 esac
 """
@@ -80,9 +82,11 @@ exit 0
 """ % FAKEPID
 
 
-def _run(restart: bool, session: bool, core: bool):
+def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: bool = False):
     """Run start-cli.sh in the stub env with the given initial state.
 
+    force  → invoke --force-restart instead of --restart.
+    wedged → the core process refuses to die (SIGTERM/kill-session won't reap it).
     Returns (returncode, stdout+stderr)."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -109,8 +113,12 @@ def _run(restart: bool, session: bool, core: bool):
             # keep the run fast: the fix polls in 0.2s ticks up to a few seconds.
             "SUTANDO_TMUX_SOCKET": str(td / "sock"),
         }
+        if wedged:
+            env["WEDGED"] = "1"
         args = ["/bin/bash", str(SCRIPT)]
-        if restart:
+        if force:
+            args.append("--force-restart")
+        elif restart:
             args.append("--restart")
         r = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
         return r.returncode, (r.stdout + r.stderr)
@@ -157,12 +165,40 @@ def case_restart_does_not_reuse_orphan():
     return fails
 
 
+def case_restart_wedged_aborts_not_kills():
+    """(Split) plain --restart on a wedged core must ABORT and point at
+    force-restart — it must NOT SIGKILL (the core may be mid-task)."""
+    rc, out = _run(restart=True, session=True, core=True, wedged=True)
+    fails = []
+    if rc == 0:
+        fails.append(f"--restart on a wedged core should abort non-zero, got 0: out={out!r}")
+    if "force-restart" not in out:
+        fails.append(f"--restart abort should point at force-restart: out={out!r}")
+    if "escalating to SIGKILL" in out:
+        fails.append(f"plain --restart must NOT escalate to SIGKILL: out={out!r}")
+    return fails
+
+
+def case_force_restart_wedged_escalates_to_sigkill():
+    """(Split) --force-restart on a wedged core DOES escalate to SIGKILL; if the
+    core still won't die it hard-aborts non-zero (never stacks a second core)."""
+    rc, out = _run(restart=True, session=True, core=True, force=True, wedged=True)
+    fails = []
+    if "escalating to SIGKILL" not in out:
+        fails.append(f"--force-restart should escalate to SIGKILL on a wedged core: out={out!r}")
+    if rc == 0:
+        fails.append(f"--force-restart on an unkillable core should hard-abort non-zero: out={out!r}")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("fresh-start-core-down-exits-nonzero", case_fresh_start_core_down_exits_nonzero),
         ("restart-core-down-exits-nonzero", case_restart_core_down_exits_nonzero),
         ("non-restart-reuses-orphan-exits-zero", case_non_restart_reuses_orphan_exits_zero),
         ("restart-does-not-reuse-orphan", case_restart_does_not_reuse_orphan),
+        ("restart-wedged-aborts-not-kills", case_restart_wedged_aborts_not_kills),
+        ("force-restart-wedged-escalates-to-sigkill", case_force_restart_wedged_escalates_to_sigkill),
     ]
     all_failures = []
     for label, fn in cases:
