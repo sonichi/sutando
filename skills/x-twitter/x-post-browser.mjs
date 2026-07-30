@@ -41,6 +41,21 @@ import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync } from 'node:f
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { normalizeComposerText, composerMatches } from './composer-text.mjs';
+
+async function readComposer(page) {
+  return await page.$eval('[data-testid="tweetTextarea_0"]', (el) => el.innerText ?? el.textContent ?? '');
+}
+
+function failComposerMismatch(requested, actual) {
+  const r = normalizeComposerText(requested);
+  const a = normalizeComposerText(actual);
+  console.error('composer read-back MISMATCH — refusing to publish (fail closed).');
+  console.error(`  requested (${r.length} chars): ${JSON.stringify(r.slice(0, 200))}`);
+  console.error(`  in composer (${a.length} chars): ${JSON.stringify(a.slice(0, 200))}`);
+  process.exit(3);
+}
+
 
 /** The `playwright` npm package pins one Chromium revision, but the installed
  *  build can drift (e.g. package wants chromium-1208, cache has chromium-1228).
@@ -231,10 +246,13 @@ try {
     await box.click();
     await page.keyboard.type(arg, { delay: 15 });
     await page.waitForTimeout(800);
+    const typedDry = await readComposer(page);
+    if (!composerMatches(arg, typedDry)) failComposerMismatch(arg, typedDry);
     if (dryRun) {
       const shot = `${SHOT_DIR}/x-dryrun-${Date.now()}.png`;
       await page.screenshot({ path: shot });
-      console.log(JSON.stringify({ dryRun: true, wouldPost: arg, screenshot: shot }));
+      // report what the composer ACTUALLY holds, not what we asked for
+      console.log(JSON.stringify({ dryRun: true, wouldPost: typedDry, verified: true, screenshot: shot }));
       process.exit(0);
     }
     // Publish: inline compose button (tweetButtonInline) or modal (tweetButton).
@@ -242,9 +260,13 @@ try {
       '[data-testid="tweetButtonInline"]:not([aria-disabled="true"]), [data-testid="tweetButton"]:not([aria-disabled="true"])',
       { timeout: 15000 }
     );
+    // Re-read immediately before the irreversible click — the button lookup above
+    // yields the event loop, so the composer could have changed since the first check.
+    const finalText = await readComposer(page);
+    if (!composerMatches(arg, finalText)) failComposerMismatch(arg, finalText);
     await btn.click();
     await page.waitForTimeout(3000);
-    console.log(JSON.stringify({ posted: true, text: arg }));
+    console.log(JSON.stringify({ posted: true, text: finalText, verified: true }));
     process.exit(0);
   }
 } catch (err) {
