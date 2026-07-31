@@ -2709,7 +2709,8 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
             unreadable += 1
             continue
         if (
-            any(action.kind == "skip" for action in parsed.actions)
+            path.stem.startswith("task-cron-")
+            or any(action.kind == "skip" for action in parsed.actions)
             or _is_local_completion_result(tasks_dir, path.stem)
         ):
             cleanup_results.append((path.name, int(age)))

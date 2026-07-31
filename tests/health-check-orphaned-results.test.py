@@ -86,6 +86,20 @@ class OrphanedResultsTest(unittest.TestCase):
         self.assertIn("3 completed/non-delivery result(s) await archival", result["detail"])
         self.assertNotIn("never delivered", result["detail"])
 
+    def test_cron_results_are_cleanup_even_without_task_metadata(self):
+        """Scheduler results are control-plane receipts, not bridge replies."""
+        self._write(
+            "results/task-cron-pending-questions-123.txt",
+            TWO_HOURS_AGO,
+            "cron-gate: owner tasks queued — deferring pending-questions\n",
+        )
+
+        result = hc.check_orphaned_results()
+
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("1 completed/non-delivery result(s) await archival", result["detail"])
+        self.assertNotIn("never delivered", result["detail"])
+
     def test_task_orphan_done_transition_does_not_claim_delivery_loss(self):
         """Archiving a DONE task leaves terminal cleanup debt, not a lost reply."""
         task = self._write("tasks/task-done.txt", TWO_HOURS_AGO)
