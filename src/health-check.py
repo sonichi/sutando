@@ -1829,6 +1829,37 @@ def check_voice_transport(voice_check: dict) -> dict:
     return check
 
 
+# Quota headers land on every proxied upstream response, so a core that is
+# working routes several per loop pass. Six hours is far outside any plausible
+# gap between passes on a host that is actually wired, and matches the "down"
+# tier the comm-sweep freshness probe already uses.
+QUOTA_STATE_STALE_SEC = 6 * 60 * 60
+# core-status.json is rewritten at the start and end of every loop pass, so a
+# half-hour-old one means a pass is either in flight or just finished.
+AGENT_ACTIVE_SEC = 30 * 60
+
+
+def _agent_activity_age() -> "float | None":
+    """Seconds since the agent last recorded loop activity, or None if unknown.
+
+    None is the honest answer for "no evidence either way" and must stay
+    distinct from a large number: absent core-status.json means this host does
+    not tell us whether the agent is working, and a check that cannot rule out
+    the quiet-core explanation must not warn.
+
+    Only the MTIME is read, never the `status` field. A pass that ends by
+    writing `{"status": "idle"}` still ran — the write itself is the evidence,
+    and reading the value would make a pass count only while mid-flight.
+    """
+    try:
+        p = status_read_path("core-status.json", WORKSPACE_DIR)
+        if not p.exists():
+            return None
+        return time.time() - p.stat().st_mtime
+    except OSError:
+        return None
+
+
 def check_quota_telemetry(proxy_status: str) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
@@ -1848,11 +1879,28 @@ def check_quota_telemetry(proxy_status: str) -> dict:
     Deliberately narrow to stay quiet in the legitimate cases:
       - proxy not up          -> silent. Not every host routes through it,
                                  and its own check already says so.
-      - file present          -> ok, with its age. NOT stale-checked: a quiet
-                                 core legitimately writes nothing for a long
-                                 time, so an age threshold would fire on
-                                 healthy idle hosts. Absence is the signal
-                                 that actually distinguishes broken wiring.
+      - file present          -> ok, with its age. A bare age threshold is
+                                 still refused: a quiet core legitimately
+                                 writes nothing for a long time, and firing on
+                                 healthy idle hosts is how a check gets muted.
+
+    ...but PRESENCE ALONE IS SATISFIED BY A HISTORICAL WRITE. This check exists
+    to catch "the proxy is up and nothing routes through it", and it detects
+    only the *never-wired* case. A host that WAS wired, wrote quota-state.json
+    once, and then lost the wiring keeps a file on disk forever and reads green
+    forever — the exact condition this check was written to make loud, in the
+    one shape it cannot see. Observed on this fleet: quota-state.json 323h old,
+    credential-proxy `ok`, quota-telemetry `ok`, and the proactive loop's
+    per-pass budget gate quoting 13-day-old percentages as current.
+
+    Staleness only becomes evidence when the "quiet core" explanation is ruled
+    OUT, so the stale branch is gated on the agent being demonstrably at work:
+    core-status.json is rewritten by the agent on every loop pass, and each of
+    those writes belongs to a turn that spent tokens. Fresh core-status plus
+    stale quota-state means requests are flowing while quota headers are not
+    landing — wiring, not quiet. An idle host has a stale core-status too, so
+    it stays silent, and a host that never wired at all still takes the
+    absent-file branch below.
     """
     check = {"name": "quota-telemetry", "status": "ok"}
     if proxy_status != "ok":
@@ -1861,10 +1909,26 @@ def check_quota_telemetry(proxy_status: str) -> dict:
     path = status_read_path("quota-state.json", WORKSPACE_DIR)
     if path.exists():
         try:
-            age_min = int((time.time() - path.stat().st_mtime) / 60)
+            quota_age = time.time() - path.stat().st_mtime
+            age_min = int(quota_age / 60)
             check["detail"] = f"quota state present (updated {age_min}m ago)"
         except OSError:
+            # Degrade to the less precise detail rather than raising — and with
+            # no age there is nothing to call stale, so never warn from here.
             check["detail"] = "quota state present"
+            return check
+        agent_age = _agent_activity_age()
+        if quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
+                and agent_age < AGENT_ACTIVE_SEC:
+            check["status"] = "warn"
+            check["detail"] = (
+                f"quota state is {int(quota_age / 3600)}h stale while the agent is "
+                f"working ({int(agent_age / 60)}m since the last loop pass) — the proxy "
+                "is up but nothing is routing through it any more, so the file on disk "
+                "is a leftover from when it was. Quota-based budgeting is quoting stale "
+                "numbers as current. Check ANTHROPIC_BASE_URL on the running core "
+                "(exported by src/startup.sh; a supervisor-launched core never runs it)."
+            )
         return check
     check["status"] = "warn"
     check["detail"] = (
