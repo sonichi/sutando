@@ -79,6 +79,13 @@ check "control: grouping paren after a keyword passes"  clean $'+++ b/skills/x/c
 check "keyword grouping does not exempt"                flag  $'+++ b/skills/x/r1.ts\n@@ -1,0 +1,1 @@\n+if (cmd === "/opt/homebrew/bin/ffmpeg" || alt === "/usr/local/bin/ffmpeg") run(cmd);'
 check "object literal does not exempt"                  flag  $'+++ b/skills/x/r2.ts\n@@ -1,0 +1,1 @@\n+const cfg = { command: "/opt/homebrew/bin/ffmpeg", fallbackHint: "/usr/local/bin/ffmpeg" };'
 
+# Round 6: an INDEX is adjacency-based, so `return [...]` must NOT false-flag; and
+# a bare paren is a tuple in Python but the COMMA OPERATOR in JS/TS.
+check "return [list] is a literal, not an index"        clean $'+++ b/skills/x/r61.ts\n@@ -1,0 +1,1 @@\n+return ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'
+check "cond and [list] likewise"                        clean $'+++ b/skills/x/r62.py\n@@ -1,0 +1,1 @@\n+paths = cond and ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'
+check "JS comma-operator paren does not exempt"         flag  $'+++ b/skills/x/r63.ts\n@@ -1,0 +1,1 @@\n+const cmd = ("/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg");'
+check "python tuple of the same shape still passes"     clean $'+++ b/skills/x/r64.py\n@@ -1,0 +1,1 @@\n+cmd = ("/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg")'
+
 # `"" in ")]"` is True in Python, so an unguarded prev-char test made a bracket at
 # COLUMN 0 read as a call on a returned value and falsely flagged a valid list.
 check "candidate list at column 0 still passes"         clean $'+++ b/skills/x/col0.ts\n@@ -1,0 +1,1 @@\n+["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'

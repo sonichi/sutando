@@ -187,9 +187,12 @@ ok("_tokens splits a candidate list into whole paths",
 # that reaches the flush-the-remainder branch.
 ok("_tokens keeps a trailing token with no closing delimiter",
    rc._tokens("BIN=/usr/local/bin/ffmpeg")[-1] == "/usr/local/bin/ffmpeg")
-ok("paired: same-basename companion exempts",
+# A bare `( ... )` is a tuple in Python and the COMMA OPERATOR in JS/TS, so the
+# path decides. See `_TUPLE_LANG_SUFFIXES`.
+ok("paired: same-basename companion exempts (python tuple)",
    rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
-                     'X = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")'))
+                     'X = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")',
+                     None, "src/x.py"))
 ok("paired: naked literal is NOT exempt",
    not rc.paired_allowed("/opt/homebrew/bin/ffmpeg", 'X = "/opt/homebrew/bin/ffmpeg"'))
 ok("paired: coincidental companion of a DIFFERENT name is NOT exempt",
@@ -394,8 +397,9 @@ try:
     # Positive controls — the exemption must survive, or this is just "flag all".
     ok("main(): array candidate list still passes", _scan1(
         'const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];').strip() == "")
-    ok("main(): tuple candidate list still passes", _scan1(
-        'C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")').strip() == "")
+    ok("main(): tuple candidate list still passes (python file)",
+       scan('+++ b/src/tu1.py\n@@ -1,0 +1,1 @@\n'
+            '+C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")')[1].strip() == "")
     ok("main(): nested candidate list still passes on its OWN tokens", _scan1(
         'const x=use(["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]);').strip() == "")
 
@@ -439,8 +443,9 @@ try:
     # "reject everything with a paren".
     ok("main(): array literal still passes",
        _s('const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];').strip() == "")
-    ok("main(): python tuple still passes",
-       _s('C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")').strip() == "")
+    ok("main(): python tuple still passes (python file)",
+       scan('+++ b/src/tu2.py\n@@ -1,0 +1,1 @@\n'
+            '+C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")')[1].strip() == "")
     ok("main(): a grouping paren after a KEYWORD is not a call",
        _s('    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")').strip() == "")
 
@@ -452,8 +457,10 @@ try:
        not rc._is_candidate_container('spawn("/a","/b")', 5))
     ok("container: `in` before ( -> sequence context, IS a collection",
        rc._is_candidate_container('for _p in ("/a","/b")', 10))
-    ok("container: assignment before ( -> tuple, IS a collection",
-       rc._is_candidate_container('C = ("/a","/b")', 4))
+    ok("container: assignment before ( -> tuple in PYTHON, IS a collection",
+       rc._is_candidate_container('C = ("/a","/b")', 4, "src/x.py"))
+    ok("container: the same shape in TS is the comma operator, NOT a collection",
+       not rc._is_candidate_container('C = ("/a","/b")', 4, "src/x.ts"))
     ok("container: closing bracket before ( -> call, not a collection",
        not rc._is_candidate_container('f()("/a")', 3))
     ok("container: `if` before ( -> condition, NOT a collection",
@@ -489,10 +496,51 @@ try:
     # Positive controls preserved.
     ok("main(): array literal still passes",
        _s2('const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];').strip() == "")
-    ok("main(): tuple still passes",
-       _s2('C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")').strip() == "")
+    ok("main(): tuple still passes (python file)",
+       scan('+++ b/src/t3.py\n@@ -1,0 +1,1 @@\n'
+            '+C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")')[1].strip() == "")
     ok("main(): sequence-keyword generator still passes",
        _s2('    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")').strip() == "")
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
+# Round 6 (qingyun-wu, review of af236f6). Two opposite defects:
+#   (a) FALSE POSITIVES — `_is_candidate_container` rejected `[` whenever any
+#       preceding word existed, so `return [...]`, `yield [...]` and
+#       `cond and [...]` — ordinary array literals — were flagged. The
+#       discriminator for an INDEX is ADJACENCY (`paths[i]`), not the presence
+#       of a word somewhere to the left.
+#   (b) A MISS — a bare `( ... )` is a tuple in Python but the COMMA OPERATOR in
+#       JS/TS, where the value is only the LAST operand. So
+#       `("/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg")` runs the Homebrew
+#       path while the /usr/local string is dead, and it was exempt.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    def _ts(src): return scan('+++ b/src/r6.ts\n@@ -1,0 +1,1 @@\n+' + src)[1]
+    def _py(src): return scan('+++ b/src/r6.py\n@@ -1,0 +1,1 @@\n+' + src)[1]
+    L = '["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'
+
+    ok("main(): `return [list]` is a literal, not an index — no false positive",
+       _ts("return " + L).strip() == "")
+    ok("main(): `yield [list]` likewise", _py("yield " + L).strip() == "")
+    ok("main(): `cond and [list]` likewise", _py("paths = cond and " + L).strip() == "")
+    ok("main(): an INDEX is still not a candidate collection",
+       "hardcoded path" in _ts('const x = paths["/opt/homebrew/bin/ffmpeg"] + alt["/usr/local/bin/ffmpeg"];'))
+
+    ok("main(): a JS comma-operator paren does NOT exempt the command",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" in
+       _ts('const cmd = ("/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg");'))
+    ok("main(): the same shape in PYTHON is a real tuple and still passes",
+       _py('cmd = ("/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg")').strip() == "")
+
+    ok("container: `[` at column 0 is a literal (empty-string membership guard)",
+       rc._is_candidate_container('["/a","/b"]', 0))
+    ok("container: `[` adjacent to an identifier is an index",
+       not rc._is_candidate_container('paths["/a"]', 5))
+    ok("container: `[` after a keyword AND a space is a literal",
+       rc._is_candidate_container('return ["/a","/b"]', 7))
 finally:
     rc.flags.remove("/opt/")
 
@@ -516,8 +564,8 @@ ok("paired: a position past the code part (inside a comment) is not exempt",
                          30))
 ok("_is_candidate_container: a list at COLUMN 0 is still a container",
    rc._is_candidate_container('["/a","/b"]', 0))
-ok("_is_candidate_container: a paren at COLUMN 0 is still a tuple",
-   rc._is_candidate_container('("/a","/b")', 0))
+ok("_is_candidate_container: a paren at COLUMN 0 is still a tuple (python)",
+   rc._is_candidate_container('("/a","/b")', 0, "src/x.py"))
 ok("paired: a token under NO configured paired prefix falls through the loop",
    not rc.paired_allowed("/Users/alice/ffmpeg",
                          '["/Users/alice/ffmpeg", "/usr/local/bin/ffmpeg"]', 2))

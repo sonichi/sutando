@@ -119,37 +119,53 @@ def _prev_word(code, i):
     return code[j], code[k + 1:j + 1]
 
 
-def _is_candidate_container(code, i):
+# Suffixes whose `( ... )` is a real SEQUENCE (a Python tuple). In JS/TS the same
+# syntax is the COMMA OPERATOR, whose value is only the LAST operand — so
+# `("/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg")` runs the Homebrew path
+# and the /usr/local string is dead. Treating that as a candidate list exempted a
+# genuinely Apple-Silicon-only command.
+_TUPLE_LANG_SUFFIXES = (".py", ".pyi")
+
+
+def _is_candidate_container(code, i, path=None):
     """Is `code[i]` the opener of a syntactic candidate COLLECTION?
 
-    * `[` — an array/list literal. NOT an index (`paths[i]`), which is a lookup,
-      not a sequence of alternatives.
-    * `(` — a parenthesised sequence: a tuple (`C = (...)`) or a sequence-keyword
-      context (`for _p in (...)`). NOT a call's argument list, and NOT a keyword
-      grouping like `if (...)`, which is a condition.
-    * `{` — never. An object literal is keyed config; a `fallbackHint` key sitting
-      beside a `command` key does not make the command portable.
+    * `[` — an array/list literal. An INDEX is excluded, and the discriminator is
+      ADJACENCY, not "is there a preceding word": `paths[i]` indexes, while
+      `return [...]`, `yield [...]` and `cond and [...]` are literals. An earlier
+      version tested only for a preceding word and so false-flagged all three,
+      which is ordinary code.
+    * `(` — a sequence-keyword grouping (`for _p in (...)`) in any language, or a
+      bare tuple (`C = (...)`) ONLY in a language where that is a sequence. Not a
+      call's argument list, not a keyword grouping like `if (...)`.
+    * `{` — never. An object literal is keyed config; a `fallbackHint` key beside a
+      `command` key does not make the command portable.
     """
     ch = code[i]
-    prev_ch, prev_word = _prev_word(code, i)
     if ch == "{":
         return False
     if ch == "[":
-        # `prev_ch and ...` is load-bearing: `"" in ")]"` is TRUE in Python, so
-        # an unguarded test made a bracket at COLUMN 0 look like a call on a
-        # returned value. A candidate list starting a line was then falsely
-        # flagged — found by chasing the last uncovered branch, not by a repro.
-        return not ((prev_ch and prev_ch in ")]") or prev_word != "")
+        # Adjacency only — no whitespace skipping.
+        # `prev and ...` is load-bearing: `"" in "_)]"` is TRUE in Python, so an
+        # unguarded test makes a `[` at COLUMN 0 read as an index. This is the
+        # SAME empty-string membership trap already fixed once in this file for
+        # `prev_ch in ")]"` — reintroduced here by a later edit and caught only by
+        # the committed column-0 control.
+        prev = code[i - 1] if i > 0 else ""
+        return not (prev and (prev.isalnum() or prev in "_)]"))
     if ch != "(":
         return False
+    prev_ch, prev_word = _prev_word(code, i)
     if prev_ch and prev_ch in ")]":
         return False                      # call on a returned value
     if prev_word:
         return prev_word in _SEQUENCE_KEYWORDS
-    return True                           # operator / comma / start -> tuple
+    # Operator / comma / start-of-expression: a tuple in Python, the comma
+    # operator in JS/TS. Only the former is a list of alternatives.
+    return bool(path) and str(path).endswith(_TUPLE_LANG_SUFFIXES)
 
 
-def _group_span(code, pos):
+def _group_span(code, pos, path=None):
     """The innermost bracket group containing `pos`, as (start, end), or None.
 
     Only a syntactic candidate COLLECTION counts as a container (see
@@ -176,7 +192,7 @@ def _group_span(code, pos):
             stack.append(i)
         elif ch in closes and stack:
             start = stack.pop()
-            if not _is_candidate_container(code, start):
+            if not _is_candidate_container(code, start, path):
                 continue          # not a syntactic candidate collection
             if start < pos < i and (best is None or start > best[0]):
                 best = (start, i)
@@ -211,7 +227,7 @@ def _siblings_only(code, start, end):
     return "".join(out)
 
 
-def paired_allowed(tok, line, pos=None):
+def paired_allowed(tok, line, pos=None, path=None):
     """Contextual exemption for the portable candidate-list shape.
 
     `tok` is exempt only when the SAME line carries a companion path for the
@@ -253,7 +269,7 @@ def paired_allowed(tok, line, pos=None):
         pos = line.find(tok)
     if pos < 0 or pos >= len(code):
         return False
-    span = _group_span(code, pos)
+    span = _group_span(code, pos, path)
     if span is None:
         return False          # no candidate container -> not a candidate list
     scope = _siblings_only(code, span[0], span[1])
@@ -370,7 +386,7 @@ def main():
                     if pos < 0:
                         break
                     tok = token_at(line, pos)
-                    if not allowed(tok) and not paired_allowed(tok, line, pos):
+                    if not allowed(tok) and not paired_allowed(tok, line, pos, cur_file):
                         print("%s:%d: hardcoded path (%s): %s" % (cur_file, cur, tok, stripped))
                         hits += 1
                         reported = True
