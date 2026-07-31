@@ -64,6 +64,72 @@ with tempfile.TemporaryDirectory() as t:
     check("backup-stranded memory → warn", r and r["status"] == "warn", str(r))
     check("warn names the stranded file", r and "gmail-imap-capability.md" in r["detail"], str(r))
 
+# --- (c) the index itself outgrowing the session read limit --------------
+# Modes (a) and (b) each lose ONE memory. This one loses the whole index at
+# once, silently, while every memory file on disk still looks healthy — so it
+# is tested at the boundary rather than with a single comfortable value.
+# Thresholds are pinned to explicit test values so the assertions do not drift
+# when the shipped defaults are retuned.
+_FAIL = hc.MEMORY_INDEX_FAIL_BYTES
+_WARN = hc.MEMORY_INDEX_WARN_BYTES
+check("shipped defaults leave real headroom (warn strictly below fail)", _WARN < _FAIL,
+      f"warn={_WARN} fail={_FAIL}")
+
+def _index_of(mem: Path, nbytes: int) -> None:
+    """Write a MEMORY.md of exactly nbytes that indexes one real memory."""
+    head = "# Index\n- [Good](good-memory.md) — "
+    (mem / "good-memory.md").write_text("body")
+    pad = "x" * max(0, nbytes - len(head.encode()) - 1)
+    (mem / "MEMORY.md").write_text(head + pad + "\n")
+
+for label, size, want in (
+    ("well under warn        → ok",   _WARN - 2048, "ok"),
+    ("one byte under warn    → ok",   _WARN - 1,    "ok"),
+    ("exactly at warn        → warn", _WARN,        "warn"),
+    ("between warn and fail  → warn", (_WARN + _FAIL) // 2, "warn"),
+    ("one byte under fail    → warn", _FAIL - 1,    "warn"),
+    ("exactly at fail        → fail", _FAIL,        "fail"),
+    ("far over fail          → fail", _FAIL + 8192, "fail"),
+):
+    with tempfile.TemporaryDirectory() as t:
+        mem = make_tree(Path(t))
+        _index_of(mem, size)
+        hc.MEMORY_DIR = mem
+        r = hc.check_memory_index_integrity()
+        check(f"index size: {label}", r and r["status"] == want,
+              f"size={size} got={r and r['status']} want={want} :: {r and r['detail'][:90]}")
+
+# The ok path should still report the size, so the number is visible BEFORE it
+# becomes a problem — a threshold you only see once it trips is a threshold you
+# cannot plan around.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    _index_of(mem, 1024)
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("ok detail states the index size", r and "KB index" in r["detail"], str(r))
+
+# Size and the pre-existing modes are independent: an oversized index must
+# still name the orphan, and must not be downgraded to warn by its presence.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    _index_of(mem, _FAIL + 512)
+    (mem / "orphan-memory.md").write_text("stranded rule that never loads")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("oversized + orphan → still fail", r and r["status"] == "fail", str(r))
+    check("oversized + orphan → still names the orphan",
+          r and "orphan-memory.md" in r["detail"], str(r))
+
+# An absent MEMORY.md is 0 bytes, not "oversized" — a fresh install must not
+# trip the size guard.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "good-memory.md").write_text("body")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("no MEMORY.md at all → not a size failure", r and r["status"] != "fail", str(r))
+
 # 4) Missing memory dir → None (no false alarm on fresh installs).
 with tempfile.TemporaryDirectory() as t:
     hc.MEMORY_DIR = Path(t) / "does-not-exist" / "memory"

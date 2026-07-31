@@ -92,6 +92,18 @@ def _default_memory_dir() -> str:
 # redirecting.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
+# MEMORY.md is read whole into every session. Past the runtime's read limit it
+# is not truncated — it is skipped — so EVERY indexed memory stops loading at
+# once, silently, while each memory file still looks fine on disk.
+# Env-overridable on purpose: the limit belongs to the session runtime, not to
+# this repo, so a deployment that measures a different one can declare it
+# rather than patch code. Defaults encode what was observed on this fleet
+# 2026-07-31 (index hit 22.0KB against a 24.4KB limit, uncaught).
+MEMORY_INDEX_FAIL_BYTES = int(os.environ.get("SUTANDO_MEMORY_INDEX_FAIL_BYTES", str(24 * 1024)))
+# Warn with enough headroom to compact deliberately rather than in a panic —
+# a few more filed memories is all the margin there is at the default.
+MEMORY_INDEX_WARN_BYTES = int(os.environ.get("SUTANDO_MEMORY_INDEX_WARN_BYTES", str(19 * 1024)))
+
 
 def _resolve_dotenv() -> Path:
     """Resolve the `.env` path via the canonical resolver.
@@ -794,10 +806,44 @@ def check_memory_index_integrity() -> "dict | None":
     except Exception:  # pragma: no cover — best-effort backup scan; never break the health check
         pass
 
-    if not unindexed and not stranded:
+    # (c) the INDEX ITSELF outgrowing the per-session read limit. This is the
+    # same failure the check already exists for — "a memory that will never
+    # load" — but at the largest possible blast radius: past the limit the
+    # index file is not truncated, it simply is not read, so EVERY indexed
+    # memory stops loading at once. Modes (a) and (b) lose one memory each;
+    # this one loses all of them, and it arrives silently while every
+    # individual memory file still looks perfectly healthy on disk.
+    #
+    # Observed on this fleet 2026-07-31: MEMORY.md reached 22.0KB against a
+    # 24.4KB limit — roughly 2KB, or a few more filed memories, from dropping
+    # a 250-entry index with no warning anywhere. Nothing caught it.
+    #
+    # The thresholds are env-overridable because the limit is a property of the
+    # session runtime, not of this repo: the default encodes what was observed
+    # rather than a documented constant, so a deployment that measures a
+    # different limit can say so instead of editing code.
+    index_bytes = len(index_text.encode("utf-8")) if index.exists() else 0
+    oversized = index_bytes >= MEMORY_INDEX_FAIL_BYTES
+    outgrowing = index_bytes >= MEMORY_INDEX_WARN_BYTES
+
+    if not unindexed and not stranded and not outgrowing:
         return {"name": "memory-index", "status": "ok",
-                "detail": "all memory files present in the MEMORY.md index"}
+                "detail": ("all memory files present in the MEMORY.md index "
+                           f"({index_bytes / 1024:.1f}KB index)")}
     parts = []
+    if oversized:
+        parts.append(
+            f"MEMORY.md is {index_bytes / 1024:.1f}KB, at/over the "
+            f"{MEMORY_INDEX_FAIL_BYTES / 1024:.1f}KB session read limit — the WHOLE index "
+            "stops loading, not part of it. Compact it now: one line per entry, "
+            "detail belongs in the topic files"
+        )
+    elif outgrowing:
+        parts.append(
+            f"MEMORY.md is {index_bytes / 1024:.1f}KB, approaching the "
+            f"{MEMORY_INDEX_FAIL_BYTES / 1024:.1f}KB session read limit — compact it "
+            "before it crosses; past the limit EVERY indexed memory stops loading"
+        )
     if unindexed:
         parts.append(
             f"{len(unindexed)} memory file(s) not in MEMORY.md (won't load): "
@@ -808,7 +854,11 @@ def check_memory_index_integrity() -> "dict | None":
             f"{len(stranded)} memory file(s) stranded in a *-BACKUP tree, absent from the live dir: "
             + ", ".join(sorted(set(stranded))[:6]) + ("…" if len(set(stranded)) > 6 else "")
         )
-    return {"name": "memory-index", "status": "warn", "detail": "; ".join(parts)}
+    # An index that is already over the limit is not "up but degraded" — it is
+    # not loading at all, so it reports as a failure rather than a warning.
+    return {"name": "memory-index",
+            "status": "fail" if oversized else "warn",
+            "detail": "; ".join(parts)}
 
 
 def check_memory_sync() -> dict:
