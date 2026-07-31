@@ -53,7 +53,12 @@ except ModuleNotFoundError:
     for _cand in _RESCUE_CANDIDATES:
         if not os.path.exists(_cand) or os.path.realpath(_cand) == _current:
             continue
-        _check = subprocess.run([_cand, "-c", "import discord"], capture_output=True)
+        try:
+            _check = subprocess.run(
+                [_cand, "-c", "import discord"], capture_output=True, timeout=20,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            continue  # a wedged interpreter must not hang bridge startup
         if _check.returncode == 0:
             print(
                 f"discord-bridge: launched with {_current} (no discord.py); "
@@ -563,8 +568,136 @@ if TEAM_TIER_OWNER:
 seen_message_ids = set()  # Discord message IDs already processed
 
 
-# Load access config
-ACCESS_FILE = channel_access_path("discord")
+# Durable on-disk backup of the Discord access allowlist (parity with
+# slack-bridge.py's ACCESS_BACKUP_FILE, #899 defense-in-depth). The live
+# access.json lives in the VOLATILE `channels/discord/` dir: Sutando.app
+# Settings, a corrupt-read + bad-default write (observed 2026-07-21 — owner
+# silently dropped from allowFrom), or an external delete can wipe it. Before
+# this backup the bridge only printed "restore from access.json.bak-*" and left
+# the operator to restore BY HAND; a wipe + restart booted into pairing/TOFU
+# with the owner de-authorized. This backup lives under state/auth/ (per
+# CLAUDE.md, the cleanup-exempt per-host install-state dir) so a restart can
+# auto-restore the allowlist from disk instead of exposing an open pairing gate.
+ACCESS_BACKUP_FILE = STATE_DIR / "auth" / "discord-access-backup.json"
+
+
+def _resolve_access_file() -> Path:
+    """Resolve the live file without letting the migration fallback bypass a
+    durable restore.
+
+    Before the first durable backup exists, preserve the transition-window
+    behavior: a missing canonical file may read/write the populated legacy
+    ``~/.claude`` file. Once the durable backup exists, however, a missing
+    canonical file is a wipe to restore—not a reason to resurrect legacy
+    authorization state. Pin to the canonical path so ``on_ready`` can restore
+    it from ``state/auth`` before any access read.
+    """
+    if ACCESS_BACKUP_FILE.exists():
+        return claude_home_path("channels", "discord", "access.json")
+    return channel_access_path("discord")
+
+
+# Load access config after defining the durable path: its presence determines
+# whether a missing canonical file means migration fallback or wipe recovery.
+ACCESS_FILE = _resolve_access_file()
+
+
+def _is_valid_access_doc(data) -> bool:
+    """A structurally valid access-control document worth backing up / restoring.
+
+    The core schema is an ``allowFrom`` list. Both a populated allowlist and the
+    intentional locked-down state ``allowFrom: []`` qualify and MUST be
+    protected. Only a transient/partial wipe — a non-dict, a parse failure, or a
+    missing/non-list ``allowFrom`` — is rejected, so it can't overwrite a good
+    backup. Mirrors slack-bridge._is_valid_access_doc so the two bridges share
+    one gate.
+    """
+    return isinstance(data, dict) and isinstance(data.get("allowFrom"), list)
+
+
+def _write_owner_only(path, text: str) -> None:
+    """Atomically write *text* to *path* with the file born 0600.
+
+    The temp is created O_EXCL with mode 0600 — access-control data is never
+    observable broader than owner-only, even under a permissive umask (a
+    write_text-then-chmod sequence leaves a window where it is). fsync +
+    os.replace make the swap atomic and crash-durable: a failed or partial
+    write leaves any previous file at *path* untouched."""
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _backup_access_to_disk(data: dict) -> None:
+    """Persist a copy of a VALID access-control document to the durable backup.
+
+    Backs up any structurally valid state (see ``_is_valid_access_doc``) —
+    including an intentional empty lockdown — but never a transient/partial
+    wipe, so a wipe can't overwrite the good backup. Best-effort: an OSError on
+    the backup write must never break the live access.json write path.
+
+    The state/auth/ leaf is owner-only (0700) and the backup is written born
+    0600 + atomically replaced, so a permissive umask can't expose auth state
+    and a crashed write can't truncate the previous good backup."""
+    if not _is_valid_access_doc(data):
+        return
+    try:
+        ACCESS_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(ACCESS_BACKUP_FILE.parent, 0o700)  # normalize a pre-existing broader leaf
+        _write_owner_only(ACCESS_BACKUP_FILE, json.dumps(data, indent=2) + "\n")
+    except OSError:
+        pass  # best-effort; backup must never break the write path
+
+
+def _restore_access_from_disk() -> bool:
+    """Restore access.json from the durable on-disk backup when the live file is
+    missing or invalid. Survives process death (unlike an in-memory cache),
+    closing the wipe+restart -> open-pairing/TOFU exposure. Returns True if it
+    restored.
+
+    Self-gating: if the live access.json already parses as a valid access doc,
+    this is a no-op (never clobber a good live file with a possibly-stale
+    backup). Only a missing / corrupt / schema-invalid live file is restored,
+    and only from a schema-VALID backup."""
+    try:
+        live = json.loads(ACCESS_FILE.read_text())
+        if _is_valid_access_doc(live):
+            return False  # live file is fine — nothing to restore
+    except Exception:
+        pass  # missing / corrupt / unparseable — fall through to restore
+    try:
+        backup = json.loads(ACCESS_BACKUP_FILE.read_text())
+    except Exception:
+        return False
+    if not _is_valid_access_doc(backup):
+        return False
+    try:
+        ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # access.json is itself access-control data: born-0600 temp + atomic
+        # replace (never observable broader, even under a permissive umask).
+        _write_owner_only(ACCESS_FILE, json.dumps(backup, indent=2) + "\n")
+        print(
+            "  [access] restored access.json from durable on-disk backup "
+            "(wipe survived a restart — #899 defense-in-depth)",
+            flush=True,
+        )
+        return True
+    except Exception as e:
+        print(f"  [access] disk-backup restore failed: {e}", flush=True)
+        return False
+
+
 def load_allowed():
     try:
         data = json.loads(ACCESS_FILE.read_text())
@@ -637,6 +770,7 @@ def ensure_tier_map_seeded() -> bool:
         tmp.write_text(json.dumps(data, indent=2) + "\n")
         os.chmod(tmp, 0o600)
         os.replace(tmp, ACCESS_FILE)
+        _backup_access_to_disk(data)  # durable backup on every valid access write
         print(f"  [tier-map] grandfathered {len(allow)} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
         return True
     except OSError as e:
@@ -2369,6 +2503,12 @@ _poll_loops_started = False
 @client.event
 async def on_ready():
     print(f"Discord bridge ready: {client.user}", flush=True)
+    # Restart-safety FIRST: if access.json was wiped/corrupted while the bridge
+    # was down, auto-restore it from the durable state/auth/ backup BEFORE any
+    # access read below. Without this a wipe+restart boots into pairing/TOFU with
+    # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
+    # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
+    _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
     # #1147: auto-seed workspace `state/discord-config.json` from the legacy
     # access.json heuristic on first boot. Idempotent (no-op if file
     # exists). Emits a WARN to stderr if the seed had to fall back to
@@ -2378,6 +2518,11 @@ async def on_ready():
         _initial_access = json.loads(ACCESS_FILE.read_text())
     except Exception:
         _initial_access = {}
+    # Seed the durable backup immediately on upgrade. Existing installations
+    # may already have a valid, fully-migrated access.json and therefore never
+    # hit one of the write paths below; without this startup mirror they would
+    # remain unprotected until a later access-control change happened.
+    _backup_access_to_disk(_initial_access)  # pragma: no cover — startup glue; helper + live restart path are tested
     try:
         discord_config.auto_seed_if_missing(_initial_access)
     except Exception as _seed_exc:
@@ -2722,6 +2867,24 @@ async def _handle_discord_message(message, force=False):
             print(f"  [skip] bot message without mention in requireMention=true channel", flush=True)
             return
 
+        # Progress-stream placeholder guard: a peer node with
+        # SUTANDO_PROGRESS_STREAM=1 posts "⏳ <step> (Ns)" placeholders (and edits
+        # them) while its own owner task runs. In a requireMention=false channel
+        # where that node sits in allowFrom, the bot-author filter above lets them
+        # through and we'd ingest each placeholder + edit as a fresh task — a
+        # self-inflicted flood. These carry no work for us; drop them regardless
+        # of requireMention. Tight-anchored detector (see progress_stream) so a
+        # real task containing an hourglass emoji is not misclassified.
+        # Scoped to BOT authors (qingyun P1 on #2157). The shape alone is not a
+        # safe discriminator: a human owner/team message whose entire body happens
+        # to read "⏳ deploy the release (9s)" would otherwise be silently dropped
+        # before task creation — a valid human task lost with only a skip log.
+        # Only a peer NODE emits these, so author.bot is the real signal and the
+        # text shape is the secondary filter, not the primary one.
+        if getattr(message.author, "bot", False) and progress_stream.is_progress_placeholder(message.content):
+            print(f"  [skip] progress-stream placeholder from bot {message.author}", flush=True)
+            return
+
         bot_mentioned = client.user in message.mentions
         # role_mentioned counts as "addressed to us" — assumes these roles are held
         # only by this bot; a role shared across sibling bots re-introduces the
@@ -2803,6 +2966,7 @@ async def _handle_discord_message(message, force=False):
                     tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
                     tmp_path.write_text(json.dumps(access_data, indent=2))
                     os.replace(tmp_path, ACCESS_FILE)
+                    _backup_access_to_disk(access_data)  # pragma: no cover — thread-engage seed write glue; the backup fn is unit-tested. Durable backup on every valid access write
                     # Refresh the gate for THIS message. require_mention was
                     # computed by load_channel_config before the seed existed,
                     # so without this the seeding message itself is still
@@ -2964,11 +3128,14 @@ async def _handle_discord_message(message, force=False):
             # with an empty-allowFrom default — that permanently wipes the real
             # config (owner dropped from allowFrom → pairing prompts + code leak
             # to channels; observed 2026-07-21). Bail loudly; leave the file for
-            # the operator to restore from channels/discord/access.json.bak-*.
+            # recovery. A restart auto-restores from the durable state/auth/
+            # backup (_restore_access_from_disk in on_ready); the legacy
+            # channels/discord/access.json.bak-* files remain a manual fallback.
             print(
                 f"  [pairing] access.json present but unreadable — NOT overwriting "
                 f"(would wipe allowFrom). Skipping pairing for @{username} ({sender_id}). "
-                f"Restore from a channels/discord/access.json.bak-* backup.",
+                f"Restart to auto-restore from the durable state/auth/discord-access-backup.json "
+                f"(or manually restore a channels/discord/access.json.bak-* backup).",
                 flush=True,
             )
             return
@@ -2999,6 +3166,7 @@ async def _handle_discord_message(message, force=False):
         tmp_path.write_text(json.dumps(access, indent=2))  # pragma: no cover
         os.chmod(tmp_path, 0o600)  # pragma: no cover
         os.replace(tmp_path, ACCESS_FILE)  # pragma: no cover
+        _backup_access_to_disk(access)  # pragma: no cover — durable backup on every valid access write
         await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
         print(f"  Pairing requested: @{username} ({sender_id}) code={code}")
         return
@@ -5124,7 +5292,7 @@ def _send_via_rest(channel_id: str, message: str):
         data = json.dumps({"content": chunk}).encode()
         req = urllib.request.Request(url, data=data, headers=headers)
         try:
-            urllib.request.urlopen(req)
+            urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
             sys.exit(1)

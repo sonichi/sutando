@@ -92,6 +92,154 @@ def _default_memory_dir() -> str:
 # redirecting.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
+# How much of MEMORY.md a session actually loads. These are the RUNTIME's
+# documented numbers, not this repo's guess:
+#
+#   "Claude Code reads the first 200 lines or 25KB of a memory file, whichever
+#    comes first" — content BEYOND that point is dropped; the prefix still
+#    loads. YAML frontmatter and block-level HTML comments are stripped before
+#    those limits are measured.
+#   https://code.claude.com/docs/en/memory#how-it-works
+#
+# Earlier revisions of this check encoded a measured-by-eye ~24KB cutoff and
+# claimed the WHOLE index stops loading past it. Both were wrong (john-the-dev,
+# #2449): the limit is line-OR-byte, and truncation is a suffix drop, not total
+# loss. They are plain constants rather than env knobs on purpose — they mirror
+# a documented external contract, so a deployment that "tunes" them is just
+# lying to itself about what its runtime does. Undeclared env vars are also
+# forbidden by AGENTS.md (qingyun-wu, #2449).
+MEMORY_INDEX_LOAD_LINES = 200
+MEMORY_INDEX_LOAD_BYTES = 25 * 1024
+# Warn while there is still room to compact deliberately rather than in a panic.
+MEMORY_INDEX_NEAR_LIMIT = 0.9
+
+
+def _index_effective_text(text: str) -> str:
+    """Drop what the runtime strips BEFORE it measures the 200-line/25KB limits.
+
+    Counting raw bytes over-reports: a file whose bulk is frontmatter or a block
+    HTML comment measures large here but small to the runtime. That produced a
+    false `fail` on a 25.6KB fixture whose visible content was one line
+    (john-the-dev, #2449).
+    """
+    if text.startswith("---"):
+        m = re.match(r"^---\r?\n.*?\r?\n---[ \t]*\r?\n?", text, re.DOTALL)
+        if m:
+            text = text[m.end():]
+
+    # Block-level HTML comments only, and NOT inside a fenced code block: the
+    # runtime strips block comments but PRESERVES them inside code fences, so a
+    # regex that ignores fence state under-reports. A 28KB comment wrapped in
+    # ```html measured as 37 bytes here and returned a false `ok` while the
+    # entry after it was genuinely past the cut (john-the-dev, #2449).
+    #
+    # Line-oriented rather than one regex, because fence state and multi-line
+    # comment state both have to be tracked, and a regex cannot carry either.
+    out: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    in_comment = False
+    def _block_indent_ok(raw: str) -> bool:
+        # CommonMark bounds a block-level marker to at most THREE columns of
+        # indentation; at four the line is indented CODE, not a marker. This
+        # gates BOTH markers we track:
+        #   fence  — a 4-space ```html is not a fence, so the comment inside it
+        #            must be stripped, not preserved (false `fail`; qingyun-wu).
+        #   <!--   — a 4-space or TAB indented comment is code CONTENT and must
+        #            count toward the 25KB prefix, not be stripped (false `ok`
+        #            on a 30KB fixture that measured 18 bytes; qingyun-wu).
+        # Counted in COLUMNS, not characters: a bare lstrip(" ") ignored tabs, and
+        # one tab already reaches the 4-column stop. Applies to a fence closer
+        # too — an over-indented closer must not close a real fence.
+        n = 0
+        for ch in raw:
+            if ch == " ":
+                n += 1
+            elif ch == "\t":
+                n += 4 - (n % 4)          # advance to the next 4-column tab stop
+            else:
+                break
+            if n >= 4:
+                return False
+        return True
+
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        indent_ok = _block_indent_ok(line)
+        if in_fence:
+            out.append(line)
+            # CommonMark: a fence closes only on the SAME character, repeated at
+            # least as many times as the opener, alone on its line. Truncating the
+            # marker to three characters let an inner ``` line close a ````
+            # fence early — the comment after it then fell outside any fence, was
+            # stripped, and a 28KB file measured 39 bytes: false `ok`
+            # (rui-sutando-codex, #2449).
+            if (indent_ok and stripped[:1] == fence_char
+                    and re.fullmatch(re.escape(fence_char) + "{%d,}" % fence_len,
+                                     stripped.rstrip())):
+                in_fence = False
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        m = re.match(r"(`{3,}|~{3,})", stripped) if indent_ok else None
+        if m and m.group(1)[0] == "`" and "`" in stripped[m.end():]:
+            # CommonMark: a BACKTICK fence's info string may not contain a
+            # backtick (it would be ambiguous with inline code). ```bad`info is
+            # therefore an ordinary paragraph line, not an opener. Accepting it
+            # opened a phantom fence, so the block comment that followed was
+            # PRESERVED and a 31KB fixture measured 31KB: a false `fail` telling
+            # the operator to compact an index that loads fine (john-the-dev,
+            # #2449). Tilde fences have no such rule — ~~~a`b IS a valid opener.
+            out.append(line)
+            continue
+        if m:
+            in_fence = True
+            fence_char = m.group(1)[0]
+            fence_len = len(m.group(1))     # FULL length — see the close check above
+            out.append(line)
+            continue
+        if indent_ok and stripped.startswith("<!--"):
+            if "-->" not in line:
+                in_comment = True
+            continue                      # whole-line block comment: dropped
+        out.append(line)
+    return "".join(out)
+
+
+def _index_loaded_prefix(text: str) -> "tuple[str, int, int]":
+    """Return (prefix_that_loads, bytes_loaded, lines_loaded) per the contract.
+
+    Whichever of the two limits is reached first stops the read. A line that
+    would straddle the byte limit is treated as not loaded — the conservative
+    reading, and the one that matters here since a half-read index line cannot
+    be relied on to name its memory file.
+    """
+    kept: list[str] = []
+    total = 0
+    for i, line in enumerate(text.splitlines(keepends=True)):
+        if i >= MEMORY_INDEX_LOAD_LINES:
+            break
+        nbytes = len(line.encode("utf-8"))
+        if total + nbytes > MEMORY_INDEX_LOAD_BYTES:
+            # The limit is a BYTE prefix, not a line count — the session reads
+            # the bytes up to the cut, so a line that STARTS inside the budget
+            # is partially read. Dropping it whole marked an entry whose
+            # filename sat comfortably before the cut as unreadable, failing an
+            # index that loads fine (qingyun-wu, #2449). Keep the bytes that fit.
+            room = MEMORY_INDEX_LOAD_BYTES - total
+            if room > 0:
+                # errors="ignore" so a cut through a multi-byte character
+                # yields the readable prefix instead of raising.
+                kept.append(line.encode("utf-8")[:room].decode("utf-8", errors="ignore"))
+                total += room
+            break
+        kept.append(line)
+        total += nbytes
+    return "".join(kept), total, len(kept)
+
 
 def _resolve_dotenv() -> Path:
     """Resolve the `.env` path via the canonical resolver.
@@ -763,21 +911,44 @@ def check_memory_index_integrity() -> "dict | None":
     ``*-BACKUP`` tree (created by scripts/sutando-migrate.sh) that never made it
     into the live index — so the rule it carried was written yet never recalled.
 
-    Warn (never fail) listing the orphaned/stranded files so the divergence is
-    visible instead of silently dropping the memory. Returns None on a clean
-    index or when the memory dir does not exist yet.
+    A third mode has the same consequence: the entry EXISTS but sits past the
+    point a session stops reading (200 lines or 25KB of post-strip content,
+    whichever comes first — see MEMORY_INDEX_LOAD_*). Truncation drops the
+    suffix, not the file, so this is measured by asking whether each memory is
+    named in the prefix that actually loads.
+
+    Fails only when a memory is demonstrably lost that way; warns for orphaned/
+    stranded files and for an index merely approaching the limit. Returns None
+    on a clean index or when the memory dir does not exist yet.
     """
     if not MEMORY_DIR.exists():
         return None
     index = MEMORY_DIR / "MEMORY.md"
     index_text = index.read_text(errors="ignore") if index.exists() else ""
 
+    # What the session actually sees: strip what the runtime strips, then keep
+    # only the prefix that fits inside 200 lines / 25KB.
+    effective_text = _index_effective_text(index_text)
+    loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
+    truncated = len(loaded_text) < len(effective_text)
+
+    def _referenced_in(hay: str, name: str) -> bool:
+        return name in hay or name[:-3] in hay
+
     # (a) live memory files not referenced anywhere in MEMORY.md → won't load.
-    unindexed = [
-        p.name for p in sorted(MEMORY_DIR.glob("*.md"))
-        if p.name != "MEMORY.md"
-        and p.name not in index_text and p.name[:-3] not in index_text
-    ]
+    # (c) referenced, but ONLY beyond the load cut → equally won't load. Same
+    #     consequence, different cause, so they are found the same way: ask the
+    #     prefix that actually loads, not the whole file. Testing the whole file
+    #     reported an index entry parked on line 201 as healthy (john-the-dev,
+    #     #2449) because the bytes were on disk — just never read.
+    unindexed: list[str] = []
+    beyond_cut: list[str] = []
+    for p in sorted(MEMORY_DIR.glob("*.md")):
+        if p.name == "MEMORY.md":
+            continue
+        if _referenced_in(loaded_text, p.name):
+            continue
+        (beyond_cut if _referenced_in(effective_text, p.name) else unindexed).append(p.name)
 
     # (b) memories stranded in a sibling *-BACKUP tree, absent from the live dir.
     stranded: list[str] = []
@@ -794,10 +965,41 @@ def check_memory_index_integrity() -> "dict | None":
     except Exception:  # pragma: no cover — best-effort backup scan; never break the health check
         pass
 
-    if not unindexed and not stranded:
+    # (c) the index outgrowing what a session reads. Truncation is a SUFFIX
+    # drop, so the damage is exactly the entries past the cut — reported above
+    # as `beyond_cut`. What is left to say here is whether the index is close
+    # enough to the cut to be worth compacting before entries start falling off.
+    effective_bytes = len(effective_text.encode("utf-8"))
+    effective_lines = len(effective_text.splitlines())
+    near_limit = (
+        effective_bytes >= MEMORY_INDEX_LOAD_BYTES * MEMORY_INDEX_NEAR_LIMIT
+        or effective_lines >= MEMORY_INDEX_LOAD_LINES * MEMORY_INDEX_NEAR_LIMIT
+    )
+
+    def _size_note() -> str:
+        return (f"{effective_bytes / 1024:.1f}KB / {effective_lines} lines of loadable "
+                f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1024:.0f}KB / "
+                f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
+
+    if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
-                "detail": "all memory files present in the MEMORY.md index"}
+                "detail": f"all memory files present in the loaded MEMORY.md index ({_size_note()})"}
     parts = []
+    if beyond_cut:
+        parts.append(
+            f"{len(beyond_cut)} memory file(s) ARE indexed but sit past the load cut "
+            f"(index stops at line {loaded_lines} / {loaded_bytes / 1024:.1f}KB), so the "
+            f"session never reads their entry: {', '.join(beyond_cut[:6])}"
+            f"{'…' if len(beyond_cut) > 6 else ''}. Compact the index — the prefix still "
+            f"loads, only the tail is dropped ({_size_note()})"
+        )
+    elif near_limit:
+        parts.append(
+            f"MEMORY.md is approaching the session read limit ({_size_note()})"
+            + (" and is already truncated" if truncated else "")
+            + " — compact it now; entries past the cut are dropped silently while "
+              "every memory file still looks fine on disk"
+        )
     if unindexed:
         parts.append(
             f"{len(unindexed)} memory file(s) not in MEMORY.md (won't load): "
@@ -808,7 +1010,14 @@ def check_memory_index_integrity() -> "dict | None":
             f"{len(stranded)} memory file(s) stranded in a *-BACKUP tree, absent from the live dir: "
             + ", ".join(sorted(set(stranded))[:6]) + ("…" if len(set(stranded)) > 6 else "")
         )
-    return {"name": "memory-index", "status": "warn", "detail": "; ".join(parts)}
+    # `fail` only for demonstrated loss: named memory files whose index entry is
+    # past the cut and therefore never read. Everything else — orphans, strays,
+    # merely approaching the limit — is degradation, not loss, so it warns.
+    # (Earlier revisions failed on a raw-byte threshold, which fired on indexes
+    # that still loaded fine once frontmatter/comments were excluded.)
+    return {"name": "memory-index",
+            "status": "fail" if beyond_cut else "warn",
+            "detail": "; ".join(parts)}
 
 
 def check_memory_sync() -> dict:
@@ -1816,6 +2025,37 @@ def check_voice_transport(voice_check: dict) -> dict:
     return check
 
 
+# Quota headers land on every proxied upstream response, so a core that is
+# working routes several per loop pass. Six hours is far outside any plausible
+# gap between passes on a host that is actually wired, and matches the "down"
+# tier the comm-sweep freshness probe already uses.
+QUOTA_STATE_STALE_SEC = 6 * 60 * 60
+# core-status.json is rewritten at the start and end of every loop pass, so a
+# half-hour-old one means a pass is either in flight or just finished.
+AGENT_ACTIVE_SEC = 30 * 60
+
+
+def _agent_activity_age() -> "float | None":
+    """Seconds since the agent last recorded loop activity, or None if unknown.
+
+    None is the honest answer for "no evidence either way" and must stay
+    distinct from a large number: absent core-status.json means this host does
+    not tell us whether the agent is working, and a check that cannot rule out
+    the quiet-core explanation must not warn.
+
+    Only the MTIME is read, never the `status` field. A pass that ends by
+    writing `{"status": "idle"}` still ran — the write itself is the evidence,
+    and reading the value would make a pass count only while mid-flight.
+    """
+    try:
+        p = status_read_path("core-status.json", WORKSPACE_DIR)
+        if not p.exists():
+            return None
+        return time.time() - p.stat().st_mtime
+    except OSError:
+        return None
+
+
 def check_quota_telemetry(proxy_status: str) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
@@ -1835,11 +2075,28 @@ def check_quota_telemetry(proxy_status: str) -> dict:
     Deliberately narrow to stay quiet in the legitimate cases:
       - proxy not up          -> silent. Not every host routes through it,
                                  and its own check already says so.
-      - file present          -> ok, with its age. NOT stale-checked: a quiet
-                                 core legitimately writes nothing for a long
-                                 time, so an age threshold would fire on
-                                 healthy idle hosts. Absence is the signal
-                                 that actually distinguishes broken wiring.
+      - file present          -> ok, with its age. A bare age threshold is
+                                 still refused: a quiet core legitimately
+                                 writes nothing for a long time, and firing on
+                                 healthy idle hosts is how a check gets muted.
+
+    ...but PRESENCE ALONE IS SATISFIED BY A HISTORICAL WRITE. This check exists
+    to catch "the proxy is up and nothing routes through it", and it detects
+    only the *never-wired* case. A host that WAS wired, wrote quota-state.json
+    once, and then lost the wiring keeps a file on disk forever and reads green
+    forever — the exact condition this check was written to make loud, in the
+    one shape it cannot see. Observed on this fleet: quota-state.json 323h old,
+    credential-proxy `ok`, quota-telemetry `ok`, and the proactive loop's
+    per-pass budget gate quoting 13-day-old percentages as current.
+
+    Staleness only becomes evidence when the "quiet core" explanation is ruled
+    OUT, so the stale branch is gated on the agent being demonstrably at work:
+    core-status.json is rewritten by the agent on every loop pass, and each of
+    those writes belongs to a turn that spent tokens. Fresh core-status plus
+    stale quota-state means requests are flowing while quota headers are not
+    landing — wiring, not quiet. An idle host has a stale core-status too, so
+    it stays silent, and a host that never wired at all still takes the
+    absent-file branch below.
     """
     check = {"name": "quota-telemetry", "status": "ok"}
     if proxy_status != "ok":
@@ -1848,10 +2105,26 @@ def check_quota_telemetry(proxy_status: str) -> dict:
     path = status_read_path("quota-state.json", WORKSPACE_DIR)
     if path.exists():
         try:
-            age_min = int((time.time() - path.stat().st_mtime) / 60)
+            quota_age = time.time() - path.stat().st_mtime
+            age_min = int(quota_age / 60)
             check["detail"] = f"quota state present (updated {age_min}m ago)"
         except OSError:
+            # Degrade to the less precise detail rather than raising — and with
+            # no age there is nothing to call stale, so never warn from here.
             check["detail"] = "quota state present"
+            return check
+        agent_age = _agent_activity_age()
+        if quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
+                and agent_age < AGENT_ACTIVE_SEC:
+            check["status"] = "warn"
+            check["detail"] = (
+                f"quota state is {int(quota_age / 3600)}h stale while the agent is "
+                f"working ({int(agent_age / 60)}m since the last loop pass) — the proxy "
+                "is up but nothing is routing through it any more, so the file on disk "
+                "is a leftover from when it was. Quota-based budgeting is quoting stale "
+                "numbers as current. Check ANTHROPIC_BASE_URL on the running core "
+                "(exported by src/startup.sh; a supervisor-launched core never runs it)."
+            )
         return check
     check["status"] = "warn"
     check["detail"] = (
@@ -4460,7 +4733,17 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
             mtime = alive_file.stat().st_mtime
             if now - mtime >= 90.0:
                 continue  # stale heartbeat — not a live core
-            sock = json.loads(alive_file.read_text()).get("socket")
+            payload = json.loads(alive_file.read_text())
+            # A heartbeat that decodes to a NON-OBJECT (`null`, `[]`, `"x"`, `3`)
+            # raises AttributeError on `.get`, which this handler does not catch —
+            # so one junk file takes down the caller. That caller is
+            # `_rearm_core_crons()`, a RECOVERY path, so it fails exactly when
+            # something is already wrong. The writer is atomic (tmp + replace in
+            # core_heartbeat.py), but this globs `*.alive` for EVERY host, so the
+            # file may come from another machine running different code.
+            if not isinstance(payload, dict):
+                continue
+            sock = payload.get("socket")
         except (OSError, ValueError):
             continue
         if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):

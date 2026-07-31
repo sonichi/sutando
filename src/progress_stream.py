@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -138,6 +139,27 @@ def format_progress(step: Optional[str], elapsed_s: float, max_len: int = 180) -
     shown = step if (isinstance(step, str) and step.strip()) else "working…"
     shown = _truncate(shown.strip(), max_len)
     return "⏳ {} ({}s)".format(shown, secs)
+
+
+# The exact shape format_progress() emits: a leading hourglass marker, arbitrary
+# step text, then a trailing "(Ns)" elapsed counter. A peer node running with
+# SUTANDO_PROGRESS_STREAM=1 posts these placeholders while ITS owner task runs;
+# in a requireMention:false channel where that node is in allowFrom, our bridge
+# would otherwise ingest each placeholder (and each edit) as a fresh task —
+# a self-inflicted flood. Detect them so the ingestion gate can drop them.
+_PLACEHOLDER_RE = re.compile(r"^\s*⏳ .+ \(\d+s\)\s*$")
+
+
+def is_progress_placeholder(text: Optional[str]) -> bool:
+    """True if ``text`` is a progress-stream placeholder emitted by format_progress().
+
+    Tight-anchored (leading ⏳ marker + trailing ``(Ns)``) so a real owner task
+    that merely happens to contain an hourglass emoji is not misclassified and
+    silently dropped. Only single-line placeholder bodies match.
+    """
+    if not isinstance(text, str):
+        return False
+    return bool(_PLACEHOLDER_RE.match(text))
 
 
 # ---- outage-aware placeholder (sonichi#2398) -------------------------------
