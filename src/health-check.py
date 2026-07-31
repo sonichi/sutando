@@ -521,6 +521,106 @@ def check_cron_runner(
     }
 
 
+def check_session_cron_registration(
+    workspace_dir: Optional[Path] = None,
+    host_label: Optional[str] = None,
+    runtime: Optional[str] = None,
+    now: Optional[float] = None,
+) -> dict:
+    """Warn when session-owned crons were never (re-)registered for this core boot.
+
+    CronCreate registrations are session-only: they die with the session and
+    only exist if /schedule-crons completed after the core booted. The failure
+    is silent (config intact on disk, zero live crons, no error) — observed
+    2026-07-23 on a peer instance as 2/18 registered. The script-visible signal:
+    /schedule-crons writes
+    `hosts/<hostname>/schedule-crons-stamp.json` when it finishes; if that
+    host-owned stamp predates the running core's `started_at` (from the
+    heartbeat payload), the current session never completed registration.
+    Stamp AGE alone is deliberately not used — long-lived sessions would
+    false-warn.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    host = host_label or _host_label()
+    name = "session-crons"
+    runtime = runtime or resolve_core_runtime(repo_root=REPO_DIR)
+
+    crons_file = workspace / "hosts" / host / "crons.json"
+    try:
+        crons = json.loads(crons_file.read_text())
+    except FileNotFoundError:
+        return {"name": name, "status": "ok", "detail": "no schedules configured"}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot read crons.json ({exc})"}
+    if not isinstance(crons, list):
+        return {"name": name, "status": "warn", "detail": "crons.json is not a list"}
+
+    def session_owned(entry: dict) -> bool:
+        if entry.get("launchd") is True or entry.get("execution") == "codex-task":
+            return False
+        if entry.get("loop") == "dynamic" or not entry.get("cron"):
+            return False
+        return True
+
+    expected = sum(1 for e in crons if isinstance(e, dict) and session_owned(e))
+    if runtime == "codex" or expected == 0:
+        # codex has no session CronCreate surface (check_cron_runner owns that
+        # story); zero expected → nothing to verify.
+        return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
+
+    alive_file = workspace / "state" / "cores" / f"{host}.alive"
+    started_at = None
+    try:
+        alive = json.loads(alive_file.read_text())
+        if isinstance(alive, dict):
+            started_at = float(alive.get("started_at"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass  # no heartbeat → can't anchor to a boot; fall through to stamp-only
+
+    stamp_file = workspace / "hosts" / host / "schedule-crons-stamp.json"
+    try:
+        stamp = json.loads(stamp_file.read_text())
+    except FileNotFoundError:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"{expected} session cron(s) expected but /schedule-crons has never stamped completion — run /schedule-crons",
+        }
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "warn", "detail": f"stamp unreadable ({exc})"}
+
+    if not isinstance(stamp, dict):
+        return {"name": name, "status": "warn", "detail": "stamp malformed (expected an object)"}
+
+    stamp_ts = stamp.get("ts")
+    if isinstance(stamp_ts, bool) or not isinstance(stamp_ts, (int, float)):
+        return {"name": name, "status": "warn", "detail": "stamp malformed (missing numeric ts)"}
+    if started_at is not None and stamp_ts < started_at:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"stamp predates this core boot ({int(started_at - stamp_ts)}s older) — "
+                f"session crons are gone with the old session; re-run /schedule-crons"
+            ),
+        }
+
+    registered = stamp.get("registered")
+    if isinstance(registered, bool) or not isinstance(registered, int) or registered < 0:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": "stamp malformed (missing non-negative registered count)",
+        }
+    if registered < expected:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"only {registered}/{expected} session cron(s) registered at last /schedule-crons",
+        }
+    return {"name": name, "status": "ok", "detail": f"{expected} session cron(s) stamped registered this boot"}
+
+
 def check_file(path: Path, name: str) -> dict:
     """Check if a file exists and is non-empty."""
     if not path.exists():
@@ -962,6 +1062,65 @@ def check_per_host_config_backup() -> dict:
                           f"{', '.join(drift)} — vault copy stale; a full sync-workspace "
                           f"(_snapshot_per_host_config) should refresh it"}
     return {"name": name, "status": "ok", "detail": f"{checked} channel access.json backup(s) current"}
+
+
+def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
+    """Warn when the live checkout has drifted off its expected branch.
+
+    Bridges and the core boot from this checkout, and Sutando.app's 30-min
+    health check auto-restarts bridges onto whatever is checked out HERE.
+    Observed 2026-07-29: a Jul-25 session checked out a PR branch on the live
+    checkout to author a PR and never switched back — for 4 days every bridge
+    auto-restart booted 4-day-stale feature-branch code (75 commits behind
+    main), and nothing surfaced it. This probe makes that drift a first-class,
+    glanceable signal (structural, not disciplinary — "remember to switch
+    back" doesn't survive session death).
+
+    Expected branch defaults to ``main``; nodes intentionally pinned elsewhere
+    (e.g. the dual-run pinned hosts) declare it durably in
+    ``sutando.config.local.json`` as ``{"core": {"expected_branch": "..."}}``
+    — read via the canonical loader so launchd/Sutando.app callers (which
+    never inherit an interactive shell's exports) honor the pin across
+    restarts. ``SUTANDO_EXPECTED_BRANCH`` remains as a per-invocation env
+    override (wins over config; useful for tests/one-offs).
+    Read-only; warn (never fail) — an intentional short-lived checkout should
+    nag, not page. Degrades to ok when git/branch state can't be read (CI
+    tarballs, detached tooling contexts) rather than false-alarming.
+    """
+    name = "live-checkout-branch"
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    expected = os.environ.get("SUTANDO_EXPECTED_BRANCH")
+    if not expected:
+        try:
+            from sutando_config import load_config  # noqa: PLC0415
+            expected = (load_config(repo_root=repo).get("core") or {}).get("expected_branch")
+        except Exception:
+            expected = None  # config unreadable — fall through to the default
+    expected = expected or "main"
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--show-current"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"name": name, "status": "ok", "detail": "git not runnable — skipping"}
+    if out.returncode != 0:
+        return {"name": name, "status": "ok", "detail": "not a git checkout — skipping"}
+    branch = out.stdout.strip()
+    if not branch:
+        # Detached HEAD: can't name a branch; still drift, still worth a nag.
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on a detached HEAD (expected {expected!r}) — "
+                          "bridges auto-restart onto whatever is checked out here; "
+                          f"switch back (git -C {repo} switch {expected})"}
+    if branch != expected:
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on branch {branch!r}, expected {expected!r} — "
+                          "bridges/core auto-restart onto this checkout, so a leftover "
+                          "PR-branch checkout ships stale/unreviewed code (2026-07-29 "
+                          "incident: 4 days on a Jul-25 PR branch). Author PRs in "
+                          f"worktrees; switch back (git -C {repo} switch {expected})"}
+    return {"name": name, "status": "ok", "detail": f"live checkout on {expected!r}"}
 
 
 def check_migrate_reader_contract() -> dict:
@@ -3147,6 +3306,7 @@ def run_all_checks() -> list[dict]:
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
     checks.append(check_cron_runner())
+    checks.append(check_session_cron_registration())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -3197,6 +3357,8 @@ def run_all_checks() -> list[dict]:
     checks.append(check_host_subtrees())
     # Per-host channel access.json backup drift (live vs vault-carried copy)
     checks.append(check_per_host_config_backup())
+    # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
+    checks.append(check_live_checkout_branch())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
