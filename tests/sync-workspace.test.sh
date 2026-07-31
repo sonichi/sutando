@@ -39,11 +39,21 @@ unset SUTANDO_HOST_LABEL
 #   * The leak is TWO-HOP: test -> real LOCAL CLONE -> origin on the next legit sync.
 #     "origin unchanged" therefore proves nothing. The first hop is the harm, so the
 #     tripwire watches the LOCAL CLONE.
+#   * HEAD ALONE IS NOT THE HARM. A reached clone can be left dirty without HEAD
+#     moving at all — an untracked probe file, a staged-but-uncommitted write, or a
+#     commit that failed after `git add`. Each leaves `rev-parse HEAD` identical and
+#     the guard green, and an untracked file in the operator's clone is carried by
+#     the next legitimate sync: exactly the two-hop leak this suite exists to stop.
+#     So snapshot the index/worktree too. Compare BEFORE vs AFTER rather than
+#     asserting clean — the operator's clone may legitimately be dirty already.
 _REAL_SYNC_DIR="${SUTANDO_MEMORY_SYNC_DIR:-$HOME/.sutando/memory-sync}"
-_REAL_HEAD_BEFORE=""
-if [ -d "$_REAL_SYNC_DIR/.git" ]; then
-  _REAL_HEAD_BEFORE="$(git -C "$_REAL_SYNC_DIR" rev-parse HEAD 2>/dev/null || echo '')"
-fi
+# The guard lives in tests/lib/real-clone-guard.sh so it is itself testable —
+# see tests/real-clone-guard.test.sh. Keeping it inline is why its HEAD-only
+# blind spot survived review: the only way to exercise it was to dirty the
+# operator's own clone by hand.
+# shellcheck source=lib/real-clone-guard.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/real-clone-guard.sh"
+rcg_snapshot "$_REAL_SYNC_DIR"
 
 # Deny by default. Per-test fixtures still set these explicitly per invocation.
 _DENIED_SYNC_DIR="$(mktemp -d -t sync-ws-denied.XXXXXX)"
@@ -51,20 +61,9 @@ export SUTANDO_MEMORY_REPO=
 export SUTANDO_MEMORY_SYNC_DIR="$_DENIED_SYNC_DIR"
 
 _assert_real_clone_untouched() {
-  # Runs on EXIT regardless of pass/fail. The suite can be 89/89 green and still have
-  # written to the operator's clone — that is precisely what happened. Assert the HARM,
-  # not the absence of the particular paths we thought of.
-  [ -n "$_REAL_HEAD_BEFORE" ] || return 0
-  local after
-  after="$(git -C "$_REAL_SYNC_DIR" rev-parse HEAD 2>/dev/null || echo '')"
-  if [ "$after" != "$_REAL_HEAD_BEFORE" ]; then
-    echo ""
-    echo "  ✖ TRIPWIRE: the suite wrote to the REAL memory clone $_REAL_SYNC_DIR"
-    echo "      HEAD before: $_REAL_HEAD_BEFORE"
-    echo "      HEAD after : $after"
-    echo "      A test reached a real repo. FAILURE even if every check passed."
-    exit 1
-  fi
+  # Runs on EXIT regardless of pass/fail. The suite can be 89/89 green and still
+  # have written to the operator's clone — that is precisely what happened.
+  rcg_assert || exit 1
 }
 
 # Same class, second inheritance: the suite makes real git commits in its
