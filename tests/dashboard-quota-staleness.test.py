@@ -112,6 +112,41 @@ with tempfile.TemporaryDirectory() as tmp:
     check("D2 age unknown → said so explicitly",
           dash._quota_age_label({"headers": {"x": "1"}, "age_h": None}) == "age unknown")
 
+    # --- the label's middle branches ---------------------------------------
+    # Between "minutes ago" and "days old" sit two bands that the cases above
+    # jump over. They are the ones a reader sees most often in normal operation.
+    check("D3 stale but under a day → hours, not a fraction of a day",
+          dash._quota_age_label({"headers": {"x": "1"}, "age_h": 8.0, "stale": True})
+          == "STALE 8.0h old")
+    check("D4 fresh and over an hour → hours ago",
+          dash._quota_age_label({"headers": {"x": "1"}, "age_h": 2.0, "stale": False})
+          == "2.0h ago")
+
+    # --- get_quota_status() end-to-end -------------------------------------
+    # The helpers can be right while the function that calls them never does.
+    p = write_state(tmp, hours_ago=400.0)
+    orig_ws = dash.WORKSPACE_DIR
+    try:
+        dash.WORKSPACE_DIR = pathlib.Path(tmp)
+        q = dash.get_quota_status()
+        check("F1 get_quota_status attaches freshness to the returned data",
+              q.get("stale") is True and (q.get("age_h") or 0) > 390, str(q)[:120])
+        check("F2 it still returns the payload it always did",
+              "headers" in q, str(q)[:120])
+    finally:
+        dash.WORKSPACE_DIR = orig_ws
+
+    # --- unreadable file: fail CLOSED --------------------------------------
+    # If neither last_checked nor mtime can be obtained, the honest answer is
+    # "unknown age, treat as stale" — never "fresh".
+    class Unstatable:
+        def stat(self):
+            raise OSError("simulated: file vanished between read and stat")
+
+    fresh = dash._quota_freshness({"last_checked": None}, Unstatable())
+    check("F3 an unstatable file reports unknown age and fails CLOSED to stale",
+          fresh == {"age_h": None, "stale": True}, str(fresh))
+
     # --- the rendered panel ------------------------------------------------
     # The helpers being right is not the fix; the fix is what the page SHOWS.
     # render_dashboard() takes no arguments and pulls its own data, so stub the
