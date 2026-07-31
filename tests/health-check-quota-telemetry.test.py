@@ -276,6 +276,39 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "ok", r["detail"])
 
+    def test_non_object_core_runtime_is_silent_not_a_crash(self):
+        """Valid JSON is not necessarily an OBJECT.
+
+        `null`, `[]`, `"codex"` and `3` all decode fine and then raise AttributeError
+        on `.get` — which the (OSError, ValueError) handler does NOT catch, so a junk
+        state file crashed the whole health run inside the branch this check hardens
+        (qingyun, #2446). A non-object marker is exactly as uninformative as malformed
+        JSON, so it takes the same silent path rather than taking the process down.
+        """
+        for raw in ("null", "[]", '"codex"', "3", "{bad"):
+            with self.subTest(raw=raw):
+                self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+                self._write_core_status(mtime_age_sec=60)
+                (self.ws / "state" / "core-runtime.json").write_text(raw)
+                r = self.hc.check_quota_telemetry("ok")   # must not raise
+                self.assertEqual(r["status"], "ok", f"{raw}: {r['detail']}")
+
+    def test_non_object_heartbeat_does_not_crash_the_staleness_compare(self):
+        """The sibling read has the same shape hazard: a junk `.alive` must not take
+        the run down while comparing a legitimate marker against it."""
+        for raw in ("null", "[]", "not json"):
+            with self.subTest(raw=raw):
+                self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+                self._write_core_status(mtime_age_sec=60)
+                (self.ws / "state" / "core-runtime.json").write_text(
+                    json.dumps({"runtime": "codex", "started_at": time.time() - 86400})
+                )
+                d = self.ws / "state" / "cores"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / f"{self.hc._host_label()}.alive").write_text(raw)
+                r = self.hc.check_quota_telemetry("ok")   # must not raise
+                self.assertEqual(r["status"], "ok", f"{raw}: {r['detail']}")
+
     def test_codex_runtime_does_not_suppress_the_ABSENT_file_warning(self):
         """Runtime scoping applies only to the staleness branch. A proxy that never
         wrote quota-state at all is still broken wiring worth reporting."""

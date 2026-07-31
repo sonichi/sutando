@@ -1861,9 +1861,16 @@ def _runtime_may_skip_proxy() -> bool:
         if not path.exists():
             return False          # no Codex launcher ever ran here -> proxy-routed
         marker = json.loads(path.read_text())
-        runtime = marker.get("runtime")
     except (OSError, ValueError):
         return True               # cannot rule Codex out -> stay silent
+    # Valid JSON is not necessarily an OBJECT. `null`, `[]`, `"codex"` and `3` all
+    # decode fine and then raise AttributeError on `.get`, which the handler above
+    # does not catch — so a junk state file would crash the entire health run inside
+    # the very branch this check hardens (qingyun, #2446). A non-object marker is
+    # exactly as uninformative as malformed JSON, so it takes the same silent path.
+    if not isinstance(marker, dict):
+        return True               # cannot rule Codex out -> stay silent
+    runtime = marker.get("runtime")
     if _marker_predates_running_core(marker):
         return False              # belongs to a previous core -> no information
     return runtime in NON_PROXY_RUNTIMES
