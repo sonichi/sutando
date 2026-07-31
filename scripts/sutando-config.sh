@@ -33,13 +33,29 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Resolve the Python interpreter. On a fresh Mac there is NO system python3 — the
+# bare `python3` name resolves to Apple's Xcode-CLT stub, which prints an "install
+# developer tools" notice and returns NOTHING, so callers that don't export
+# SUTANDO_PY (e.g. the desktop's Tauri sign-in, which shells this to resolve
+# CLAUDE_CONFIG_DIR) got an empty result and failed with "could not resolve the
+# bundled CLAUDE_CONFIG_DIR". Prefer, in order: an explicit SUTANDO_PY (set by
+# launch-sutando.sh), the bundle-vendored relocatable python next to the engine
+# copy (`<engine>/runtime/python`, i.e. REPO_ROOT/../runtime), then system python3.
+if [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
+  PY="$SUTANDO_PY"
+elif [ -x "$REPO_ROOT/../runtime/python/bin/python3" ]; then
+  PY="$REPO_ROOT/../runtime/python/bin/python3"
+else
+  PY="python3"
+fi
+
 cmd="${1:-workspace}"
 
 case "$cmd" in
   workspace)
     # `python3 -c` instead of `-m` so we don't pollute argv[0] with a module
     # path that confuses the loader's exe-anchored repo discovery.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_workspace
@@ -48,7 +64,7 @@ print(resolve_workspace(), end='')
     ;;
 
   vault-enabled)
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -57,7 +73,7 @@ print('true' if resolve_vault().get('enabled') else 'false', end='')
     ;;
 
   vault-url)
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -69,7 +85,7 @@ print(resolve_vault().get('remote_url', ''), end='')
     # PR-3: print sync.include paths one-per-line. Consumed by
     # sync-workspace.sh::_compose_gitignore_content to drive the carrier-set
     # whitelist. Schema in sutando_config.py::resolve_vault.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -82,7 +98,7 @@ for p in resolve_vault().get('sync', {}).get('include', []):
     # PR-3: print sync.exclude paths one-per-line. Explicit denies emitted
     # AFTER the include whitelist (gitignore last-match wins), so user can
     # carve out subpaths from an otherwise-included directory.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -95,7 +111,7 @@ for p in resolve_vault().get('sync', {}).get('exclude', []):
     # Print migrate.stale_hosts (one per line) — per-clone machine-<host> dirs
     # the legacy import should DROP. Lives in sutando.config.local.json (gitignored,
     # per-clone), NOT .env: this is config, not a secret. Default empty.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import load_config
@@ -108,7 +124,7 @@ for h in load_config().get('migrate', {}).get('stale_hosts', []):
     # Print migrate.skip_skills (one per line) — per-clone host-only skill names
     # the legacy import should NOT salvage to shared (stale/superseded). Same
     # gitignored per-clone config home as migrate-stale-hosts. Default empty.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import load_config
@@ -123,7 +139,7 @@ for s in load_config().get('migrate', {}).get('skip_skills', []):
     # legacy `claude_sutando_config_dir.subdir` (deprecation-warned) →
     # `<workspace>/.claude-sutando` baked default. `synced=true` entries are
     # validated to be under the workspace at load time.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_claude_sutando_config_dir
@@ -179,7 +195,7 @@ print(resolve_claude_sutando_config_dir(), end='')
     # Optional second arg picks by id or type; defaults to first type=claude.
     # Example: `bash sutando-config.sh core-config-dir-env-name` → CLAUDE_CONFIG_DIR
     _selector="${2:-claude}"
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import find_core_config_dir
@@ -190,12 +206,21 @@ print(entry['env_name'], end='')
 "
     ;;
 
+  core-runtime)
+    "$PY" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_core_runtime
+print(resolve_core_runtime(), end='')
+"
+    ;;
+
   core-config-dir-value)
     # v0.9 — print the resolved value (absolute path) of the matching
     # core_config_dirs entry. Selector semantics identical to
     # core-config-dir-env-name.
     _selector="${2:-claude}"
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import find_core_config_dir
@@ -210,7 +235,7 @@ print(entry['value'], end='')
     # v0.9 — print all resolved core_config_dirs entries as JSON (one object
     # per line — JSON Lines). For tooling that wants to enumerate without
     # parsing the full merged config.
-    python3 -c "
+    "$PY" -c "
 import json, sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_core_config_dirs
@@ -219,8 +244,92 @@ for entry in resolve_core_config_dirs():
 "
     ;;
 
+  host-label)
+    # Per-host directory label for hosts/<host>/ paths, mirroring
+    # src/util_paths.py:_host_label() for shell callers. Use this instead of the
+    # inline `hostname | sed 's/\..*//'` anti-pattern: that resolves the
+    # DHCP-assigned hostname, which can drift (e.g. a Comcast lease →
+    # Chis-MBP) and split per-host paths from the stable Bonjour LocalHostName
+    # (Chis-MacBook-Pro), spawning a second hosts/<label>/ dir. Precedence
+    # (single source of truth lives in Python; #1745):
+    #   1. $SUTANDO_HOST_LABEL (or legacy $SUTANDO_HOST_OVERRIDE)
+    #   2. macOS `scutil --get LocalHostName` (stable Bonjour name)
+    #   3. short `hostname`
+    "$PY" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.util_paths import _host_label
+print(_host_label(), end='')
+"
+    ;;
+
+  app-node-dir)
+    # The bundled app runtime's node bin dir (Sutando.app ships a private node
+    # for hosts with no homebrew/nvm/volta). CONFIG-RESOLVED, not hardcoded:
+    # override via $SUTANDO_APP_NODE_DIR; default = the app-support engine path.
+    printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
+    ;;
+
+  node-bin)
+    # SINGLE SOURCE OF TRUTH for the Node executable (G1.5 node-bundle,
+    # owner-adopted design + owner review 2026-07-19). Precedence:
+    #   1. $SUTANDO_NODE — the EXACT executable, exported by the desktop app.
+    #      AUTHORITATIVE ONCE SET: if it is set but not executable, that is a
+    #      desktop packaging error — FAIL CLOSED (stderr + exit 1) instead of
+    #      silently rescuing via whatever node the host happens to have, which
+    #      would mask the packaging bug and void the deterministic-runtime
+    #      guarantee (owner review P1-1).
+    #   2. app-node-dir/node — the bundled runtime at its canonical home
+    #      <engine-root>/runtime/node/bin (covers launchd jobs whose plist
+    #      doesn't export SUTANDO_NODE).
+    #   3. first `node` on PATH — dev/OSS hosts, unchanged behavior.
+    # Prints the resolved path; empty output + exit 0 when nothing resolves
+    # (caller decides), exit 1 ONLY for the invalid-explicit case.
+    if [ -n "${SUTANDO_NODE:-}" ]; then
+      if [ -x "${SUTANDO_NODE}" ]; then
+        printf '%s' "$SUTANDO_NODE"
+      else
+        echo "sutando-config: SUTANDO_NODE is set but not an executable: $SUTANDO_NODE (desktop packaging error — refusing PATH fallback)" >&2
+        exit 1
+      fi
+    else
+      _app_node="${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}/node"
+      if [ -x "$_app_node" ]; then
+        printf '%s' "$_app_node"
+      else
+        command -v node 2>/dev/null || true
+      fi
+    fi
+    ;;
+
+  tsx-bin)
+    # SINGLE SOURCE OF TRUTH for tsx resolution — the launchd wrapper and
+    # src/startup.sh both call this instead of each duplicating the candidate
+    # list. Prefers the repo-pinned node_modules/.bin/tsx (the version the repo
+    # pins, and the ONLY tsx on a host with no homebrew/nvm/volta node at all),
+    # then the usual global locations. Prints the resolved path, or nothing —
+    # the caller falls back to `npx tsx` on empty output.
+    # `|| true` inside the substitution: on a host with no ~/.nvm the `ls`
+    # fails, and under `set -euo pipefail` that pipeline status would kill the
+    # whole script BEFORE the candidate loop — startup.sh then dies silently at
+    # its `_TSX_BIN=$(...)` line even though node_modules/.bin/tsx exists.
+    _nvm_tsx="$HOME/.nvm/versions/node/$( (ls "$HOME/.nvm/versions/node/" 2>/dev/null || true) | sort -V | tail -1)/bin/tsx"
+    for _p in \
+      "$REPO_ROOT/node_modules/.bin/tsx" \
+      /opt/homebrew/bin/tsx \
+      /usr/local/bin/tsx \
+      "$_nvm_tsx" \
+      "$HOME/.volta/bin/tsx"; do
+      [ -x "$_p" ] && { printf '%s' "$_p"; break; }
+    done
+    # The contract is "print the path, or nothing" — exit 0 either way. Without
+    # this, a no-match run exits with the last [ -x ] test's failure status and
+    # set -e callers die instead of falling back to `npx tsx`.
+    true
+    ;;
+
   dump)
-    python3 -m src.sutando_config
+    "$PY" -m src.sutando_config
     ;;
 
   subdirs)
@@ -245,8 +354,282 @@ for entry in resolve_core_config_dirs():
     echo "workspace bootstrapped: $ws" >&2
     ;;
 
+  tmux-socket)
+    # Print the tmux socket the sutando-core session runs on. Mirrors the
+    # resolution in src/agent/claude/cli/start-cli.sh (`${SUTANDO_TMUX_SOCKET:-
+    # /tmp/sutando-tmux.sock}`) so a caller resolves the same socket the core
+    # actually launched on. Contract sibling of `workspace` — resolve via helper,
+    # never hardcode /tmp/sutando-tmux.sock. NOTE: for a FOREIGN caller (e.g. the
+    # desktop app, whose own env may point SUTANDO_TMUX_SOCKET at a private
+    # bundled socket) prefer the env-independent `runtime` subcommand below,
+    # which pins to the default OSS socket. This getter honors the ambient env
+    # and is meant for same-runtime callers.
+    printf '%s' "${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
+    ;;
+
+  run-dir)
+    # The runtime run-dir — where the per-runtime sockets/pids live. MIRRORS
+    # #2325's ag2space runtime-api rundir.py EXACTLY, so the shell (this getter,
+    # start-cli, health-check) and the daemon/CLI can never disagree on the path.
+    # Resolution order (must match rundir.py.run_dir()):
+    #   1. SUTANDO_RUN_DIR                                   explicit override
+    #   2. darwin: ~/Library/Application Support/space.ag2.app/run   (Desktop root)
+    #   3. $XDG_RUNTIME_DIR/sutando                          Linux/systemd per-user
+    #   4. ~/.sutando/run                                    portable fallback
+    if [ -n "${SUTANDO_RUN_DIR:-}" ]; then
+      printf '%s' "$SUTANDO_RUN_DIR"
+    elif [ "$(uname -s)" = "Darwin" ]; then
+      printf '%s' "$HOME/Library/Application Support/space.ag2.app/run"
+    elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+      printf '%s' "$XDG_RUNTIME_DIR/sutando"
+    else
+      printf '%s' "$HOME/.sutando/run"
+    fi
+    ;;
+
+  runtime-socket)
+    # The runtime-API daemon's Unix socket. MIRRORS #2325's rundir.py
+    # socket_path(): SUTANDO_RUNTIME_SOCKET override wins, else
+    # <run-dir>/sutando-runtime.sock. (Filename is sutando-runtime.sock — NOT
+    # runtime-api.sock; #2325 ships that default and both ends interpret it here.)
+    if [ -n "${SUTANDO_RUNTIME_SOCKET:-}" ]; then
+      printf '%s' "$SUTANDO_RUNTIME_SOCKET"
+    else
+      printf '%s/sutando-runtime.sock' "$(bash "$0" run-dir)"
+    fi
+    ;;
+
+  runtime)
+    # Emit this install's AgentRuntime descriptor as one JSON object — the single
+    # OSS-side contract the desktop app reads to resolve which runtime to attach
+    # its Terminal to, route task-drops/gateway to, and decide port-vs-new
+    # (issue ag2-space/ag2space-cinny-desktop#98). Keyed on the repo; everything
+    # else derives:
+    #   {alive, repo, workspace, brain, socket, session, health, authenticated}
+    # FOREIGN-CALLER-SAFE *and* honors custom sockets: the tmux socket is read
+    # from a RUNTIME-AUTHORED source (the core's .alive heartbeat, which records
+    # the socket the core actually launched on — see core_heartbeat.py), NOT the
+    # caller's ambient SUTANDO_TMUX_SOCKET. So a foreign caller (the desktop app,
+    # whose env points at its bundled socket) still gets THIS OSS core's real
+    # socket, AND an install running on a custom socket is reported correctly
+    # (start-cli.sh honors SUTANDO_TMUX_SOCKET). No fresh heartbeat -> default OSS
+    # socket. Reuses src/runtime-health.py for alive/health/authenticated (single
+    # liveness source of truth) and the canonical resolve_claude_sutando_config_dir()
+    # for brain (honors core_config_dirs[type=claude] customization).
+    "$PY" -c "
+import sys, os, json, time, subprocess
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import resolve_workspace, resolve_claude_sutando_config_dir
+repo = '$REPO_ROOT'
+ws = str(resolve_workspace())
+brain = str(resolve_claude_sutando_config_dir())
+# The socket this core runs on, from its own heartbeat: runtime-authored, so it
+# is correct for custom sockets AND immune to the caller's ambient env. Only a
+# FRESH heartbeat (<90s, matching core-heartbeat's liveness window) is trusted;
+# stale/absent -> default OSS socket.
+def _host_label():
+    # Must match the WRITER's resolution exactly (core_heartbeat.py names the
+    # .alive file via util_paths._host_label, honoring \$SUTANDO_HOST_LABEL /
+    # \$SUTANDO_HOST_OVERRIDE). REPO_ROOT (not REPO_ROOT/src) is on sys.path here,
+    # so the import is 'src.util_paths' — matching 'from src.sutando_config'
+    # above; a bare 'from util_paths' silently fails to sys.path and would fall
+    # back to gethostname(), losing the label (review catch on c91a68c).
+    try:
+        from src.util_paths import _host_label as hl
+        return hl()
+    except Exception:
+        import socket as _s
+        return _s.gethostname().split('.')[0]
+probe_socket = '/tmp/sutando-tmux.sock'
+try:
+    with open(os.path.join(ws, 'state', 'cores', _host_label() + '.alive')) as f:
+        rec = json.load(f)
+    if time.time() - float(rec.get('last_beat_at', 0)) < 90 and rec.get('socket'):
+        probe_socket = rec['socket']
+except Exception:
+    pass
+# voice_ws: the WS the running voice-agent actually bound. Runtime-authored —
+# voice-agent.ts writes state/voice-agent.json at listen with its real PORT — so
+# a non-default PORT is reported correctly instead of a hardcoded default (same
+# 'running process is the authority' principle as the socket above). Liveness is
+# validated by the recorded pid, NOT a time window: the file is written once at
+# startup (not refreshed like the heartbeat), so a window would wrongly expire a
+# long-running agent. Absent / dead-pid / unreadable -> default OSS endpoint.
+probe_voice_ws = 'ws://127.0.0.1:9900'
+try:
+    with open(os.path.join(ws, 'state', 'voice-agent.json')) as f:
+        vrec = json.load(f)
+    vpid = int(vrec.get('pid', 0) or 0)
+    alive = False
+    if vpid > 0:
+        try:
+            os.kill(vpid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True  # exists but not ours — still a live process
+        except Exception:
+            alive = False
+    if alive and vrec.get('voice_ws'):
+        probe_voice_ws = vrec['voice_ws']
+except Exception:
+    pass
+# vision_control: the HTTP control endpoint the running vision-control server
+# actually bound (:7847 default, or VISION_CONTROL_PORT). Runtime-authored the
+# same way as voice_ws — vision-tools.ts writes state/vision-control.json at
+# listen with its real port, pid-validated (written once at startup, so liveness
+# is the pid not a time window). Consumed by the desktop 'Watch' toggle (v0.3.0
+# Slice-2) to drive /vision/start|stop|state. Absent / dead-pid / unreadable ->
+# default OSS endpoint.
+probe_vision_control = 'http://127.0.0.1:7847'
+try:
+    with open(os.path.join(ws, 'state', 'vision-control.json')) as f:
+        crec = json.load(f)
+    cpid = int(crec.get('pid', 0) or 0)
+    calive = False
+    if cpid > 0:
+        try:
+            os.kill(cpid, 0)
+            calive = True
+        except ProcessLookupError:
+            calive = False
+        except PermissionError:
+            calive = True  # exists but not ours — still a live process
+        except Exception:
+            calive = False
+    # Only trust a loopback endpoint — the control server binds 127.0.0.1, so a
+    # non-loopback scheme/host in the state file is stale or crafted; fall back to
+    # the default rather than hand the desktop client a URL it should never call.
+    _cv = crec.get('vision_control')
+    if calive and isinstance(_cv, str) and _cv.startswith('http://127.0.0.1:'):
+        probe_vision_control = _cv
+except Exception:
+    pass
+# call_tiers: the DIRECT call endpoints this core can advertise right now, the
+# runtime-authored half of the availability-driven call-tier menu (Track 9). The
+# emitter (src/emit-call-tiers.ts, from reachability-endpoints.ts) writes
+# state/call-tiers.json at startup; the client renders the tier picker from this
+# instead of the old static 'force tier' stub (greyed Direct even when live,
+# offered Local on a remote core). Only direct tiers are advertised — 'local' is
+# client-relative and cloud/relay are always-available + composed client-side.
+# The advertisement is a HINT: the client verifies reachability (first-reachable-
+# wins), so a stale entry degrades gracefully. Absent/malformed -> [] (client
+# falls back to cloud). A freshness window / re-emit-on-network-change is a
+# documented follow-up.
+probe_call_tiers = []
+try:
+    with open(os.path.join(ws, 'state', 'call-tiers.json')) as f:
+        crec = json.load(f)
+    ct = crec.get('call_tiers')
+    if isinstance(ct, list):
+        probe_call_tiers = ct
+except Exception:
+    pass
+env = dict(os.environ, SUTANDO_TMUX_SOCKET=probe_socket)
+h = {}
+try:
+    out = subprocess.run([sys.executable, os.path.join(repo, 'src', 'runtime-health.py')],
+                         capture_output=True, text=True, timeout=15, env=env, cwd=repo)
+    if out.stdout.strip():
+        h = json.loads(out.stdout)
+except Exception:
+    pass
+# code: the source-version identity of the runtime — 'which Sutando is this,
+# behaviorally?' Prompts + skills + scripts in the repo determine behavior, so
+# the desktop app (and fleet tooling) wants this to reason about version-compat
+# and to spot a locally-modified core. All git-native + best-effort (None when
+# not a git checkout). tree_sha is the content hash of TRACKED files (version-
+# independent); dirty flags uncommitted edits. A stronger working-tree
+# 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
+# follow-up alongside the identity block.
+def _git(*a):
+    try:
+        r = subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, timeout=5)
+        return (r.stdout.strip() or None) if r.returncode == 0 else None
+    except Exception:
+        return None
+code = {
+    'commit': _git('rev-parse', '--short', 'HEAD'),
+    'branch': _git('rev-parse', '--abbrev-ref', 'HEAD'),
+    'describe': _git('describe', '--tags', '--always', '--dirty'),
+    'tree_sha': _git('rev-parse', 'HEAD^{tree}'),
+    'dirty': bool(_git('status', '--porcelain')),
+}
+# run-dir + runtime-api socket: mirror #2325 rundir.py (same policy as the
+# run-dir / runtime-socket subcommands). This is a second copy of the chain (the
+# bash subcommand is the other); the resolver test asserts the descriptor
+# runtimeSocket equals the runtime-socket subcommand, so the two cannot drift
+# silently (review nit). NOTE: no shell-active chars in this comment block -- the
+# python runs inside a bash double-quoted -c string, so a dollar-var or backtick
+# here would be bash-expanded and break the program.
+_run_dir_env = os.environ.get('SUTANDO_RUN_DIR')
+if _run_dir_env:
+    _rundir = _run_dir_env
+elif sys.platform == 'darwin':
+    _rundir = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'space.ag2.app', 'run')
+elif os.environ.get('XDG_RUNTIME_DIR'):
+    _rundir = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'sutando')
+else:
+    _rundir = os.path.join(os.path.expanduser('~'), '.sutando', 'run')
+_runtime_socket = os.environ.get('SUTANDO_RUNTIME_SOCKET') or os.path.join(_rundir, 'sutando-runtime.sock')
+# runtimeRoot = parent of run/ when run-dir is <root>/run (darwin App-Support,
+# portable dot-sutando); for the XDG case the run-dir (XDG_RUNTIME_DIR/sutando) IS
+# the app dir (its parent is the shared XDG base), so use the run-dir itself.
+_runtime_root = os.path.dirname(_rundir) if os.path.basename(_rundir) == 'run' else _rundir
+
+print(json.dumps({
+    'alive': bool(h.get('core_running', False)),
+    'repo': repo,
+    'code': code,
+    'workspace': ws,
+    'brain': brain,
+    'socket': h.get('tmux_socket') or probe_socket,
+    'session': h.get('session', 'sutando-core'),
+    # voice_ws: the WebSocket the runtime's voice-agent listens on — the endpoint
+    # the desktop 'Live' page's browser VoiceTransport.connect(url) opens
+    # (ag2-space/ag2space-cinny-desktop v0.3.0). Sourced from runtime-authored
+    # state (probe_voice_ws above): voice-agent.ts records its actual bound PORT,
+    # so a non-default-PORT install is reported correctly, not a hardcoded default.
+    'voice_ws': probe_voice_ws,
+    # vision_control: the HTTP control endpoint the runtime's vision-control server
+    # listens on — where the desktop 'Watch' toggle POSTs /vision/start|stop and
+    # polls /vision/state (ag2-space/ag2space-cinny-desktop v0.3.0 Slice-2).
+    # Sourced from runtime-authored state (probe_vision_control above), so a
+    # VISION_CONTROL_PORT override is reported correctly, not a hardcoded default.
+    'vision_control': probe_vision_control,
+    # call_tiers: the direct call endpoints this core advertises (Track 9). The
+    # desktop 'Start Call' picker renders the tier menu from this — showing only
+    # reachable rows, un-greying Direct(Tailscale)/Direct(LAN) when their url is
+    # advertised. Runtime-authored via probe_call_tiers above (emit-call-tiers.ts).
+    'call_tiers': probe_call_tiers,
+    'health': h.get('health', 'unknown'),
+    'authenticated': h.get('authenticated'),
+    # ── additive runtime-standardization fields (standard.md task A P1; air
+    # confirmed ADDITIVE 2026-07-26). Old readers ignore unknown keys, and the
+    # existing socket/session fields stay for desktop back-compat. The components
+    # field (the 4-window topology) is intentionally NOT emitted yet — it lands in P2
+    # (NOTE: no backticks/$-vars anywhere in this python -c comment block — it runs
+    # inside a bash double-quoted -c string, so a backtick would command-substitute
+    # and a $-var would expand; both break the program / execute PATH binaries.)
+    # with the session rename (sutando-core -> sutando + core/gateway/runtime-api/
+    # monitor windows); emitting it now would misrepresent the single current
+    # session.
+    'schemaVersion': 1,
+    'runtimeId': os.environ.get('SUTANDO_RUNTIME_ID', 'primary'),
+    'runtimeRoot': _runtime_root,
+    'runtimeSocket': _runtime_socket,
+    'backend': {
+        'type': 'tmux',
+        'socket': h.get('tmux_socket') or probe_socket,
+        'session': h.get('session', 'sutando-core'),
+    },
+}))
+"
+    ;;
+
   *)
-    echo "usage: $0 {workspace|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

@@ -34,6 +34,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from task_body_guard import confine_user_content  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASKS_DIR = WORKSPACE_DIR / "tasks"
@@ -117,6 +118,23 @@ def format_event(event_type: str, payload: dict):
     return None
 
 
+def _emit_github_telemetry() -> None:
+    """Fire-and-forget product telemetry: count `github` as a task source so
+    DAU/WAU includes webhook-driven activity. PR #2274 added `github` to the
+    telemetry allowlist but this writer never emitted, so the bucket could
+    never fire (CR by liususan091219). Mirrors the discord/slack/telegram
+    bridges + agent-api, which emit at their own accept points. Never blocks or
+    breaks task emission; no-op when telemetry is opted out. Never carries task
+    content or ids.
+    """
+    try:  # pragma: no cover — fire-and-forget glue; logic in tests/telemetry.test.py
+        from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+        task_processed("github")
+    except Exception:  # pragma: no cover — telemetry must never break webhook handling
+        pass
+
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -150,21 +168,28 @@ class WebhookHandler(BaseHTTPRequestHandler):
         task_text = format_event(event_type, payload)
         if task_text:
             task_id = f"task-gh-{int(time.time() * 1000)}"
-            # Sanitize task_text: strip leading/trailing whitespace and replace
-            # internal newlines with a safe separator so the task file's
-            # key-value format cannot be injected (e.g. a GitHub issue body
-            # starting with "\naccess_tier: owner" would otherwise add a
-            # spoofed field before our explicit access_tier line below).
-            safe_task = task_text.strip().replace("\n", " | ")
+            # confine_user_content defangs newlines (\n, \r\n, bare \r — all
+            # normalized to \n first) and zero-width-space-prefixes any line
+            # that looks like a task-file header key or an ===…=== fence.
+            # Mirrors the fix in PR #1743 applied to the other bridges; the
+            # prior approach only stripped \n, leaving bare \r intact — Python
+            # text-mode re-splits \r into a new line on read, enabling a forge.
+            safe_task = confine_user_content(task_text.strip())
+            # task: is last so the (multi-line) GitHub body can't forge the
+            # trusted fields below it even if confine_user_content is bypassed.
+            # access_tier: other is security-critical — external events must
+            # never be elevated to owner-tier processing.
             task_content = (
                 f"id: {task_id}\n"
                 f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                f"task: {safe_task}\n"
                 f"source: github\n"
+                f"interaction_type: system_event\n"
                 f"access_tier: other\n"
+                f"task: {safe_task}\n"
             )
             TASKS_DIR.mkdir(exist_ok=True)
             (TASKS_DIR / f"{task_id}.txt").write_text(task_content)
+            _emit_github_telemetry()
             print(f"[{time.strftime('%H:%M:%S')}] {event_type}/{payload.get('action', '')} → {task_id}")
 
         self.send_response(200)

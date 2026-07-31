@@ -172,7 +172,11 @@ fi
 # Section 2 — Logging + UI                                                     #
 # --------------------------------------------------------------------------- #
 
-LOG="/tmp/sync-workspace.log"
+# Per-user log path: on multi-user machines a shared /tmp/sync-workspace.log is
+# owned by whichever account wrote it first; the sticky bit blocks every other
+# account from appending or replacing it. $TMPDIR is per-user on macOS.
+LOG="${SYNC_WORKSPACE_LOG:-${TMPDIR:-/tmp}/sync-workspace.log}"
+
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
@@ -279,7 +283,7 @@ _host_ws_segment() {
 # Section 3 — Lock (atomic mkdir, POSIX, no flock dependency)                  #
 # --------------------------------------------------------------------------- #
 
-LOCK_DIR="/tmp/sync-workspace.lock.d"
+LOCK_DIR="${SUTANDO_SYNC_LOCK_DIR:-/tmp/sync-workspace.lock.d}"
 
 acquire_lock() {
     # Stale lock cleanup: lock dir older than 10 min = assume crash, remove.
@@ -581,12 +585,12 @@ _refuse_staged_secrets() {
     return 0
 }
 
-# Snapshot the per-host config that LIVES at $CLAUDE_CONFIG_DIR into
+# Snapshot the per-host config from the canonical Claude config dir into
 # <workspace>/hosts/<host>/ so it's carried by the hosts/*/ vault glob and
-# survives a rebuild. settings.json and channel access.json are owned by Claude
-# Code / the bridges at $CLAUDE_CONFIG_DIR — they can't be relocated, so they're
-# *backed up* here (the live readers keep reading $CLAUDE_CONFIG_DIR; hosts/<host>/
-# is a pure backup → no read/write skew).
+# survives a rebuild. Startup exports this same path as CLAUDE_CONFIG_DIR for
+# Claude Code / the bridges. Resolve it from config here because launchd/cron
+# does not reliably inherit that export; falling back to ~/.claude would copy
+# stale pre-migration access state over the live backup.
 #
 # NOT snapshotted: PERSONAL_CLAUDE.md / stand-identity.json / tab-aliases.json —
 # those follow the RELOCATION model (migrator one-time move + personal_path /
@@ -598,7 +602,7 @@ _refuse_staged_secrets() {
 # returns 0, so a snapshot hiccup can never block the push.
 _snapshot_per_host_config() {
     local _cfg
-    _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path)" || return 0
+    _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-sutando-config-dir)" || return 0
     local _host_dir="$WORKSPACE_DIR/hosts/$(_host)"
     mkdir -p "$_host_dir" 2>/dev/null || return 0
 
@@ -1148,6 +1152,20 @@ _push_only_impl() {
 # Default: pull peers first (so own commits build on latest peer state), then push.
 
 cmd_default_bidirectional() {
+    # Cross-machine sync is opt-in — enabled only when a vault URL is configured
+    # (--vault-url, sutando.config vault.remote_url, or the legacy
+    # SUTANDO_MEMORY_REPO). When none is set, sync is INTENTIONALLY disabled, and
+    # this automated (cron) path must skip cleanly rather than fall into
+    # _pull_only_impl → `die "…is not a git repo; run --init first"`, which paints
+    # a red error and a non-zero exit on every tick (every 30 min for a typical
+    # cron). A disabled feature erroring loudly is noise, not a signal. The
+    # explicit subcommands (--init / --pull-only / --push-only) keep their loud
+    # "run --init first" feedback because the operator asked for them directly.
+    if [ -z "$VAULT_URL" ]; then
+        log "cmd_default_bidirectional: no vault URL configured — cross-machine sync disabled; skipping."
+        echo "sync-workspace: cross-machine sync disabled (no vault URL configured) — skipping." >&2
+        return 0
+    fi
     acquire_lock
     _pull_only_impl || true   # pull failures shouldn't block push
     _push_only_impl

@@ -1,6 +1,6 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTmuxPane, readTmuxStatus, _resetTmuxCacheForTests } from '../src/tmux-status.js';
+import { parseTmuxPane, readTmuxStatus, buildCaptureArgs, resolveSock, _resetTmuxCacheForTests } from '../src/tmux-status.js';
 
 /**
  * Tests for `parseTmuxPane` — the pane-capture parser used as a fallback
@@ -151,17 +151,91 @@ describe('parseTmuxPane', () => {
 	});
 
 	it('undefined input → idle (defensive)', () => {
-		// @ts-expect-error
+		// @ts-expect-error - deliberately passing undefined to test the defensive guard
 		const r = parseTmuxPane(undefined);
 		assert.equal(r.state, 'idle');
 		assert.equal(r.label, '');
 	});
 
 	it('non-string input → idle (defensive)', () => {
-		// @ts-expect-error
+		// @ts-expect-error - deliberately passing a non-string to test the defensive guard
 		const r = parseTmuxPane(42);
 		assert.equal(r.state, 'idle');
 		assert.equal(r.label, '');
+	});
+});
+
+describe('buildCaptureArgs', () => {
+	// Regression guard: Sutando.app / start-cli.sh run tmux on a custom socket
+	// (`tmux -S /tmp/sutando-tmux.sock`). A bare `tmux capture-pane` hits the
+	// DEFAULT server, never finds `sutando-core`, throws, and the scraper falls
+	// back to `idle` on every call — so the status widget reads "idle" even
+	// while the core is working. The `-S <socket>` server flag must be present
+	// AND precede the `capture-pane` command word.
+
+	it('includes -S <socket> and it precedes capture-pane', () => {
+		const args = buildCaptureArgs('/tmp/sutando-tmux.sock', 'sutando-core');
+		const sIdx = args.indexOf('-S');
+		const capIdx = args.indexOf('capture-pane');
+		assert.notEqual(sIdx, -1, '-S socket flag must be present');
+		assert.equal(args[sIdx + 1], '/tmp/sutando-tmux.sock', '-S must be followed by the socket path');
+		assert.ok(sIdx < capIdx, '-S (server flag) must come before the capture-pane command');
+	});
+
+	it('targets the given session with -t', () => {
+		const args = buildCaptureArgs('/sock', 'my-session');
+		const tIdx = args.indexOf('-t');
+		assert.notEqual(tIdx, -1);
+		assert.equal(args[tIdx + 1], 'my-session');
+	});
+});
+
+describe('resolveSock', () => {
+	// #2087 unified start-cli.sh / main.swift / watch-tasks-stream.sh on
+	// SUTANDO_TMUX_SOCKET; SUTANDO_TMUX_SOCK is kept as a one-release fallback
+	// so a straggler setter still works.
+	const saved = {
+		SOCKET: process.env.SUTANDO_TMUX_SOCKET,
+		SOCK: process.env.SUTANDO_TMUX_SOCK,
+	};
+
+	beforeEach(() => {
+		delete process.env.SUTANDO_TMUX_SOCKET;
+		delete process.env.SUTANDO_TMUX_SOCK;
+	});
+
+	function restore() {
+		if (saved.SOCKET === undefined) delete process.env.SUTANDO_TMUX_SOCKET;
+		else process.env.SUTANDO_TMUX_SOCKET = saved.SOCKET;
+		if (saved.SOCK === undefined) delete process.env.SUTANDO_TMUX_SOCK;
+		else process.env.SUTANDO_TMUX_SOCK = saved.SOCK;
+	}
+
+	it('neither set → default socket', () => {
+		try {
+			assert.equal(resolveSock(), '/tmp/sutando-tmux.sock');
+		} finally {
+			restore();
+		}
+	});
+
+	it('legacy SUTANDO_TMUX_SOCK set → used as fallback', () => {
+		process.env.SUTANDO_TMUX_SOCK = '/tmp/legacy.sock';
+		try {
+			assert.equal(resolveSock(), '/tmp/legacy.sock');
+		} finally {
+			restore();
+		}
+	});
+
+	it('canonical SUTANDO_TMUX_SOCKET takes priority over legacy SUTANDO_TMUX_SOCK', () => {
+		process.env.SUTANDO_TMUX_SOCKET = '/tmp/canonical.sock';
+		process.env.SUTANDO_TMUX_SOCK = '/tmp/legacy.sock';
+		try {
+			assert.equal(resolveSock(), '/tmp/canonical.sock');
+		} finally {
+			restore();
+		}
 	});
 });
 

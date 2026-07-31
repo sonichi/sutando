@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Screen capture HTTP server — runs in a terminal (has Screen Recording permission).
 The voice agent calls http://localhost:7845/capture to get instant screenshots.
@@ -20,37 +21,33 @@ import os as _os
 from datetime import datetime
 
 PORT = 7845
-DIR = "/tmp/sutando-screenshots"
+# Per-user temp dir — same treatment as browser.mjs in this PR: a shared
+# /tmp/sutando-screenshots is owned by whichever account wrote it first and
+# EACCES-fails the second account. SUTANDO_SCREENSHOT_DIR overrides.
+import tempfile as _tempfile
+DIR = _os.environ.get("SUTANDO_SCREENSHOT_DIR") or _os.path.join(
+    _tempfile.gettempdir(), "sutando-screenshots")
 # Web-client endpoint for agent-state reporting. When a /capture happens we
 # flash state=seeing on the menu-bar avatar for ~1.5s — makes screen-capture
 # visible to the user without them needing to watch the web UI.
 WEB_CLIENT_STATE_URL = "http://localhost:8080/mute-state?state=seeing&ttl_ms=1500&source=tool"
 
-# macOS notification toggle. Default on; opt out during demo recordings.
-NOTIFY_ENABLED = _os.environ.get("SUTANDO_CAPTURE_NOTIFY", "1") != "0"
-
-# Debounce: don't spam notifications for burst captures (e.g. a loop of
-# describe_screen calls every 5s). One notification per this many seconds.
-NOTIFY_DEBOUNCE_S = 5.0
-_last_notify_ts = 0.0
-
-# /capture-video is the one side-effectful endpoint that records 1-60s of screen.
-# Unlike /capture (a single still) it requires a shared token so a drive-by web
-# page can't silently start a recording: the token lives in a 0600 file only
-# local processes can read, and the native Swift hotkey caller passes it back in
-# the X-Sutando-Capture-Token header. A browser can neither read that file nor
-# set a custom header on a no-cors/<img> request, so it can't reach the endpoint.
-# (The pre-existing /capture hole is tracked for a follow-up.)
+# Shared token for /capture and any future side-effectful endpoints.
+# Generated once at startup and stored 0600 so only the owning user can read it.
+# Callers must include it in the X-Sutando-Capture-Token header; a browser page
+# cannot read a local file or set a custom header on a no-cors request, so it
+# cannot reach these endpoints even if the server is on loopback.
 _CAPTURE_TOKEN_PATH = _os.path.expanduser("~/.config/sutando/screen-capture-token")
 
 
-def _load_or_create_capture_token():
+def _load_or_create_capture_token() -> str | None:
     try:
         if _os.path.lexists(_CAPTURE_TOKEN_PATH):
             st = _os.lstat(_CAPTURE_TOKEN_PATH)
             if (stat.S_ISREG(st.st_mode) and (st.st_mode & 0o777) == 0o600
                     and st.st_uid == _os.getuid()):
-                existing = open(_CAPTURE_TOKEN_PATH).read().strip()
+                with open(_CAPTURE_TOKEN_PATH) as _f:
+                    existing = _f.read().strip()
                 if existing:
                     return existing
             _os.unlink(_CAPTURE_TOKEN_PATH)
@@ -65,7 +62,19 @@ def _load_or_create_capture_token():
         return None
 
 
-CAPTURE_VIDEO_TOKEN = _load_or_create_capture_token()
+CAPTURE_TOKEN = _load_or_create_capture_token()
+# Web-client endpoint for agent-state reporting. When a /capture happens we
+# flash state=seeing on the menu-bar avatar for ~1.5s — makes screen-capture
+# visible to the user without them needing to watch the web UI.
+WEB_CLIENT_STATE_URL = "http://localhost:8080/mute-state?state=seeing&ttl_ms=1500&source=tool"
+
+# macOS notification toggle. Default on; opt out during demo recordings.
+NOTIFY_ENABLED = _os.environ.get("SUTANDO_CAPTURE_NOTIFY", "1") != "0"
+
+# Debounce: don't spam notifications for burst captures (e.g. a loop of
+# describe_screen calls every 5s). One notification per this many seconds.
+NOTIFY_DEBOUNCE_S = 5.0
+_last_notify_ts = 0.0
 
 # --- ⌃R start/stop toggle state ---------------------------------------------
 # A single open-ended `screencapture -v` recording driven by two ⌃R presses
@@ -74,6 +83,18 @@ CAPTURE_VIDEO_TOKEN = _load_or_create_capture_token()
 _active_recording = None  # {"proc": Popen, "path": str, "watchdog": threading.Timer}
 _recording_lock = threading.Lock()
 MAX_RECORDING_SECONDS = 600  # safety cap for a recording nobody stopped
+
+
+def _post_recording_state(on: bool):
+    """Darwin-notify recording state so Sutando.app can flip the Drop Video
+    Clip 🔴 without polling (Susan 2026-07-22: the server KNOWS when recording
+    starts/stops — push, don't poll). Covers ⌃R toggles, watcher-started
+    sessions, and the watchdog auto-stop uniformly. Fire-and-forget."""
+    try:
+        subprocess.Popen(["notifyutil", "-p",
+                          "com.sutando.recording." + ("on" if on else "off")])
+    except Exception:
+        pass
 
 
 def _signal_seeing_blocking():
@@ -127,10 +148,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
     def do_GET(self):
-        # NB: "/capture-video" (handled below) also startswith("/capture"), so
-        # exclude it explicitly or this screenshot branch would intercept it and
-        # return a PNG instead of recording a clip.
         if self.path.startswith("/capture") and not self.path.startswith("/capture-video"):
+            # Reject if no valid token — a browser page on loopback cannot set a
+            # custom header on a no-cors fetch, so this is a same-origin CSRF guard.
+            provided = self.headers.get("X-Sutando-Capture-Token", "")
+            if not CAPTURE_TOKEN or not provided or not secrets.compare_digest(provided, CAPTURE_TOKEN):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"error","error":"forbidden"}')
+                return
             # Parse display number from query: /capture?display=2 or /capture?all=true
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
@@ -204,9 +231,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Recording TCC grant, same reason /capture does.
             #
             # Token gate FIRST — before any side effect (no flash, no recording)
-            # so an unauthorized request can't even signal. See CAPTURE_VIDEO_TOKEN.
+            # so an unauthorized request can't even signal. See CAPTURE_TOKEN.
             supplied = self.headers.get("X-Sutando-Capture-Token", "")
-            if not CAPTURE_VIDEO_TOKEN or supplied != CAPTURE_VIDEO_TOKEN:
+            if not CAPTURE_TOKEN or not secrets.compare_digest(supplied, CAPTURE_TOKEN):
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -235,6 +262,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     rec["proc"].send_signal(signal.SIGINT)  # -v finalizes on SIGINT
                     rec["proc"].wait(timeout=30)
                     path = rec["path"]
+                    # Only publish OFF if no NEW recording started during this
+                    # finalization (SIGINT+wait released the lock). Otherwise the
+                    # stale stop would stomp the new recording's ON state, leaving
+                    # the app's isRecordingVideo=false while it records. (CR: qingyun-wu)
+                    with _recording_lock:
+                        if _active_recording is None:
+                            _post_recording_state(False)
                     if not (os.path.exists(path) and os.path.getsize(path) > 0):
                         raise RuntimeError("recording produced no file")
                     if query.get("silent", ["false"])[0] != "true":
@@ -294,19 +328,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                     def _auto_stop(p=proc):
                         global _active_recording
+                        # Publish OFF only if this watchdog still OWNS the active
+                        # recording, atomically under the lock — a stale watchdog
+                        # (its proc already replaced by a newer recording) must not
+                        # stomp the newer recording's ON state. (CR: qingyun-wu)
                         with _recording_lock:
                             if _active_recording and _active_recording.get("proc") is p:
                                 _active_recording = None
+                                _post_recording_state(False)
                         try:
                             p.send_signal(signal.SIGINT)
                             p.wait(timeout=30)
                         except Exception:
                             pass
 
-                    wd = threading.Timer(MAX_RECORDING_SECONDS, _auto_stop)
+                    # ?max=<seconds> raises the safety cap for known-long sessions
+                    # (meeting-link auto-record needs meeting-length clips; the
+                    # 600s default ate a 41-min meeting on 2026-07-22). Bounded
+                    # at 4h so a typo can't disable the watchdog entirely.
+                    max_raw = query.get("max", [None])[0]
+                    cap = MAX_RECORDING_SECONDS
+                    if max_raw and max_raw.isdigit() and int(max_raw) > 0:
+                        cap = min(int(max_raw), 4 * 3600)
+                    wd = threading.Timer(cap, _auto_stop)
                     wd.daemon = True
-                    wd.start()
+                    # Register the active recording BEFORE arming the watchdog: a
+                    # tiny cap could fire _auto_stop almost immediately, and it must
+                    # see _active_recording already set (both run under
+                    # _recording_lock, so the callback blocks until this returns).
                     _active_recording = {"proc": proc, "path": path, "watchdog": wd}
+                    wd.start()
+                    _post_recording_state(True)  # under the lock: a concurrent stop can't interleave a stale ON (CR: qingyun-wu)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

@@ -37,10 +37,11 @@ def _require_requests():
         import requests as _requests
         from requests_oauthlib import OAuth1 as _OAuth1
     except ImportError:
-        print("Installing required packages...")
-        os.system("pip3 install --break-system-packages requests requests-oauthlib")
-        import requests as _requests
-        from requests_oauthlib import OAuth1 as _OAuth1
+        sys.exit(
+            "x-post: missing dependencies. Install them with:\n"
+            "  pip3 install requests requests-oauthlib\n"
+            "or add them to your project's requirements."
+        )
     requests = _requests
     OAuth1 = _OAuth1
 
@@ -91,7 +92,8 @@ def _bearer_get(url):
     read_tweet() when X_BEARER_TOKEN is set, so a bearer-only environment
     doesn't need `requests` / `requests_oauthlib`.
     """
-    import urllib.request, urllib.error
+    import urllib.request
+    import urllib.error
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {BEARER_TOKEN}"})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:

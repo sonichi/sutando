@@ -7,6 +7,7 @@ Output: results/insight-{date}.txt (voice agent can speak it).
 
 import json
 import os
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -21,6 +22,10 @@ CALLS_FILE = WORKSPACE / "results" / "calls" / "calls.jsonl"
 RESULTS_DIR = WORKSPACE / "results"
 STATE_DIR = WORKSPACE / "state"
 NOTES_DIR = Path(shared_personal_path("notes", WORKSPACE))
+# The src/ dir — a known-inside-the-repo path. `git -C` here resolves the repo
+# toplevel itself, so we don't walk parents to guess the checkout root (which is
+# both the workspace-resolution anti-pattern the CI guard forbids and fragile).
+SRC_DIR = Path(__file__).resolve().parent
 
 
 def load_calls():
@@ -123,7 +128,89 @@ def analyze_note_activity():
     return {"total": len(notes), "recent_7d": len(recent), "top_tags": tags.most_common(5)}
 
 
+def _git_author_identity(repo_root):
+    """The local git identity (email, else name) — the "you" this insight speaks
+    to. Used to count only the owner's own commits so a pull of upstream work
+    doesn't inflate "you shipped N" (CR #2257). Returns "" if none is set or git
+    is unavailable, in which case the caller declines to make a personal claim."""
+    for key in ("user.email", "user.name"):
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(repo_root), "config", "--get", key],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        v = r.stdout.strip()
+        if r.returncode == 0 and v:
+            return v
+    return ""
+
+
+def analyze_dev_activity(repo_root=SRC_DIR, now=None):
+    """Real code output in the last 24h, straight from git.
+
+    Added 2026-07-21: the insight kept reducing the owner's day to "you made N
+    notes" — a shallow workspace-folder metric blind to what he actually did
+    (shipping commits, PRs, meetings). Notes are a side effect; commits are the
+    headline. This surfaces the latter so a productive day doesn't read as
+    "just notes."
+
+    Returns ``{"commits_24h": int, "top_dirs": [(dir, n), ...]}`` or None when
+    git isn't available / it's not a repo. Deliberately local + deterministic
+    (git only — no ``gh`` network call) so a cron run never hangs.
+
+    Counts only the LOCAL git identity's own commits (``--author``). Without
+    this filter, a ``git pull`` that lands other contributors' work would report
+    their commits as "you shipped N", the exact misleading personal metric this
+    insight exists to avoid (CR #2257, qingyun-wu). If no identity resolves, we
+    return None rather than attribute someone else's commits to the owner.
+    """
+    author = _git_author_identity(repo_root)
+    if not author:
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "log", "--since=24 hours ago",
+             f"--author={author}", "--pretty=format:C:%H", "--name-only"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    commits = 0
+    dirs = Counter()
+    for line in out.stdout.splitlines():
+        if line.startswith("C:"):
+            commits += 1
+        elif line.strip() and "/" in line:
+            dirs[line.split("/", 1)[0]] += 1
+    if commits == 0:
+        return None
+    return {"commits_24h": commits, "top_dirs": dirs.most_common(3)}
+
+
+def dev_activity_insight(dev):
+    """Render the dev-activity dict into one headline sentence, or None."""
+    if not dev or dev.get("commits_24h", 0) <= 0:
+        return None
+    n = dev["commits_24h"]
+    where = ", ".join(f"{d}/" for d, _ in dev["top_dirs"]) or "the codebase"
+    plural = "s" if n != 1 else ""
+    return (
+        f"You shipped {n} commit{plural} in the last 24h, mostly in {where}. "
+        f"That's the real headline of your day — steady build velocity."
+    )
+
+
 def generate_insight():
+    # Real code output is the highest-signal insight — surface it first so a
+    # productive day never reads as "you just made some notes" (owner 2026-07-21).
+    dev_line = dev_activity_insight(analyze_dev_activity())
+    if dev_line:
+        return dev_line
+
     calls = load_calls()
     insights = []
 
@@ -207,6 +294,15 @@ def main():
     sentinel.write_text(insight)
     print(f"Daily insight → {output_path}")
     print(insight)
+
+    # Anonymous, opt-out product telemetry: one bucketed event when this feature
+    # actually runs (not on the cached early return). Never content/PII.
+    try:  # pragma: no cover — bounded flush; logic tested in tests/telemetry.test.py
+        from telemetry import feature_used  # sibling module (src/ on sys.path)
+
+        feature_used("daily_insight", flush=True)
+    except Exception:  # pragma: no cover — telemetry must never break the feature
+        pass
 
 
 if __name__ == "__main__":

@@ -1,0 +1,652 @@
+{
+ "note": "Step-5 behavior anchors (post-5a-1: real factory output). Deliberate prompt changes must regenerate via ANCHOR_UPDATE=1 with the diff called out in the PR.",
+ "tools": [
+  {
+   "name": "brightness",
+   "description": "Adjust screen brightness. Use for: \"brighter\", \"dim the screen\", \"set brightness to 50%\". Instant.",
+   "execution": "inline",
+   "params": {
+    "level": "Brightness level 0-100"
+   }
+  },
+  {
+   "name": "brightness",
+   "description": "Adjust screen brightness. Use for: \"brighter\", \"dim the screen\", \"set brightness to 50%\". Instant.",
+   "execution": "inline",
+   "params": {
+    "level": "Brightness level 0-100"
+   }
+  },
+  {
+   "name": "call_contact",
+   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
+   "execution": "inline",
+   "params": {
+    "message": "What to tell the person. They have no tools — include all details they might need.",
+    "name": "Contact name to search for (e.g. \"Bob\", \"Mary Smith\")"
+   }
+  },
+  {
+   "name": "call_contact",
+   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
+   "execution": "inline",
+   "params": {
+    "message": "What to tell the person. They have no tools — include all details they might need.",
+    "name": "Contact name to search for (e.g. \"Bob\", \"Mary Smith\")"
+   }
+  },
+  {
+   "name": "cancel_task",
+   "description": "Cancel a pending or in-flight task by writing a CANCEL_INSTRUCTION task that core will see next. Default (no args) cancels the most recent. Pass `taskId` to cancel a specific task by id (e.g. \"task-1777686932069\"). Pass `query` to cancel the first task whose content contains the substring (case-insensitive). Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. Use when user says \"cancel\", \"nevermind\", \"stop that\", \"what's queued\", \"cancel the one about X\". Note: in-flight processing only halts when core reaches the CANCEL_INSTRUCTION task in its queue — this prevents future pickup + tells core to abort if mid-task, but doesn't interrupt a single LLM turn.",
+   "execution": "inline",
+   "params": {
+    "list": "If true, list pending tasks (id + 60-char preview) without cancelling.",
+    "query": "Case-insensitive substring to match against task content. Cancels first match.",
+    "taskId": "Specific task id to cancel (matches the filename without .txt)."
+   }
+  },
+  {
+   "name": "cancel_task",
+   "description": "Cancel a pending or in-flight task by writing a CANCEL_INSTRUCTION task that core will see next. Default (no args) cancels the most recent. Pass `taskId` to cancel a specific task by id (e.g. \"task-1777686932069\"). Pass `query` to cancel the first task whose content contains the substring (case-insensitive). Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. Use when user says \"cancel\", \"nevermind\", \"stop that\", \"what's queued\", \"cancel the one about X\". Note: in-flight processing only halts when core reaches the CANCEL_INSTRUCTION task in its queue — this prevents future pickup + tells core to abort if mid-task, but doesn't interrupt a single LLM turn.",
+   "execution": "inline",
+   "params": {
+    "list": "If true, list pending tasks (id + 60-char preview) without cancelling.",
+    "query": "Case-insensitive substring to match against task content. Cancels first match.",
+    "taskId": "Specific task id to cancel (matches the filename without .txt)."
+   }
+  },
+  {
+   "name": "capture_screen",
+   "description": "Capture a screenshot of the screen. Use for: \"take a screenshot\", \"what's on my screen\", \"look at this\". Supports multi-monitor: pass display=2 for secondary screen, display=3 for third, etc. Default captures the main display. Instant.",
+   "execution": "inline",
+   "params": {
+    "display": "Display number: 1=main, 2=secondary, 3=third. Default: main display."
+   }
+  },
+  {
+   "name": "capture_screen",
+   "description": "Capture a screenshot of the screen. Use for: \"take a screenshot\", \"what's on my screen\", \"look at this\". Supports multi-monitor: pass display=2 for secondary screen, display=3 for third, etc. Default captures the main display. Instant.",
+   "execution": "inline",
+   "params": {
+    "display": "Display number: 1=main, 2=secondary, 3=third. Default: main display."
+   }
+  },
+  {
+   "name": "clear_active_artifact",
+   "description": "Clear the active artifact from the session cache. Use when the conversation topic shifts, or the user is done with the current document. Voice-agent also clears automatically on session disconnect.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "clear_active_artifact",
+   "description": "Clear the active artifact from the session cache. Use when the conversation topic shifts, or the user is done with the current document. Voice-agent also clears automatically on session disconnect.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "click",
+   "description": "Click at a specific screen coordinate. Use with describe_screen to identify where to click. Also supports keyboard shortcuts like \"cmd+shift+5\".",
+   "execution": "inline",
+   "params": {
+    "shortcut": "Keyboard shortcut to press instead of clicking (e.g. \"cmd+shift+5\")",
+    "x": "X coordinate on screen",
+    "y": "Y coordinate on screen"
+   }
+  },
+  {
+   "name": "click",
+   "description": "Click at a specific screen coordinate. Use with describe_screen to identify where to click. Also supports keyboard shortcuts like \"cmd+shift+5\".",
+   "execution": "inline",
+   "params": {
+    "shortcut": "Keyboard shortcut to press instead of clicking (e.g. \"cmd+shift+5\")",
+    "x": "X coordinate on screen",
+    "y": "Y coordinate on screen"
+   }
+  },
+  {
+   "name": "clipboard",
+   "description": "Read or write the system clipboard. Use for: \"what did I copy\", \"copy this text\", \"paste\". Instant.",
+   "execution": "inline",
+   "params": {
+    "action": "\"read\" to get clipboard contents, \"write\" to set them",
+    "text": "Text to write to clipboard (only for action=\"write\")"
+   }
+  },
+  {
+   "name": "clipboard",
+   "description": "Read or write the system clipboard. Use for: \"what did I copy\", \"copy this text\", \"paste\". Instant.",
+   "execution": "inline",
+   "params": {
+    "action": "\"read\" to get clipboard contents, \"write\" to set them",
+    "text": "Text to write to clipboard (only for action=\"write\")"
+   }
+  },
+  {
+   "name": "close_tab",
+   "description": "Close the current Chrome tab (the active/frontmost tab). Use for: \"close it\", \"close this tab\", \"close the tab\", \"close the page\". Note: this is for closing browser tabs, NOT for ending the call (use hang_up for that) and NOT for closing video (use close_video).",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "close_tab",
+   "description": "Close the current Chrome tab (the active/frontmost tab). Use for: \"close it\", \"close this tab\", \"close the tab\", \"close the page\". Note: this is for closing browser tabs, NOT for ending the call (use hang_up for that) and NOT for closing video (use close_video).",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "close_video",
+   "description": "\"close the video\" (Cmd+W, app=QuickTime Player). Instant — do NOT use work for simple keystrokes. NEVER use Cmd+Q to close QuickTime — use Cmd+W to close the window only.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "close_video",
+   "description": "\"close the video\" (Cmd+W, app=QuickTime Player). Instant — do NOT use work for simple keystrokes. NEVER use Cmd+Q to close QuickTime — use Cmd+W to close the window only.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "delete_note",
+   "description": "Delete a specific note by name or slug.",
+   "execution": "inline",
+   "params": {
+    "name": "Note name or slug to delete"
+   }
+  },
+  {
+   "name": "delete_note",
+   "description": "Delete a specific note by name or slug.",
+   "execution": "inline",
+   "params": {
+    "name": "Note name or slug to delete"
+   }
+  },
+  {
+   "name": "describe_screen",
+   "description": "Describe what is currently visible on screen WITHOUT scrolling. Captures ALL connected displays by default. Use this to introduce/narrate the current view to the caller. Pass display=2 for secondary only.",
+   "execution": "inline",
+   "params": {
+    "display": "Specific display (1=main, 2=secondary). Omit to capture all."
+   }
+  },
+  {
+   "name": "describe_screen",
+   "description": "Describe what is currently visible on screen WITHOUT scrolling. Captures ALL connected displays by default. Use this to introduce/narrate the current view to the caller. Pass display=2 for secondary only.",
+   "execution": "inline",
+   "params": {
+    "display": "Specific display (1=main, 2=secondary). Omit to capture all."
+   }
+  },
+  {
+   "name": "get_core_status",
+   "description": "Get what the core agent (Claude Code) is currently doing. Use when the user asks \"what are you working on\", \"what are you up to\", \"are you busy\", \"anything running\", or similar questions about background work. Instant file read. Call it ONLY for those explicit status questions — NEVER on greetings (\"hello\"), filler, garbled speech, or as a fallback when unsure what the user wants; fire nothing instead.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "get_current_time",
+   "description": "Get the current date and time. Instant. Call this ONLY when the user explicitly asks for the time, date, or day. NEVER call it for any other question, on filler (\"hm\", \"okay\"), or as a fallback when you are unsure what the user wants — answering an unrelated question (e.g. about a paper) by announcing the time is always wrong; when unsure, fire nothing.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "join_gmeet",
+   "description": "Join a Google Meet meeting via browser with computer audio. Use when user says \"join the meet\" or provides a Google Meet link/code.",
+   "execution": "inline",
+   "params": {
+    "meetingCode": "Google Meet code (e.g., \"abc-defg-hij\") or full URL"
+   }
+  },
+  {
+   "name": "join_gmeet",
+   "description": "Join a Google Meet meeting via browser with computer audio. Use when user says \"join the meet\" or provides a Google Meet link/code.",
+   "execution": "inline",
+   "params": {
+    "meetingCode": "Google Meet code (e.g., \"abc-defg-hij\") or full URL"
+   }
+  },
+  {
+   "name": "lookup_meeting_id",
+   "description": "Look up the Zoom personal meeting ID from the environment. Instant — does NOT go through the task bridge. Use for: \"what's the Zoom meeting ID\", \"find the meeting ID\", \"get the Zoom ID\".",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "open_file",
+   "description": "Open a file with macOS. ALWAYS pass an absolute `path` (or one starting with $VAR / ~). Use for: \"open the file\", \"open that\", \"can you open it\". If the user says \"open the log\" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. Known files: \"diagnostic tracker\" or \"diagnostics\" = /tmp/phone-diagnostics-tracker.html, \"voice diagnostics\" = /tmp/voice-diagnostics-tracker.html, \"voice context\" / \"the voice context file\" / \"the active context\" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. Pass `app` when the user names a specific app (\"open with Sublime Text\", \"open the SQLite db in TablePlus\") OR when recent conversation makes the intended app clear (e.g. user just said \"I'll review this in VS Code\"). Without `app`, macOS uses its default handler for that file type — leave unset when the default is fine. Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).",
+   "execution": "inline",
+   "params": {
+    "app": "Optional app name (e.g. \"Sublime Text\", \"VS Code\", \"TablePlus\") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.",
+    "fullscreen": "If true, send Cmd+Ctrl+F to the default app right after opening — generic native-fullscreen toggle, works for any file type (video, PDF, image, web page).",
+    "path": "Absolute file path to open."
+   }
+  },
+  {
+   "name": "open_file",
+   "description": "Open a file with macOS. ALWAYS pass an absolute `path` (or one starting with $VAR / ~). Use for: \"open the file\", \"open that\", \"can you open it\". If the user says \"open the log\" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. Known files: \"diagnostic tracker\" or \"diagnostics\" = /tmp/phone-diagnostics-tracker.html, \"voice diagnostics\" = /tmp/voice-diagnostics-tracker.html, \"voice context\" / \"the voice context file\" / \"the active context\" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. Pass `app` when the user names a specific app (\"open with Sublime Text\", \"open the SQLite db in TablePlus\") OR when recent conversation makes the intended app clear (e.g. user just said \"I'll review this in VS Code\"). Without `app`, macOS uses its default handler for that file type — leave unset when the default is fine. Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).",
+   "execution": "inline",
+   "params": {
+    "app": "Optional app name (e.g. \"Sublime Text\", \"VS Code\", \"TablePlus\") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.",
+    "fullscreen": "If true, send Cmd+Ctrl+F to the default app right after opening — generic native-fullscreen toggle, works for any file type (video, PDF, image, web page).",
+    "path": "Absolute file path to open."
+   }
+  },
+  {
+   "name": "open_url",
+   "description": "Open a URL in Chrome. Reuses the active tab when the target shares origin (scheme + host + port) with what's already in the active tab; spawns a new tab only for cross-origin URLs. Use for: \"open github.com\", \"go to that link\".",
+   "execution": "inline",
+   "params": {
+    "url": "The URL to open"
+   }
+  },
+  {
+   "name": "open_url",
+   "description": "Open a URL in Chrome. Reuses the active tab when the target shares origin (scheme + host + port) with what's already in the active tab; spawns a new tab only for cross-origin URLs. Use for: \"open github.com\", \"go to that link\".",
+   "execution": "inline",
+   "params": {
+    "url": "The URL to open"
+   }
+  },
+  {
+   "name": "pause_video",
+   "description": "Pause the video. Use when user says \"pause\", \"stop\", or \"hold\".",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "pause_video",
+   "description": "Pause the video. Use when user says \"pause\", \"stop\", or \"hold\".",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "play_video",
+   "description": "Play the video from the beginning. Use ONLY when user explicitly says \"play\" or \"play it\".",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "play_video",
+   "description": "Play the video from the beginning. Use ONLY when user explicitly says \"play\" or \"play it\".",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "point_at",
+   "description": "Physically point at something on the user's screen — flies an on-screen marker to it and gives you what to say. This is the embodied \"show me where\" / teaching gesture: use it whenever the user asks where something is or how to do something in the app in front of them (\"where do I commit?\", \"show me the search\", \"point at the deploy button\", \"teach me — where do I start?\"). Captures the main display, locates the target, and animates a pointer there. After it returns you MUST speak the returned `say` sentence aloud.",
+   "execution": "inline",
+   "params": {
+    "query": "What to point at, in plain words — a control, icon, menu, or region. E.g. \"the commit button\", \"the Source Control icon\", \"where do I run the app\"."
+   }
+  },
+  {
+   "name": "point_at",
+   "description": "Physically point at something on the user's screen — flies an on-screen marker to it and gives you what to say. This is the embodied \"show me where\" / teaching gesture: use it whenever the user asks where something is or how to do something in the app in front of them (\"where do I commit?\", \"show me the search\", \"point at the deploy button\", \"teach me — where do I start?\"). Captures the main display, locates the target, and animates a pointer there. After it returns you MUST speak the returned `say` sentence aloud.",
+   "execution": "inline",
+   "params": {
+    "query": "What to point at, in plain words — a control, icon, menu, or region. E.g. \"the commit button\", \"the Source Control icon\", \"where do I run the app\"."
+   }
+  },
+  {
+   "name": "press_key",
+   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another assistant or device (\"Hey Google\", \"Alexa\", \"Siri\"), and never on filler or garbled speech — a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.",
+   "execution": "inline",
+   "params": {
+    "app": "Target app name (e.g. \"QuickTime Player\"). If set, activates it first.",
+    "key": "Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter",
+    "modifiers": "Modifier keys"
+   }
+  },
+  {
+   "name": "press_key",
+   "description": "Press a keyboard key or shortcut in the frontmost app. Use for: \"press enter\", \"press escape\", \"press tab\", \"send the message\" (Enter), \"close the dialog\" (Escape), \"select all\" (Cmd+A), \"clear the input\" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another assistant or device (\"Hey Google\", \"Alexa\", \"Siri\"), and never on filler or garbled speech — a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.",
+   "execution": "inline",
+   "params": {
+    "app": "Target app name (e.g. \"QuickTime Player\"). If set, activates it first.",
+    "key": "Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter",
+    "modifiers": "Modifier keys"
+   }
+  },
+  {
+   "name": "query_active_artifact",
+   "description": "Search the currently-loaded artifact (see set_active_artifact) for content matching a query. Use for any follow-up question about the same document: sections, keywords, line references. Fast — in-process, no task-bridge round-trip. Returns a relevant excerpt with line range. Error if no artifact is loaded.",
+   "execution": "inline",
+   "params": {
+    "query": "Section name, keyword, question, or line reference — e.g. \"§4 baselines\", \"contribution\", \"what is W3\"."
+   }
+  },
+  {
+   "name": "query_active_artifact",
+   "description": "Search the currently-loaded artifact (see set_active_artifact) for content matching a query. Use for any follow-up question about the same document: sections, keywords, line references. Fast — in-process, no task-bridge round-trip. Returns a relevant excerpt with line range. Error if no artifact is loaded.",
+   "execution": "inline",
+   "params": {
+    "query": "Section name, keyword, question, or line reference — e.g. \"§4 baselines\", \"contribution\", \"what is W3\"."
+   }
+  },
+  {
+   "name": "read_note",
+   "description": "Read a specific note by name or slug. Speak the content to the user.",
+   "execution": "inline",
+   "params": {
+    "name": "Note name or slug to search for"
+   }
+  },
+  {
+   "name": "read_note",
+   "description": "Read a specific note by name or slug. Speak the content to the user.",
+   "execution": "inline",
+   "params": {
+    "name": "Note name or slug to search for"
+   }
+  },
+  {
+   "name": "recent_context",
+   "description": "Return the current voice-session context — active drafts, pending actions, recent task results — so you can pick up a thread even if it predates your Gemini context window. Call this when the user references something with a deictic pronoun (\"the post\", \"the draft\", \"the one I just typed\") that you can't place from your own recent transcript. Also fine to call proactively at the start of an active session to ground yourself. Returns JSON with keys: active_drafts (array), pending_action (object|null), last_results (array of {task_id, subject, ts}). If the file is missing or empty, returns {note: \"no context recorded yet\"}.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "recent_context",
+   "description": "Return the current voice-session context — active drafts, pending actions, recent task results — so you can pick up a thread even if it predates your Gemini context window. Call this when the user references something with a deictic pronoun (\"the post\", \"the draft\", \"the one I just typed\") that you can't place from your own recent transcript. Also fine to call proactively at the start of an active session to ground yourself. Returns JSON with keys: active_drafts (array), pending_action (object|null), last_results (array of {task_id, subject, ts}). If the file is missing or empty, returns {note: \"no context recorded yet\"}.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "record_screen_with_narration",
+   "description": "Record a NARRATED demo video — auto-scrolls the page and returns descriptions for you to speak. Use ONLY when user says \"record with narration\", \"record for N seconds\", or \"demo video\". For plain screen recording WITHOUT narration, use screen_record instead. Call ONCE with duration_seconds. SPEAK the returned description as your first words (do NOT announce \"starting recording\"). New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. Recording auto-stops. Do NOT call this more than once per recording. **Subtitles are attempted automatically** when both transcript text exists and a libass-capable ffmpeg is installed — you DO support subtitles, never refuse a \"with subtitles\" request, just call this tool (the burn may silently skip if transcript is empty or ffmpeg lacks libass; the subtitled_path field will then point at a non-existent file and the model should fall back to narrated_path). After auto-stop, to play back or open the recording, call play_video — it auto-finds the file. Or pass `subtitled_path` from the start result to open_file (the start result returns recording_path/narrated_path/subtitled_path; subtitled is the right one for \"with subtitles\"). Do NOT invent file paths — only use the exact paths returned by this tool.",
+   "execution": "inline",
+   "params": {
+    "duration_seconds": "Target duration in seconds (default 15, max 60). ALWAYS seconds, never minutes."
+   }
+  },
+  {
+   "name": "record_screen_with_narration",
+   "description": "Record a NARRATED demo video — auto-scrolls the page and returns descriptions for you to speak. Use ONLY when user says \"record with narration\", \"record for N seconds\", or \"demo video\". For plain screen recording WITHOUT narration, use screen_record instead. Call ONCE with duration_seconds. SPEAK the returned description as your first words (do NOT announce \"starting recording\"). New descriptions will be pushed as the page scrolls — speak each one. NEVER repeat earlier narration. Recording auto-stops. Do NOT call this more than once per recording. **Subtitles are attempted automatically** when both transcript text exists and a libass-capable ffmpeg is installed — you DO support subtitles, never refuse a \"with subtitles\" request, just call this tool (the burn may silently skip if transcript is empty or ffmpeg lacks libass; the subtitled_path field will then point at a non-existent file and the model should fall back to narrated_path). After auto-stop, to play back or open the recording, call play_video — it auto-finds the file. Or pass `subtitled_path` from the start result to open_file (the start result returns recording_path/narrated_path/subtitled_path; subtitled is the right one for \"with subtitles\"). Do NOT invent file paths — only use the exact paths returned by this tool.",
+   "execution": "inline",
+   "params": {
+    "duration_seconds": "Target duration in seconds (default 15, max 60). ALWAYS seconds, never minutes."
+   }
+  },
+  {
+   "name": "replay_video",
+   "description": "Replay the video from the beginning. Use when user says \"start over\", \"replay\", \"play again\".",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "replay_video",
+   "description": "Replay the video from the beginning. Use when user says \"start over\", \"replay\", \"play again\".",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "resume_video",
+   "description": "Resume the paused video from where it stopped. Use ONLY when user says \"resume\", \"continue\", \"go on\".",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "resume_video",
+   "description": "Resume the paused video from where it stopped. Use ONLY when user says \"resume\", \"continue\", \"go on\".",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "save_note",
+   "description": "Save a note. Use for \"take a note\", \"remember this\", \"save this\".",
+   "execution": "inline",
+   "params": {
+    "content": "The note content",
+    "tags": "Comma-separated tags",
+    "title": "Short title for the note"
+   }
+  },
+  {
+   "name": "save_note",
+   "description": "Save a note. Use for \"take a note\", \"remember this\", \"save this\".",
+   "execution": "inline",
+   "params": {
+    "content": "The note content",
+    "tags": "Comma-separated tags",
+    "title": "Short title for the note"
+   }
+  },
+  {
+   "name": "screen_record",
+   "description": "Start or stop PLAIN screen recording (no narration, no auto-scroll). Use ONLY when user explicitly says \"start recording\", \"record the screen\", or \"screen record\". Do NOT match on \"fullscreen\", \"full screen\", \"play fullscreen\", \"make it full screen\", or any cue with \"screen\" that is not preceded by \"record\" — those go to fullscreen_presenter or play_video. Do NOT use record_screen_with_narration for plain recording requests. Uses ffmpeg avfoundation for reliable .mov output. When starting, ASK the user if they want live transcript subtitles burned into the recording.",
+   "execution": "inline",
+   "params": {
+    "action": "\"start\" begins recording, \"stop\" stops and saves the file",
+    "duration_seconds": "If provided with start, auto-stops after this many seconds.",
+    "subtitle": "If true, burn live conversation transcript as subtitles into the recording. Ask the user before setting this."
+   }
+  },
+  {
+   "name": "screen_record",
+   "description": "Start or stop PLAIN screen recording (no narration, no auto-scroll). Use ONLY when user explicitly says \"start recording\", \"record the screen\", or \"screen record\". Do NOT match on \"fullscreen\", \"full screen\", \"play fullscreen\", \"make it full screen\", or any cue with \"screen\" that is not preceded by \"record\" — those go to fullscreen_presenter or play_video. Do NOT use record_screen_with_narration for plain recording requests. Uses ffmpeg avfoundation for reliable .mov output. When starting, ASK the user if they want live transcript subtitles burned into the recording.",
+   "execution": "inline",
+   "params": {
+    "action": "\"start\" begins recording, \"stop\" stops and saves the file",
+    "duration_seconds": "If provided with start, auto-stops after this many seconds.",
+    "subtitle": "If true, burn live conversation transcript as subtitles into the recording. Ask the user before setting this."
+   }
+  },
+  {
+   "name": "scroll",
+   "description": "Scroll the currently focused application. Works in Chrome, VS Code, or any app. Use for: \"scroll down\", \"scroll up\", \"scroll to top\", \"scroll to bottom\". Pass amount=small for \"scroll a little\" / \"a bit\", large for \"scroll a lot\". Use target for specific areas in Chrome: \"sidebar\", \"chat history\", \"code block\".",
+   "execution": "inline",
+   "params": {
+    "amount": "How far to scroll for down/up. small=150px, medium=400px (default), large=800px. Ignored for top/bottom.",
+    "direction": "Scroll direction. Use \"top\" or \"bottom\" to jump to start/end of page.",
+    "target": "Optional: which area to scroll in Chrome. E.g. \"sidebar\", \"chat history\", \"nav\", \"code\". Omit for main content."
+   }
+  },
+  {
+   "name": "scroll",
+   "description": "Scroll the currently focused application. Works in Chrome, VS Code, or any app. Use for: \"scroll down\", \"scroll up\", \"scroll to top\", \"scroll to bottom\". Pass amount=small for \"scroll a little\" / \"a bit\", large for \"scroll a lot\". Use target for specific areas in Chrome: \"sidebar\", \"chat history\", \"code block\".",
+   "execution": "inline",
+   "params": {
+    "amount": "How far to scroll for down/up. small=150px, medium=400px (default), large=800px. Ignored for top/bottom.",
+    "direction": "Scroll direction. Use \"top\" or \"bottom\" to jump to start/end of page.",
+    "target": "Optional: which area to scroll in Chrome. E.g. \"sidebar\", \"chat history\", \"nav\", \"code\". Omit for main content."
+   }
+  },
+  {
+   "name": "send_vision_frame",
+   "description": "Capture and send a single image to you (Gemini) as vision input. Use for one-off \"what am I looking at\", \"can you see this\", \"check what's on my screen now\". Source defaults to the user's screen; pass source='webcam' for the front camera, or any other registered source (e.g. 'glasses'). For ongoing observation, use start_vision instead. Instant.",
+   "execution": "inline",
+   "params": {
+    "source": "Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."
+   }
+  },
+  {
+   "name": "send_vision_frame",
+   "description": "Capture and send a single image to you (Gemini) as vision input. Use for one-off \"what am I looking at\", \"can you see this\", \"check what's on my screen now\". Source defaults to the user's screen; pass source='webcam' for the front camera, or any other registered source (e.g. 'glasses'). For ongoing observation, use start_vision instead. Instant.",
+   "execution": "inline",
+   "params": {
+    "source": "Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."
+   }
+  },
+  {
+   "name": "set_active_artifact",
+   "description": "Load a local file into the in-session cache for fast repeated Q&A. Use at the start of a document-review or code-review session (\"open paper 1093\", \"let's look at task-bridge.ts\"). Supports .pdf (pdftotext), .md/.txt, .ts/.js/.py/.sh, and any text file. After loading, use query_active_artifact — no task-bridge round-trip needed. Swap files by calling set_active_artifact again; clear with clear_active_artifact.",
+   "execution": "inline",
+   "params": {
+    "path": "Absolute or ~ path to the file to load."
+   }
+  },
+  {
+   "name": "set_active_artifact",
+   "description": "Load a local file into the in-session cache for fast repeated Q&A. Use at the start of a document-review or code-review session (\"open paper 1093\", \"let's look at task-bridge.ts\"). Supports .pdf (pdftotext), .md/.txt, .ts/.js/.py/.sh, and any text file. After loading, use query_active_artifact — no task-bridge round-trip needed. Swap files by calling set_active_artifact again; clear with clear_active_artifact.",
+   "execution": "inline",
+   "params": {
+    "path": "Absolute or ~ path to the file to load."
+   }
+  },
+  {
+   "name": "show_view",
+   "description": "Switch the web UI to a specific view. Use when user says \"show notes\", \"show tasks\", \"show activity\", etc.",
+   "execution": "inline",
+   "params": {
+    "view": "Which view to show"
+   }
+  },
+  {
+   "name": "show_view",
+   "description": "Switch the web UI to a specific view. Use when user says \"show notes\", \"show tasks\", \"show activity\", etc.",
+   "execution": "inline",
+   "params": {
+    "view": "Which view to show"
+   }
+  },
+  {
+   "name": "start_vision",
+   "description": "Start streaming live vision frames to you (Gemini) so you can see what the user is doing in real time. Use for: \"watch my screen\", \"look at what I'm doing\", \"follow along\", \"see me as I talk\". Frames flow at ~1 fps until stop_vision is called or the session ends. Source defaults to the user's screen; pass source='webcam' for the front camera, or any other registered source (e.g. 'glasses'). Prefer send_vision_frame for one-off \"look at this\" questions. Instant.",
+   "execution": "inline",
+   "params": {
+    "fps": "Frames per second, 0.5–2. Default 1. Webcam may not keep up above 0.5.",
+    "source": "Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."
+   }
+  },
+  {
+   "name": "start_vision",
+   "description": "Start streaming live vision frames to you (Gemini) so you can see what the user is doing in real time. Use for: \"watch my screen\", \"look at what I'm doing\", \"follow along\", \"see me as I talk\". Frames flow at ~1 fps until stop_vision is called or the session ends. Source defaults to the user's screen; pass source='webcam' for the front camera, or any other registered source (e.g. 'glasses'). Prefer send_vision_frame for one-off \"look at this\" questions. Instant.",
+   "execution": "inline",
+   "params": {
+    "fps": "Frames per second, 0.5–2. Default 1. Webcam may not keep up above 0.5.",
+    "source": "Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."
+   }
+  },
+  {
+   "name": "stop_vision",
+   "description": "Stop the live vision stream started by start_vision. Use for: \"stop watching\", \"you can stop looking now\", \"stop the screen share\", \"stop the camera\". Instant.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "stop_vision",
+   "description": "Stop the live vision stream started by start_vision. Use for: \"stop watching\", \"you can stop looking now\", \"stop the screen share\", \"stop the camera\". Instant.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "switch_app",
+   "description": "Switch to (activate) a macOS application. Use for: \"switch to Chrome\", \"open Slack\", \"go to Terminal\".",
+   "execution": "inline",
+   "params": {
+    "app": "Application name (e.g. \"Google Chrome\", \"Slack\", \"Terminal\", \"Finder\")"
+   }
+  },
+  {
+   "name": "switch_app",
+   "description": "Switch to (activate) a macOS application. Use for: \"switch to Chrome\", \"open Slack\", \"go to Terminal\".",
+   "execution": "inline",
+   "params": {
+    "app": "Application name (e.g. \"Google Chrome\", \"Slack\", \"Terminal\", \"Finder\")"
+   }
+  },
+  {
+   "name": "switch_tab",
+   "description": "Switch to a Chrome tab by keyword. Searches both tab titles and URLs. Use for: \"switch to GitHub\", \"go to Gmail\", \"open the calendar tab\". NOT for \"share screen\" / \"screen share\" / \"show my screen\" — those are screen-share workflows, route to share_screen instead.",
+   "execution": "inline",
+   "params": {
+    "keyword": "Keyword to match in tab title or URL (e.g., \"GitHub\", \"Gmail\", \"calendar\")"
+   }
+  },
+  {
+   "name": "switch_tab",
+   "description": "Switch to a Chrome tab by keyword. Searches both tab titles and URLs. Use for: \"switch to GitHub\", \"go to Gmail\", \"open the calendar tab\". NOT for \"share screen\" / \"screen share\" / \"show my screen\" — those are screen-share workflows, route to share_screen instead.",
+   "execution": "inline",
+   "params": {
+    "keyword": "Keyword to match in tab title or URL (e.g., \"GitHub\", \"Gmail\", \"calendar\")"
+   }
+  },
+  {
+   "name": "switch_voice_config",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
+   "execution": "inline",
+   "params": {
+    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web."
+   }
+  },
+  {
+   "name": "switch_voice_config",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
+   "execution": "inline",
+   "params": {
+    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web."
+   }
+  },
+  {
+   "name": "toggle_tasks",
+   "description": "Collapse or expand tasks in the web UI. Use for: \"collapse tasks\", \"expand tasks\", \"hide tasks\", \"show tasks\", \"expand only the first task\". Pass taskIndex=1 for \"the first task\", 2 for \"the second\", etc. (1-based, by display order); omit for all-tasks. Instant.",
+   "execution": "inline",
+   "params": {
+    "action": "\"collapse\" to hide task results, \"expand\" to show them",
+    "taskIndex": "1-based index of a single task to act on (by display order). Omit to act on all tasks."
+   }
+  },
+  {
+   "name": "toggle_tasks",
+   "description": "Collapse or expand tasks in the web UI. Use for: \"collapse tasks\", \"expand tasks\", \"hide tasks\", \"show tasks\", \"expand only the first task\". Pass taskIndex=1 for \"the first task\", 2 for \"the second\", etc. (1-based, by display order); omit for all-tasks. Instant.",
+   "execution": "inline",
+   "params": {
+    "action": "\"collapse\" to hide task results, \"expand\" to show them",
+    "taskIndex": "1-based index of a single task to act on (by display order). Omit to act on all tasks."
+   }
+  },
+  {
+   "name": "type_text",
+   "description": "Type text into the currently focused field. Use for: \"type hello\", \"enter my email\". Instant. Pass `mode` to control how the text lands relative to existing content. `mode: \"replace_all\"` selects everything in the field first, then writes the new text — pick this for in-place edits (rewrite the draft, shorten, add words to the existing paragraph; compute the FULL edited version and call with replace_all). `mode: \"append\"` collapses any selection to its end before writing — pick this when the user says \"add\", \"append\", \"type at the end\". `mode: \"at_caret\"` (default) inserts at the current caret position — pick this for fill-in-a-blank (\"type hello\", \"enter my email\"). The legacy `append: true` is still honored and treated as `mode: \"append\"` for backward compat.",
+   "execution": "inline",
+   "params": {
+    "append": "Deprecated — pass `mode: \"append\"` instead. Still honored: if true (and mode is unset), behaves like mode=\"append\".",
+    "mode": "How the text lands: \"replace_all\" selects all + writes new content (in-place edits); \"append\" collapses selection to end + writes (add-to-end); \"at_caret\" (default) inserts at caret.",
+    "text": "The text to type. For mode=\"replace_all\" this is the FULL new content of the field (compute the edited version locally before calling)."
+   }
+  },
+  {
+   "name": "type_text",
+   "description": "Type text into the currently focused field. Use for: \"type hello\", \"enter my email\". Instant. Pass `mode` to control how the text lands relative to existing content. `mode: \"replace_all\"` selects everything in the field first, then writes the new text — pick this for in-place edits (rewrite the draft, shorten, add words to the existing paragraph; compute the FULL edited version and call with replace_all). `mode: \"append\"` collapses any selection to its end before writing — pick this when the user says \"add\", \"append\", \"type at the end\". `mode: \"at_caret\"` (default) inserts at the current caret position — pick this for fill-in-a-blank (\"type hello\", \"enter my email\"). The legacy `append: true` is still honored and treated as `mode: \"append\"` for backward compat.",
+   "execution": "inline",
+   "params": {
+    "append": "Deprecated — pass `mode: \"append\"` instead. Still honored: if true (and mode is unset), behaves like mode=\"append\".",
+    "mode": "How the text lands: \"replace_all\" selects all + writes new content (in-place edits); \"append\" collapses selection to end + writes (add-to-end); \"at_caret\" (default) inserts at caret.",
+    "text": "The text to type. For mode=\"replace_all\" this is the FULL new content of the field (compute the edited version locally before calling)."
+   }
+  },
+  {
+   "name": "volume",
+   "description": "Adjust system volume. Use for: \"turn it up\", \"mute\", \"set volume to 50%\". Instant.",
+   "execution": "inline",
+   "params": {
+    "level": "Volume level 0-100. Omit to mute/unmute.",
+    "mute": "true to mute, false to unmute"
+   }
+  },
+  {
+   "name": "volume",
+   "description": "Adjust system volume. Use for: \"turn it up\", \"mute\", \"set volume to 50%\". Instant.",
+   "execution": "inline",
+   "params": {
+    "level": "Volume level 0-100. Omit to mute/unmute.",
+    "mute": "true to mute, false to unmute"
+   }
+  },
+  {
+   "name": "work",
+   "description": "Do the work. Call this for anything beyond simple greetings — questions, actions, research, writing, translation, file changes, system queries, explanations, analysis. This is how Sutando thinks and acts. Results are spoken back when ready.",
+   "execution": "inline",
+   "params": {
+    "dm_on_timeout": "If true, send a Discord DM to the owner when this task hits its timeout. Default false (silent UI-only timeout, per Susan PR #578). Use only for tasks the user has explicitly flagged as critical. The Chi-override to default-true (2026-05-03 06:00 PT) was reverted at 06:47 PT after Chi flagged a timeout DM that shouldn't have gone through.",
+    "task": "Full description of the task to perform",
+    "timeout_minutes": "Per-task timeout in minutes. Default 10. Pass a larger value (e.g. 30) for multi-step jobs like rendering, batch encoding, or long research. Pass 0 for no timeout — use sparingly, only when the user explicitly asks for a long autonomous job that may legitimately take hours."
+   }
+  }
+ ],
+ "instructions_hash_fixed_env": "c75044993561fe13bf95f8d8d0bc9b1269074b7260abf797dc67ca1dcc5c7cd4",
+ "meeting_greeting": "[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says \"Sutando\" or \"hey Sutando\" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no \"silent\", no sounds. You are an invisible note-taker until called upon.]\n\n[MODE-MARKER-MEETING]",
+ "regions": {
+  "tool_table": "e6d53e7a98b6c0f052148b6bae6096eab4e5768fb8187be8d03deee179023e78"
+ }
+}

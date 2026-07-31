@@ -1,3 +1,8 @@
+---
+name: audio-transcribe
+description: Transcribes audio files and voice notes to text via Gemini 2.5-flash. Integrates with Slack, Discord, and Telegram bridges so voice clips surface as readable text in tasks.
+---
+
 # audio-transcribe
 
 Transcribes audio files (voice notes, clips) to text via Gemini 2.5-flash.
@@ -27,7 +32,7 @@ a file was sent.
 ## Key resolution order
 
 1. `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the process environment
-2. `$SUTANDO_WORKSPACE/.env` (default: `~/.sutando/workspace/.env`)
+2. `<workspace>/.env` (resolved via `resolve_workspace()`)
 3. `$CLAUDE_CONFIG_DIR/channels/slack/.env`
 4. `$CLAUDE_CONFIG_DIR/channels/discord/.env`
 5. `$CLAUDE_CONFIG_DIR/channels/telegram/.env`

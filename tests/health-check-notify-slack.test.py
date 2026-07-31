@@ -198,12 +198,19 @@ def case_i_token_read_prefers_channel_env() -> list[str]:
     first, then fall back to $REPO/.env.
 
     Redirects HOME (Path.home() honors $HOME on POSIX) and hc.REPO_DIR so the
-    real path-resolution code runs against temp files."""
+    real path-resolution code runs against temp files. CLAUDE_CONFIG_DIR and
+    CLAUDE_HOME must be cleared too: claude_home_path() prefers them over
+    ~/.claude, and CLAUDE_CONFIG_DIR is set on every claude-sutando install —
+    with it live, the HOME redirect is bypassed and the host's REAL channel
+    .env leaks into the assertions (3 failures on any slack-enrolled host,
+    printing the real token into test output)."""
     import os
     fails = []
     saved_home = os.environ.get("HOME")
     saved_repo = hc.REPO_DIR
     saved_env_token = os.environ.pop("SLACK_BOT_TOKEN", None)  # force the file path
+    saved_ccd = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    saved_chome = os.environ.pop("CLAUDE_HOME", None)
     try:
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as repo:
             os.environ["HOME"] = home
@@ -213,27 +220,63 @@ def case_i_token_read_prefers_channel_env() -> list[str]:
             (Path(repo) / ".env").write_text("SLACK_BOT_TOKEN=xoxb-from-repo\n")
             (chan / ".env").write_text('SLACK_BOT_TOKEN="xoxb-from-channel"\n')
 
+            # Never print a non-fixture value: if isolation regresses, the
+            # leaked value is the host's live bot token.
+            def masked(v):
+                fixtures = ("xoxb-from-channel", "xoxb-from-repo", "")
+                return repr(v) if v in fixtures else f"<non-fixture {len(v)}-char value, masked>"
+
             tok = hc._slack_token_from_env_file()
             if tok != "xoxb-from-channel":
-                fails.append(f"i) channel .env should win, got {tok!r}")
+                fails.append(f"i) channel .env should win, got {masked(tok)}")
 
             # Remove the channel token → must fall back to $REPO/.env.
             (chan / ".env").write_text("OTHER=1\n")
             tok2 = hc._slack_token_from_env_file()
             if tok2 != "xoxb-from-repo":
-                fails.append(f"i) fallback to $REPO/.env failed, got {tok2!r}")
+                fails.append(f"i) fallback to $REPO/.env failed, got {masked(tok2)}")
 
             # Neither present → empty string (no crash).
             (Path(repo) / ".env").write_text("OTHER=2\n")
             tok3 = hc._slack_token_from_env_file()
             if tok3 != "":
-                fails.append(f"i) absent token should be '', got {tok3!r}")
+                fails.append(f"i) absent token should be '', got {masked(tok3)}")
     finally:
         if saved_home is not None:
             os.environ["HOME"] = saved_home
         if saved_env_token is not None:
             os.environ["SLACK_BOT_TOKEN"] = saved_env_token
+        if saved_ccd is not None:
+            os.environ["CLAUDE_CONFIG_DIR"] = saved_ccd
+        if saved_chome is not None:
+            os.environ["CLAUDE_HOME"] = saved_chome
         hc.REPO_DIR = saved_repo
+    return fails
+
+
+def case_j_same_set_past_cooldown_does_not_resend() -> list[str]:
+    """Regression (owner complaint 2026-07-01): a persistent, unchanged
+    failure set must not re-DM the owner just because time has passed —
+    the old 1h-cooldown design re-sent the identical DM every hour
+    indefinitely for a never-resolving issue. Seeds state as if the set
+    was last (successfully) sent 25h ago and confirms a second call with
+    the SAME set sends nothing."""
+    fails = []
+    sent, send = recording_sender()
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "slack.json"
+        checks = make_checks(("down", "voice-agent", "port 9900"))
+        set_key = "|".join(sorted(c["name"] for c in checks))
+        hash_key = hc.hashlib.sha256(set_key.encode()).hexdigest()[:16]
+        now_ms = int(time.time() * 1000)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({
+            hash_key: now_ms - (25 * 3600 * 1000),  # 25h ago — past old 1h cooldown
+            "_last_hash": hash_key,
+        }))
+        hc.notify_slack_for_failures(checks, state_file=state, sender=send)
+        if sent:
+            fails.append("j) unchanged failure set re-sent after 25h — spam bug regressed")
     return fails
 
 
@@ -248,6 +291,7 @@ def main() -> int:
         ("g", case_g_failed_send_not_recorded),
         ("h", case_h_history_pruned_after_24h),
         ("i", case_i_token_read_prefers_channel_env),
+        ("j", case_j_same_set_past_cooldown_does_not_resend),
     ]
     all_failures = []
     for label, fn in cases:

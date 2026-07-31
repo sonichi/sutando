@@ -2,6 +2,8 @@
 """Tests for the room-ops collection — shared gate, the read/media/react modules,
 and the unified room_ops CLI dispatcher. No network."""
 import base64
+import contextlib
+import io
 import json
 import os
 import sys
@@ -15,6 +17,8 @@ import _gateway  # noqa: E402
 import read as rd  # noqa: E402
 import media as md  # noqa: E402
 import react as rc  # noqa: E402
+import join as jn  # noqa: E402
+import doc as dc  # noqa: E402
 import room_ops  # noqa: E402
 
 HS = "@agent.a:hs"
@@ -210,6 +214,98 @@ class ReactTests(EnvCase):
             self.assertIn("not a joined member", rc.react(ROOM, EV, "👀", HS, gate=None)["reason"])
 
 
+# ----- join ----- #
+class JoinTests(EnvCase):
+    def test_missing_room(self):
+        self.assertFalse(jn.join_room("", HS)["ok"])
+
+    def test_gate_deny(self):
+        os.environ["RELAY_URL"] = "https://r"
+        self.assertIn("gate denied", jn.join_room(ROOM, HS, gate={})["reason"])
+
+    def test_no_relay(self):
+        self.assertIn("no gateway", jn.join_room(ROOM, HS, gate=None)["reason"])
+
+    def test_join_endpoint(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(jn, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, {}))[1]):
+            res = jn.join_room(ROOM, HS, gate=None)
+        self.assertTrue(res["ok"] and cap["url"].endswith("/join"))
+        self.assertEqual(cap["payload"], {})
+
+    def test_403_degrades(self):
+        # No standing invite for an invite-only room → the gateway 403 degrades
+        # to the structured membership reason, not an exception.
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(jn, "http_json", side_effect=err):
+            self.assertIn("not a joined member", jn.join_room(ROOM, HS, gate=None)["reason"])
+
+
+class DocTests(EnvCase):
+    def test_missing_room(self):
+        self.assertFalse(dc.doc_get("", HS)["ok"])
+
+    def test_gate_deny(self):
+        os.environ["RELAY_URL"] = "https://r"
+        self.assertIn("gate denied", dc.doc_put(ROOM, "x", agent_mxid=HS, gate={})["reason"])
+
+    def test_no_relay(self):
+        self.assertIn("no gateway", dc.doc_get(ROOM, agent_mxid=HS, gate=None)["reason"])
+
+    def test_get_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"ok": True, "file": "TODO.md", "folder": "room-todo", "content": "# T"}
+        with mock.patch.object(dc, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
+            res = dc.doc_get(ROOM, folder="room-todo", name="TODO.md", agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        self.assertEqual(cap["payload"]["op"], "prep_get")
+        self.assertEqual(cap["payload"]["folder"], "room-todo")
+        self.assertEqual(res["content"], "# T")
+
+    def test_put_envelope_b64(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"ok": True, "file": "notes.md", "sha": "abc123"}
+        with mock.patch.object(dc, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, fake))[1]):
+            res = dc.doc_put(ROOM, "hello", folder="scratch", name="notes.md",
+                             message="m", agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"] and res["sha"] == "abc123")
+        self.assertEqual(cap["payload"]["op"], "prep_put")
+        self.assertEqual(base64.b64decode(cap["payload"]["content_b64"]).decode(), "hello")
+        self.assertEqual(cap["payload"]["message"], "m")
+
+    def test_rm_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(dc, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {"ok": True}))[1]):
+            res = dc.doc_rm(ROOM, "old.md", folder="room-memo", agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["op"], "prep_delete")
+        self.assertEqual(cap["payload"]["filename"], "old.md")
+
+    def test_gateway_error_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(dc, "http_json",
+                               return_value=(200, {"error": "bad folder (1-3 safe path segments, no leading dots)"})):
+            res = dc.doc_put(ROOM, "x", folder="../etc", agent_mxid=HS, gate=None)
+        self.assertFalse(res["ok"])
+        self.assertIn("bad folder", res["reason"])
+
+    def test_403_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(dc, "http_json", side_effect=err):
+            self.assertIn("not a joined member", dc.doc_get(ROOM, agent_mxid=HS, gate=None)["reason"])
+
+
 # ----- unified CLI ----- #
 class CliTests(EnvCase):
     def test_read_exits_zero(self):
@@ -229,6 +325,20 @@ class CliTests(EnvCase):
 
     def test_fetch_exits_zero(self):
         self.assertEqual(room_ops._main(["fetch", "mxc://x/y", "--room", ROOM, "--agent", HS]), 0)
+
+    def test_join_exits_zero_on_no_gateway(self):
+        self.assertEqual(room_ops._main(["join", ROOM, "--agent", HS]), 0)
+
+    def test_doc_put_missing_file_structured_error(self):
+        # P2 (PR #2050 review): --file read failure must yield the structured
+        # ok:false envelope, not a traceback.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_ = room_ops._main(["doc", "put", ROOM, "--file", "/nope/missing.md", "--agent", HS])
+        self.assertEqual(rc_, 0)
+        res = json.loads(buf.getvalue())
+        self.assertFalse(res["ok"])
+        self.assertIn("cannot read --file", res["reason"])
 
 
 class GatewayTokenOnboardingTests(EnvCase):
@@ -331,6 +441,696 @@ class ContentLengthTests(EnvCase):
             res = md.fetch_media("mxc://x/y", HS, ROOM, gate=None)
         self.assertFalse(res["ok"])
         self.assertIn("exceeds", res["reason"])
+
+
+class NormalizeReactionsTests(unittest.TestCase):
+    """_normalize must carry the gateway's per-message `reactions` annotation —
+    it's the ONLY surface for the 👀 delivery-ack (reactions never arrive as tasks).
+    Regression: the field was silently dropped, so a worker saw zero reactions."""
+
+    def test_reactions_preserved(self):
+        out = rd._normalize([{"event_id": "$e", "sender": "@a:hs", "body": "hi",
+                              "reactions": [{"key": "\U0001F440", "sender": "@b:hs"}]}])
+        self.assertEqual(out[0]["reactions"], [{"key": "\U0001F440", "sender": "@b:hs"}])
+
+    def test_reactions_default_empty_list(self):
+        out = rd._normalize([{"event_id": "$e", "sender": "@a:hs", "body": "hi"}])
+        self.assertEqual(out[0]["reactions"], [])
+
+
+import resolve as rs  # noqa: E402
+import mention as mn  # noqa: E402
+
+_AGENTS = [
+    {"id": "@sutando-qingyun-001:ag2.space", "label": "Air MBP"},
+    {"id": "@sutando-qingyun-mini:ag2.space", "label": "Mini"},
+    {"id": "@qingyun-air.agent:ag2.space", "label": "core"},
+]
+
+
+class ResolveTests(unittest.TestCase):
+    def test_exact_localpart(self):
+        r = rs.match_agent("sutando-qingyun-001", _AGENTS)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@sutando-qingyun-001:ag2.space")
+
+    def test_substring_unique(self):
+        r = rs.match_agent("001", _AGENTS)  # only qingyun-001's localpart contains it
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@sutando-qingyun-001:ag2.space")
+
+    def test_full_mxid_passthrough(self):
+        r = rs.match_agent("@whoever:ag2.space", _AGENTS)  # already an mxid → trust it
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@whoever:ag2.space")
+
+    def test_ambiguous_reports_candidates_and_does_not_resolve(self):
+        r = rs.match_agent("sutando-qingyun", _AGENTS)  # substring of BOTH 001 and mini
+        self.assertFalse(r["ok"])
+        self.assertEqual(len(r["candidates"]), 2)
+        self.assertIsNone(r["mxid"])
+
+    def test_no_match(self):
+        r = rs.match_agent("nobody", _AGENTS)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["candidates"], [])
+
+    def test_exact_beats_substring(self):
+        agents = [{"id": "@mini:hs", "label": ""}, {"id": "@mini-helper:hs", "label": ""}]
+        r = rs.match_agent("mini", agents)  # exact localpart wins over the substring one
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@mini:hs")
+
+    def test_label_exact_match(self):
+        r = rs.match_agent("Mini", _AGENTS)  # case-insensitive label hit
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], "@sutando-qingyun-mini:ag2.space")
+
+    def test_empty_query(self):
+        self.assertFalse(rs.match_agent("", _AGENTS)["ok"])
+
+
+class MentionBodyTests(unittest.TestCase):
+    def test_leads_with_mxid(self):
+        b = mn.build_body("@sutando-qingyun-001:ag2.space", "review #149")
+        self.assertTrue(b.startswith("@sutando-qingyun-001:ag2.space"))
+        self.assertIn("review #149", b)
+
+    def test_empty_message_is_bare_mxid(self):
+        self.assertEqual(mn.build_body("@x:hs", ""), "@x:hs")
+
+    def test_ambiguous_handle_does_not_post(self):
+        # mention() must refuse to post on an ambiguous handle (never mention the
+        # wrong agent) — returns ok:false + candidates, no network touched.
+        res = mn.mention("sutando-qingyun", "hi", ROOM, HS, gate=None, agents=_AGENTS)
+        self.assertFalse(res["ok"])
+        self.assertEqual(len(res["candidates"]), 2)
+
+    def test_post_payload_leads_with_mxid_and_carries_mentions(self):
+        # A resolved mention posts op:message to /v1/room with the mxid LEADING
+        # the body (text trigger) AND a forward-compat `mentions:[mxid]` (activates
+        # structured push once the broker honors it). Both pinned so neither regresses.
+        cap = {}
+
+        def _fake_http_json(method, url, headers, payload):
+            cap["url"], cap["payload"] = url, payload
+            return 200, {"event_id": "$posted"}
+
+        with mock.patch.object(mn, "gateway", return_value=("https://gw/relay", {})), \
+             mock.patch.object(mn, "http_json", side_effect=_fake_http_json):
+            res = mn.mention("qingyun-001", "review #149", ROOM, HS, gate=None, agents=_AGENTS)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["event_id"], "$posted")
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        p = cap["payload"]
+        self.assertEqual(p["op"], "message")
+        self.assertEqual(p["mentions"], ["@sutando-qingyun-001:ag2.space"])
+        self.assertTrue(p["body"].startswith("@sutando-qingyun-001:ag2.space"))
+
+
+import events as ev  # noqa: E402
+import rooms as rm  # noqa: E402
+import events_acceptance as ea  # noqa: E402
+
+
+# ----- rooms (#184 client half) ----- #
+class RoomsTests(EnvCase):
+    def test_no_gateway(self):
+        self.assertIn("no gateway", rm.joined_rooms(HS)["reason"])
+
+    def test_result_shape_and_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"ok": True, "rooms": [ROOM], "rooms_detailed": [{"room_id": ROOM, "name": "A"}]}
+        with mock.patch.object(rm, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
+            res = rm.joined_rooms(HS)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["rooms"], [ROOM])
+        self.assertEqual(res["rooms_detailed"][0]["room_id"], ROOM)
+        self.assertIsNone(res["reason"])
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        self.assertEqual(cap["payload"], {"op": "joined_rooms"})
+
+    def test_403_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(rm, "http_json", side_effect=err):
+            self.assertIn("not a joined member", rm.joined_rooms(HS)["reason"])
+
+
+# ----- events: subscription ops (#184) ----- #
+class EventsSubscribeTests(EnvCase):
+    def test_no_gateway(self):
+        self.assertIn("no gateway", ev.subscribe(ROOM, ["message.created"],
+                                                 agent_mxid=HS, gate=None)["reason"])
+
+    def test_gate_deny(self):
+        os.environ["RELAY_URL"] = "https://r"
+        self.assertIn("gate denied",
+                      ev.subscribe(ROOM, ["message.created"], agent_mxid=HS, gate={})["reason"])
+
+    def test_subscribe_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        # #184 contract shape: the id is NESTED under "subscription", not
+        # top-level. Guards the P2-1 fix — client must read the nested id.
+        fake = {"ok": True, "subscription": {"subscription_id": "sub-1", "room_id": ROOM}}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
+            res = ev.subscribe(ROOM, ["message.created", "reaction.added"],
+                               filters={"actor": "@x:hs"}, agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["subscription_id"], "sub-1")
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        self.assertEqual(cap["payload"], {"op": "events_subscribe", "room_id": ROOM,
+                                          "event_types": ["message.created", "reaction.added"],
+                                          "filters": {"actor": "@x:hs"}})
+
+    def test_subscribe_omits_absent_filters(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {"ok": True}))[1]):
+            ev.subscribe(ROOM, ["message.created"], agent_mxid=HS, gate=None)
+        self.assertNotIn("filters", cap["payload"])
+
+    def test_unsubscribe_envelope(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {"ok": True}))[1]):
+            res = ev.unsubscribe(ROOM, agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"], {"op": "events_unsubscribe", "room_id": ROOM})
+
+    def test_subscriptions_no_room_no_gate(self):
+        # `events_subscriptions` has no room target → the per-room gate must
+        # NOT be consulted (an empty gate would otherwise deny everything).
+        os.environ["RELAY_URL"] = "https://r"
+        os.environ["ROOM_OPS_GATE"] = "/nonexistent/but-empty-would-deny.json"
+        cap = {}
+        fake = {"ok": True, "subscriptions": [{"room_id": ROOM, "subscription_id": "sub-1"}]}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, fake))[1]):
+            res = ev.subscriptions(HS)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["subscriptions"][0]["subscription_id"], "sub-1")
+        self.assertEqual(cap["payload"], {"op": "events_subscriptions"})
+
+    def test_403_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(ev, "http_json", side_effect=err):
+            self.assertIn("not a joined member",
+                          ev.subscribe(ROOM, ["message.created"], agent_mxid=HS, gate=None)["reason"])
+
+
+# ----- events: long-poll pull ----- #
+class EventsPullTests(EnvCase):
+    def test_no_gateway(self):
+        res = ev.pull(cursor=3)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["cursor"], 3)  # cursor passes through unchanged
+
+    def test_pull_url_and_timeout(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"ok": True, "events": [], "cursor": 7}
+        with mock.patch.object(ev, "_http_get_json",
+                               side_effect=lambda u, h, t: (cap.update(url=u, headers=h, timeout=t), fake)[1]):
+            res = ev.pull(cursor=7, wait=5)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["cursor"], 7)
+        self.assertIn("/v1/events?", cap["url"])
+        self.assertIn("cursor=7", cap["url"])
+        self.assertIn("wait=5", cap["url"])
+        # Socket timeout must OUTLIVE the server's hold window (wait) or every
+        # quiet poll dies mid-hold instead of returning empty events.
+        self.assertGreater(cap["timeout"], 5)
+        # Contract: User-Agent required on every request, like everything else.
+        self.assertIn("User-Agent", cap["headers"])
+
+    def test_404_degrades(self):
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 404, "nf", {}, None)
+        with mock.patch.object(ev, "_http_get_json", side_effect=err):
+            self.assertIn("unimplemented", ev.pull()["reason"])
+
+
+# ----- events: SSE frame parser ----- #
+class SSEFrameTests(unittest.TestCase):
+    def _frames(self, text):
+        return list(ev.sse_frames(text.split("\n")))
+
+    def test_id_data_blank_dispatch(self):
+        fr = self._frames('id: 5\ndata: {"a":1}\n\n')
+        self.assertEqual(fr, [("event", "5", '{"a":1}')])
+
+    def test_multiline_data_accumulates(self):
+        fr = self._frames("id: 6\ndata: line1\ndata: line2\n\n")
+        self.assertEqual(fr, [("event", "6", "line1\nline2")])
+
+    def test_keepalive_comment(self):
+        fr = self._frames(": ping\n\n")
+        self.assertEqual(fr, [("comment", None, "ping")])
+
+    def test_no_dispatch_without_blank_line(self):
+        # A frame is only dispatched by its terminating blank line — a torn
+        # tail at disconnect must NOT surface as a (partial) event.
+        self.assertEqual(self._frames('data: {"a":1}'), [])
+
+    def test_id_is_sticky_across_frames(self):
+        fr = self._frames("id: 9\ndata: a\n\ndata: b\n\n")
+        self.assertEqual(fr[1], ("event", "9", "b"))
+
+    def test_unknown_fields_ignored(self):
+        fr = self._frames("event: message\nretry: 100\nid: 3\ndata: x\n\n")
+        self.assertEqual(fr, [("event", "3", "x")])
+
+
+# ----- events: stream ----- #
+def _sse_resp(text):
+    return io.BytesIO(text.encode())
+
+
+class EventsStreamTests(EnvCase):
+    def test_no_gateway_raises_runtimeerror(self):
+        with self.assertRaises(RuntimeError):
+            ev.stream(on_event=lambda c, e: None)
+
+    def test_last_event_id_header_and_delivery(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap, got = {}, []
+        body = 'id: 7\ndata: {"event_id":"$e","cursor":7,"type":"message.created"}\n\n'
+
+        def fake_open(url, headers):
+            cap.update(url=url, headers=headers)
+            return _sse_resp(body)
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open):
+            cur = ev.stream(cursor=42, on_event=lambda c, e: got.append((c, e)), max_events=1)
+        self.assertEqual(cap["headers"]["Last-Event-ID"], "42")
+        self.assertEqual(cap["headers"]["Accept"], "text/event-stream")
+        self.assertTrue(cap["url"].endswith("/v1/events/stream"))
+        self.assertEqual(got[0][0], 7)
+        self.assertEqual(got[0][1]["event_id"], "$e")
+        self.assertEqual(cur, 7)
+
+    def test_no_cursor_no_header(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+
+        def fake_open(url, headers):
+            cap.update(headers=headers)
+            return _sse_resp('id: 1\ndata: {"cursor":1}\n\n')
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open):
+            ev.stream(on_event=lambda c, e: None, max_events=1)
+        self.assertNotIn("Last-Event-ID", cap["headers"])
+
+    def test_keepalive_cb_and_eof_raises(self):
+        os.environ["RELAY_URL"] = "https://r"
+        pings = []
+        with mock.patch.object(ev, "_open_stream", return_value=_sse_resp(": ping\n\n")):
+            with self.assertRaises(ev.StreamDisconnected):
+                ev.stream(on_event=lambda c, e: None, keepalive_cb=pings.append)
+        self.assertEqual(pings, ["ping"])
+
+    def test_403_open_raises_runtimeerror(self):
+        # Permission problems must NOT look like a transient disconnect, or the
+        # resume wrapper would retry a hopeless connection forever.
+        os.environ["RELAY_URL"] = "https://r"
+        err = urllib.error.HTTPError("u", 403, "no", {}, None)
+        with mock.patch.object(ev, "_open_stream", side_effect=err):
+            with self.assertRaises(RuntimeError):
+                ev.stream(on_event=lambda c, e: None)
+
+
+# ----- events: durable cursor ----- #
+class CursorFileTests(unittest.TestCase):
+    def test_save_load_roundtrip_atomic(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "cursor")
+        ev.save_cursor(p, 41)
+        ev.save_cursor(p, 42)  # overwrite goes through the same tmp+rename path
+        self.assertEqual(ev.load_cursor(p), 42)
+        self.assertFalse(os.path.exists(p + ".tmp"))  # rename consumed the tmp
+
+    def test_load_missing_is_none(self):
+        self.assertIsNone(ev.load_cursor("/nonexistent/cursor"))
+
+    def test_load_garbled_is_none(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "cursor")
+        open(p, "w").write("junk")
+        self.assertIsNone(ev.load_cursor(p))
+
+
+class StreamWithResumeTests(EnvCase):
+    def test_resumes_from_file_and_persists_each_event(self):
+        os.environ["RELAY_URL"] = "https://r"
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")
+        ev.save_cursor(cf, 10)
+        cap, got = {"resume_ids": []}, []
+        body = ('id: 11\ndata: {"event_id":"$a","cursor":11}\n\n'
+                'id: 12\ndata: {"event_id":"$b","cursor":12}\n\n')
+
+        def fake_open(url, headers):
+            cap["resume_ids"].append(headers.get("Last-Event-ID"))
+            return _sse_resp(body)
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open):
+            cur = ev.stream_with_resume(cf, lambda c, e: got.append(c), max_events=2)
+        self.assertEqual(cap["resume_ids"][0], "10")  # resumed from the file
+        self.assertEqual(got, [11, 12])
+        self.assertEqual(ev.load_cursor(cf), 12)      # last delivered persisted
+        self.assertEqual(cur, 12)
+
+    def test_reconnects_with_backoff_after_disconnect(self):
+        os.environ["RELAY_URL"] = "https://r"
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")
+        calls, naps = {"n": 0}, []
+
+        def fake_open(url, headers):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _sse_resp(": ping\n\n")  # EOF → StreamDisconnected
+            return _sse_resp('id: 1\ndata: {"event_id":"$a","cursor":1}\n\n')
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open), \
+             mock.patch.object(ev.time, "sleep", side_effect=naps.append):
+            cur = ev.stream_with_resume(cf, lambda c, e: None, max_events=1)
+        self.assertEqual(cur, 1)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(naps, [1.0])  # the ladder starts at 1s
+
+    def test_should_persist_holds_cursor_for_pending_batch(self):
+        # P1-2: a batching consumer HOLDS cursor persistence while events sit
+        # un-flushed. Events 11,12 are "pending" (gate False); 13 "flushes"
+        # (gate True) — only 13's cursor may reach the durable file, so a
+        # restart replays 11,12 instead of skipping past them.
+        os.environ["RELAY_URL"] = "https://r"
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")
+        ev.save_cursor(cf, 10)
+        body = ('id: 11\ndata: {"event_id":"$a","cursor":11}\n\n'
+                'id: 12\ndata: {"event_id":"$b","cursor":12}\n\n'
+                'id: 13\ndata: {"event_id":"$c","cursor":13}\n\n')
+        persisted = []
+        real_save = ev.save_cursor
+
+        def spy_save(path, cur):
+            persisted.append(cur)
+            real_save(path, cur)
+
+        with mock.patch.object(ev, "_open_stream", side_effect=lambda url, headers: _sse_resp(body)), \
+             mock.patch.object(ev, "save_cursor", side_effect=spy_save):
+            cur = ev.stream_with_resume(cf, lambda c, e: None, max_events=3,
+                                        should_persist=lambda c, e: c == 13)
+        self.assertEqual(persisted, [13])       # 11,12 held; only the flush committed
+        self.assertEqual(ev.load_cursor(cf), 13)
+        self.assertEqual(cur, 13)
+
+
+    def test_save_cursor_fsyncs_file_then_directory(self):
+        # Review P1 (both reviewers): the COLD-START anchor's directory entry
+        # must be durable — save_cursor asserts data-fsync → rename →
+        # dir-fsync, same contract as task promotion. Losing a later cursor
+        # merely replays; losing the first-ever anchor loses the held batch.
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")
+        events_seen = []
+        real_fsync, real_replace, real_open_fd = os.fsync, os.replace, os.open
+        fd_paths = {}
+
+        def spy_open(path, flags, *a, **k):
+            fd = real_open_fd(path, flags, *a, **k)
+            fd_paths[fd] = path
+            return fd
+
+        def spy_fsync(fd):
+            events_seen.append(("fsync", "dir" if fd_paths.get(fd) == d else "file"))
+            return real_fsync(fd)
+
+        def spy_replace(src, dst):
+            events_seen.append(("rename", dst))
+            return real_replace(src, dst)
+
+        try:
+            os.open, os.fsync, os.replace = spy_open, spy_fsync, spy_replace
+            ev.save_cursor(cf, 130)
+        finally:
+            os.open, os.fsync, os.replace = real_open_fd, real_fsync, real_replace
+        self.assertEqual([k for k, _ in events_seen], ["fsync", "rename", "fsync"])
+        self.assertEqual(events_seen[0][1], "file")  # temp-file data first
+        self.assertEqual(events_seen[2][1], "dir")   # then the directory entry
+        self.assertEqual(ev.load_cursor(cf), 130)
+
+    def test_cold_start_seeds_replay_anchor_before_withheld_batch(self):
+        # Review P1 (cold-start half): NO cursor file + a batching consumer
+        # that withholds persistence. The first delivered event must seed
+        # `cur - 1` as a durable pre-batch anchor BEFORE it can sit in a
+        # withheld batch — otherwise a hard kill leaves no cursor file, the
+        # restart sends no Last-Event-ID, the server defaults to new-events-
+        # only, and the held event is lost forever (not at-least-once).
+        os.environ["RELAY_URL"] = "https://r"
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "cursor")           # absent — true cold start
+        body = ('id: 131\ndata: {"event_id":"$a","cursor":131}\n\n'
+                'id: 132\ndata: {"event_id":"$b","cursor":132}\n\n')
+        with mock.patch.object(ev, "_open_stream",
+                               side_effect=lambda url, headers: _sse_resp(body)):
+            ev.stream_with_resume(cf, lambda c, e: None, max_events=2,
+                                  should_persist=lambda c, e: False)  # batch never flushes
+        # "hard kill with the batch pending": the file must already anchor
+        # replay at 130 so a restart re-delivers 131 (and 132).
+        self.assertEqual(ev.load_cursor(cf), 130)
+        cap = {"resume": None}
+
+        def fake_open2(url, headers):
+            cap["resume"] = headers.get("Last-Event-ID")
+            return _sse_resp(body)
+
+        with mock.patch.object(ev, "_open_stream", side_effect=fake_open2):
+            ev.stream_with_resume(cf, lambda c, e: None, max_events=2,
+                                  should_persist=lambda c, e: False)
+        self.assertEqual(cap["resume"], "130")   # restart REPLAYS the held events
+        self.assertEqual(ev.load_cursor(cf), 130)  # anchor still held (no flush)
+        # a warm start (existing cursor) never rewrites the anchor backwards:
+        ev.save_cursor(cf, 200)
+        with mock.patch.object(ev, "_open_stream",
+                               side_effect=lambda url, headers: _sse_resp(
+                                   'id: 300\ndata: {"event_id":"$z","cursor":300}\n\n')):
+            ev.stream_with_resume(cf, lambda c, e: None, max_events=1,
+                                  should_persist=lambda c, e: False)
+        self.assertEqual(ev.load_cursor(cf), 200)  # loaded cursor wins; no 299 seed
+
+
+# ----- events CLI ----- #
+class EventsCliTests(EnvCase):
+    def test_rooms_exits_zero(self):
+        self.assertEqual(room_ops._main(["rooms", "--agent", HS]), 0)
+
+    def test_events_pull_exits_zero_no_gateway(self):
+        self.assertEqual(room_ops._main(["events", "pull"]), 0)
+
+    def test_events_subscribe_bad_filters_structured(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_ = room_ops._main(["events", "subscribe", ROOM, "--types", "message.created",
+                                  "--filters", "{not json", "--agent", HS])
+        self.assertEqual(rc_, 0)
+        res = json.loads(buf.getvalue())
+        self.assertFalse(res["ok"])
+        self.assertIn("not valid JSON", res["reason"])
+
+    def test_events_stream_no_gateway_structured(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_ = room_ops._main(["events", "stream", "--once"])
+        self.assertEqual(rc_, 0)
+        out = json.loads(buf.getvalue().strip().split("\n")[-1])
+        self.assertFalse(out["ok"])
+        self.assertIn("no gateway", out["reason"])
+
+
+# ----- acceptance runner (events_acceptance) ----- #
+class ObserveReactionKeyTests(unittest.TestCase):
+    def test_observe_key_is_eyes_and_distinct_from_task_ack(self):
+        # Owner-finalized convention: 👀 = event OBSERVED, 🫡 = task acknowledged.
+        # The earlier 🔭 hold is retired now that the task-ack glyph moved to 🫡
+        # (broker server-side #188 + this skill's ACK["received"]), so a room
+        # glance still tells "observed" (👀) apart from "acknowledged" (🫡).
+        self.assertEqual(ea.OBSERVE_REACTION, "\U0001F440")   # 👀
+        self.assertEqual(rc.ACK["received"], "\U0001FAE1")    # 🫡
+        self.assertNotEqual(ea.OBSERVE_REACTION, rc.ACK["received"])
+
+
+# ----- taskify accumulator (events_acceptance) ----- #
+class EventAccumulatorTests(unittest.TestCase):
+    @staticmethod
+    def _env(eid, actor, etype="message.created", room=ROOM):
+        return {"event_id": eid, "type": etype, "room_id": room, "actor_id": actor,
+                "ts": 0, "content": {}}
+
+    def test_threshold_promotion_skips_self_and_dups(self):
+        d = tempfile.mkdtemp()
+        acc = ea.EventAccumulator(ROOM, HS, 3, d)
+        feed = [
+            (1, self._env("$self1", HS)),                        # self → skip
+            (2, self._env("$a", "@u:hs")),                       # counts (1)
+            (3, self._env("$self2", HS)),                        # self → skip
+            (4, self._env("$b", "@u:hs", "reaction.added")),     # counts (2)
+            (5, self._env("$a", "@u:hs")),                       # duplicate → skip
+            (6, self._env("$c", "@u:hs")),                       # counts (3) → promote
+        ]
+        paths = [p for cur, e in feed for p in [acc.offer(cur, e)] if p]
+        self.assertEqual(len(paths), 1)
+
+        base = os.path.basename(paths[0])
+        self.assertTrue(base.startswith("task-") and base.endswith(".txt"))
+        # Format is the SPARROW promotion format now — the accumulator is a
+        # thin adapter over ag2_sparrow TaskifyHandler (one implementation).
+        lines = open(paths[0]).read().split("\n")
+        self.assertEqual(lines[0], f"id: {base[:-4]}")
+        self.assertTrue(lines[1].startswith("timestamp: ") and lines[1].endswith("Z"))
+        # Origin must be explicit at a glance: the [taskify] marker leads the
+        # task line and the promoted-from suffix names the room.
+        self.assertTrue(lines[2].startswith("task: [taskify] "))
+        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[2])
+        self.assertEqual(lines[3], "source: events-promotion")
+        self.assertEqual(lines[4], f"channel_id: {ROOM}")
+        self.assertEqual(lines[5], "priority: low")          # never outranks humans
+        self.assertEqual(lines[6], "model_hint: efficient")  # cheap-model eligible
+        self.assertEqual(lines[7], "access_tier: ambient")  # trust boundary: never owner
+        prov_line = next(ln for ln in lines if ln.startswith("provenance: "))
+        prov = json.loads(prov_line.split("provenance: ", 1)[1])
+        self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])
+        self.assertEqual(prov["promotion_reason"], "threshold 3 meaningful events")
+        self.assertEqual(prov["cursor_range"], [2, 6])
+        # In-band DiD block trails the headers/provenance (mirrors the bridge
+        # fence), telling the core: observation-not-instruction, no privileged
+        # action. It's guidance, not the boundary (the tier is).
+        full = open(paths[0]).read()
+        self.assertIn("===SUTANDO SYSTEM INSTRUCTIONS", full)
+        self.assertIn("===END SUTANDO SYSTEM INSTRUCTIONS===", full)
+        self.assertIn("ambient OBSERVATION", full)
+        self.assertIn("NO privileged action", full)
+        # ...and it comes AFTER the provenance line, not interleaved with headers.
+        self.assertGreater(full.index("SUTANDO SYSTEM INSTRUCTIONS"), full.index("provenance:"))
+
+    def test_wrong_room_and_state_changed_do_not_count(self):
+        d = tempfile.mkdtemp()
+        acc = ea.EventAccumulator(ROOM, HS, 1, d)
+        self.assertIsNone(acc.offer(1, self._env("$x", "@u:hs", room="!other:hs")))
+        self.assertIsNone(acc.offer(2, self._env("$y", "@u:hs", "room.state_changed")))
+
+    def test_each_batch_promotes_once_and_resets(self):
+        d = tempfile.mkdtemp()
+        acc = ea.EventAccumulator(ROOM, HS, 1, d)
+        p1 = acc.offer(1, self._env("$x", "@u:hs"))
+        p2 = acc.offer(2, self._env("$y", "@u:hs"))
+        self.assertTrue(p1 and p2)
+        # Distinct batches ($x vs $y) → distinct deterministic ids → distinct
+        # files (the id is keyed on source event_ids, not a timestamp).
+        self.assertNotEqual(p1, p2)
+        self.assertIn("1 room events", open(p1).read())  # sparrow format
+
+    def test_replayed_batch_is_idempotent_no_duplicate(self):
+        # P1-2 duplicate half (#2292 review): a crash after _promote() renames
+        # the task file but before the cursor advances replays the SAME events
+        # into a fresh accumulator (empty _seen_ids). The deterministic id keyed
+        # on source event_ids means the replay resolves to the SAME path and is
+        # skipped — no second time-based task. Simulates restart via a new acc
+        # over the same task_dir.
+        d = tempfile.mkdtemp()
+        acc1 = ea.EventAccumulator(ROOM, HS, 2, d)
+        acc1.offer(1, self._env("$a", "@u:hs"))
+        p1 = acc1.offer(2, self._env("$b", "@u:hs"))          # promote
+        self.assertTrue(p1)
+        # "restart": fresh accumulator, fresh dedup, same task_dir; same events
+        # replay (cursor did not advance past them).
+        acc2 = ea.EventAccumulator(ROOM, HS, 2, d)
+        acc2.offer(1, self._env("$a", "@u:hs"))
+        p2 = acc2.offer(2, self._env("$b", "@u:hs"))          # replay → same id
+        self.assertEqual(p1, p2)                               # same path, idempotent
+        self.assertEqual(len([f for f in os.listdir(d) if f.endswith(".txt")]), 1)
+
+    def test_promotion_fsyncs_file_then_directory_before_return(self):
+        # Review merge-gate 1: should_persist advances the durable cursor on
+        # the strength of the task path existing, so BOTH the file data and
+        # the directory entry must be fsynced BEFORE _promote returns — an
+        # unflushed rename + host crash loses the batch permanently (cursor
+        # moved, file gone). Asserts the ORDER: data fsync → rename → dir fsync.
+        d = tempfile.mkdtemp()
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+        fd_paths = {}
+        real_open_fd = os.open
+
+        def spy_open(path, flags, *a, **k):
+            fd = real_open_fd(path, flags, *a, **k)
+            fd_paths[fd] = path
+            return fd
+
+        def spy_fsync(fd):
+            # dir-fsync arrives on an os.open() fd we recorded (the task_dir);
+            # the data fsync arrives on the write-handle's fd (not via os.open).
+            events.append(("fsync", "dir" if fd_paths.get(fd) == d else "file"))
+            return real_fsync(fd)
+
+        def spy_replace(src, dst):
+            events.append(("rename", dst))
+            return real_replace(src, dst)
+
+        acc = ea.EventAccumulator(ROOM, HS, 1, d)
+        try:
+            os.open = spy_open
+            os.fsync = spy_fsync
+            os.replace = spy_replace
+            path = acc.offer(1, self._env("$dur", "@u:hs"))
+        finally:
+            os.open, os.fsync, os.replace = real_open_fd, real_fsync, real_replace
+        self.assertTrue(path and os.path.exists(path))
+        kinds = [k for k, _ in events]
+        self.assertEqual(kinds, ["fsync", "rename", "fsync"],
+                         f"durability order must be data-fsync → rename → dir-fsync, got {events}")
+        self.assertEqual(events[0][1], "file")   # first fsync is the temp file's data
+        self.assertEqual(events[2][1], "dir")    # last fsync is the tasks directory entry
+
+    def test_has_pending_tracks_unflushed_batch(self):
+        # P1-2 cursor-hold hinges on this: pending while events accumulate,
+        # clear the instant a promotion flushes the batch.
+        d = tempfile.mkdtemp()
+        acc = ea.EventAccumulator(ROOM, HS, 3, d)
+        self.assertFalse(acc.has_pending())                 # empty
+        acc.offer(1, self._env("$a", "@u:hs"))
+        self.assertTrue(acc.has_pending())                  # 1 accumulated
+        acc.offer(2, self._env("$self", HS))               # self → skipped, no change
+        self.assertTrue(acc.has_pending())                  # still pending $a
+        acc.offer(3, self._env("$b", "@u:hs"))
+        p = acc.offer(4, self._env("$c", "@u:hs"))         # 3rd meaningful → promote
+        self.assertTrue(p)
+        self.assertFalse(acc.has_pending())                 # flushed → cursor safe
+
+
+# ----- acceptance runner arg guards (events_acceptance) ----- #
+class AcceptanceRunnerArgTests(EnvCase):
+    def test_acting_modes_require_agent(self):
+        # P2-2: react/taskify ACT (emit reactions / write tasks) and rely on the
+        # agent's own mxid to suppress self-echo — argparse must reject them when
+        # neither --agent nor AGENT_MXID is present, or the runner acts on its
+        # own events in a feedback loop.
+        os.environ.pop("AGENT_MXID", None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                ea._main(["--room", ROOM, "--cursor-file", "/tmp/c", "--mode", "react"])
+            with self.assertRaises(SystemExit):
+                ea._main(["--room", ROOM, "--cursor-file", "/tmp/c",
+                          "--mode", "taskify", "--task-dir", "/tmp/t"])
 
 
 if __name__ == "__main__":

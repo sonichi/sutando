@@ -1,0 +1,52 @@
+name: Coverage Gate
+
+# Enforce >= 95% unit-test coverage on changed Python lines (diff coverage).
+# The whole-tree number is printed informationally in the job log; the gate
+# itself only judges lines added/changed by the PR, so pre-existing legacy
+# coverage debt never reds an unrelated PR. See docs/testing-coverage.md.
+#
+# The gate writes coverage-summary.md and uploads it as an artifact; the
+# companion workflow_run job (.github/workflows/coverage-comment.yml) posts
+# it as a sticky PR comment. Two-stage on purpose: fork PRs run here with a
+# read-only GITHUB_TOKEN, so the comment must be posted by a workflow that
+# runs in the base-repo context WITHOUT checking out PR code.
+
+on:
+  pull_request:
+    branches: [main, staging-interaction-planes]
+
+jobs:
+  coverage-gate:
+    name: diff coverage >= 95% (python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # diff-cover needs the base branch locally to compute changed lines.
+          fetch-depth: 0
+
+      - name: Install coverage tooling + test deps
+        run: python3 -m pip install coverage diff-cover 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+
+      - name: Run coverage gate
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: bash scripts/coverage-gate.sh
+
+      - name: Stamp PR number for the comment workflow
+        if: always()
+        run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+
+      - name: Upload summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: |
+            coverage-summary.md
+            pr-number.txt
+          if-no-files-found: ignore
+          retention-days: 3

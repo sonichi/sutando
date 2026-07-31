@@ -20,8 +20,11 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
+import urllib.parse
 from urllib.parse import urlparse
 
 # Two-variable split (see docs/workspace-contract.md):
@@ -31,7 +34,7 @@ from urllib.parse import urlparse
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
-from util_paths import personal_path, shared_personal_path  # noqa: E402
+from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
@@ -169,8 +172,15 @@ def get_system_stats() -> dict:
 
     result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
     battery_m = re.search(r'(\d+)%', result.stdout)
-    battery = f"{battery_m.group(1)}%" if battery_m else "?"
-    charging = "charging" in result.stdout.lower() or "ac power" in result.stdout.lower()
+    if battery_m:
+        battery = f"{battery_m.group(1)}%"
+        # \b keeps "discharging" (battery power) from substring-matching "charging".
+        charging = bool(re.search(r'\bcharging\b', result.stdout.lower())) or "ac power" in result.stdout.lower()
+    else:
+        # Battery-less Mac (mini / Studio / Pro): pmset reports "AC Power" with no
+        # percentage line. The old "?" + charging=True combo rendered as "? ⚡".
+        battery = "—"
+        charging = False
 
     return {
         "disk_free": f"{free_gb:.0f}GB",
@@ -209,7 +219,16 @@ h2{font-size:12px;color:#555;text-transform:uppercase;letter-spacing:0.5px;margi
 .pending-badge.done{background:#1a2a1a;color:#5a9a6a}
 .refresh{font-size:10px;color:#333;text-align:center;margin-top:12px}
 .intro{max-width:900px;margin:12px auto 0;color:#7b7b90;font-size:12px;line-height:1.45}
-</style></head><body>
+.quick-links{display:flex;gap:12px;flex-wrap:wrap;font-size:12px}
+.quick-links a{color:#4a8aaa;text-decoration:none}
+</style>
+<script>
+function openQuickLink(event, link){
+  event.preventDefault();
+  window.open(link.href,'_blank','noopener,noreferrer');
+}
+</script>
+</head><body>
 <div style="max-width:900px;margin:0 auto">
 <div style="display:flex;align-items:center;gap:14px">
 <img id="stand-avatar" src="/avatar" style="width:56px;height:56px;border-radius:50%;border:2px solid #4ecca3;display:none;object-fit:cover">
@@ -226,7 +245,44 @@ fetch('/stand-identity').then(r=>r.json()).then(s=>{
 <p class="intro">Tracks current system status alongside the latest capability matrix, recent activity, local endpoints, and quota pressure.</p>
 <div class="grid" id="content">__CONTENT__</div>
 <p class="refresh">Auto-refreshes every 15s</p>
-<script>setInterval(()=>location.reload(),15000)</script>
+<script>
+let _schedBusy=false;
+setInterval(()=>{if(!_schedBusy && !(document.activeElement&&document.activeElement.tagName==='INPUT'))location.reload();},15000);
+function _schedMsg(t,ok){const m=document.getElementById('sched-msg');if(m){m.textContent=t;m.style.color=ok?'#7d9':'#d99';}}
+async function _post(job){
+  _schedBusy=true;
+  try{const r=await fetch('/api/schedules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(job)});
+    const d=await r.json();
+    if(r.ok){_schedMsg(d.note||'Saved.',true);setTimeout(()=>location.reload(),900);}
+    else{_schedMsg(d.error||'Save failed',false);}
+  }catch(e){_schedMsg('Request failed: '+e,false);}
+  finally{_schedBusy=false;}
+}
+function saveCron(btn){
+  const tr=btn.closest('tr');const name=tr.dataset.name;
+  const cron=tr.querySelector('.cron-in').value.trim();
+  _post({name:name,cron:cron});
+}
+async function delCron(btn){
+  const tr=btn.closest('tr');const name=tr.dataset.name;
+  if(!confirm('Delete schedule "'+name+'"?'))return;
+  _schedBusy=true;
+  try{const r=await fetch('/api/schedules/'+encodeURIComponent(name),{method:'DELETE'});
+    const d=await r.json();
+    if(r.ok){_schedMsg(d.note||'Removed.',true);setTimeout(()=>location.reload(),900);}
+    else{_schedMsg('Delete failed',false);}
+  }catch(e){_schedMsg('Request failed: '+e,false);}finally{_schedBusy=false;}
+}
+function addCron(){
+  const name=document.getElementById('ns-name').value.trim();
+  const cron=document.getElementById('ns-cron').value.trim();
+  const body=document.getElementById('ns-body').value.trim();
+  if(!name||!cron||!body){_schedMsg('name, cron, and body are all required',false);return;}
+  const job={name:name,cron:cron};
+  if(body.startsWith('/'))job.prompt_skill=body.slice(1); else job.prompt=body;
+  _post(job);
+}
+</script>
 </body></html>"""
 
 
@@ -272,6 +328,280 @@ def get_use_case_matrix() -> str:
     return '<table style="width:100%;font-size:11px;border-collapse:collapse"><tr style="color:#555;text-align:left"><th></th><th>Use Case</th><th>Details</th></tr>' + ''.join(rows) + '</table>'
 
 
+def _cron_field_match(spec: str, value: int) -> bool:
+    """Match one cron field value against a spec supporting *, */N, A-B, A,B, N."""
+    for token in spec.split(","):
+        if token == "*":
+            return True
+        if token.startswith("*/"):
+            try:
+                step = int(token[2:])
+            except ValueError:
+                continue
+            if step and value % step == 0:
+                return True
+        elif "-" in token:
+            try:
+                a, b = (int(x) for x in token.split("-", 1))
+            except ValueError:
+                continue
+            if a <= value <= b:
+                return True
+        elif token.isdigit() and int(token) == value:
+            return True
+    return False
+
+
+# Per-field value bounds (minute, hour, day-of-month, month, day-of-week).
+# dow allows 0-7 (0 and 7 both = Sunday, per cron convention).
+_CRON_BOUNDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+
+
+def _cron_field_valid(spec: str, lo: int, hi: int) -> bool:
+    """True iff every comma-token of a cron field is syntactically valid and in
+    range: ``*``, ``*/N`` (N>0), ``A-B`` (lo<=A<=B<=hi), or a plain integer in
+    [lo, hi]. Used to reject a malformed field (e.g. ``foo``) or an out-of-range
+    one (e.g. minute ``99``) up front — ``_cron_next_run`` can't distinguish
+    those from a valid-but-rare cron with no run in the scan horizon (both →
+    None), so it must not be the validator (CR #2164, qingyun-wu)."""
+    spec = spec.strip()
+    if not spec:
+        return False
+    for token in spec.split(","):
+        token = token.strip()
+        if token == "*":
+            continue
+        if token.startswith("*/"):
+            step = token[2:]
+            if step.isdigit() and int(step) > 0:
+                continue
+            return False
+        if "-" in token:
+            a, _, b = token.partition("-")
+            if a.isdigit() and b.isdigit() and lo <= int(a) <= int(b) <= hi:
+                continue
+            return False
+        if token.isdigit() and lo <= int(token) <= hi:
+            continue
+        return False
+    return True
+
+
+def _cron_next_run(expr: str, now: datetime, horizon_days: int = 8):
+    """Next datetime matching a 5-field cron expr (minute hour dom month dow),
+    scanning minute-by-minute up to horizon_days. Returns datetime or None.
+
+    dom/dow are AND-combined (sufficient for our crons, which restrict only one
+    of them); the rare cron OR-semantics edge case is not modeled.
+    """
+    from datetime import timedelta
+    parts = expr.split()
+    if len(parts) != 5:
+        return None
+    mnt, hr, dom, mon, dow = parts
+    t = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    end = now + timedelta(days=horizon_days)
+    while t <= end:
+        cron_dow = (t.weekday() + 1) % 7  # python Mon=0..Sun=6 -> cron Sun=0..Sat=6
+        if (_cron_field_match(mnt, t.minute) and _cron_field_match(hr, t.hour)
+                and _cron_field_match(dom, t.day) and _cron_field_match(mon, t.month)
+                and _cron_field_match(dow, cron_dow)):
+            return t
+        t += timedelta(minutes=1)
+    return None
+
+
+def _html_attr(v: str) -> str:
+    """Escape a string for safe use inside a double-quoted HTML attribute."""
+    return (str(v).replace("&", "&amp;").replace('"', "&quot;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _crons_path():
+    """This host's crons.json — canonical host-label (matches schedule-crons +
+    where the file is actually written), NOT the bare hostname (which drifts on
+    DHCP lease changes; #1745). Read and write MUST agree, so both go through
+    this helper."""
+    return WORKSPACE_DIR / "hosts" / _host_label() / "crons.json"
+
+
+def _read_crons() -> list:
+    """Load the cron job list; [] on missing/invalid (never raises)."""
+    p = _crons_path()
+    if not p.exists():
+        return []
+    try:
+        jobs = json.loads(p.read_text())
+        return jobs if isinstance(jobs, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+# Serializes the full read-merge-write transaction for schedule mutations.
+# dashboard runs under ThreadingHTTPServer, so two overlapping POST/DELETE
+# requests would otherwise both read the old list, and the later os.replace
+# could clobber the earlier acknowledged write (or raise FileNotFoundError off a
+# shared temp path). Every upsert/delete holds this lock across read→merge→write
+# so mutations are linearizable (CR #2164, qingyun-wu). A module-level Lock is
+# process-wide; the dashboard is single-process, so it fully covers the server.
+_CRONS_LOCK = threading.Lock()
+
+
+def _write_crons(jobs: list) -> None:
+    """Persist the cron list atomically (tmp + os.replace) so a crash mid-write
+    can't leave a truncated crons.json. Callers MUST hold _CRONS_LOCK for the
+    surrounding read-modify-write; the per-writer temp name (pid+uuid) is only
+    defense in depth so two writers can never collide on one .tmp path."""
+    p = _crons_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(jobs, indent=2) + "\n")
+        os.replace(tmp, p)
+    except OSError:
+        # Never leave an orphan temp behind on a failed write.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _validate_job(job: dict) -> str | None:
+    """Return an error string if the job is invalid, else None. A job needs a
+    non-empty name, a valid 5-field cron expr, and exactly one of prompt /
+    prompt_skill (what schedule-crons requires to actually fire something)."""
+    if not isinstance(job, dict):
+        return "job must be an object"
+    name = (job.get("name") or "").strip()
+    if not name:
+        return "name is required"
+    expr = (job.get("cron") or "").strip()
+    fields = expr.split()
+    if len(fields) != 5:
+        return "cron must be a 5-field expression (min hour dom month dow)"
+    # Validate each field's SYNTAX + range directly. _cron_next_run returns None
+    # for a malformed cron AND for a valid-but-no-run-in-horizon one, so it can't
+    # be the gate — a garbage expr like "foo bar baz qux quux" would slip through
+    # and be persisted as an uncomputable schedule (CR #2164, qingyun-wu).
+    if not all(_cron_field_valid(f, lo, hi) for f, (lo, hi) in zip(fields, _CRON_BOUNDS)):
+        return f"invalid cron expression: {expr!r}"
+    has_prompt = bool((job.get("prompt") or "").strip())
+    has_skill = bool((job.get("prompt_skill") or "").strip())
+    if has_prompt == has_skill:
+        return "provide exactly one of prompt or prompt_skill"
+    return None
+
+
+def upsert_schedule(body: dict) -> tuple[int, dict]:
+    """Pure add/edit: merge `body` onto an existing job by name (so an inline
+    cron-only edit inherits its prompt/prompt_skill), validate the merged
+    result, persist. Returns (http_status, response_obj). Unit-tested; the
+    do_POST handler is a thin wrapper around this."""
+    if not isinstance(body, dict):
+        return 400, {"error": "malformed JSON body"}
+    # Reject a non-string scalar in any text field before calling a string method
+    # on it. `{"name": 123}` (or a non-string cron/prompt/…) would otherwise raise
+    # AttributeError on `.strip()` and close the request with no JSON 400
+    # (CR #2164, qingyun-wu). `null` is allowed here — it's handled downstream as
+    # "field absent".
+    for _k in ("name", "cron", "prompt", "prompt_skill", "description"):
+        _v = body.get(_k)
+        if _v is not None and not isinstance(_v, str):
+            return 400, {"error": f"{_k} must be a string"}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return 400, {"error": "name is required"}
+    # Serialize the whole read→merge→validate→write transaction. Under
+    # ThreadingHTTPServer two overlapping upserts (or an upsert racing a delete)
+    # would both read the pre-mutation list and the second write would silently
+    # clobber the first acknowledged update (CR #2164). The lock makes the
+    # transaction linearizable; delete_schedule takes the same lock.
+    with _CRONS_LOCK:
+        jobs = _read_crons()
+        existing = next((j for j in jobs if j.get("name") == name), None)
+        merged = dict(existing) if existing else {}
+        merged["name"] = name
+        for k in ("cron", "prompt", "prompt_skill", "description"):
+            if k in body and str(body.get(k)).strip():
+                merged[k] = str(body[k]).strip()
+        if (body.get("prompt_skill") or "").strip():
+            merged.pop("prompt", None)
+        elif (body.get("prompt") or "").strip():
+            merged.pop("prompt_skill", None)
+        err = _validate_job(merged)
+        if err:
+            return 400, {"error": err}
+        # Persist the MERGED job — it starts from the existing on-disk entry, so
+        # scheduler-specific fields (execution, delivery, retry_minutes, timezone,
+        # launchd, room, room_id, …) are preserved. A prior version rebuilt a
+        # name/cron/prompt/description whitelist here, silently dropping those on any
+        # edit — saving a cron change could disable a Codex job or detach its room
+        # (CR #2164, qingyun-wu). The prompt/prompt_skill exclusivity was already
+        # applied to `merged` above, so it's write-ready.
+        jobs = [j for j in jobs if j.get("name") != name]
+        jobs.append(merged)
+        _write_crons(jobs)
+        return 200, {"ok": True, "name": name, "count": len(jobs),
+                     "note": "Saved. Takes effect on the next /schedule-crons run (restart)."}
+
+
+def delete_schedule(name: str) -> tuple[int, dict]:
+    """Pure delete-by-name. Returns (http_status, response_obj)."""
+    # Same transaction lock as upsert_schedule — a delete racing an upsert must
+    # not read a stale list and re-persist a job the upsert just removed, or vice
+    # versa (CR #2164).
+    with _CRONS_LOCK:
+        jobs = _read_crons()
+        remaining = [j for j in jobs if j.get("name") != name]
+        if len(remaining) == len(jobs):
+            return 404, {"error": "not found", "name": name}
+        _write_crons(remaining)
+        return 200, {"deleted": name, "count": len(remaining),
+                     "note": "Removed. Takes effect on the next /schedule-crons run (restart)."}
+
+
+def get_schedules() -> list[dict]:
+    """This host's cron schedules + computed next-run time.
+
+    Source: <workspace>/hosts/<hostname>/crons.json (see skills/schedule-crons).
+    Status is 'active' + next run; last-run history isn't tracked on disk.
+    """
+    # Reads via _read_crons() → _crons_path(), which keys off the scutil-first
+    # canonical `_host_label()` (NOT bare hostname) so this panel matches the
+    # WRITER (schedule-crons) and doesn't read the wrong hosts/<host>/ dir under
+    # a DHCP hostname drift (#1745).
+    jobs = _read_crons()
+    now = datetime.now()
+    out = []
+    for job in jobs:
+        expr = job.get("cron", "")
+        kind = f'skill:{job["prompt_skill"]}' if job.get("prompt_skill") else "prompt"
+        nxt = _cron_next_run(expr, now) if expr else None
+        if nxt:
+            mins = int((nxt - now).total_seconds() // 60)
+            if mins < 60:
+                rel = f"in {mins}m"
+            elif mins < 1440:
+                rel = f"in {mins // 60}h{mins % 60:02d}m"
+            else:
+                rel = f"in {mins // 1440}d{(mins % 1440) // 60}h"
+            next_str = f'{nxt.strftime("%a %H:%M")} ({rel})'
+        else:
+            next_str = ">7d" if expr else "invalid"
+        if job.get("description"):
+            desc = job["description"]
+        elif job.get("prompt_skill"):
+            desc = f'Runs the /{job["prompt_skill"]} skill'
+        else:
+            _p = re.sub(r"^Run:?\s*", "", (job.get("prompt") or "").strip())
+            desc = (_p[:100] + "…") if len(_p) > 100 else _p
+        desc = desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        out.append({"name": job.get("name", "?"), "cron": expr, "kind": kind,
+                    "next": next_str, "desc": desc})
+    return out
+
+
 def render_dashboard() -> str:
     health = get_health()
     activity = get_activity(5)
@@ -283,10 +613,19 @@ def render_dashboard() -> str:
     ok_count = sum(1 for c in services_only if c.get("status") in ("ok", "warn"))
     total_count = len(services_only)
 
-    # Score card
+    # Score card. A missing/unparseable score used to render as a bare "?" —
+    # glyph soup for new installs whose build_log.md has no **Score:** marker
+    # yet. Show a real empty state instead of pretending "?" is a value.
+    if score == "?":
+        score_html = ('<p style="font-size:12px;color:#667;line-height:1.5;margin-top:4px">'
+                      'Nothing scored yet. Use cases appear here once the build log '
+                      'records one (a <code style="color:#889">**Score: …**</code> line in '
+                      '<code style="color:#889">build_log.md</code>).</p>')
+    else:
+        score_html = f'<div class="score">{score}</div>'
     cards = [f"""<div class="card">
 <h2>Use Cases</h2>
-<div class="score">{score}</div>
+{score_html}
 </div>"""]
 
     # System stats
@@ -358,28 +697,89 @@ def render_dashboard() -> str:
     # distributed .app (`/Applications/Sutando.app/Contents/MacOS/Sutando`).
     sutando_running = subprocess.run(["/usr/bin/pgrep", "-f", "(Sutando|MacOS)/Sutando"], capture_output=True).returncode == 0
     shortcut_status = '<span class="ok">✓</span> Sutando app running' if sutando_running else '<span class="bad">✗</span> Sutando app not running'
+    # Shortcuts come from <workspace>/state/hotkeys.json (published by the
+    # Sutando app from its resolved config — single source of truth). Only the
+    # human descriptions are local UI copy, keyed by the stable action name.
+    _hk_desc = {
+        "drop_context": "Context drop (text/image/file)",
+        "drop_screenshot": "Drop screenshot",
+        "drop_video_clip": "Drop video clip",
+        "toggle_voice": "Toggle voice",
+        "toggle_mute": "Toggle mute",
+    }
+    try:
+        _hk = json.loads((WORKSPACE_DIR / "state" / "hotkeys.json").read_text())
+    except (OSError, ValueError):
+        _hk = []  # app hasn't published yet — show the header only
+    _hk_rows = "".join(
+        f'<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">{e.get("label","")}</kbd> {_hk_desc.get(e.get("action"), e.get("action",""))}</div>'
+        for e in _hk
+    )
     cards.append(f"""<div class="card">
 <h2>Keyboard Shortcuts</h2>
 <div class="check">{shortcut_status}</div>
 <div style="margin-top:8px;font-size:12px;color:#555">
-<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃C</kbd> Context drop (text/image/file)</div>
-<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃S</kbd> Drop screenshot</div>
-<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃V</kbd> Toggle voice</div>
-<div style="margin:4px 0"><kbd style="background:#222;color:#aaa;padding:2px 6px;border-radius:3px;font-family:monospace">⌃M</kbd> Toggle mute</div>
+{_hk_rows}
 </div></div>""")
 
+    # Schedules (cron jobs from this host's crons.json)
+    schedules = get_schedules()
+    sched_rows = ""
+    for s in schedules:
+        nm = _html_attr(s["name"])
+        sched_rows += (
+            f'<tr data-name="{nm}">'
+            f'<td style="color:#8ab">{s["name"]}'
+            f'<div style="font-size:9px;color:#555">{s.get("desc","")}</div></td>'
+            f'<td><input class="cron-in" value="{_html_attr(s["cron"])}" '
+            f'style="width:110px;font-family:monospace;font-size:10px;background:#12121c;'
+            f'color:#9cf;border:1px solid #2a2a3e;border-radius:3px;padding:2px 4px"></td>'
+            f'<td style="color:#555;font-size:10px">{s["kind"]}</td>'
+            f'<td style="color:#4a8aaa;font-size:10px">{s["next"]}</td>'
+            f'<td style="white-space:nowrap">'
+            f'<button onclick="saveCron(this)" style="font-size:10px;cursor:pointer;'
+            f'background:#1a3a2a;color:#7d9;border:none;border-radius:3px;padding:2px 6px;margin-right:3px">Save</button>'
+            f'<button onclick="delCron(this)" style="font-size:10px;cursor:pointer;'
+            f'background:#3a1a1a;color:#d99;border:none;border-radius:3px;padding:2px 6px">Del</button>'
+            f'</td></tr>\n'
+        )
+    _in = ('background:#12121c;color:#ccd;border:1px solid #2a2a3e;'
+           'border-radius:3px;padding:2px 4px;font-size:10px')
+    add_row = (
+        '<tr style="border-top:1px solid #2a2a3e">'
+        f'<td><input id="ns-name" placeholder="name" style="width:90px;{_in}"></td>'
+        f'<td><input id="ns-cron" placeholder="*/10 * * * *" style="width:110px;font-family:monospace;{_in}"></td>'
+        f'<td colspan="2"><input id="ns-body" placeholder="/skill-name  or  Run: ..." style="width:100%;{_in}"></td>'
+        '<td><button onclick="addCron()" style="font-size:10px;cursor:pointer;'
+        'background:#1a2a3a;color:#9cf;border:none;border-radius:3px;padding:2px 8px">Add</button></td>'
+        '</tr>'
+    )
+    cards.append(
+        '<div class="card full"><h2>Schedules</h2>'
+        '<table style="width:100%;font-size:11px;border-collapse:collapse">'
+        '<tr style="color:#555;text-align:left"><th>Name</th><th>Cron</th>'
+        '<th>Type</th><th>Next run</th><th></th></tr>'
+        + sched_rows + add_row +
+        '</table>'
+        '<div id="sched-msg" style="font-size:10px;margin-top:4px;min-height:12px"></div>'
+        '<div style="font-size:9px;color:#444;margin-top:2px">'
+        f'{len(schedules)} active. Edits persist to crons.json and take effect on the '
+        'next /schedule-crons run (restart). New job body: a <code>/skill-name</code> '
+        '(→ prompt_skill) or free text (→ prompt).</div></div>'
+    )
+
     # Quick links
-    cards.append(f"""<div class="card full">
+    cards.append("""<div class="card full">
 <h2>Quick Links</h2>
-<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px">
-<a href="http://localhost:8080" style="color:#4a8aaa;text-decoration:none">Voice UI :8080</a>
-<a href="http://localhost:7843" style="color:#4a8aaa;text-decoration:none">Task API :7843</a>
-<a href="http://localhost:7844" style="color:#4a8aaa;text-decoration:none">Dashboard :7844</a>
-<a href="http://localhost:7845" style="color:#4a8aaa;text-decoration:none">Screen Capture :7845</a>
-<a href="/notes-ui" style="color:#4a8aaa;text-decoration:none">Notes Browser</a>
-<a href="https://github.com/sonichi/sutando" style="color:#4a8aaa;text-decoration:none">GitHub</a>
-<a href="https://sutando.ai" style="color:#4a8aaa;text-decoration:none">Website</a>
-<a href="https://discord.gg/uZHWXXmrCS" style="color:#4a8aaa;text-decoration:none">Discord</a>
+<div class="quick-links">
+<a href="http://localhost:8080" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Voice UI :8080</a>
+<a href="http://localhost:7843" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Task API :7843</a>
+<a href="http://localhost:7844" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Dashboard :7844</a>
+<a href="http://localhost:7845" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Screen Capture :7845</a>
+<a href="/notes-ui" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Notes Browser</a>
+<a href="https://github.com/sonichi/sutando" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">GitHub</a>
+<a href="https://sutando.ai" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Website</a>
+<a href="https://discord.gg/uZHWXXmrCS" target="_blank" rel="noopener noreferrer" onclick="openQuickLink(event,this)">Discord</a>
 </div></div>""")
 
     return HTML.replace("__CONTENT__", "\n".join(cards))
@@ -393,15 +793,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args): pass
 
-    def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        super().end_headers()
-
-    def do_OPTIONS(self):
+    # No wildcard CORS. The dashboard UI is same-origin (served from this same
+    # loopback origin), so it needs no Access-Control-Allow-Origin. Sending
+    # `*` on every response — while advertising POST/DELETE — let a cross-origin
+    # browser tab mutate loopback schedules in browsers without Private Network
+    # Access enforcement (CR #2164, qingyun-wu). Omitting the header makes the
+    # browser block any cross-origin read or state-changing request; same-origin
+    # calls are unaffected.
+    def do_OPTIONS(self):  # pragma: no cover — HTTP preflight; no cross-origin grant
+        # Same-origin requests never preflight; answer without granting cross-
+        # origin access (no Access-Control-Allow-Origin → browser denies).
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Methods", "GET, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Allow", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
+
+    def _json_body(self):  # pragma: no cover — reads the HTTP request body
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, TypeError):
+            return None
+
+    def _reply_json(self, code, obj):  # pragma: no cover — writes the HTTP response
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
+
+    def do_POST(self):  # pragma: no cover — thin HTTP glue over upsert_schedule()
+        """Upsert a cron job. Loopback-only (same bind as GET). Business logic
+        is the unit-tested pure upsert_schedule()."""
+        if urlparse(self.path).path != "/api/schedules":
+            self.send_response(404); self.end_headers(); return
+        code, obj = upsert_schedule(self._json_body())
+        self._reply_json(code, obj)
 
     def do_GET(self):
         if urlparse(self.path).path == "/":
@@ -547,6 +972,10 @@ load()
             else:
                 self.send_response(404)
                 self.end_headers()
+        elif path.startswith("/api/schedules/"):  # pragma: no cover — thin glue over delete_schedule()
+            name = urllib.parse.unquote(path.split("/api/schedules/", 1)[1])
+            code, obj = delete_schedule(name)
+            self._reply_json(code, obj)
         else:
             self.send_response(404)
             self.end_headers()
