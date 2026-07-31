@@ -602,6 +602,40 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 10 (qingyun-wu, review of 3d631b7). A candidate-LOOKING literal that is
+# immediately SUBSCRIPTED is not a fallback list:
+#     const cmd = ["/usr/local/...", "/opt/homebrew/..."][1];
+# The index picks one operand at AUTHOR time, so the other string is dead and the
+# selected one runs unconditionally. Distinct from the line-continuation case:
+# there the bracket was the subscript; here the literal itself is the subject.
+#
+# `.find(...)` / `.filter(...)` deliberately still pass — they choose at RUNTIME
+# by probing, which is what makes a candidate list portable in the first place.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    def _x(src): return scan('+++ b/src/r10.ts\n@@ -1,0 +1,1 @@\n+' + src)[1]
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    ok("main(): an immediately-indexed literal is not a fallback list",
+       "hardcoded path" in _x("const cmd = " + L + "[1];"))
+    ok("main(): [0] selects just as deterministically",
+       "hardcoded path" in _x("const cmd = " + L + "[0];"))
+    ok("main(): .find(exists) is a RUNTIME resolver and still passes",
+       _x('const cmd = ["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"].find(exists);').strip() == "")
+    ok("main(): a plain list still passes",
+       _x('const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];').strip() == "")
+    ok("_is_selected_from: subscript immediately after the close",
+       rc._is_selected_from('["/a","/b"][1]', 10))
+    ok("_is_selected_from: whitespace then subscript still counts",
+       rc._is_selected_from('["/a","/b"] [1]', 10))
+    ok("_is_selected_from: a semicolon does not count",
+       not rc._is_selected_from('["/a","/b"];', 10))
+    ok("_is_selected_from: a method call does not count",
+       not rc._is_selected_from('["/a","/b"].find(x)', 10))
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so

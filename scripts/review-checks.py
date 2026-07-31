@@ -135,6 +135,25 @@ def _prev_word(code, i):
 _TUPLE_LANG_SUFFIXES = (".py", ".pyi")
 
 
+def _is_selected_from(code, close_idx):
+    """True when the group closing at `close_idx` is IMMEDIATELY subscripted.
+
+        const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"][1];
+
+    That literal is not a fallback list — the index picks one operand at author
+    time, so the other string is dead and the selected one runs unconditionally.
+
+    Only a SUBSCRIPT counts. `.find(exists)` / `.filter(...)` are the genuine
+    resolver idioms this rule exists to permit: they choose at RUNTIME by
+    probing, which is exactly what makes the list portable. `[1]` chooses at
+    author time, which does not.
+    """
+    j = close_idx + 1
+    while j < len(code) and code[j] in " \t":
+        j += 1
+    return j < len(code) and code[j] == "["
+
+
 def _is_candidate_container(code, i, path=None, prev_code=None):
     """Is `code[i]` the opener of a syntactic candidate COLLECTION?
 
@@ -226,6 +245,8 @@ def _group_span(code, pos, path=None, prev_code=None):
             start = stack.pop()
             if not _is_candidate_container(code, start, path, prev_code):
                 continue          # not a syntactic candidate collection
+            if _is_selected_from(code, i):
+                continue          # the collection is immediately indexed
             if start < pos < i and (best is None or start > best[0]):
                 best = (start, i)
     return best

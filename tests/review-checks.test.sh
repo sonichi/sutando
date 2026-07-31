@@ -94,6 +94,10 @@ check "optional element access ?.[ is an index"         flag  $'+++ b/skills/x/r
 check "line-continued subscript is still an index"      flag  $'+++ b/skills/x/c9.ts\n@@ -1,0 +1,2 @@\n+const cmd = paths\n+["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"];'
 check "standalone line-start literal still passes"      clean $'+++ b/skills/x/c9b.ts\n@@ -1,0 +1,2 @@\n+const a = 1;\n+["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"];'
 
+# Round 10: an immediately-subscripted literal selects one operand at author time.
+check "immediately-indexed literal is not a list"      flag  $'+++ b/skills/x/x1.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"][1];'
+check "runtime .find() resolver still passes"          clean $'+++ b/skills/x/x2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"].find(exists);'
+
 # `"" in ")]"` is True in Python, so an unguarded prev-char test made a bracket at
 # COLUMN 0 read as a call on a returned value and falsely flagged a valid list.
 check "candidate list at column 0 still passes"         clean $'+++ b/skills/x/col0.ts\n@@ -1,0 +1,1 @@\n+["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'
