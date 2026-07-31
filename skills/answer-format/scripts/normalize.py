@@ -36,6 +36,7 @@ _MAGNITUDE_RE = re.compile(
     re.IGNORECASE,
 )
 _PURE_NUMBER_COMMAS = re.compile(r"^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
+_CURRENCY_PREFIX = re.compile(r"^(?:[$€£¥]|USD|EUR|GBP|JPY)\s*", re.IGNORECASE)
 _LEADING_ARTICLE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
 
 
@@ -57,25 +58,38 @@ def _expand_magnitude(text: str) -> str | None:
     return f"{normalized:f}"
 
 
+def _strip_currency_prefix(text: str) -> str:
+    """Strip one supported currency wrapper only around a numeric core."""
+    match = _CURRENCY_PREFIX.match(text)
+    if not match:
+        return text
+    core = text[match.end():]
+    numeric = core[:-1] if core.endswith("%") else core
+    if (
+        _MAGNITUDE_RE.match(numeric)
+        or _PURE_NUMBER_COMMAS.match(numeric)
+        or re.fullmatch(r"-?\d+(?:\.\d+)?", numeric)
+    ):
+        return core
+    return text
+
+
 def normalize_number(text: str) -> str:
     """Bare numeric form: expand worded magnitudes, strip thousands separators,
     drop a trailing/leading currency or unit token only when unambiguous."""
-    s = text.strip()
+    s = _strip_currency_prefix(text.strip())
     expanded = _expand_magnitude(s)
     if expanded is not None:
         return expanded
     # "1,234,567" -> "1234567" (only when the whole token is a comma-grouped number)
     if _PURE_NUMBER_COMMAS.match(s):
         return s.replace(",", "")
-    # "$1234" / "$1,000" / "1,000%" -> strip a single leading/trailing symbol
-    # when the rest is numeric — plain OR comma-grouped. The symbol strip and
-    # the thousands-separator removal must COMPOSE (qingyun CR on #2382:
+    # "$1234" / "$1,000" / "1,000%" -> strip a supported currency prefix and
+    # trailing percent around a numeric core. These transforms and the
+    # thousands-separator removal must COMPOSE (qingyun CR on #2382:
     # '$1,000' previously survived number mode intact and, worse, auto mode
-    # list-split it into '$1, 000'). Order: symbol, percent, then commas.
+    # list-split it into '$1, 000'). Order: currency, magnitude, percent, commas.
     stripped = s
-    if stripped[:1] in "$€£¥" and (
-            re.fullmatch(r"-?\d+(?:\.\d+)?", stripped[1:]) or _PURE_NUMBER_COMMAS.match(stripped[1:])):
-        stripped = stripped[1:]
     if stripped[-1:] == "%" and (
             re.fullmatch(r"-?\d+(?:\.\d+)?", stripped[:-1]) or _PURE_NUMBER_COMMAS.match(stripped[:-1])):
         stripped = stripped[:-1]
@@ -129,14 +143,16 @@ def _infer_kind(text: str) -> str:
     # the supported symbol forms — '$1,000' is a number, not the list ['$1','000']
     # (qingyun CR on #2382). Strip the one leading symbol / trailing percent the
     # number path itself supports, then test the grouped-number core.
-    core = s
-    if core[:1] in "$€£¥":
-        core = core[1:]
+    core = _strip_currency_prefix(s)
+    # An unknown ISO-shaped wrapper is not a list just because its amount has a
+    # grouping comma. Preserve it unchanged rather than manufacture "AUD 1, 000".
+    if core == s and re.match(r"^[A-Z]{3}\s+", s):
+        return "string"
     if core[-1:] == "%":
         core = core[:-1]
     if "," in s and not _PURE_NUMBER_COMMAS.match(core):
         return "list"
-    if _MAGNITUDE_RE.match(s) or re.fullmatch(r"[-$€£¥]?\d[\d,]*(?:\.\d+)?%?", s):
+    if _MAGNITUDE_RE.match(core) or re.fullmatch(r"-?\d[\d,]*(?:\.\d+)?", core):
         return "number"
     return "string"
 
