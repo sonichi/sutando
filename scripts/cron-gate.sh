@@ -34,6 +34,13 @@ WORKSPACE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
 reason="$1"
 shift
 
+# Voice delegation caps an explicitly bounded task at six hours. After that
+# point a top-level task file is no longer reliable evidence of live owner work:
+# the result may already have been consumed into results/archive/, or a bridge
+# may have stranded the task before writing a result. Keep yielding to every
+# fresh task, but bound the damage from any stale lifecycle shape.
+MAX_OWNER_TASK_AGE_SECONDS=$((6 * 60 * 60))
+
 # Defer if any OWNER task-*.txt is queued (top-level only; archive/processed
 # subdirs don't count). A matching result means the task has already completed;
 # do not let a delayed task-archival cleanup starve maintenance crons forever.
@@ -53,7 +60,12 @@ if [ -d "$WORKSPACE/tasks" ]; then
     case "$task_name" in
       task-cron-*.txt) continue ;;
     esac
-    if [ ! -f "$WORKSPACE/results/$task_name" ]; then
+    [ -f "$WORKSPACE/results/$task_name" ] && continue
+
+    now_epoch="$(date +%s)"
+    task_mtime="$(stat -f %m "$task_file" 2>/dev/null || stat -c %Y "$task_file" 2>/dev/null || echo "$now_epoch")"
+    task_age=$((now_epoch - task_mtime))
+    if [ "$task_age" -lt "$MAX_OWNER_TASK_AGE_SECONDS" ]; then
       echo "cron-gate: owner tasks queued — deferring $reason (will retry next fire)"
       exit 0
     fi

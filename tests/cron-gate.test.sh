@@ -62,6 +62,34 @@ rm -f \
   "$TMPDIR/tasks/task-2222222222222.txt" \
   "$TMPDIR/results/task-1234567890123.txt"
 
+# --- stale task whose result was already archived → runs --------------------
+# Live shape from issue #2442: the bridge consumed/renamed the result but left
+# its task top-level. Age is the lifecycle-independent starvation backstop.
+mkdir -p "$TMPDIR/results/archive"
+touch "$TMPDIR/tasks/task-3333333333333.txt"
+touch "$TMPDIR/results/archive/task-3333333333333-1785487664.txt"
+touch -t 200001010000 "$TMPDIR/tasks/task-3333333333333.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-stale-archived-result echo 'ran-stale-ok' 2>&1)"
+[ "$out" = "ran-stale-ok" ] || fail "stale archived-result task: expected 'ran-stale-ok', got '$out'"
+ok "stale top-level task cannot starve the gate after its result is archived"
+
+# --- stale task plus genuinely fresh owner task → still defers --------------
+touch "$TMPDIR/tasks/task-4444444444444.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-stale-plus-fresh echo 'should-not-run' 2>&1)"
+case "$out" in
+  *"deferring test-stale-plus-fresh"*) : ;;
+  *) fail "stale+fresh: expected deferral, got '$out'" ;;
+esac
+case "$out" in
+  *"should-not-run"*) fail "stale+fresh: wrapped command ran" ;;
+  *) : ;;
+esac
+ok "fresh owner task still defers alongside stale lifecycle debris"
+rm -f \
+  "$TMPDIR/tasks/task-3333333333333.txt" \
+  "$TMPDIR/tasks/task-4444444444444.txt" \
+  "$TMPDIR/results/archive/task-3333333333333-1785487664.txt"
+
 # --- tasks/ missing entirely → runs wrapped command --------------------------
 rm -rf "$TMPDIR/tasks"
 out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-missing echo 'ran-no-dir' 2>&1)"
@@ -121,4 +149,4 @@ set -e
 ok "wrapped command exit code propagates via exec"
 
 echo
-echo "OK — 11/11 cron-gate tests passed"
+echo "OK — 13/13 cron-gate tests passed"
