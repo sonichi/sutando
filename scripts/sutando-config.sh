@@ -543,7 +543,27 @@ except Exception:
 # independent); dirty flags uncommitted edits. A stronger working-tree
 # 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
 # follow-up alongside the identity block.
+# Skip git entirely on a fresh consumer Mac with no Xcode Command Line Tools.
+# There /usr/bin/git is an Apple shim that pops a GUI 'install the developer
+# tools?' dialog the instant it is invoked -- BEFORE git runs, so the try/except
+# below cannot suppress it -- and this descriptor is probed at app boot, so the
+# dialog fires on the first onboarding screen. The code identity is a no-op there
+# anyway: the bundled engine is an rsync copy with no .git, so every field is
+# None. Gate on a REAL git resolving without invoking the shim: CLT dir present,
+# or the repo actually has a .git. os.path checks never trigger the shim (unlike
+# a bare 'git' or shutil.which('git'), which can).
+def _git_available():
+    if os.path.isdir(os.path.join(repo, '.git')) or os.path.isfile(os.path.join(repo, '.git')):
+        return True
+    for p in ('/Library/Developer/CommandLineTools/usr/bin/git',
+              '/usr/local/bin/git', '/opt/homebrew/bin/git'):
+        if os.path.exists(p):
+            return True
+    return False
+_HAVE_GIT = _git_available()
 def _git(*a):
+    if not _HAVE_GIT:
+        return None
     try:
         r = subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, timeout=5)
         return (r.stdout.strip() or None) if r.returncode == 0 else None
