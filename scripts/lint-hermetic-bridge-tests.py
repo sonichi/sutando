@@ -412,16 +412,41 @@ _DEFERRED_BODIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lam
 
 
 def _reachable_nodes(stmt: ast.AST):
-    """Walk `stmt` but do NOT descend into bodies that only run when CALLED.
+    """Walk `stmt`, descending ONLY into bodies that run unconditionally on import.
 
-    ast.walk() cannot express this — it flattens everything — so the traversal is
-    explicit. Conditionals (`if`/`try`/`with`) are still descended into: they at
-    least execute in module order, and refusing them would reject the ordinary
-    `with tempfile.TemporaryDirectory() as d:` seeding shape.
+    Round 7 (qingyun): skipping def/class bodies was not enough. Descending into every
+    child of `if` and `try` admitted a seed under `if False:` or inside an `except`
+    handler that never fires — recorded as if it had executed before the bridge import.
+
+    What runs unconditionally when a module is imported:
+      * top-level statements
+      * a `with` body (the context manager is entered)
+      * a `try` BODY and its `finally`
+
+    What does NOT:
+      * either branch of an `if`  — `if False:` is the degenerate case, but no `if` branch
+        is guaranteed
+      * an `except` handler       — only on exception
+      * a `try`/`for`/`while` `else` — conditional on how the block exits
+      * `for`/`while` bodies      — an empty iterable runs the body zero times
+
+    Under-approximating CLEAN is this file's documented stance, so anything not
+    guaranteed is refused. The cost is stated plainly rather than hidden: a legitimate
+    `if not (cfg / "access.json").exists(): seed()` now reads as a violation. That is a
+    real false positive, and it is the same class as the one #2357 exposed — see the
+    open design question about isolation-via-helper and scoped isolation.
     """
     if isinstance(stmt, _DEFERRED_BODIES):
         return
     yield stmt
+    if isinstance(stmt, ast.If):
+        return                      # neither branch is guaranteed
+    if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+        return                      # zero iterations is legal
+    if isinstance(stmt, ast.Try):
+        for child in stmt.body + stmt.finalbody:
+            yield from _reachable_nodes(child)
+        return                      # handlers and `else` are conditional
     for child in ast.iter_child_nodes(stmt):
         yield from _reachable_nodes(child)
 

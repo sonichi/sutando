@@ -370,6 +370,36 @@ check(
     "module-level inline seed IS still a seed",
     lint.classify(write(tmpdir, _ENV + _INLINE_SEED + IMPORTS_BRIDGE)) == lint.CLEAN,
 )
+# Review 14 (qingyun, #2429): skipping def/class bodies was not enough — descending into
+# every child of `if`/`try` admitted a seed under `if False:` or inside an `except` handler
+# that never fires. Only bodies that run UNCONDITIONALLY on import may count.
+check(
+    "seed under `if False:` is NOT a seed",
+    lint.classify(write(tmpdir, _ENV + 'if False:\n    ' + _INLINE_SEED + IMPORTS_BRIDGE))
+    == lint.VIOLATION,
+    "no `if` branch is guaranteed to run on import",
+)
+check(
+    "seed inside an `except` handler is NOT a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'try:\n    pass\nexcept Exception:\n    ' + _INLINE_SEED + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "a handler only runs on exception",
+)
+check(
+    "seed inside a `for` body is NOT a seed",
+    lint.classify(write(tmpdir, _ENV + 'for _ in []:\n    ' + _INLINE_SEED + IMPORTS_BRIDGE))
+    == lint.VIOLATION,
+    "zero iterations is legal",
+)
+check(
+    "seed in a `try` BODY IS a seed (runs unconditionally)",
+    lint.classify(
+        write(tmpdir, _ENV + 'try:\n    ' + _INLINE_SEED + 'except Exception:\n    pass\n' + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+)
 check(
     "seed inside a `with` block IS a seed (runs in module order)",
     lint.classify(
