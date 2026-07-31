@@ -28,6 +28,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import time
@@ -163,6 +164,72 @@ code, msg = cli("release", "session-b", "--stamp", "--token", tok_b,
 check("release after claim gone refuses without stamping",
       code == 1 and "no live claim" in msg, msg)
 
+# 4d. compare-and-delete reap (#2454 round 4): the deterministic hazard —
+# after a claimer reads a STALE claim, the claim is reaped-and-replaced by
+# a FRESH one; the late deleter must NOT remove the fresh claim.
+d6 = Path(tempfile.mkdtemp(prefix="claim-reap-"))
+(d6 / rc.CLAIM_NAME).write_text(json.dumps(
+    {"session": "old", "ts": time.time() - STALE_S - 60, "token": "tok-old"}))
+stale_tok, stale_age = rc._read_claim(d6 / rc.CLAIM_NAME)
+check("stale read sees the old token", stale_tok == "tok-old"
+      and stale_age >= STALE_S)
+# ...meanwhile another reclaimer wins: stale reaped, FRESH claim linked
+(d6 / rc.CLAIM_NAME).write_text(json.dumps(
+    {"session": "new", "ts": time.time(), "token": "tok-fresh"}))
+rc._try_reap(d6, stale_tok, STALE_S)   # the late deleter fires
+check("late reap refuses to delete the fresh claim",
+      (d6 / rc.CLAIM_NAME).exists()
+      and json.loads((d6 / rc.CLAIM_NAME).read_text())["token"] == "tok-fresh")
+# ...but a genuine stale claim IS reaped under the lock
+(d6 / rc.CLAIM_NAME).write_text(json.dumps(
+    {"session": "old2", "ts": time.time() - STALE_S - 60, "token": "tok-o2"}))
+rc._try_reap(d6, "tok-o2", STALE_S)
+check("matching stale claim is reaped", not (d6 / rc.CLAIM_NAME).exists())
+check("reaper lock released after reap",
+      not (d6 / rc.REAP_LOCK_NAME).exists())
+# ...a held reaper lock blocks deletion entirely
+(d6 / rc.CLAIM_NAME).write_text(json.dumps(
+    {"session": "old3", "ts": time.time() - STALE_S - 60, "token": "tok-o3"}))
+(d6 / rc.REAP_LOCK_NAME).write_text("held")
+rc._try_reap(d6, "tok-o3", STALE_S)
+check("held reaper lock blocks the reap",
+      (d6 / rc.CLAIM_NAME).exists())
+# ...an EXPIRED reaper lock is cleared (crash recovery) without reaping
+old = time.time() - rc.REAP_LOCK_TTL_S - 5
+os.utime(d6 / rc.REAP_LOCK_NAME, (old, old))
+rc._try_reap(d6, "tok-o3", STALE_S)
+check("expired reaper lock cleared, claim untouched this round",
+      not (d6 / rc.REAP_LOCK_NAME).exists()
+      and (d6 / rc.CLAIM_NAME).exists())
+
+# 4e. concurrent stale-reclaim stress (reviewer hit 2 winners by round 219
+# of 24 claimers on the pre-fix head): every round starts from one STALE
+# claim; the safety property is never >1 winner, and the surviving claim
+# must be a winner's. Liveness: nearly every round should produce a winner.
+rounds, claimers, winner_counts = 300, 12, []
+d7 = Path(tempfile.mkdtemp(prefix="claim-stress-"))
+with ThreadPoolExecutor(max_workers=claimers) as pool:
+    for rnd in range(rounds):
+        for f in d7.iterdir():
+            f.unlink()
+        (d7 / rc.CLAIM_NAME).write_text(json.dumps(
+            {"session": "dead", "ts": time.time() - STALE_S - 60,
+             "token": f"dead-{rnd}"}))
+        with redirect_stdout(io.StringIO()):
+            codes = list(pool.map(
+                lambda _: rc.claim(d7, SESSION, STALE_S), range(claimers)))
+        wins = codes.count(0)
+        winner_counts.append(wins)
+        if wins > 1:
+            break
+check("stale-reclaim stress: never more than one winner "
+      f"({rounds} rounds x {claimers} claimers)",
+      max(winner_counts) <= 1, f"round {len(winner_counts)-1}: "
+      f"{winner_counts[-1]} winners")
+check("stale-reclaim stress: liveness (>=90% rounds produce a winner)",
+      sum(winner_counts) >= 0.9 * len(winner_counts),
+      f"{sum(winner_counts)}/{len(winner_counts)}")
+
 # 5. stale claim (dead worker) is reclaimed
 d2 = Path(tempfile.mkdtemp(prefix="claim-stale-"))
 (d2 / rc.CLAIM_NAME).write_text(json.dumps(
@@ -172,11 +239,18 @@ check("stale claim reclaimed", code == 0 and "claimed" in msg, msg)
 check("reclaim refreshed the ts",
       time.time() - json.loads((d2 / rc.CLAIM_NAME).read_text())["ts"] < 60)
 
-# 6. corrupt claim file counts as stale
+# 6. corrupt claims: non-reclaimable while their mtime is FRESH (round-2
+# review: an unreadable-but-young claim must not be treated as stale), and
+# reclaimable once the file mtime itself is stale.
 d3 = Path(tempfile.mkdtemp(prefix="claim-corrupt-"))
 (d3 / rc.CLAIM_NAME).write_text("not json{")
 code, msg = cli("claim", SESSION, "--state-dir", str(d3))
-check("corrupt claim treated as stale and reclaimed", code == 0, msg)
+check("fresh corrupt claim is NOT reclaimable (in-flight by mtime)",
+      code == 1 and "in-flight" in msg, msg)
+old_m = time.time() - STALE_S - 60
+os.utime(d3 / rc.CLAIM_NAME, (old_m, old_m))
+code, msg = cli("claim", SESSION, "--state-dir", str(d3))
+check("mtime-stale corrupt claim is reclaimed", code == 0, msg)
 
 # 6b. defensive loop exit: if every link round collides (claim keeps
 # reading stale), the claimer gives up with exit 1 instead of spinning

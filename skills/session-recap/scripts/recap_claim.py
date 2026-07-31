@@ -55,6 +55,11 @@ REPO = SCRIPT_PARENT.parents[2]
 
 CLAIM_NAME = "recap-inflight.json"
 STAMP_NAME = "last-recap-session.txt"
+REAP_LOCK_NAME = "recap-inflight.reap.lock"
+# The reaper's critical section is three syscalls (~1ms); the TTL only
+# matters if a reaper dies inside it, so 60s makes takeover pathologies
+# require a 60s stall in a 1ms section while keeping crash recovery quick.
+REAP_LOCK_TTL_S = 60.0
 
 
 def state_dir(override: str | None) -> Path:
@@ -64,6 +69,58 @@ def state_dir(override: str | None) -> Path:
         ["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
         capture_output=True, text=True, check=True).stdout.strip()
     return Path(ws) / "state"
+
+
+def _read_claim(path: Path) -> tuple[str | None, float]:
+    """(token, age_seconds) of the claim at path. Unparseable claims have
+    token None and age from file mtime; a missing file reads as infinitely
+    old so callers fall through to the normal link race."""
+    try:
+        cur = json.loads(path.read_text())
+        return cur.get("token"), time.time() - float(cur.get("ts") or 0)
+    except (OSError, ValueError):
+        try:
+            return None, time.time() - path.stat().st_mtime
+        except OSError:
+            return None, float("inf")
+
+
+def _try_reap(sdir: Path, stale_token: str | None, stale_s: float) -> None:
+    """Compare-and-delete of a stale claim, serialized by a reaper lock.
+
+    A bare unlink between 'read stale' and 'delete' can destroy a FRESH
+    claim another reclaimer just linked (round-4 review repro: 24
+    concurrent claimers on one stale claim -> two winners). Deletion is
+    therefore allowed only (a) while holding the O_EXCL reaper lock and
+    (b) after a re-read under that lock confirms the claim is still the
+    exact stale one the caller judged (token identity + still stale).
+    Losers of the lock delete nothing and simply re-race."""
+    lock = sdir / REAP_LOCK_NAME
+    path = sdir / CLAIM_NAME
+    try:
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+    except FileExistsError:
+        # A reaper is active or died inside the section < TTL ago. Never
+        # reap without the lock; clear it only once it has expired.
+        try:
+            if time.time() - lock.stat().st_mtime > REAP_LOCK_TTL_S:
+                lock.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    try:
+        tok, age = _read_claim(path)
+        # A MISSING claim is never reaped: the path is already free, and a
+        # free path can gain a fresh link between our re-read and an
+        # unlink — deleting it would kill that fresh winner (the residual
+        # 2-winner hole: missing reads as (None, inf), which "matches" a
+        # caller whose stale read was also token-less). An OCCUPIED stale
+        # file is safe to delete: link fails while it exists, so nothing
+        # fresh can appear under it, and the lock serializes deleters.
+        if age != float("inf") and tok == stale_token and age >= stale_s:
+            path.unlink(missing_ok=True)
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def claim(sdir: Path, session: str, stale_s: float) -> int:
@@ -93,16 +150,16 @@ def claim(sdir: Path, session: str, stale_s: float) -> int:
             try:
                 os.link(tmp, path)
             except FileExistsError:
-                try:
-                    cur = json.loads(path.read_text())
-                except (OSError, ValueError):
-                    cur = {}
-                age = time.time() - float(cur.get("ts") or 0)
+                cur_tok, age = _read_claim(path)
+                if age == float("inf"):
+                    continue  # claim vanished — just re-race the link
                 if age < stale_s:
-                    print(f"skip: in-flight ({cur.get('session', '?')}, "
-                          f"{age:.0f}s old)")
+                    print(f"skip: in-flight ({age:.0f}s old)")
                     return 1
-                path.unlink(missing_ok=True)  # dead worker — re-race
+                # Dead worker. Deletion goes through the serialized
+                # compare-and-delete — never a bare unlink, which could
+                # destroy a fresh claim linked after our stale read.
+                _try_reap(sdir, cur_tok, stale_s)
                 continue
             print(f"claimed token={token}")
             return 0
