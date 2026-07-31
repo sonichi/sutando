@@ -565,6 +565,12 @@ try:
        not rc._is_candidate_container('paths?.["/a","/b"]', 7))
     ok("container: keyword + space before [ -> literal",
        rc._is_candidate_container('return ["/a","/b"]', 7))
+    # `)` / `]` before the bracket: a subscript on an expression result, e.g.
+    # `fn()["k"]` or `rows[0]["k"]`. Distinct from the `?.` and identifier arms.
+    ok("container: `)` before [ -> subscript on a call result",
+       not rc._is_candidate_container('fn()["/a","/b"]', 4))
+    ok("container: `]` before [ -> chained subscript",
+       not rc._is_candidate_container('rows[0]["/a","/b"]', 7))
 finally:
     rc.flags.remove("/opt/")
 
