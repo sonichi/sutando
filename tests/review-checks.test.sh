@@ -55,6 +55,12 @@ check "paired line still flags a real /Users/ leak"   flag  $'+++ b/skills/x/f.p
 check "2nd same-prefix token, unpaired, still flagged" flag  $'+++ b/skills/x/h.ts\n@@ -1,0 +1,1 @@\n+const P = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/othertool"];'
 check "two independently paired lists both pass"       clean $'+++ b/skills/x/i.ts\n@@ -1,0 +1,1 @@\n+const A=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]; const B=["/opt/homebrew/bin/ffprobe","/usr/local/bin/ffprobe"];'
 
+# Companion must be in the token's OWN group, not merely the same line: a valid
+# list must not vouch for an unrelated direct use of the same binary (review of
+# 0e786f8). origin/main flags this line; the line-wide version passed it.
+check "direct use beside a valid same-binary list flags" flag  $'+++ b/skills/x/j.ts\n@@ -1,0 +1,1 @@\n+const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]; spawn("/opt/homebrew/bin/ffmpeg");'
+check "positive control: that same list alone passes"   clean $'+++ b/skills/x/k.ts\n@@ -1,0 +1,1 @@\n+const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

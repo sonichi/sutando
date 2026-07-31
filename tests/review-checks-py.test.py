@@ -323,6 +323,45 @@ try:
 finally:
     rc.flags.remove("/opt/")
 
+# ---------------------------------------------------------------------------
+# Same-basename direct use beside a VALID list (qingyun-wu, review of 0e786f8).
+#
+# The candidate-list shape is an EXPRESSION, not a line. A line-wide companion
+# search let a legitimate list vouch for an unrelated direct use of the SAME
+# binary later on the same line — the runtime still launches an Apple-Silicon-only
+# path on Intel, which is exactly what this rule exists to prevent. Note the
+# every-occurrence fix above is what makes the third token reachable, so this
+# case only became observable once that landed.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    _mixed = ('+++ b/src/mixed.ts\n@@ -1,0 +1,1 @@\n'
+              '+const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]; '
+              'spawn("/opt/homebrew/bin/ffmpeg");')
+    _code, _out = scan(_mixed)
+    ok("main(): direct use beside a valid same-binary list is still reported",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" in _out)
+
+    # Positive control — the list ALONE must still pass, or the fix is just
+    # "stop exempting anything".
+    _code, _out = scan('+++ b/src/list.ts\n@@ -1,0 +1,1 @@\n'
+                       '+const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];')
+    ok("main(): the valid list on its own still passes", _out.strip() == "")
+
+    # Unit level: the companion must be in the token's OWN group.
+    _l = 'const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]; spawn("/opt/homebrew/bin/ffmpeg");'
+    ok("paired: token inside the list is exempt (its group has the companion)",
+       rc.paired_allowed("/opt/homebrew/bin/ffmpeg", _l, _l.find("/opt/homebrew/bin/ffmpeg")))
+    ok("paired: the direct-use token is NOT exempt (its group has no companion)",
+       not rc.paired_allowed("/opt/homebrew/bin/ffmpeg", _l, _l.rfind("/opt/homebrew/bin/ffmpeg")))
+    ok("paired: two independently paired groups on one line both exempt",
+       rc.paired_allowed("/opt/homebrew/bin/ffprobe",
+                         'A=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]; '
+                         'B=["/opt/homebrew/bin/ffprobe","/usr/local/bin/ffprobe"];',
+                         None))
+finally:
+    rc.flags.remove("/opt/")
+
 print("---")
 if failed:
     print("FAILED — %d of %d" % (failed, passed + failed))

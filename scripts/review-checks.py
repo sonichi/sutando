@@ -92,7 +92,32 @@ def _code_part(s):
     return s
 
 
-def paired_allowed(tok, line):
+def _group_span(code, pos):
+    """The innermost bracket group containing `pos`, as (start, end) into `code`.
+
+    The candidate-list shape is an EXPRESSION — `["/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg"]` — not a line. Scoping the companion search to the
+    flagged token's own group is what stops a valid list from vouching for an
+    unrelated direct use of the same binary later on the same line.
+
+    Falls back to the whole string when `pos` is inside no bracket (a bare
+    `A = "..."; B = "..."` has no grouping) or when brackets are unbalanced.
+    That fallback is the pre-existing line-wide behaviour, and the basename
+    check still guards it.
+    """
+    opens, closes = "([{", ")]}"
+    stack, best = [], None
+    for i, ch in enumerate(code):
+        if ch in opens:
+            stack.append(i)
+        elif ch in closes and stack:
+            start = stack.pop()
+            if start < pos < i and (best is None or start > best[0]):
+                best = (start, i)
+    return best if best is not None else (0, len(code))
+
+
+def paired_allowed(tok, line, pos=None):
     """Contextual exemption for the portable candidate-list shape.
 
     `tok` is exempt only when the SAME line carries a companion path for the
@@ -106,15 +131,33 @@ def paired_allowed(tok, line):
 
     The companion is sought in the line's CODE only (see `_code_part`): a
     promise in a comment is not a fallback.
+
+    It is also sought only within the flagged occurrence's own bracket GROUP,
+    not anywhere on the line. Line-wide matching let a valid candidate list
+    vouch for an unrelated direct use of the same binary:
+
+        const C = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"];
+        spawn("/opt/homebrew/bin/ffmpeg");
+
+    The third token has the same basename, so it reused the list's companion and
+    was exempted while the runtime still launched an Apple-Silicon-only path on
+    Intel. `pos` is the occurrence's index in `line`; it defaults to the first
+    occurrence so existing two-argument callers keep their behaviour.
     """
     base = tok.rsplit("/", 1)[-1]
     if not base:
         return False
     code = _code_part(line)
+    if pos is None:
+        pos = line.find(tok)
+    if pos < 0 or pos >= len(code):
+        return False
+    start, end = _group_span(code, pos)
+    scope = code[start:end]
     for prefix, companion in paired:
         if not tok.startswith(prefix):
             continue
-        for other in _tokens(code):
+        for other in _tokens(scope):
             if other.startswith(companion) and other.rsplit("/", 1)[-1] == base:
                 return True
     return False
@@ -224,7 +267,7 @@ def main():
                     if pos < 0:
                         break
                     tok = token_at(line, pos)
-                    if not allowed(tok) and not paired_allowed(tok, line):
+                    if not allowed(tok) and not paired_allowed(tok, line, pos):
                         print("%s:%d: hardcoded path (%s): %s" % (cur_file, cur, tok, stripped))
                         hits += 1
                         reported = True
