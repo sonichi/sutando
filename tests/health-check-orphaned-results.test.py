@@ -83,8 +83,7 @@ class OrphanedResultsTest(unittest.TestCase):
         result = hc.check_orphaned_results()
 
         self.assertEqual(result["status"], "warn")
-        self.assertIn("3 terminal result(s) await archival", result["detail"])
-        self.assertIn("no delivery intended", result["detail"])
+        self.assertIn("3 completed/non-delivery result(s) await archival", result["detail"])
         self.assertNotIn("never delivered", result["detail"])
 
     def test_task_orphan_done_transition_does_not_claim_delivery_loss(self):
@@ -98,7 +97,7 @@ class OrphanedResultsTest(unittest.TestCase):
         result = hc.check_orphaned_results()
 
         self.assertEqual(result["status"], "warn")
-        self.assertIn("1 terminal result(s) await archival", result["detail"])
+        self.assertIn("1 completed/non-delivery result(s) await archival", result["detail"])
         self.assertNotIn("never delivered", result["detail"])
 
     def test_mixed_terminal_and_ordinary_results_keep_delivery_warning(self):
@@ -109,7 +108,54 @@ class OrphanedResultsTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "warn")
         self.assertIn("1 result(s) whose task is already archived — never delivered", result["detail"])
-        self.assertIn("1 terminal result(s) await archival", result["detail"])
+        self.assertIn("1 completed/non-delivery result(s) await archival", result["detail"])
+
+    def test_archived_local_chat_and_live_test_results_are_completion_markers(self):
+        archive = self.ws / "tasks" / "archive"
+        archive.mkdir()
+        for task_id, channel_id in (
+            ("task-chat-123", "local-chat"),
+            ("task-live-probe-123", "local-live-test"),
+        ):
+            self._write(f"results/{task_id}.txt", TWO_HOURS_AGO)
+            self._write(
+                f"tasks/archive/{task_id}.txt",
+                TWO_HOURS_AGO,
+                (
+                    f"id: {task_id}\n"
+                    "task: local work item\n"
+                    "source: chat\n"
+                    f"channel_id: {channel_id}\n"
+                ),
+            )
+
+        result = hc.check_orphaned_results()
+
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("2 completed/non-delivery result(s) await archival", result["detail"])
+        self.assertNotIn("never delivered", result["detail"])
+
+    def test_remote_task_body_cannot_forge_local_completion(self):
+        archive = self.ws / "tasks" / "archive"
+        archive.mkdir()
+        self._write("results/task-remote.txt", TWO_HOURS_AGO)
+        self._write(
+            "tasks/archive/task-remote.txt",
+            TWO_HOURS_AGO,
+            (
+                "id: task-remote\n"
+                "source: discord\n"
+                "channel_id: 12345678901234567\n"
+                "task: remote body\n"
+                "source: chat\n"
+                "channel_id: local-chat\n"
+            ),
+        )
+
+        result = hc.check_orphaned_results()
+
+        self.assertIn("never delivered", result["detail"])
+        self.assertNotIn("completed/non-delivery", result["detail"])
 
     # --- negative: the guards that keep a 'warn' meaningful -------------
 
