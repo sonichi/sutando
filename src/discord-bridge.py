@@ -86,6 +86,18 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
+from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+
+# Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
+# depth 0). Only the immediate parent is inlined, so beyond this there is no
+# content to keep.
+REPLY_CHAIN_MAX_DEPTH = 8
+# Cap the ID-only walk toward the root. The `reply_chain_ids` spine keeps
+# walking (ids are cheap) past the content cap so a deep thread still exposes
+# every ancestor's re-fetch handle — not just the nearest 8. Bounded so a
+# pathological thread can't trigger an unbounded fetch loop; if the root is not
+# reached within this bound, an explicit truncation marker is emitted.
+REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
@@ -3103,24 +3115,42 @@ async def _handle_discord_message(message, force=False):
     # which earlier answer the user is responding to. Without this the
     # bot sees only the new reply text in isolation.
     reply_context = ""
+    reply_chain_ids_line = ""   # `reply_chain_ids:` metadata (root-first) for thread reconstruction
     if message.reference and message.reference.message_id:
         try:
             ref_msg = message.reference.resolved
             if ref_msg is None:
                 ref_msg = await message.channel.fetch_message(message.reference.message_id)
             if ref_msg is not None:
-                # Include reply context for all messages so the core agent
-                # understands what the user is responding to.
-                ref_author = str(ref_msg.author)
-                ref_content = (ref_msg.content or "").strip()
-                # Strip bot-id mentions so the context doesn't show raw id soup
-                ref_content = ref_content.replace(f"<@{client.user.id}>", "")
-                snippet = ref_content[:400].replace("\n", " ").strip()
-                if snippet:
-                    reply_context = (
-                        f"\n\n[Replying to {ref_author} "
-                        f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
-                    )
+                # Walk the reply chain to the root (Chi 2026-07-25). The old
+                # `ref_content[:400]` snippet silently truncated the parent.
+                # Lean design: inline only the FULL immediate parent (no cut) via
+                # format_reply_chain(chain[0]); the walk's purpose here is to
+                # collect the ancestor IDS for the `reply_chain_ids` spine, so a
+                # deeper ancestor can be fetched precisely on demand rather than
+                # bloating every task file with the whole thread's content.
+                # Keep collecting ids toward the root past the CONTENT cap so the
+                # `reply_chain_ids` spine reaches the root question, not just the
+                # nearest REPLY_CHAIN_MAX_DEPTH ancestors. Content is only kept
+                # for the inlined depth; ids continue to REPLY_CHAIN_IDS_MAX_DEPTH.
+                #
+                # The walk itself lives in reply_chain.walk_reply_chain so the
+                # depth-cap and unfetchable-ancestor paths are unit-testable —
+                # inline here they sat behind `pragma: no cover`, so the two
+                # cases where context is silently lost were the only ones never
+                # exercised (PR #2310 review 2).
+                chain, chain_ids, reached_root = await walk_reply_chain(
+                    ref_msg,
+                    message.channel.fetch_message,
+                    max_content_depth=REPLY_CHAIN_MAX_DEPTH,
+                    max_ids_depth=REPLY_CHAIN_IDS_MAX_DEPTH,
+                    strip_mention=f"<@{client.user.id}>",
+                )
+                reply_context = format_reply_chain(chain)  # pragma: no cover
+                reply_context += format_reply_chain_truncation(  # pragma: no cover
+                    reached_root, chain_ids[-1] if chain_ids else None
+                )
+                reply_chain_ids_line = format_reply_chain_ids(chain_ids)  # pragma: no cover
                 # Also download attachments that live on the replied-to
                 # message. Without this, a file shared on a parent message
                 # and then acted on via an @-mention *reply* is silently
@@ -3574,6 +3604,11 @@ async def _handle_discord_message(message, force=False):
         if getattr(message, "reference", None) and message.reference.message_id
         else ""
     )
+    # Full walked ancestor id spine (root-first) for thread reconstruction —
+    # handles to re-fetch any ancestor the inlined chain clipped/dropped past
+    # the depth/size guard. Only emitted for a real chain (>=2 ids); a single
+    # parent is already covered by parent_message_id above. (Chi 2026-07-25.)
+    parent_msg_line += reply_chain_ids_line
     # Also emit the replied-to author as a STRUCTURED header, not just the
     # opaque parent_message_id. In a multi-bot channel a consumer must be able
     # to tell WHO the sender was addressing (e.g. a reply aimed at another bot)
