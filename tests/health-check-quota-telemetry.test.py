@@ -234,7 +234,8 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         p.write_text(json.dumps({"host": "h", "started_at": started_at}))
         return p
 
-    def _write_sessions(self, *starts: float, runtime: "str | None" = None) -> Path:
+    def _write_sessions(self, *starts: float, runtime: "str | None" = None,
+                        host: "str | None" = None) -> Path:
         """`state/session-starts.log` — one JSON line per core launch. THIS is the
         session boundary; the heartbeat is not (see below).
 
@@ -245,11 +246,19 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         nothing therefore produces the CLAUDE shape. Omitting it while intending a Codex
         launch is what made the original skew regression pin the ambiguous case as
         healthy instead of the real one (qingyun-wu + john-the-dev, #2446).
+
+        `host` defaults to THIS host, because both real launchers stamp it as the first
+        field (`{"host":"%s","session_started_at":...}`). The helper used to omit it
+        entirely, which is precisely why a 33/33 green suite could not see that
+        `_last_core_launch_at()` was picking the newest record from ANY host — every
+        fixture was host-less, so the filter had nothing to discriminate on
+        (john-the-dev, #2446). Pass `host=` to write a FOREIGN host's launch.
         """
         p = self.ws / "state" / "session-starts.log"
         lines = []
         for t in starts:
-            entry = {"session_started_at": t, "source": "start-cli"}
+            entry = {"host": self.hc._host_label() if host is None else host,
+                     "session_started_at": t, "source": "start-cli"}
             if runtime is not None:
                 entry["runtime"] = runtime
             lines.append(json.dumps(entry) + "\n")
@@ -273,6 +282,77 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         self._write_sessions(now - 86400, now - 300)  # current core launched AFTER the marker
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "warn", r["detail"])
+
+    def test_newer_foreign_host_launch_does_not_age_the_local_marker(self):
+        """qingyun-wu + john-the-dev's exact repro (#2446), independently reproduced.
+
+        `session-starts.log` lives in a SYNCED workspace, so it carries other hosts'
+        launches too. Taking the newest line globally let a launch on host B become
+        host A's session boundary and age host A's current marker into a false `warn`
+        — manufacturing the very false positive this check exists to suppress.
+
+        Reported activated-path result before the host filter:
+            local Codex marker/session at now-60 only     => ok
+            same local state + foreign Codex launch at now => warn
+        """
+        now = time.time()
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        (self.ws / "state" / "core-runtime.json").write_text(
+            json.dumps({"runtime": "codex", "started_at": now - 60})
+        )
+        # Local core launched at now-60; a DIFFERENT host launched more recently.
+        p = self.ws / "state" / "session-starts.log"
+        p.write_text(
+            json.dumps({"host": self.hc._host_label(),
+                        "session_started_at": now - 60,
+                        "source": "start-cli", "runtime": "codex"}) + "\n"
+            + json.dumps({"host": "some-other-host",
+                          "session_started_at": now,
+                          "source": "start-cli", "runtime": "codex"}) + "\n"
+        )
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertNotEqual(r["status"], "warn", r["detail"])
+
+    def test_foreign_host_launch_is_not_a_boundary_at_all(self):
+        """A log containing ONLY another host's launches yields no local boundary."""
+        now = time.time()
+        p = self.ws / "state" / "session-starts.log"
+        p.write_text(json.dumps({"host": "some-other-host",
+                                 "session_started_at": now,
+                                 "source": "start-cli", "runtime": "codex"}) + "\n")
+        self.assertIsNone(self.hc._last_core_launch_at())
+
+    def test_legacy_host_less_record_is_skipped_not_assumed_local(self):
+        """Explicit legacy policy: unattributable records are SKIPPED.
+
+        Pre-`host` lines cannot be attributed to a host. Treating them as local would
+        reintroduce exactly the cross-host poisoning above from older synced logs, so
+        they are skipped — which can leave no boundary, and no boundary already means
+        "no evidence", never "stale". The failure direction is silence, not a false
+        alarm.
+        """
+        now = time.time()
+        p = self.ws / "state" / "session-starts.log"
+        p.write_text(json.dumps({"session_started_at": now, "source": "start-cli"}) + "\n")
+        self.assertIsNone(self.hc._last_core_launch_at())
+
+    def test_local_record_still_found_behind_a_newer_foreign_one(self):
+        """The filter must keep SCANNING past a foreign line, not stop at it."""
+        now = time.time()
+        p = self.ws / "state" / "session-starts.log"
+        p.write_text(
+            json.dumps({"host": self.hc._host_label(), "session_started_at": now - 500,
+                        "source": "start-cli", "runtime": "codex"}) + "\n"
+            + json.dumps({"host": "other-a", "session_started_at": now - 10,
+                          "source": "start-cli"}) + "\n"
+            + json.dumps({"host": "other-b", "session_started_at": now,
+                          "source": "start-cli"}) + "\n"
+        )
+        got = self.hc._last_core_launch_at()
+        self.assertIsNotNone(got)
+        self.assertAlmostEqual(got[0], now - 500, places=3)
+        self.assertEqual(got[1], "codex")
 
     def test_long_lived_heartbeat_is_not_a_session_boundary(self):
         """john-the-dev, #2446: the heartbeat CANNOT stand in for session start.

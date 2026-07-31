@@ -1911,8 +1911,21 @@ def _last_core_launch_at() -> "tuple[float, str | None] | None":
     `_marker_predates_running_core`.
 
     Both launchers append one line per launch — `src/agent/claude/cli/start-cli.sh:610`
-    and `src/agent/codex/cli/start-cli.sh:243` — so the newest entry is the boundary of
-    the running session regardless of which runtime started it.
+    and `src/agent/codex/cli/start-cli.sh:243` — and both stamp the `host` that launched.
+
+    Only THIS host's records are eligible. `session-starts.log` lives in a workspace that
+    is synced across hosts, so the newest line globally is not this host's boundary: a
+    later launch on host B would otherwise become host A's boundary and age host A's
+    perfectly current marker into a false `warn` — the exact false-positive class this
+    check exists to suppress (qingyun-wu + john-the-dev, #2446, independently reproduced:
+    local Codex marker at now-60 alone => ok; add a foreign Codex launch at now => warn).
+
+    Legacy policy, stated explicitly: a record whose `host` is absent, non-string, or
+    belongs to another host is SKIPPED, never treated as local. Pre-`host` lines cannot
+    be attributed, and guessing "probably local" reintroduces the same poisoning from
+    older synced logs. Skipping them can leave no boundary at all, which yields None —
+    and None already means "no evidence", never "stale", so the failure direction is
+    silence rather than a false alarm.
 
     The heartbeat was the obvious candidate and is WRONG: `core_heartbeat.py` stamps
     `_STARTED_AT` once at module load and both launch paths RETAIN an existing heartbeat
@@ -1939,6 +1952,9 @@ def _last_core_launch_at() -> "tuple[float, str | None] | None":
             continue                      # a torn/partial line is not the boundary
         if not isinstance(entry, dict):
             continue
+        entry_host = entry.get("host")
+        if not isinstance(entry_host, str) or entry_host != _host_label():
+            continue                      # another host's launch, or unattributable
         try:
             ts = float(entry.get("session_started_at"))
         except (TypeError, ValueError):
