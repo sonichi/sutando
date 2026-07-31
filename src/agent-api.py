@@ -114,6 +114,25 @@ PORT = 7843
 from util_paths import personal_path  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 
+
+def _emit_task_processed(content: str) -> None:
+    """Anonymous, opt-out product telemetry for tasks this API creates —
+    relay-voice (POST /delegation/tasks), local web/API chat (the ``api``
+    surface), and the Twilio voice/SMS/voicemail surfaces. Mirrors the discord/slack/
+    telegram bridges, which emit at their own accept points; those surfaces are
+    counted, these weren't. Source is read from the task body's own ``source:``
+    header. Fire-and-forget: never blocks or breaks task creation; no-op when
+    telemetry is opted out / unconfigured. Never carries task content or ids.
+    """
+    try:  # pragma: no cover — fire-and-forget glue; logic tested in tests/telemetry.test.py
+        from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+        m = re.search(r"^source:\s*(\S+)", content, re.MULTILINE)
+        task_processed(m.group(1) if m else "unknown")
+    except Exception:  # pragma: no cover — telemetry must never break the API
+        pass
+
+
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
 
@@ -418,6 +437,7 @@ def delegation_submit_task(data: dict):
             except FileNotFoundError:
                 pass
         os.close(task_dir_fd)
+    _emit_task_processed(content)
     return 200, {"ok": True, "task_id": tid}
 
 
@@ -891,6 +911,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: Incoming phone call from {safe_caller}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        _emit_task_processed(task_content)
 
         # TwiML: greet caller, record message
         self.send_twiml(
@@ -925,6 +946,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: SMS from {safe_sender}: {confine_user_content(body)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        _emit_task_processed(task_content)
 
         # Reply with acknowledgment
         self.send_twiml(
@@ -951,6 +973,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"task: Voicemail from {safe_caller}: {confine_user_content(text)}\n"
             )
             (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+            _emit_task_processed(task_content)
         self.send_json(200, {"ok": True})
 
     def do_POST(self):
@@ -1180,6 +1203,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: {confine_user_content(task)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        _emit_task_processed(task_content)
 
         # Register webhook callback if provided
         if callback_url:

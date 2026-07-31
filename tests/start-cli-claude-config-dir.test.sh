@@ -67,15 +67,41 @@ exit 0
 EOF
   chmod +x "$BIN_STUB/claude"
 
-  # Stub `pgrep` — start-cli's L34/L48 use pgrep to detect an existing
-  # sutando-core session and short-circuit to "already running". The TEST
-  # runner itself IS a claude process, so real pgrep would match and the
-  # spawn path never runs. Stub returns exit 1 (no matches found).
-  cat > "$BIN_STUB/pgrep" << 'EOF'
+  # Stubs must model the core LIFECYCLE, not a fixed "nothing is running".
+  # #2418 added a post-launch liveness verify (tmux_core_session_running: session
+  # exists AND a live `claude --name $SESSION` under it) that exits non-zero when
+  # the core does not come up. Stubs that always report "not running" satisfy the
+  # pre-launch short-circuit but can never satisfy that verify, so start-cli
+  # correctly exits 1 and every case here failed on the exit code before reaching
+  # its real assertions. A marker file, written by the new-session stub, is the
+  # before/after discriminator.
+  CORE_UP_MARKER="$SANDBOX/.core-up"
+  export CORE_UP_MARKER
+
+  # Stub `pgrep` — before launch: no match (so the "already running"
+  # short-circuit is not taken; the test runner is itself a claude process, so
+  # real pgrep would match). After launch: report the fake core pid.
+  cat > "$BIN_STUB/pgrep" << EOF
 #!/bin/bash
-exit 1
+[ -f "$CORE_UP_MARKER" ] || exit 1
+echo "424242 claude"
 EOF
   chmod +x "$BIN_STUB/pgrep"
+
+  # Stub `ps` — core_claude_pids cross-checks each pgrep pid against
+  # \\`ps -p <pid> -o args=\\` and keeps only those whose args carry
+  # "--name \$SESSION". Faking pgrep alone is not enough.
+  cat > "$BIN_STUB/ps" << EOF
+#!/bin/bash
+case " \$* " in
+  *" 424242 "*)
+    [ -f "$CORE_UP_MARKER" ] || exit 1
+    echo "claude --name sutando-core --dangerously-skip-permissions"
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$BIN_STUB/ps"
 
   # Stub `tmux` — start-cli sometimes calls into tmux to wrap the claude
   # spawn. Stub it to exec claude directly, bypassing the tmux layer.
@@ -90,15 +116,18 @@ case "\$1" in
 esac
 case "\$1" in
   new-session)
+    # The core is now "up" for every later liveness probe in this run.
+    touch "$CORE_UP_MARKER"
     # find the trailing claude command
     while [ "\$#" -gt 0 ] && [ "\$1" != "claude" ]; do shift; done
     if [ "\$1" = "claude" ]; then exec "\$@"; fi
     ;;
   has-session)
-    # The sandbox starts without a managed session. Returning success here
-    # sends the current launcher down its orphaned-session healing path
-    # (new-window) instead of the new-session path this test exercises.
-    exit 1
+    # Before new-session the sandbox has no managed session (returning success
+    # here would send the launcher down its orphaned-session healing path
+    # instead of the new-session path this test exercises). After new-session
+    # it must report the session so #2418's post-launch verify can pass.
+    [ -f "$CORE_UP_MARKER" ] || exit 1
     ;;
   kill-session|start-server|set-option|bind|attach)
     :  # no-op

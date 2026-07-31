@@ -174,6 +174,7 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 # the path (no repo-walking; the old triple-parent form predated the move into
 # src/ and pointed outside the repo).
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
+from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
@@ -201,6 +202,21 @@ TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
 # guessing from tmux-window presence. Written on every poll outcome: connected
 # after a healthy round-trip, reconnecting in the backoff branches.
 GATEWAY_STATUS_FILE = _STATE / "gateway-status.json"
+
+# Launch provenance + in-bridge file log. A supervisor that persists stdout
+# (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
+# SUTANDO_SUPERVISED=1, and _log stays stdout-only — byte-identical to before.
+# Launched any other way ("bare": a hand-run of the script, a debug shell, an
+# app spawn that forgot the redirect), stdout persists nowhere — the exact
+# diagnostic hole of the 2026-07-25 tester wedge (bridge stuck 21h, zero logs
+# or discoverable status to read). So a bare launch ALSO appends every _log
+# line to <state-parent>/logs/gateway-bridge.log (<workspace>/logs/ when
+# sutando injects dirs, ~/.ag2-sparrow/logs/ under defaults), size-capped with
+# a single .1 rotation, best-effort — log I/O must never break the bridge.
+_LAUNCHED_VIA = "supervised" if os.environ.get("SUTANDO_SUPERVISED") else "bare"
+_LOG_DIR = _STATE.parent / "logs"
+_LOG_FILE = _LOG_DIR / "gateway-bridge.log"
+_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # AWP P0: the persistent event channel (if enabled) — a module-level handle so
 # gateway-status can report per-channel health. None until _maybe_start_event_channel.
@@ -581,7 +597,22 @@ def _redact_url(value: str) -> str:
 
 
 def _log(msg: str) -> None:
-    print(f"[remote-gateway-bridge] {msg}", flush=True)
+    line = f"[remote-gateway-bridge] {msg}"
+    print(line, flush=True)
+    if _LAUNCHED_VIA == "supervised":
+        return  # stdout already persisted by the supervisor's redirect
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if _LOG_FILE.stat().st_size > _LOG_MAX_BYTES:
+                _LOG_FILE.replace(_LOG_FILE.with_suffix(".log.1"))
+        except FileNotFoundError:
+            pass
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(_LOG_FILE, "a") as f:
+            f.write(f"{stamp} {line}\n")
+    except Exception:  # noqa: BLE001 — logging must never break the bridge
+        pass
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
@@ -758,6 +789,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "backoff_s": int(backoff_s),
             "error": _one_line(error) if error else None,
             "gateway": _redact_url(URL),
+            "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
         }
         # AWP P0 per-channel health: the task connection is `connected` above; the
@@ -1002,6 +1034,9 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         body = (task.get("task") or "").lstrip()
         if body.startswith("[") and "]" in body:
             body = body[body.index("]") + 1:].lstrip()
+        # #2267 parity: the presence summary is persisted state too — a pasted
+        # token must not survive in last-owner-activity.json either.
+        body = filter_chat_secrets(body).text
         payload = {
             "ts": int(time.time()),
             "channel": task.get("source") or PROVIDER,
@@ -1068,6 +1103,7 @@ def _write_task(task: dict) -> str | None:
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
+    _secret_types: tuple = ()
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -1091,7 +1127,17 @@ def _write_task(task: dict) -> str | None:
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
-            lines.append(f"task: {_one_line(_fetched)}")
+            # Redact pasted secrets BEFORE the body is persisted (#2267 parity
+            # with the discord/slack/telegram bridges): a token pasted into a
+            # room message must never land on disk. Runs AFTER media
+            # resolution so a signed media-proxy URL is consumed intact and
+            # only the resolved text is filtered.
+            _filtered = filter_chat_secrets(_fetched)
+            if _filtered.secret_types:
+                _secret_types = tuple(_filtered.secret_types)
+                _log(f"redacted pasted secret(s) in {tid} body: "
+                     f"{', '.join(sorted(_secret_types))}")
+            lines.append(f"task: {_one_line(_filtered.text)}")
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
             # alongside the legacy [File attached:] body line (dual-write) via the
@@ -1129,6 +1175,12 @@ def _write_task(task: dict) -> str | None:
     # no double read of the tierMap).
     sender_tier = _tier_for(task.get("user_id"))
     lines.append(f"access_tier: {sender_tier}")
+    # #2267 parity, second half: the other bridges append the in-band security
+    # notice so the core neither reproduces nor re-requests the redacted value.
+    # Appended AFTER access_tier: the notice is bridge-generated fixed text with
+    # no header-shaped lines, so the access-tier-wins-last invariant holds.
+    if _secret_types:
+        lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
@@ -1502,6 +1554,13 @@ def main() -> None:
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
+    # Always name where the diagnostics live: after an incident this line is the
+    # trailhead (a bare-launched bridge under default dirs writes status to
+    # ~/.ag2-sparrow/state/, where nobody thinks to look).
+    _log(f"launched_via={_LAUNCHED_VIA} status={GATEWAY_STATUS_FILE}")
+    if _LAUNCHED_VIA == "bare":
+        _log(f"running unsupervised — output also logged to {_LOG_FILE}; "
+             f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
     _emit_gateway_status(False, error="starting — not yet connected")
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop

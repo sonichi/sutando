@@ -21,6 +21,7 @@ Each entry has:
 - `loop` (optional, value `"dynamic"`) — declares a **dynamic (self-pacing) loop** using the built-in `/loop` primitive. An entry with **no interval** (no `cron` field) + `loop: "dynamic"` is run by schedule-crons as `/loop` *without an interval* (see step 3) — which is exactly the built-in adaptive mode: the loop self-paces via ScheduleWakeup, deciding each next delay by its own judgment. Optional `loop_hint` (free text) guides that pacing (e.g. "~10 min when owner active, ~40 min quiet"). **Durable** because schedule-crons re-launches it every boot; **adaptive** because that's what `/loop`-no-interval already is. No min/max/signal schema and no custom gate — the built-in does the pacing. Example: `{name:"inbox-score", prompt_skill:"inbox-score", loop:"dynamic", loop_hint:"…"}`.
 - `execution` (optional, value `"codex-task"`) — opt this entry into the durable OS-backed Codex runner instead of session cron registration. Codex entries may also set `timezone` (IANA name, default `America/Los_Angeles`), `delivery: "proactive"`, `retry_minutes` (default 15), `max_attempts` (default 3), and `active_stale_minutes` (default 60). Jobs require this explicit opt-in except for the canonical `main-loop` while the selected runtime is Codex; the runtime-specific exception is described below.
 - `launchd` (optional bool) — when `true`, the entry is owned by the OS-level cron-runner (`src/cron-runner.py`, installed via `src/install-cron-runner-launchd.sh`), NOT by this session skill. `/schedule-crons` skips these so the two schedulers never double-fire. Use it for daily-deliverable crons that must fire even when no Claude session is idle (the reliability fix for the 2026-07-02 silent 6am-digest miss).
+  On macOS, the Codex core launcher automatically reconciles ordinary fixed-interval entries to this owner because Codex has no session `CronCreate` surface. It preserves `main-loop`, dynamic loops, and entries already owned by `execution: "codex-task"`, and initializes the runner boundary before changing ownership so activation never replays an old action backlog.
 
 ### Durable Codex schedules
 
@@ -56,6 +57,15 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    - **Agent catchup — ALWAYS (gate: a previous transcript exists).** Generate the structured next-session recap and write it to `<workspace>/state/last-session-recap.md` (also stamp `state/last-recap-session.txt`). This is the primary purpose — it seeds the fresh core's context at boot — and does **not** depend on `recap_room`. A host with no `recap.json` still gets this.
    - **Human room post — ONLY if `recap_room` is set (and private).** If `recap_room` is configured in this host's `recap.json` — `<workspace>/hosts/<hostname>/recap.json`, per the hosts/<hostname>/ per-host state convention, sibling of `crons.json` (which itself stays a bare job list) and names a private, owner-only room, additionally post the brief to `recap_room` (gateway op:message). No `recap_room`, or a non-private one → skip the post, leave the recap on disk under `data/session-recaps/`.
    Idempotence lives in the recap skill's `state/last-recap-session.txt` stamp — a mid-session `/schedule-crons` re-run finds the previous session already stamped and skips both the write and the post, so this never double-writes or double-posts (same guard philosophy as the dynamic-loop freshness sentinel in step 3).
+
+5.7. **Stamp completion for the health-check divergence guard.** After all registrations (and the fallback check in step 4), count the session-owned entries you actually registered this run (CronCreate successes + pre-existing matches from step 3, including the main-loop/fallback) and write the stamp — script-visible proof that THIS core boot completed registration:
+   ```bash
+   WS="$(bash scripts/sutando-config.sh workspace)"
+   H="$(bash scripts/sutando-config.sh host-label)"
+   mkdir -p "$WS/hosts/$H"
+   echo "{\"ts\": $(date +%s), \"registered\": <count>, \"config_total\": <total entries in crons.json>}" > "$WS/hosts/$H/schedule-crons-stamp.json"
+   ```
+   `health-check.py`'s `session-crons` probe compares this host-owned stamp against the same host's core heartbeat `started_at`: a stamp older than the boot means session crons died with a previous session and were never re-registered (the silent 2/18 failure observed on a peer instance 2026-07-23). Do not skip the stamp on re-runs — a fresh stamp is what keeps the guard quiet.
 
 6. Confirm what was scheduled — note whether the proactive-loop fallback was triggered (informs operator that crons.json may need a persistent entry).
 
@@ -121,5 +131,7 @@ bash src/install-cron-runner-launchd.sh --uninstall
 ```
 
 This installs `com.sutando.cron-runner` (launchd, every 60s → `src/cron-runner.py`), which reads the same `crons.json`, decides which `"launchd": true` entries are DUE since their last recorded fire, and emits a task file into `tasks/` for each. The streaming watcher hands it to the session — same OS-level → emit-task → process pipeline as `com.sutando.health-check-fallback`. Missed fires (machine asleep/off) catch up exactly once on the next tick, never a backlog storm.
+
+When the selected core runtime is Codex on macOS, `src/agent/codex/cli/start-cli.sh` performs this installation/reconciliation automatically. Manual installation remains the opt-in path for Claude-core hosts.
 
 **Ownership partition (no double-fire):** the launchd runner handles ONLY `"launchd": true` entries; this session skill (step 3) skips those same entries. Exactly one scheduler owns each cron. Leave `main-loop` / `/proactive-loop` session-owned (it drives the session itself — it is not a task and must never be launchd-owned).

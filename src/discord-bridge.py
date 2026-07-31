@@ -81,6 +81,18 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
+from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+
+# Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
+# depth 0). Only the immediate parent is inlined, so beyond this there is no
+# content to keep.
+REPLY_CHAIN_MAX_DEPTH = 8
+# Cap the ID-only walk toward the root. The `reply_chain_ids` spine keeps
+# walking (ids are cheap) past the content cap so a deep thread still exposes
+# every ancestor's re-fetch handle — not just the nearest 8. Bounded so a
+# pathological thread can't trigger an unbounded fetch loop; if the root is not
+# reached within this bound, an explicit truncation marker is emitted.
+REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
 import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
 import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
@@ -88,6 +100,7 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
@@ -2568,6 +2581,36 @@ def select_rulebook_key(access_tier, is_collaborator):
     return "team-collaborator" if is_collaborator else access_tier
 
 
+async def _handle_restart_command(message, text, access_tier, username, workspace) -> bool:
+    """Owner easy-restart command (sonichi#2401): "restart core" / "stop core"
+    is handled by the BRIDGE, not the core — the whole point is that it works
+    while the core is dead. Writes the intent file for the GUI-session
+    executor (Sutando.app poller) and acks in-channel; no task file. Returns
+    True when the message was a restart command (caller stops processing).
+    Owner tier only — never team/other — and parse is exact-match so prose
+    that merely mentions restarting can't trigger it."""
+    if not text or access_tier != "owner":
+        return False
+    action = parse_restart_command(text)
+    if not action:
+        return False
+    try:
+        write_intent(workspace, action, "discord")
+        ack = ("Restart requested — the app will relaunch the core in a few "
+               "seconds (authenticated, GUI session). I'll be back once it's up."
+               if action == "restart" else
+               "Stop requested — the app will stop the core in a few seconds. "
+               "It stays stopped until you say `restart core`.")
+    except Exception as exc:
+        ack = f"Couldn't write the {action} request ({type(exc).__name__}) — not queued."
+    print(f"  [core-restart] owner {action} command from @{username}", flush=True)
+    try:
+        await message.channel.send(ack)
+    except Exception as send_exc:
+        print(f"  [core-restart] ack send failed: {send_exc}", flush=True)
+    return True
+
+
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
@@ -3067,24 +3110,42 @@ async def _handle_discord_message(message, force=False):
     # which earlier answer the user is responding to. Without this the
     # bot sees only the new reply text in isolation.
     reply_context = ""
+    reply_chain_ids_line = ""   # `reply_chain_ids:` metadata (root-first) for thread reconstruction
     if message.reference and message.reference.message_id:
         try:
             ref_msg = message.reference.resolved
             if ref_msg is None:
                 ref_msg = await message.channel.fetch_message(message.reference.message_id)
             if ref_msg is not None:
-                # Include reply context for all messages so the core agent
-                # understands what the user is responding to.
-                ref_author = str(ref_msg.author)
-                ref_content = (ref_msg.content or "").strip()
-                # Strip bot-id mentions so the context doesn't show raw id soup
-                ref_content = ref_content.replace(f"<@{client.user.id}>", "")
-                snippet = ref_content[:400].replace("\n", " ").strip()
-                if snippet:
-                    reply_context = (
-                        f"\n\n[Replying to {ref_author} "
-                        f"({ref_msg.created_at.strftime('%Y-%m-%d %H:%M')}): {snippet}]"
-                    )
+                # Walk the reply chain to the root (Chi 2026-07-25). The old
+                # `ref_content[:400]` snippet silently truncated the parent.
+                # Lean design: inline only the FULL immediate parent (no cut) via
+                # format_reply_chain(chain[0]); the walk's purpose here is to
+                # collect the ancestor IDS for the `reply_chain_ids` spine, so a
+                # deeper ancestor can be fetched precisely on demand rather than
+                # bloating every task file with the whole thread's content.
+                # Keep collecting ids toward the root past the CONTENT cap so the
+                # `reply_chain_ids` spine reaches the root question, not just the
+                # nearest REPLY_CHAIN_MAX_DEPTH ancestors. Content is only kept
+                # for the inlined depth; ids continue to REPLY_CHAIN_IDS_MAX_DEPTH.
+                #
+                # The walk itself lives in reply_chain.walk_reply_chain so the
+                # depth-cap and unfetchable-ancestor paths are unit-testable —
+                # inline here they sat behind `pragma: no cover`, so the two
+                # cases where context is silently lost were the only ones never
+                # exercised (PR #2310 review 2).
+                chain, chain_ids, reached_root = await walk_reply_chain(
+                    ref_msg,
+                    message.channel.fetch_message,
+                    max_content_depth=REPLY_CHAIN_MAX_DEPTH,
+                    max_ids_depth=REPLY_CHAIN_IDS_MAX_DEPTH,
+                    strip_mention=f"<@{client.user.id}>",
+                )
+                reply_context = format_reply_chain(chain)  # pragma: no cover
+                reply_context += format_reply_chain_truncation(  # pragma: no cover
+                    reached_root, chain_ids[-1] if chain_ids else None
+                )
+                reply_chain_ids_line = format_reply_chain_ids(chain_ids)  # pragma: no cover
                 # Also download attachments that live on the replied-to
                 # message. Without this, a file shared on a parent message
                 # and then acted on via an @-mention *reply* is silently
@@ -3250,6 +3311,10 @@ async def _handle_discord_message(message, force=False):
     # always processed locally regardless of this setting.
     if access_tier != "owner" and TEAM_TIER_OWNER and LOCAL_MACHINE != TEAM_TIER_OWNER:
         print(f"  [tier-ownership] dropping {access_tier}-tier task from @{username} — owner is {TEAM_TIER_OWNER}, this node is {LOCAL_MACHINE or 'unknown'}")
+        return
+
+    # Owner easy-restart command (sonichi#2401) — see _handle_restart_command.
+    if await _handle_restart_command(message, text, access_tier, username, str(REPO)):
         return
 
     # Write as task
@@ -3534,6 +3599,11 @@ async def _handle_discord_message(message, force=False):
         if getattr(message, "reference", None) and message.reference.message_id
         else ""
     )
+    # Full walked ancestor id spine (root-first) for thread reconstruction —
+    # handles to re-fetch any ancestor the inlined chain clipped/dropped past
+    # the depth/size guard. Only emitted for a real chain (>=2 ids); a single
+    # parent is already covered by parent_message_id above. (Chi 2026-07-25.)
+    parent_msg_line += reply_chain_ids_line
     # Also emit the replied-to author as a STRUCTURED header, not just the
     # opaque parent_message_id. In a multi-bot channel a consumer must be able
     # to tell WHO the sender was addressing (e.g. a reply aimed at another bot)
@@ -4352,6 +4422,36 @@ async def poll_results():
 _progress_msgs: dict = {}
 
 
+def _newest_alive_mtime():
+    """Newest per-host core heartbeat mtime (state/cores/*.alive), or None
+    when no heartbeat file exists (graceful shutdown unlinks it)."""
+    try:
+        return max((p.stat().st_mtime for p in (STATE_DIR / "cores").glob("*.alive")),
+                   default=None)
+    except Exception:
+        return None
+
+
+def _queued_task_count():
+    """Live (unarchived) task files waiting in tasks/."""
+    try:
+        return sum(1 for _ in TASKS_DIR.glob("task-*.txt"))
+    except Exception:
+        return 0
+
+
+def _render_progress_content(now, elapsed):
+    """Placeholder body for poll_progress: the live core step normally, or the
+    honest outage copy (frozen status + stale heartbeat + queue depth) when the
+    core looks dead (sonichi#2398 — the 2026-07-30 'restart in flight (1625s)'
+    class: never narrate progress the core is not making)."""
+    status = progress_stream.read_core_status(STATE_DIR)
+    if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):
+        return progress_stream.format_outage(
+            progress_stream.status_age_s(status, now), _queued_task_count())
+    return progress_stream.format_progress(progress_stream.current_step(status), elapsed)
+
+
 async def poll_progress():
     """Hermes-style streaming tool output (2026-06-05).
 
@@ -4409,12 +4509,9 @@ async def poll_progress():
                         _progress_msgs[task_id] = {"expired": True}  # terminal
                         continue
                     if progress_stream.should_edit(now, info["last_edit"]):
-                        step = progress_stream.current_step(
-                            progress_stream.read_core_status(STATE_DIR)
-                        )
                         try:
                             await info["msg"].edit(
-                                content=progress_stream.format_progress(step, elapsed)
+                                content=_render_progress_content(now, elapsed)
                             )
                             info["last_edit"] = now
                         except Exception:
@@ -4442,12 +4539,9 @@ async def poll_progress():
                     created = now
                 elapsed = now - created
                 if progress_stream.should_post_placeholder(elapsed):
-                    step = progress_stream.current_step(
-                        progress_stream.read_core_status(STATE_DIR)
-                    )
                     try:
                         msg = await channel.send(
-                            progress_stream.format_progress(step, elapsed)
+                            _render_progress_content(now, elapsed)
                         )
                         _progress_msgs[task_id] = {
                             "msg": msg,
