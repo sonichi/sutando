@@ -24,6 +24,8 @@ Covers:
   k) malformed JSON, bytes differ       → warn (raw-byte fallback)
   l) malformed JSON, bytes identical    → ok (raw-byte fallback)
   m) resolves canonical tree, not env ~/.claude → ok (no false all-clear; #2277 review)
+  n) explicit vault opt-out                 → ok (no impossible sync remedy)
+  o) no configured vault remote             → ok (single-machine mode)
 
 Run: python3 tests/health-check-per-host-config-backup.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -69,6 +71,8 @@ class _Harness:
             "hc.claude_home_path": hc.claude_home_path,
             "hc.WORKSPACE_DIR": hc.WORKSPACE_DIR,
             "hc._host_label": hc._host_label,
+            "hc._resolved_vault": hc._resolved_vault,
+            "hc._resolve_dotenv": hc._resolve_dotenv,
             "sc.resolve_claude_sutando_config_dir": sutando_config.resolve_claude_sutando_config_dir,
         }
         # canonical resolver → temp config dir (this is where write_live seeds)
@@ -77,12 +81,19 @@ class _Harness:
         hc.claude_home_path = lambda *parts: self.home_divergent.joinpath(*parts)
         hc.WORKSPACE_DIR = self.ws
         hc._host_label = lambda: "TestHost"
+        hc._resolved_vault = lambda: {
+            "enabled": True,
+            "remote_url": "ssh://example.invalid/vault.git",
+            "_explicit_disable": False,
+        }
         return self
 
     def __exit__(self, *a):
         hc.claude_home_path = self._saved["hc.claude_home_path"]
         hc.WORKSPACE_DIR = self._saved["hc.WORKSPACE_DIR"]
         hc._host_label = self._saved["hc._host_label"]
+        hc._resolved_vault = self._saved["hc._resolved_vault"]
+        hc._resolve_dotenv = self._saved["hc._resolve_dotenv"]
         sutando_config.resolve_claude_sutando_config_dir = self._saved["sc.resolve_claude_sutando_config_dir"]
 
     def write_live(self, svc: str, content: bytes):
@@ -273,6 +284,43 @@ def case_m_reads_canonical_tree_not_env_home() -> list[str]:
     return []
 
 
+def case_n_explicit_vault_optout_ok() -> list[str]:
+    """A deliberately disabled vault never snapshots the carrier, so drift is
+    not actionable and must not advertise an impossible full-sync remedy."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            h.write_live("discord", b'{"allowFrom":["123","456"]}')
+            h.write_carrier("discord", b'{"allowFrom":["123"]}')
+            hc._resolved_vault = lambda: {
+                "enabled": False,
+                "remote_url": "",
+                "_explicit_disable": True,
+            }
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "ok" or "config opt-out" not in r["detail"]:
+        return [f"n) explicit vault opt-out should be informational ok, got {r}"]
+    return []
+
+
+def case_o_unconfigured_vault_ok() -> list[str]:
+    """Without a canonical or legacy vault URL, sync-workspace skips before
+    snapshotting; single-machine mode must not retain the stale-backup nag."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td)) as h:
+            h.write_live("discord", b'{"allowFrom":["123","456"]}')
+            h.write_carrier("discord", b'{"allowFrom":["123"]}')
+            hc._resolved_vault = lambda: {
+                "enabled": False,
+                "remote_url": "",
+                "_explicit_disable": False,
+            }
+            hc._resolve_dotenv = lambda: Path(td) / "missing.env"
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "ok" or "single-machine mode" not in r["detail"]:
+        return [f"o) unconfigured vault should be informational ok, got {r}"]
+    return []
+
+
 def main() -> int:
     cases = [
         ("a", case_a_identical_ok),
@@ -288,6 +336,8 @@ def main() -> int:
         ("k", case_k_malformed_json_raw_fallback_warn),
         ("l", case_l_malformed_but_byte_identical_ok),
         ("m", case_m_reads_canonical_tree_not_env_home),
+        ("n", case_n_explicit_vault_optout_ok),
+        ("o", case_o_unconfigured_vault_ok),
     ]
     failures = []
     for label, fn in cases:
