@@ -200,17 +200,24 @@ def resolve_voice_health_config(
         return {"enabled": True, "detail": "Gemini voice credential configured"}
     if skip_voice not in ("", "0", "1"):
         return {"enabled": True, "error": f"invalid SKIP_VOICE={skip_voice!r}"}
-    if skip_voice == "1":
-        return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
     # The MANAGED tier, checked in the same order startup-runtime.sh uses: BYO env
-    # first, then managed. Without this the two disagree — startup-runtime.sh:52-58
-    # boots voice on a managed credential while this returned "disabled", so all
-    # four voice checks reported `ok — disabled` over a running-and-broken voice
-    # agent. A health check that reports "disabled" about a service that is
-    # actually running is worse than no check: it converts an outage into a green
-    # light. (#2197 review blocker, john-the-dev 2026-07-30T01:53.)
+    # first, then managed, and only then SKIP_VOICE. Without this the two disagree —
+    # startup-runtime.sh:52-58 boots voice on a managed credential while this
+    # returned "disabled", so all four voice checks reported `ok — disabled` over a
+    # running-and-broken voice agent. A health check that reports "disabled" about a
+    # service that is actually running is worse than no check: it converts an outage
+    # into a green light. (#2197 review blocker, john-the-dev 2026-07-30T01:53.)
+    #
+    # This check MUST sit above the SKIP_VOICE=1 return, not below it. Placing it
+    # below narrowed the bug without resolving it: the launcher *unsets* an inherited
+    # SKIP_VOICE when a managed credential exists, so the composition "managed key +
+    # inherited SKIP_VOICE=1" still had startup booting voice while health reported
+    # disabled. The managed-only test could not catch it because it omits SKIP_VOICE.
+    # (#2197 review blocker, john-the-dev 2026-07-31T05:37.)
     if managed_voice_credential_present():
         return {"enabled": True, "detail": "managed voice credential configured"}
+    if skip_voice == "1":
+        return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
 
 

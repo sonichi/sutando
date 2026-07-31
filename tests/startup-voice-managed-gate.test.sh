@@ -85,4 +85,54 @@ if [ "$(id -u)" -ne 0 ]; then  # root ignores the mode bits
 fi
 chmod 644 "$WS/state/auth/managed-credentials.json"
 
+# 7. CROSS-PATH: managed key + INHERITED SKIP_VOICE=1 — the launcher and the health
+#    resolver must agree. This is the composition neither single-path test could
+#    catch: cases 1-6 never set SKIP_VOICE, and the python suite never runs the real
+#    launcher. The launcher UNSETS an inherited SKIP_VOICE when a managed credential
+#    exists, so health must report ENABLED for the same workspace. When they
+#    disagree the product ships a running voice agent behind a green "disabled".
+#    (#2197 review blocker, john-the-dev 2026-07-31T05:37.)
+write_managed '{"capabilities":{"gemini-voice":{"key":"managed-voice-key"}}}'
+
+# real launcher, with SKIP_VOICE=1 inherited from the parent environment
+startup_out="$(env -i PATH="/usr/bin:/bin" REPO="$STUB" SKIP_VOICE=1 \
+  bash -c 'cd "$1"; source "$2/src/startup-runtime.sh"; configure_startup_runtime; printf "SKIP_VOICE=%s\n" "${SKIP_VOICE:-0}"' \
+  _ "$TMP" "$REPO")"
+
+# real health resolver, pointed at the SAME workspace
+health_out="$(python3 -c '
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("hc", sys.argv[1] + "/src/health-check.py")
+hc = importlib.util.module_from_spec(spec); spec.loader.exec_module(hc)
+hc.WORKSPACE_DIR = Path(sys.argv[2])
+cfg = hc.resolve_voice_health_config(env={"SKIP_VOICE": "1"},
+                                     env_path=Path(sys.argv[2]) / "no-such-dotenv")
+print("enabled" if cfg["enabled"] else "disabled", "|", cfg.get("detail", cfg.get("error","")))
+' "$REPO" "$WS")"
+
+grep -q 'SKIP_VOICE=0' <<<"$startup_out" \
+  || fail "launcher did not unset inherited SKIP_VOICE for a managed credential: $startup_out"
+grep -q '^enabled' <<<"$health_out" \
+  || fail "CROSS-PATH DISAGREEMENT — launcher starts voice, health says: $health_out"
+
+# control: with NO credential in any tier, BOTH must say disabled. Without this the
+# assertion above could pass by making health ignore SKIP_VOICE unconditionally.
+clear_managed
+startup_none="$(env -i PATH="/usr/bin:/bin" REPO="$STUB" SKIP_VOICE=1 \
+  bash -c 'cd "$1"; source "$2/src/startup-runtime.sh"; configure_startup_runtime; printf "SKIP_VOICE=%s\n" "${SKIP_VOICE:-0}"' \
+  _ "$TMP" "$REPO")"
+health_none="$(python3 -c '
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("hc", sys.argv[1] + "/src/health-check.py")
+hc = importlib.util.module_from_spec(spec); spec.loader.exec_module(hc)
+hc.WORKSPACE_DIR = Path(sys.argv[2])
+cfg = hc.resolve_voice_health_config(env={"SKIP_VOICE": "1"},
+                                     env_path=Path(sys.argv[2]) / "no-such-dotenv")
+print("enabled" if cfg["enabled"] else "disabled")
+' "$REPO" "$WS")"
+grep -q 'SKIP_VOICE=1' <<<"$startup_none" || fail "control: credential-free launcher should disable: $startup_none"
+grep -q '^disabled' <<<"$health_none"     || fail "control: credential-free health should disable: $health_none"
+
 echo "PASS: startup voice gate recognizes the managed tier"

@@ -94,8 +94,30 @@ class VoiceHealthConfigTests(unittest.TestCase):
                 self.assertFalse(hc.resolve_voice_health_config(
                     env={}, env_path=self._no_dotenv)["enabled"])
 
-    def test_skip_voice_still_wins_over_a_managed_credential(self) -> None:
+    def test_managed_credential_wins_over_inherited_skip_voice(self) -> None:
+        """Managed key + inherited SKIP_VOICE=1 must report ENABLED, like the launcher.
+
+        Replaces test_skip_voice_still_wins_over_a_managed_credential, which pinned
+        the OPPOSITE precedence from the thing that actually boots voice.
+        `configure_startup_runtime()` UNSETS an inherited SKIP_VOICE when a managed
+        credential is present (startup-runtime.sh:57-58), so asserting "disabled"
+        here made the test suite certify the exact disagreement it should have
+        caught: voice running, health reporting disabled.
+        (#2197 review blocker, john-the-dev 2026-07-31T05:37.)
+        """
         self.write_managed('{"capabilities": {"gemini-voice": {"key": "k"}}}')
+        cfg = hc.resolve_voice_health_config(
+            env={"SKIP_VOICE": "1"}, env_path=self._no_dotenv)
+        self.assertTrue(cfg["enabled"])
+        self.assertIn("managed", cfg["detail"])
+
+    def test_skip_voice_still_disables_without_any_credential(self) -> None:
+        """The control: SKIP_VOICE=1 must STILL disable when no tier supplies a key.
+
+        Without this, the change above could be satisfied by ignoring SKIP_VOICE
+        entirely, and the discriminator would have stopped being able to say NO.
+        """
+        self.write_managed('{"capabilities": {}}')
         cfg = hc.resolve_voice_health_config(
             env={"SKIP_VOICE": "1"}, env_path=self._no_dotenv)
         self.assertFalse(cfg["enabled"])
