@@ -273,6 +273,23 @@ def _isolation_line(tree: ast.Module) -> int | None:
 _WRITE_METHODS = {"write_text", "write_bytes"}
 _WRITE_HELPERS = {"write_private_text"}
 
+# A write only creates a file if its PARENT DIRECTORY already exists. `mkdtemp()` hands
+# back an EMPTY directory, so `$CLAUDE_CONFIG_DIR/channels/<ch>/` does not exist until the
+# test makes it, and a bare
+#     (cfg / "channels" / "discord" / "access.json").write_text("{}")
+# raises FileNotFoundError having created nothing. Swallow that error and the bridge
+# still imports, with `channel_access_path()` still falling back to the operator's real
+# allowlist — a write that was recorded as a seed while the canonical file never existed.
+# The write alone was therefore never evidence; this module's own docstring has always
+# shown `mkdir(parents=True, exist_ok=True)` as part of the safe shape, and the predicate
+# now requires it.
+#
+# `parents=True` is required, not decorative: `channels/` itself is absent in a fresh
+# mkdtemp, so a plain `.mkdir(exist_ok=True)` on `channels/<ch>` raises too.
+# `os.makedirs` is recursive by definition and needs no keyword.
+_MKDIR_METHODS = {"mkdir"}
+_MAKEDIRS_FUNCS = {"makedirs"}
+
 
 def _is_ccd_ref(node) -> bool:
     """True for a literal `os.environ["CLAUDE_CONFIG_DIR"]` READ."""
@@ -501,14 +518,18 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
     rooted = _rooted_segments(tree)
     consts = _literal_segment_names(tree)
 
-    def _seeded_channel(expr: ast.AST) -> "str | None":
-        """The channel this write seeds, or None if it is not a canonical seed."""
+    def _path_channel(expr: ast.AST, *, want_access_json: bool) -> "str | None":
+        """The channel this path expression belongs to under the CONFIGURED config dir.
+
+        `want_access_json=True` asks for the access FILE (a write target);
+        `False` asks for the containing DIRECTORY (an mkdir target).
+        """
         is_rooted, segs = _expr_root_segments(expr, roots, rooted, consts)
         if not is_rooted:
             return None
         if not any("channels" in seg for seg in segs):
             return None
-        if not any("access.json" in seg for seg in segs):
+        if want_access_json and not any("access.json" in seg for seg in segs):
             return None
         # The channel is a segment naming a bridge we know about. Matching against
         # the known set (rather than "the segment after channels") keeps this robust
@@ -518,11 +539,62 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
                 return ch
         return None
 
+    def _seeded_channel(expr: ast.AST) -> "str | None":
+        """The channel this write seeds, or None if it is not a canonical seed."""
+        return _path_channel(expr, want_access_json=True)
+
+    def _mkdir_target(call: ast.Call) -> "ast.AST | None":
+        """The directory a call creates RECURSIVELY, or None if it creates nothing.
+
+        Only recursive creation counts. `channels/` does not exist inside a fresh
+        `mkdtemp()`, so `(cfg / "channels" / "discord").mkdir(exist_ok=True)` raises
+        FileNotFoundError exactly like the unguarded write it was supposed to make safe.
+        """
+        if isinstance(call.func, ast.Attribute) and call.func.attr in _MKDIR_METHODS:
+            for kw in call.keywords:
+                if kw.arg == "parents" and isinstance(kw.value, ast.Constant) \
+                        and kw.value.value is True:
+                    return call.func.value
+            return None
+        name = (
+            call.func.attr if isinstance(call.func, ast.Attribute)
+            else call.func.id if isinstance(call.func, ast.Name)
+            else None
+        )
+        if name in _MAKEDIRS_FUNCS:
+            for kw in call.keywords:
+                if kw.arg == "name":
+                    return kw.value
+            return call.args[0] if call.args else None
+        return None
+
+    # channel -> earliest REACHABLE line that recursively creates channels/<ch>/.
+    # Computed from the same `_reachable_nodes` walk as the seeds, so an mkdir parked
+    # under `if False:` or inside a never-called `def` cannot vouch for a write.
+    created: dict[str, int] = {}
+    for node in tree.body:
+        for sub in _reachable_nodes(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            target = _mkdir_target(sub)
+            if target is None:
+                continue
+            ch = _path_channel(target, want_access_json=False)
+            if ch and sub.lineno < created.get(ch, 1 << 30):
+                created[ch] = sub.lineno
+
     # channel -> earliest module-level line that seeds it
     seeded: dict[str, int] = {}
 
-    def _record(ch: "str | None", lineno: int) -> None:
-        if ch and ch not in seeded:
+    def _record(ch: "str | None", lineno: int, at: int) -> None:
+        """Record a seed — but only if `channels/<ch>/` was created BEFORE line `at`.
+
+        The parent-directory precondition is what makes the write evidence rather than
+        an intention. Ordering is checked on the CALL's own line, not the enclosing
+        top-level statement's, so an mkdir and a write sharing a `with` block are still
+        ordered correctly relative to each other.
+        """
+        if ch and ch not in seeded and created.get(ch, 1 << 30) < at:
             seeded[ch] = lineno
 
     for node in tree.body:
@@ -532,7 +604,7 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
             # Method style: (dir / "access.json").write_text(...) — path is the RECEIVER.
             if isinstance(sub.func, ast.Attribute):
                 if sub.func.attr in _WRITE_METHODS:
-                    _record(_seeded_channel(sub.func.value), node.lineno)
+                    _record(_seeded_channel(sub.func.value), node.lineno, sub.lineno)
             # Helper style: write_private_text(dir / "access.json", data) — path is an
             # ARGUMENT. #2356 makes this the canonical way access files are written, so
             # a receiver-only check would start false-flagging correctly-seeded tests
@@ -554,7 +626,14 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
                     if kw.arg == "path":
                         path_arg = kw.value
                 if path_arg is not None:
-                    _record(_seeded_channel(path_arg), node.lineno)
+                    # The helper is held to the SAME parent-directory precondition. It
+                    # does not exist in this tree yet (#2356 introduces it), so its
+                    # parent-creating semantics cannot be verified here — and an
+                    # unverifiable exemption is exactly the kind of assumption this
+                    # predicate keeps getting caught making. If #2356 lands with a
+                    # helper that creates parents itself, add it to a
+                    # _PARENT_CREATING_HELPERS set then, against the real source.
+                    _record(_seeded_channel(path_arg), node.lineno, sub.lineno)
     # EVERY imported bridge must be seeded. Return the LATEST such line so the
     # caller's `seed_line < exec_line` ordering check covers all of them.
     if not channels or any(ch not in seeded for ch in channels):

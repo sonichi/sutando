@@ -195,7 +195,7 @@ check(
 # --- scope + seed bypasses (qingyun + Rui/john-the-dev, #2429 review 8) ----
 SEED = ('import os, tempfile, pathlib\n'
         'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
-        'pathlib.Path("channels/discord").mkdir(parents=True, exist_ok=True)\n'
+        'pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]).joinpath("channels", "discord").mkdir(parents=True, exist_ok=True)\n'
         '(pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / "access.json").write_text("{}")\n')
 EXEC_LOAD = ('src = open("src/discord-bridge.py").read()\n'
              'import types\nbridge = types.ModuleType("b")\n'
@@ -243,10 +243,17 @@ check(
 # is the sound direction, but it would have flagged correctly-seeded files and
 # inflated the migration denominator.
 _ENV = 'import os, tempfile, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+# A CLEAN fixture must also CREATE channels/<ch>/. A write into a fresh mkdtemp
+# without it raises FileNotFoundError and creates nothing, so the canonical file is
+# still absent at import (#2429 review 14, qingyun). Fixtures that omitted the mkdir
+# were themselves instances of the bug under test.
+_MKDIR = ('pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]).joinpath("channels", "discord")'
+          '.mkdir(parents=True, exist_ok=True)\n')
+_ENVDIR = _ENV + _MKDIR
 check(
     "seed via an intermediate variable counts (p = chan / 'access.json'; p.write_text)",
     lint.classify(
-        write(tmpdir, _ENV + 'chan = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+        write(tmpdir, _ENVDIR + 'chan = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
               'p = chan / "access.json"\np.write_text("{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
@@ -254,7 +261,7 @@ check(
 check(
     "seed taint propagates two hops (ACCESS = 'access.json'; p = d / ACCESS)",
     lint.classify(
-        write(tmpdir, _ENV + 'ACCESS = "access.json"\n'
+        write(tmpdir, _ENVDIR + 'ACCESS = "access.json"\n'
               'p = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / ACCESS\n'
               'p.write_text("{}")\n' + IMPORTS_BRIDGE)
     )
@@ -305,7 +312,7 @@ check(
 check(
     "canonical HELPER seed under the configured dir IS a seed",
     lint.classify(
-        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+        write(tmpdir, _ENVDIR + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
               'write_private_text(cfg / "access.json", "{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
@@ -317,6 +324,7 @@ check(
         write(tmpdir, 'import os, tempfile, pathlib\n_ccd = tempfile.mkdtemp()\n'
               'os.environ["CLAUDE_CONFIG_DIR"] = _ccd\n'
               'p = pathlib.Path(_ccd) / "channels" / "discord" / "access.json"\n'
+              'p.parent.mkdir(parents=True, exist_ok=True)\n'
               'p.write_text("{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
@@ -368,7 +376,7 @@ check(
 )
 check(
     "module-level inline seed IS still a seed",
-    lint.classify(write(tmpdir, _ENV + _INLINE_SEED + IMPORTS_BRIDGE)) == lint.CLEAN,
+    lint.classify(write(tmpdir, _ENVDIR + _INLINE_SEED + IMPORTS_BRIDGE)) == lint.CLEAN,
 )
 # Review 14 (qingyun, #2429): skipping def/class bodies was not enough — descending into
 # every child of `if`/`try` admitted a seed under `if False:` or inside an `except` handler
@@ -389,7 +397,7 @@ check(
 check(
     "seed BEFORE the raise IS still a seed",
     lint.classify(
-        write(tmpdir, _ENV + 'try:\n    ' + _INLINE_SEED + '    raise RuntimeError("x")\n'
+        write(tmpdir, _ENVDIR + 'try:\n    ' + _INLINE_SEED + '    raise RuntimeError("x")\n'
               + 'except Exception:\n    pass\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
@@ -418,14 +426,14 @@ check(
 check(
     "seed in a `try` BODY IS a seed (runs unconditionally)",
     lint.classify(
-        write(tmpdir, _ENV + 'try:\n    ' + _INLINE_SEED + 'except Exception:\n    pass\n' + IMPORTS_BRIDGE)
+        write(tmpdir, _ENVDIR + 'try:\n    ' + _INLINE_SEED + 'except Exception:\n    pass\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
 )
 check(
     "seed inside a `with` block IS a seed (runs in module order)",
     lint.classify(
-        write(tmpdir, _ENV + 'with open("/dev/null"):\n    ' + _INLINE_SEED + IMPORTS_BRIDGE)
+        write(tmpdir, _ENVDIR + 'with open("/dev/null"):\n    ' + _INLINE_SEED + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
     "refusing conditionals would reject the ordinary TemporaryDirectory seeding shape",
@@ -433,7 +441,7 @@ check(
 check(
     "seed inside try/except IS a seed",
     lint.classify(
-        write(tmpdir, _ENV + 'try:\n    ' + _INLINE_SEED + 'except Exception:\n    pass\n' + IMPORTS_BRIDGE)
+        write(tmpdir, _ENVDIR + 'try:\n    ' + _INLINE_SEED + 'except Exception:\n    pass\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
 )
@@ -480,7 +488,7 @@ check(
 check(
     "HELPER: path in arg 0 IS a seed (positive still holds)",
     lint.classify(
-        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+        write(tmpdir, _ENVDIR + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
               'write_private_text(cfg / "access.json", "{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
@@ -488,7 +496,7 @@ check(
 check(
     "HELPER: keyword form path=<canonical> IS a seed",
     lint.classify(
-        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+        write(tmpdir, _ENVDIR + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
               'write_private_text(path=cfg / "access.json", data="{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
@@ -569,7 +577,7 @@ check(
         write(
             tmpdir,
             'import os, tempfile, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
-            'pathlib.Path("channels/discord").mkdir(parents=True, exist_ok=True)\n'
+            'pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]).joinpath("channels", "discord").mkdir(parents=True, exist_ok=True)\n'
             '(pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / "access.json").write_text("{}")\n' + IMPORTS_BRIDGE,
         )
     )
@@ -623,6 +631,70 @@ check(
     and lint.classify(write(tmpdir, IMPORTS_BRIDGE.replace("discord", "telegram"))) == lint.VIOLATION,
 )
 check("unreadable path -> None", lint.classify(tmpdir / "does-not-exist.py") is None)
+
+# --- Review 14 (qingyun, #2429): a WRITE is not a FILE ----------------------
+# The predicate proved the test asked for the canonical path; it never proved the file
+# came into existence. `mkdtemp()` returns an EMPTY directory, so `channels/<ch>/` does
+# not exist and the write raises FileNotFoundError having created nothing. Swallow that
+# and the bridge still imports, still falling back to the operator's real allowlist.
+#
+# qingyun sent ONE member of this family (swallowed missing parent). Probing the SHAPE
+# rather than her repro turned up seven more, including the simplest one of all: a bare
+# write with no mkdir anywhere. All eight classified CLEAN before this change.
+_CCD_P = 'pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"])'
+_WRITE = f'({_CCD_P} / "channels" / "discord" / "access.json").write_text("{{}}")\n'
+_SWALLOW = "try:\n    " + _WRITE + "except FileNotFoundError:\n    pass\n"
+
+for _name, _body in [
+    # qingyun's exact repro.
+    ("swallowed missing-parent write", _ENV + _SWALLOW),
+    # Simpler than her repro and equally broken: nothing creates the directory at all.
+    ("bare write with no mkdir anywhere", _ENV + _WRITE),
+    # `channels/` is absent too, so a non-recursive mkdir raises exactly like the write.
+    ("mkdir without parents=True does not vouch for the write",
+     _ENV + "try:\n    " + _CCD_P + '.joinpath("channels", "discord").mkdir(exist_ok=True)\n'
+     "except FileNotFoundError:\n    pass\n" + _SWALLOW),
+    # Ordering is the whole point: creating the directory afterwards is too late.
+    ("mkdir AFTER the write is too late",
+     _ENV + _SWALLOW + _CCD_P + '.joinpath("channels", "discord").mkdir(parents=True, exist_ok=True)\n'),
+    # A directory for a different channel proves nothing about this one.
+    ("mkdir for a DIFFERENT channel does not vouch for discord",
+     _ENV + _CCD_P + '.joinpath("channels", "slack").mkdir(parents=True, exist_ok=True)\n' + _SWALLOW),
+    # The mkdir must clear the same reachability bar as the seed, or `if False:` and a
+    # never-called `def` would each launder a write that cannot succeed.
+    ("mkdir under `if False:` does not vouch for the write",
+     _ENV + "if os.environ.get('NEVER'):\n    " + _CCD_P
+     + '.joinpath("channels", "discord").mkdir(parents=True, exist_ok=True)\n' + _SWALLOW),
+    ("mkdir inside a never-called def does not vouch for the write",
+     _ENV + "def _setup():\n    " + _CCD_P
+     + '.joinpath("channels", "discord").mkdir(parents=True, exist_ok=True)\n' + _SWALLOW),
+    # A broad handler swallows the same failure; the family is the swallow, not the type.
+    ("write swallowed by a broad `except Exception` is not a seed",
+     _ENV + "try:\n    " + _WRITE + "except Exception:\n    pass\n"),
+]:
+    check(f"BYPASS 14: {_name}",
+          lint.classify(write(tmpdir, _body + IMPORTS_BRIDGE)) == lint.VIOLATION,
+          "the canonical access.json is never created, so the bridge still falls back")
+
+# The other direction, so closing this does not switch the gate off: the two recursive
+# creation idioms this repo actually uses must both keep reading CLEAN.
+check(
+    "mkdir(parents=True) before the write is still clean",
+    lint.classify(write(tmpdir, _ENVDIR + _WRITE + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "the `p.parent.mkdir(parents=True)` idiom is still clean",
+    lint.classify(write(tmpdir, _ENV + f'_p = {_CCD_P} / "channels" / "discord" / "access.json"\n'
+                        '_p.parent.mkdir(parents=True, exist_ok=True)\n_p.write_text("{}")\n'
+                        + IMPORTS_BRIDGE)) == lint.CLEAN,
+    "tests/discord-bridge-file-markers.test.py and friends seed exactly this way",
+)
+check(
+    "os.makedirs before the write is still clean",
+    lint.classify(write(tmpdir, _ENV + f'os.makedirs({_CCD_P} / "channels" / "discord", exist_ok=True)\n'
+                        + _WRITE + IMPORTS_BRIDGE)) == lint.CLEAN,
+    "makedirs is recursive by definition and needs no parents= keyword",
+)
 
 # --- scan() ----------------------------------------------------------------
 scanned = lint.scan(["tests/lint-hermetic-bridge-tests.test.py"])
