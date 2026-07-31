@@ -75,7 +75,9 @@ function runStream(chunks: string[], turnEnd = true): { forwarded: string; suppr
 		if (FABRICATED_OUTPUT_RE.test(outputBuffer.trim())) { turnFab = true; continue; }
 		if (!couldStillBeFabrication(outputBuffer)) { turnCleared = true; forwarded += heldText; heldText = ''; }
 	}
-	if (turnEnd && heldText && !turnFab) { forwarded += heldText; heldText = ''; }
+	// No trailing `heldText = ''` here: the function returns on the next line, so the
+	// reset is dead (eslint no-useless-assignment). Kept inside the loop, where it matters.
+	if (turnEnd && heldText && !turnFab) { forwarded += heldText; }
 	return { forwarded, suppressed: turnFab };
 }
 
