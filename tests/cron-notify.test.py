@@ -75,17 +75,53 @@ def main() -> int:
     check("record_ping tolerates non-dict", cn.record_ping(None, "c", 5) == {"c": 5})
 
     # ── gateway config + delivery (urllib mocked — no network) ──────────
+    # _load_gateway now delegates to the canonical resolver (ensure-cron-room.py:
+    # resolve_token): it reads process env AND <repo>/.env across all gateway
+    # alias keys, honoring combined "url|secret" and split URL+token. It takes a
+    # REPO DIR (reads <repo>/.env), repo-anchored regardless of cwd — not a .env
+    # file path. Tests clear the process-env gateway keys so the running core's
+    # real creds can't leak in and make a negative meaningless.
     import unittest.mock as um
+    import os as _os
+    _GW_KEYS = ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN",
+                "GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
+
+    def _clean_env(**over):
+        e = {k: v for k, v in _os.environ.items() if k not in _GW_KEYS}
+        e.update(over)
+        return um.patch.dict(_os.environ, e, clear=True)
+
     with tempfile.TemporaryDirectory() as d:
         env = Path(d) / ".env"
         env.write_text("OTHER=1\nAG2_REMOTE_TOKEN='https://x.example/relay|sekret'\n")
-        base, secret = cn._load_gateway(str(env))
-        check("_load_gateway parses quoted url|secret",
-              base == "https://x.example/relay" and secret == "sekret", (base, secret))
+        with _clean_env():
+            base, secret = cn._load_gateway(d)
+            check("_load_gateway parses combined url|secret from <repo>/.env",
+                  base == "https://x.example/relay" and secret == "sekret", (base, secret))
+        # split token via process env WINS over .env (the exact #2346 gap: the old
+        # reader saw only AG2_REMOTE_TOKEN in .env and returned (None, None) here)
+        with _clean_env(GATEWAY_URL="https://env.example", GATEWAY_TOKEN="s2"):
+            check("_load_gateway split process-env wins over .env",
+                  cn._load_gateway(d) == ("https://env.example", "s2"), cn._load_gateway(d))
+        # repo-anchored: resolves the same from a non-repo cwd
+        with _clean_env():
+            _cwd0 = _os.getcwd()
+            try:
+                _os.chdir(tempfile.gettempdir())
+                check("_load_gateway resolves <repo>/.env from a non-repo cwd",
+                      cn._load_gateway(d) == ("https://x.example/relay", "sekret"),
+                      cn._load_gateway(d))
+            finally:
+                _os.chdir(_cwd0)
+        # bare token, no URL anywhere → no base, so nothing can be sent
         env.write_text("AG2_REMOTE_TOKEN=nopipe\n")
-        check("_load_gateway no-pipe → (None, None)", cn._load_gateway(str(env)) == (None, None))
-        check("_load_gateway missing file → (None, None)",
-              cn._load_gateway(str(Path(d) / "absent.env")) == (None, None))
+        with _clean_env():
+            b2, _s2 = cn._load_gateway(d)
+            check("_load_gateway bare token → no base (won't send)", b2 is None, (b2, _s2))
+        # nothing configured anywhere → (None, None)
+        with tempfile.TemporaryDirectory() as _empty, _clean_env():
+            check("_load_gateway unconfigured → (None, None)",
+                  cn._load_gateway(_empty) == (None, None))
 
         env.write_text("AG2_REMOTE_TOKEN=https://x.example/relay|sekret\n")
         resp = um.MagicMock()
@@ -137,13 +173,34 @@ def main() -> int:
         check("CLI: dry-run does not stamp state",
               json.loads(sf.read_text()) == {"c": 9_000})
 
+    # ── #2346 review blocker: the DEFAULT invocation (no --state-file) must be
+    # rate-limited too. Previously an empty default meant every process started
+    # from {} and the cooldown never applied, so two process-equivalent default
+    # calls both posted. Now the default resolves to a canonical workspace path;
+    # here we point that at a temp file and prove the 2nd call is suppressed.
+    with tempfile.TemporaryDirectory() as d:
+        default_sf = Path(d) / "cron-notify-cooldown.json"
+        posts = []
+        with um.patch.object(cn, "_default_state_file", return_value=str(default_sf)), \
+             um.patch.object(cn, "_post_to_room",
+                             side_effect=lambda *a, **k: posts.append(a) or "$evt"):
+            rc1 = cn.main(["--cron", "c", "--summary", "news", "--kind", "digest",
+                           "--room", "!r:x", "--now", "10000"])
+            rc2 = cn.main(["--cron", "c", "--summary", "news", "--kind", "digest",
+                           "--room", "!r:x", "--now", "10001"])
+        check("CLI default (no --state-file): 1st posts exit 0", rc1 == 0, rc1)
+        check("CLI default (no --state-file): 2nd rate-limited exit 3", rc2 == 3, rc2)
+        check("CLI default: exactly one post across two calls", len(posts) == 1, len(posts))
+        check("CLI default: cooldown persisted to the workspace path",
+              json.loads(default_sf.read_text()) == {"c": 10000}, default_sf.read_text())
+
     # ── review blocker 1: deep-link room is a DIFFERENT identity from the
     # delivery room. Linking a cron-room event under the destination room
     # produces a matrix.to URL that cannot resolve the event.
     with tempfile.TemporaryDirectory() as td:
         sf = Path(td) / "s.json"
         posted = []
-        cn._post_to_room = lambda room, body, env_path=".env": (
+        cn._post_to_room = lambda room, body, repo=None: (
             posted.append((room, body)) or "$evt"
         )
         rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",

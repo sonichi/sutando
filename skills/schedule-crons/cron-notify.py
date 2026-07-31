@@ -154,27 +154,53 @@ def save_state_atomic(path: str, state: dict) -> bool:
 # still gated on owner review). A cron calls this to emit an attention-filtered,
 # rate-limited, deep-linked ping into a room the owner monitors.
 # ─────────────────────────────────────────────────────────────────────────────
-def _load_gateway(env_path=".env"):
-    """Return (base_url, secret) from AG2_REMOTE_TOKEN='url|secret' in .env, or (None, None)."""
-    import os
-    try:
-        for line in open(env_path):
-            if line.startswith("AG2_REMOTE_TOKEN="):
-                v = line.split("=", 1)[1].strip().strip('"').strip("'")
-                if "|" in v:
-                    base, secret = v.split("|", 1)
-                    return base.strip().strip("'").strip('"'), secret.strip()
-    except OSError:
-        pass
-    return None, None
+_RESOLVE_TOKEN = None
 
 
-def _post_to_room(room_id, body, env_path=".env"):
+def _canonical_resolver():
+    """Lazily load resolve_token() from the sibling ensure-cron-room.py.
+
+    Its main() is `__main__`-guarded, so importing the module only defines its
+    functions (no side effects). Reusing that one resolver keeps a SINGLE
+    gateway-cred contract across the schedule-crons skill instead of a second,
+    drift-prone copy — the file has a hyphen so it can't be a plain `import`."""
+    global _RESOLVE_TOKEN
+    if _RESOLVE_TOKEN is None:
+        import importlib.util
+        from pathlib import Path
+        sib = Path(__file__).resolve().parent / "ensure-cron-room.py"
+        spec = importlib.util.spec_from_file_location("_ensure_cron_room", sib)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _RESOLVE_TOKEN = mod.resolve_token
+    return _RESOLVE_TOKEN
+
+
+def _repo_root():
+    from pathlib import Path
+    return str(Path(__file__).resolve().parents[2])
+
+
+def _load_gateway(repo=None):
+    """Return (base_url, secret) for the gateway, or (None, None) if unconfigured.
+
+    Delegates to the canonical resolver (ensure-cron-room.py:resolve_token) so
+    cron-notify honors the SAME cred contract as every other client: process env
+    AND <repo>/.env (process env wins), all alias keys
+    (GATEWAY_*/RELAY_*/REMOTE_TASK_*/AG2_REMOTE_*), and both a combined
+    "url|secret" token and a split URL+token. Repo-root anchored, so a cron
+    invoked from any cwd still resolves — the prior cwd-relative, `.env`-only,
+    `AG2_REMOTE_TOKEN`-only reader returned (None, None) for a supported
+    split-token install and from a non-repo cwd (#2346 review)."""
+    return _canonical_resolver()(repo if repo is not None else _repo_root())
+
+
+def _post_to_room(room_id, body, repo=None):
     """Send `body` to `room_id` via gateway op:message. Returns event_id or None."""
     import json
     import urllib.error
     import urllib.request
-    base, secret = _load_gateway(env_path)
+    base, secret = _load_gateway(repo)
     if not base:
         return None
     req = urllib.request.Request(
@@ -187,6 +213,21 @@ def _post_to_room(room_id, body, env_path=".env"):
         return (json.loads(r.read().decode() or "{}")).get("event_id")
     except (urllib.error.URLError, urllib.error.HTTPError):
         return None
+
+
+def _default_state_file():
+    """Canonical workspace-backed rate-limit state path, used when --state-file
+    is omitted. Without this the default was empty → every process started from
+    {} and the cooldown never applied, so the default invocation posted on every
+    fire with no rate limit (#2346 review). Anchored to the resolved workspace so
+    the cooldown persists across processes regardless of cwd."""
+    import sys
+    from pathlib import Path
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from workspace_default import resolve_workspace
+    return str(resolve_workspace() / "state" / "cron-notify-cooldown.json")
 
 
 def _load_state(path):
@@ -219,7 +260,10 @@ def main(argv=None):
     )
     ap.add_argument("--event-id", default="", help="cron-room event to deep-link to")
     ap.add_argument("--via", default="ag2.space")
-    ap.add_argument("--state-file", default="", help="JSON rate-limit state (cron→last-ping epoch)")
+    ap.add_argument("--state-file", default="",
+                    help="JSON rate-limit state (cron→last-ping epoch). Default: "
+                         "<workspace>/state/cron-notify-cooldown.json — omitting it "
+                         "still rate-limits, it no longer means 'no persistence'.")
     ap.add_argument("--min-interval", type=int, default=1800)
     ap.add_argument("--now", type=int, default=0, help="override epoch (testing); 0=real time")
     ap.add_argument("--dry-run", action="store_true")
@@ -227,11 +271,17 @@ def main(argv=None):
 
     now = args.now or int(time.time())
 
+    # Empty --state-file no longer disables persistence — it resolves to the
+    # canonical workspace-backed path so the DEFAULT invocation is rate-limited
+    # too (the empty default previously started every process from {}, so the
+    # cooldown never applied and the default posted on every fire — #2346).
+    state_file = args.state_file or _default_state_file()
+
     if not is_attention_worthy(args.kind, args.summary):
         print(f"suppressed: not attention-worthy (kind={args.kind})")
         return 3
 
-    state = _load_state(args.state_file) if args.state_file else {}
+    state = _load_state(state_file)
     if not should_ping_now(state, args.cron, now, args.min_interval):
         print(f"suppressed: rate-limited (last ping < {args.min_interval}s ago)")
         return 3
@@ -254,14 +304,13 @@ def main(argv=None):
     # failure: the worst case becomes one SUPPRESSED ping (visible, self-heals on
     # the next fire) instead of an unbounded duplicate stream.
     prior = state.get(args.cron) if isinstance(state, dict) else None
-    if args.state_file:
-        record_ping(state, args.cron, now)
-        if not save_state_atomic(args.state_file, state):
-            print(
-                "error: could not persist rate-limit state — refusing to post "
-                "(posting without a cooldown risks duplicate notifications)"
-            )
-            return 2
+    record_ping(state, args.cron, now)
+    if not save_state_atomic(state_file, state):
+        print(
+            "error: could not persist rate-limit state — refusing to post "
+            "(posting without a cooldown risks duplicate notifications)"
+        )
+        return 2
 
     eid = _post_to_room(args.room, body)
     if not eid:
@@ -269,12 +318,11 @@ def main(argv=None):
         # transient send error would silently mute this cron for the whole
         # cooldown window. Best-effort: if the rollback write fails we keep the
         # reservation, which suppresses rather than duplicates.
-        if args.state_file:
-            if prior is None:
-                state.pop(args.cron, None)
-            else:
-                state[args.cron] = prior
-            save_state_atomic(args.state_file, state)
+        if prior is None:
+            state.pop(args.cron, None)
+        else:
+            state[args.cron] = prior
+        save_state_atomic(state_file, state)
         print("error: post failed (no gateway / send error)")
         return 2
 
