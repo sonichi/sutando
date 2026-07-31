@@ -41,6 +41,7 @@ worker can never wedge boot recaps.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import secrets
@@ -55,11 +56,7 @@ REPO = SCRIPT_PARENT.parents[2]
 
 CLAIM_NAME = "recap-inflight.json"
 STAMP_NAME = "last-recap-session.txt"
-REAP_LOCK_NAME = "recap-inflight.reap.lock"
-# The reaper's critical section is three syscalls (~1ms); the TTL only
-# matters if a reaper dies inside it, so 60s makes takeover pathologies
-# require a 60s stall in a 1ms section while keeping crash recovery quick.
-REAP_LOCK_TTL_S = 60.0
+OWNERSHIP_LOCK_NAME = "recap-inflight.reap.lock"
 
 
 def state_dir(override: str | None) -> Path:
@@ -86,33 +83,36 @@ def _read_claim(path: Path) -> tuple[str | None, float]:
 
 
 def _acquire_ownership_lock(sdir: Path, tries: int = 1,
-                            delay: float = 0.05) -> bool:
-    """O_EXCL lock serializing EVERY mutation of the claim path — reaping
-    AND releasing (round-5 review: release validated ownership then
-    stamped/unlinked unlocked, so a reaper could replace the claim between
-    A's validate and A's unlink). An expired lock (dead holder) is cleared
-    and re-raced. tries=1 = non-blocking (reapers skip); releases retry
-    briefly since their hold time is ~1ms."""
-    lock = sdir / REAP_LOCK_NAME
-    for _ in range(tries):
+                            delay: float = 0.05) -> int | None:
+    """Kernel fd lock (flock) serializing EVERY mutation of the claim path
+    — reaping AND releasing (round-5 review: release validated ownership
+    then stamped/unlinked unlocked). Returns the locked fd, or None.
+
+    flock, not a TTL'd lock FILE (round-6 review): a TTL lets a stale
+    reclaimer steal the lock from an aged-but-still-LIVE holder — a
+    release stalled >TTL inside its section lost the lock, a successor
+    claimed, and the stalled release then stamped itself and deleted the
+    successor's reservation. The kernel releases an flock when its holder
+    dies (fd closes), so crash recovery needs no expiry and a live holder
+    can never be dispossessed, however slow. The lock file itself is
+    permanent and content-free; only the flock on it matters.
+
+    tries=1 = non-blocking (reapers just skip); releases retry briefly
+    since a healthy holder's section is ~1ms."""
+    fd = os.open(sdir / OWNERSHIP_LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o644)
+    for attempt in range(tries):
         try:
-            os.close(os.open(lock,
-                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
-            return True
-        except FileExistsError:
-            try:
-                if time.time() - lock.stat().st_mtime > REAP_LOCK_TTL_S:
-                    lock.unlink(missing_ok=True)
-                    continue
-            except OSError:
-                continue
-            if tries > 1:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if attempt < tries - 1:
                 time.sleep(delay)
-    return False
+    os.close(fd)
+    return None
 
 
-def _release_ownership_lock(sdir: Path) -> None:
-    (sdir / REAP_LOCK_NAME).unlink(missing_ok=True)
+def _release_ownership_lock(fd: int) -> None:
+    os.close(fd)  # closing the fd releases the flock
 
 
 def _try_reap(sdir: Path, stale_token: str | None, stale_s: float) -> None:
@@ -127,7 +127,8 @@ def _try_reap(sdir: Path, stale_token: str | None, stale_s: float) -> None:
     one the caller judged (token identity + still stale). Losers of the
     lock delete nothing and simply re-race."""
     path = sdir / CLAIM_NAME
-    if not _acquire_ownership_lock(sdir):
+    lock_fd = _acquire_ownership_lock(sdir)
+    if lock_fd is None:
         return
     try:
         tok, age = _read_claim(path)
@@ -141,7 +142,7 @@ def _try_reap(sdir: Path, stale_token: str | None, stale_s: float) -> None:
         if age != float("inf") and tok == stale_token and age >= stale_s:
             path.unlink(missing_ok=True)
     finally:
-        _release_ownership_lock(sdir)
+        _release_ownership_lock(lock_fd)
 
 
 def claim(sdir: Path, session: str, stale_s: float) -> int:
@@ -201,7 +202,8 @@ def release(sdir: Path, session: str, stamp: bool, token: str) -> int:
     # claim between our read and our unlink, and we'd then stamp our
     # session and delete the reclaimer's fresh reservation. With the lock,
     # reapers are excluded for the ~1ms this section takes.
-    if not _acquire_ownership_lock(sdir, tries=40):
+    lock_fd = _acquire_ownership_lock(sdir, tries=40)
+    if lock_fd is None:
         print("skip: ownership lock busy — not stamping (a later boot "
               "will retry the recap)")
         return 1
@@ -225,7 +227,7 @@ def release(sdir: Path, session: str, stamp: bool, token: str) -> int:
         print("released" + (" + stamped" if stamp else ""))
         return 0
     finally:
-        _release_ownership_lock(sdir)
+        _release_ownership_lock(lock_fd)
 
 
 def main() -> int:

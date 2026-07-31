@@ -191,10 +191,11 @@ rel_out: dict = {}
 
 
 def run_release():
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        rel_out["code"] = rc.release(d8, "session-a", True, tok_a8)
-    rel_out["msg"] = buf.getvalue()
+    # No redirect_stdout here: it swaps sys.stdout PROCESS-wide, so the
+    # main thread's concurrent check() lines would be swallowed into the
+    # buffer while release is paused. release's own one-line print is
+    # harmless on the console.
+    rel_out["code"] = rc.release(d8, "session-a", True, tok_a8)
 
 
 t = threading.Thread(target=run_release)
@@ -206,13 +207,25 @@ try:
     with redirect_stdout(io.StringIO()):
         b_code = rc.claim(d8, "session-b", 0.0)
     check("B cannot reclaim while A's release holds the lock", b_code == 1)
+    # Aged-LIVE-lock regression (#2454 round 6): age the lock FILE far past
+    # any wall-clock threshold while A still holds the flock. With a TTL'd
+    # lock file this let a reclaimer steal the lock from a live-but-slow
+    # holder, admit session-c, and A's resume then stamped A and deleted
+    # C's reservation. flock has no expiry — a live holder cannot be
+    # dispossessed — so both attempts must still lose.
+    ancient = time.time() - 3600
+    os.utime(d8 / rc.OWNERSHIP_LOCK_NAME, (ancient, ancient))
+    with redirect_stdout(io.StringIO()):
+        aged_b = rc.claim(d8, "session-b", 0.0)
+        aged_c = rc.claim(d8, "session-c", 0.0)
+    check("aged lock file cannot be stolen from a live holder",
+          aged_b == 1 and aged_c == 1, f"b={aged_b} c={aged_c}")
 finally:
     resume.set()
     t.join(5)
     rc.os.replace = real_replace
 check("A's paused release completed normally",
-      rel_out.get("code") == 0 and "stamped" in rel_out.get("msg", ""),
-      str(rel_out))
+      rel_out.get("code") == 0, str(rel_out))
 check("stamp is A's and A's claim is gone",
       (d8 / rc.STAMP_NAME).read_text().strip() == "session-a"
       and not (d8 / rc.CLAIM_NAME).exists())
@@ -240,22 +253,22 @@ check("late reap refuses to delete the fresh claim",
     {"session": "old2", "ts": time.time() - STALE_S - 60, "token": "tok-o2"}))
 rc._try_reap(d6, "tok-o2", STALE_S)
 check("matching stale claim is reaped", not (d6 / rc.CLAIM_NAME).exists())
-check("reaper lock released after reap",
-      not (d6 / rc.REAP_LOCK_NAME).exists())
-# ...a held reaper lock blocks deletion entirely
+post_fd = rc._acquire_ownership_lock(d6)
+check("ownership lock is free again after the reap", post_fd is not None)
+if post_fd is not None:
+    rc._release_ownership_lock(post_fd)
+# ...a HELD ownership lock blocks deletion entirely (flock, not file
+# presence: the lock file always exists; only a held flock excludes)
 (d6 / rc.CLAIM_NAME).write_text(json.dumps(
     {"session": "old3", "ts": time.time() - STALE_S - 60, "token": "tok-o3"}))
-(d6 / rc.REAP_LOCK_NAME).write_text("held")
+holder_fd = rc._acquire_ownership_lock(d6)
 rc._try_reap(d6, "tok-o3", STALE_S)
-check("held reaper lock blocks the reap",
+check("held ownership lock blocks the reap",
       (d6 / rc.CLAIM_NAME).exists())
-# ...an EXPIRED reaper lock is cleared (crash recovery) without reaping
-old = time.time() - rc.REAP_LOCK_TTL_S - 5
-os.utime(d6 / rc.REAP_LOCK_NAME, (old, old))
+rc._release_ownership_lock(holder_fd)
 rc._try_reap(d6, "tok-o3", STALE_S)
-check("expired reaper lock cleared, claim untouched this round",
-      not (d6 / rc.REAP_LOCK_NAME).exists()
-      and (d6 / rc.CLAIM_NAME).exists())
+check("reap proceeds once the holder releases",
+      not (d6 / rc.CLAIM_NAME).exists())
 
 # 4e. concurrent stale-reclaim stress (reviewer hit 2 winners by round 219
 # of 24 claimers on the pre-fix head): every round starts from one STALE
