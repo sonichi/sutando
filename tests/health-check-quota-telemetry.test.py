@@ -296,6 +296,51 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "warn", r["detail"])
 
+    def test_same_launch_timestamp_skew_is_not_staleness(self):
+        """qingyun, #2446: the two launch records come from SEPARATE `date +%s` calls.
+
+        `codex/cli/start-cli.sh:240` stamps core-runtime.json and `:243` appends
+        session-starts.log, so ONE launch can produce started_at=N and
+        session_started_at=N+1 when the second rolls between them. A strict `<` then
+        reads a CURRENT marker as stale and emits the exact false proxy warning this
+        check exists to suppress. Her reproducer used 1000/1001.
+        """
+        # ONE captured timestamp: calling time.time() twice made the boundary case
+        # drift microseconds past the margin and fail intermittently — a flaky test of
+        # my own making, caught before it shipped.
+        now = time.time()
+        for label, marker_at, session_at in (
+            ("1s skew (her repro)", 1000, 1001),
+            ("skew exactly at the margin", now - self.hc.LAUNCH_RECORD_SKEW_SEC, now),
+        ):
+            with self.subTest(label=label):
+                self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+                self._write_core_status(mtime_age_sec=60)
+                (self.ws / "state" / "core-runtime.json").write_text(
+                    json.dumps({"runtime": "codex", "started_at": marker_at})
+                )
+                self._write_sessions(session_at)
+                r = self.hc.check_quota_telemetry("ok")
+                self.assertEqual(r["status"], "ok", f"{label}: {r['detail']}")
+
+    def test_margin_does_not_mask_a_real_previous_core(self):
+        """The slack must not swallow genuine staleness — a previous core is separated
+        from the next launch by its whole lifetime, not by seconds."""
+        now = time.time()
+        for label, marker_at, session_at in (
+            ("just past the margin", now - 86400 - 6, now - 86400),
+            ("a day apart", now - 86400, now - 600),
+        ):
+            with self.subTest(label=label):
+                self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+                self._write_core_status(mtime_age_sec=60)
+                (self.ws / "state" / "core-runtime.json").write_text(
+                    json.dumps({"runtime": "codex", "started_at": marker_at})
+                )
+                self._write_sessions(session_at)
+                r = self.hc.check_quota_telemetry("ok")
+                self.assertEqual(r["status"], "warn", f"{label}: {r['detail']}")
+
     def test_unverifiable_marker_says_so_instead_of_a_bare_ok(self):
         """A pinned pre-Jul-13 checkout has no `session-starts.log` at all.
 

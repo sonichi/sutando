@@ -1833,6 +1833,20 @@ AGENT_ACTIVE_SEC = 30 * 60
 # the check this whole probe exists to make actionable (qingyun, #2445).
 NON_PROXY_RUNTIMES = {"codex"}
 
+# The two launch records are stamped by SEPARATE `date +%s` calls in the same
+# launcher — `src/agent/codex/cli/start-cli.sh:240` writes core-runtime.json and
+# :243 appends session-starts.log — so one launch can legitimately produce
+# started_at=N and session_started_at=N+1 if the second rolls between them. A
+# strict `<` then reads a CURRENT marker as stale and emits the exact false proxy
+# warning this check exists to suppress (qingyun, #2446).
+#
+# A few seconds of slack cannot mask a real previous-core marker: that marker is
+# separated from the next launch by the entire lifetime of the core that wrote it,
+# which is minutes at the very least. So the margin is generous on purpose — it
+# costs nothing on the true-positive side and closes the whole race, rather than
+# assuming the gap is exactly one second.
+LAUNCH_RECORD_SKEW_SEC = 5
+
 
 def _runtime_may_skip_proxy() -> bool:
     """True when this core's runtime is not expected to produce Anthropic quota headers.
@@ -1939,7 +1953,7 @@ def _marker_predates_running_core(marker: dict) -> bool:
     launched = _last_core_launch_at()
     if launched is None:
         return False
-    return started < launched
+    return started < launched - LAUNCH_RECORD_SKEW_SEC
 
 
 def _agent_activity_age() -> "float | None":
