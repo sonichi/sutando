@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""The dashboard quota panel must disclose how old its reading is.
+
+`quota-state.json` is written by the credential proxy. When the proxy is not in
+the boot path (sonichi#2211) nothing rewrites it, and the panel kept rendering
+the last snapshot as if current: Chi found it showing "4% used, resets 16:40
+Jul 17" from a file **332 hours** old.
+
+The asymmetry is the point. A MISSING file already degrades honestly — no
+numbers, `available: True`. A STALE file is confidently wrong, and confidently
+wrong is the worse failure because nothing prompts a second look.
+
+These pin that the age travels with the data and that the label never implies a
+freshness the reader cannot vouch for.
+"""
+import importlib.util
+import json
+import pathlib
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location("dash", REPO / "src" / "dashboard.py")
+dash = importlib.util.module_from_spec(spec)
+sys.modules["dash"] = dash
+spec.loader.exec_module(dash)
+
+failures = []
+
+
+def check(label, cond, detail=""):
+    print(("  ok  " if cond else "  FAIL ") + label + ("" if cond else f" — {detail}"))
+    if not cond:
+        failures.append(label)
+
+
+def write_state(tmp, hours_ago=None, last_checked="use-age", extra=None):
+    """A quota-state.json whose reading is `hours_ago` old."""
+    p = pathlib.Path(tmp) / "quota-state.json"
+    body = {"available": True, "headers": {
+        "anthropic-ratelimit-unified-5h-utilization": "0.04",
+        "anthropic-ratelimit-unified-5h-reset": "1784331600",
+    }}
+    if last_checked == "use-age" and hours_ago is not None:
+        ts = datetime.now(timezone.utc).timestamp() - hours_ago * 3600
+        body["last_checked"] = datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+    elif last_checked not in (None, "use-age"):
+        body["last_checked"] = last_checked
+    if extra:
+        body.update(extra)
+    p.write_text(json.dumps(body))
+    if hours_ago is not None:
+        old = time.time() - hours_ago * 3600
+        import os
+        os.utime(p, (old, old))
+    return p
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    # --- the live failure: a 332h-old reading -------------------------------
+    p = write_state(tmp, hours_ago=331.7)
+    data = json.loads(p.read_text())
+    fresh = dash._quota_freshness(data, p)
+    # NB: .get() not [] — a pre-fix module returns {} and must FAIL these
+    # checks, not raise KeyError and abort the suite before the rest run.
+    check("A1 a 332h-old reading is flagged stale", fresh.get("stale") is True, str(fresh))
+    check("A2 its age is reported, not hidden",
+          (fresh.get("age_h") or 0) > 300, str(fresh))
+    check("A3 the label says STALE and gives the age in days",
+          "STALE" in dash._quota_age_label({**data, **fresh}) and "d old" in dash._quota_age_label({**data, **fresh}),
+          dash._quota_age_label({**data, **fresh}))
+
+    # --- controls: a fresh reading must NOT be cried wolf on ----------------
+    p = write_state(tmp, hours_ago=0.05)
+    data = json.loads(p.read_text())
+    fresh = dash._quota_freshness(data, p)
+    check("B1 a 3-minute-old reading is NOT stale", fresh.get("stale") is False, str(fresh))
+    check("B2 fresh readings still show their age (absence trains the eye to ignore it)",
+          "ago" in dash._quota_age_label({**data, **fresh}),
+          dash._quota_age_label({**data, **fresh}))
+
+    p = write_state(tmp, hours_ago=5.5)
+    data = json.loads(p.read_text())
+    check("B3 just under the 6h threshold is still fresh",
+          dash._quota_freshness(data, p).get("stale") is False)
+    p = write_state(tmp, hours_ago=6.5)
+    data = json.loads(p.read_text())
+    check("B4 just over the 6h threshold is stale",
+          dash._quota_freshness(data, p).get("stale") is True)
+
+    # --- unknown age must fail CLOSED --------------------------------------
+    p = write_state(tmp, hours_ago=0.1, last_checked="not-a-timestamp")
+    data = json.loads(p.read_text())
+    fresh = dash._quota_freshness(data, p)
+    check("C1 an unparseable last_checked falls back to mtime, not a crash",
+          fresh.get("age_h") is not None, str(fresh))
+
+    # last_checked is the WRITER's observation; mtime only says when the file
+    # was touched. A rewrite carrying an old reading must still read old.
+    p = write_state(tmp, hours_ago=None, last_checked=(
+        datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - 40 * 3600, timezone.utc)
+        .isoformat().replace("+00:00", "Z")))
+    data = json.loads(p.read_text())
+    fresh = dash._quota_freshness(data, p)
+    check("C2 a FRESH mtime with an OLD last_checked still reads stale",
+          fresh.get("stale") is True and (fresh.get("age_h") or 0) > 30, str(fresh))
+
+    check("D1 no data at all → 'no data', not a fake age",
+          dash._quota_age_label({"available": True}) == "no data")
+    check("D2 age unknown → said so explicitly",
+          dash._quota_age_label({"headers": {"x": "1"}, "age_h": None}) == "age unknown")
+
+print()
+if failures:
+    print(f"FAIL — {len(failures)} check(s) failed")
+    sys.exit(1)
+print("PASS — dashboard quota staleness tests")
