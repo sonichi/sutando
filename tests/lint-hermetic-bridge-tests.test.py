@@ -349,6 +349,42 @@ def _seed(channel):
             '(_c / "access.json").write_text("{}")\n')
 
 
+# Review 13 (qingyun, #2429): `ast.walk()` flattens everything, so a canonical seed
+# inside a never-called function was recorded as if it had run before the import.
+# The file is never created, so the bridge still falls back to the real allowlist.
+_INLINE_SEED = ('(pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"'
+                ' / "access.json").write_text("{}")\n')
+
+check(
+    "seed inside a never-called function is NOT a seed",
+    lint.classify(write(tmpdir, _ENV + 'def never_called():\n    ' + _INLINE_SEED + IMPORTS_BRIDGE))
+    == lint.VIOLATION,
+    "a def body does not run on import; the canonical file is never created",
+)
+check(
+    "seed inside a class body is NOT a seed",
+    lint.classify(write(tmpdir, _ENV + 'class C:\n    ' + _INLINE_SEED + IMPORTS_BRIDGE))
+    == lint.VIOLATION,
+)
+check(
+    "module-level inline seed IS still a seed",
+    lint.classify(write(tmpdir, _ENV + _INLINE_SEED + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "seed inside a `with` block IS a seed (runs in module order)",
+    lint.classify(
+        write(tmpdir, _ENV + 'with open("/dev/null"):\n    ' + _INLINE_SEED + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+    "refusing conditionals would reject the ordinary TemporaryDirectory seeding shape",
+)
+check(
+    "seed inside try/except IS a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'try:\n    ' + _INLINE_SEED + 'except Exception:\n    pass\n' + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+)
 check(
     "MISMATCH: seed discord, import telegram -> violation",
     lint.classify(write(tmpdir, _seed("discord") + _TELEGRAM_BRIDGE)) == lint.VIOLATION,

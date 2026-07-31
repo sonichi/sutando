@@ -402,6 +402,30 @@ def _imported_bridge_channels(text: str) -> "set[str]":
     return set(BRIDGE_IMPORT.findall(text))
 
 
+# Statements whose bodies do NOT run just because the module was imported. A seed
+# written inside one of these is not a seed: the canonical access.json is never
+# created before the bridge loads, so the import still falls back to the operator's
+# real allowlist. qingyun's repro on #2429 put a fully-inline canonical write inside
+# a `def never_called():` and it classified CLEAN, because ast.walk() descends into
+# function bodies.
+_DEFERRED_BODIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _reachable_nodes(stmt: ast.AST):
+    """Walk `stmt` but do NOT descend into bodies that only run when CALLED.
+
+    ast.walk() cannot express this — it flattens everything — so the traversal is
+    explicit. Conditionals (`if`/`try`/`with`) are still descended into: they at
+    least execute in module order, and refusing them would reject the ordinary
+    `with tempfile.TemporaryDirectory() as d:` seeding shape.
+    """
+    if isinstance(stmt, _DEFERRED_BODIES):
+        return
+    yield stmt
+    for child in ast.iter_child_nodes(stmt):
+        yield from _reachable_nodes(child)
+
+
 def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
     """Earliest module-level WRITE that creates the CANONICAL
     `$CLAUDE_CONFIG_DIR/channels/<ch>/access.json`.
@@ -453,7 +477,7 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
             seeded[ch] = lineno
 
     for node in tree.body:
-        for sub in ast.walk(node):
+        for sub in _reachable_nodes(node):
             if not isinstance(sub, ast.Call):
                 continue
             # Method style: (dir / "access.json").write_text(...) — path is the RECEIVER.
