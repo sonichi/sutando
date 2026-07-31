@@ -58,6 +58,15 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    - **Human room post — ONLY if `recap_room` is set (and private).** If `recap_room` is configured in this host's `recap.json` — `<workspace>/hosts/<hostname>/recap.json`, per the hosts/<hostname>/ per-host state convention, sibling of `crons.json` (which itself stays a bare job list) and names a private, owner-only room, additionally post the brief to `recap_room` (gateway op:message). No `recap_room`, or a non-private one → skip the post, leave the recap on disk under `data/session-recaps/`.
    Idempotence lives in the recap skill's `state/last-recap-session.txt` stamp — a mid-session `/schedule-crons` re-run finds the previous session already stamped and skips both the write and the post, so this never double-writes or double-posts (same guard philosophy as the dynamic-loop freshness sentinel in step 3).
 
+5.7. **Stamp completion for the health-check divergence guard.** After all registrations (and the fallback check in step 4), count the session-owned entries you actually registered this run (CronCreate successes + pre-existing matches from step 3, including the main-loop/fallback) and write the stamp — script-visible proof that THIS core boot completed registration:
+   ```bash
+   WS="$(bash scripts/sutando-config.sh workspace)"
+   H="$(bash scripts/sutando-config.sh host-label)"
+   mkdir -p "$WS/hosts/$H"
+   echo "{\"ts\": $(date +%s), \"registered\": <count>, \"config_total\": <total entries in crons.json>}" > "$WS/hosts/$H/schedule-crons-stamp.json"
+   ```
+   `health-check.py`'s `session-crons` probe compares this host-owned stamp against the same host's core heartbeat `started_at`: a stamp older than the boot means session crons died with a previous session and were never re-registered (the silent 2/18 failure observed on a peer instance 2026-07-23). Do not skip the stamp on re-runs — a fresh stamp is what keeps the guard quiet.
+
 6. Confirm what was scheduled — note whether the proactive-loop fallback was triggered (informs operator that crons.json may need a persistent entry).
 
 ## Adding New Crons
