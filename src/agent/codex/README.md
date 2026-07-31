@@ -11,6 +11,13 @@ adapts Sutando's streaming file watcher to Codex by submitting one prompt per
 task-file event into the core pane. It runs in a separate managed tmux session
 so it survives launcher exit and is restarted together with the core.
 
+Watcher events are wake signals rather than queue order. The notifier waits for
+the core's positive `idle` status and a pane without Codex's live working marker
+before touching the interactive input, then selects the highest-priority pending
+task from disk (`urgent`, `normal`, `low`, FIFO within a tier). This keeps a busy
+core from losing an injected prompt and prevents scheduled low-priority work
+from blocking later owner messages.
+
 On macOS the launcher also reconciles fixed `crons.json` schedules onto the
 OS-backed cron runner before starting or reusing the Codex session. Codex has
 no session `CronCreate` surface, so leaving those entries session-owned would
