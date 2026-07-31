@@ -1899,6 +1899,43 @@ def _runtime_may_skip_proxy() -> bool:
     return runtime in NON_PROXY_RUNTIMES
 
 
+def _local_host_labels() -> "set[str]":
+    r"""Every label a launcher on THIS host could plausibly have persisted.
+
+    The reader and the writers do NOT share a host-label contract, and comparing
+    against only one of them discards this host's real launch records:
+
+      reader  `util_paths._host_label()`  -> SUTANDO_HOST_LABEL > scutil
+                                             LocalHostName > short hostname
+      writers `hostname | sed 's/\..*//'` -> short hostname, always
+              (src/agent/codex/cli/start-cli.sh:242,
+               src/agent/claude/cli/start-cli.sh:609)
+
+    On macOS those routinely differ — LocalHostName is the stable Bonjour name
+    while `hostname` follows DHCP — and with SUTANDO_HOST_LABEL set they differ by
+    construction. When they do, EVERY local line is skipped as foreign, the
+    boundary becomes None, and a stale `runtime:codex` marker stays trusted
+    forever: the stale-quota warning goes permanently silent. That is strictly
+    worse than the cross-host false positive the host filter was added to fix
+    (qingyun-wu + john-the-dev, #2446, independently reproduced).
+
+    This host is not hypothetical evidence: its own vault carries BOTH
+    `host/Chis-MacBook-Pro/…` and `host/Chis-MBP/…` branches, so the short name
+    has already drifted here at least once.
+
+    Accepting the union is deliberately the conservative direction. A foreign host
+    would have to share one of these exact labels to be mistaken for local, which
+    is the pre-existing collision risk; discarding local records, by contrast,
+    silences a real alert on every affected host.
+    """
+    labels = {_host_label()}
+    try:
+        labels.add(socket.gethostname().split(".")[0])
+    except Exception:  # pragma: no cover — gethostname failing is not a reason to go blind
+        pass
+    return {x for x in labels if x}
+
+
 def _last_core_launch_at() -> "tuple[float, str | None] | None":
     """When the CURRENT core was launched, from `state/session-starts.log`.
 
@@ -1953,7 +1990,7 @@ def _last_core_launch_at() -> "tuple[float, str | None] | None":
         if not isinstance(entry, dict):
             continue
         entry_host = entry.get("host")
-        if not isinstance(entry_host, str) or entry_host != _host_label():
+        if not isinstance(entry_host, str) or entry_host not in _local_host_labels():
             continue                      # another host's launch, or unattributable
         try:
             ts = float(entry.get("session_started_at"))

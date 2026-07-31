@@ -20,6 +20,7 @@ Exit: 0 on pass, 1 on fail.
 from __future__ import annotations
 import importlib.util
 import json
+import socket
 import os
 import tempfile
 import time
@@ -313,6 +314,48 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         )
         r = self.hc.check_quota_telemetry("ok")
         self.assertNotEqual(r["status"], "warn", r["detail"])
+
+    def test_canonical_label_differing_from_short_hostname_still_matches(self):
+        """The reader and the writers do not share a host-label contract (#2446).
+
+        `_host_label()` prefers SUTANDO_HOST_LABEL / scutil LocalHostName; both
+        launchers persist `hostname | sed 's/\\..*//'`. On macOS those routinely
+        differ. Comparing against only the canonical label discarded EVERY local
+        record, leaving no boundary — which makes a stale codex marker trusted
+        forever and silences the warning permanently. That is strictly worse than
+        the cross-host false positive the filter was added to fix.
+
+        This host is the evidence: its vault carries both `host/Chis-MacBook-Pro/…`
+        and `host/Chis-MBP/…` branches, so the short name has already drifted here.
+        """
+        now = time.time()
+        p = self.ws / "state" / "session-starts.log"
+        p.write_text(json.dumps({"host": "short-host", "session_started_at": now - 60,
+                                 "source": "start-cli", "runtime": "codex"}) + "\n")
+        real_label, real_gh = self.hc._host_label, socket.gethostname
+        try:
+            self.hc._host_label = lambda: "BonjourHost"      # canonical differs...
+            socket.gethostname = lambda: "short-host"        # ...from what the writer used
+            got = self.hc._last_core_launch_at()
+        finally:
+            self.hc._host_label, socket.gethostname = real_label, real_gh
+        self.assertIsNotNone(got, "local launch record was discarded as foreign")
+        self.assertAlmostEqual(got[0], now - 60, places=3)
+        self.assertEqual(got[1], "codex")
+
+    def test_union_does_not_re_admit_a_genuinely_foreign_host(self):
+        """Control: accepting BOTH local spellings must not undo the cross-host fix."""
+        now = time.time()
+        p = self.ws / "state" / "session-starts.log"
+        p.write_text(json.dumps({"host": "somebody-elses-mac", "session_started_at": now,
+                                 "source": "start-cli", "runtime": "codex"}) + "\n")
+        real_label, real_gh = self.hc._host_label, socket.gethostname
+        try:
+            self.hc._host_label = lambda: "BonjourHost"
+            socket.gethostname = lambda: "short-host"
+            self.assertIsNone(self.hc._last_core_launch_at())
+        finally:
+            self.hc._host_label, socket.gethostname = real_label, real_gh
 
     def test_foreign_host_launch_is_not_a_boundary_at_all(self):
         """A log containing ONLY another host's launches yields no local boundary."""
