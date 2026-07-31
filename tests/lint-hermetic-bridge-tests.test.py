@@ -789,5 +789,107 @@ finally:
 
 check("grandfather list restored after patching", lint.KNOWN_UNISOLATED is _real_known)
 
+# --- KNOWN LIMITATIONS: pinned false positives ----------------------------
+# These two shapes are hermetic and SHOULD classify clean. They do not, and the
+# reason is structural rather than a bug in any one predicate: `_isolation_line`
+# only counts isolation that `_reachable_nodes` proves runs unconditionally on
+# import, while the load side uses `ast.walk` and sees a load anywhere — including
+# inside a function body. The two detectors therefore disagree about what "runs".
+#
+# Neither symmetric repair is acceptable, which is why this is pinned rather than
+# fixed here:
+#   * load side -> _reachable_nodes  : stops seeing loads inside test functions,
+#                                      which is the COMMON shape. False CLEAN.
+#   * isolation side -> ast.walk     : re-admits a seed under `if False:` or in an
+#                                      except handler. That is exactly the hole
+#                                      round 7 closed. False CLEAN.
+# The real fix is per-scope ordering (isolation before load along the same path),
+# which is a new analysis and does not belong in this PR's last round.
+#
+# They are pinned as EXPECTED-CURRENT-BEHAVIOUR, not endorsed. The gate's documented
+# stance is to under-approximate CLEAN, so a false positive is the safe direction to
+# be wrong in — it costs a grandfather entry, never a silent host-config mutation.
+#
+# WHEN EITHER OF THESE STARTS RETURNING CLEAN: that is the scope-aware fix landing.
+# Delete the corresponding pin — do not "repair" it — and note it in the PR/issue
+# that made it pass. A pin that is quietly flipped to CLEAN would hide the change.
+check(
+    "KNOWN LIMITATION: isolation + load inside ONE function reads as violation",
+    lint.classify(
+        write(tmpdir,
+              'import os, tempfile, pathlib, importlib.util\n'
+              'def test_it():\n'
+              '    os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+              '    _c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              '    _c.mkdir(parents=True, exist_ok=True)\n'
+              '    (_c / "access.json").write_text("{}")\n'
+              '    spec = importlib.util.spec_from_file_location("db", "src/discord-bridge.py")\n'
+              '    m = importlib.util.module_from_spec(spec)\n'
+              '    spec.loader.exec_module(m)\n')
+    ) == lint.VIOLATION,
+    "started classifying CLEAN — the scope-aware fix landed; delete this pin",
+)
+# Anti-vacuity control for the pin above. A bare `== VIOLATION` assertion would also
+# hold if classify() started returning violation for everything, which would make the
+# pin pass while measuring nothing. Hoisting the SAME statements to module level must
+# be clean, so function scope is provably the only variable.
+check(
+    "control: those same statements at module level ARE clean",
+    lint.classify(
+        write(tmpdir,
+              'import os, tempfile, pathlib, importlib.util\n'
+              'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+              '_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              '_c.mkdir(parents=True, exist_ok=True)\n'
+              '(_c / "access.json").write_text("{}")\n'
+              'spec = importlib.util.spec_from_file_location("db", "src/discord-bridge.py")\n'
+              'm = importlib.util.module_from_spec(spec)\n'
+              'spec.loader.exec_module(m)\n')
+    ) == lint.CLEAN,
+)
+# The remaining two pins share one baseline, held here so each varies exactly one thing.
+# Writing this control is what caught a mis-attribution: the first draft of the guard pin
+# ALSO routed the temp dir through a variable, so its violation could have come from
+# either cause. The 2x2 disambiguates — direct+unconditional clean, direct+guarded
+# violation, indirect+unconditional violation — so these are two independent limitations,
+# and the third one below was not previously documented anywhere.
+_DIRECT_SETUP = ('import os, tempfile, pathlib\n'
+                 'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+                 '_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n')
+_SEED = '_c.mkdir(parents=True, exist_ok=True)\n(_c / "access.json").write_text("{}")\n'
+
+check(
+    "control (shared baseline): direct temp assignment + unconditional seed IS clean",
+    lint.classify(write(tmpdir, _DIRECT_SETUP + _SEED + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "KNOWN LIMITATION: seed guarded by `if not ...exists()` reads as violation",
+    lint.classify(
+        write(tmpdir,
+              _DIRECT_SETUP +
+              'if not (_c / "access.json").exists():\n'
+              '    _c.mkdir(parents=True, exist_ok=True)\n'
+              '    (_c / "access.json").write_text("{}")\n' + IMPORTS_BRIDGE)
+    ) == lint.VIOLATION,
+    "started classifying CLEAN — the scope-aware fix landed; delete this pin",
+)
+# Third limitation, found by the control above rather than by reading the code:
+# `_isolation_line` recognises the temp dir only when the mkdtemp() call is the
+# assignment's own RHS. Routing it through a variable — which is ordinary style, and
+# what a test needs in order to reuse the path — is not recognised as isolation at all,
+# even with no conditional anywhere. This one is NOT scope-related, so the scope-aware
+# fix will not remove it; it needs the isolation predicate to follow a local binding.
+check(
+    "KNOWN LIMITATION: temp dir routed through a variable reads as violation",
+    lint.classify(
+        write(tmpdir,
+              'import os, tempfile, pathlib\n'
+              '_cfg = pathlib.Path(tempfile.mkdtemp())\n'
+              'os.environ["CLAUDE_CONFIG_DIR"] = str(_cfg)\n'
+              '_c = _cfg / "channels" / "discord"\n' + _SEED + IMPORTS_BRIDGE)
+    ) == lint.VIOLATION,
+    "started classifying CLEAN — the binding-following fix landed; delete this pin",
+)
+
 print("\n" + ("FAIL — " + ", ".join(failures) if failures else "PASS — lint-hermetic-bridge-tests"))
 sys.exit(1 if failures else 0)
