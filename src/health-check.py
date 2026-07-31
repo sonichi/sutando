@@ -1871,6 +1871,15 @@ def _runtime_may_skip_proxy() -> bool:
     if not isinstance(marker, dict):
         return True               # cannot rule Codex out -> stay silent
     runtime = marker.get("runtime")
+    # The FIELD has a schema too, not just the container. `{"runtime": []}` and
+    # `{"runtime": {}}` reach the membership test and raise TypeError (unhashable);
+    # `{"runtime": 3}`, `{"runtime": true}` and a marker with no `runtime` key at all
+    # don't crash but fall through to "proxy-routed" and manufacture the very warning
+    # this check exists to suppress. A field that isn't a string tells us nothing about
+    # the runtime, so it takes the same fail-silent path as malformed JSON
+    # (qingyun, #2446 — the same shape one level in from the container guard above).
+    if not isinstance(runtime, str):
+        return True               # cannot rule Codex out -> stay silent
     if _marker_predates_running_core(marker):
         return False              # belongs to a previous core -> no information
     return runtime in NON_PROXY_RUNTIMES

@@ -293,6 +293,37 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
                 r = self.hc.check_quota_telemetry("ok")   # must not raise
                 self.assertEqual(r["status"], "ok", f"{raw}: {r['detail']}")
 
+    def test_non_string_runtime_field_is_silent_not_a_crash_or_a_warn(self):
+        """The FIELD has a schema too, not just the container.
+
+        Two distinct failures from one loose read, which is why both are pinned here:
+          * `{"runtime": []}` / `{"runtime": {}}` reach `in NON_PROXY_RUNTIMES` and raise
+            TypeError (unhashable) — crashing the whole health run;
+          * `{"runtime": 3}` / `{"runtime": true}` / `{}` don't crash but fall through to
+            "proxy-routed" and MANUFACTURE the stale-quota warning this check exists to
+            suppress.
+        A field that isn't a string tells us nothing about the runtime, so it takes the
+        same fail-silent path as malformed JSON (qingyun, #2446).
+        """
+        for raw in ('{"runtime": []}', '{"runtime": {}}', '{"runtime": 3}',
+                    '{"runtime": true}', '{"runtime": null}', '{}'):
+            with self.subTest(raw=raw):
+                self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+                self._write_core_status(mtime_age_sec=60)
+                (self.ws / "state" / "core-runtime.json").write_text(raw)
+                r = self.hc.check_quota_telemetry("ok")   # must not raise
+                self.assertEqual(r["status"], "ok", f"{raw}: {r['detail']}")
+
+    def test_string_runtime_values_still_decide_normally(self):
+        """The guard must not over-correct into ignoring well-formed markers."""
+        for raw, expected in (('{"runtime": "codex"}', "ok"), ('{"runtime": "claude"}', "warn")):
+            with self.subTest(raw=raw):
+                self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+                self._write_core_status(mtime_age_sec=60)
+                (self.ws / "state" / "core-runtime.json").write_text(raw)
+                r = self.hc.check_quota_telemetry("ok")
+                self.assertEqual(r["status"], expected, f"{raw}: {r['detail']}")
+
     def test_non_object_heartbeat_does_not_crash_the_staleness_compare(self):
         """The sibling read has the same shape hazard: a junk `.alive` must not take
         the run down while comparing a legitimate marker against it."""
