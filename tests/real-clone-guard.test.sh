@@ -165,6 +165,28 @@ echo "      (asserted as 0 on purpose — pins the limitation so it stays visibl
 
 rm -rf "$D"
 
+# 14. DISCRIMINATING (qingyun, round 3): the INDEX is a third surface. `git diff HEAD`
+#     compares WORKTREE to HEAD and ignores staged content, so on an already-`MM` path
+#     the staged blob can be swapped while status, worktree bytes and that diff are all
+#     byte-identical. Fails against a guard without `git diff --cached`.
+D="$(mkfixture)"
+echo index-before > "$D/seed.txt"; git -C "$D" add seed.txt      # staged change
+echo worktree-before > "$D/seed.txt"                              # + unstaged -> MM
+rcg_snapshot "$D"
+S_BEFORE="$(git -C "$D" status --porcelain -uall)"
+W_BEFORE="$(cat "$D/seed.txt")"
+blob=$(printf 'index-after\n' | git -C "$D" hash-object -w --stdin)
+git -C "$D" update-index --cacheinfo 100644,"$blob",seed.txt      # ONLY the index moves
+rcg_assert >/dev/null 2>&1
+check "replacing ONLY the staged blob fails" 1 $?
+[ "$S_BEFORE" = "$(git -C "$D" status --porcelain -uall)" ] \
+  && { echo "  ok  ...and porcelain status was IDENTICAL (MM either way)"; pass=$((pass+1)); } \
+  || { echo "  FAIL status changed — not discriminating"; fail=$((fail+1)); }
+[ "$W_BEFORE" = "$(cat "$D/seed.txt")" ] \
+  && { echo "  ok  ...and the WORKTREE bytes never changed"; pass=$((pass+1)); } \
+  || { echo "  FAIL worktree changed — not discriminating"; fail=$((fail+1)); }
+rm -rf "$D"
+
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 [ "$fail" -eq 0 ] || exit 1

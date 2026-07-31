@@ -28,6 +28,12 @@
 _rcg_content_digest() {
   local dir="$1"
   {
+    # THE INDEX IS A THIRD SURFACE. `git diff HEAD` compares the WORKTREE to HEAD and
+    # ignores staged content entirely, so on an already-`MM` path the staged blob can
+    # be replaced while status, worktree bytes and this diff all stay identical.
+    # Verified: before_index=index-before -> after_index=index-after, guard passed.
+    # `--cached` (index vs HEAD) is the missing comparison.
+    git -C "$dir" diff --cached 2>/dev/null
     git -C "$dir" diff HEAD 2>/dev/null
     git -C "$dir" ls-files --others --exclude-standard -z 2>/dev/null \
       | while IFS= read -r -d "" f; do
