@@ -696,6 +696,85 @@ check(
     "makedirs is recursive by definition and needs no parents= keyword",
 )
 
+# --- false-CLEAN paths reported on 1e7794e9 (qingyun-wu, #2429) -------------
+# Both are the same shape: a check that recognised a NAME instead of the PROPERTY
+# it stands for. Neither fixture ever creates or writes the canonical file, and
+# both classified `clean`, so a test could read/mutate the developer's real
+# channel allowlist while the gate said it was isolated.
+check(
+    "false CLEAN 1: a fake `.makedirs` receiver does NOT vouch for the parent",
+    lint.classify(write(tmpdir,
+        'import os, tempfile, pathlib\n'
+        'class Fake:\n'
+        '    def makedirs(self, *a, **k): pass\n'
+        'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+        f'_p = {_CCD_P} / "channels" / "discord"\n'
+        'Fake().makedirs(_p)\n'
+        '(_p / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) != lint.CLEAN,
+    "a no-op makedirs cannot create the parent; the real write then raises and is swallowed",
+)
+check(
+    "false CLEAN 2: rooted `notchannels/.../access.json.bak` is NOT the canonical seed",
+    lint.classify(write(tmpdir,
+        _ENV
+        + f'_p = {_CCD_P} / "notchannels" / "discord"\n'
+        'os.makedirs(_p, exist_ok=True)\n'
+        '(_p / "access.json.bak").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) != lint.CLEAN,
+    "substring matching accepted both the notchannels/ lookalike and the .bak suffix",
+)
+# Anti-vacuity: the two pins above would also hold if classify() simply stopped
+# returning CLEAN. The genuine article — real os.makedirs, exact canonical path —
+# must still read clean.
+check(
+    "control: the genuine os.makedirs + canonical access.json seed is STILL clean",
+    lint.classify(write(tmpdir,
+        _ENV
+        + f'_p = {_CCD_P} / "channels" / "discord"\n'
+        'os.makedirs(_p, exist_ok=True)\n'
+        '(_p / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+# The alias forms must keep working, or the receiver check would just break the
+# idioms it is meant to protect.
+check(
+    "alias: `import os as _os` -> _os.makedirs still counts",
+    lint.classify(write(tmpdir,
+        # Rooting via plain `os.environ` on purpose: aliasing the env read too would
+        # test the CCD-root resolver (which only knows `os.environ`) instead of the
+        # makedirs-receiver check this pins.
+        'import os, tempfile, pathlib\n'
+        'import os as _os\n'
+        'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+        f'_p = {_CCD_P} / "channels" / "discord"\n'
+        '_os.makedirs(_p, exist_ok=True)\n'
+        '(_p / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "alias: `from os import makedirs` -> bare makedirs still counts",
+    lint.classify(write(tmpdir,
+        'import os, tempfile, pathlib\n'
+        'from os import makedirs\n'
+        'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+        f'_p = {_CCD_P} / "channels" / "discord"\n'
+        'makedirs(_p, exist_ok=True)\n'
+        '(_p / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "a bare `makedirs(...)` that was never imported from os does NOT count",
+    lint.classify(write(tmpdir,
+        'import os, tempfile, pathlib\n'
+        'def makedirs(*a, **k): pass\n'
+        'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+        f'_p = {_CCD_P} / "channels" / "discord"\n'
+        'makedirs(_p)\n'
+        '(_p / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) != lint.CLEAN,
+)
+
 # --- scan() ----------------------------------------------------------------
 scanned = lint.scan(["tests/lint-hermetic-bridge-tests.test.py"])
 check("scan(): skips out-of-scope files", scanned == {}, str(scanned))

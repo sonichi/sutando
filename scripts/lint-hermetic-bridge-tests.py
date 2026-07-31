@@ -518,6 +518,23 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
     rooted = _rooted_segments(tree)
     consts = _literal_segment_names(tree)
 
+    # Names that actually resolve to the `os` module / `os.makedirs` IN THIS FILE.
+    # Recognising a call by its attribute name alone let `Fake().makedirs(parent)` —
+    # a no-op — vouch for a parent directory that was never created; the canonical
+    # write then raised, was swallowed, and the file still classified `clean`
+    # (qingyun-wu, #2429).
+    os_aliases: "set[str]" = set()
+    makedirs_names: "set[str]" = set()
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.Import):
+            for _a in _n.names:
+                if _a.name == "os":
+                    os_aliases.add(_a.asname or "os")
+        elif isinstance(_n, ast.ImportFrom) and _n.module == "os":
+            for _a in _n.names:
+                if _a.name in _MAKEDIRS_FUNCS:
+                    makedirs_names.add(_a.asname or _a.name)
+
     def _path_channel(expr: ast.AST, *, want_access_json: bool) -> "str | None":
         """The channel this path expression belongs to under the CONFIGURED config dir.
 
@@ -527,15 +544,28 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
         is_rooted, segs = _expr_root_segments(expr, roots, rooted, consts)
         if not is_rooted:
             return None
-        if not any("channels" in seg for seg in segs):
+        # EXACT component identity, not substring membership. `"channels" in seg`
+        # accepted a rooted `notchannels/discord/access.json.bak` as the canonical
+        # seed and `"access.json" in seg` accepted the `.bak` suffix, so a file that
+        # never touched the real allowlist classified `clean` (qingyun-wu, #2429).
+        # A segment may itself carry several components ("channels/discord"), so
+        # flatten before comparing.
+        #
+        # ORDER IS NOT ENFORCED, deliberately and with a known limit: segments arrive
+        # as an unordered SET because a path assembled across assignments
+        # (`c = root / "channels" / "discord"` … `c / "access.json"`) loses sequence in
+        # `_expr_root_segments`. Exact identity is what rejects both reported
+        # false-CLEANs — neither needs ordering — and making the resolver
+        # order-preserving is a wider change than this fix. The residual gap is a path
+        # holding all three components in a nonsensical order; it is strictly smaller
+        # than the substring gap it replaces.
+        comps = {c for seg in segs for c in str(seg).split("/") if c}
+        if "channels" not in comps:
             return None
-        if want_access_json and not any("access.json" in seg for seg in segs):
+        if want_access_json and "access.json" not in comps:
             return None
-        # The channel is a segment naming a bridge we know about. Matching against
-        # the known set (rather than "the segment after channels") keeps this robust
-        # to a path assembled across several assignments, where ordering is lost.
         for ch in ("discord", "slack", "telegram"):
-            if any(ch == seg or ch in seg.split("/") for seg in segs):
+            if ch in comps:
                 return ch
         return None
 
@@ -556,11 +586,23 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
                         and kw.value.value is True:
                     return call.func.value
             return None
-        name = (
-            call.func.attr if isinstance(call.func, ast.Attribute)
-            else call.func.id if isinstance(call.func, ast.Name)
-            else None
-        )
+        # `makedirs` takes the path as an ARGUMENT, so a fake receiver still hands us
+        # the canonical path and every path check passes — only the receiver is a lie.
+        # (`.mkdir(parents=True)` above needs no such guard: it returns the RECEIVER as
+        # the created path, so a fake receiver fails path resolution on its own.)
+        # Hence: the receiver must be a name that really imports the `os` module here,
+        # or a bare name really imported via `from os import makedirs`.
+        if isinstance(call.func, ast.Attribute):
+            recv = call.func.value
+            name = (call.func.attr
+                    if isinstance(recv, ast.Name) and recv.id in os_aliases
+                    else None)
+        elif isinstance(call.func, ast.Name):
+            # `makedirs_names` holds only names proven to BE os.makedirs, so an alias
+            # (`from os import makedirs as md`) normalises to the canonical spelling.
+            name = "makedirs" if call.func.id in makedirs_names else None
+        else:
+            name = None
         if name in _MAKEDIRS_FUNCS:
             for kw in call.keywords:
                 if kw.arg == "name":
