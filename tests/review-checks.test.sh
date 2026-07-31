@@ -98,6 +98,11 @@ check "standalone line-start literal still passes"      clean $'+++ b/skills/x/c
 check "immediately-indexed literal is not a list"      flag  $'+++ b/skills/x/x1.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"][1];'
 check "runtime .find() resolver still passes"          clean $'+++ b/skills/x/x2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"].find(exists);'
 
+# Rounds 11-13: next-line subscript, .at() selection, context-line continuation.
+check "next-line subscript still selects"              flag  $'+++ b/skills/x/n1.ts\n@@ -0,0 +1,2 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+[1];'
+check ".at(1) selects, not a resolver"                 flag  $'+++ b/skills/x/n2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].at(1);'
+check "context expr + added bracket is a continuation" flag  $'+++ b/skills/x/n3.ts\n@@ -1 +1,2 @@\n const cmd = paths\n+["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"];'
+
 # `"" in ")]"` is True in Python, so an unguarded prev-char test made a bracket at
 # COLUMN 0 read as a call on a returned value and falsely flagged a valid list.
 check "candidate list at column 0 still passes"         clean $'+++ b/skills/x/col0.ts\n@@ -1,0 +1,1 @@\n+["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'

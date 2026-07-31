@@ -636,6 +636,42 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Rounds 11-13 (qingyun-wu, review of 527b8687). Three ways a candidate-looking
+# list is still selected deterministically:
+#   A. the subscript opens the NEXT line (JS continues the member expression);
+#   B. `.at(1)` — a method that selects rather than probes;
+#   C. the expression is unchanged CONTEXT and only the bracket line is added, so
+#      `prev_added` was never populated and the bracket looked standalone.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    ok("main(): a subscript opening the NEXT line still selects",
+       "hardcoded path" in scan('+++ b/src/n1.ts\n@@ -0,0 +1,2 @@\n+const cmd = ' + L + '\n+[1];')[1])
+    ok("main(): `.at(1)` selects — not a runtime resolver",
+       "hardcoded path" in scan('+++ b/src/n2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.at(1);')[1])
+    ok("main(): a CONTEXT expression + added bracket line is a continuation",
+       "hardcoded path" in scan('+++ b/src/n3.ts\n@@ -1 +1,2 @@\n const cmd = paths\n+' + L + ';')[1])
+
+    ok("main(): `.find(exists)` is still a runtime resolver",
+       scan('+++ b/src/n4.ts\n@@ -1,0 +1,1 @@\n+const cmd = '
+            '["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"].find(exists);')[1].strip() == "")
+    ok("main(): a standalone line-start literal still passes",
+       scan('+++ b/src/n5.ts\n@@ -1,0 +1,2 @@\n+const a = 1;\n+'
+            '["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"];')[1].strip() == "")
+
+    ok("_is_selected_from: next-line subscript counts",
+       rc._is_selected_from('["/a","/b"]', 10, "[1];"))
+    ok("_is_selected_from: next line that is NOT a subscript does not",
+       not rc._is_selected_from('["/a","/b"]', 10, "const x = 1;"))
+    ok("_is_selected_from: an unknown method fails CLOSED",
+       rc._is_selected_from('["/a","/b"].at(1)', 10))
+    ok("_is_selected_from: a resolver method is permitted",
+       not rc._is_selected_from('["/a","/b"].find(x)', 10))
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so

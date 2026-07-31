@@ -135,23 +135,52 @@ def _prev_word(code, i):
 _TUPLE_LANG_SUFFIXES = (".py", ".pyi")
 
 
-def _is_selected_from(code, close_idx):
-    """True when the group closing at `close_idx` is IMMEDIATELY subscripted.
+# Methods that RESOLVE a candidate list at runtime by probing. Anything else that
+# consumes the list selects deterministically at author time (`.at(1)`) and is
+# therefore not a fallback chain. Allowlisted, not denylisted: an unknown method
+# fails CLOSED.
+_RESOLVER_METHODS = frozenset((
+    "find", "filter", "some", "includes", "indexOf", "findIndex", "map",
+    "flatMap", "reduce", "forEach", "next",
+))
+
+
+def _is_selected_from(code, close_idx, next_code=None):
+    """True when the group closing at `close_idx` is SELECTED FROM rather than tried.
 
         const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"][1];
+        const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].at(1);
+        const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]
+        [1];
 
-    That literal is not a fallback list — the index picks one operand at author
-    time, so the other string is dead and the selected one runs unconditionally.
+    All three pick one operand at AUTHOR time, so the other string is dead.
 
-    Only a SUBSCRIPT counts. `.find(exists)` / `.filter(...)` are the genuine
-    resolver idioms this rule exists to permit: they choose at RUNTIME by
-    probing, which is exactly what makes the list portable. `[1]` chooses at
-    author time, which does not.
+    Three consumers count:
+      * a subscript on the same line;
+      * a method that is NOT a runtime resolver (`.at`, `.pop`, ...) — the
+        allowlist is `_RESOLVER_METHODS`, so an unrecognised method fails CLOSED;
+      * a subscript that opens the NEXT line, because JS lets the member
+        expression continue across the break. `next_code` carries it.
+
+    `.find(exists)` / `.filter(...)` stay permitted: they choose at RUNTIME by
+    probing, which is exactly what makes a candidate list portable.
     """
     j = close_idx + 1
     while j < len(code) and code[j] in " \t":
         j += 1
-    return j < len(code) and code[j] == "["
+    if j < len(code):
+        if code[j] == "[":
+            return True
+        if code[j] == ".":
+            k = j + 1
+            while k < len(code) and (code[k].isalnum() or code[k] == "_"):
+                k += 1
+            return code[j + 1:k] not in _RESOLVER_METHODS
+        return False
+    # Group ended at end-of-line: a subscript may open the next line.
+    if next_code is not None and next_code.lstrip().startswith("["):
+        return True
+    return False
 
 
 def _is_candidate_container(code, i, path=None, prev_code=None):
@@ -216,7 +245,7 @@ def _is_candidate_container(code, i, path=None, prev_code=None):
     return bool(path) and str(path).endswith(_TUPLE_LANG_SUFFIXES)
 
 
-def _group_span(code, pos, path=None, prev_code=None):
+def _group_span(code, pos, path=None, prev_code=None, next_code=None):
     """The innermost bracket group containing `pos`, as (start, end), or None.
 
     Only a syntactic candidate COLLECTION counts as a container (see
@@ -245,7 +274,7 @@ def _group_span(code, pos, path=None, prev_code=None):
             start = stack.pop()
             if not _is_candidate_container(code, start, path, prev_code):
                 continue          # not a syntactic candidate collection
-            if _is_selected_from(code, i):
+            if _is_selected_from(code, i, next_code):
                 continue          # the collection is immediately indexed
             if start < pos < i and (best is None or start > best[0]):
                 best = (start, i)
@@ -280,7 +309,7 @@ def _siblings_only(code, start, end):
     return "".join(out)
 
 
-def paired_allowed(tok, line, pos=None, path=None, prev_code=None):
+def paired_allowed(tok, line, pos=None, path=None, prev_code=None, next_code=None):
     """Contextual exemption for the portable candidate-list shape.
 
     `tok` is exempt only when the SAME line carries a companion path for the
@@ -322,7 +351,7 @@ def paired_allowed(tok, line, pos=None, path=None, prev_code=None):
         pos = line.find(tok)
     if pos < 0 or pos >= len(code):
         return False
-    span = _group_span(code, pos, path, prev_code)
+    span = _group_span(code, pos, path, prev_code, next_code)
     if span is None:
         return False          # no candidate container -> not a candidate list
     scope = _siblings_only(code, span[0], span[1])
@@ -386,7 +415,26 @@ def main():
     # bracket starts its line. Reset per file and per hunk — a gap between hunks
     # means the preceding line is unknown, and unknown must not read as "standalone".
     prev_added = None
-    for raw in diff.split("\n"):
+    _lines = diff.split("\n")
+
+    def _next_code(i):
+        """Executable text of the next line that is part of the NEW file.
+
+        A member expression may continue onto the following line, so a group that
+        ends at EOL can still be subscripted. Added AND context lines both exist
+        in the new file and both qualify; a `-`/`@@`/`+++` boundary does not.
+        """
+        if i + 1 >= len(_lines):
+            return None
+        nxt = _lines[i + 1]
+        if nxt.startswith("+") and not nxt.startswith("+++"):
+            return _code_part(nxt[1:])
+        if nxt.startswith(" "):
+            return _code_part(nxt[1:])
+        return None
+
+    for _i, raw in enumerate(_lines):
+        next_added = _next_code(_i)
         if raw.startswith("+++ "):
             f = raw[4:].split("\t")[0]
             if f.startswith("b/"):
@@ -415,6 +463,12 @@ def main():
             # docstring state (a docstring may open on unchanged context).
             in_doc = _doc_transition(raw[1:], in_doc)
             ln += 1
+            # A context line is part of the NEW file too, so it can be the
+            # expression a following added bracket subscripts. Not carrying it
+            # made the cross-line discriminator work only when BOTH lines were
+            # additions — append a bracket line under unchanged code and the
+            # gate exempted it.
+            prev_added = _code_part(raw[1:])
             continue
         if raw.startswith("+"):
             if skip:
@@ -446,7 +500,7 @@ def main():
                     if pos < 0:
                         break
                     tok = token_at(line, pos)
-                    if not allowed(tok) and not paired_allowed(tok, line, pos, cur_file, prev_added):
+                    if not allowed(tok) and not paired_allowed(tok, line, pos, cur_file, prev_added, next_added):
                         print("%s:%d: hardcoded path (%s): %s" % (cur_file, cur, tok, stripped))
                         hits += 1
                         reported = True
