@@ -414,8 +414,18 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
                 else None
             )
             if name in _WRITE_HELPERS:
-                for a in sub.args:
-                    _record(_seeded_channel(a), node.lineno)
+                # ARGUMENT ROLE MATTERS. `write_private_text(path, data)` writes to
+                # arg 0; every later argument is CONTENT. Scanning all arguments
+                # accepted a canonical path passed as the DATA while the write went
+                # somewhere else entirely — qingyun's repro classified clean without
+                # ever creating $CLAUDE_CONFIG_DIR/channels/<ch>/access.json. Only the
+                # path position counts; `path=` covers the keyword form.
+                path_arg = sub.args[0] if sub.args else None
+                for kw in sub.keywords:
+                    if kw.arg == "path":
+                        path_arg = kw.value
+                if path_arg is not None:
+                    _record(_seeded_channel(path_arg), node.lineno)
     # EVERY imported bridge must be seeded. Return the LATEST such line so the
     # caller's `seed_line < exec_line` ordering check covers all of them.
     if not channels or any(ch not in seeded for ch in channels):

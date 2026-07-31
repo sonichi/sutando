@@ -315,6 +315,37 @@ check(
     "MATCH: seed slack, import slack -> clean",
     lint.classify(write(tmpdir, _seed("slack") + _SLACK_BRIDGE)) == lint.CLEAN,
 )
+# Review 12 (qingyun, #2429): the helper analysis scanned EVERY argument, so a
+# canonical access path passed as the DATA argument satisfied the seed check while
+# the write landed somewhere else entirely. Argument ROLE matters:
+# `write_private_text(path, data)` writes to arg 0.
+check(
+    "HELPER: canonical path in the DATA argument is NOT a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              'write_private_text(pathlib.Path("/tmp/elsewhere.txt"), str(cfg / "access.json"))\n'
+              + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "the write target is arg 0; a path in the payload seeds nothing",
+)
+check(
+    "HELPER: path in arg 0 IS a seed (positive still holds)",
+    lint.classify(
+        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              'write_private_text(cfg / "access.json", "{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+)
+check(
+    "HELPER: keyword form path=<canonical> IS a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              'write_private_text(path=cfg / "access.json", data="{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+    "restricting to arg 0 must not break the keyword call form",
+)
 check(
     "a test importing TWO bridges needs BOTH seeded",
     lint.classify(write(tmpdir, _seed("discord") + _TELEGRAM_BRIDGE + IMPORTS_BRIDGE)) == lint.VIOLATION,
