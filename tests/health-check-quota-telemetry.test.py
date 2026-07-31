@@ -19,6 +19,7 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 import importlib.util
+import json
 import os
 import tempfile
 import time
@@ -171,6 +172,63 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         with mock.patch.object(Path, "stat", _boom):
             r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "ok", r["detail"])
+
+    # --- runtime scoping (#2445 review 2, qingyun) --------------------------
+    # `core-status.json` is a CROSS-RUNTIME contract: a Codex pass refreshes it too,
+    # while producing no Anthropic quota headers. Treating any fresh write as proof a
+    # request should have crossed the proxy warns on a perfectly healthy Codex host —
+    # which trains operators to ignore the very check this probe exists to make
+    # actionable. Same defect shape the probe itself targets: a proxy for the property
+    # ("the agent did something") standing in for the property ("an Anthropic request
+    # should have traversed the proxy").
+
+    def _write_runtime(self, runtime: str | None, raw: str | None = None) -> Path:
+        p = self.ws / "state" / "core-runtime.json"
+        p.write_text(raw if raw is not None else json.dumps({"runtime": runtime}))
+        return p
+
+    def test_codex_runtime_stale_quota_stays_silent(self):
+        """The false positive qingyun demonstrated: healthy Codex pass, stale quota."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        self._write_runtime("codex")
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_absent_core_runtime_still_warns(self):
+        """Absence positively excludes Codex — its launcher is the only writer, and it
+        writes unconditionally. Treating absence as 'unknown' would silence the check on
+        every Claude host, i.e. ship a no-op."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "warn", r["detail"])
+
+    def test_claude_runtime_still_warns(self):
+        """A positively-identified proxy-routed runtime keeps the detection (#2406)."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        self._write_runtime("claude")
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "warn", r["detail"])
+
+    def test_unreadable_core_runtime_stays_silent(self):
+        """Malformed JSON cannot rule Codex out, and a corrupt status file must never
+        manufacture a health warning."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        self._write_runtime(None, raw="{not json")
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_codex_runtime_does_not_suppress_the_ABSENT_file_warning(self):
+        """Runtime scoping applies only to the staleness branch. A proxy that never
+        wrote quota-state at all is still broken wiring worth reporting."""
+        self._write_core_status(mtime_age_sec=60)
+        self._write_runtime("codex")
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("never written quota-state.json", r["detail"])
 
     def test_stale_quota_with_proxy_down_stays_silent(self):
         """Proxy-down short-circuits before any staleness reasoning: its own
