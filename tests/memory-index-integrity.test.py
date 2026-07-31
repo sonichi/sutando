@@ -181,6 +181,28 @@ check("...and measures small once stripped",
 check("~~~ fences are honoured too, not just backticks",
       len(hc._index_effective_text("~~~\n<!--\n" + ("p\n" * 500) + "-->\n~~~\n").encode()) > 500)
 
+# rui-sutando-codex: a 4-backtick fence containing an inner ``` line. The marker
+# was truncated to three characters, so the inner line closed the fence early and
+# the comment after it was stripped as if unfenced — a 28KB file measured 39
+# bytes and returned a false `ok`. CommonMark closes a fence only on the SAME
+# character, at least as long as the opener, alone on its line.
+_BIGC = "<!--\n" + ("padding padding padding\n" * 1200) + "-->\n"
+for _label, _body in (
+    ("4-backtick fence with an inner ``` line", "````\n```\n" + _BIGC + "````\n" + _ENTRY),
+    ("4-tilde fence with an inner ~~~ line",    "~~~~\n~~~\n" + _BIGC + "~~~~\n" + _ENTRY),
+    ("4-backtick fence carrying an info string", "````html\n" + _BIGC + "````\n" + _ENTRY),
+):
+    _mem_with(_body)
+    r = hc.check_memory_index_integrity()
+    check(f"{_label} → comment is NOT stripped", r and r["status"] != "ok", str(r))
+# Controls: the fix must not simply stop stripping, and must not stop closing.
+_mem_with("<!--\n" + ("padding padding padding\n" * 1200) + "-->\n" + _ENTRY)
+check("control: an UNfenced comment is still stripped",
+      (hc.check_memory_index_integrity() or {}).get("status") == "ok")
+_mem_with("```\n<!--\n-->\n```\n" + _ENTRY)
+check("control: a fence still CLOSES (small fenced comment stays ok)",
+      (hc.check_memory_index_integrity() or {}).get("status") == "ok")
+
 # qingyun-wu: the byte limit cuts THROUGH a line; the filename before the cut is
 # still read, so the memory loads and must not be reported lost.
 _mem_with(("x" * (25 * 1024 - 100)) + "\n- [Good](good-memory.md) " + ("d" * 4000) + "\n")

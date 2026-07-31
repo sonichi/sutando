@@ -137,22 +137,33 @@ def _index_effective_text(text: str) -> str:
     # comment state both have to be tracked, and a regex cannot carry either.
     out: list[str] = []
     in_fence = False
-    fence_marker = ""
+    fence_char = ""
+    fence_len = 0
     in_comment = False
     for line in text.splitlines(keepends=True):
         stripped = line.lstrip()
         if in_fence:
             out.append(line)
-            if stripped.startswith(fence_marker):
+            # CommonMark: a fence closes only on the SAME character, repeated at
+            # least as many times as the opener, alone on its line. Truncating the
+            # marker to three characters let an inner ``` line close a ````
+            # fence early — the comment after it then fell outside any fence, was
+            # stripped, and a 28KB file measured 39 bytes: false `ok`
+            # (rui-sutando-codex, #2449).
+            if (stripped[:1] == fence_char
+                    and re.fullmatch(re.escape(fence_char) + "{%d,}" % fence_len,
+                                     stripped.rstrip())):
                 in_fence = False
             continue
         if in_comment:
             if "-->" in line:
                 in_comment = False
             continue
-        m = re.match(r"(```+|~~~+)", stripped)
+        m = re.match(r"(`{3,}|~{3,})", stripped)
         if m:
-            in_fence, fence_marker = True, m.group(1)[:3]
+            in_fence = True
+            fence_char = m.group(1)[0]
+            fence_len = len(m.group(1))     # FULL length — see the close check above
             out.append(line)
             continue
         if stripped.startswith("<!--"):
