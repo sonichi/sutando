@@ -1088,8 +1088,13 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
 				}
 				if (typeof mod.setup === 'function') {
+					// Log the DISCOVERY here (naming the root, which is what you need when
+					// debugging a duplicate) — never the registration. The same skill found
+					// in N roots hits this line N times but registers ONCE, so claiming
+					// "registered" here overstates it by exactly the factor the dedupe
+					// removes. The authoritative count is logged after the scan.
+					console.log(`[skill-loader] found setup() hook in ${manifest.name || dirName} (${skillsDir})`);
 					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
-					console.log(`[skill-loader] registered setup() hook from ${manifest.name || dirName}`);
 				}
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
@@ -1107,6 +1112,8 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		for (const t of arr) byName.set(t.name, t);
 		return [...byName.values()];
 	};
+	// One authoritative line for what actually got registered, after dedupe.
+	if (setups.size) console.log(`[skill-loader] registered ${setups.size} setup() hook(s): ${[...setups.keys()].join(', ')}`);
 	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()] };
 }
 const personalTools = await loadSkillManifestTools();
