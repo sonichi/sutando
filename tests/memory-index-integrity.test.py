@@ -177,10 +177,10 @@ _os.environ.pop("_TEST_MEM_IDX", None)
 check("unset env → default", hc._positive_int_env("_TEST_MEM_IDX_UNSET", 777) == 777)
 
 # The property that actually matters: the module still IMPORTS with a bad value.
-import subprocess as _sp, sys as _sys
+import subprocess as _sp   # `sys` is already imported at the top of this file
 _env = dict(_os.environ, SUTANDO_MEMORY_INDEX_FAIL_BYTES="24k",
             SUTANDO_MEMORY_INDEX_WARN_BYTES="oops")
-_r = _sp.run([_sys.executable, "-c",
+_r = _sp.run([sys.executable, "-c",
               "import importlib.util;s=importlib.util.spec_from_file_location('hc',%r);"
               "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
               "print(m.MEMORY_INDEX_FAIL_BYTES, m.MEMORY_INDEX_WARN_BYTES)" % str(HC)],
