@@ -53,7 +53,12 @@ except ModuleNotFoundError:
     for _cand in _RESCUE_CANDIDATES:
         if not os.path.exists(_cand) or os.path.realpath(_cand) == _current:
             continue
-        _check = subprocess.run([_cand, "-c", "import discord"], capture_output=True)
+        try:
+            _check = subprocess.run(
+                [_cand, "-c", "import discord"], capture_output=True, timeout=20,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            continue  # a wedged interpreter must not hang bridge startup
         if _check.returncode == 0:
             print(
                 f"discord-bridge: launched with {_current} (no discord.py); "
@@ -5124,7 +5129,7 @@ def _send_via_rest(channel_id: str, message: str):
         data = json.dumps({"content": chunk}).encode()
         req = urllib.request.Request(url, data=data, headers=headers)
         try:
-            urllib.request.urlopen(req)
+            urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
             sys.exit(1)
