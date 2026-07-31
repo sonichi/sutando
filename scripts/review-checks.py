@@ -92,10 +92,50 @@ def _code_part(s):
     return s
 
 
+# Keywords that may legitimately precede a grouping paren. Everything else
+# immediately before `(` marks it as a CALL's argument list.
+_GROUPING_KEYWORDS = frozenset((
+    "in", "for", "if", "elif", "else", "while", "return", "and", "or", "not",
+    "yield", "assert", "await", "lambda", "case", "match", "del", "is",
+))
+
+
+def _is_call_paren(code, i):
+    """True when `code[i] == '('` opens a CALL's argument list.
+
+    An argument list is not a candidate collection. Two arguments that happen to
+    share a basename do not make the first one portable:
+
+        spawn("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
+
+    The first argument IS the command being launched — an Apple-Silicon-only
+    path on Intel — and the second is just another argument, not a fallback the
+    code will try. A `(` counts as a call when the preceding non-space character
+    closes an expression (`)`/`]`) or ends an identifier that is not a keyword,
+    so `for _p in (...)` and `x = (...)` stay genuine groupings.
+    """
+    j = i - 1
+    while j >= 0 and code[j] in " \t":
+        j -= 1
+    if j < 0:
+        return False
+    if code[j] in ")]":
+        return True
+    if not (code[j].isalnum() or code[j] == "_"):
+        return False
+    k = j
+    while k >= 0 and (code[k].isalnum() or code[k] == "_"):
+        k -= 1
+    return code[k + 1:j + 1] not in _GROUPING_KEYWORDS
+
+
 def _group_span(code, pos):
     """The innermost bracket group containing `pos`, as (start, end), or None.
 
-    Returns None when `pos` sits inside no bracket. That is a FAIL-CLOSED
+    A CALL's argument list is not a container (see `_is_call_paren`) — only a
+    genuine collection literal or grouping counts.
+
+    Returns None when `pos` sits inside no such container. That is a FAIL-CLOSED
     answer, not a fallback: an earlier version searched the whole line in that
     case, which let a valid list vouch for a bare direct use later on the same
     line —
@@ -113,6 +153,8 @@ def _group_span(code, pos):
             stack.append(i)
         elif ch in closes and stack:
             start = stack.pop()
+            if code[start] == "(" and _is_call_paren(code, start):
+                continue          # a call's argument list is not a collection
             if start < pos < i and (best is None or start > best[0]):
                 best = (start, i)
     return best

@@ -69,6 +69,11 @@ check "valid list does not vouch for a later bare use"  flag  $'+++ b/skills/x/n
 check "control: tuple candidate list still passes"      clean $'+++ b/skills/x/n4.py\n@@ -1,0 +1,1 @@\n+C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")'
 check "control: nested list passes on its own tokens"   clean $'+++ b/skills/x/n5.ts\n@@ -1,0 +1,1 @@\n+const x=use(["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]);'
 
+# A call's argument list is not a candidate collection (review of c526784).
+check "call-arg siblings do not exempt the command"     flag  $'+++ b/skills/x/c1.ts\n@@ -1,0 +1,1 @@\n+spawn("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg");'
+check "method-call arguments likewise"                  flag  $'+++ b/skills/x/c2.ts\n@@ -1,0 +1,1 @@\n+child.exec("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg");'
+check "control: grouping paren after a keyword passes"  clean $'+++ b/skills/x/c3.py\n@@ -1,0 +1,1 @@\n+    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

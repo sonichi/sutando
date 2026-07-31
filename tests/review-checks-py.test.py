@@ -415,6 +415,47 @@ try:
 finally:
     rc.flags.remove("/opt/")
 
+# ---------------------------------------------------------------------------
+# A CALL's argument list is not a candidate collection (qingyun-wu, review of
+# c526784). Failing closed on "no container" and blanking nested groups still
+# accepted ANY immediate bracket group, so a plain call satisfied the pairing:
+#     spawn("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
+# The first argument IS the command being launched; the second is just another
+# argument, not a fallback the code will ever try.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    def _s(src):
+        return scan('+++ b/src/c.ts\n@@ -1,0 +1,1 @@\n+' + src)[1]
+
+    ok("main(): call-argument siblings do not exempt the command",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" in
+       _s('spawn("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg");'))
+    ok("main(): method-call arguments likewise",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" in
+       _s('child.exec("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg");'))
+
+    # Controls — genuine collections must still be exempt, or this degrades into
+    # "reject everything with a paren".
+    ok("main(): array literal still passes",
+       _s('const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];').strip() == "")
+    ok("main(): python tuple still passes",
+       _s('C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")').strip() == "")
+    ok("main(): a grouping paren after a KEYWORD is not a call",
+       _s('    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")').strip() == "")
+
+    # Unit level.
+    ok("_is_call_paren: identifier before ( -> call",
+       rc._is_call_paren('spawn("/a","/b")', 5))
+    ok("_is_call_paren: keyword before ( -> NOT a call",
+       not rc._is_call_paren('for _p in ("/a","/b")', 10))
+    ok("_is_call_paren: assignment before ( -> NOT a call",
+       not rc._is_call_paren('C = ("/a","/b")', 4))
+    ok("_is_call_paren: closing bracket before ( -> call",
+       rc._is_call_paren('f()("/a")', 3))
+finally:
+    rc.flags.remove("/opt/")
+
 print("---")
 if failed:
     print("FAILED — %d of %d" % (failed, passed + failed))
