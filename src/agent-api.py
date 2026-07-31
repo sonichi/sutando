@@ -1086,6 +1086,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "result": result,
                         "source": source_line,
                     }
+                fire_webhook(tid, result)
                 self.send_json(200, {"ok": True})
             except Exception:
                 self.send_json(400, {"error": "invalid"})

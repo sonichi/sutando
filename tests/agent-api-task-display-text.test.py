@@ -160,7 +160,26 @@ def test_remember_repairs_done_fallback_on_later_poll():
         api._remember_done_result_file(result_file)
         row = api.task_history["task-999"]
         assert row["text"] == "the REAL user request", row
-        assert row["source"] == "voice", row
+    assert row["source"] == "voice", row
+
+
+def test_fire_webhook_consumes_callback_exactly_once():
+    api._webhooks.clear()
+    api._webhooks["task-callback"] = "https://callback.example/result"
+
+    with mock.patch.object(api, "_is_safe_callback_url", return_value=(True, "ok")), \
+         mock.patch("urllib.request.urlopen") as post:
+        api.fire_webhook("task-callback", "done body")
+        api.fire_webhook("task-callback", "done body")
+
+    assert post.call_count == 1
+    request = post.call_args.args[0]
+    assert request.full_url == "https://callback.example/result"
+    assert json.loads(request.data.decode()) == {
+        "task_id": "task-callback",
+        "status": "completed",
+        "result": "done body",
+    }
 
 
 def test_http_dispatch_paths():
@@ -212,11 +231,13 @@ def test_http_dispatch_paths():
 
     t = threading.Thread(target=worker)
     with mock.patch.object(api.shutil, "which", return_value="/usr/bin/tmux"), \
-         mock.patch.object(api.subprocess, "run", side_effect=run_probe):
+         mock.patch.object(api.subprocess, "run", side_effect=run_probe), \
+         mock.patch.object(api, "fire_webhook") as fire:
         t.start()
         while not done.is_set():
             server.handle_request()
         t.join(timeout=5)
+        fire.assert_called_once_with("task-http-2", "done body")
     server.server_close()
 
     assert "error" not in out, out.get("error")
@@ -234,5 +255,6 @@ if __name__ == "__main__":
     test_display_fields_for_id_swallows_oserror()
     test_remember_updates_existing_non_done_entry()
     test_remember_repairs_done_fallback_on_later_poll()
+    test_fire_webhook_consumes_callback_exactly_once()
     test_http_dispatch_paths()
     print("agent-api task display text tests passed.")
