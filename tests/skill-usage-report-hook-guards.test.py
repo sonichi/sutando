@@ -21,6 +21,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 HOOK = Path(__file__).resolve().parents[1] / "skills" / "skill-usage-report" / "hooks" / "log-usage.py"
 FAILS = []
@@ -39,7 +40,7 @@ def load_hook():
     return mod
 
 
-def run(hook, raw: str, ws: Path | None):
+def run(hook, raw: str, ws: Optional[Path]):
     """Drive main() with `raw` on stdin and workspace() pinned to `ws`."""
     real_stdin, real_ws = sys.stdin, hook.workspace
     sys.stdin = io.StringIO(raw)
@@ -71,6 +72,21 @@ try:
     # --- guard: not a Skill tool call (line 59)
     rc = run(hook, json.dumps({"tool_name": "Bash", "tool_input": {"skill": "probe"}}), tmp)
     check("non-Skill tool -> exit 0, no write", rc == 0 and log_lines(tmp) == base, f"rc={rc}")
+
+    # --- guard: VALID json that is not an object. The parse try/except does not
+    # cover these — .get() on an int/str/list raises and the hook exited 1,
+    # violating the always-exit-0 contract on a PostToolUse hook (#2180 review).
+    for raw, label in (("123", "int payload"), ('"x"', "string payload"), ("[]", "list payload")):
+        rc = run(hook, raw, tmp)
+        check(f"valid non-object JSON ({label}) -> exit 0, no write",
+              rc == 0 and log_lines(tmp) == base, f"rc={rc}")
+
+    # --- guard: tool_input present but NOT an object. `or {}` only rescues
+    # falsy values, so a truthy non-dict reached .get() and raised.
+    for ti, label in (("oops", "string"), (42, "int"), ([1], "list")):
+        rc = run(hook, json.dumps({"tool_name": "Skill", "tool_input": ti}), tmp)
+        check(f"non-object tool_input ({label}) -> exit 0, no write",
+              rc == 0 and log_lines(tmp) == base, f"rc={rc}")
 
     # --- guard: missing / non-string slug (line 62)
     for payload, label in (

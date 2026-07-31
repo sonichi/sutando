@@ -15,7 +15,11 @@ The endpoint only accepts usage for skills currently equipped to this agent
 expected until the owner equips skills to this agent's mxid.
 
 Identity: agentId = $AGENT_MXID (the ag2space identity, same key the
-EquipPanel / assignments API use). Cloud origin override: $AG2_CLOUD_ORIGIN.
+EquipPanel / assignments API use).
+
+Cloud origin is declared in this skill's manifest.json `config` block (the
+config-only manifest convention in skills/MANIFEST.md) and resolved as
+`$AG2_CLOUD_ORIGIN override > manifest default > CLOUD_FALLBACK`.
 """
 
 import json
@@ -26,8 +30,59 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-CLOUD = os.environ.get("AG2_CLOUD_ORIGIN", "https://sutando.ag2.ai")
+CLOUD_ENV_NAME = "AG2_CLOUD_ORIGIN"
+MANIFEST_PATH = Path(__file__).resolve().parents[1] / "manifest.json"
+# Last-resort only. The manifest's `config` block is the declared source of
+# truth for this default (skills/MANIFEST.md); this constant exists so an
+# unreadable/corrupt manifest degrades to the historical value instead of
+# crashing a cron-invoked reporter. If the two ever disagree, the manifest wins.
+CLOUD_FALLBACK = "https://sutando.ag2.ai"
 MAX_EVENTS = 100  # server cap per report
+
+
+def _manifest_default(
+    key: str = CLOUD_ENV_NAME, manifest_path: Path = MANIFEST_PATH
+) -> "str | None":
+    """Read a declared config default out of this skill's manifest.
+
+    Mirrors skills/proactive-loop/scripts/self-development-enabled.py — the
+    in-repo precedent for a pipeline script consuming a config-only manifest.
+    Any read/parse problem returns None so the caller can fall back rather than
+    raise: this runs from cron.
+    """
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        config = manifest.get("config", {})
+        if not isinstance(config, dict):
+            return None
+        value = config.get(key)
+    except (OSError, ValueError, TypeError):
+        return None
+    return str(value) if value is not None else None
+
+
+def resolve_cloud_origin(
+    environ: "dict[str, str] | None" = None, manifest_path: Path = MANIFEST_PATH
+) -> str:
+    """Resolve the cloud origin per the skill-config precedence.
+
+    env override > manifest `config` default > CLOUD_FALLBACK.
+
+    An env var set to the empty string is treated as UNSET rather than as an
+    override to "" — an empty origin would build a garbage URL, and the shell
+    idiom `AG2_CLOUD_ORIGIN= cmd` reads as "leave it alone", not "use nothing".
+    """
+    env = os.environ if environ is None else environ
+    override = env.get(CLOUD_ENV_NAME)
+    if override:
+        return override
+    declared = _manifest_default(CLOUD_ENV_NAME, manifest_path)
+    if declared:
+        return declared
+    return CLOUD_FALLBACK
+
+
+CLOUD = resolve_cloud_origin()
 
 
 def repo_root() -> Path:

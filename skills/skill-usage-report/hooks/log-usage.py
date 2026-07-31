@@ -17,7 +17,9 @@ from pathlib import Path
 
 def repo_root() -> Path:
     # This file lives at <repo>/skills/skill-usage-report/hooks/log-usage.py.
-    # realpath() first: the skill is symlinked into ~/.claude/skills/.
+    # realpath() first: skills/install.sh symlinks this skill into the core's
+    # configured skills directory, so __file__ is a symlink and parents[3]
+    # would otherwise resolve under that directory instead of the repo.
     return Path(os.path.realpath(__file__)).parents[3]
 
 
@@ -55,9 +57,22 @@ def main() -> int:
         payload = json.load(sys.stdin)
     except Exception:
         return 0
+    # `json.load` succeeding does NOT mean we got an object: `123`, `"x"` and
+    # `[]` are all valid JSON, and .get() on them raises. The try above only
+    # guards the PARSE, so an unchecked payload here exits 1 and breaks the
+    # always-exit-0 contract — which, on a PostToolUse hook, can block a Skill
+    # invocation on the host (#2180 review).
+    if not isinstance(payload, dict):
+        return 0
     if payload.get("tool_name") != "Skill":
         return 0
-    slug = (payload.get("tool_input") or {}).get("skill")
+    # Same trap one level down: `tool_input` may be a non-object. `or {}` only
+    # rescues falsy values, so a truthy non-dict (e.g. the string "oops") sails
+    # through and .get() raises.
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return 0
+    slug = tool_input.get("skill")
     if not slug or not isinstance(slug, str):
         return 0
     # Directory-scoped ("apps/web:deploy") and plugin ("plugin:skill") forms

@@ -10,10 +10,18 @@ Two pieces, both offline-first and fail-open:
 1. **`hooks/log-usage.py`** — a `PostToolUse` hook on the `Skill` tool.
    Appends `{"slug","ts"}` to `<workspace>/state/skill-usage-log.jsonl` on
    every skill invocation. Never blocks, never fails the invocation.
-   Registered in `~/.claude/settings.json` with `"async": true` — this is a
+   Registered in the core's `settings.json` with `"async": true` — this is a
    fire-and-forget usage logger, so it must run off the Skill critical path
    (async keeps interpreter startup + file I/O out of every skill invocation's
    latency):
+
+   Resolve that settings file through the path helper rather than a literal
+   home-relative path — the core config dir is configurable per clone, and on
+   a packaged install it is not under `$HOME` at all:
+
+   ```bash
+   SETTINGS="$(bash scripts/sutando-config.sh claude-sutando-config-dir)/settings.json"
+   ```
 
    ```json
    {"PostToolUse": [{"matcher": "Skill", "hooks": [{"type": "command",
@@ -25,16 +33,24 @@ Two pieces, both offline-first and fail-open:
    POSTs one batched report (`{agentId, events:[{slug,count,lastUsedAt}]}`).
    - `agentId` = `$AGENT_MXID` (the ag2space identity — same key the
      EquipPanel and assignments API use).
-   - Bearer from vault key `AG2_CLOUD_TOKEN`; cloud origin override
-     `$AG2_CLOUD_ORIGIN` (default `https://sutando.ag2.ai`).
+   - Bearer from vault key `AG2_CLOUD_TOKEN`.
+   - Cloud origin is **declared in `manifest.json`'s `config` block** (the
+     config-only manifest convention — see `skills/MANIFEST.md`), not invented
+     as an env-only setting. Resolution order is
+     `$AG2_CLOUD_ORIGIN override > manifest default > CLOUD_FALLBACK`, so the
+     manifest is the single place to change the default.
    - Rename-before-POST so events arriving mid-report are never lost;
      fold-back on failure so nothing is dropped. Always exits 0.
 
    Run on a gated sub-daily cron (crons.json):
 
+   The cron needs `AGENT_MXID` in the environment. Read it from the channel
+   env under the **resolved** core config dir — never a home-relative literal,
+   which is wrong on any clone that configures the config dir elsewhere:
+
    ```json
    {"name": "skill-usage-report", "cron": "*/30 * * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh skill-usage-report env $(cat ~/.claude/channels/ag2space/.env 2>/dev/null | grep AGENT_MXID) python3 skills/skill-usage-report/scripts/report-usage.py — drains the local skill-usage log to AU (AU#93). Deferred when owner tasks are queued."}
+    "prompt": "Run: bash scripts/cron-gate.sh skill-usage-report env $(grep AGENT_MXID \"$(bash scripts/sutando-config.sh claude-sutando-config-dir)/channels/ag2space/.env\" 2>/dev/null) python3 skills/skill-usage-report/scripts/report-usage.py — drains the local skill-usage log to AU (AU#93). Deferred when owner tasks are queued."}
    ```
 
 ## Expected behavior before equips exist
