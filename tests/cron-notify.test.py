@@ -257,6 +257,91 @@ def main() -> int:
         check("CONTROL: successful post records cooldown",
               json.loads(sf.read_text()).get("c") == 4242)
 
+    # ── #2346 review blocker (CONCURRENCY): load→check→reserve must be ONE
+    # cross-process-exclusive transaction. john forced two same-cron processes to
+    # both finish _load_state() before either reserved → both posted, defeating
+    # the per-cron noise bound; and two DIFFERENT crons can clobber each other's
+    # stamp in the shared file's read-modify-write. These run REAL threads
+    # contending on the flock — flock is per-open-file-description, so each
+    # thread's own os.open+flock serializes even in one process (CPython releases
+    # the GIL around the blocking flock, so no deadlock). With the lock the
+    # outcome is order-INDEPENDENT, so the assertions are deterministic; remove
+    # the lock and these flap/fail. A barrier releases all workers together to
+    # maximize contention.
+    import threading
+
+    # (a) same-cron overlap → EXACTLY ONE post, the rest rate-limited.
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"
+        N = 8
+        posts = []
+        posts_lock = threading.Lock()
+
+        def _counting_post(*a, **k):
+            with posts_lock:
+                posts.append(a)
+            return "$evt"
+
+        barrier = threading.Barrier(N)
+        rcs = [None] * N
+
+        def _worker(i):
+            barrier.wait()  # all workers enter main() together
+            rcs[i] = cn.main(["--cron", "overlap", "--summary", "news",
+                              "--kind", "digest", "--room", "!r:x",
+                              "--state-file", str(sf), "--min-interval", "1800",
+                              "--now", "10000"])
+
+        with um.patch.object(cn, "_post_to_room", side_effect=_counting_post):
+            ts = [threading.Thread(target=_worker, args=(i,)) for i in range(N)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+
+        check("concurrent same-cron: exactly ONE post across N overlapping fires",
+              len(posts) == 1, f"posts={len(posts)}")
+        check("concurrent same-cron: one exit-0, the rest exit-3",
+              rcs.count(0) == 1 and rcs.count(3) == N - 1, rcs)
+        check("concurrent same-cron: state holds the single reservation",
+              json.loads(sf.read_text()) == {"overlap": 10000}, sf.read_text())
+
+    # (b) distinct crons → NO lost update: every reservation survives the shared
+    # read-modify-write (without the lock, one save can clobber another's stamp).
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"
+        crons = [f"cron{i}" for i in range(6)]
+        postsD = []
+        postsD_lock = threading.Lock()
+
+        def _counting_postD(*a, **k):
+            with postsD_lock:
+                postsD.append(a)
+            return "$evt"
+
+        barrierD = threading.Barrier(len(crons))
+        rcsD = {}
+
+        def _workerD(name):
+            barrierD.wait()
+            rcsD[name] = cn.main(["--cron", name, "--summary", "news",
+                                  "--kind", "digest", "--room", "!r:x",
+                                  "--state-file", str(sf), "--now", "20000"])
+
+        with um.patch.object(cn, "_post_to_room", side_effect=_counting_postD):
+            ts = [threading.Thread(target=_workerD, args=(c,)) for c in crons]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+
+        check("concurrent distinct crons: all posted (none rate-limited)",
+              all(rc == 0 for rc in rcsD.values()) and len(postsD) == len(crons),
+              (rcsD, len(postsD)))
+        check("concurrent distinct crons: NO clobber — every reservation survives",
+              json.loads(sf.read_text()) == {c: 20000 for c in crons},
+              sf.read_text())
+
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1
