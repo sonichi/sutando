@@ -1481,7 +1481,19 @@ def _post_proactive() -> None:
         try:
             route, room_override, routed_body = _proactive_route(
                 claim.read_text(encoding="utf-8"))
-        except OSError:
+        except OSError as exc:
+            # A TRANSIENT post-claim read failure must not strand the nudge: the
+            # file is now `.sending.<our-pid>`, and _recover_orphan_proactive()
+            # refuses to steal a LIVE pid's claim, so leaving it here loses the
+            # owner message until THIS bridge process exits (review blocker).
+            # Hand the claim back to the original `.txt` for a later pass; if even
+            # the restore fails, log loudly so the stranded inode is visible.
+            try:
+                claim.rename(f)
+            except OSError as restore_exc:
+                _log(f"CRITICAL: proactive {claim.name} post-claim read failed "
+                     f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
+                     f"owner nudge stranded under live pid until restart")
             continue
         if route == "skip":
             # A foreign destination that only became visible post-claim: hand

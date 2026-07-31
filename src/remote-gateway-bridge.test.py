@@ -469,6 +469,35 @@ def main() -> int:
           and not stale.exists(),
           "the late flush of a long-empty file is delivered, never lost")
 
+    # A TRANSIENT post-claim read failure must RESTORE the file to `.txt`, never
+    # strand it as `.sending.<pid>`: _recover_orphan_proactive() refuses to steal
+    # a LIVE pid's claim, so a stranded claim is permanent owner-message loss
+    # until this bridge restarts (review P1). Inject: the pre-claim peek succeeds,
+    # only the post-claim read (on the `.sending.` name) raises.
+    import pathlib as _pl
+    (rtc.RESULTS_DIR / "proactive-readfail.txt").write_text("nudge readfail\n")
+    _real_read_text = _pl.Path.read_text
+
+    def _read_text_fail_on_claim(self, *a, **k):
+        if ".sending." in self.name:      # only the post-claim read raises
+            raise OSError("simulated transient post-claim read failure")
+        return _real_read_text(self, *a, **k)
+
+    posts_rf = len(STATE["room_posts"])
+    _pl.Path.read_text = _read_text_fail_on_claim
+    try:
+        rtc._post_proactive()
+    finally:
+        _pl.Path.read_text = _real_read_text
+    check((rtc.RESULTS_DIR / "proactive-readfail.txt").exists()
+          and not list(rtc.RESULTS_DIR.glob("proactive-readfail.sending.*"))
+          and len(STATE["room_posts"]) == posts_rf,
+          "post-claim read failure restores the .txt (not stranded, not posted)")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_rf + 1
+          and not (rtc.RESULTS_DIR / "proactive-readfail.txt").exists(),
+          "the restored file delivers normally on the next pass")
+
     # REGRESSION (review blocker, 2026-07-28): an aged-but-still-open file.
     # mtime cannot distinguish "created, fd still open, not yet written" from
     # "abandoned" — a file held open with no write keeps its creation mtime.
