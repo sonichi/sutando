@@ -1826,6 +1826,39 @@ QUOTA_STATE_STALE_SEC = 6 * 60 * 60
 AGENT_ACTIVE_SEC = 30 * 60
 
 
+# Runtimes whose request path is NOT expected to traverse the Anthropic credential
+# proxy. A Codex pass refreshes the very same `core-status.json` this check reads for
+# activity, but produces no Anthropic quota headers — so "agent working + stale quota"
+# is a perfectly healthy shape there, and warning on it would train operators to ignore
+# the check this whole probe exists to make actionable (qingyun, #2445).
+NON_PROXY_RUNTIMES = {"codex"}
+
+
+def _runtime_may_skip_proxy() -> bool:
+    """True when this core's runtime is not expected to produce Anthropic quota headers.
+
+    Read from `state/core-runtime.json`. Today the **Codex launcher is its only writer**
+    (`src/agent/codex/cli/start-cli.sh` writes it unconditionally once the workspace
+    resolves), so its ABSENCE positively excludes Codex rather than merely being
+    unknown — which is why absence is treated as proxy-routed instead of silencing the
+    check everywhere. An unreadable or malformed file cannot rule Codex out, so it is
+    treated as non-proxy and stays silent: a corrupted status file must not manufacture
+    a health warning.
+
+    When a Claude-side writer lands (#2406 emits `core-runtime.json` on Claude launch),
+    tighten this to positive identification of a proxy-routed runtime instead of
+    inferring it from absence.
+    """
+    path = status_read_path("core-runtime.json", WORKSPACE_DIR)
+    try:
+        if not path.exists():
+            return False          # no Codex launcher ever ran here -> proxy-routed
+        runtime = json.loads(path.read_text()).get("runtime")
+    except (OSError, ValueError):
+        return True               # cannot rule Codex out -> stay silent
+    return runtime in NON_PROXY_RUNTIMES
+
+
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
 
@@ -1906,7 +1939,7 @@ def check_quota_telemetry(proxy_status: str) -> dict:
             return check
         agent_age = _agent_activity_age()
         if quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
-                and agent_age < AGENT_ACTIVE_SEC:
+                and agent_age < AGENT_ACTIVE_SEC and not _runtime_may_skip_proxy():
             check["status"] = "warn"
             check["detail"] = (
                 f"quota state is {int(quota_age / 3600)}h stale while the agent is "
