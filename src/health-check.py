@@ -521,6 +521,106 @@ def check_cron_runner(
     }
 
 
+def check_session_cron_registration(
+    workspace_dir: Optional[Path] = None,
+    host_label: Optional[str] = None,
+    runtime: Optional[str] = None,
+    now: Optional[float] = None,
+) -> dict:
+    """Warn when session-owned crons were never (re-)registered for this core boot.
+
+    CronCreate registrations are session-only: they die with the session and
+    only exist if /schedule-crons completed after the core booted. The failure
+    is silent (config intact on disk, zero live crons, no error) — observed
+    2026-07-23 on a peer instance as 2/18 registered. The script-visible signal:
+    /schedule-crons writes
+    `hosts/<hostname>/schedule-crons-stamp.json` when it finishes; if that
+    host-owned stamp predates the running core's `started_at` (from the
+    heartbeat payload), the current session never completed registration.
+    Stamp AGE alone is deliberately not used — long-lived sessions would
+    false-warn.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    host = host_label or _host_label()
+    name = "session-crons"
+    runtime = runtime or resolve_core_runtime(repo_root=REPO_DIR)
+
+    crons_file = workspace / "hosts" / host / "crons.json"
+    try:
+        crons = json.loads(crons_file.read_text())
+    except FileNotFoundError:
+        return {"name": name, "status": "ok", "detail": "no schedules configured"}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot read crons.json ({exc})"}
+    if not isinstance(crons, list):
+        return {"name": name, "status": "warn", "detail": "crons.json is not a list"}
+
+    def session_owned(entry: dict) -> bool:
+        if entry.get("launchd") is True or entry.get("execution") == "codex-task":
+            return False
+        if entry.get("loop") == "dynamic" or not entry.get("cron"):
+            return False
+        return True
+
+    expected = sum(1 for e in crons if isinstance(e, dict) and session_owned(e))
+    if runtime == "codex" or expected == 0:
+        # codex has no session CronCreate surface (check_cron_runner owns that
+        # story); zero expected → nothing to verify.
+        return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
+
+    alive_file = workspace / "state" / "cores" / f"{host}.alive"
+    started_at = None
+    try:
+        alive = json.loads(alive_file.read_text())
+        if isinstance(alive, dict):
+            started_at = float(alive.get("started_at"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass  # no heartbeat → can't anchor to a boot; fall through to stamp-only
+
+    stamp_file = workspace / "hosts" / host / "schedule-crons-stamp.json"
+    try:
+        stamp = json.loads(stamp_file.read_text())
+    except FileNotFoundError:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"{expected} session cron(s) expected but /schedule-crons has never stamped completion — run /schedule-crons",
+        }
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "warn", "detail": f"stamp unreadable ({exc})"}
+
+    if not isinstance(stamp, dict):
+        return {"name": name, "status": "warn", "detail": "stamp malformed (expected an object)"}
+
+    stamp_ts = stamp.get("ts")
+    if isinstance(stamp_ts, bool) or not isinstance(stamp_ts, (int, float)):
+        return {"name": name, "status": "warn", "detail": "stamp malformed (missing numeric ts)"}
+    if started_at is not None and stamp_ts < started_at:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"stamp predates this core boot ({int(started_at - stamp_ts)}s older) — "
+                f"session crons are gone with the old session; re-run /schedule-crons"
+            ),
+        }
+
+    registered = stamp.get("registered")
+    if isinstance(registered, bool) or not isinstance(registered, int) or registered < 0:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": "stamp malformed (missing non-negative registered count)",
+        }
+    if registered < expected:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"only {registered}/{expected} session cron(s) registered at last /schedule-crons",
+        }
+    return {"name": name, "status": "ok", "detail": f"{expected} session cron(s) stamped registered this boot"}
+
+
 def check_file(path: Path, name: str) -> dict:
     """Check if a file exists and is non-empty."""
     if not path.exists():
@@ -3147,6 +3247,7 @@ def run_all_checks() -> list[dict]:
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
     checks.append(check_cron_runner())
+    checks.append(check_session_cron_registration())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
