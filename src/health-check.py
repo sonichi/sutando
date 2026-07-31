@@ -92,6 +92,154 @@ def _default_memory_dir() -> str:
 # redirecting.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
+# How much of MEMORY.md a session actually loads. These are the RUNTIME's
+# documented numbers, not this repo's guess:
+#
+#   "Claude Code reads the first 200 lines or 25KB of a memory file, whichever
+#    comes first" — content BEYOND that point is dropped; the prefix still
+#    loads. YAML frontmatter and block-level HTML comments are stripped before
+#    those limits are measured.
+#   https://code.claude.com/docs/en/memory#how-it-works
+#
+# Earlier revisions of this check encoded a measured-by-eye ~24KB cutoff and
+# claimed the WHOLE index stops loading past it. Both were wrong (john-the-dev,
+# #2449): the limit is line-OR-byte, and truncation is a suffix drop, not total
+# loss. They are plain constants rather than env knobs on purpose — they mirror
+# a documented external contract, so a deployment that "tunes" them is just
+# lying to itself about what its runtime does. Undeclared env vars are also
+# forbidden by AGENTS.md (qingyun-wu, #2449).
+MEMORY_INDEX_LOAD_LINES = 200
+MEMORY_INDEX_LOAD_BYTES = 25 * 1024
+# Warn while there is still room to compact deliberately rather than in a panic.
+MEMORY_INDEX_NEAR_LIMIT = 0.9
+
+
+def _index_effective_text(text: str) -> str:
+    """Drop what the runtime strips BEFORE it measures the 200-line/25KB limits.
+
+    Counting raw bytes over-reports: a file whose bulk is frontmatter or a block
+    HTML comment measures large here but small to the runtime. That produced a
+    false `fail` on a 25.6KB fixture whose visible content was one line
+    (john-the-dev, #2449).
+    """
+    if text.startswith("---"):
+        m = re.match(r"^---\r?\n.*?\r?\n---[ \t]*\r?\n?", text, re.DOTALL)
+        if m:
+            text = text[m.end():]
+
+    # Block-level HTML comments only, and NOT inside a fenced code block: the
+    # runtime strips block comments but PRESERVES them inside code fences, so a
+    # regex that ignores fence state under-reports. A 28KB comment wrapped in
+    # ```html measured as 37 bytes here and returned a false `ok` while the
+    # entry after it was genuinely past the cut (john-the-dev, #2449).
+    #
+    # Line-oriented rather than one regex, because fence state and multi-line
+    # comment state both have to be tracked, and a regex cannot carry either.
+    out: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    in_comment = False
+    def _block_indent_ok(raw: str) -> bool:
+        # CommonMark bounds a block-level marker to at most THREE columns of
+        # indentation; at four the line is indented CODE, not a marker. This
+        # gates BOTH markers we track:
+        #   fence  — a 4-space ```html is not a fence, so the comment inside it
+        #            must be stripped, not preserved (false `fail`; qingyun-wu).
+        #   <!--   — a 4-space or TAB indented comment is code CONTENT and must
+        #            count toward the 25KB prefix, not be stripped (false `ok`
+        #            on a 30KB fixture that measured 18 bytes; qingyun-wu).
+        # Counted in COLUMNS, not characters: a bare lstrip(" ") ignored tabs, and
+        # one tab already reaches the 4-column stop. Applies to a fence closer
+        # too — an over-indented closer must not close a real fence.
+        n = 0
+        for ch in raw:
+            if ch == " ":
+                n += 1
+            elif ch == "\t":
+                n += 4 - (n % 4)          # advance to the next 4-column tab stop
+            else:
+                break
+            if n >= 4:
+                return False
+        return True
+
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        indent_ok = _block_indent_ok(line)
+        if in_fence:
+            out.append(line)
+            # CommonMark: a fence closes only on the SAME character, repeated at
+            # least as many times as the opener, alone on its line. Truncating the
+            # marker to three characters let an inner ``` line close a ````
+            # fence early — the comment after it then fell outside any fence, was
+            # stripped, and a 28KB file measured 39 bytes: false `ok`
+            # (rui-sutando-codex, #2449).
+            if (indent_ok and stripped[:1] == fence_char
+                    and re.fullmatch(re.escape(fence_char) + "{%d,}" % fence_len,
+                                     stripped.rstrip())):
+                in_fence = False
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        m = re.match(r"(`{3,}|~{3,})", stripped) if indent_ok else None
+        if m and m.group(1)[0] == "`" and "`" in stripped[m.end():]:
+            # CommonMark: a BACKTICK fence's info string may not contain a
+            # backtick (it would be ambiguous with inline code). ```bad`info is
+            # therefore an ordinary paragraph line, not an opener. Accepting it
+            # opened a phantom fence, so the block comment that followed was
+            # PRESERVED and a 31KB fixture measured 31KB: a false `fail` telling
+            # the operator to compact an index that loads fine (john-the-dev,
+            # #2449). Tilde fences have no such rule — ~~~a`b IS a valid opener.
+            out.append(line)
+            continue
+        if m:
+            in_fence = True
+            fence_char = m.group(1)[0]
+            fence_len = len(m.group(1))     # FULL length — see the close check above
+            out.append(line)
+            continue
+        if indent_ok and stripped.startswith("<!--"):
+            if "-->" not in line:
+                in_comment = True
+            continue                      # whole-line block comment: dropped
+        out.append(line)
+    return "".join(out)
+
+
+def _index_loaded_prefix(text: str) -> "tuple[str, int, int]":
+    """Return (prefix_that_loads, bytes_loaded, lines_loaded) per the contract.
+
+    Whichever of the two limits is reached first stops the read. A line that
+    would straddle the byte limit is treated as not loaded — the conservative
+    reading, and the one that matters here since a half-read index line cannot
+    be relied on to name its memory file.
+    """
+    kept: list[str] = []
+    total = 0
+    for i, line in enumerate(text.splitlines(keepends=True)):
+        if i >= MEMORY_INDEX_LOAD_LINES:
+            break
+        nbytes = len(line.encode("utf-8"))
+        if total + nbytes > MEMORY_INDEX_LOAD_BYTES:
+            # The limit is a BYTE prefix, not a line count — the session reads
+            # the bytes up to the cut, so a line that STARTS inside the budget
+            # is partially read. Dropping it whole marked an entry whose
+            # filename sat comfortably before the cut as unreadable, failing an
+            # index that loads fine (qingyun-wu, #2449). Keep the bytes that fit.
+            room = MEMORY_INDEX_LOAD_BYTES - total
+            if room > 0:
+                # errors="ignore" so a cut through a multi-byte character
+                # yields the readable prefix instead of raising.
+                kept.append(line.encode("utf-8")[:room].decode("utf-8", errors="ignore"))
+                total += room
+            break
+        kept.append(line)
+        total += nbytes
+    return "".join(kept), total, len(kept)
+
 
 def _resolve_dotenv() -> Path:
     """Resolve the `.env` path via the canonical resolver.
@@ -763,21 +911,44 @@ def check_memory_index_integrity() -> "dict | None":
     ``*-BACKUP`` tree (created by scripts/sutando-migrate.sh) that never made it
     into the live index — so the rule it carried was written yet never recalled.
 
-    Warn (never fail) listing the orphaned/stranded files so the divergence is
-    visible instead of silently dropping the memory. Returns None on a clean
-    index or when the memory dir does not exist yet.
+    A third mode has the same consequence: the entry EXISTS but sits past the
+    point a session stops reading (200 lines or 25KB of post-strip content,
+    whichever comes first — see MEMORY_INDEX_LOAD_*). Truncation drops the
+    suffix, not the file, so this is measured by asking whether each memory is
+    named in the prefix that actually loads.
+
+    Fails only when a memory is demonstrably lost that way; warns for orphaned/
+    stranded files and for an index merely approaching the limit. Returns None
+    on a clean index or when the memory dir does not exist yet.
     """
     if not MEMORY_DIR.exists():
         return None
     index = MEMORY_DIR / "MEMORY.md"
     index_text = index.read_text(errors="ignore") if index.exists() else ""
 
+    # What the session actually sees: strip what the runtime strips, then keep
+    # only the prefix that fits inside 200 lines / 25KB.
+    effective_text = _index_effective_text(index_text)
+    loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
+    truncated = len(loaded_text) < len(effective_text)
+
+    def _referenced_in(hay: str, name: str) -> bool:
+        return name in hay or name[:-3] in hay
+
     # (a) live memory files not referenced anywhere in MEMORY.md → won't load.
-    unindexed = [
-        p.name for p in sorted(MEMORY_DIR.glob("*.md"))
-        if p.name != "MEMORY.md"
-        and p.name not in index_text and p.name[:-3] not in index_text
-    ]
+    # (c) referenced, but ONLY beyond the load cut → equally won't load. Same
+    #     consequence, different cause, so they are found the same way: ask the
+    #     prefix that actually loads, not the whole file. Testing the whole file
+    #     reported an index entry parked on line 201 as healthy (john-the-dev,
+    #     #2449) because the bytes were on disk — just never read.
+    unindexed: list[str] = []
+    beyond_cut: list[str] = []
+    for p in sorted(MEMORY_DIR.glob("*.md")):
+        if p.name == "MEMORY.md":
+            continue
+        if _referenced_in(loaded_text, p.name):
+            continue
+        (beyond_cut if _referenced_in(effective_text, p.name) else unindexed).append(p.name)
 
     # (b) memories stranded in a sibling *-BACKUP tree, absent from the live dir.
     stranded: list[str] = []
@@ -794,10 +965,41 @@ def check_memory_index_integrity() -> "dict | None":
     except Exception:  # pragma: no cover — best-effort backup scan; never break the health check
         pass
 
-    if not unindexed and not stranded:
+    # (c) the index outgrowing what a session reads. Truncation is a SUFFIX
+    # drop, so the damage is exactly the entries past the cut — reported above
+    # as `beyond_cut`. What is left to say here is whether the index is close
+    # enough to the cut to be worth compacting before entries start falling off.
+    effective_bytes = len(effective_text.encode("utf-8"))
+    effective_lines = len(effective_text.splitlines())
+    near_limit = (
+        effective_bytes >= MEMORY_INDEX_LOAD_BYTES * MEMORY_INDEX_NEAR_LIMIT
+        or effective_lines >= MEMORY_INDEX_LOAD_LINES * MEMORY_INDEX_NEAR_LIMIT
+    )
+
+    def _size_note() -> str:
+        return (f"{effective_bytes / 1024:.1f}KB / {effective_lines} lines of loadable "
+                f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1024:.0f}KB / "
+                f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
+
+    if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
-                "detail": "all memory files present in the MEMORY.md index"}
+                "detail": f"all memory files present in the loaded MEMORY.md index ({_size_note()})"}
     parts = []
+    if beyond_cut:
+        parts.append(
+            f"{len(beyond_cut)} memory file(s) ARE indexed but sit past the load cut "
+            f"(index stops at line {loaded_lines} / {loaded_bytes / 1024:.1f}KB), so the "
+            f"session never reads their entry: {', '.join(beyond_cut[:6])}"
+            f"{'…' if len(beyond_cut) > 6 else ''}. Compact the index — the prefix still "
+            f"loads, only the tail is dropped ({_size_note()})"
+        )
+    elif near_limit:
+        parts.append(
+            f"MEMORY.md is approaching the session read limit ({_size_note()})"
+            + (" and is already truncated" if truncated else "")
+            + " — compact it now; entries past the cut are dropped silently while "
+              "every memory file still looks fine on disk"
+        )
     if unindexed:
         parts.append(
             f"{len(unindexed)} memory file(s) not in MEMORY.md (won't load): "
@@ -808,7 +1010,14 @@ def check_memory_index_integrity() -> "dict | None":
             f"{len(stranded)} memory file(s) stranded in a *-BACKUP tree, absent from the live dir: "
             + ", ".join(sorted(set(stranded))[:6]) + ("…" if len(set(stranded)) > 6 else "")
         )
-    return {"name": "memory-index", "status": "warn", "detail": "; ".join(parts)}
+    # `fail` only for demonstrated loss: named memory files whose index entry is
+    # past the cut and therefore never read. Everything else — orphans, strays,
+    # merely approaching the limit — is degradation, not loss, so it warns.
+    # (Earlier revisions failed on a raw-byte threshold, which fired on indexes
+    # that still loaded fine once frontmatter/comments were excluded.)
+    return {"name": "memory-index",
+            "status": "fail" if beyond_cut else "warn",
+            "detail": "; ".join(parts)}
 
 
 def check_memory_sync() -> dict:
@@ -1826,6 +2035,221 @@ QUOTA_STATE_STALE_SEC = 6 * 60 * 60
 AGENT_ACTIVE_SEC = 30 * 60
 
 
+# Runtimes whose request path is NOT expected to traverse the Anthropic credential
+# proxy. A Codex pass refreshes the very same `core-status.json` this check reads for
+# activity, but produces no Anthropic quota headers — so "agent working + stale quota"
+# is a perfectly healthy shape there, and warning on it would train operators to ignore
+# the check this whole probe exists to make actionable (qingyun, #2445).
+NON_PROXY_RUNTIMES = {"codex"}
+
+# The two launch records are stamped by SEPARATE `date +%s` calls in the same
+# launcher — `src/agent/codex/cli/start-cli.sh:240` writes core-runtime.json and
+# :243 appends session-starts.log — so one launch can legitimately produce
+# started_at=N and session_started_at=N+1 if the second rolls between them. A
+# strict `<` then reads a CURRENT marker as stale and emits the exact false proxy
+# warning this check exists to suppress (qingyun, #2446).
+#
+# A few seconds of slack cannot mask a real previous-core marker: that marker is
+# separated from the next launch by the entire lifetime of the core that wrote it,
+# which is minutes at the very least. So the margin is generous on purpose — it
+# costs nothing on the true-positive side and closes the whole race, rather than
+# assuming the gap is exactly one second.
+LAUNCH_RECORD_SKEW_SEC = 5
+
+
+def _runtime_may_skip_proxy() -> bool:
+    """True when this core's runtime is not expected to produce Anthropic quota headers.
+
+    Read from `state/core-runtime.json`. Today the **Codex launcher is its only writer**
+    (`src/agent/codex/cli/start-cli.sh` writes it unconditionally once the workspace
+    resolves), so its ABSENCE positively excludes Codex rather than merely being
+    unknown — which is why absence is treated as proxy-routed instead of silencing the
+    check everywhere. An unreadable or malformed file cannot rule Codex out, so it is
+    treated as non-proxy and stays silent: a corrupted status file must not manufacture
+    a health warning.
+
+    A marker left by a PREVIOUS core is ignored. Today only the Codex launcher writes
+    this file and nothing resets it, so after a Codex -> Claude switch a stale
+    `{"runtime": "codex"}` sits there describing a core that is no longer running
+    (#2406 documents exactly that happening live on 2026-07-30). Trusting it would
+    silence this check on a host that IS proxy-routed — the mirror of the false
+    positive this function was added to fix. So a marker whose `started_at` predates
+    the running core's own start is treated as absent, i.e. proxy-routed.
+
+    When #2406 lands a Claude-side writer, tighten this to positive identification of
+    a proxy-routed runtime instead of inferring it from absence.
+    """
+    path = status_read_path("core-runtime.json", WORKSPACE_DIR)
+    try:
+        if not path.exists():
+            return False          # no Codex launcher ever ran here -> proxy-routed
+        marker = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return True               # cannot rule Codex out -> stay silent
+    # Valid JSON is not necessarily an OBJECT. `null`, `[]`, `"codex"` and `3` all
+    # decode fine and then raise AttributeError on `.get`, which the handler above
+    # does not catch — so a junk state file would crash the entire health run inside
+    # the very branch this check hardens (qingyun, #2446). A non-object marker is
+    # exactly as uninformative as malformed JSON, so it takes the same silent path.
+    if not isinstance(marker, dict):
+        return True               # cannot rule Codex out -> stay silent
+    runtime = marker.get("runtime")
+    # The FIELD has a schema too, not just the container. `{"runtime": []}` and
+    # `{"runtime": {}}` reach the membership test and raise TypeError (unhashable);
+    # `{"runtime": 3}`, `{"runtime": true}` and a marker with no `runtime` key at all
+    # don't crash but fall through to "proxy-routed" and manufacture the very warning
+    # this check exists to suppress. A field that isn't a string tells us nothing about
+    # the runtime, so it takes the same fail-silent path as malformed JSON
+    # (qingyun, #2446 — the same shape one level in from the container guard above).
+    if not isinstance(runtime, str):
+        return True               # cannot rule Codex out -> stay silent
+    if _marker_predates_running_core(marker):
+        return False              # belongs to a previous core -> no information
+    return runtime in NON_PROXY_RUNTIMES
+
+
+def _local_host_labels() -> "set[str]":
+    r"""Every label a launcher on THIS host could plausibly have persisted.
+
+    The reader and the writers do NOT share a host-label contract, and comparing
+    against only one of them discards this host's real launch records:
+
+      reader  `util_paths._host_label()`  -> SUTANDO_HOST_LABEL > scutil
+                                             LocalHostName > short hostname
+      writers `hostname | sed 's/\..*//'` -> short hostname, always
+              (src/agent/codex/cli/start-cli.sh:242,
+               src/agent/claude/cli/start-cli.sh:609)
+
+    On macOS those routinely differ — LocalHostName is the stable Bonjour name
+    while `hostname` follows DHCP — and with SUTANDO_HOST_LABEL set they differ by
+    construction. When they do, EVERY local line is skipped as foreign, the
+    boundary becomes None, and a stale `runtime:codex` marker stays trusted
+    forever: the stale-quota warning goes permanently silent. That is strictly
+    worse than the cross-host false positive the host filter was added to fix
+    (qingyun-wu + john-the-dev, #2446, independently reproduced).
+
+    This host is not hypothetical evidence: its own vault carries BOTH
+    `host/Chis-MacBook-Pro/…` and `host/Chis-MBP/…` branches, so the short name
+    has already drifted here at least once.
+
+    Accepting the union is deliberately the conservative direction. A foreign host
+    would have to share one of these exact labels to be mistaken for local, which
+    is the pre-existing collision risk; discarding local records, by contrast,
+    silences a real alert on every affected host.
+    """
+    labels = {_host_label()}
+    try:
+        labels.add(socket.gethostname().split(".")[0])
+    except Exception:  # pragma: no cover — gethostname failing is not a reason to go blind
+        pass
+    return {x for x in labels if x}
+
+
+def _last_core_launch_at() -> "tuple[float, str | None] | None":
+    """When the CURRENT core was launched, from `state/session-starts.log`.
+
+    Returns `(timestamp, runtime)`, where `runtime` is the identity the launcher
+    recorded for that launch — `"codex"` from the Codex launcher, and None from the
+    Claude launcher, which writes no such field
+    (`src/agent/claude/cli/start-cli.sh:608`). The identity is returned rather than
+    discarded because the skew tolerance below is only safe when the launch record
+    and the marker positively agree on the runtime; see
+    `_marker_predates_running_core`.
+
+    Both launchers append one line per launch — `src/agent/claude/cli/start-cli.sh:610`
+    and `src/agent/codex/cli/start-cli.sh:243` — and both stamp the `host` that launched.
+
+    Only THIS host's records are eligible. `session-starts.log` lives in a workspace that
+    is synced across hosts, so the newest line globally is not this host's boundary: a
+    later launch on host B would otherwise become host A's boundary and age host A's
+    perfectly current marker into a false `warn` — the exact false-positive class this
+    check exists to suppress (qingyun-wu + john-the-dev, #2446, independently reproduced:
+    local Codex marker at now-60 alone => ok; add a foreign Codex launch at now => warn).
+
+    Legacy policy, stated explicitly: a record whose `host` is absent, non-string, or
+    belongs to another host is SKIPPED, never treated as local. Pre-`host` lines cannot
+    be attributed, and guessing "probably local" reintroduces the same poisoning from
+    older synced logs. Skipping them can leave no boundary at all, which yields None —
+    and None already means "no evidence", never "stale", so the failure direction is
+    silence rather than a false alarm.
+
+    The heartbeat was the obvious candidate and is WRONG: `core_heartbeat.py` stamps
+    `_STARTED_AT` once at module load and both launch paths RETAIN an existing heartbeat
+    process, so `.alive.started_at` is the heartbeat process's age, not the session's.
+    After a Codex → Claude switch it can be far older than a freshly-written marker,
+    which made the staleness comparison silently useless (john-the-dev, #2446).
+
+    Every hop is validated rather than the one that last broke: unreadable file, a line
+    that isn't JSON, a decoded value that isn't an object, a missing key, a non-numeric
+    value. Anything uninformative yields None, and None means "no evidence", never
+    "stale".
+    """
+    try:
+        raw = (status_read_path("session-starts.log", WORKSPACE_DIR)).read_text()
+    except OSError:
+        return None
+    for line in reversed(raw.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue                      # a torn/partial line is not the boundary
+        if not isinstance(entry, dict):
+            continue
+        entry_host = entry.get("host")
+        if not isinstance(entry_host, str) or entry_host not in _local_host_labels():
+            continue                      # another host's launch, or unattributable
+        try:
+            ts = float(entry.get("session_started_at"))
+        except (TypeError, ValueError):
+            continue                      # keep looking further back
+        launch_runtime = entry.get("runtime")
+        if not isinstance(launch_runtime, str):
+            launch_runtime = None         # absent or wrong type -> no identity claim
+        return ts, launch_runtime
+    return None
+
+
+def _marker_predates_running_core(marker: dict) -> bool:
+    """True when `core-runtime.json` describes a core older than the one running now.
+
+    Compared against the newest `session-starts.log` entry — a real per-launch boundary
+    — not the heartbeat. Both timestamps must be present and comparable; if either is
+    missing the marker is taken at face value, because "no evidence of staleness" is not
+    evidence of staleness.
+
+    The skew tolerance is IDENTITY-AWARE, and only sound that way. It exists solely
+    because the Codex launcher stamps the marker and the session line with two separate
+    `date +%s` calls (`src/agent/codex/cli/start-cli.sh:240` and `:242`), so one real
+    launch can record `started_at=N` and `session_started_at=N+1`. That case always
+    carries `"runtime":"codex"` on BOTH records. Granting the same margin when the
+    runtimes do not positively agree would swallow the fast Codex -> Claude switch: a
+    stale Codex marker at N against a Claude launch at N+1 is a genuinely different core,
+    and Claude is proxy-routed, so silencing it there hides stale quota telemetry
+    indefinitely on the one runtime that needs the warning (qingyun-wu + john-the-dev,
+    independently reproduced on f887b2a7).
+
+    So the margin applies only on a positive runtime match; otherwise the comparison is
+    strict. A Claude launch record carries no `runtime` field at all, which is exactly
+    the ambiguity that must NOT earn the tolerance.
+    """
+    try:
+        started = float(marker.get("started_at"))
+    except (TypeError, ValueError):
+        return False
+    launch = _last_core_launch_at()
+    if launch is None:
+        return False
+    launched, launch_runtime = launch
+    same_runtime = (
+        launch_runtime is not None and launch_runtime == marker.get("runtime")
+    )
+    margin = LAUNCH_RECORD_SKEW_SEC if same_runtime else 0
+    return started < launched - margin
+
+
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
 
@@ -1905,8 +2329,26 @@ def check_quota_telemetry(proxy_status: str) -> dict:
             check["detail"] = "quota state present"
             return check
         agent_age = _agent_activity_age()
+        skipped_for_runtime = _runtime_may_skip_proxy()
         if quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
-                and agent_age < AGENT_ACTIVE_SEC:
+                and agent_age < AGENT_ACTIVE_SEC and skipped_for_runtime \
+                and _last_core_launch_at() is None:
+            # Silenced by a runtime marker we could NOT date. `session-starts.log`
+            # only exists on checkouts carrying the launcher write-sites (first
+            # landed 17d094f4, 2026-07-13), and a pinned older node has no such
+            # file — a live counter-example on this fleet, not a hypothesis. The
+            # conservative reading is kept, because refusing to trust the marker
+            # would reinstate the false warn on every healthy pre-Jul-13 Codex
+            # host, which is the defect this check was opened to remove. But the
+            # no-op is stated rather than silent: an unqualified `ok` here would
+            # be indistinguishable from a check that actually verified something.
+            check["detail"] += (
+                " — runtime marker present but UNVERIFIABLE on this checkout "
+                "(no state/session-starts.log), so a stale marker cannot be "
+                "detected; staleness check inactive here"
+            )
+        elif quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
+                and agent_age < AGENT_ACTIVE_SEC and not skipped_for_runtime:
             check["status"] = "warn"
             check["detail"] = (
                 f"quota state is {int(quota_age / 3600)}h stale while the agent is "
@@ -4524,7 +4966,17 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
             mtime = alive_file.stat().st_mtime
             if now - mtime >= 90.0:
                 continue  # stale heartbeat — not a live core
-            sock = json.loads(alive_file.read_text()).get("socket")
+            payload = json.loads(alive_file.read_text())
+            # A heartbeat that decodes to a NON-OBJECT (`null`, `[]`, `"x"`, `3`)
+            # raises AttributeError on `.get`, which this handler does not catch —
+            # so one junk file takes down the caller. That caller is
+            # `_rearm_core_crons()`, a RECOVERY path, so it fails exactly when
+            # something is already wrong. The writer is atomic (tmp + replace in
+            # core_heartbeat.py), but this globs `*.alive` for EVERY host, so the
+            # file may come from another machine running different code.
+            if not isinstance(payload, dict):
+                continue
+            sock = payload.get("socket")
         except (OSError, ValueError):
             continue
         if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
