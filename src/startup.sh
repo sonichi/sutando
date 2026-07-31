@@ -261,8 +261,20 @@ fi
 #
 # Actively clear any stale committer.* a prior startup wrote, so every
 # fleet host self-heals on its next boot.
-git -C "$REPO" config --unset committer.name 2>/dev/null || true
-git -C "$REPO" config --unset committer.email 2>/dev/null || true
+#
+# Guard on Xcode CLT presence: on a fresh consumer Mac (no Command Line Tools),
+# /usr/bin/git is an Apple SHIM that pops a GUI "install the developer tools?"
+# dialog the instant it's invoked — BEFORE git runs, so `2>/dev/null` can't
+# suppress it — and startup runs on every core boot, so the dialog reappears
+# every launch. The self-heal is a no-op there anyway: the bundled engine is an
+# rsync copy with no .git, so there's no stale committer.* to unset. Skip it
+# unless real git is available. `xcode-select -p` is the shim-safe probe (returns
+# non-zero without prompting; same pattern as migrate.sh) — do NOT use
+# `command -v git`, which can itself trigger the shim.
+if xcode-select -p >/dev/null 2>&1; then
+  git -C "$REPO" config --unset committer.name 2>/dev/null || true
+  git -C "$REPO" config --unset committer.email 2>/dev/null || true
+fi
 
 # Re-apply tracked plugin-cache patches (skills/plugin-patches/). Plugin caches
 # are managed like node_modules — clobbered on update + invisible to git/sync —
