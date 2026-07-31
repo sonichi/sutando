@@ -626,6 +626,84 @@ def _socket_connected() -> bool:
         return False
 
 
+# Reconnect-churn discriminator (qingyun CR 2026-07-31). The live repro on
+# Chis-MacBook-Pro showed a second wedge shape the connection gate alone
+# misses: a tight BrokenPipe/reconnect loop minting new Socket Mode sessions
+# at ~7/min (1,016 sessions over 1d14h) where is_connected() reads True at
+# the instants the heartbeat gate samples it — connected, tearing down
+# cleanly, reconnecting, but never carrying events. The discriminating
+# signal is session churn: the builtin SocketModeClient mints a fresh
+# session id per (re)connect, and a healthy connection changes id rarely
+# (Slack's routine refresh is ~1 per 10-30 min). The result_watcher loop
+# samples session_id() every tick; >= _CHURN_MAX_SESSIONS distinct id
+# changes inside _CHURN_WINDOW_S marks the socket unhealthy, the heartbeat
+# write is suppressed, and health-check's existing staleness detector
+# (Check 3) flips to warn. Self-recovering: when churn stops the window
+# drains and heartbeats resume.
+_CHURN_WINDOW_S = 300
+_CHURN_MAX_SESSIONS = 3
+_session_changes: deque = deque()  # timestamps of observed session-id changes
+_last_session_id = None
+_churn_logged = False
+
+
+def _note_session_sample(now=None):
+    """Sample the live socket's session id; record a change timestamp.
+
+    Called from the result_watcher loop (~1s cadence), so sampling is far
+    faster than the ~9s session lifetime seen in the wedge repro. A None id
+    (between sessions, or handler not wired yet) is skipped rather than
+    counted — only id -> different-id transitions are churn. The first
+    observed id after boot is baseline, not churn.
+    """
+    global _last_session_id
+    handler = _socket_handler
+    try:
+        client = getattr(handler, "client", None)
+        sid = client.session_id() if client is not None else None
+    except Exception:
+        sid = None
+    if sid is None:
+        return
+    if now is None:
+        now = time.time()
+    if _last_session_id is not None and sid != _last_session_id:
+        _session_changes.append(now)
+    _last_session_id = sid
+
+
+def _reconnect_churning(now=None) -> bool:
+    """True when the socket is thrashing through sessions (wedge shape #2)."""
+    global _churn_logged
+    if now is None:
+        now = time.time()
+    while _session_changes and now - _session_changes[0] > _CHURN_WINDOW_S:
+        _session_changes.popleft()
+    churning = len(_session_changes) >= _CHURN_MAX_SESSIONS
+    if churning and not _churn_logged:
+        print(
+            f"[Slack] reconnect churn: {len(_session_changes)} new socket "
+            f"sessions in {_CHURN_WINDOW_S}s — suppressing heartbeat so "
+            "health-check flags the wedge",
+            flush=True,
+        )
+        _churn_logged = True
+    elif not churning and _churn_logged:
+        print("[Slack] reconnect churn subsided — heartbeat resumes", flush=True)
+        _churn_logged = False
+    return churning
+
+
+def _socket_healthy() -> bool:
+    """Heartbeat gate: the socket is up AND not thrashing through sessions.
+
+    Both wedge shapes must suppress the heartbeat: is_connected() False
+    (half-open socket, the original repro) and is_connected() True under
+    reconnect churn (the 2026-07-31 repro).
+    """
+    return _socket_connected() and not _reconnect_churning()
+
+
 def _download_slack_file(file_dict: dict) -> str | None:
     """Download a Slack file to INBOX_DIR. Returns the local path or None.
 
@@ -1554,13 +1632,15 @@ def result_watcher():
                     claim.unlink(missing_ok=True)
 
             # Heartbeat (used by health-check.py) — written ONLY while the
-            # Socket Mode connection is actually up. This thread runs
-            # independently of the WSS loop, so an unconditional write would
-            # stay fresh through a socket wedge and hide it; gating on the live
-            # connection makes the heartbeat go stale during a wedge so
-            # health-check can detect an alive-but-deaf bridge.
+            # Socket Mode connection is actually up AND not thrashing through
+            # reconnect churn. This thread runs independently of the WSS loop,
+            # so an unconditional write would stay fresh through a socket
+            # wedge and hide it; gating on live-socket health makes the
+            # heartbeat go stale during either wedge shape so health-check
+            # can detect an alive-but-deaf bridge.
+            _note_session_sample()
             now = time.time()
-            if now - last_heartbeat >= 60 and _socket_connected():
+            if now - last_heartbeat >= 60 and _socket_healthy():
                 try:
                     heartbeat_file.write_text(str(int(now)))
                     last_heartbeat = now

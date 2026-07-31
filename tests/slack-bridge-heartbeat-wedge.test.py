@@ -25,11 +25,25 @@ def check(name, cond, detail=""):
 
 # --- structure: the three load-bearing properties of the fix ---
 
-# 1. The heartbeat write is GATED on _socket_connected() — an unconditional
-#    write would stay fresh through a wedge and hide it (the original bug).
-check("heartbeat-gated-on-connection",
-      re.search(r"if\s+now\s*-\s*last_heartbeat\s*>=\s*60\s+and\s+_socket_connected\(\)\s*:", SRC) is not None,
-      "heartbeat write must be guarded by `and _socket_connected()`")
+# 1. The heartbeat write is GATED on _socket_healthy() — an unconditional
+#    write would stay fresh through a wedge and hide it (the original bug),
+#    and a connection-only gate would stay fresh through reconnect churn
+#    (the 2026-07-31 live repro: is_connected() True, ~7 new sessions/min).
+check("heartbeat-gated-on-health",
+      re.search(r"if\s+now\s*-\s*last_heartbeat\s*>=\s*60\s+and\s+_socket_healthy\(\)\s*:", SRC) is not None,
+      "heartbeat write must be guarded by `and _socket_healthy()`")
+
+# 1b. _socket_healthy() requires BOTH the live connection and no churn.
+check("healthy-requires-connected-and-no-churn",
+      re.search(r"def _socket_healthy\(\)[\s\S]+?_socket_connected\(\)\s+and\s+not\s+_reconnect_churning\(\)", SRC) is not None,
+      "_socket_healthy() must be `_socket_connected() and not _reconnect_churning()`")
+
+# 1c. The result_watcher loop samples the session id every tick, not just at
+#     heartbeat instants — churn faster than the 60s heartbeat cadence must
+#     still be observed.
+check("session-sampled-every-tick",
+      re.search(r"_note_session_sample\(\)\s*\n\s*now = time\.time\(\)", SRC) is not None,
+      "result_watcher must call _note_session_sample() each tick before the heartbeat check")
 
 # 2. _socket_connected() consults the real socket client's is_connected().
 check("socket-connected-checks-is_connected",
@@ -79,6 +93,238 @@ class _Boom:
     def is_connected(self):
         raise RuntimeError("socket state unavailable")
 check("is_connected-raises-false", run_socket_connected(types.SimpleNamespace(client=_Boom())) is False)
+
+# --- behavioral: reconnect-churn discriminator (qingyun CR 2026-07-31) ---
+# The P1 scenario: is_connected() stays True while Socket Mode thrashes
+# through sessions. Exec the REAL churn functions (production filename +
+# line offsets preserved, same as above) and drive them with a fake clock
+# and a client whose is_connected() never goes False.
+
+def _extract(name):
+    m2 = re.search(rf"\ndef {name}\([\s\S]+?\n(?=\S)", SRC)
+    assert m2, f"could not locate {name} source"
+    return "\n" * SRC[:m2.start()].count("\n") + m2.group(0)
+
+def make_churn_ns(handler):
+    """Fresh namespace holding the real churn code + controllable state."""
+    import collections
+    ns = {
+        "time": types.SimpleNamespace(time=lambda: 0.0),  # tests always pass now=
+        "deque": collections.deque,
+        "_socket_handler": handler,
+        "_CHURN_WINDOW_S": 300,
+        "_CHURN_MAX_SESSIONS": 3,
+        "_session_changes": collections.deque(),
+        "_last_session_id": None,
+        "_churn_logged": False,
+        "print": lambda *a, **k: None,  # churn-transition log lines, silenced
+    }
+    for fn in ("_socket_connected", "_note_session_sample",
+               "_reconnect_churning", "_socket_healthy"):
+        exec(compile(_extract(fn), str(SRC_PATH), "exec"), ns)
+    return ns
+
+class _ChurningClient:
+    """is_connected() ALWAYS True; session_id changes per reconnect — the
+    exact live-repro shape (~7 sessions/min, is_connected truthy)."""
+    def __init__(self):
+        self._sid = "s-0"
+    def reconnect(self, n):
+        self._sid = f"s-{n}"
+    def is_connected(self):
+        return True
+    def session_id(self):
+        return self._sid
+
+client = _ChurningClient()
+ns = make_churn_ns(types.SimpleNamespace(client=client))
+
+# Baseline: first observed session id is not churn; healthy gate passes.
+ns["_note_session_sample"](now=0)
+check("stable-session-healthy",
+      ns["_socket_healthy"]() is True,
+      "a stable session with is_connected()=True must remain healthy")
+
+# Two id changes inside the window: still below threshold -> healthy.
+for i, t in [(1, 10), (2, 20)]:
+    client.reconnect(i)
+    ns["_note_session_sample"](now=t)
+check("below-threshold-still-healthy",
+      ns["_reconnect_churning"](now=25) is False and ns["_socket_healthy"]() is True,
+      "threshold-1 session changes must not trip the churn gate")
+
+# Third change inside the window: churn threshold reached while
+# is_connected() is STILL True -> unhealthy, heartbeat suppressed.
+client.reconnect(3)
+ns["_note_session_sample"](now=30)
+check("churn-with-truthy-is_connected-unhealthy",
+      client.is_connected() is True and ns["_socket_healthy"]() is False,
+      "3 session changes in the window with is_connected()=True must suppress the heartbeat")
+
+# Sustained churn at the repro rate (~7/min) stays unhealthy.
+for i in range(4, 20):
+    client.reconnect(i)
+    ns["_note_session_sample"](now=30 + i * 9)
+check("sustained-churn-stays-unhealthy",
+      ns["_socket_healthy"]() is False,
+      "sustained reconnect churn must keep the heartbeat suppressed")
+
+# Recovery: churn stops, the window drains -> healthy again (self-recovering,
+# no restart required for the gate itself).
+last_change = 30 + 19 * 9  # ts of the final reconnect above
+check("churn-subsides-recovers",
+      ns["_reconnect_churning"](now=last_change + 301) is False and ns["_socket_healthy"]() is True,
+      "after a quiet window the gate must recover to healthy")
+
+# Baseline-not-churn: a fresh boot's first id must never count toward churn.
+ns2 = make_churn_ns(types.SimpleNamespace(client=_ChurningClient()))
+ns2["_note_session_sample"](now=0)
+check("first-session-is-baseline",
+      len(ns2["_session_changes"]) == 0,
+      "the first observed session id is baseline, not a churn event")
+
+# None session ids (between sessions / handler unwired) are skipped, and a
+# session_id() that raises must never crash the watcher thread.
+class _NoneThenBoom:
+    def is_connected(self):
+        return True
+    def session_id(self):
+        return None
+ns3 = make_churn_ns(types.SimpleNamespace(client=_NoneThenBoom()))
+ns3["_note_session_sample"](now=0)
+class _Boom2:
+    def is_connected(self):
+        return True
+    def session_id(self):
+        raise RuntimeError("no session state")
+ns3["_socket_handler"] = types.SimpleNamespace(client=_Boom2())
+ns3["_note_session_sample"](now=1)
+check("none-and-raising-session-ids-safe",
+      len(ns3["_session_changes"]) == 0 and ns3["_last_session_id"] is None,
+      "None/raising session_id() must be skipped, not counted or crashing")
+
+# Slack's routine session refresh (~1 per 10-30 min) must NOT read as churn:
+# id changes spaced wider than the window never accumulate to threshold.
+client4 = _ChurningClient()
+ns4 = make_churn_ns(types.SimpleNamespace(client=client4))
+ns4["_note_session_sample"](now=0)
+for i, t in [(1, 600), (2, 1200), (3, 1800), (4, 2400)]:
+    client4.reconnect(i)
+    ns4["_note_session_sample"](now=t)
+    check(f"routine-refresh-{i}-healthy",
+          ns4["_reconnect_churning"](now=t) is False,
+          "routine ~10-min session refreshes must never trip the churn gate")
+
+# --- real-module behavioral: import the bridge (slack_bolt stubbed, same
+#     pattern as slack-bridge-allowlist.test.py) and drive the REAL
+#     result_watcher loop through both phases: heartbeat suppressed under
+#     churn while is_connected() is True, then resuming once churn drains.
+#     This is the loop-level half the exec-based tests above cannot reach. ---
+import os
+import sys
+import tempfile
+import threading
+import time as _time
+
+
+class _StubApp:
+    def __init__(self, *a, **kw):
+        self.client = types.SimpleNamespace()
+
+    def event(self, _name):
+        def decorator(fn):
+            return fn
+        return decorator
+
+
+def _load_bridge():
+    os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-token-wedge")
+    os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-token-wedge")
+    # Isolate config reads (access.json etc.) from the operator's real tree.
+    os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="wedge-test-cfg-")
+    try:
+        import slack_bolt as _real_bolt
+        _real_bolt.App = _StubApp
+    except ImportError:
+        stub_bolt = types.ModuleType("slack_bolt")
+        stub_bolt.App = _StubApp
+        sys.modules["slack_bolt"] = stub_bolt
+        adapter_pkg = types.ModuleType("slack_bolt.adapter")
+        sys.modules["slack_bolt.adapter"] = adapter_pkg
+        sm_mod = types.ModuleType("slack_bolt.adapter.socket_mode")
+        sm_mod.SocketModeHandler = object
+        sys.modules["slack_bolt.adapter.socket_mode"] = sm_mod
+    import importlib.util
+    repo = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("slack_bridge_wedge_test", repo / "src" / "slack-bridge.py")
+    sys.path.insert(0, str(repo / "src"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+try:
+    _mod = _load_bridge()
+except Exception as _e:  # slack_sdk absent etc. — exec-based coverage above stands
+    print(f"note: real-module section skipped ({_e})")
+    _mod = None
+
+if _mod is not None:
+    class _LiveChurnClient:
+        def __init__(self):
+            self._sid = "live-0"
+        def is_connected(self):
+            return True
+        def session_id(self):
+            return self._sid
+
+    lc = _LiveChurnClient()
+    _mod._socket_handler = types.SimpleNamespace(client=lc)
+
+    # Real module functions, quick sanity: baseline, churn, recovery.
+    _mod._note_session_sample(now=0)
+    check("realmod-baseline-healthy", _mod._socket_healthy() is True)
+    for i, t in [(1, 1), (2, 2), (3, 3)]:
+        lc._sid = f"live-{i}"
+        _mod._note_session_sample(now=_time.time())
+    check("realmod-churn-unhealthy",
+          lc.is_connected() is True and _mod._socket_healthy() is False,
+          "real module must suppress the heartbeat under churn with a truthy is_connected()")
+    _mod._session_changes.clear()
+    check("realmod-recovery-healthy", _mod._socket_healthy() is True)
+
+    # Loop-level: run the REAL result_watcher thread.
+    for d in (_mod.RESULTS_DIR, _mod.ARCHIVE_RESULTS_DIR, _mod.STATE_DIR,
+              _mod.REPO / "tasks"):
+        Path(d).mkdir(parents=True, exist_ok=True)
+    hb = Path(_mod.REPO) / "state" / "slack-bridge.heartbeat"
+    hb.unlink(missing_ok=True)
+
+    # Seed one pending reply whose result carries a skip marker, so the
+    # loop's delivery branch (skip-marker path, part of this branch's diff)
+    # executes alongside the heartbeat phases.
+    with _mod.pending_replies_lock:
+        _mod.pending_replies["task-wedge-test"] = {"channel": "C000", "access_tier": "owner"}
+    (Path(_mod.RESULTS_DIR) / "task-wedge-test.txt").write_text("[no-send]\ninternal\n")
+
+    # Phase A: churn active (3 fresh changes) — the loop must NOT write.
+    now = _time.time()
+    _mod._session_changes.clear()
+    _mod._session_changes.extend([now - 10, now - 5, now - 1])
+    threading.Thread(target=_mod.result_watcher, daemon=True).start()
+    _time.sleep(2.5)
+    check("watcher-suppresses-heartbeat-under-churn",
+          not hb.exists(),
+          "result_watcher must not write the heartbeat while churn is active")
+
+    # Phase B: churn drains — the loop must resume writing within ~2 ticks.
+    _mod._session_changes.clear()
+    deadline = _time.time() + 6
+    while _time.time() < deadline and not hb.exists():
+        _time.sleep(0.25)
+    check("watcher-resumes-heartbeat-after-churn",
+          hb.exists(),
+          "result_watcher must resume the heartbeat once churn subsides")
 
 # --- health-check already has the consuming half (Check 3) — assert it exists,
 #     so this fix and that detector stay coupled. ---
