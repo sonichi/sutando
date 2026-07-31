@@ -36,7 +36,7 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 from pending_questions_md import (  # noqa: E402
-    DIVIDER_OR_DONE_RE, active_region, mask_html_comments)
+    DIVIDER_OR_DONE_RE, active_region, mask_html_comments, mask_markup)
 
 OLD_ANCHOR = r'^#\s+Resolved\b'              # the original bug
 EOL_ANCHOR = r'^#[ \t]+Resolved[ \t\r]*$'    # the first fix, which regressed case B
@@ -166,6 +166,51 @@ for py in sorted(f for r in roots if r.is_dir() for f in r.rglob("*.py")):
             offenders.append(f"{py.name}:{i}")
 check(f"no second divider definition in src/, scripts/ or skills/ (scanned {scanned} files; found {offenders or 'none'})",
       scanned > 20 and not offenders)
+
+# ---------------------------------------------------------------------------
+# Case F — QUOTED DIVIDERS: a fenced example, and a code span that line-wrapped.
+#
+# Reported on #2419 at exact head aa6a64aa (john-the-dev, P1) and corroborated the
+# same hour on a third host by sonichi: the notifier dropped from 6 pending to 2
+# with no owner activity, because a sentence explaining the checker wrapped so that
+# `` # Resolved` `` landed line-initial inside an inline code span.
+#
+# Both are the SAME class as the case-A HTML comment: documentation of the divider,
+# quoted. Neither was masked, so the active region collapsed and every later owner
+# question vanished — from all five readers at once, since they now share this helper.
+# ---------------------------------------------------------------------------
+QUESTIONS = "\n\n## real one\nbody\n\n## real two\nbody\n\n# Resolved\n\n## archived\n"
+
+check("F1 ``` fence quoting the divider does not truncate",
+      n_sections("Docs:\n```md\n# Resolved\n```" + QUESTIONS) == 2)
+check("F2 ~~~ fence quoting the divider does not truncate",
+      n_sections("Docs:\n~~~md\n# Resolved\n~~~" + QUESTIONS) == 2)
+check("F3 inline code span wrapping to column 0 does not truncate (live on host C)",
+      n_sections("Docs: reads only text above the `\n# Resolved` content and counts.\n"
+                 + QUESTIONS) == 2)
+
+# Parser boundaries. These are the controls: each asserts the masker is NOT simply
+# blanking anything that looks fence-ish, which would silently over-count instead.
+check("F4 a shorter inner run must not close a longer fence",
+      n_sections("````\n```\n# Resolved\n````" + QUESTIONS) == 2)
+check("F5 a closer must use the same marker character",
+      n_sections("```\n~~~\n# Resolved\n```" + QUESTIONS) == 2)
+check("F6 four-space indent is an indented code block, NOT a fence (divider still real)",
+      n_sections("    ```\n# Resolved\n" + QUESTIONS.lstrip("\n")) == 0)
+check("F7 a backtick opener whose info string holds a backtick is not a fence",
+      n_sections("``` a`b\n# Resolved\n```" + QUESTIONS) == 0)
+check("F8 an UNCLOSED fence masks to EOF — over-counts, never returns a silent zero",
+      n_sections("```\n# Resolved\n## a\n\n## b\n") == 2)
+
+# Offset invariant: every masker must preserve length AND line count, because
+# agent-api derives question identity by slicing the ORIGINAL at a masked offset.
+_offset_ok = True
+for _doc in ("Docs:\n```md\n# Resolved\n```" + QUESTIONS,
+             "Docs: above the `\n# Resolved` content.\n" + QUESTIONS,
+             BANNER + QUESTIONS):
+    _m = mask_markup(_doc)
+    _offset_ok &= (len(_m) == len(_doc) and _m.count("\n") == _doc.count("\n"))
+check("F9 masking preserves length and line count (offsets stay sliceable)", _offset_ok)
 
 passed = sum(ok for _, ok in CASES)
 for name, ok in CASES:
