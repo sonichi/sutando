@@ -197,8 +197,32 @@ check("F5 a closer must use the same marker character",
       n_sections("```\n~~~\n# Resolved\n```" + QUESTIONS) == 2)
 check("F6 four-space indent is an indented code block, NOT a fence (divider still real)",
       n_sections("    ```\n# Resolved\n" + QUESTIONS.lstrip("\n")) == 0)
-check("F7 a backtick opener whose info string holds a backtick is not a fence",
-      n_sections("``` a`b\n# Resolved\n```" + QUESTIONS) == 0)
+# F7 EXPECTATION REVISED 2026-07-31 (was `== 0`). `` ``` a`b `` is not a valid FENCE
+# opener (a backtick fence's info string may not contain a backtick) — that half still
+# holds. But the col-0 three-run and the three-run two lines later are equal-length
+# maximal runs, so they legitimately delimit a CODE SPAN around `# Resolved`. The old
+# `0` encoded fence-only semantics, from before spans were masked at all. Masking is
+# also the safe direction here: it over-counts (visible) rather than truncating to a
+# silent zero.
+check("F7 backtick-in-info is not a fence, but IS a code span (equal maximal runs)",
+      n_sections("``` a`b\n# Resolved\n```" + QUESTIONS) == 2)
+
+# ---------------------------------------------------------------------------
+# Case G — UNEQUAL BACKTICK RUNS. Second P1 on #2419 (john-the-dev, head 297bd669).
+# The first fix used ``(`+)(?:(?!\1).)*?\1``, which can backtrack to a PREFIX of a
+# longer run and close on a PREFIX of another, pairing runs of unequal length. Markdown
+# requires both delimiters to be MAXIMAL runs of EXACTLY equal length.
+# ---------------------------------------------------------------------------
+check("G1 unequal runs: 3-opener is not closed by a 4-run (reviewer's exact repro)",
+      n_sections("Docs: ```quoted\n````\n````\n# Resolved\n```" + QUESTIONS) == 2)
+check("G2 control: an exact-length pair still masks",
+      n_sections("Docs: ```\n# Resolved\n```" + QUESTIONS) == 2)
+check("G3 control: ordinary prose with no backticks leaves the divider real",
+      n_sections("Docs: plain text.\n" + QUESTIONS.lstrip("\n")) == 2)
+check("G4 control: an opener with no equal-length partner is literal, divider real",
+      n_sections("Docs: ``` unclosed\n# Resolved\n" + QUESTIONS.lstrip("\n")) == 0)
+check("G5 order is load-bearing: a span closer at col 0 must not open a fence",
+      n_sections("Docs: above the `\n# Resolved` content.\n" + QUESTIONS) == 2)
 check("F8 an UNCLOSED fence masks to EOF — over-counts, never returns a silent zero",
       n_sections("```\n# Resolved\n## a\n\n## b\n") == 2)
 

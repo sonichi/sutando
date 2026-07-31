@@ -60,10 +60,10 @@ _COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
 # not cosmetic. A backtick opener's info string may not contain a backtick.
 _FENCE_OPEN_RE = re.compile(r'^( {0,3})(`{3,}|~{3,})([^\n]*)$')
 
-# Inline code span: N backticks ... N backticks, non-greedy, may span a line break
-# (a wrapped sentence is exactly how this bit us). Longest-run-first so ``a`b``
-# is one span rather than two.
-_CODE_SPAN_RE = re.compile(r'(`+)(?:(?!\1).)*?\1', re.DOTALL)
+# Inline code spans are parsed, not regexed. A regex of the form ``(`+)…\1`` can
+# backtrack to a PREFIX of a longer run and close on a PREFIX of another, pairing
+# runs of unequal length — which exposes a divider that is genuinely quoted. Markdown
+# requires both delimiters to be MAXIMAL runs of EXACTLY equal length.
 
 
 def _blank(s: str) -> str:
@@ -109,18 +109,62 @@ def mask_fenced_code(text: str) -> str:
     return '\n'.join(out)
 
 
+def _backtick_runs(text: str) -> list[tuple[int, int]]:
+    """Every MAXIMAL run of backticks as (start, length)."""
+    runs, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] == '`':
+            j = i
+            while j < n and text[j] == '`':
+                j += 1
+            runs.append((i, j - i))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
 def mask_code_spans(text: str) -> str:
     """Blank inline code spans, preserving length and line breaks.
 
     A span may wrap across a line break, which is how `` # Resolved` `` reached
     column 0 on a real host while being, semantically, quoted text.
+
+    Delimiters are MAXIMAL backtick runs and a closer must have EXACTLY the
+    opener's length — a 4-run neither closes nor is closed by a 3-run. An opener
+    with no equal-length partner is literal text, not a span, so scanning resumes
+    after it rather than swallowing the rest of the document.
     """
-    return _CODE_SPAN_RE.sub(lambda m: _blank(m.group(0)), text)
+    out = list(text)
+    runs = _backtick_runs(text)
+    k = 0
+    while k < len(runs):
+        start, length = runs[k]
+        m = k + 1
+        while m < len(runs) and runs[m][1] != length:
+            m += 1
+        if m < len(runs):
+            end = runs[m][0] + runs[m][1]
+            for p in range(start, end):
+                if out[p] != '\n':
+                    out[p] = ' '
+            k = m + 1
+        else:
+            k += 1
+    return ''.join(out)
 
 
 def mask_markup(text: str) -> str:
-    """All three maskers, composed. Each preserves offsets, so order is safe."""
-    return mask_code_spans(mask_fenced_code(mask_html_comments(text)))
+    """All three maskers, composed. Each preserves offsets.
+
+    ORDER IS LOAD-BEARING: code spans must be masked BEFORE fences. A span's
+    closing run often sits at column 0 on its own line, and `mask_fenced_code`
+    would read that as a fence OPENER, find no closer, and blank to end of
+    document — hiding the real divider and, worse, the questions after it.
+    Masking spans first removes those delimiters before the fence scanner sees
+    them. Measured on the 11-case matrix: spans-first 11/11, fences-first 10/11.
+    """
+    return mask_fenced_code(mask_code_spans(mask_html_comments(text)))
 
 
 def active_region(text: str, divider: re.Pattern = DIVIDER_RE) -> str:
