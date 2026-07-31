@@ -74,6 +74,11 @@ check "call-arg siblings do not exempt the command"     flag  $'+++ b/skills/x/c
 check "method-call arguments likewise"                  flag  $'+++ b/skills/x/c2.ts\n@@ -1,0 +1,1 @@\n+child.exec("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg");'
 check "control: grouping paren after a keyword passes"  clean $'+++ b/skills/x/c3.py\n@@ -1,0 +1,1 @@\n+    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")'
 
+# Non-candidate containers: a keyword grouping is a condition, an object literal
+# is keyed config — neither is a sequence tried in order (review of 8e83ca5).
+check "keyword grouping does not exempt"                flag  $'+++ b/skills/x/r1.ts\n@@ -1,0 +1,1 @@\n+if (cmd === "/opt/homebrew/bin/ffmpeg" || alt === "/usr/local/bin/ffmpeg") run(cmd);'
+check "object literal does not exempt"                  flag  $'+++ b/skills/x/r2.ts\n@@ -1,0 +1,1 @@\n+const cfg = { command: "/opt/homebrew/bin/ffmpeg", fallbackHint: "/usr/local/bin/ffmpeg" };'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

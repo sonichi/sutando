@@ -445,14 +445,54 @@ try:
        _s('    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")').strip() == "")
 
     # Unit level.
-    ok("_is_call_paren: identifier before ( -> call",
-       rc._is_call_paren('spawn("/a","/b")', 5))
-    ok("_is_call_paren: keyword before ( -> NOT a call",
-       not rc._is_call_paren('for _p in ("/a","/b")', 10))
-    ok("_is_call_paren: assignment before ( -> NOT a call",
-       not rc._is_call_paren('C = ("/a","/b")', 4))
-    ok("_is_call_paren: closing bracket before ( -> call",
-       rc._is_call_paren('f()("/a")', 3))
+    # A candidate collection is stated POSITIVELY: an array literal, a tuple, or
+    # a sequence-keyword grouping. Everything else is not a list of alternatives
+    # the code will try in order.
+    ok("container: identifier before ( -> call, not a collection",
+       not rc._is_candidate_container('spawn("/a","/b")', 5))
+    ok("container: `in` before ( -> sequence context, IS a collection",
+       rc._is_candidate_container('for _p in ("/a","/b")', 10))
+    ok("container: assignment before ( -> tuple, IS a collection",
+       rc._is_candidate_container('C = ("/a","/b")', 4))
+    ok("container: closing bracket before ( -> call, not a collection",
+       not rc._is_candidate_container('f()("/a")', 3))
+    ok("container: `if` before ( -> condition, NOT a collection",
+       not rc._is_candidate_container('if ("/a" || "/b")', 3))
+    ok("container: object literal { } is never a collection",
+       not rc._is_candidate_container('x = { a: "/a", b: "/b" }', 4))
+    ok("container: array literal IS a collection",
+       rc._is_candidate_container('C = ["/a","/b"]', 4))
+    ok("container: an INDEX is not a collection",
+       not rc._is_candidate_container('paths["/a"]', 5))
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
+# Non-candidate containers (qingyun-wu, review of 8e83ca5). Rejecting CALL
+# parens still left two containers that were never candidate lists either: a
+# keyword grouping (`if (...)`) and an object literal. Neither is a sequence the
+# code tries in order — the first is a condition, the second keyed config.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    def _s2(src):
+        return scan('+++ b/src/r.ts\n@@ -1,0 +1,1 @@\n+' + src)[1]
+
+    ok("main(): a keyword grouping does not exempt the literal",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" in _s2(
+           'if (cmd === "/opt/homebrew/bin/ffmpeg" || alt === "/usr/local/bin/ffmpeg") run(cmd);'))
+    ok("main(): an object literal does not exempt the literal",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" in _s2(
+           'const cfg = { command: "/opt/homebrew/bin/ffmpeg", '
+           'fallbackHint: "/usr/local/bin/ffmpeg" };'))
+
+    # Positive controls preserved.
+    ok("main(): array literal still passes",
+       _s2('const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];').strip() == "")
+    ok("main(): tuple still passes",
+       _s2('C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")').strip() == "")
+    ok("main(): sequence-keyword generator still passes",
+       _s2('    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")').strip() == "")
 finally:
     rc.flags.remove("/opt/")
 

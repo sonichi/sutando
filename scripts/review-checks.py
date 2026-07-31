@@ -92,48 +92,67 @@ def _code_part(s):
     return s
 
 
-# Keywords that may legitimately precede a grouping paren. Everything else
-# immediately before `(` marks it as a CALL's argument list.
-_GROUPING_KEYWORDS = frozenset((
-    "in", "for", "if", "elif", "else", "while", "return", "and", "or", "not",
-    "yield", "assert", "await", "lambda", "case", "match", "del", "is",
-))
+# A candidate collection is a SEQUENCE the code will actually try in order —
+# an array/list literal, or a parenthesised sequence. Stated positively rather
+# than as a growing list of exclusions, because each round of "reject the shape
+# just reported" left another container that was never a candidate list either:
+# a call's argument list, then a keyword grouping, then an object literal.
+#
+# `in` is the only keyword that introduces a SEQUENCE context (`for x in (...)`).
+# `if`/`while`/`return`/`and`/`or`/... introduce a CONDITION or an expression, and
+# two same-basename strings inside one are not a fallback chain.
+_SEQUENCE_KEYWORDS = frozenset(("in",))
 
 
-def _is_call_paren(code, i):
-    """True when `code[i] == '('` opens a CALL's argument list.
-
-    An argument list is not a candidate collection. Two arguments that happen to
-    share a basename do not make the first one portable:
-
-        spawn("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
-
-    The first argument IS the command being launched — an Apple-Silicon-only
-    path on Intel — and the second is just another argument, not a fallback the
-    code will try. A `(` counts as a call when the preceding non-space character
-    closes an expression (`)`/`]`) or ends an identifier that is not a keyword,
-    so `for _p in (...)` and `x = (...)` stay genuine groupings.
-    """
+def _prev_word(code, i):
+    """(char, word) immediately before `code[i]`, skipping spaces/tabs."""
     j = i - 1
     while j >= 0 and code[j] in " \t":
         j -= 1
     if j < 0:
-        return False
-    if code[j] in ")]":
-        return True
+        return "", ""
     if not (code[j].isalnum() or code[j] == "_"):
-        return False
+        return code[j], ""
     k = j
     while k >= 0 and (code[k].isalnum() or code[k] == "_"):
         k -= 1
-    return code[k + 1:j + 1] not in _GROUPING_KEYWORDS
+    return code[j], code[k + 1:j + 1]
+
+
+def _is_candidate_container(code, i):
+    """Is `code[i]` the opener of a syntactic candidate COLLECTION?
+
+    * `[` — an array/list literal. NOT an index (`paths[i]`), which is a lookup,
+      not a sequence of alternatives.
+    * `(` — a parenthesised sequence: a tuple (`C = (...)`) or a sequence-keyword
+      context (`for _p in (...)`). NOT a call's argument list, and NOT a keyword
+      grouping like `if (...)`, which is a condition.
+    * `{` — never. An object literal is keyed config; a `fallbackHint` key sitting
+      beside a `command` key does not make the command portable.
+    """
+    ch = code[i]
+    prev_ch, prev_word = _prev_word(code, i)
+    if ch == "{":
+        return False
+    if ch == "[":
+        return not (prev_ch in ")]" or prev_word != "")
+    if ch != "(":
+        return False
+    if prev_ch in ")]":
+        return False                      # call on a returned value
+    if prev_word:
+        return prev_word in _SEQUENCE_KEYWORDS
+    return True                           # operator / comma / start -> tuple
 
 
 def _group_span(code, pos):
     """The innermost bracket group containing `pos`, as (start, end), or None.
 
-    A CALL's argument list is not a container (see `_is_call_paren`) — only a
-    genuine collection literal or grouping counts.
+    Only a syntactic candidate COLLECTION counts as a container (see
+    `_is_candidate_container`): an array literal, a tuple, or a
+    sequence-keyword grouping. A call's argument list, a keyword grouping like
+    `if (...)`, an index, and an object literal are all excluded — none of them
+    is a list of alternatives the code will try in order.
 
     Returns None when `pos` sits inside no such container. That is a FAIL-CLOSED
     answer, not a fallback: an earlier version searched the whole line in that
@@ -153,8 +172,8 @@ def _group_span(code, pos):
             stack.append(i)
         elif ch in closes and stack:
             start = stack.pop()
-            if code[start] == "(" and _is_call_paren(code, start):
-                continue          # a call's argument list is not a collection
+            if not _is_candidate_container(code, start):
+                continue          # not a syntactic candidate collection
             if start < pos < i and (best is None or start > best[0]):
                 best = (start, i)
     return best
