@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -24,6 +25,9 @@ REPO = SCRIPT_PARENT.parents[2]
 
 
 def transcripts_dir() -> Path:
+    override = os.environ.get("SUTANDO_TRANSCRIPTS_DIR")
+    if override:
+        return Path(override)
     ws = subprocess.run(
         ["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
         capture_output=True, text=True, check=True).stdout.strip()
@@ -126,6 +130,13 @@ def main() -> None:
                          "dialog: user + assistant text; "
                          "all: dialog + tool-call names + system lines")
     ap.add_argument("--max-chars", type=int, default=200_000)
+    ap.add_argument("--tail-bytes", type=int, default=0,
+                    help="read only the LAST N bytes of the transcript "
+                         "(0 = whole file). Bounds dump I/O on multi-GB-class "
+                         "transcripts; the boot recap uses 8388608 (8 MiB) so "
+                         "boot cost stops scaling with session length. The "
+                         "tail keeps the RECENT end — which is what a catchup "
+                         "needs (open loops live at the end, not the start).")
     args = ap.parse_args()
 
     sessions = sorted(transcripts_dir().glob("*.jsonl"),
@@ -143,6 +154,14 @@ def main() -> None:
     out: list = []
     total = 0
     with open(path, errors="replace") as f:
+        if args.tail_bytes:
+            size = path.stat().st_size
+            if size > args.tail_bytes:
+                f.seek(size - args.tail_bytes)
+                f.readline()  # discard the partial line the seek landed in
+                out.append(f"...[tail: last {args.tail_bytes} bytes of "
+                           f"{size} — re-run with --tail-bytes 0 for the "
+                           "full session]")
         for line in f:
             try:
                 d = json.loads(line)
