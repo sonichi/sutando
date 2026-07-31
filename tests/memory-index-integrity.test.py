@@ -154,6 +154,44 @@ t = tempfile.mkdtemp(); mem = make_tree(Path(t))
 r = hc.check_memory_index_integrity()
 check("no MEMORY.md at all → not a size failure", r and r["status"] != "fail", str(r))
 
+# --- round-5 findings: both are "model the contract precisely" refinements ---
+# The runtime strips block HTML comments, but PRESERVES them inside code fences;
+# and its limit is a BYTE prefix, so a line straddling the cut is partially read.
+# Getting either wrong reintroduces exactly the false verdicts this check exists
+# to prevent — one in each direction.
+
+# john-the-dev: a big comment INSIDE a fence is real content to the runtime.
+_FENCED = "```html\n<!--\n" + ("padding padding padding\n" * 1200) + "-->\n```\n" + _ENTRY
+_mem_with(_FENCED)
+r = hc.check_memory_index_integrity()
+check("28KB HTML comment inside a ```fence is NOT stripped → entry is past the cut",
+      r and r["status"] != "ok", str(r))
+check("...and the fenced comment still counts toward the measured size",
+      len(hc._index_effective_text(_FENCED).encode()) > 25 * 1024,
+      f"effective={len(hc._index_effective_text(_FENCED).encode())}")
+# Discriminating control: the SAME comment unfenced must still be stripped, so
+# this is fence-awareness rather than "stop stripping comments".
+_UNFENCED = "<!--\n" + ("padding padding padding\n" * 1200) + "-->\n" + _ENTRY
+_mem_with(_UNFENCED)
+r = hc.check_memory_index_integrity()
+check("the SAME comment UNfenced is still stripped → still ok", r and r["status"] == "ok", str(r))
+check("...and measures small once stripped",
+      len(hc._index_effective_text(_UNFENCED).encode()) < 1024,
+      f"effective={len(hc._index_effective_text(_UNFENCED).encode())}")
+check("~~~ fences are honoured too, not just backticks",
+      len(hc._index_effective_text("~~~\n<!--\n" + ("p\n" * 500) + "-->\n~~~\n").encode()) > 500)
+
+# qingyun-wu: the byte limit cuts THROUGH a line; the filename before the cut is
+# still read, so the memory loads and must not be reported lost.
+_mem_with(("x" * (25 * 1024 - 100)) + "\n- [Good](good-memory.md) " + ("d" * 4000) + "\n")
+r = hc.check_memory_index_integrity()
+check("entry starting just BEFORE the 25KB cut is read → not a failure",
+      r and r["status"] != "fail", str(r))
+# Discriminating control: an entry starting AFTER the cut is genuinely lost.
+_mem_with(("x" * (25 * 1024 + 50)) + "\n" + _ENTRY)
+r = hc.check_memory_index_integrity()
+check("entry starting AFTER the cut is still a failure", r and r["status"] == "fail", str(r))
+
 # --- the undeclared env knobs are GONE ------------------------------------
 # AGENTS.md forbids inventing undocumented env vars, and these mirrored a
 # documented external contract that a deployment cannot legitimately retune

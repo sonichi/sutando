@@ -126,9 +126,41 @@ def _index_effective_text(text: str) -> str:
         m = re.match(r"^---\r?\n.*?\r?\n---[ \t]*\r?\n?", text, re.DOTALL)
         if m:
             text = text[m.end():]
-    # Block-level HTML comments only — a comment sharing a line with visible
-    # content is not block-level, so leave that line alone.
-    return re.sub(r"(?ms)^[ \t]*<!--.*?-->[ \t]*\r?\n?", "", text)
+
+    # Block-level HTML comments only, and NOT inside a fenced code block: the
+    # runtime strips block comments but PRESERVES them inside code fences, so a
+    # regex that ignores fence state under-reports. A 28KB comment wrapped in
+    # ```html measured as 37 bytes here and returned a false `ok` while the
+    # entry after it was genuinely past the cut (john-the-dev, #2449).
+    #
+    # Line-oriented rather than one regex, because fence state and multi-line
+    # comment state both have to be tracked, and a regex cannot carry either.
+    out: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    in_comment = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if in_fence:
+            out.append(line)
+            if stripped.startswith(fence_marker):
+                in_fence = False
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        m = re.match(r"(```+|~~~+)", stripped)
+        if m:
+            in_fence, fence_marker = True, m.group(1)[:3]
+            out.append(line)
+            continue
+        if stripped.startswith("<!--"):
+            if "-->" not in line:
+                in_comment = True
+            continue                      # whole-line block comment: dropped
+        out.append(line)
+    return "".join(out)
 
 
 def _index_loaded_prefix(text: str) -> "tuple[str, int, int]":
@@ -146,6 +178,17 @@ def _index_loaded_prefix(text: str) -> "tuple[str, int, int]":
             break
         nbytes = len(line.encode("utf-8"))
         if total + nbytes > MEMORY_INDEX_LOAD_BYTES:
+            # The limit is a BYTE prefix, not a line count — the session reads
+            # the bytes up to the cut, so a line that STARTS inside the budget
+            # is partially read. Dropping it whole marked an entry whose
+            # filename sat comfortably before the cut as unreadable, failing an
+            # index that loads fine (qingyun-wu, #2449). Keep the bytes that fit.
+            room = MEMORY_INDEX_LOAD_BYTES - total
+            if room > 0:
+                # errors="ignore" so a cut through a multi-byte character
+                # yields the readable prefix instead of raising.
+                kept.append(line.encode("utf-8")[:room].decode("utf-8", errors="ignore"))
+                total += room
             break
         kept.append(line)
         total += nbytes
