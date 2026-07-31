@@ -255,6 +255,15 @@ class _StateLock:
     two threads/processes each opening their own fd contend correctly. Held
     across load→check→reserve and released BEFORE network I/O, so a slow/hung
     send never blocks another cron's reservation.
+
+    FAIL-CLOSED: acquisition failure PROPAGATES (OSError) — it is never silently
+    downgraded to running unlocked. A sidecar that can't be opened does NOT imply
+    the save will fail: the sidecar can be unopenable (e.g. a directory sits at
+    its path, or a filesystem fault) while the state file's parent stays writable,
+    so a "best-effort no-lock" would reserve+post WITHOUT exclusivity and restore
+    the exact duplicate-notification race this lock exists to prevent (#2346
+    review, john's directory-at-`.lock` repro). The caller must treat an
+    acquisition failure as "refuse to reserve/post", not "continue".
     """
 
     def __init__(self, lock_path):
@@ -264,21 +273,13 @@ class _StateLock:
     def __enter__(self):
         import fcntl
         import os
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)  # OSError → caller fails closed
         try:
-            self._fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-            fcntl.flock(self._fd, fcntl.LOCK_EX)
+            fcntl.flock(fd, fcntl.LOCK_EX)
         except OSError:
-            # Sidecar can't be created (state dir missing/unwritable). That SAME
-            # condition makes save_state_atomic() fail, so this path never posts
-            # and carries no duplicate-notification risk to guard — degrade to a
-            # best-effort no-lock instead of crashing, letting the caller reach
-            # its save-fails → exit-2 path unchanged.
-            if self._fd is not None:
-                try:
-                    os.close(self._fd)
-                except OSError:
-                    pass
-            self._fd = None
+            os.close(fd)
+            raise
+        self._fd = fd
         return self
 
     def __exit__(self, *exc):
@@ -363,25 +364,38 @@ def main(argv=None):
     # each other's stamp (#2346 review). The lock is released BEFORE network I/O
     # so a slow/hung send never blocks another cron's reservation.
     lock_path = state_file + ".lock"
-    with _StateLock(lock_path):
-        state = _load_state(state_file)
-        if not should_ping_now(state, args.cron, now, args.min_interval):
-            print(f"suppressed: rate-limited (last ping < {args.min_interval}s ago)")
-            return 3
-        # Reserve the cooldown BEFORE delivering. Persisting after a successful
-        # post means an unwritable state path returns "posted" with no cooldown
-        # recorded, and the next fire duplicates the notification. Reserving
-        # first inverts the failure: the worst case becomes one SUPPRESSED ping
-        # (visible, self-heals on the next fire) instead of an unbounded
-        # duplicate stream.
-        prior = state.get(args.cron) if isinstance(state, dict) else None
-        record_ping(state, args.cron, now)
-        if not save_state_atomic(state_file, state):
-            print(
-                "error: could not persist rate-limit state — refusing to post "
-                "(posting without a cooldown risks duplicate notifications)"
-            )
-            return 2
+    try:
+        with _StateLock(lock_path):
+            state = _load_state(state_file)
+            if not should_ping_now(state, args.cron, now, args.min_interval):
+                print(f"suppressed: rate-limited (last ping < {args.min_interval}s ago)")
+                return 3
+            # Reserve the cooldown BEFORE delivering. Persisting after a successful
+            # post means an unwritable state path returns "posted" with no cooldown
+            # recorded, and the next fire duplicates the notification. Reserving
+            # first inverts the failure: the worst case becomes one SUPPRESSED ping
+            # (visible, self-heals on the next fire) instead of an unbounded
+            # duplicate stream.
+            prior = state.get(args.cron) if isinstance(state, dict) else None
+            record_ping(state, args.cron, now)
+            if not save_state_atomic(state_file, state):
+                print(
+                    "error: could not persist rate-limit state — refusing to post "
+                    "(posting without a cooldown risks duplicate notifications)"
+                )
+                return 2
+    except OSError:
+        # FAIL CLOSED: the exclusive lock could not be acquired (unopenable
+        # sidecar — a directory at its path, a filesystem fault, a permission
+        # error). Do NOT post: without exclusivity, overlapping fires duplicate
+        # pings and clobber other crons' stamps — the exact race the lock guards
+        # (#2346). The only OSError that reaches here is from _StateLock.__enter__;
+        # _load_state and save_state_atomic swallow their own OSErrors.
+        print(
+            "error: could not acquire the exclusive cooldown lock — refusing to "
+            "post (posting without exclusivity risks duplicate notifications)"
+        )
+        return 2
 
     eid = _post_to_room(args.room, body)
     if not eid:
@@ -392,14 +406,20 @@ def main(argv=None):
         # posted after our cooldown elapsed, our stale rollback must not erase
         # that newer, valid reservation. Best-effort — a failed rollback write
         # keeps the reservation, which suppresses rather than duplicates.
-        with _StateLock(lock_path):
-            cur = _load_state(state_file)
-            if isinstance(cur, dict) and cur.get(args.cron) == now:
-                if prior is None:
-                    cur.pop(args.cron, None)
-                else:
-                    cur[args.cron] = prior
-                save_state_atomic(state_file, cur)
+        try:
+            with _StateLock(lock_path):
+                cur = _load_state(state_file)
+                if isinstance(cur, dict) and cur.get(args.cron) == now:
+                    if prior is None:
+                        cur.pop(args.cron, None)
+                    else:
+                        cur[args.cron] = prior
+                    save_state_atomic(state_file, cur)
+        except OSError:
+            # Can't acquire the lock to roll back — keep the reservation. That
+            # suppresses this cron's next fire (self-heals), never duplicates, so
+            # a lost rollback is the safe failure here (unlike the reserve path).
+            pass
         print("error: post failed (no gateway / send error)")
         return 2
 

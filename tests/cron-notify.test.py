@@ -257,6 +257,26 @@ def main() -> int:
         check("CONTROL: successful post records cooldown",
               json.loads(sf.read_text()).get("c") == 4242)
 
+    # ── #2346 review (FAIL-CLOSED): if the exclusive lock can't be acquired but
+    # the state file IS writable, we must REFUSE to post. Degrading to unlocked
+    # (the old best-effort) restores the duplicate-notification race — john's
+    # exact-head repro was a *directory* sitting at the `.lock` sidecar path,
+    # which makes os.open fail while save_state_atomic would still succeed.
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"          # parent writable → the save WOULD succeed
+        _os.mkdir(str(sf) + ".lock")      # a directory at the sidecar path → os.open fails
+        posted = []
+        with um.patch.object(cn, "_post_to_room",
+                             side_effect=lambda *a, **k: posted.append(a) or "$evt"):
+            rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                          "--room", "!r:x", "--state-file", str(sf), "--now", "10000"])
+        check("unlockable sidecar + writable state: REFUSES to post (fail-closed)",
+              posted == [], posted)
+        check("unlockable sidecar: exits non-zero", rc == 2, rc)
+        check("unlockable sidecar: no reservation written without exclusivity",
+              (not Path(sf).exists()) or json.loads(sf.read_text()) == {},
+              sf.read_text() if Path(sf).exists() else "(no file)")
+
     # ── #2346 review blocker (CONCURRENCY): load→check→reserve must be ONE
     # cross-process-exclusive transaction. john forced two same-cron processes to
     # both finish _load_state() before either reserved → both posted, defeating
