@@ -341,23 +341,40 @@ def _rooted_segments(tree: ast.Module) -> "dict[str, list[str]]":
     roots = _ccd_root_names(tree)
     consts = _literal_segment_names(tree)
     rooted: dict[str, list[str]] = {}
-    while True:
-        grew = False
+    # LAST WRITE WINS, in source order. The previous rule kept a binding unless
+    # the new segment list was strictly LONGER, so a same-length rebinding was
+    # silently ignored:
+    #     _cfg = <ccd>/"channels"/"discord"   ; _cfg.mkdir(parents=True)
+    #     _cfg = <ccd>/"channels"/"slack"     ; (_cfg/"access.json").write_text()
+    # kept `_cfg -> channels/discord` and classified the file CLEAN, while at
+    # runtime only the SLACK allowlist is written and the Discord canonical file
+    # is still absent — so importing the Discord bridge can fall back to the
+    # operator's real allowlist (qingyun-wu, #2429).
+    #
+    # Convergence is detected by comparing the WHOLE map across a pass rather
+    # than per-assignment. A per-assignment `grew` flag cannot work with
+    # last-write-wins: a name assigned twice would flip on every pass and spin
+    # forever. Snapshot-compare terminates as soon as a pass is a no-op, and the
+    # iteration cap is a backstop against a pathological oscillation.
+    for _ in range(64):
+        before = {k: list(v) for k, v in rooted.items()}
         for node in tree.body:
             if not isinstance(node, ast.Assign):
                 continue
             ok, segs = _expr_root_segments(node.value, roots, rooted, consts)
-            if not ok:
-                continue
             for target in node.targets:
                 if not isinstance(target, ast.Name):
                     continue
-                prev = rooted.get(target.id)
-                if prev is None or len(segs) > len(prev):
+                if ok:
                     rooted[target.id] = segs
-                    grew = True
-        if not grew:
+                else:
+                    # Rebound to something NOT rooted at the configured dir: the
+                    # name no longer names a canonical path, so drop it rather
+                    # than leave the stale rooted binding vouching for it.
+                    rooted.pop(target.id, None)
+        if rooted == before:
             return rooted
+    return rooted
 
 
 def _literal_segment_names(tree: ast.Module) -> "dict[str, list[str]]":

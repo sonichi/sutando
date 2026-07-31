@@ -840,6 +840,46 @@ check(
     "a Subscript target whose base is `os` is not a rebinding of the name `os`",
 )
 
+# --- round-18 (qingyun-wu, #2429): same-length rebinding ------------------
+# `_rooted_segments()` kept a binding unless the new segment list was strictly
+# LONGER, so rebinding a path variable to a same-length NON-canonical path was
+# ignored. The file below writes only the SLACK allowlist, yet imports the
+# Discord bridge — whose canonical access.json is absent, so it can still fall
+# back to the operator's real one.
+check(
+    "same-length rebind (discord -> slack) is NOT a discord seed",
+    lint.classify(write(tmpdir,
+        _ENV
+        + f'_cfg = {_CCD_P} / "channels" / "discord"\n'
+        '_cfg.mkdir(parents=True, exist_ok=True)\n'
+        + f'_cfg = {_CCD_P} / "channels" / "slack"\n'
+        '(_cfg / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) != lint.CLEAN,
+    "last write wins: _cfg names the SLACK path by the time access.json is written",
+)
+# Controls — last-write-wins must not degrade into "rebinding always dirties".
+check(
+    "control: a genuine single-binding discord seed is STILL clean",
+    lint.classify(write(tmpdir,
+        _ENV
+        + f'_cfg = {_CCD_P} / "channels" / "discord"\n'
+        '_cfg.mkdir(parents=True, exist_ok=True)\n'
+        '(_cfg / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "control: rebind slack -> discord, seeding discord LAST, is clean",
+    lint.classify(write(tmpdir,
+        _ENV
+        + f'_cfg = {_CCD_P} / "channels" / "slack"\n'
+        '_cfg.mkdir(parents=True, exist_ok=True)\n'
+        + f'_cfg = {_CCD_P} / "channels" / "discord"\n'
+        '_cfg.mkdir(parents=True, exist_ok=True)\n'
+        '(_cfg / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) == lint.CLEAN,
+    "order-sensitivity has to cut both ways or it is just a stricter gate",
+)
+
 # --- scan() ----------------------------------------------------------------
 scanned = lint.scan(["tests/lint-hermetic-bridge-tests.test.py"])
 check("scan(): skips out-of-scope files", scanned == {}, str(scanned))
