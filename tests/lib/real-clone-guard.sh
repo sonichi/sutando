@@ -14,8 +14,30 @@
 #
 # Compare BEFORE vs AFTER rather than asserting clean: the operator's clone may
 # legitimately be dirty already, and demanding cleanliness would fail on a real box.
+#
+# STATUS CODES ARE NOT CONTENT. `git status --porcelain` reports an already-modified
+# tracked file as " M path" both before and after the suite overwrites it, and an
+# existing untracked file as "?? path" either way — so a write that CLOBBERS the
+# operator's own uncommitted work leaves the status output byte-identical and the
+# guard green. Fingerprint the actual bytes too: the tracked diff against HEAD, plus
+# a hash per untracked file.
 
-# rcg_snapshot <dir> — record HEAD + porcelain status into RCG_* globals.
+# _rcg_content_digest <dir> — bytes-level fingerprint of the working tree's dirt.
+# Tracked modifications come from `git diff HEAD` (covers staged AND unstaged
+# content); untracked files are hashed individually, since no diff covers them.
+_rcg_content_digest() {
+  local dir="$1"
+  {
+    git -C "$dir" diff HEAD 2>/dev/null
+    git -C "$dir" ls-files --others --exclude-standard -z 2>/dev/null \
+      | while IFS= read -r -d "" f; do
+          printf '%s ' "$f"
+          shasum -a 256 "$dir/$f" 2>/dev/null | awk '{print $1}'
+        done
+  } | shasum -a 256 | awk '{print $1}'
+}
+
+# rcg_snapshot <dir> — record HEAD + porcelain status + content digest into RCG_* globals.
 rcg_snapshot() {
   local dir="$1"
   RCG_DIR="$dir"
@@ -27,6 +49,7 @@ rcg_snapshot() {
     # -uall so a file inside an untracked DIRECTORY is listed individually rather
     # than collapsed to the directory name (which would hide a second write).
     RCG_STATUS_BEFORE="$(git -C "$dir" status --porcelain -uall 2>/dev/null || echo '')"
+    RCG_CONTENT_BEFORE="$(_rcg_content_digest "$dir")"
     RCG_TAKEN=1
   fi
 }
@@ -34,10 +57,13 @@ rcg_snapshot() {
 # rcg_assert — print the harm and return 1 if the clone changed; 0 otherwise.
 rcg_assert() {
   [ -n "$RCG_TAKEN" ] || return 0
-  local after_head after_status
+  local after_head after_status after_content
   after_head="$(git -C "$RCG_DIR" rev-parse HEAD 2>/dev/null || echo '')"
   after_status="$(git -C "$RCG_DIR" status --porcelain -uall 2>/dev/null || echo '')"
-  if [ "$after_head" = "$RCG_HEAD_BEFORE" ] && [ "$after_status" = "$RCG_STATUS_BEFORE" ]; then
+  after_content="$(_rcg_content_digest "$RCG_DIR")"
+  if [ "$after_head" = "$RCG_HEAD_BEFORE" ] \
+     && [ "$after_status" = "$RCG_STATUS_BEFORE" ] \
+     && [ "$after_content" = "$RCG_CONTENT_BEFORE" ]; then
     return 0
   fi
   echo ""
@@ -52,6 +78,10 @@ rcg_assert() {
     echo "      index/worktree CHANGED. New or altered entries:"
     diff <(printf '%s\n' "$RCG_STATUS_BEFORE") <(printf '%s\n' "$after_status") \
       | sed -n 's/^> /        /p' | head -20
+  fi
+  if [ "$after_content" != "$RCG_CONTENT_BEFORE" ] && [ "$after_status" = "$RCG_STATUS_BEFORE" ]; then
+    echo "      status codes UNCHANGED but CONTENT changed — an already-dirty file"
+    echo "      was overwritten. This is the clobber case status alone cannot see."
   fi
   echo "      A test reached a real repo. FAILURE even if every check passed."
   return 1

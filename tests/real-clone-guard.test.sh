@@ -75,6 +75,50 @@ D="$(mktemp -d -t rcg-nogit.XXXXXX)"; rcg_snapshot "$D"; rcg_assert >/dev/null 2
 check "non-repo path is inert" 0 $?
 rm -rf "$D"
 
+# --- Review 2 (qingyun, #2440): status codes are not content -------------------
+# `git status --porcelain` prints " M path" for an already-modified tracked file
+# both before and after it is overwritten, and "?? path" for an existing untracked
+# file either way. So a write that CLOBBERS the operator's own uncommitted work left
+# the status output byte-identical and the guard returned success. These two cases
+# FAIL against a status-only guard and pass against the content-digest one.
+
+# 7. DISCRIMINATING: overwrite an ALREADY-MODIFIED tracked file (status unchanged)
+D="$(mkfixture)"
+echo "operator work" > "$D/seed.txt"          # dirty BEFORE the snapshot
+rcg_snapshot "$D"
+S_BEFORE="$(git -C "$D" status --porcelain -uall)"
+echo "clobbered by the suite" > "$D/seed.txt"  # same status code, different bytes
+S_AFTER="$(git -C "$D" status --porcelain -uall)"
+out="$(rcg_assert 2>&1)"; rc=$?
+check "overwriting an already-MODIFIED tracked file fails" 1 $rc
+[ "$S_BEFORE" = "$S_AFTER" ] \
+  && { echo "  ok  ...and porcelain status was IDENTICAL (status-only guard would pass)"; pass=$((pass+1)); } \
+  || { echo "  FAIL status changed — not a discriminating case"; fail=$((fail+1)); }
+case "$out" in *"CONTENT changed"*) echo "  ok  ...and the message names the clobber case"; pass=$((pass+1));;
+  *) echo "  FAIL clobber case not explained"; fail=$((fail+1));; esac
+rm -rf "$D"
+
+# 8. DISCRIMINATING: overwrite an EXISTING untracked file (status unchanged)
+D="$(mkfixture)"
+echo "operator scratch" > "$D/scratch.txt"     # untracked BEFORE the snapshot
+rcg_snapshot "$D"
+S_BEFORE="$(git -C "$D" status --porcelain -uall)"
+echo "clobbered" > "$D/scratch.txt"
+S_AFTER="$(git -C "$D" status --porcelain -uall)"
+rcg_assert >/dev/null 2>&1
+check "overwriting an existing UNTRACKED file fails" 1 $?
+[ "$S_BEFORE" = "$S_AFTER" ] \
+  && { echo "  ok  ...and porcelain status was IDENTICAL"; pass=$((pass+1)); } \
+  || { echo "  FAIL status changed"; fail=$((fail+1)); }
+rm -rf "$D"
+
+# 9. an untouched already-dirty clone is STILL not a false positive
+D="$(mkfixture)"
+echo "operator work" > "$D/seed.txt"; touch "$D/scratch.txt"
+rcg_snapshot "$D"; rcg_assert >/dev/null 2>&1
+check "already-dirty clone left alone is not a false positive" 0 $?
+rm -rf "$D"
+
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 [ "$fail" -eq 0 ] || exit 1
