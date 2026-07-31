@@ -18,11 +18,21 @@ about which root to use, and the leak hid it. Newly exposed is not newly
 introduced; the right repair is to align the fixtures with the production
 contract, not to restore the pollution.
 
-Use `seed_discord_token()` before exec-loading the bridge.
+Use `temp_config_root()` around the exec-load. It gives the fixture its OWN root,
+so nothing is ever written to the caller's config dir.
+
+⚠ Do NOT call `seed_discord_token()` against the ambient root. Seeding "the root the
+bridge reads" fixes WHICH root is used but not WHOSE: with a real `CLAUDE_CONFIG_DIR`
+set, the fixture then fabricates a Discord install in the caller's actual config dir
+and leaves a stub credential behind — the very production symptom this PR reports,
+relocated rather than removed (john-the-dev, #2357 review 2026-07-31T07:36).
 """
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 STUB_TOKEN = "DISCORD_BOT_TOKEN=test-stub-token\n"
@@ -51,3 +61,36 @@ def seed_discord_token(root: Path | None = None) -> Path:
         env_dir.mkdir(parents=True, exist_ok=True)
         env.write_text(STUB_TOKEN)
     return env
+
+
+@contextlib.contextmanager
+def temp_config_root():
+    """Point CLAUDE_CONFIG_DIR at a throwaway root, seed it, then PUT THE CALLER'S BACK.
+
+    Isolation, not just routing. `seed_discord_token()` alone writes under whatever
+    root is ambient, so a fixture run with a real `CLAUDE_CONFIG_DIR` leaves a stub
+    `channels/discord/.env` in the caller's config dir. health-check then reports a
+    Discord install that does not exist, with a fake token in it. Same host-leakage
+    class as #2204.
+
+    Two details are load-bearing:
+
+    * **Restore ABSENCE, not the empty string.** If the caller had no
+      CLAUDE_CONFIG_DIR, `os.environ["CLAUDE_CONFIG_DIR"] = ""` is not the same
+      state — `config_root()` treats "" as unset only because it calls `.strip()`,
+      and other readers may not. Pop the key instead.
+    * **try/finally, not a pair of assignments.** A failing assertion between the
+      two would otherwise leak both the env var and the temp dir.
+    """
+    prior = os.environ.get("CLAUDE_CONFIG_DIR")
+    tmp = tempfile.mkdtemp(prefix="dbenv-config-")
+    os.environ["CLAUDE_CONFIG_DIR"] = tmp
+    try:
+        seed_discord_token(Path(tmp))
+        yield Path(tmp)
+    finally:
+        if prior is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = prior
+        shutil.rmtree(tmp, ignore_errors=True)

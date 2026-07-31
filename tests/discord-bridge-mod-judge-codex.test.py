@@ -20,7 +20,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "tests" / "_helpers"))
-from discord_env import seed_discord_token  # noqa: E402
+from discord_env import temp_config_root  # noqa: E402
 
 # Stub minimal discord module
 _discord_stub = types.ModuleType("discord")
@@ -58,15 +58,18 @@ sys.modules["discord"] = _discord_stub
 
 def load_bridge():
     src = (REPO / "src" / "discord-bridge.py").read_text()
-    # Seed under the CONFIG ROOT the bridge actually reads ($CLAUDE_CONFIG_DIR,
-    # else ~/.claude). Hardcoding Path.home()/".claude" here was wrong whenever
-    # CLAUDE_CONFIG_DIR is set, and only passed because a sibling fixture leaked
-    # its temp config root into the process (#2357).
-    seed_discord_token()
-    spec = importlib.util.spec_from_loader("bridge", loader=None)
-    bridge = importlib.util.module_from_spec(spec)
-    bridge.__file__ = str(REPO / "src" / "discord-bridge.py")
-    exec(src, bridge.__dict__)
+    # Give this fixture its OWN config root. Seeding the AMBIENT root fixes which
+    # root the bridge reads but not WHOSE: with a real CLAUDE_CONFIG_DIR set, the
+    # fixture fabricates a Discord install in the caller's config dir and leaves a
+    # stub credential behind — the PR's own reported production symptom, relocated
+    # rather than removed (john-the-dev, #2357 review 2026-07-31T07:36).
+    # The bridge resolves its token at exec time, so the temp root only has to be
+    # live across the exec; the caller's environment is restored on the way out.
+    with temp_config_root():
+        spec = importlib.util.spec_from_loader("bridge", loader=None)
+        bridge = importlib.util.module_from_spec(spec)
+        bridge.__file__ = str(REPO / "src" / "discord-bridge.py")
+        exec(src, bridge.__dict__)
     return bridge
 
 

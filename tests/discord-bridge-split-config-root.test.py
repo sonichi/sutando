@@ -12,12 +12,16 @@ standalone run inherited a config root that happened to hold a token.
 wrong about the root, and the leak hid it. Newly exposed is not newly introduced.
 
 The reviewer's reproduction, as an actual test rather than a paragraph: run the
-four fixtures with FRESH, DISTINCT HOME and CLAUDE_CONFIG_DIR and require exit 0
-from each, then assert the token landed under the CONFIG ROOT and nowhere else.
+four fixtures with FRESH, DISTINCT HOME and CLAUDE_CONFIG_DIR, require exit 0 from
+each, then assert the caller's config root came back UNTOUCHED.
 
-Both halves matter. "All four exit 0" alone would pass if the fixtures stopped
-seeding entirely and the bridge stopped needing a token; asserting WHERE the file
-landed is what pins the contract.
+Both halves matter, and the second one changed in the second round of review.
+Exit 0 pins ROUTING — the bridge resolves its token via CLAUDE_CONFIG_DIR at import,
+so a fixture seeding the wrong root cannot load. The directory assertions pin
+ISOLATION. The first version of this test asserted the token landed under the
+caller's CONFIG ROOT, which pinned routing but mandated the pollution: a fixture
+run against a real config dir left a stub credential there, fabricating a Discord
+install on a machine that has none — the same symptom this PR exists to fix.
 
 Run: python3 tests/discord-bridge-split-config-root.test.py
 """
@@ -66,12 +70,24 @@ try:
         check(f"split-root: {name} exits 0", proc.returncode == 0,
               f"rc={proc.returncode} {detail}")
 
-    # WHERE the token landed is the actual contract. Without this, the block above
-    # would also pass if nothing seeded anything.
+    # ISOLATION is the contract, not routing. Each fixture builds its OWN throwaway
+    # config root, so after the sequence the caller's CLAUDE_CONFIG_DIR and HOME must
+    # be exactly as handed over: no fabricated Discord install, no stub credential.
+    #
+    # ⚠ The previous version of this block asserted the token landed IN `config`.
+    # That verified routing while REQUIRING the pollution — it is why the fixtures
+    # could pass with a stub left in the caller's real config dir (john-the-dev,
+    # #2357 review 2026-07-31T07:36). Routing is still pinned, by the exit-0 checks
+    # above: the bridge resolves its token through CLAUDE_CONFIG_DIR at import, so a
+    # fixture that seeded the wrong root would fail to load and exit non-zero.
     in_config = (config / "channels" / "discord" / ".env").exists()
     in_home = (home / ".claude" / "channels" / "discord" / ".env").exists()
-    check("token seeded under $CLAUDE_CONFIG_DIR (the root the bridge reads)", in_config)
-    check("token NOT seeded under HOME/.claude (the wrong root)", not in_home,
+    leftovers = sorted(x.name for x in config.iterdir())
+    check("caller's $CLAUDE_CONFIG_DIR has no fabricated Discord install",
+          not in_config, "a fixture seeded the caller's real config root")
+    check("caller's $CLAUDE_CONFIG_DIR left entirely unchanged (still empty)",
+          not leftovers, f"unexpected entries: {leftovers}")
+    check("caller's HOME/.claude left clean", not in_home,
           "a fixture is still hardcoding Path.home()/'.claude'")
 finally:
     shutil.rmtree(home, ignore_errors=True)
@@ -81,4 +97,4 @@ print()
 if failures:
     print(f"FAIL — {len(failures)} check(s): {failures}")
     sys.exit(1)
-print("PASS — the split-config-root sequence is green and seeds the correct root")
+print("PASS — split-config-root sequence is green and leaves the caller's config root untouched")
