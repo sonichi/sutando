@@ -45,6 +45,16 @@ check "coincidental /usr/local does not exempt"       flag  $'+++ b/skills/x/e.p
 check "mismatched companion basename does not exempt" flag  $'+++ b/skills/x/g.py\n@@ -1,0 +1,1 @@\n+A = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffprobe")'
 check "paired line still flags a real /Users/ leak"   flag  $'+++ b/skills/x/f.py\n@@ -1,0 +1,1 @@\n+A = ("/opt/homebrew/bin/x","/usr/local/bin/x"); L = "/Users/alice/s"'
 
+# Second occurrence of the SAME prefix (bassilkhilo-ag2, review of head c2802575).
+# Distinct from the /Users/ case directly above: that leak is a DIFFERENT flag, so
+# the outer per-prefix loop reaches it. Here both literals are '/opt/homebrew/', and
+# the scan used to inspect only the first — which pairs — and stop, so the naked
+# second token was never examined. Asserted at the wrapper level because the wrapper
+# owns the verdict (review-checks.py always returns 0; review-checks.sh exits 1 on
+# non-empty stdout), so this covers the exit code the CI gate actually reads.
+check "2nd same-prefix token, unpaired, still flagged" flag  $'+++ b/skills/x/h.ts\n@@ -1,0 +1,1 @@\n+const P = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/othertool"];'
+check "two independently paired lists both pass"       clean $'+++ b/skills/x/i.ts\n@@ -1,0 +1,1 @@\n+const A=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]; const B=["/opt/homebrew/bin/ffprobe","/usr/local/bin/ffprobe"];'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

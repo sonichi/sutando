@@ -209,15 +209,29 @@ def main():
             stripped = line.lstrip()
             if was_in_doc or stripped.startswith("#") or stripped.startswith("//"):
                 continue
+            # EVERY occurrence of each flag, not just the first. `paired_allowed`
+            # is a PARTIAL exemption, so once the first token on a line pairs
+            # successfully a first-occurrence-only scan stops looking — and a
+            # second, companion-less literal on the same line passes silently.
+            # Harmless before this PR (nothing ever exempted an /opt/ token, so
+            # the first occurrence always flagged); a real hole once partial
+            # exemptions exist.
+            reported = False
             for p in flags:
-                pos = line.find(p)
-                if pos < 0:
-                    continue
-                tok = token_at(line, pos)
-                if not allowed(tok) and not paired_allowed(tok, line):
-                    print("%s:%d: hardcoded path (%s): %s" % (cur_file, cur, tok, stripped))
-                    hits += 1
-                    break
+                start = 0
+                while True:
+                    pos = line.find(p, start)
+                    if pos < 0:
+                        break
+                    tok = token_at(line, pos)
+                    if not allowed(tok) and not paired_allowed(tok, line):
+                        print("%s:%d: hardcoded path (%s): %s" % (cur_file, cur, tok, stripped))
+                        hits += 1
+                        reported = True
+                        break
+                    start = pos + len(p)   # advance past this occurrence
+                if reported:
+                    break                  # one violation per line is enough
     return 0
 
 

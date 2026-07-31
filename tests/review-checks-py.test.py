@@ -274,6 +274,55 @@ try:
 finally:
     rc.flags.remove("/opt/")
 
+# ---------------------------------------------------------------------------
+# Same-line MULTIPLE occurrences (bassilkhilo-ag2, review of head c2802575).
+#
+# main() scanned only `line.find(p)` — the FIRST occurrence of each flag. That was
+# harmless before this PR, because no allow entry ever matched an `/opt/` token, so
+# the first occurrence always flagged. This PR adds the first PARTIAL exemption
+# (`paired_allowed`), and a first-occurrence-only scan then stops looking once the
+# leading token pairs — letting a second, companion-less literal through silently.
+#
+# Assertions read STDOUT, not main()'s return: main() is a REPORTER and returns 0
+# unconditionally (scripts/review-checks.py:235, pre-dates this PR). The verdict is
+# the wrapper's — review-checks.sh captures stdout and exits 1 when non-empty. The
+# exit-code half of this regression is covered in tests/review-checks.test.sh.
+#
+# This group appends AFTER the previous block's `rc.flags.remove("/opt/")`, so it
+# must re-own the flag; inheriting it would silently disarm every case here.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    _multi = ('+++ b/src/multi.ts\n@@ -1,0 +1,1 @@\n'
+              '+const P = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", '
+              '"/opt/homebrew/bin/othertool"];')
+    _code, _out = scan(_multi)
+    # Match the TOKEN FIELD, not the whole report: the format is
+    # "<file>:<line>: hardcoded path (<token>): <source line>" — the echoed source
+    # line contains every literal on it, so a bare substring test would pass no
+    # matter which token was blamed.
+    ok("main(): a 2nd, companion-less /opt/ literal on a paired line is reported",
+       "hardcoded path (/opt/homebrew/bin/othertool)" in _out)
+    ok("main(): ...and the PAIRED token on that same line is not the one blamed",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" not in _out)
+
+    # Controls — the exemption must still exempt, or the fix is just "flag everything".
+    _code, _out = scan('+++ b/src/ok.ts\n@@ -1,0 +1,1 @@\n'
+                       '+const F = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"];')
+    ok("main(): a legitimately paired candidate list still passes", _out.strip() == "")
+
+    _code, _out = scan('+++ b/src/two.ts\n@@ -1,0 +1,1 @@\n'
+                       '+const A = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]; '
+                       'const B = ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"];')
+    ok("main(): TWO independently paired lists on one line both pass", _out.strip() == "")
+
+    _code, _out = scan('+++ b/src/solo.ts\n@@ -1,0 +1,1 @@\n'
+                       '+const X = "/opt/homebrew/bin/othertool";')
+    ok("main(): the same naked token alone on a line still reports",
+       "/opt/homebrew/bin/othertool" in _out)
+finally:
+    rc.flags.remove("/opt/")
+
 print("---")
 if failed:
     print("FAILED — %d of %d" % (failed, passed + failed))
