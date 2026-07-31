@@ -135,10 +135,14 @@ def _is_candidate_container(code, i):
     if ch == "{":
         return False
     if ch == "[":
-        return not (prev_ch in ")]" or prev_word != "")
+        # `prev_ch and ...` is load-bearing: `"" in ")]"` is TRUE in Python, so
+        # an unguarded test made a bracket at COLUMN 0 look like a call on a
+        # returned value. A candidate list starting a line was then falsely
+        # flagged — found by chasing the last uncovered branch, not by a repro.
+        return not ((prev_ch and prev_ch in ")]") or prev_word != "")
     if ch != "(":
         return False
-    if prev_ch in ")]":
+    if prev_ch and prev_ch in ")]":
         return False                      # call on a returned value
     if prev_word:
         return prev_word in _SEQUENCE_KEYWORDS

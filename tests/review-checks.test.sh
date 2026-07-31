@@ -79,6 +79,10 @@ check "control: grouping paren after a keyword passes"  clean $'+++ b/skills/x/c
 check "keyword grouping does not exempt"                flag  $'+++ b/skills/x/r1.ts\n@@ -1,0 +1,1 @@\n+if (cmd === "/opt/homebrew/bin/ffmpeg" || alt === "/usr/local/bin/ffmpeg") run(cmd);'
 check "object literal does not exempt"                  flag  $'+++ b/skills/x/r2.ts\n@@ -1,0 +1,1 @@\n+const cfg = { command: "/opt/homebrew/bin/ffmpeg", fallbackHint: "/usr/local/bin/ffmpeg" };'
 
+# `"" in ")]"` is True in Python, so an unguarded prev-char test made a bracket at
+# COLUMN 0 read as a call on a returned value and falsely flagged a valid list.
+check "candidate list at column 0 still passes"         clean $'+++ b/skills/x/col0.ts\n@@ -1,0 +1,1 @@\n+["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

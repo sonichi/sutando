@@ -496,6 +496,32 @@ try:
 finally:
     rc.flags.remove("/opt/")
 
+# ---------------------------------------------------------------------------
+# Branch coverage for the container predicate. The diff-coverage gate flagged
+# these ten lines; each is a real branch the behavioural cases never reach
+# because they all take an earlier return. Asserted directly at the predicate so
+# a future edit to any arm fails here rather than silently.
+# ---------------------------------------------------------------------------
+ok("_code_part: a backslash escape inside a string does not end the string",
+   rc._code_part('x = "a\\"# still in string"; y = 1') == 'x = "a\\"# still in string"; y = 1')
+ok("_prev_word: nothing before the position -> empty char and word",
+   rc._prev_word("(a)", 0) == ("", ""))
+ok("_is_candidate_container: a non-bracket character is never a container",
+   not rc._is_candidate_container("x = 1", 0))
+ok("_siblings_only: a NESTED group is blanked, siblings survive",
+   rc._siblings_only('(a, [b], c)', 0, 10) == 'a,    , c')   # nested [b] -> 3 blanks
+ok("paired: a position past the code part (inside a comment) is not exempt",
+   not rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                         'x = 1  # ["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]',
+                         30))
+ok("_is_candidate_container: a list at COLUMN 0 is still a container",
+   rc._is_candidate_container('["/a","/b"]', 0))
+ok("_is_candidate_container: a paren at COLUMN 0 is still a tuple",
+   rc._is_candidate_container('("/a","/b")', 0))
+ok("paired: a token under NO configured paired prefix falls through the loop",
+   not rc.paired_allowed("/Users/alice/ffmpeg",
+                         '["/Users/alice/ffmpeg", "/usr/local/bin/ffmpeg"]', 2))
+
 print("---")
 if failed:
     print("FAILED — %d of %d" % (failed, passed + failed))
