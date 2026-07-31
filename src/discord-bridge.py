@@ -88,6 +88,7 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from core_restart_intent import parse_restart_command, write_intent  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 
@@ -2568,6 +2569,36 @@ def select_rulebook_key(access_tier, is_collaborator):
     return "team-collaborator" if is_collaborator else access_tier
 
 
+async def _handle_restart_command(message, text, access_tier, username, workspace) -> bool:
+    """Owner easy-restart command (sonichi#2401): "restart core" / "stop core"
+    is handled by the BRIDGE, not the core — the whole point is that it works
+    while the core is dead. Writes the intent file for the GUI-session
+    executor (Sutando.app poller) and acks in-channel; no task file. Returns
+    True when the message was a restart command (caller stops processing).
+    Owner tier only — never team/other — and parse is exact-match so prose
+    that merely mentions restarting can't trigger it."""
+    if not text or access_tier != "owner":
+        return False
+    action = parse_restart_command(text)
+    if not action:
+        return False
+    try:
+        write_intent(workspace, action, "discord")
+        ack = ("Restart requested — the app will relaunch the core in a few "
+               "seconds (authenticated, GUI session). I'll be back once it's up."
+               if action == "restart" else
+               "Stop requested — the app will stop the core in a few seconds. "
+               "It stays stopped until you say `restart core`.")
+    except Exception as exc:
+        ack = f"Couldn't write the {action} request ({type(exc).__name__}) — not queued."
+    print(f"  [core-restart] owner {action} command from @{username}", flush=True)
+    try:
+        await message.channel.send(ack)
+    except Exception as send_exc:
+        print(f"  [core-restart] ack send failed: {send_exc}", flush=True)
+    return True
+
+
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
         return
@@ -3250,6 +3281,10 @@ async def _handle_discord_message(message, force=False):
     # always processed locally regardless of this setting.
     if access_tier != "owner" and TEAM_TIER_OWNER and LOCAL_MACHINE != TEAM_TIER_OWNER:
         print(f"  [tier-ownership] dropping {access_tier}-tier task from @{username} — owner is {TEAM_TIER_OWNER}, this node is {LOCAL_MACHINE or 'unknown'}")
+        return
+
+    # Owner easy-restart command (sonichi#2401) — see _handle_restart_command.
+    if await _handle_restart_command(message, text, access_tier, username, str(REPO)):
         return
 
     # Write as task
@@ -4352,6 +4387,36 @@ async def poll_results():
 _progress_msgs: dict = {}
 
 
+def _newest_alive_mtime():
+    """Newest per-host core heartbeat mtime (state/cores/*.alive), or None
+    when no heartbeat file exists (graceful shutdown unlinks it)."""
+    try:
+        return max((p.stat().st_mtime for p in (STATE_DIR / "cores").glob("*.alive")),
+                   default=None)
+    except Exception:
+        return None
+
+
+def _queued_task_count():
+    """Live (unarchived) task files waiting in tasks/."""
+    try:
+        return sum(1 for _ in TASKS_DIR.glob("task-*.txt"))
+    except Exception:
+        return 0
+
+
+def _render_progress_content(now, elapsed):
+    """Placeholder body for poll_progress: the live core step normally, or the
+    honest outage copy (frozen status + stale heartbeat + queue depth) when the
+    core looks dead (sonichi#2398 — the 2026-07-30 'restart in flight (1625s)'
+    class: never narrate progress the core is not making)."""
+    status = progress_stream.read_core_status(STATE_DIR)
+    if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):
+        return progress_stream.format_outage(
+            progress_stream.status_age_s(status, now), _queued_task_count())
+    return progress_stream.format_progress(progress_stream.current_step(status), elapsed)
+
+
 async def poll_progress():
     """Hermes-style streaming tool output (2026-06-05).
 
@@ -4409,12 +4474,9 @@ async def poll_progress():
                         _progress_msgs[task_id] = {"expired": True}  # terminal
                         continue
                     if progress_stream.should_edit(now, info["last_edit"]):
-                        step = progress_stream.current_step(
-                            progress_stream.read_core_status(STATE_DIR)
-                        )
                         try:
                             await info["msg"].edit(
-                                content=progress_stream.format_progress(step, elapsed)
+                                content=_render_progress_content(now, elapsed)
                             )
                             info["last_edit"] = now
                         except Exception:
@@ -4442,12 +4504,9 @@ async def poll_progress():
                     created = now
                 elapsed = now - created
                 if progress_stream.should_post_placeholder(elapsed):
-                    step = progress_stream.current_step(
-                        progress_stream.read_core_status(STATE_DIR)
-                    )
                     try:
                         msg = await channel.send(
-                            progress_stream.format_progress(step, elapsed)
+                            _render_progress_content(now, elapsed)
                         )
                         _progress_msgs[task_id] = {
                             "msg": msg,
