@@ -224,23 +224,6 @@ def _is_isolated_value(node, isolated_names: "set[str]") -> bool:
     return False
 
 
-def _isolated_names(tree: ast.Module) -> "set[str]":
-    """Module-level names bound to a temp-dir source, to a fixpoint."""
-    names: set[str] = set()
-    while True:
-        grew = False
-        for node in tree.body:
-            if not isinstance(node, ast.Assign):
-                continue
-            if not _is_isolated_value(node.value, names):
-                continue
-            for t in node.targets:
-                if isinstance(t, ast.Name) and t.id not in names:
-                    names.add(t.id); grew = True
-        if not grew:
-            return names
-
-
 def _isolation_line(tree: ast.Module) -> int | None:
     """Earliest MODULE-LEVEL `os.environ["CLAUDE_CONFIG_DIR"] = ...`, else None.
 
