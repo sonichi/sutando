@@ -13,8 +13,17 @@
       "properties": {
         "runtime": {
           "type": "string",
-          "enum": ["claude", "codex"],
+          "enum": [
+            "claude",
+            "codex"
+          ],
           "default": "claude"
+        },
+        "expected_branch": {
+          "type": "string",
+          "minLength": 1,
+          "default": "main",
+          "description": "Branch the live checkout is expected to be on; health-check's live-checkout-branch probe warns on drift. Set on hosts intentionally pinned to a non-main branch (e.g. dual-run pinned nodes). SUTANDO_EXPECTED_BRANCH env var overrides per-invocation."
         }
       }
     },
@@ -33,14 +42,14 @@
     "claude_sutando_config_dir": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Where the Sutando-scoped Claude Code config lives — set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
+      "description": "Where the Sutando-scoped Claude Code config lives \u2014 set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
       "properties": {
         "subdir": {
           "type": "string",
           "minLength": 1,
           "default": ".claude-sutando",
           "pattern": "^(?!.*\\.\\.)(?!/)[^/].*$",
-          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace — absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
+          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace \u2014 absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
         }
       }
     },
@@ -50,12 +59,32 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "type", "env_name", "value"],
+        "required": [
+          "id",
+          "type",
+          "env_name",
+          "value"
+        ],
         "properties": {
-          "id": { "type": "string", "minLength": 1 },
-          "type": { "type": "string", "enum": ["claude", "codex"] },
-          "env_name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-          "synced": { "type": "boolean", "default": true },
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "codex"
+            ]
+          },
+          "env_name": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "synced": {
+            "type": "boolean",
+            "default": true
+          },
           "value": {
             "type": "string",
             "minLength": 1,
@@ -81,16 +110,22 @@
         "sync": {
           "type": "object",
           "additionalProperties": false,
-          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) — overriding in .local.json wipes the defaults for that array.",
+          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) \u2014 overriding in .local.json wipes the defaults for that array.",
           "properties": {
             "include": {
               "type": "array",
-              "items": { "type": "string", "minLength": 1 },
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
               "description": "Workspace-relative paths to sync. Trailing slash convention indicates a directory."
             },
             "exclude": {
               "type": "array",
-              "items": { "type": "string", "minLength": 1 },
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
               "description": "Workspace-relative paths to skip during sync. Glob patterns supported (e.g. '*.heartbeat')."
             }
           }

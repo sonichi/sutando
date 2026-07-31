@@ -1064,6 +1064,65 @@ def check_per_host_config_backup() -> dict:
     return {"name": name, "status": "ok", "detail": f"{checked} channel access.json backup(s) current"}
 
 
+def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
+    """Warn when the live checkout has drifted off its expected branch.
+
+    Bridges and the core boot from this checkout, and Sutando.app's 30-min
+    health check auto-restarts bridges onto whatever is checked out HERE.
+    Observed 2026-07-29: a Jul-25 session checked out a PR branch on the live
+    checkout to author a PR and never switched back — for 4 days every bridge
+    auto-restart booted 4-day-stale feature-branch code (75 commits behind
+    main), and nothing surfaced it. This probe makes that drift a first-class,
+    glanceable signal (structural, not disciplinary — "remember to switch
+    back" doesn't survive session death).
+
+    Expected branch defaults to ``main``; nodes intentionally pinned elsewhere
+    (e.g. the dual-run pinned hosts) declare it durably in
+    ``sutando.config.local.json`` as ``{"core": {"expected_branch": "..."}}``
+    — read via the canonical loader so launchd/Sutando.app callers (which
+    never inherit an interactive shell's exports) honor the pin across
+    restarts. ``SUTANDO_EXPECTED_BRANCH`` remains as a per-invocation env
+    override (wins over config; useful for tests/one-offs).
+    Read-only; warn (never fail) — an intentional short-lived checkout should
+    nag, not page. Degrades to ok when git/branch state can't be read (CI
+    tarballs, detached tooling contexts) rather than false-alarming.
+    """
+    name = "live-checkout-branch"
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    expected = os.environ.get("SUTANDO_EXPECTED_BRANCH")
+    if not expected:
+        try:
+            from sutando_config import load_config  # noqa: PLC0415
+            expected = (load_config(repo_root=repo).get("core") or {}).get("expected_branch")
+        except Exception:
+            expected = None  # config unreadable — fall through to the default
+    expected = expected or "main"
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--show-current"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"name": name, "status": "ok", "detail": "git not runnable — skipping"}
+    if out.returncode != 0:
+        return {"name": name, "status": "ok", "detail": "not a git checkout — skipping"}
+    branch = out.stdout.strip()
+    if not branch:
+        # Detached HEAD: can't name a branch; still drift, still worth a nag.
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on a detached HEAD (expected {expected!r}) — "
+                          "bridges auto-restart onto whatever is checked out here; "
+                          f"switch back (git -C {repo} switch {expected})"}
+    if branch != expected:
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on branch {branch!r}, expected {expected!r} — "
+                          "bridges/core auto-restart onto this checkout, so a leftover "
+                          "PR-branch checkout ships stale/unreviewed code (2026-07-29 "
+                          "incident: 4 days on a Jul-25 PR branch). Author PRs in "
+                          f"worktrees; switch back (git -C {repo} switch {expected})"}
+    return {"name": name, "status": "ok", "detail": f"live checkout on {expected!r}"}
+
+
 def check_migrate_reader_contract() -> dict:
     """Verify migration CLASS_RULES are compatible with reader resolution chains (issue #1543).
 
@@ -3298,6 +3357,8 @@ def run_all_checks() -> list[dict]:
     checks.append(check_host_subtrees())
     # Per-host channel access.json backup drift (live vs vault-carried copy)
     checks.append(check_per_host_config_backup())
+    # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
+    checks.append(check_live_checkout_branch())
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
