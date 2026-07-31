@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Tests for session-recap extract.py --tail-bytes (boot-cost bound) — hermetic.
 
-A synthetic transcripts dir (via $SUTANDO_TRANSCRIPTS_DIR) stands in for the
-real project dir, so no live workspace or 58 MB transcript is needed. Pinned
-behaviors:
+A synthetic transcripts dir (via the --transcripts-dir CLI hook — the
+supported override surface; no env var) stands in for the real project dir,
+so no live workspace or 58 MB transcript is needed. Pinned behaviors:
   1. --tail-bytes 0 (default) reads the whole file — unchanged behavior
   2. --tail-bytes N smaller than the file reads only the tail: the dump
      KEEPS the newest events (a catchup's open loops live at the END),
@@ -11,8 +11,10 @@ behaviors:
   3. the seek lands mid-line and the partial first line is discarded, not
      emitted as a corrupt event
   4. --tail-bytes larger than the file behaves exactly like 0 (no marker)
-  5. $SUTANDO_TRANSCRIPTS_DIR override is honored (what makes this test —
-     and A/B timing runs from worktrees — possible at all)
+  5. --transcripts-dir override is honored (what makes this test — and A/B
+     timing runs from worktrees — possible at all)
+  6. a seek landing EXACTLY on a record boundary keeps that complete
+     record — the partial-line discard must not eat it (#2454 review)
 
 Run: python3 tests/session-recap-extract-tail.test.py   (exit 0 pass / 1 fail)
 """
@@ -63,14 +65,12 @@ cur = tmp / "bbbb-cur.jsonl"
 cur.write_text(event(0, "2026-07-31T09:00:00Z") + "\n")
 os.utime(cur, (now, now))
 
-os.environ["SUTANDO_TRANSCRIPTS_DIR"] = str(tmp)
-
-
 def run(*extra: str) -> str:
     # In-process (importlib + argv patch, the repo's coverage-visible pattern):
     # subprocess invocations are invisible to the diff-coverage gate.
     argv, out = ["extract.py", "dump", "--session", "last",
-                 "--filter", "user", "--max-chars", "0", *extra], io.StringIO()
+                 "--filter", "user", "--max-chars", "0",
+                 "--transcripts-dir", str(tmp), *extra], io.StringIO()
     old_argv = sys.argv
     sys.argv = argv
     try:
@@ -104,6 +104,31 @@ check("tail: shared suffix identical to unbounded dump",
 # 4. bound larger than the file = whole file, no marker
 big = run("--tail-bytes", str(size * 10))
 check("oversized bound: identical to default", big == full)
+
+# 6. exact-boundary seek: every record is the same length L (fixed-width
+# fields), so tail_bytes = k*(L+1) puts the seek exactly at the start of
+# record 400-k — the byte before it is the previous record's newline. The
+# discard must NOT eat that complete record: expect exactly k records,
+# starting at 400-k. (An unconditional readline() yields k-1, starting at
+# 400-k+1 — the off-by-one-record loss the reviewer's boundary probe found.)
+line_len = len(event(0, "2026-07-30T10:00:00Z")) + 1  # +1 = newline
+k = 10
+at_boundary = run("--tail-bytes", str(k * line_len))
+boundary_events = [ln for ln in at_boundary.splitlines() if "USER:" in ln]
+check("boundary seek: complete record at the seek point is kept",
+      f"message number {400 - k:04d}" in at_boundary, at_boundary[:200])
+check("boundary seek: exactly k records survive",
+      len(boundary_events) == k, f"got {len(boundary_events)}")
+
+# ...and the mid-line case still discards the partial: 3 bytes past the
+# boundary lands inside record 400-k, which must be dropped as partial.
+mid_line = run("--tail-bytes", str(k * line_len - 3))
+mid_events = [ln for ln in mid_line.splitlines() if "USER:" in ln]
+check("mid-line seek: partial record dropped, k-1 complete records remain",
+      len(mid_events) == k - 1
+      and f"message number {400 - k:04d}" not in mid_line
+      and f"message number {400 - k + 1:04d}" in mid_line,
+      f"got {len(mid_events)}")
 
 print()
 if failures:

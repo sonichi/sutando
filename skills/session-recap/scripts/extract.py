@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -25,9 +24,6 @@ REPO = SCRIPT_PARENT.parents[2]
 
 
 def transcripts_dir() -> Path:
-    override = os.environ.get("SUTANDO_TRANSCRIPTS_DIR")
-    if override:
-        return Path(override)
     ws = subprocess.run(
         ["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
         capture_output=True, text=True, check=True).stdout.strip()
@@ -137,9 +133,16 @@ def main() -> None:
                          "boot cost stops scaling with session length. The "
                          "tail keeps the RECENT end — which is what a catchup "
                          "needs (open loops live at the end, not the start).")
+    ap.add_argument("--transcripts-dir", default=None,
+                    help="read transcripts from this directory instead of the "
+                         "resolved workspace project dir. Hook for hermetic "
+                         "tests and worktree A/B runs — the supported "
+                         "override surface (no env var).")
     args = ap.parse_args()
 
-    sessions = sorted(transcripts_dir().glob("*.jsonl"),
+    tdir = (Path(args.transcripts_dir) if args.transcripts_dir
+            else transcripts_dir())
+    sessions = sorted(tdir.glob("*.jsonl"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
     if not sessions:
         sys.exit("no transcripts found")
@@ -157,8 +160,16 @@ def main() -> None:
         if args.tail_bytes:
             size = path.stat().st_size
             if size > args.tail_bytes:
-                f.seek(size - args.tail_bytes)
-                f.readline()  # discard the partial line the seek landed in
+                pos = size - args.tail_bytes
+                f.seek(pos)
+                # Discard the partial line the seek landed in — but only if
+                # it IS partial. When pos lands exactly on a record boundary
+                # (the previous byte is a newline), an unconditional
+                # readline() would silently drop one COMPLETE record.
+                with open(path, "rb") as bf:
+                    bf.seek(pos - 1)
+                    if bf.read(1) != b"\n":
+                        f.readline()
                 out.append(f"...[tail: last {args.tail_bytes} bytes of "
                            f"{size} — re-run with --tail-bytes 0 for the "
                            "full session]")
