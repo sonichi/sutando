@@ -103,6 +103,14 @@ def _code_part(s):
 # two same-basename strings inside one are not a fallback chain.
 _SEQUENCE_KEYWORDS = frozenset(("in",))
 
+# Words that may legitimately sit before an ARRAY LITERAL. Anything else that
+# looks like an identifier is a variable being subscripted.
+_LITERAL_PRECEDING_KEYWORDS = frozenset((
+    "return", "yield", "and", "or", "not", "in", "is", "if", "else", "elif",
+    "while", "await", "lambda", "del", "assert", "case", "match", "for",
+    "typeof", "instanceof", "of", "new", "void", "delete",
+))
+
 
 def _prev_word(code, i):
     """(char, word) immediately before `code[i]`, skipping spaces/tabs."""
@@ -145,14 +153,30 @@ def _is_candidate_container(code, i, path=None):
     if ch == "{":
         return False
     if ch == "[":
-        # Adjacency only — no whitespace skipping.
-        # `prev and ...` is load-bearing: `"" in "_)]"` is TRUE in Python, so an
-        # unguarded test makes a `[` at COLUMN 0 read as an index. This is the
-        # SAME empty-string membership trap already fixed once in this file for
-        # `prev_ch in ")]"` — reintroduced here by a later edit and caught only by
-        # the committed column-0 control.
-        prev = code[i - 1] if i > 0 else ""
-        return not (prev and (prev.isalnum() or prev in "_)]"))
+        # An INDEX vs an ARRAY LITERAL is decided by what PRECEDES the bracket,
+        # and adjacency alone cannot tell them apart: both languages allow
+        # whitespace before an index (`paths ["k"]`) and JS has optional element
+        # access (`paths?.["k"]`). Conversely `return [...]`, `yield [...]` and
+        # `cond and [...]` are literals despite a preceding word.
+        #
+        # The real discriminator is KEYWORD vs IDENTIFIER:
+        #   ?.  )  ]  or an identifier  -> a subscript on an expression
+        #   a keyword, an operator, or start-of-line -> a literal
+        k = i - 1
+        while k >= 0 and code[k] in " \t":
+            k -= 1
+        if k < 0:
+            return True                       # start of line -> literal
+        if code[k] == "." and k >= 1 and code[k - 1] == "?":
+            return False                      # optional element access
+        if code[k] in ")]":
+            return False                      # subscript on an expression
+        if code[k].isalnum() or code[k] == "_":
+            m = k
+            while m >= 0 and (code[m].isalnum() or code[m] == "_"):
+                m -= 1
+            return code[m + 1:k + 1] in _LITERAL_PRECEDING_KEYWORDS
+        return True                           # operator / comma / `=` -> literal
     if ch != "(":
         return False
     prev_ch, prev_word = _prev_word(code, i)

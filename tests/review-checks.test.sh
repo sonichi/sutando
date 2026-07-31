@@ -86,6 +86,10 @@ check "cond and [list] likewise"                        clean $'+++ b/skills/x/r
 check "JS comma-operator paren does not exempt"         flag  $'+++ b/skills/x/r63.ts\n@@ -1,0 +1,1 @@\n+const cmd = ("/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg");'
 check "python tuple of the same shape still passes"     clean $'+++ b/skills/x/r64.py\n@@ -1,0 +1,1 @@\n+cmd = ("/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg")'
 
+# Round 7: whitespace indexing and optional element access are lookups, not literals.
+check "whitespace before [ is still an index"           flag  $'+++ b/skills/x/r71.ts\n@@ -1,0 +1,1 @@\n+const cmd = paths ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"];'
+check "optional element access ?.[ is an index"         flag  $'+++ b/skills/x/r72.ts\n@@ -1,0 +1,1 @@\n+const cmd = paths?.["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"];'
+
 # `"" in ")]"` is True in Python, so an unguarded prev-char test made a bracket at
 # COLUMN 0 read as a call on a returned value and falsely flagged a valid list.
 check "candidate list at column 0 still passes"         clean $'+++ b/skills/x/col0.ts\n@@ -1,0 +1,1 @@\n+["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'

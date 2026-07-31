@@ -545,6 +545,30 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 7 (qingyun-wu, review of 7b94efc). Adjacency alone cannot separate an
+# INDEX from an ARRAY LITERAL: both languages allow whitespace before a
+# subscript, and JS has optional element access. The discriminator is KEYWORD vs
+# IDENTIFIER — `return [...]` is a literal, `paths [...]` is a lookup.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    def _t7(src): return scan('+++ b/src/r7.ts\n@@ -1,0 +1,1 @@\n+' + src)[1]
+    P = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    ok("main(): whitespace before an index is still an index",
+       "hardcoded path" in _t7("const cmd = paths " + P + ";"))
+    ok("main(): optional element access `?.[` is an index",
+       "hardcoded path" in _t7("const cmd = paths?." + P + ";"))
+    ok("main(): `return [list]` remains a literal", _t7("return " + P).strip() == "")
+    ok("container: identifier + space before [ -> index",
+       not rc._is_candidate_container('paths ["/a","/b"]', 6))
+    ok("container: `?.[` -> index",
+       not rc._is_candidate_container('paths?.["/a","/b"]', 7))
+    ok("container: keyword + space before [ -> literal",
+       rc._is_candidate_container('return ["/a","/b"]', 7))
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so
