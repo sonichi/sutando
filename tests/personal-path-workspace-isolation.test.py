@@ -16,6 +16,7 @@ ignored when an explicit workspace is passed. The read probe is the migration
 fallback and is still load-bearing — removing it would strand readers on files
 that exist right now. See the PR body for that boundary.
 """
+import os
 import pathlib
 import subprocess
 import sys
@@ -23,7 +24,7 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-from util_paths import personal_path, _host_label  # noqa: E402
+from util_paths import personal_path, _host_label, _private_machine_dir  # noqa: E402
 
 failures = []
 
@@ -36,6 +37,28 @@ def check(label, cond, detail=""):
 
 ws = pathlib.Path(tempfile.mkdtemp(prefix="pp-iso-"))
 host = _host_label()
+
+# THE TEST MUST CONTROL THE CONDITION IT IS TESTING.
+# The escape only exists when a private memory dir is configured — that is the
+# branch that answered from the environment instead of from `ws`. The first
+# version inherited SUTANDO_MEMORY_DIR from the ambient environment: set on this
+# fleet, UNSET in CI. So in CI the branch was never entered, every check below
+# passed against the UNFIXED code, and the suite silently stopped protecting
+# anything. Verified, not assumed: with the fix reverted and the var unset, the
+# original suite reported PASS.
+#
+# So point it at a temp dir OUTSIDE `ws` — that is precisely the shape that used
+# to escape — and refuse to run if the precondition did not take.
+priv = pathlib.Path(tempfile.mkdtemp(prefix="pp-priv-"))
+os.environ["SUTANDO_MEMORY_DIR"] = str(priv)
+os.environ.pop("SUTANDO_PRIVATE_DIR", None)
+
+_pmd = _private_machine_dir()
+if _pmd is None or str(_pmd).startswith(str(ws)):
+    print("  FAIL PRECONDITION: no private dir outside the workspace — every check "
+          "below would pass against the unfixed code, so the suite proves nothing.")
+    sys.exit(1)
+print(f"  precondition ok: private dir is {_pmd}, outside the workspace")
 
 # --- the bug: a file that does not exist anywhere -------------------------
 for name in ("brand-new-file.md", "pending-questions-unique-xyz.md", "stand-identity.json"):
@@ -80,30 +103,36 @@ check(
     pathlib.Path(personal_path("stand-avatar.png", ws)) == assets / "stand-avatar.png",
 )
 
-# --- ambient resolution must be UNCHANGED --------------------------------
-# No workspace argument = the caller accepted ambient resolution, so whatever the
-# environment says stays correct. This must hold in BOTH environments: with
-# SUTANDO_MEMORY_DIR set (this fleet) the answer is the private machine dir; with
-# it unset (CI) there is no private dir and the answer is the ambient workspace.
-# The first version asserted only the former and failed in CI — the assertion had
-# baked in a property of my machine.
-amb = subprocess.run(
+# --- ambient resolution must be UNCHANGED in BOTH environment shapes -------
+def _ambient(env_extra):
+    e=dict(os.environ); e.update(env_extra)
+    return subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0,'src');"
+         "from util_paths import personal_path, _private_machine_dir, _workspace_root;"
+         "p=personal_path('brand-new-ambient.md');"
+         "d=_private_machine_dir();"
+         "want=(d/'brand-new-ambient.md') if d is not None else (_workspace_root()/'brand-new-ambient.md');"
+         "print('MATCH' if str(p)==str(want) else f'DIFF got={p} want={want}')"],
+        capture_output=True, text=True, cwd=REPO, env=e)
+
+r = _ambient({"SUTANDO_MEMORY_DIR": str(priv)})
+check("D1 ambient WITH a private dir still resolves to it (unchanged)",
+      "MATCH" in r.stdout, (r.stdout + r.stderr).strip()[:180])
+
+e2 = {k: v for k, v in os.environ.items()
+      if k not in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR")}
+r2 = subprocess.run(
     [sys.executable, "-c",
      "import sys; sys.path.insert(0,'src');"
      "from util_paths import personal_path, _private_machine_dir, _workspace_root;"
      "p=personal_path('brand-new-ambient.md');"
      "d=_private_machine_dir();"
      "want=(d/'brand-new-ambient.md') if d is not None else (_workspace_root()/'brand-new-ambient.md');"
-     "print('MATCH' if str(p)==str(want) else f'DIFF got={p} want={want}');"
-     "print('PRIVATE_SET' if d is not None else 'PRIVATE_NONE')"],
-    capture_output=True, text=True, cwd=REPO,
-)
-check(
-    "D ambient call (no workspace arg) resolves per the environment, unchanged",
-    "MATCH" in amb.stdout,
-    (amb.stdout + amb.stderr).strip()[:200],
-)
-print(f"       (environment for D: {'private dir configured' if 'PRIVATE_SET' in amb.stdout else 'no private dir — CI shape'})")
+     "print('MATCH' if str(p)==str(want) else f'DIFF got={p} want={want}')"],
+    capture_output=True, text=True, cwd=REPO, env=e2)
+check("D2 ambient WITHOUT a private dir falls to the workspace (the CI shape)",
+      "MATCH" in r2.stdout, (r2.stdout + r2.stderr).strip()[:180])
 
 print()
 if failures:
