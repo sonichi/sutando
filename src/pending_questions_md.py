@@ -29,7 +29,7 @@ matters: agent-api derives question identity from section bodies, and stripping
 
   * `mask_html_comments`  — `<!-- ... -->`          (host-A under-count)
   * `mask_fenced_code`    — ``` / ~~~ blocks         (#2419 review, 2026-07-31)
-  * `mask_code_spans`     — `` `...` ``, may wrap    (live on a third host, same day)
+  * `_mask_nonfence_spans` — `` `...` ``, may wrap   (live on a third host, same day)
 
 The last two were added after review: a fenced *example* of the divider, and a
 sentence that line-wrapped so `` # Resolved` `` landed line-initial inside an inline
@@ -129,36 +129,6 @@ def _backtick_runs(text: str) -> list[tuple[int, int]]:
         else:
             i += 1
     return runs
-
-
-def mask_code_spans(text: str) -> str:
-    """Blank inline code spans, preserving length and line breaks.
-
-    A span may wrap across a line break, which is how `` # Resolved` `` reached
-    column 0 on a real host while being, semantically, quoted text.
-
-    Delimiters are MAXIMAL backtick runs and a closer must have EXACTLY the
-    opener's length — a 4-run neither closes nor is closed by a 3-run. An opener
-    with no equal-length partner is literal text, not a span, so scanning resumes
-    after it rather than swallowing the rest of the document.
-    """
-    out = list(text)
-    runs = _backtick_runs(text)
-    k = 0
-    while k < len(runs):
-        start, length = runs[k]
-        m = k + 1
-        while m < len(runs) and runs[m][1] != length:
-            m += 1
-        if m < len(runs):
-            end = runs[m][0] + runs[m][1]
-            for p in range(start, end):
-                if out[p] != '\n':
-                    out[p] = ' '
-            k = m + 1
-        else:
-            k += 1
-    return ''.join(out)
 
 
 def _opens_span(text: str, start: int, length: int) -> bool:

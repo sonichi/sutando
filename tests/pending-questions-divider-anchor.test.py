@@ -279,6 +279,15 @@ check("I4 control: a properly closed backtick fence leaves an OUTSIDE divider re
 check("I5 control: a fence-eligible run does not open a span across the document",
       n_sections("```\ncode\n```\n## a\n\n## b\n# Resolved\n") == 2)
 
+# I6 exercises the `length < 3` arm of `_opens_span`: a SHORT run that begins its
+# line. Every other short-run fixture in this file has text before the backtick,
+# so it returns on the text-before-it arm and this branch was never reached —
+# the coverage gate is what surfaced that, not a failing assertion.
+check("I6 a line-initial 1-backtick run is inline, not a fence",
+      n_sections("`code`\n# Resolved" + QUESTIONS) == 0)
+check("I7 a line-initial short run still pairs across lines as a span",
+      n_sections("`\n# Resolved`\n" + QUESTIONS.lstrip("\n")) == 2)
+
 # Offset invariant: every masker must preserve length AND line count, because
 # agent-api derives question identity by slicing the ORIGINAL at a masked offset.
 _offset_ok = True
