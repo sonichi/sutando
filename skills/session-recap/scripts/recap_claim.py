@@ -9,13 +9,23 @@ transcript — two concurrent summarizers racing last-session-recap.md and
 double-posting the private-room brief. This script makes the reservation
 atomic and is the required gate BEFORE spawning the worker:
 
-  claim <session-uuid>              exit 0 -> caller may spawn the worker
+  claim <session-uuid>              exit 0 -> caller may spawn the worker;
+                                    prints "claimed token=<nonce>" — the
+                                    launcher MUST pass that token to the
+                                    worker for release.
                                     exit 1 -> skip (already recapped, or a
                                               live claim exists)
-  release <session-uuid> [--stamp]  worker calls on completion; --stamp
+  release <session-uuid> --token T [--stamp]
+                                    worker calls on completion; --stamp
                                     records the session as recapped. Without
                                     --stamp (failure path) the claim is
-                                    dropped so a later run can retry.
+                                    dropped so a later run can retry. Both
+                                    paths are OWNERSHIP-CHECKED: they only
+                                    act if the on-disk claim still carries
+                                    token T. A worker whose claim was
+                                    stale-reclaimed gets exit 1 and must NOT
+                                    touch the stamp — the reclaiming worker
+                                    owns the session now.
 
 Atomicity: the payload is written to a private temp file first, then
 os.link()ed to the claim path (state/recap-inflight.json) — link is atomic
@@ -33,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -64,8 +75,9 @@ def claim(sdir: Path, session: str, stale_s: float) -> int:
     except OSError:
         pass  # no stamp yet — normal on a fresh boot
     path = sdir / CLAIM_NAME
+    token = secrets.token_hex(8)
     payload = json.dumps({"session": session, "ts": time.time(),
-                          "pid": os.getpid()})
+                          "pid": os.getpid(), "token": token})
     # Full payload lands in a private temp file BEFORE the claim becomes
     # visible: os.link is atomic-or-FileExistsError, so no claimer can ever
     # observe a partial/empty claim (the corrupt→stale misread that produced
@@ -92,7 +104,7 @@ def claim(sdir: Path, session: str, stale_s: float) -> int:
                     return 1
                 path.unlink(missing_ok=True)  # dead worker — re-race
                 continue
-            print("claimed")
+            print(f"claimed token={token}")
             return 0
         print("skip: lost re-race")
         return 1
@@ -100,12 +112,27 @@ def claim(sdir: Path, session: str, stale_s: float) -> int:
         os.unlink(tmp)
 
 
-def release(sdir: Path, session: str, stamp: bool) -> int:
+def release(sdir: Path, session: str, stamp: bool, token: str) -> int:
+    # Ownership gate: act only if the on-disk claim is still OURS. A worker
+    # whose claim was stale-reclaimed must not unlink the reclaimer's live
+    # reservation, and a late `release --stamp` must not stamp over the
+    # reclaimer's in-progress run (the stale-A/reclaimed-B lifecycle race).
+    path = sdir / CLAIM_NAME
+    try:
+        cur = json.loads(path.read_text())
+    except (OSError, ValueError):
+        print("skip: no live claim to release (reclaimed or already "
+              "released) — not stamping")
+        return 1
+    if cur.get("token") != token or cur.get("session") != session:
+        print(f"skip: live claim is not ours "
+              f"(live session={cur.get('session', '?')}) — not stamping")
+        return 1
     if stamp:
         tmp = sdir / (STAMP_NAME + ".tmp")
         tmp.write_text(session + "\n")
         os.replace(tmp, sdir / STAMP_NAME)
-    (sdir / CLAIM_NAME).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
     print("released" + (" + stamped" if stamp else ""))
     return 0
 
@@ -118,6 +145,9 @@ def main() -> int:
     ap.add_argument("session", help="session transcript uuid being recapped")
     ap.add_argument("--stamp", action="store_true",
                     help="release only: record the session as recapped")
+    ap.add_argument("--token", default=None,
+                    help="release only (required there): the ownership "
+                         "token printed by the winning claim")
     ap.add_argument("--stale-minutes", type=float, default=15.0,
                     help="claims older than this are dead workers (default 15)")
     ap.add_argument("--state-dir", default=None,
@@ -128,7 +158,9 @@ def main() -> int:
     sdir.mkdir(parents=True, exist_ok=True)
     if args.cmd == "claim":
         return claim(sdir, args.session, args.stale_minutes * 60)
-    return release(sdir, args.session, args.stamp)
+    if not args.token:
+        ap.error("release requires --token (printed by the winning claim)")
+    return release(sdir, args.session, args.stamp, args.token)
 
 
 if __name__ == "__main__":

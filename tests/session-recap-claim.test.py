@@ -89,12 +89,23 @@ check("race: exactly one of 8 concurrent claims wins, every round (x20), "
       "claim intact, no temp litter",
       not bad_rounds, str(bad_rounds[:3]))
 
+def live_token(d: Path) -> str:
+    return json.loads((d / rc.CLAIM_NAME).read_text())["token"]
+
+
+def token_of(msg: str) -> str:
+    return msg.split("token=")[1].strip()
+
+
 # 2. a fresh claim blocks a later claimer
 code, msg = cli("claim", SESSION, "--state-dir", str(d1))
 check("fresh claim blocks re-claim", code == 1 and "in-flight" in msg, msg)
 
-# 3. release --stamp: stamp written, claim dropped, session now skipped
-code, msg = cli("release", SESSION, "--stamp", "--state-dir", str(d1))
+# 3. release --stamp with the live token: stamp written, claim dropped,
+# session now skipped
+tok = live_token(d1)
+code, msg = cli("release", SESSION, "--stamp", "--token", tok,
+                "--state-dir", str(d1))
 check("release --stamp exits 0", code == 0 and "stamped" in msg, msg)
 check("release --stamp writes the stamp",
       (d1 / rc.STAMP_NAME).read_text().strip() == SESSION)
@@ -104,16 +115,53 @@ check("stamped session skips as already-recapped",
       code == 1 and "already-recapped" in msg, msg)
 
 # ...but a NEW session claims fine over an old stamp
-code, _ = cli("claim", "dddd-next", "--state-dir", str(d1))
-check("new session claims over an old stamp", code == 0)
+code, msg = cli("claim", "dddd-next", "--state-dir", str(d1))
+check("new session claims over an old stamp",
+      code == 0 and "token=" in msg, msg)
+tok_next = token_of(msg)
 
 # 4. failure-path release (no --stamp): claim dropped, no stamp, retry wins
-code, msg = cli("release", "dddd-next", "--state-dir", str(d1))
+code, msg = cli("release", "dddd-next", "--token", tok_next,
+                "--state-dir", str(d1))
 check("bare release exits 0 without stamping",
       code == 0 and "stamped" not in msg
       and (d1 / rc.STAMP_NAME).read_text().strip() == SESSION, msg)
-code, _ = cli("claim", "dddd-next", "--state-dir", str(d1))
+code, msg = cli("claim", "dddd-next", "--state-dir", str(d1))
 check("retry after failure-path release wins", code == 0)
+cli("release", "dddd-next", "--token", token_of(msg), "--state-dir", str(d1))
+
+# 4b. ownership gate — the stale-A / reclaimed-B / late-A-release race
+# (#2454 review on 567e8014): a slow worker whose claim was legitimately
+# reclaimed must not release the reclaimer's live reservation, stamp over
+# its run, or open the door for a third worker.
+d5 = Path(tempfile.mkdtemp(prefix="claim-ownership-"))
+_, msg = cli("claim", "session-a", "--state-dir", str(d5))
+tok_a = token_of(msg)
+code, msg = cli("claim", "session-b", "--stale-minutes", "0",
+                "--state-dir", str(d5))
+check("B reclaims A's (stale) claim", code == 0, msg)
+tok_b = token_of(msg)
+code, msg = cli("release", "session-a", "--stamp", "--token", tok_a,
+                "--state-dir", str(d5))
+check("late A release refused (claim is B's now)",
+      code == 1 and "not ours" in msg, msg)
+check("B's live claim survived A's late release",
+      live_token(d5) == tok_b)
+check("A's late --stamp did not land",
+      not (d5 / rc.STAMP_NAME).exists())
+code, msg = cli("claim", "session-c", "--state-dir", str(d5))
+check("C cannot claim while B's reservation is live",
+      code == 1 and "in-flight" in msg, msg)
+code, msg = cli("release", "session-b", "--stamp", "--token", tok_b,
+                "--state-dir", str(d5))
+check("B's own release --stamp still works", code == 0
+      and (d5 / rc.STAMP_NAME).read_text().strip() == "session-b", msg)
+
+# 4c. release with no live claim at all: refuse, never stamp
+code, msg = cli("release", "session-b", "--stamp", "--token", tok_b,
+                "--state-dir", str(d5))
+check("release after claim gone refuses without stamping",
+      code == 1 and "no live claim" in msg, msg)
 
 # 5. stale claim (dead worker) is reclaimed
 d2 = Path(tempfile.mkdtemp(prefix="claim-stale-"))
