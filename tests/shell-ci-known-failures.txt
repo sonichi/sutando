@@ -13,4 +13,3 @@ tests/start-cli-claude-config-dir.test.sh
 tests/startup-env-token-persist.test.sh
 tests/startup-self-log-tmp.test.sh
 tests/sutando-migrate.test.sh
-tests/sync-workspace.test.sh

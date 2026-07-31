@@ -25,6 +25,18 @@ set -euo pipefail
 # The tests were not wrong about the product — they were reading someone else's
 # environment. Clear it once here so the shim can actually take effect.
 unset SUTANDO_HOST_LABEL
+
+# Same class, second inheritance: the suite makes real git commits in its
+# fixtures, so it also depends on the CALLER having a git identity. On a dev box
+# that is set globally and the dependency is invisible; on the ubuntu-latest
+# runner it is not, and every commit dies with
+#   Author identity unknown / *** Please tell me who you are.
+# which is why this suite sits in tests/shell-ci-known-failures.txt. Pin an
+# identity here so the suite carries its own, rather than borrowing one.
+export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-sync-workspace-test}"
+export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-sync-workspace-test@invalid}"
+export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-sync-workspace-test}"
+export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-sync-workspace-test@invalid}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
