@@ -77,8 +77,9 @@ check(
     lint.classify(
         write(tmpdir,
               'import os, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = "/tmp/x"\n'
-              'pathlib.Path("channels/discord").mkdir(parents=True, exist_ok=True)\n'
-              '(pathlib.Path("channels/discord") / "access.json").write_text("{}")\n' + IMPORTS_BRIDGE)
+              '_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              '_c.mkdir(parents=True, exist_ok=True)\n'
+              '(_c / "access.json").write_text("{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
 )
@@ -135,7 +136,7 @@ check(
 SEED = ('import os, tempfile, pathlib\n'
         'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
         'pathlib.Path("channels/discord").mkdir(parents=True, exist_ok=True)\n'
-        '(pathlib.Path("channels/discord") / "access.json").write_text("{}")\n')
+        '(pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / "access.json").write_text("{}")\n')
 EXEC_LOAD = ('src = open("src/discord-bridge.py").read()\n'
              'import types\nbridge = types.ModuleType("b")\n'
              'exec(src, bridge.__dict__)\n')
@@ -185,7 +186,7 @@ _ENV = 'import os, tempfile, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile
 check(
     "seed via an intermediate variable counts (p = chan / 'access.json'; p.write_text)",
     lint.classify(
-        write(tmpdir, _ENV + 'chan = pathlib.Path("/tmp/x") / "channels" / "discord"\n'
+        write(tmpdir, _ENV + 'chan = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
               'p = chan / "access.json"\np.write_text("{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
@@ -194,7 +195,7 @@ check(
     "seed taint propagates two hops (ACCESS = 'access.json'; p = d / ACCESS)",
     lint.classify(
         write(tmpdir, _ENV + 'ACCESS = "access.json"\n'
-              'p = pathlib.Path("/tmp/x") / "channels" / "discord" / ACCESS\n'
+              'p = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / ACCESS\n'
               'p.write_text("{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
@@ -211,11 +212,64 @@ check(
 check(
     "a variable that never carries access.json is not a seed",
     lint.classify(
-        write(tmpdir, _ENV + 'p = pathlib.Path("/tmp/x") / "channels" / "discord" / ".env"\n'
+        write(tmpdir, _ENV + 'p = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / ".env"\n'
               'p.write_text("{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.VIOLATION,
     "taint must track the path, not any written variable",
+)
+
+# Review 10 (qingyun, #2429): the seed predicate proved only that SOME path expression
+# contained "access.json" — not that the write targeted the configured
+# $CLAUDE_CONFIG_DIR/channels/<ch>/access.json. Both shapes below wrote to an unrelated
+# directory and classified CLEAN while the canonical file stayed absent, so the bridge
+# still fell back to the operator's real-home allowlist. Rootedness is now required.
+check(
+    "unrelated METHOD write to some other access.json is NOT a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'p = pathlib.Path("/tmp/x") / "access.json"\n'
+              'p.write_text("{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "a seed must be rooted at the CONFIGURED config dir, not merely named access.json",
+)
+check(
+    "unrelated HELPER write to some other access.json is NOT a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'write_private_text(pathlib.Path("/tmp/x") / "access.json", "{}")\n'
+              + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "the helper shape inherited the same false CLEAN and must be closed with it",
+)
+check(
+    "canonical HELPER seed under the configured dir IS a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"\n'
+              'write_private_text(cfg / "access.json", "{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+    "closing the hole must not start false-flagging correctly-seeded helper writes",
+)
+check(
+    "seed rooted via the NAME assigned into os.environ is clean",
+    lint.classify(
+        write(tmpdir, 'import os, tempfile, pathlib\n_ccd = tempfile.mkdtemp()\n'
+              'os.environ["CLAUDE_CONFIG_DIR"] = _ccd\n'
+              'p = pathlib.Path(_ccd) / "channels" / "discord" / "access.json"\n'
+              'p.write_text("{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+    "_ccd = mkdtemp(); os.environ[...] = _ccd is the same canonical path, spelled once",
+)
+check(
+    "rooted but WITHOUT a channels segment is NOT a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'p = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "access.json"\n'
+              'p.write_text("{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "channel_access_path() reads channels/<ch>/access.json — the root alone is not that file",
 )
 
 # --- receiver + ordering bypasses (qingyun, #2429 review 7) ----------------
@@ -288,7 +342,7 @@ check(
             tmpdir,
             'import os, tempfile, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
             'pathlib.Path("channels/discord").mkdir(parents=True, exist_ok=True)\n'
-            '(pathlib.Path("channels/discord") / "access.json").write_text("{}")\n' + IMPORTS_BRIDGE,
+            '(pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / "access.json").write_text("{}")\n' + IMPORTS_BRIDGE,
         )
     )
     == lint.CLEAN,

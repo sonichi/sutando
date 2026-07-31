@@ -218,36 +218,153 @@ _WRITE_METHODS = {"write_text", "write_bytes"}
 _WRITE_HELPERS = {"write_private_text"}
 
 
+def _is_ccd_ref(node) -> bool:
+    """True for a literal `os.environ["CLAUDE_CONFIG_DIR"]` READ."""
+    return (
+        isinstance(node, ast.Subscript)
+        and _is_os_environ(node.value)
+        and _const_str(node.slice) == "CLAUDE_CONFIG_DIR"
+    )
+
+
+def _ccd_root_names(tree: ast.Module) -> "set[str]":
+    """Names that hold the CONFIGURED config-dir root.
+
+    Seeded from the value assigned to `os.environ["CLAUDE_CONFIG_DIR"]` — the
+    `_ccd = mkdtemp(); os.environ["CLAUDE_CONFIG_DIR"] = _ccd` shape — so a path
+    later built from `_ccd` is recognized as canonical just like one built from
+    `os.environ["CLAUDE_CONFIG_DIR"]` directly.
+    """
+    roots: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for tgt in node.targets:
+            if (
+                isinstance(tgt, ast.Subscript)
+                and _is_os_environ(tgt.value)
+                and _const_str(tgt.slice) == "CLAUDE_CONFIG_DIR"
+                and isinstance(node.value, ast.Name)
+            ):
+                roots.add(node.value.id)
+    return roots
+
+
+def _rooted_segments(tree: ast.Module) -> "dict[str, set[str]]":
+    """Module-level names whose value is a path ROOTED at the configured config dir,
+    mapped to the literal path segments accumulated along the way.
+
+    Fixpoint over straight-line module-level assignments, so
+    `_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"` records
+    `_cfg -> {"channels", "discord"}` and a later `p = _cfg / "access.json"` records
+    `p -> {"channels", "discord", "access.json"}`.
+
+    Rootedness is the point. The previous predicate tainted any name carrying the
+    STRING "access.json", so a write to an unrelated `/tmp/x/access.json` counted as a
+    seed while the canonical file stayed absent — a false CLEAN qingyun demonstrated on
+    #2429 for both the method and helper shapes. Tracking the root instead means only a
+    write under the dir the test actually configured can satisfy the gate.
+    """
+    roots = _ccd_root_names(tree)
+    consts = _literal_segment_names(tree)
+    rooted: dict[str, set[str]] = {}
+    while True:
+        grew = False
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            ok, segs = _expr_root_segments(node.value, roots, rooted, consts)
+            if not ok:
+                continue
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                prev = rooted.get(target.id)
+                if prev is None or not segs <= prev:
+                    rooted[target.id] = segs | (prev or set())
+                    grew = True
+        if not grew:
+            return rooted
+
+
+def _literal_segment_names(tree: ast.Module) -> "dict[str, set[str]]":
+    """Module-level names bound to plain string constants, mapped to those strings.
+
+    A path segment is often factored out (`ACCESS = "access.json"; p = cfg / ACCESS`).
+    Such a name contributes SEGMENTS but never ROOTEDNESS — it says nothing about which
+    directory the path starts from, so it cannot rescue an unrooted write.
+    """
+    out: dict[str, set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        segs = {
+            c.value for c in ast.walk(node.value)
+            if isinstance(c, ast.Constant) and isinstance(c.value, str)
+        }
+        if not segs:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                out.setdefault(target.id, set()).update(segs)
+    return out
+
+
+def _expr_root_segments(expr: ast.AST, roots: "set[str]", rooted: "dict[str, set[str]]",
+                        consts: "dict[str, set[str]] | None" = None):
+    """(is_rooted_at_configured_ccd, literal segments) for a path expression."""
+    consts = consts or {}
+    is_rooted = False
+    segs: set[str] = set()
+    for c in ast.walk(expr):
+        if _is_ccd_ref(c):
+            is_rooted = True
+        elif isinstance(c, ast.Name):
+            if c.id in roots:
+                is_rooted = True
+            elif c.id in rooted:
+                is_rooted = True
+                segs |= rooted[c.id]
+            elif c.id in consts:
+                segs |= consts[c.id]
+        elif isinstance(c, ast.Constant) and isinstance(c.value, str):
+            segs.add(c.value)
+    return is_rooted, segs
+
+
 def _access_seed_line(tree: ast.Module) -> "int | None":
-    """Earliest module-level WRITE that creates a `channels/<ch>/access.json`.
+    """Earliest module-level WRITE that creates the CANONICAL
+    `$CLAUDE_CONFIG_DIR/channels/<ch>/access.json`.
 
     Required in addition to the CLAUDE_CONFIG_DIR assignment, because pointing the env
     var at an EMPTY temp dir is not isolation: `channel_access_path()` falls back to the
     LEGACY real-home `~/.claude/channels/<ch>/access.json` when the canonical path is
-    missing, so the operator's real allowlist is still what gets read. This is the exact
-    thing my own #2428 fix had to add, and my first predicate then failed to require it —
-    john caught it on tests/discord-bridge-public-notice-suppression.test.py, which sets
-    the env var and seeds only `.env`.
+    missing, so the operator's real allowlist is still what gets read.
 
-    A WRITE, never a mention: that file names "access.json" in its module docstring, and
-    a constant-substring check would have called it isolated. Same shape as
-    "a comment is not isolation".
+    Three conditions, all necessary — a write that satisfies only the last one is the
+    false CLEAN this predicate was rebuilt to reject:
+      1. it is a WRITE, never a mention (that file names "access.json" in its own module
+         docstring, and a substring check would have called it isolated);
+      2. the path is ROOTED at the configured config dir (`os.environ["CLAUDE_CONFIG_DIR"]`
+         or the name assigned into it) — an unrelated `/tmp/x/access.json` is NOT a seed;
+      3. the path carries both a `channels` segment and an `access.json` segment, so it is
+         the file `channel_access_path()` actually reads.
 
-    The receiver may be an inline expression OR a variable the path was built into
-    first — `p = chan / "access.json"; p.write_text(...)` seeds exactly as much as
-    `(chan / "access.json").write_text(...)`. Binding a path to a name is not a
-    behavioral difference, so `_access_path_names` propagates the taint through
+    The path may be an inline expression or a variable built up first; binding a path to a
+    name is not a behavioral difference, so `_rooted_segments` propagates through
     module-level assignments and both shapes count.
     """
-    tainted = _access_path_names(tree)
+    roots = _ccd_root_names(tree)
+    rooted = _rooted_segments(tree)
+    consts = _literal_segment_names(tree)
 
-    def _is_access_receiver(expr: ast.AST) -> bool:
-        for c in ast.walk(expr):
-            if isinstance(c, ast.Constant) and isinstance(c.value, str) and "access.json" in c.value:
-                return True
-            if isinstance(c, ast.Name) and c.id in tainted:
-                return True
-        return False
+    def _is_canonical_access_path(expr: ast.AST) -> bool:
+        is_rooted, segs = _expr_root_segments(expr, roots, rooted, consts)
+        if not is_rooted:
+            return False
+        has_channels = any("channels" in seg for seg in segs)
+        has_access = any("access.json" in seg for seg in segs)
+        return has_channels and has_access
 
     for node in tree.body:
         for sub in ast.walk(node):
@@ -255,7 +372,7 @@ def _access_seed_line(tree: ast.Module) -> "int | None":
                 continue
             # Method style: (dir / "access.json").write_text(...) — path is the RECEIVER.
             if isinstance(sub.func, ast.Attribute):
-                if sub.func.attr in _WRITE_METHODS and _is_access_receiver(sub.func.value):
+                if sub.func.attr in _WRITE_METHODS and _is_canonical_access_path(sub.func.value):
                     return node.lineno
             # Helper style: write_private_text(dir / "access.json", data) — path is an
             # ARGUMENT. #2356 makes this the canonical way access files are written, so
@@ -267,40 +384,10 @@ def _access_seed_line(tree: ast.Module) -> "int | None":
                 else None
             )
             if name in _WRITE_HELPERS and any(
-                _is_access_receiver(a) for a in sub.args
+                _is_canonical_access_path(a) for a in sub.args
             ):
                 return node.lineno
     return None
-
-
-def _access_path_names(tree: ast.Module) -> "set[str]":
-    """Module-level names whose value carries an `access.json` path.
-
-    Straight-line propagation to a fixpoint, so a name built from another tainted
-    name is tainted too (`ACCESS = "access.json"` → `p = chan / ACCESS` → `p`).
-    Module level only: a name bound inside a function or an `if` body has not
-    necessarily been bound by the time the bridge loads, and unbound-at-load is
-    exactly the reachability failure this gate refuses to guess about.
-    """
-    tainted: set[str] = set()
-    while True:
-        grew = False
-        for node in tree.body:
-            if not isinstance(node, ast.Assign):
-                continue
-            carries = any(
-                (isinstance(c, ast.Constant) and isinstance(c.value, str) and "access.json" in c.value)
-                or (isinstance(c, ast.Name) and c.id in tainted)
-                for c in ast.walk(node.value)
-            )
-            if not carries:
-                continue
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id not in tainted:
-                    tainted.add(target.id)
-                    grew = True
-        if not grew:
-            return tainted
 
 
 def _bridge_load_call(tree: ast.AST):
