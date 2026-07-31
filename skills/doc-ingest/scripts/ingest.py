@@ -25,6 +25,8 @@ MAX_TABLE_BYTES = 64 * 1024 * 1024
 MAX_TABLE_ROWS = 100_000
 MAX_TABLE_CELLS = 1_000_000
 MAX_TABLE_TEXT_CHARS = 16 * 1024 * 1024
+MAX_XLSX_COLUMNS = 16_384
+TEXT_READ_CHUNK_CHARS = 64 * 1024
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".heic"}
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus"}
@@ -36,8 +38,41 @@ TEXT_SUFFIXES = {
 
 
 def _truncate(text: str, max_chars: int) -> str:
+    if isinstance(text, _PreTruncatedText):
+        return text
     if max_chars and len(text) > max_chars:
         return text[:max_chars] + f"\n\n[doc-ingest: truncated at {max_chars} chars — original {len(text)} chars]"
+    return text
+
+
+class _PreTruncatedText(str):
+    """A bounded stream result that already carries the exact truncation notice."""
+
+
+def _read_text_bounded(path: Path, max_chars: int) -> str:
+    """Decode text incrementally, retaining at most the requested output prefix."""
+    if not max_chars:
+        return path.read_text(encoding="utf-8", errors="replace")
+    kept: list[str] = []
+    kept_chars = 0
+    total_chars = 0
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        while True:
+            chunk = fh.read(TEXT_READ_CHUNK_CHARS)
+            if not chunk:
+                break
+            total_chars += len(chunk)
+            if kept_chars < max_chars:
+                prefix = chunk[:max_chars - kept_chars]
+                kept.append(prefix)
+                kept_chars += len(prefix)
+    text = "".join(kept)
+    if total_chars > max_chars:
+        return _PreTruncatedText(
+            text
+            + f"\n\n[doc-ingest: truncated at {max_chars} chars — "
+            f"original {total_chars} chars]"
+        )
     return text
 
 
@@ -242,7 +277,7 @@ def extract_pdf(path: Path) -> str:
     raise RuntimeError("no PDF extractor available (need poppler's pdftotext, pypdf, or PyMuPDF)")
 
 
-def _col_index(cell_ref: str) -> int:
+def _col_index(cell_ref: str, max_columns: int = MAX_XLSX_COLUMNS) -> int:
     """'B2' -> 1 (0-based column). Falls back to 0 if the ref has no letters."""
     letters = re.match(r"[A-Za-z]+", cell_ref or "")
     if not letters:
@@ -250,6 +285,11 @@ def _col_index(cell_ref: str) -> int:
     idx = 0
     for ch in letters.group(0).upper():
         idx = idx * 26 + (ord(ch) - 64)
+        if idx > max_columns:
+            raise RuntimeError(
+                f"XLSX cell reference exceeds column/cell budget "
+                f"({max_columns}); extraction stopped"
+            )
     return idx - 1
 
 
@@ -302,7 +342,15 @@ def _xlsx_zip_fallback(path: Path, max_rows: int) -> str:
                     for c in row:
                         if local(c.tag) != "c":
                             continue
-                        col = _col_index(c.get("r", ""))
+                        if budget["cells"] <= 0:
+                            raise RuntimeError(
+                                f"table exceeds shared cell budget "
+                                f"({MAX_TABLE_CELLS}); extraction stopped"
+                            )
+                        col = _col_index(
+                            c.get("r", ""),
+                            min(MAX_XLSX_COLUMNS, budget["cells"]),
+                        )
                         ctype = c.get("t")
                         if ctype == "s":  # shared string: <v> holds the index
                             v = next((x for x in c if local(x.tag) == "v"), None)
@@ -404,7 +452,8 @@ def extract_pptx(path: Path) -> str:
 
 def extract_zip(path: Path, max_rows: int, member_cap: int = 20,
                 total_budget: int = 64 * 1024 * 1024,
-                _budget: dict[str, int] | None = None, _depth: int = 0) -> str:
+                _budget: dict[str, int] | None = None, _depth: int = 0,
+                *, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     # Archive → manifest + recursive extraction of the first N supported members.
     # RESOURCE BOUNDS (attachments are untrusted): cap the member count AND the
     # cumulative uncompressed bytes we materialize, so a zip-bomb / oversized
@@ -450,7 +499,7 @@ def extract_zip(path: Path, max_rows: int, member_cap: int = 20,
                 target.write_bytes(zf.read(name))
                 try:
                     kind, text = extract(
-                        target, max_rows,
+                        target, max_rows, max_chars,
                         _archive_budget=budget,
                         _archive_depth=_depth + 1,
                     )
@@ -475,7 +524,7 @@ def extract_textutil(path: Path) -> str:
     return proc.stdout
 
 
-def extract(path: Path, max_rows: int,
+def extract(path: Path, max_rows: int, max_chars: int = DEFAULT_MAX_CHARS,
             _archive_budget: dict[str, int] | None = None,
             _archive_depth: int = 0) -> tuple[str, str]:
     """Returns (kind, text). Raises on failure; special kinds 'image'/'audio' carry a pointer."""
@@ -499,13 +548,14 @@ def extract(path: Path, max_rows: int,
             path, max_rows,
             _budget=_archive_budget,
             _depth=_archive_depth,
+            max_chars=max_chars,
         )
     if suffix in {".rtf", ".doc"}:
         return "textutil", extract_textutil(path)
     if suffix in TEXT_SUFFIXES or not suffix:
-        return "text", path.read_text(encoding="utf-8", errors="replace")
+        return "text", _read_text_bounded(path, max_chars)
     # Unknown suffix: try text read — better a replaced-chars dump than a refusal.
-    return "text?", path.read_text(encoding="utf-8", errors="replace")
+    return "text?", _read_text_bounded(path, max_chars)
 
 
 def main(argv: list[str]) -> int:
@@ -539,7 +589,7 @@ def main(argv: list[str]) -> int:
             result = {"file": name, "kind": "missing", "ok": False, "error": "not a file"}
         else:
             try:
-                kind, text = extract(path, max_rows)
+                kind, text = extract(path, max_rows, max_chars)
                 if kind in {"image", "audio"}:
                     had_pointer = True
                     result = {"file": name, "kind": kind, "ok": False, "error": text}

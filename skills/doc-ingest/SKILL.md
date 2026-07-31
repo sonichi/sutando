@@ -29,7 +29,7 @@ Not for:
 | `.docx` | `python-docx` (paragraphs + tables) | `textutil -convert txt` (macOS), else zip XML extraction |
 | `.pptx` | zip XML extraction (per-slide text, dependency-free) | — |
 | `.zip` | member manifest + recursive extraction of the first 20 supported members (flattened basenames — zip-slip safe) | — |
-| `.txt` `.md` `.json` `.jsonl` `.xml` `.html` code files | direct read (UTF-8, errors replaced) | — |
+| `.txt` `.md` `.json` `.jsonl` `.xml` `.html` code files | bounded streaming read (UTF-8, errors replaced) | — |
 | `.rtf` `.doc` | `textutil -convert txt` (macOS) | error naming the gap |
 
 Exit codes: `0` all files extracted · `1` at least one failed · `2` bad invocation · `3` file type is handled elsewhere (image/audio pointer printed).
@@ -39,6 +39,10 @@ rows are consumed incrementally: only the rendered prefix is retained while the
 computed summary is updated over the stream. Hard shared safety budgets cap
 compressed/uncompressed table bytes, rows, cells, and cell text; exceeding one
 fails the file explicitly instead of risking unbounded attachment memory use.
+The dependency-free XLSX reader rejects sparse cell references before they can
+expand into a dense row beyond the remaining cell budget or Excel's column
+limit. Plain-text inputs are decoded in fixed-size chunks and retain only the
+`--max-chars` prefix (`--max-chars 0` is the explicit uncapped mode).
 A display-truncation notice is appended whenever the rendered row cap fires, so
 a consumer never mistakes a prefix for the whole document.
 

@@ -57,6 +57,37 @@ with tempfile.TemporaryDirectory() as td:
     code, out, _ = run_cli([str(txt), "--max-chars", "50"])
     check("truncation-notice", "truncated at 50 chars" in out, out[-120:])
 
+    # The direct text path must stream rather than call read_text()/read(-1)
+    # before the output cap is applied. The fake source is much larger than the
+    # retained prefix and rejects every unbounded read.
+    class _ChunkedText:
+        def __init__(self, total):
+            self.remaining = total
+            self.read_sizes = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size):
+            assert size == ingest.TEXT_READ_CHUNK_CHARS
+            self.read_sizes.append(size)
+            take = min(size, self.remaining)
+            self.remaining -= take
+            return "x" * take
+
+    chunked = _ChunkedText(1_000_000)
+    fake_path = types.SimpleNamespace(open=lambda *_a, **_k: chunked)
+    bounded = ingest._read_text_bounded(fake_path, 50)
+    check("text-streams-before-truncate",
+          bounded.startswith("x" * 50)
+          and "original 1000000 chars" in bounded
+          and chunked.read_sizes
+          and max(chunked.read_sizes) == ingest.TEXT_READ_CHUNK_CHARS,
+          f"reads={chunked.read_sizes[:3]} len={len(bounded)}")
+
     # 2. CSV → markdown table, row cap appends a visible notice.
     csvf = tmp / "data.csv"
     csvf.write_text("name,qty\nwidget,3\ngadget,5\nsprocket,7\n")
@@ -448,5 +479,25 @@ with tempfile.TemporaryDirectory() as td:
         except RuntimeError as exc:
             check("xlsx-uncompressed-byte-budget",
                   "uncompressed byte budget" in str(exc), str(exc))
+
+    # 34. A tiny fallback XLSX can claim a very sparse column. Reject the
+    # reference against the remaining shared cell/XLSX column budget BEFORE
+    # expanding it into a dense list of empty cells.
+    sparse_xlsx = tmp / "sparse.xlsx"
+    with zipfile.ZipFile(sparse_xlsx, "w") as zf:
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            "<worksheet><sheetData><row><c r=\"ZZZZ1\"><v>1</v></c>"
+            "</row></sheetData></worksheet>",
+        )
+    with mock.patch.dict(sys.modules, {"openpyxl": None}), \
+         mock.patch.object(ingest, "MAX_TABLE_CELLS", 1000):
+        try:
+            ingest.extract_xlsx(sparse_xlsx, 2)
+            check("xlsx-sparse-reference-budget", False,
+                  "expected pre-allocation column/cell-budget failure")
+        except RuntimeError as exc:
+            check("xlsx-sparse-reference-budget",
+                  "column/cell budget" in str(exc), str(exc))
 
 print(f"OK — {len(passed)} checks passed: {', '.join(passed)}")
