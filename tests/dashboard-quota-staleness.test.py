@@ -112,6 +112,46 @@ with tempfile.TemporaryDirectory() as tmp:
     check("D2 age unknown → said so explicitly",
           dash._quota_age_label({"headers": {"x": "1"}, "age_h": None}) == "age unknown")
 
+    # --- the rendered panel ------------------------------------------------
+    # The helpers being right is not the fix; the fix is what the page SHOWS.
+    # render_dashboard() takes no arguments and pulls its own data, so stub the
+    # collaborators and drive the real template.
+    def render_with(quota):
+        orig = {n: getattr(dash, n) for n in
+                ("get_health", "get_activity", "get_pending_count", "get_score",
+                 "get_system_stats")}
+        dash.get_health = lambda: {}
+        dash.get_activity = lambda n=5: []
+        dash.get_pending_count = lambda: {"open": 0, "done": 0}
+        dash.get_score = lambda: "?"
+        dash.get_system_stats = lambda: {
+            "quota": quota, "disk_free": "1G", "battery": "50%",
+            "charging": False, "cpu": "1%", "mem": "1G", "uptime": "1d",
+        }
+        try:
+            return dash.render_dashboard()
+        finally:
+            for n, f in orig.items():
+                setattr(dash, n, f)
+
+    try:
+        stale_html = render_with({"available": True, "headers": {"x": "1"},
+                                  "age_h": 336.5, "stale": True})
+        check("E1 a stale panel renders the warning glyph, not a check",
+              "⚠" in stale_html)
+        check("E2 a stale panel renders the age next to it",
+              "STALE 14.0d old" in stale_html, "age badge missing")
+        check("E3 a stale panel is coloured as a warning",
+              "#b45309" in stale_html)
+
+        fresh_html = render_with({"available": True, "headers": {"x": "1"},
+                                  "age_h": 0.2, "stale": False})
+        check("E4 a fresh panel does NOT cry wolf", "⚠" not in fresh_html)
+        check("E5 a fresh panel still states its age",
+              "12m ago" in fresh_html, "fresh age missing")
+    except Exception as exc:  # a template break must fail loudly, not skip
+        check(f"E* render_dashboard raised: {type(exc).__name__}: {exc}", False)
+
 print()
 if failures:
     print(f"FAIL — {len(failures)} check(s) failed")
