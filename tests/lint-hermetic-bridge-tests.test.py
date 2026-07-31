@@ -373,6 +373,28 @@ check(
 # Review 14 (qingyun, #2429): skipping def/class bodies was not enough — descending into
 # every child of `if`/`try` admitted a seed under `if False:` or inside an `except` handler
 # that never fires. Only bodies that run UNCONDITIONALLY on import may count.
+# Review 15 (qingyun, round 8): a `try` BODY runs, but only until something
+# definitely terminates it. A seed AFTER an unconditional `raise` never executes —
+# yet the handler swallows the exception and the import proceeds, so the lint was
+# reporting clean on a test that seeded nothing.
+check(
+    "seed AFTER an unconditional raise in a handled try is NOT a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'try:\n    raise RuntimeError("x")\n    ' + _INLINE_SEED
+              + 'except Exception:\n    pass\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "everything after the raise is dead, but the import still happens",
+)
+check(
+    "seed BEFORE the raise IS still a seed",
+    lint.classify(
+        write(tmpdir, _ENV + 'try:\n    ' + _INLINE_SEED + '    raise RuntimeError("x")\n'
+              + 'except Exception:\n    pass\n' + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+    "the terminator must not retroactively invalidate statements before it",
+)
 check(
     "seed under `if False:` is NOT a seed",
     lint.classify(write(tmpdir, _ENV + 'if False:\n    ' + _INLINE_SEED + IMPORTS_BRIDGE))

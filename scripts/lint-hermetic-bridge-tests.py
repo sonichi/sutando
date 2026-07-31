@@ -411,6 +411,23 @@ def _imported_bridge_channels(text: str) -> "set[str]":
 _DEFERRED_BODIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 
 
+# Statements after one of these never run in the same block.
+_TERMINATORS = (ast.Raise, ast.Return, ast.Continue, ast.Break)
+
+
+def _until_terminator(body):
+    """Yield statements up to and including the first definite terminator.
+
+    `raise` inside a `try` body is the live case: everything after it is dead, but
+    the handler swallows the exception so the module import continues — meaning a
+    seed written after the raise never happens while the bridge still loads.
+    """
+    for st in body:
+        yield st
+        if isinstance(st, _TERMINATORS):
+            return
+
+
 def _reachable_nodes(stmt: ast.AST):
     """Walk `stmt`, descending ONLY into bodies that run unconditionally on import.
 
@@ -444,7 +461,14 @@ def _reachable_nodes(stmt: ast.AST):
     if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
         return                      # zero iterations is legal
     if isinstance(stmt, ast.Try):
-        for child in stmt.body + stmt.finalbody:
+        # A `try` BODY runs, but only up to the first statement that definitely
+        # terminates it. A seed placed AFTER an unconditional `raise` never executes,
+        # yet the exception is swallowed by the handler and the import proceeds
+        # without the canonical file — so the lint would report clean on a test that
+        # never seeded anything (qingyun, round 8).
+        for child in _until_terminator(stmt.body):
+            yield from _reachable_nodes(child)
+        for child in _until_terminator(stmt.finalbody):
             yield from _reachable_nodes(child)
         return                      # handlers and `else` are conditional
     for child in ast.iter_child_nodes(stmt):
