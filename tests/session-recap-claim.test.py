@@ -232,6 +232,72 @@ check("stamp is A's and A's claim is gone",
 code, _ = cli("claim", "session-b", "--state-dir", str(d8))
 check("B claims cleanly after A's release finishes", code == 0)
 
+# 4b3. stamp-read / release / late-link barrier regression (#2454 round
+# 7): B reads the missing stamp, PAUSES just before os.link; A completes
+# release --stamp (stamp precedes unlink, freeing the path); B's link then
+# succeeds — pre-fix, B returned exit 0 and a duplicate recap started for
+# a session whose stamp already existed. The post-link stamp recheck must
+# instead retract B's claim and report already-recapped.
+d9 = Path(tempfile.mkdtemp(prefix="claim-latelink-"))
+_, msg = cli("claim", "session-a", "--state-dir", str(d9))
+tok_a9 = token_of(msg)
+b_paused, b_resume = threading.Event(), threading.Event()
+real_link = rc.os.link
+pause_once = {"armed": True}
+
+
+def pausing_link(src, dst):
+    if pause_once["armed"]:
+        pause_once["armed"] = False
+        b_paused.set()
+        assert b_resume.wait(5), "late-link pause never resumed"
+    return real_link(src, dst)
+
+
+b9_out: dict = {}
+
+
+def run_b_claim():
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        b9_out["code"] = rc.claim(d9, "session-a", 0.0)
+    b9_out["msg"] = buf.getvalue()
+
+
+rc.os.link = pausing_link
+tb = threading.Thread(target=run_b_claim)
+tb.start()
+try:
+    check("B paused before publishing its claim", b_paused.wait(5))
+    code, _ = cli("release", "session-a", "--stamp", "--token", tok_a9,
+                  "--state-dir", str(d9))
+    check("A's stamped release completed while B was paused", code == 0)
+finally:
+    b_resume.set()
+    tb.join(5)
+    rc.os.link = real_link
+check("B's late link self-retracts as already-recapped",
+      b9_out.get("code") == 1 and "already-recapped" in b9_out.get("msg", ""),
+      str(b9_out))
+check("no live claim survives B's retraction",
+      not (d9 / rc.CLAIM_NAME).exists())
+check("stamp remains session-a",
+      (d9 / rc.STAMP_NAME).read_text().strip() == "session-a")
+code, msg = cli("claim", "session-next", "--state-dir", str(d9))
+check("a different session claims cleanly afterwards", code == 0)
+# retract-edge branches: a foreign token never removes the live claim, and
+# a busy lock leaves it for stale reclaim (both are safe no-ops)
+rc._retract_own_claim(d9, "not-the-live-token")
+check("retract with a foreign token leaves the live claim",
+      (d9 / rc.CLAIM_NAME).exists())
+busy_fd = rc._acquire_ownership_lock(d9)
+rc._retract_own_claim(d9, token_of(msg))
+check("retract under a busy lock leaves the claim (stale reclaim later)",
+      (d9 / rc.CLAIM_NAME).exists())
+rc._release_ownership_lock(busy_fd)
+cli("release", "session-next", "--token", token_of(msg),
+    "--state-dir", str(d9))
+
 # 4d. compare-and-delete reap (#2454 round 4): the deterministic hazard —
 # after a claimer reads a STALE claim, the claim is reaped-and-replaced by
 # a FRESH one; the late deleter must NOT remove the fresh claim.

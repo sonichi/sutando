@@ -145,6 +145,26 @@ def _try_reap(sdir: Path, stale_token: str | None, stale_s: float) -> None:
         _release_ownership_lock(lock_fd)
 
 
+def _retract_own_claim(sdir: Path, token: str) -> None:
+    """Ownership-safely remove OUR just-published claim (round-7 recheck).
+    Same discipline as release: under the lock, only if the live claim
+    still carries our token. If the lock stays busy the claim is left for
+    stale reclaim — the caller still reports skip, so no duplicate worker
+    is admitted either way."""
+    lock_fd = _acquire_ownership_lock(sdir, tries=40)
+    if lock_fd is None:
+        return
+    try:
+        path = sdir / CLAIM_NAME
+        try:
+            if json.loads(path.read_text()).get("token") == token:
+                path.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+    finally:
+        _release_ownership_lock(lock_fd)
+
+
 def claim(sdir: Path, session: str, stale_s: float) -> int:
     stamp = sdir / STAMP_NAME
     try:
@@ -183,6 +203,21 @@ def claim(sdir: Path, session: str, stale_s: float) -> int:
                 # destroy a fresh claim linked after our stale read.
                 _try_reap(sdir, cur_tok, stale_s)
                 continue
+            # Post-link stamp RE-check (round-7 review): a stamped release
+            # can land between the pre-link stamp check and the link — the
+            # link only succeeds after that release's unlink frees the
+            # path, and its stamp write precedes its unlink, so if the
+            # race happened the stamp is guaranteed visible now. Without
+            # this, a same-session claimer paused before os.link would
+            # publish AFTER completion and admit a duplicate recap.
+            try:
+                if stamp.read_text().strip() == session:
+                    _retract_own_claim(sdir, token)
+                    print("skip: already-recapped (stamp landed during "
+                          "publication)")
+                    return 1
+            except OSError:
+                pass
             print(f"claimed token={token}")
             return 0
         print("skip: lost re-race")
