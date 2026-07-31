@@ -76,7 +76,20 @@ REPO = Path(
 
 BRIDGE_IMPORT = re.compile(r"(discord|slack|telegram)-bridge\.py")
 
-# Grandfathered: known-unisolated at the time this lint landed. Mini's shared-helper
+# Grandfathered: known-unisolated at the time this lint landed.
+#
+# Net-flat this round, two offsetting edits:
+#   - REMOVED tests/dm-result-multipart-upload.test.py — it never imported a bridge;
+#     it only NAMED one in prose, and target selection used to regex the raw file
+#     text. _code_strings() now selects structurally, so the entry went stale and
+#     the stale-entry check (correctly) failed the run until it was dropped.
+#   + ADDED tests/discord-access-backup.test.py — a REAL hole, not a false positive:
+#     it builds channels/discord/access.json under a mkdtemp inside a class fixture
+#     while exec_module runs at MODULE level, so the import still resolves against
+#     the developer's real config. It landed in #2358, after the 2026-07-30 baseline
+#     below was measured, which is why it is absent from it. Grandfathered rather
+#     than fixed here: repairing another PR's test is a second concern, and
+#     CONTRIBUTING forbids bundling it. Follow-up tracked separately. Mini's shared-helper
 # migration removes these; the stale-entry check below forces the list to shrink.
 # Measured on origin/main (2026-07-30, post-#2428-merge) with the AST classifier. The count rose
 # from 26 to 27 when detection moved off regex: two files the regex called clean were real
@@ -85,6 +98,7 @@ BRIDGE_IMPORT = re.compile(r"(discord|slack|telegram)-bridge\.py")
 KNOWN_UNISOLATED = frozenset(
     """
 tests/audio-transcribe-skill.test.py
+tests/discord-access-backup.test.py
 tests/bridge-env-token-perms.test.py
 tests/bridge-not-allowlisted-ack.test.py
 tests/bridge-restart-intercept.test.py
@@ -118,7 +132,6 @@ tests/discord-bridge-welcome-on-first-post.test.py
 tests/discord-chunker.test.py
 tests/discord-task-source-invariance.test.py
 tests/discord-writeside-attachments.test.py
-tests/dm-result-multipart-upload.test.py
 tests/health-check-fix-down-bridges.test.py
 tests/owner-activity-channel-id.test.py
 tests/slack-bridge-access-durable-backup.test.py
@@ -250,7 +263,22 @@ def _isolation_line(tree: ast.Module) -> int | None:
     Module level is required so the assignment is guaranteed to execute: a body nested in a
     function, branch or with-block may never run, or may run after the import.
     """
-    isolated = _isolated_names(tree)
+    # POINT-IN-TIME, not final-state. Two opposite errors live here:
+    #   * A monotone set says `d` is isolated forever, so
+    #         d = mkdtemp(); d = "/Users/<me>/.claude"
+    #         os.environ["CLAUDE_CONFIG_DIR"] = d
+    #     reads as "provably isolated" while it actually points the env var at the
+    #     operator's REAL config dir — the test then writes into it and imports the
+    #     bridge against it.
+    #   * A final-state set makes the opposite mistake: in
+    #         _ccd = mkdtemp(); os.environ["CLAUDE_CONFIG_DIR"] = _ccd
+    #         _ccd = "/tmp/elsewhere"
+    #     the env var WAS set to a temp dir and a later rebinding does not un-set
+    #     it, so calling that unisolated is a false positive — and a false positive
+    #     is what gets a lint switched off (#2392/#2407).
+    # Both vanish if the question is asked where it is actually asked: what did this
+    # name hold at the line the assignment executes?
+    isolated: set[str] = set()
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
@@ -264,6 +292,15 @@ def _isolation_line(tree: ast.Module) -> int | None:
                 and _is_isolated_value(node.value, isolated)
             ):
                 return node.lineno
+        # Update AFTER testing this statement, so the test above sees the state as
+        # of the line it is on.
+        this_isolated = _is_isolated_value(node.value, isolated)
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name):
+                if this_isolated:
+                    isolated.add(tgt.id)
+                else:
+                    isolated.discard(tgt.id)
     return None
 
 # A seed is a WRITE. Two call shapes exist in this repo and both really occur:
@@ -312,6 +349,18 @@ def _ccd_root_names(tree: ast.Module) -> "set[str]":
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
+        # REBINDING REVOKES ROOTEDNESS, in source order. Without this a name kept
+        # its root status forever:
+        #     _ccd = mkdtemp() ; os.environ["CLAUDE_CONFIG_DIR"] = _ccd
+        #     _ccd = "/tmp/elsewhere"
+        #     (Path(_ccd)/"channels"/"discord"/"access.json").write_text(...)
+        # still recorded `_ccd` as the configured root, so the write classified as
+        # seeding the canonical discord file while at runtime it lands in
+        # /tmp/elsewhere and the real one stays absent — the same false CLEAN as
+        # the segment case, reached through the ROOT instead of the SEGMENT.
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name):
+                roots.discard(tgt.id)
         for tgt in node.targets:
             if (
                 isinstance(tgt, ast.Subscript)
@@ -392,11 +441,28 @@ def _literal_segment_names(tree: ast.Module) -> "dict[str, list[str]]":
         for c in ast.walk(node.value):
             if isinstance(c, ast.Constant) and isinstance(c.value, str):
                 segs.extend(x for x in c.value.split("/") if x)
-        if not segs:
-            continue
+        # A bare alias (`CHANNEL = OTHER`) carries the ALIASED name's segments.
+        # Only a bare Name is resolved: resolving names nested in arbitrary
+        # expressions would ADD segments, and more segments means more paths
+        # match a seed — that widens CLEAN, which is the unsafe direction.
+        if not segs and isinstance(node.value, ast.Name):
+            segs = list(out.get(node.value.id, []))
         for target in node.targets:
-            if isinstance(target, ast.Name):
+            if not isinstance(target, ast.Name):
+                continue
+            if segs:
                 out[target.id] = segs
+            else:
+                # REBINDING DROPS THE BINDING. Previously a rebind that yielded no
+                # literal `continue`d, leaving the stale segments in place:
+                #     OTHER = "slack" ; CHANNEL = "discord" ; CHANNEL = OTHER
+                # kept `CHANNEL -> discord`, so a test that writes only the SLACK
+                # access file classified CLEAN for a DISCORD bridge import — the
+                # canonical discord file is absent at runtime, so import-time
+                # resolution falls back to the operator's real allowlist
+                # (john-the-dev + qingyun-wu, #2429). Dropping fails CLOSED: an
+                # unprovable segment cannot satisfy the seed check.
+                out.pop(target.id, None)
     return out
 
 
@@ -449,6 +515,38 @@ def _expr_root_segments(expr: ast.AST, roots: "set[str]", rooted: "dict[str, lis
 
     visit(expr)
     return is_rooted, segs
+
+
+def _code_strings(tree: ast.Module) -> str:
+    """String constants that are CODE, excluding docstrings and bare string exprs.
+
+    Target selection used to regex the raw file text, so a file that merely
+    MENTIONED `discord-bridge.py` in prose was treated as a bridge-importing test
+    and required to be hermetic. That fired for real: tests/discord-read-forwarded
+    .test.py (#2458) names the bridge in its module docstring while importing only
+    `src/discord-read.py`, which resolves no channel config at import — a false
+    positive, and a false positive is what gets a lint disabled (#2392/#2407).
+
+    Comments are absent from the AST already; this drops docstrings too, so only
+    strings the module actually evaluates — a `spec_from_file_location(...)`
+    argument, a `REPO / "src" / "discord-bridge.py"` spine — can select a target.
+    """
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", None) or []
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                docstrings.add(id(body[0].value))
+        # A bare string statement anywhere is prose, not code.
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            docstrings.add(id(node.value))
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+            out.append(node.value)
+    return "\n".join(out)
 
 
 def _imported_bridge_channels(text: str) -> "set[str]":
@@ -844,6 +942,9 @@ def classify(path: Path) -> str | None:
         text = path.read_text(errors="ignore")
     except OSError:
         return None
+    # Cheap PRE-FILTER over raw text: a superset. Kept first so an unparseable file
+    # that never mentions a bridge still exits here rather than reaching the
+    # conservative VIOLATION below — that verdict is for files we had reason to scan.
     if not BRIDGE_IMPORT.search(text):
         return None
     if "exec_module" not in text and "exec(" not in text:
@@ -855,13 +956,19 @@ def classify(path: Path) -> str | None:
         # silently passing it. A file that cannot be analysed is not proven clean.
         return VIOLATION
 
+    # STRUCTURAL confirmation: only strings the module actually evaluates may select
+    # a target. A docstring or comment naming the bridge is prose, not an import.
+    code = _code_strings(tree)
+    if not BRIDGE_IMPORT.search(code):
+        return None
+
     exec_line, mod_var = _bridge_load_call(tree)
     if exec_line is None:
         return None
     iso_line = _isolation_line(tree)
     # Isolation only counts when it EXECUTES BEFORE the bridge import. Setting the env
     # afterwards leaves the module-level resolution already done against host config.
-    seed_line = _access_seed_line(tree, _imported_bridge_channels(text))
+    seed_line = _access_seed_line(tree, _imported_bridge_channels(code))
     # CLEAN needs BOTH, both before the load: the env override AND a seeded canonical
     # access.json. Env-var-only leaves channel_access_path() on its legacy real-home
     # fallback, which is the very read this gate exists to prevent.

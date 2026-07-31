@@ -17,6 +17,7 @@ Run: python3 tests/lint-hermetic-bridge-tests.test.py   (exit 0 pass / 1 fail)
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
 import contextlib
@@ -55,6 +56,110 @@ spec.loader.exec_module(m)
 """
 
 tmpdir = Path(tempfile.mkdtemp(prefix="lint-hermetic-test-"))
+
+# --- rebinding: every module-level name tracker must honor it (round 19) ----
+# One defect, three trackers. _rooted_segments was fixed in round 18; the
+# reviewers found the second; probing the AXIS rather than the reported case
+# found the other two. Each negative fixture writes only a decoy or points
+# elsewhere, so a CLEAN verdict would mean the canonical discord access.json is
+# absent at import and the bridge falls back to the operator's real allowlist.
+_HEAD = (
+    "import os, tempfile, pathlib\n"
+    "_ccd = tempfile.mkdtemp()\n"
+    'os.environ["CLAUDE_CONFIG_DIR"] = _ccd\n'
+)
+_SEED = (
+    "p.mkdir(parents=True, exist_ok=True)\n"
+    '(p / "access.json").write_text("{}")\n'
+)
+_VIA_ENV = 'p = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / CHANNEL\n'
+
+check(
+    "rebind via NAME drops the stale literal segment (john + qingyun, #2429)",
+    lint.classify(write(tmpdir, _HEAD
+        + 'OTHER = "slack"\nCHANNEL = "discord"\nCHANNEL = OTHER\n'
+        + _VIA_ENV + _SEED + IMPORTS_BRIDGE)) == lint.VIOLATION,
+)
+check(
+    "CONTROL reverse order: the alias resolves TO discord, so the seed is real",
+    lint.classify(write(tmpdir, _HEAD
+        + 'OTHER = "discord"\nCHANNEL = "slack"\nCHANNEL = OTHER\n'
+        + _VIA_ENV + _SEED + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "CONTROL an unrelated rebinding must not disturb a good binding",
+    lint.classify(write(tmpdir, _HEAD
+        + 'CHANNEL = "discord"\nUNRELATED = "slack"\nUNRELATED = CHANNEL\n'
+        + _VIA_ENV + _SEED + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "rebind to a non-literal drops the binding, failing CLOSED",
+    lint.classify(write(tmpdir, _HEAD
+        + 'CHANNEL = "discord"\nCHANNEL = os.environ.get("CH", "discord")\n'
+        + _VIA_ENV + _SEED + IMPORTS_BRIDGE)) == lint.VIOLATION,
+)
+check(
+    "rebinding the ROOT name revokes rootedness (_ccd_root_names)",
+    # _HEAD already set the env from _ccd, so isolation is VALID here and the
+    # verdict can only turn on rootedness — which is what makes this discriminating.
+    lint.classify(write(tmpdir, _HEAD
+        + '_ccd = "/tmp/somewhere-else"\n'
+        + 'p = pathlib.Path(_ccd) / "channels" / "discord"\n'
+        + _SEED + IMPORTS_BRIDGE)) == lint.VIOLATION,
+)
+check(
+    "CONTROL a root name never rebound stays rooted",
+    lint.classify(write(tmpdir, _HEAD
+        + 'p = pathlib.Path(_ccd) / "channels" / "discord"\n'
+        + _SEED + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+# The most severe of the three, because it defeats isolation outright rather than
+# mis-attributing one path: a rebound name kept its temp-dir status, so a file
+# pointing CLAUDE_CONFIG_DIR at the operator's REAL config dir read as isolated.
+check(
+    "rebound BEFORE the env assignment: not isolated (_isolation_line)",
+    lint._isolation_line(ast.parse(
+        "import os, tempfile\n"
+        "d = tempfile.mkdtemp()\n"
+        'd = "/Users/someone/.claude"\n'
+        'os.environ["CLAUDE_CONFIG_DIR"] = d\n')) is None,
+)
+# The control that caught a false positive I nearly shipped: a FINAL-STATE set
+# calls this unisolated, but the env var really was set to a temp dir and a later
+# rebinding does not un-set it. Isolation is a question about the line it is on.
+check(
+    "CONTROL rebound AFTER the env assignment is still isolated",
+    lint._isolation_line(ast.parse(
+        "import os, tempfile\n"
+        "_ccd = tempfile.mkdtemp()\n"
+        'os.environ["CLAUDE_CONFIG_DIR"] = _ccd\n'
+        '_ccd = "/tmp/elsewhere"\n')) is not None,
+)
+check(
+    "CONTROL an isolated name never rebound still isolates",
+    lint._isolation_line(ast.parse(
+        "import os, tempfile\n"
+        "d = tempfile.mkdtemp()\n"
+        'os.environ["CLAUDE_CONFIG_DIR"] = d\n')) is not None,
+)
+
+# --- target selection must be structural, not textual ----------------------
+# Selection used to regex the RAW file text, so a file that merely NAMED a bridge
+# in prose had to be hermetic. It fired on a real merged test (#2458) whose module
+# docstring mentions discord-bridge.py while it imports only src/discord-read.py.
+check(
+    "a prose-only mention of a bridge is not a bridge import",
+    lint.classify(write(tmpdir,
+        '"""Doc mentioning src/discord-bridge.py in prose."""\n'
+        "import importlib.util\n"
+        'spec = importlib.util.spec_from_file_location("d", "src/discord-read.py")\n'
+        "m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n")) is None,
+)
+check(
+    "CONTROL a real bridge path in CODE is still selected",
+    lint.classify(write(tmpdir, IMPORTS_BRIDGE)) == lint.VIOLATION,
+)
 
 # --- classify() ------------------------------------------------------------
 check(
