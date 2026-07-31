@@ -18,12 +18,28 @@ import { execFileSync } from 'node:child_process';
 // a host recording still starts and stops but NO *-narrated.mov is ever produced:
 // the narration is captured and then silently discarded at the mux.
 //
-// Same candidate-list shape as record.py in this skill and the rest of the repo
-// (src/agent-api.py's tmux lookup, health-check.py's _resolve_tmux_bin): try the
-// known prefixes, then fall back to a bare name so PATH resolution still applies.
-// Kept local rather than imported — this skill is self-contained by design.
-const FFMPEG = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', 'ffmpeg']
-	.find((p) => !p.includes('/') || existsSync(p)) ?? 'ffmpeg';
+// Resolve through PATH rather than a candidate list of absolute paths — the TS
+// half of the same change made in record.py, kept identical on purpose so the
+// two halves of one skill cannot drift.
+//
+// The list this replaces named `/opt/homebrew/bin/ffmpeg` and
+// `/usr/local/bin/ffmpeg` literally, which REVIEW.md's hardcoded-path scan
+// denies. `command -v` is the shell equivalent of Python's `shutil.which()`
+// (Node has no built-in), and it resolves via PATH with no machine-specific
+// literal left to exempt.
+//
+// Falls back to the bare name so a missing ffmpeg fails at exec time with a
+// readable error, exactly as the old final candidate did.
+const FFMPEG = (() => {
+	try {
+		const found = execFileSync('/usr/bin/env', ['sh', '-c', 'command -v ffmpeg'], {
+			encoding: 'utf8',
+		}).trim();
+		return found || 'ffmpeg';
+	} catch {
+		return 'ffmpeg';
+	}
+})();
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 const SCREEN_REC_PID = '/tmp/sutando-screen-record.pid';

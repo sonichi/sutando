@@ -2,6 +2,7 @@
 """Screen recording via macOS screencapture -v. Stores PID in a file for stop/status."""
 
 import subprocess
+import shutil
 import signal
 import sys
 import os
@@ -16,19 +17,22 @@ import json
 # `except Exception: pass`, so the silence warning it exists to emit would itself
 # never fire. Only start() surfaced anything, as a raw FileNotFoundError.
 #
-# Same shape the rest of the repo already uses for homebrew binaries (agent-api's
-# tmux lookup, health-check's _resolve_tmux_bin and _BRIDGE_INTERP_CANDIDATES,
-# skills/voice-agent-test-harness's `rec`): try the known prefixes, then fall back
-# to a bare name so PATH resolution still applies. A bare name is always a valid
-# candidate; absolute paths only when they exist.
+# Resolve through PATH. `shutil.which()` is the house pattern already used by
+# src/agent-api.py, src/core-input-watch.py and src/health-check.py.
+#
+# An earlier version of this fix used a candidate list — /opt/homebrew/bin, then
+# /usr/local/bin, then a bare name. That still named machine-specific paths
+# literally, so REVIEW.md's hardcoded-path scan denied it and CI stayed red; it
+# also undercut this file's own stated intent, encoding "Apple Silicon Homebrew,
+# then Intel Homebrew, then hope" rather than actually resolving. which() needs
+# no scanner exemption because nothing machine-specific is left to exempt.
 #
 # Deliberately local rather than imported from src/: this skill is standalone
 # (stdlib only, no main-repo imports) and must keep working against any checkout.
-FFMPEG = next(
-    (_p for _p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg")
-     if os.path.sep not in _p or os.path.exists(_p)),
-    "ffmpeg",
-)
+#
+# Falls back to the bare name so a missing ffmpeg fails at exec time with a
+# readable error, exactly as the old final candidate did.
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
 PID_FILE = "/tmp/sutando-screen-record.pid"
 INDICATOR_PID_FILE = "/tmp/sutando-rec-indicator.pid"
