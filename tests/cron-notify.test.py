@@ -40,6 +40,15 @@ def main() -> int:
           cn.is_attention_worthy("error", "nothing new but the cron crashed"))
     check("empty summary digest still pings (no empty-signal match)",
           cn.is_attention_worthy("digest", ""))
+    # Mixed summary: real news + an INCIDENTAL empty-signal clause must still
+    # ping — the old `sig in s` substring gate silently swallowed these (the
+    # owner_action case is the one that must never be swallowed).
+    check("mixed digest: real news + incidental empty clause still pings",
+          cn.is_attention_worthy("digest", "3 PRs merged; nothing new on the Slack storm"))
+    check("mixed owner_action: real ask + 'no changes' aside still pings",
+          cn.is_attention_worthy("owner_action", "approve #2446; no changes needed elsewhere"))
+    check("whole-summary empty digest is still downgraded",
+          not cn.is_attention_worthy("digest", "nothing new"))
 
     # ── deep_link ────────────────────────────────────────────────────────
     check("room-only link",

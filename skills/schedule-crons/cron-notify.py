@@ -55,10 +55,27 @@ def is_attention_worthy(kind: str, summary: str = "") -> bool:
         return False
     if kind == "error":
         return True
-    s = (summary or "").lower()
-    if any(sig in s for sig in _EMPTY_SIGNALS):
-        return False
-    return True
+    import re
+
+    # Downgrade only when the summary reads as "nothing happened" AS A WHOLE —
+    # i.e. every clause is just an empty-signal phrase — not when it merely
+    # contains one as an incidental aside. Match signals against whole clauses
+    # (equality), not `sig in s` (substring): the substring form silently
+    # swallowed real owner_action/digest pings whose summary carried an
+    # unrelated empty clause, e.g. "approve #2446; no changes needed elsewhere".
+    s = " ".join((summary or "").split()).lower()
+    if not s:
+        return True
+    for clause in re.split(r"[;,.]|—", s):
+        c = clause.strip().strip(".!?,;:").strip()
+        # tolerate a trailing temporal qualifier: "nothing new this pass"
+        c = re.sub(
+            r"\s+(?:this|last|next)?\s*"
+            r"(?:pass|tick|run|cycle|time|today|tonight|now)$",
+            "", c).strip()
+        if c and c not in _EMPTY_SIGNALS:
+            return True   # a substantive clause → attention-worthy
+    return False          # every clause is an empty signal → downgrade
 
 
 def deep_link(room_id: str, event_id: str = "", via: str = "ag2.space") -> str:
