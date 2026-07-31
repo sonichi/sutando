@@ -59,11 +59,20 @@ def _expand_magnitude(text: str) -> str | None:
 
 
 def _strip_currency_prefix(text: str) -> str:
-    """Strip one supported currency wrapper only around a numeric core."""
-    match = _CURRENCY_PREFIX.match(text)
+    """Strip one supported currency wrapper only around a numeric core.
+
+    A leading minus may sit BEFORE the symbol ("-$1,000") as well as after it
+    ("$-1,000") — peel the sign, match the wrapper on the remainder, reattach
+    (bassil CR 2026-07-31: the before-symbol form fell through to list
+    classification and was re-spaced into "-$1, 000")."""
+    sign = ""
+    body = text
+    if body.startswith("-"):
+        sign, body = "-", body[1:]
+    match = _CURRENCY_PREFIX.match(body)
     if not match:
         return text
-    core = text[match.end():]
+    core = sign + body[match.end():]
     numeric = core[:-1] if core.endswith("%") else core
     if (
         _MAGNITUDE_RE.match(numeric)
@@ -146,7 +155,9 @@ def _infer_kind(text: str) -> str:
     core = _strip_currency_prefix(s)
     # An unknown ISO-shaped wrapper is not a list just because its amount has a
     # grouping comma. Preserve it unchanged rather than manufacture "AUD 1, 000".
-    if core == s and re.match(r"^[A-Z]{3}\s+", s):
+    # Sign-aware for the same reason as _strip_currency_prefix: "-AUD 1,000"
+    # must stay a preserved string, not become the list ["-AUD 1", "000"].
+    if core == s and re.match(r"^-?[A-Z]{3}\s+", s):
         return "string"
     if core[-1:] == "%":
         core = core[:-1]

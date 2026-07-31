@@ -80,6 +80,18 @@ check("currency-symbol-magnitude", nz.normalize_answer("$100 million"), "1000000
 check("currency-euro-magnitude-number",
       nz.normalize_answer("€100 million", kind="number"), "100000000")
 check("currency-grouped-not-list", nz._infer_kind("$1,000"), "number")
+# Signed currency: minus BEFORE the symbol (bassil CR 2026-07-31 — previously
+# list-mangled to "-$1, 000"), plus the already-working after-symbol mirror
+# pinned so the sign-peel refactor can't regress it.
+check("currency-negative-before-symbol", nz.normalize_answer("-$1,000"), "-1000")
+check("currency-negative-before-symbol-number",
+      nz.normalize_answer("-$1,000", kind="number"), "-1000")
+check("currency-negative-before-code", nz.normalize_answer("-USD 1,000"), "-1000")
+check("currency-negative-magnitude", nz.normalize_answer("-$100 million"), "-100000000")
+check("currency-negative-after-symbol", nz.normalize_answer("$-1,000"), "-1000")
+check("currency-negative-not-list", nz._infer_kind("-$1,000"), "number")
+check("currency-negative-unknown-code-untouched",
+      nz.normalize_answer("-AUD 1,000"), "-AUD 1,000")
 check("currency-code-grouped-not-list", nz._infer_kind("USD 1,000"), "number")
 check("unsupported-currency-wrapper-unchanged",
       nz.normalize_answer("AUD 1,000", kind="number"), "AUD 1,000")
