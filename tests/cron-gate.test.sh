@@ -10,6 +10,7 @@ GATE="$REPO/scripts/cron-gate.sh"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 mkdir -p "$TMPDIR/tasks"
+mkdir -p "$TMPDIR/results"
 
 # SUTANDO_TEST_MODE=1 lets resolve_workspace() honor SUTANDO_WORKSPACE silently
 # (without emitting the v0.8 deprecation warning that contaminates captured output).
@@ -35,6 +36,31 @@ case "$out" in
   *) : ;;
 esac
 ok "queued task defers and does not run wrapped command"
+rm -f "$TMPDIR/tasks/task-1234567890123.txt"
+
+# --- completed owner task → runs despite delayed task archival ---------------
+touch "$TMPDIR/tasks/task-1234567890123.txt"
+touch "$TMPDIR/results/task-1234567890123.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-completed echo 'ran-completed-ok' 2>&1)"
+[ "$out" = "ran-completed-ok" ] || fail "completed task: expected 'ran-completed-ok', got '$out'"
+ok "completed owner task with matching result does not trigger deferral"
+
+# --- completed task plus a genuinely queued task → still defers --------------
+touch "$TMPDIR/tasks/task-2222222222222.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-completed-plus-queued echo 'should-not-run' 2>&1)"
+case "$out" in
+  *"deferring test-completed-plus-queued"*) : ;;
+  *) fail "completed+queued: expected deferral, got '$out'" ;;
+esac
+case "$out" in
+  *"should-not-run"*) fail "completed+queued: wrapped command ran" ;;
+  *) : ;;
+esac
+ok "genuinely queued task still defers alongside completed task"
+rm -f \
+  "$TMPDIR/tasks/task-1234567890123.txt" \
+  "$TMPDIR/tasks/task-2222222222222.txt" \
+  "$TMPDIR/results/task-1234567890123.txt"
 
 # --- tasks/ missing entirely → runs wrapped command --------------------------
 rm -rf "$TMPDIR/tasks"
@@ -95,4 +121,4 @@ set -e
 ok "wrapped command exit code propagates via exec"
 
 echo
-echo "OK — 9/9 cron-gate tests passed"
+echo "OK — 11/11 cron-gate tests passed"

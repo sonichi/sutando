@@ -35,8 +35,8 @@ reason="$1"
 shift
 
 # Defer if any OWNER task-*.txt is queued (top-level only; archive/processed
-# subdirs don't count). find is safer than ls + glob for empty-dir /
-# non-existent-dir.
+# subdirs don't count). A matching result means the task has already completed;
+# do not let a delayed task-archival cleanup starve maintenance crons forever.
 #
 # Exclude task-cron-*.txt: those are emitted by src/cron-runner.py (the launchd
 # cron owner) as its delivery vehicle for `launchd: true` entries, carrying
@@ -46,9 +46,18 @@ shift
 # file every fire, silently and permanently. This is the gate-side (root) half
 # of the fix; the eligibility-side half (don't migrate gated entries) landed in
 # reconcile_launchd.py.
-if [ -d "$WORKSPACE/tasks" ] && [ -n "$(find "$WORKSPACE/tasks" -maxdepth 1 -name 'task-*.txt' ! -name 'task-cron-*.txt' -print -quit 2>/dev/null)" ]; then
-  echo "cron-gate: owner tasks queued — deferring $reason (will retry next fire)"
-  exit 0
+if [ -d "$WORKSPACE/tasks" ]; then
+  shopt -s nullglob
+  for task_file in "$WORKSPACE"/tasks/task-*.txt; do
+    task_name="${task_file##*/}"
+    case "$task_name" in
+      task-cron-*.txt) continue ;;
+    esac
+    if [ ! -f "$WORKSPACE/results/$task_name" ]; then
+      echo "cron-gate: owner tasks queued — deferring $reason (will retry next fire)"
+      exit 0
+    fi
+  done
 fi
 
 exec "$@"
