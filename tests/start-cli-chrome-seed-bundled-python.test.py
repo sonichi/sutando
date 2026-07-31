@@ -14,15 +14,19 @@ The fix resolves the interpreter into `$PY` (SUTANDO_PY → bundled
 `<engine>/runtime/python` → system python3) and uses `"$PY"` for the seed, with
 a `"$PY" -c 'import sys'` guard (proves it RUNS, not just that a name exists).
 
-This test drives the ACTUAL start-cli.sh (source-tied) in a simulated clean-Mac
-env: a working interpreter in SUTANDO_PY, and a `python3` stub on PATH that
-mimics the CLT shim (emits the notice, returns nothing, exit 1). It asserts the
-seed still writes `hasCompletedClaudeInChromeOnboarding: true`.
+This test is SOURCE-TIED, not a full launch of start-cli.sh: it extracts the
+seed's PY heredoc verbatim from the script and reproduces the script's own
+resolver + guard in a small shell harness, then runs the extracted seed under a
+simulated clean-Mac env — a working interpreter in SUTANDO_PY, and a `python3`
+stub on PATH that mimics the CLT shim (emits the notice, returns nothing, exit
+1). It asserts the seed writes `hasCompletedClaudeInChromeOnboarding: true`.
 
-To keep the run hermetic and fast we stop the script right after the seed block
-by pointing it at a config dir and using SUTANDO_TMUX_SOCKET so nothing real is
-launched; we only assert the seeded file. If the guard regresses to bare
-`python3`, the stub wins on PATH and the flag is never written — the test fails.
+Drift is caught by `_resolver_and_guard_snippet()` and the verbatim heredoc
+extraction — if start-cli.sh's resolver, guard, or seed block changes shape,
+those assertions fail. If the guard regresses to bare `python3`, the stub wins on
+PATH under the reproduced harness and the flag is never written — the test fails.
+(A full end-to-end launch is avoided so the run stays hermetic and fast — it
+would spawn tmux/claude and need a real bundled runtime tree.)
 
 Run: python3 tests/start-cli-chrome-seed-bundled-python.test.py
 """
