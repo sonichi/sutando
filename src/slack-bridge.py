@@ -1232,7 +1232,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> None:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> "tuple[str, str]":
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -1247,7 +1247,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     readability suffers above ~4k).
     """
     if not text:
-        return
+        return channel, ""
 
     parsed = parse_markers(text)
     clean_text = parsed.body
@@ -1364,6 +1364,11 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             )
         except Exception:  # pragma: no cover  (defensive: result_audit import is safe + record() never raises)
             pass
+
+    # Return the resolved route + marker-free body so callers can report what
+    # actually happened. In particular, proactive delivery starts with an
+    # owner-DM fallback but `[channel:]` may redirect the real post elsewhere.
+    return channel, clean_text
 
 
 def _record_skip_audit(task_id: str, skip_value: str) -> None:
@@ -1520,9 +1525,14 @@ def result_watcher():
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
-                            _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
+                            delivered_channel, delivered_text = _send_reply(
+                                dm_channel, None, text, access_tier="owner"
+                            )
                             mark_proactive_delivered(STATE_DIR, delivery_id)
-                            print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
+                            print(
+                                f"  [proactive] sent to {delivered_channel}: {delivered_text[:80]}",
+                                flush=True,
+                            )
                         except Exception as e:
                             print(f"  [proactive] failed: {e}", flush=True)
                     else:

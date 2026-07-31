@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Regression tests for recreated proactive-result delivery IDs."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -119,11 +121,17 @@ def main():
     bridge.ACCESS_FILE = access_file
     access_file.write_text(json.dumps({"allowFrom": ["owner-id"]}))
     proactive = bridge.RESULTS_DIR / "proactive-same-slot.txt"
-    proactive.write_text("first body")
-    watcher = threading.Thread(target=bridge.result_watcher, daemon=True)
-    watcher.start()
-    time.sleep(0.3)
+    proactive.write_text("[channel: C0TARGET]\nfirst body")
+    watcher_log = io.StringIO()
+    with contextlib.redirect_stdout(watcher_log):
+        watcher = threading.Thread(target=bridge.result_watcher, daemon=True)
+        watcher.start()
+        time.sleep(0.3)
     assert len(bridge.app.client.calls) == 1
+    assert bridge.app.client.calls[0]["channel"] == "C0TARGET"
+    assert bridge.app.client.calls[0]["text"] == "first body"
+    assert "[proactive] sent to C0TARGET: first body" in watcher_log.getvalue()
+    assert "[proactive] sent to owner-id" not in watcher_log.getvalue()
     proactive.write_text("recreated body")
     time.sleep(1.2)
     assert len(bridge.app.client.calls) == 1
@@ -134,7 +142,7 @@ def main():
     bridge = (REPO / "src" / "slack-bridge.py").read_text()
     check_pos = bridge.index("proactive_was_delivered(STATE_DIR, delivery_id)")
     claim_pos = bridge.index("f.rename(claim)", check_pos)
-    send_pos = bridge.index("_send_reply(dm_channel", claim_pos)
+    send_pos = bridge.index("delivered_channel, delivered_text = _send_reply(", claim_pos)
     mark_pos = bridge.index("mark_proactive_delivered(STATE_DIR, delivery_id)", send_pos)
     assert check_pos < claim_pos < send_pos < mark_pos
 
