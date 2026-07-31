@@ -323,7 +323,7 @@ def _ccd_root_names(tree: ast.Module) -> "set[str]":
     return roots
 
 
-def _rooted_segments(tree: ast.Module) -> "dict[str, set[str]]":
+def _rooted_segments(tree: ast.Module) -> "dict[str, list[str]]":
     """Module-level names whose value is a path ROOTED at the configured config dir,
     mapped to the literal path segments accumulated along the way.
 
@@ -340,7 +340,7 @@ def _rooted_segments(tree: ast.Module) -> "dict[str, set[str]]":
     """
     roots = _ccd_root_names(tree)
     consts = _literal_segment_names(tree)
-    rooted: dict[str, set[str]] = {}
+    rooted: dict[str, list[str]] = {}
     while True:
         grew = False
         for node in tree.body:
@@ -353,55 +353,84 @@ def _rooted_segments(tree: ast.Module) -> "dict[str, set[str]]":
                 if not isinstance(target, ast.Name):
                     continue
                 prev = rooted.get(target.id)
-                if prev is None or not segs <= prev:
-                    rooted[target.id] = segs | (prev or set())
+                if prev is None or len(segs) > len(prev):
+                    rooted[target.id] = segs
                     grew = True
         if not grew:
             return rooted
 
 
-def _literal_segment_names(tree: ast.Module) -> "dict[str, set[str]]":
+def _literal_segment_names(tree: ast.Module) -> "dict[str, list[str]]":
     """Module-level names bound to plain string constants, mapped to those strings.
 
     A path segment is often factored out (`ACCESS = "access.json"; p = cfg / ACCESS`).
     Such a name contributes SEGMENTS but never ROOTEDNESS — it says nothing about which
     directory the path starts from, so it cannot rescue an unrooted write.
     """
-    out: dict[str, set[str]] = {}
+    out: dict[str, list[str]] = {}
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        segs = {
-            c.value for c in ast.walk(node.value)
-            if isinstance(c, ast.Constant) and isinstance(c.value, str)
-        }
+        segs: list[str] = []
+        for c in ast.walk(node.value):
+            if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                segs.extend(x for x in c.value.split("/") if x)
         if not segs:
             continue
         for target in node.targets:
             if isinstance(target, ast.Name):
-                out.setdefault(target.id, set()).update(segs)
+                out[target.id] = segs
     return out
 
 
-def _expr_root_segments(expr: ast.AST, roots: "set[str]", rooted: "dict[str, set[str]]",
-                        consts: "dict[str, set[str]] | None" = None):
+def _expr_root_segments(expr: ast.AST, roots: "set[str]", rooted: "dict[str, list[str]]",
+                        consts: "dict[str, list[str]] | None" = None):
     """(is_rooted_at_configured_ccd, literal segments) for a path expression."""
     consts = consts or {}
     is_rooted = False
-    segs: set[str] = set()
-    for c in ast.walk(expr):
-        if _is_ccd_ref(c):
+    segs: list[str] = []
+
+    def visit(node: ast.AST) -> None:
+        # ORDER MATTERS. `ast.walk` is breadth-first and loses the left-to-right
+        # sequence of a `root / "channels" / "discord" / "access.json"` chain, so the
+        # old set-valued result accepted any PERMUTATION — a rooted
+        # `access.json/channels/discord` classified as the canonical seed while the
+        # real allowlist was never created (john-the-dev, #2429). Walking the `/`
+        # spine structurally is what makes the exact suffix checkable.
+        nonlocal is_rooted
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            visit(node.left)
+            visit(node.right)
+            return
+        if _is_ccd_ref(node):
             is_rooted = True
-        elif isinstance(c, ast.Name):
-            if c.id in roots:
+            return
+        if isinstance(node, ast.Name):
+            if node.id in roots:
                 is_rooted = True
-            elif c.id in rooted:
+            elif node.id in rooted:
                 is_rooted = True
-                segs |= rooted[c.id]
-            elif c.id in consts:
-                segs |= consts[c.id]
-        elif isinstance(c, ast.Constant) and isinstance(c.value, str):
-            segs.add(c.value)
+                segs.extend(rooted[node.id])
+            elif node.id in consts:
+                segs.extend(consts[node.id])
+            return
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                segs.extend(x for x in node.value.split("/") if x)
+            return
+        if isinstance(node, ast.Attribute) and node.attr == "parent":
+            # `.parent` DROPS the last component. Order-blind matching never had to
+            # model this; an ordered suffix check does, or the repo's own
+            # `p = …/access.json; p.parent.mkdir(parents=True)` idiom stops
+            # resolving to the channel DIRECTORY and reads as a violation.
+            visit(node.value)
+            if segs:
+                segs.pop()
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(expr)
     return is_rooted, segs
 
 
@@ -535,6 +564,44 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
                 if _a.name in _MAKEDIRS_FUNCS:
                     makedirs_names.add(_a.asname or _a.name)
 
+    # An IMPORTED name is not necessarily still that module at the call site.
+    # `import os` … `os = Fake()` … `os.makedirs(p)` passed the receiver check
+    # while creating nothing (qingyun-wu, #2429). Any name that is REBOUND
+    # anywhere — assignment, for-target, with-as, def/class, parameter — stops
+    # vouching for anything. Conservative on purpose: a shadowed alias reads as
+    # a violation, and this gate's documented stance is to under-approximate
+    # CLEAN, so a false positive costs a grandfather entry while a false CLEAN
+    # costs the operator's real allowlist.
+    _shadowed: "set[str]" = set()
+    for _n in ast.walk(tree):
+        _targets = []
+        if isinstance(_n, ast.Assign):
+            _targets = list(_n.targets)
+        elif isinstance(_n, (ast.AugAssign, ast.AnnAssign)):
+            _targets = [_n.target]
+        elif isinstance(_n, ast.For):
+            _targets = [_n.target]
+        elif isinstance(_n, ast.withitem):
+            _targets = [_n.optional_vars] if _n.optional_vars else []
+        elif isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _shadowed.add(_n.name)
+        # ONLY a bare Name target rebinds the name. `os.environ[k] = v` has a
+        # Subscript target whose base happens to be the Name `os` — walking into
+        # it would declare `os` shadowed and turn every correctly-isolated test
+        # into a violation, since setting CLAUDE_CONFIG_DIR is the first thing
+        # they all do. Tuple/List/Starred are unpacked one level for `a, b = ...`.
+        _pending = [t for t in _targets if t is not None]
+        while _pending:
+            _t = _pending.pop()
+            if isinstance(_t, ast.Name):
+                _shadowed.add(_t.id)
+            elif isinstance(_t, (ast.Tuple, ast.List)):
+                _pending.extend(_t.elts)
+            elif isinstance(_t, ast.Starred):
+                _pending.append(_t.value)
+    os_aliases -= _shadowed
+    makedirs_names -= _shadowed
+
     def _path_channel(expr: ast.AST, *, want_access_json: bool) -> "str | None":
         """The channel this path expression belongs to under the CONFIGURED config dir.
 
@@ -544,28 +611,29 @@ def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
         is_rooted, segs = _expr_root_segments(expr, roots, rooted, consts)
         if not is_rooted:
             return None
-        # EXACT component identity, not substring membership. `"channels" in seg`
-        # accepted a rooted `notchannels/discord/access.json.bak` as the canonical
-        # seed and `"access.json" in seg` accepted the `.bak` suffix, so a file that
-        # never touched the real allowlist classified `clean` (qingyun-wu, #2429).
-        # A segment may itself carry several components ("channels/discord"), so
-        # flatten before comparing.
-        #
-        # ORDER IS NOT ENFORCED, deliberately and with a known limit: segments arrive
-        # as an unordered SET because a path assembled across assignments
-        # (`c = root / "channels" / "discord"` … `c / "access.json"`) loses sequence in
-        # `_expr_root_segments`. Exact identity is what rejects both reported
-        # false-CLEANs — neither needs ordering — and making the resolver
-        # order-preserving is a wider change than this fix. The residual gap is a path
-        # holding all three components in a nonsensical order; it is strictly smaller
-        # than the substring gap it replaces.
-        comps = {c for seg in segs for c in str(seg).split("/") if c}
-        if "channels" not in comps:
-            return None
-        if want_access_json and "access.json" not in comps:
-            return None
-        for ch in ("discord", "slack", "telegram"):
-            if ch in comps:
+        # EXACT components in the EXACT canonical ORDER. Two false CLEANs came from
+        # weakening this (both qingyun-wu / john-the-dev, #2429):
+        #   substring membership -> a rooted `notchannels/discord/access.json.bak`
+        #                           matched on "channels" and "access.json"
+        #   unordered set        -> any PERMUTATION matched, so a rooted
+        #                           `access.json/channels/discord` classified clean
+        #                           while the real allowlist was never created
+        # `_expr_root_segments` now preserves left-to-right order, so the canonical
+        # run `channels/<bridge>/access.json` is checkable as a contiguous sequence.
+        comps = list(segs)
+        for i in range(len(comps) - 1):
+            if comps[i] != "channels":
+                continue
+            ch = comps[i + 1]
+            if ch not in ("discord", "slack", "telegram"):
+                continue
+            rest = comps[i + 2:]
+            if want_access_json:
+                # access.json must be the FINAL component, so `.bak`/`.tmp`
+                # siblings of the real file are never mistaken for it.
+                if rest == ["access.json"]:
+                    return ch
+            elif not rest:
                 return ch
         return None
 

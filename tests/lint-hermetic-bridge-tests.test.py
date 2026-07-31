@@ -775,6 +775,71 @@ check(
         + IMPORTS_BRIDGE)) != lint.CLEAN,
 )
 
+# --- round-16 findings (qingyun-wu / john-the-dev, #2429) -------------------
+# Both are the same shape AGAIN: a check that accepted a weaker property than the
+# one it needs. Order-blindness accepted permutations; an imported NAME was
+# trusted after it had been rebound to something else entirely.
+check(
+    "permutation `access.json/channels/discord` is NOT the canonical seed",
+    lint.classify(write(tmpdir,
+        _ENV
+        + f'_wrong = {_CCD_P} / "access.json" / "channels" / "discord"\n'
+        'os.makedirs(_wrong, exist_ok=True)\n'
+        '(_wrong / "seed.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) != lint.CLEAN,
+    "component ORDER is load-bearing: the canonical run is channels/<bridge>/access.json",
+)
+check(
+    "an `os` alias REBOUND to a fake no longer vouches for the parent",
+    lint.classify(write(tmpdir,
+        'import os, tempfile, pathlib\n'
+        'class Fake:\n'
+        '    def makedirs(self, *a, **k): pass\n'
+        'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+        f'_p = {_CCD_P} / "channels" / "discord"\n'
+        'os = Fake()\n'
+        'try:\n'
+        '    os.makedirs(_p)\n'
+        '    (_p / "access.json").write_text("{}")\n'
+        'except FileNotFoundError:\n'
+        '    pass\n'
+        + IMPORTS_BRIDGE)) != lint.CLEAN,
+    "import-time recognition is not call-site truth",
+)
+# Anti-vacuity controls. Ordering and shadow-detection are both easy to overshoot
+# into "nothing is ever clean" — these pin the legitimate idioms this repo uses.
+check(
+    "control: multi-assignment canonical seed is STILL clean",
+    lint.classify(write(tmpdir,
+        _ENV
+        + f'_c = {_CCD_P} / "channels" / "discord"\n'
+        'os.makedirs(_c, exist_ok=True)\n'
+        '(_c / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "control: the `p.parent.mkdir(parents=True)` idiom is STILL clean",
+    lint.classify(write(tmpdir,
+        _ENV
+        + f'_p = {_CCD_P} / "channels" / "discord" / "access.json"\n'
+        '_p.parent.mkdir(parents=True, exist_ok=True)\n'
+        '_p.write_text("{}")\n'
+        + IMPORTS_BRIDGE)) == lint.CLEAN,
+    "`.parent` DROPS a component — an ordered suffix check has to model that",
+)
+check(
+    "control: `os.environ[...] = ...` does NOT count as rebinding `os`",
+    lint.classify(write(tmpdir,
+        'import os, tempfile, pathlib\n'
+        'import os as _os\n'
+        'os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
+        f'_c = {_CCD_P} / "channels" / "discord"\n'
+        '_os.makedirs(_c, exist_ok=True)\n'
+        '(_c / "access.json").write_text("{}")\n'
+        + IMPORTS_BRIDGE)) == lint.CLEAN,
+    "a Subscript target whose base is `os` is not a rebinding of the name `os`",
+)
+
 # --- scan() ----------------------------------------------------------------
 scanned = lint.scan(["tests/lint-hermetic-bridge-tests.test.py"])
 check("scan(): skips out-of-scope files", scanned == {}, str(scanned))
