@@ -21,6 +21,8 @@ import importlib.util
 import io
 import os
 import sys
+import json
+import pathlib
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -40,8 +42,20 @@ except ImportError:
     print("SKIP — discord.py not importable under any known interpreter")
     sys.exit(0)
 
-os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="sutando-ppg-test-")
+# Isolate CLAUDE_CONFIG_DIR *and* seed the canonical access.json BEFORE the
+# bridge is exec'd (qingyun P1 on #2157). The env var alone is not isolation:
+# discord-bridge.py resolves channel config at MODULE level, and
+# channel_access_path() falls back to the LEGACY real-home
+# ~/.claude/channels/discord/access.json when the canonical path is missing —
+# so an empty temp root still reads the operator's real allowlist and emits the
+# deprecation warning. This is the exact rule scripts/lint-hermetic-bridge-tests.py
+# enforces; my own test was violating my own gate.
+_cfg_root = tempfile.mkdtemp(prefix="sutando-ppg-test-")
+os.environ["CLAUDE_CONFIG_DIR"] = _cfg_root
 os.environ.setdefault("DISCORD_BOT_TOKEN", "faketoken-for-tests")
+_chan_dir = pathlib.Path(_cfg_root) / "channels" / "discord"
+_chan_dir.mkdir(parents=True, exist_ok=True)
+(_chan_dir / "access.json").write_text(json.dumps({"allowFrom": [], "groups": {}}))
 
 spec = importlib.util.spec_from_file_location("discordbridge_ppg", REPO / "src" / "discord-bridge.py")
 mod = importlib.util.module_from_spec(spec)
@@ -69,19 +83,19 @@ class FakeChannel:
 
 
 class FakeAuthor:
-    def __init__(self, uid=999001):
+    def __init__(self, uid=999001, bot=True):
         self.id = uid
-        self.bot = True  # a peer node posting placeholders
+        self.bot = bot  # True = peer node posting placeholders; False = human
 
     def __str__(self):
-        return "peer-node#0001"
+        return "peer-node#0001" if self.bot else "chi#1234"
 
 
 class FakeMsg:
-    def __init__(self, content, channel):
+    def __init__(self, content, channel, bot=True):
         self.content = content
         self.channel = channel
-        self.author = FakeAuthor()
+        self.author = FakeAuthor(bot=bot)
         self.mentions: list = []
         self.role_mentions: list = []
         self.embeds: list = []
@@ -92,7 +106,7 @@ class FakeMsg:
         self.id = 777001
 
 
-def _drive(content, tasks_dir):
+def _drive(content, tasks_dir, bot=True):
     """Run _handle_discord_message on a channel msg with the given content;
     return (captured_stdout, task_files_written)."""
     fake_client = type("_C", (), {"user": object()})()
@@ -103,7 +117,7 @@ def _drive(content, tasks_dir):
          patch.object(mod, "load_channel_config", lambda cid: (False, set())), \
          contextlib.redirect_stdout(buf):
         try:
-            asyncio.run(mod._handle_discord_message(FakeMsg(content, FakeChannel())))
+            asyncio.run(mod._handle_discord_message(FakeMsg(content, FakeChannel(), bot=bot)))
         except Exception:
             # Past the guard the real ingest path may hit unmet deps; we only
             # assert guard behavior (drop vs not-dropped-by-this-guard) here.
@@ -136,6 +150,33 @@ with tempfile.TemporaryDirectory() as td:
           "[skip] progress-stream placeholder" not in out)
     check("detector agrees: a real task is not a placeholder",
           mod.progress_stream.is_progress_placeholder(REAL_TASK) is False)
+
+# --- HUMAN control (qingyun P1 on #2157) ------------------------------------
+# The exact placeholder SHAPE from a HUMAN author must survive. Before the fix
+# the guard keyed on text alone, so an owner/team message reading
+# "⏳ deploy the release (9s)" was silently discarded before task creation —
+# a valid human task lost, with only a skip log to show for it.
+HUMAN_LOOKALIKE = "⏳ deploy the release (9s)"
+with tempfile.TemporaryDirectory() as td:
+    tasks = Path(td) / "tasks"
+    tasks.mkdir()
+    out, _ = _drive(HUMAN_LOOKALIKE, tasks, bot=False)
+    check("HUMAN message matching the placeholder shape is NOT dropped",
+          "[skip] progress-stream placeholder" not in out,
+          "guard must key on author.bot, not on text shape alone")
+    # The detector still recognises the shape — proving the fix is the SCOPING,
+    # not a weakened detector (which would reopen the flood this PR closes).
+    check("detector still classifies that exact text as a placeholder",
+          mod.progress_stream.is_progress_placeholder(HUMAN_LOOKALIKE) is True,
+          "if this flips, the fix loosened detection instead of scoping it")
+
+# And the same text from a BOT is still dropped — the flood fix is intact.
+with tempfile.TemporaryDirectory() as td:
+    tasks = Path(td) / "tasks"
+    tasks.mkdir()
+    out, written = _drive(HUMAN_LOOKALIKE, tasks, bot=True)
+    check("same text from a BOT is still dropped (flood fix intact)",
+          "[skip] progress-stream placeholder" in out and not written)
 
 print()
 if failures:

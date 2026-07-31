@@ -2718,8 +2718,14 @@ async def _handle_discord_message(message, force=False):
         # self-inflicted flood. These carry no work for us; drop them regardless
         # of requireMention. Tight-anchored detector (see progress_stream) so a
         # real task containing an hourglass emoji is not misclassified.
-        if progress_stream.is_progress_placeholder(message.content):
-            print(f"  [skip] progress-stream placeholder from {message.author}", flush=True)
+        # Scoped to BOT authors (qingyun P1 on #2157). The shape alone is not a
+        # safe discriminator: a human owner/team message whose entire body happens
+        # to read "⏳ deploy the release (9s)" would otherwise be silently dropped
+        # before task creation — a valid human task lost with only a skip log.
+        # Only a peer NODE emits these, so author.bot is the real signal and the
+        # text shape is the secondary filter, not the primary one.
+        if getattr(message.author, "bot", False) and progress_stream.is_progress_placeholder(message.content):
+            print(f"  [skip] progress-stream placeholder from bot {message.author}", flush=True)
             return
 
         bot_mentioned = client.user in message.mentions
