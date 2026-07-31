@@ -221,6 +221,32 @@ finally:
     rgb._log = _orig_log
     rgb._ALLOWDIV_STATE["unsupported_until"] = 0.0
 
+# 7b. a non-404/405 HTTP error (e.g. 500) stays TRANSIENT: no cooldown is
+# entered, so the very next loop retries — only the unsupported-endpoint
+# shape gets the time gate.
+tmp = fresh()
+rgb._ALLOWDIV_STATE["unsupported_until"] = 0.0
+write_access(["@rui:hs", "@mark:hs"])
+_500_calls = {"n": 0}
+
+
+def fake_500(method, path, payload=None, timeout=35):
+    _500_calls["n"] += 1
+    raise urllib.error.HTTPError("/v1/agents", 500, "boom", {}, io.BytesIO(b""))
+
+
+rgb._req = fake_500
+rgb._log = lambda msg: None
+try:
+    rgb._maybe_warn_allowlist_divergence()
+    rgb._maybe_warn_allowlist_divergence()
+    check("500: stays transient — both loops retry, no cooldown",
+          _500_calls["n"] == 2 and rgb._ALLOWDIV_STATE["unsupported_until"] == 0.0,
+          f"calls={_500_calls['n']} state={rgb._ALLOWDIV_STATE}")
+finally:
+    rgb._req = _orig_req
+    rgb._log = _orig_log
+
 # agent-id resolution from the seeded .env (no $AGENT_ID in env)
 check("agent id read from channel .env", rgb._agent_id() == AGENT, rgb._agent_id())
 
