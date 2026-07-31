@@ -85,6 +85,14 @@ def resolve_cloud_origin(
 CLOUD = resolve_cloud_origin()
 
 
+def _skill_dir() -> Path:
+    return Path(os.path.realpath(__file__)).parents[1]
+
+
+sys.path.insert(0, str(_skill_dir()))
+from usage_lock import claim_lock as _claim_lock  # noqa: E402
+
+
 def repo_root() -> Path:
     return Path(os.path.realpath(__file__)).parents[3]
 
@@ -147,7 +155,21 @@ def main() -> int:
         print("usage-report: no AG2_CLOUD_TOKEN in vault — skipping (log kept)")
         return 0
 
-    log.rename(pending)
+    # Claim under the shared lock. The lock is held ONLY across the rename, not
+    # across the POST below: the hook takes the same lock around its open+write,
+    # so holding it through a 20s HTTP round trip would put that latency on a
+    # PostToolUse hook. Serialising the rename is enough — a hook either
+    # completes its append before the claim, or starts after it and opens the
+    # fresh active log. Neither can write into the claimed inode. (#2180 review:
+    # a hook fd opened pre-rename could otherwise write after our read-to-EOF and
+    # before the unlink, and the record was destroyed.)
+    with _claim_lock(log, blocking=True) as locked:
+        if not locked:
+            # Someone is mid-append. Nothing is lost by reporting on the next
+            # run, so leave the active log exactly where it is.
+            print("usage-report: log busy — skipping this run (log kept)")
+            return 0
+        log.rename(pending)
     counts: dict[str, int] = defaultdict(int)
     last: dict[str, int] = defaultdict(int)
     with pending.open("r", encoding="utf-8") as f:

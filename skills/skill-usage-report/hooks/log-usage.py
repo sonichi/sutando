@@ -15,6 +15,27 @@ import time
 from pathlib import Path
 
 
+def _skill_dir() -> Path:
+    # realpath() for the same reason as repo_root(): this file is symlinked into
+    # the core's skills directory, so __file__ alone points at the link.
+    return Path(os.path.realpath(__file__)).parents[1]
+
+
+# The claim lock MUST be the same implementation the reporter uses — a drifted
+# copy looks synchronised while it is not. Import the one module; if that import
+# fails, fall back to a no-op contextmanager that yields True so the hook keeps
+# working exactly as before rather than silently logging nothing.
+sys.path.insert(0, str(_skill_dir()))
+try:
+    from usage_lock import claim_lock as _claim_lock  # type: ignore
+except Exception:  # pragma: no cover - degraded path
+    import contextlib as _ctx
+
+    @_ctx.contextmanager
+    def _claim_lock(_log, *_a, **_kw):
+        yield True
+
+
 def repo_root() -> Path:
     # This file lives at <repo>/skills/skill-usage-report/hooks/log-usage.py.
     # realpath() first: skills/install.sh symlinks this skill into the core's
@@ -89,8 +110,31 @@ def main() -> int:
     try:
         log = ws / "state" / "skill-usage-log.jsonl"
         log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"slug": slug, "ts": int(time.time())}) + "\n")
+        # Hold the shared claim lock across BOTH the open and the write.
+        #
+        # Without it, this hook can open the active log, the reporter can then
+        # rename it to .reporting, and this fd — still pointing at the renamed
+        # inode — can write AFTER the reporter has read to EOF but BEFORE it
+        # unlinks. The record is then neither posted nor folded back: the unlink
+        # destroys it, silently violating the "events arriving during a report
+        # are never lost" contract (#2180 review, reproduced).
+        #
+        # Holding the lock across open+write makes that interleaving impossible:
+        # the reporter takes the same lock around its rename, so either this
+        # append completes first, or it starts afterwards and opens the FRESH
+        # active log. The reporter never holds this lock across the network POST,
+        # so contention here is a rename, not a round trip.
+        with _claim_lock(log) as locked:
+            if not locked:
+                # Could not acquire quickly. Fail OPEN, and drop the record: this
+                # is a PostToolUse hook whose first duty is never to block a tool
+                # call. Losing one usage datapoint is strictly better than adding
+                # latency to a skill invocation — and better than writing anyway,
+                # which is precisely the unsynchronised write this lock exists to
+                # prevent.
+                return 0
+            with log.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"slug": slug, "ts": int(time.time())}) + "\n")
     except Exception:
         pass
     return 0

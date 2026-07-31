@@ -113,10 +113,19 @@ try:
 
     broken = tmp / "state" / "skill-usage-log.jsonl"
     broken.unlink(missing_ok=True)
-    (tmp / "state").rmdir()
+    # rmtree, not rmdir: the claim lock (skill-usage-log.jsonl.lock, added with
+    # the #2180 claim-race fix) also lives in state/, so rmdir now raises
+    # "Directory not empty". Remove the whole directory rather than enumerating
+    # artifacts, so a future sibling file does not break this teardown again.
+    shutil.rmtree(tmp / "state")
     (tmp / "state").write_text("not a directory")   # mkdir/open must now raise
     rc = run(hook, json.dumps({"tool_name": "Skill", "tool_input": {"skill": "probe"}}), tmp)
-    check("write failure -> still exit 0 (fail-open, never blocks the tool)", rc == 0, f"rc={rc}")
+    # NOTE what is being exercised here changed with the lock: an unusable state
+    # dir now fails at LOCK ACQUISITION before the write is ever attempted, so
+    # this covers the lock's degrade path as well as the write-raises guard.
+    # Both must land on exit 0 — that is the invariant under test, and it holds
+    # whichever of the two trips first.
+    check("unusable state dir -> still exit 0 (fail-open, never blocks the tool)", rc == 0, f"rc={rc}")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
