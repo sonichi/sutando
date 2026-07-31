@@ -263,10 +263,16 @@ check("H5 tilde control: a 0-space closer IS valid, divider stays real",
 # candidate-containment) and each satisfied one by breaking the other.
 #
 # The resolution is not an ordering. Runs are PARTITIONED by whether each one
-# could be a fence marker at all: a run with text before it, a tab indent, or a
-# backtick in its info string can only ever be a span delimiter, so it is
-# resolved first and may cross fences. Every other run is left to the fence
+# could be a fence marker at all: a run with TEXT BEFORE IT, a run shorter than
+# 3, or a backtick in its info string can only ever be an inline delimiter, so it
+# is resolved first and may cross fences. Every other run is left to the fence
 # parser and its raw 0-3-space closer contract. The two classes never compete.
+#
+# NOTE a tab- or 4+-space-indented run alone on its line is deliberately NOT in
+# the inline class, even though it cannot open a fence either. It is an INVALID
+# FENCE MARKER — ordinary text inside the enclosing fence. Treating it as inline
+# let it pair with the fence's real closer, so the fence ran to EOF and swallowed
+# the REAL divider too. See `_opens_span`.
 # ---------------------------------------------------------------------------
 check("I1 backtick: a TAB-indented closer does not close the fence",
       n_sections("```\n\t```\n# Resolved\n```" + QUESTIONS) == 2)

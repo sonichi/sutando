@@ -199,7 +199,7 @@ def mask_markup(text: str) -> str:
 
     NOT a global precedence ordering — every ordering breaks a real case,
     measured across five designs. The runs are instead PARTITIONED by whether
-    each one could be a fence marker at all (`_fence_eligible`):
+    each one could be a fence marker at all (`_opens_span`):
 
       * a run with TEXT BEFORE IT, a run shorter than 3, or a backtick in its
         info string can only be an inline delimiter -> resolved first, and
