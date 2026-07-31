@@ -176,6 +176,58 @@ def _is_os_environ(node) -> bool:
     )
 
 
+# Recognised sources of an ISOLATED directory. Deliberately a closed list: the
+# question is not "is this a path" but "is this provably NOT the operator's own
+# config dir", and only an explicitly-temporary source answers that.
+_TMP_FACTORIES = {"mkdtemp", "TemporaryDirectory", "mkstemp"}
+
+
+def _is_isolated_value(node, isolated_names: "set[str]") -> bool:
+    """True only when the value provably comes from a temporary directory.
+
+    The fourth false-CLEAN of this predicate, found by self-audit rather than
+    review: `_isolation_line` proved an ASSIGNMENT happened, never that the value
+    pointed anywhere safe. A test doing
+
+        os.environ["CLAUDE_CONFIG_DIR"] = os.path.expanduser("~/.claude")
+
+    and then seeding `channels/discord/access.json` under it classified CLEAN — while
+    writing into the OPERATOR'S REAL allowlist. That is strictly worse than the
+    fallback-read this gate was built to stop: it mutates host config.
+
+    Under-approximating CLEAN is the documented stance of this file, so anything not
+    recognisably temporary is refused, including a bare name whose origin we cannot
+    see. `pytest`'s `tmp_path` is not accepted here because these are plain scripts,
+    not pytest tests; add it deliberately if that ever changes.
+    """
+    for c in ast.walk(node):
+        if isinstance(c, ast.Call):
+            fn = c.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else (fn.id if isinstance(fn, ast.Name) else None)
+            if name in _TMP_FACTORIES:
+                return True
+        if isinstance(c, ast.Name) and c.id in isolated_names:
+            return True
+    return False
+
+
+def _isolated_names(tree: ast.Module) -> "set[str]":
+    """Module-level names bound to a temp-dir source, to a fixpoint."""
+    names: set[str] = set()
+    while True:
+        grew = False
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if not _is_isolated_value(node.value, names):
+                continue
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id not in names:
+                    names.add(t.id); grew = True
+        if not grew:
+            return names
+
+
 def _isolation_line(tree: ast.Module) -> int | None:
     """Earliest MODULE-LEVEL `os.environ["CLAUDE_CONFIG_DIR"] = ...`, else None.
 
@@ -198,6 +250,7 @@ def _isolation_line(tree: ast.Module) -> int | None:
     Module level is required so the assignment is guaranteed to execute: a body nested in a
     function, branch or with-block may never run, or may run after the import.
     """
+    isolated = _isolated_names(tree)
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
@@ -206,6 +259,9 @@ def _isolation_line(tree: ast.Module) -> int | None:
                 isinstance(tgt, ast.Subscript)
                 and _is_os_environ(tgt.value)
                 and _const_str(tgt.slice) == "CLAUDE_CONFIG_DIR"
+                # ...AND the value must provably be a temporary dir. Pointing the env
+                # var at the operator's real ~/.claude is an assignment, not isolation.
+                and _is_isolated_value(node.value, isolated)
             ):
                 return node.lineno
     return None

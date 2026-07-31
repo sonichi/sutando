@@ -76,7 +76,7 @@ check(
     "clean: CLAUDE_CONFIG_DIR assignment PLUS a seeded access.json, both before the load",
     lint.classify(
         write(tmpdir,
-              'import os, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = "/tmp/x"\n'
+'import os, tempfile, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()\n'
               '_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
               '_c.mkdir(parents=True, exist_ok=True)\n'
               '(_c / "access.json").write_text("{}")\n' + IMPORTS_BRIDGE)
@@ -85,6 +85,66 @@ check(
 )
 # The narrowing (qingyun, #2429 reviews 5-6): these shapes are NO LONGER clean, because
 # none of them guarantees the import avoids an inherited CLAUDE_CONFIG_DIR.
+# Review self-audit (#2429, found by me before review): `_isolation_line` proved an
+# ASSIGNMENT happened, never that the value pointed anywhere safe. Setting the env var
+# to the operator's REAL ~/.claude and seeding under it classified CLEAN — while writing
+# into their live allowlist. That is worse than the fallback-READ this gate was built to
+# stop, because it MUTATES host config. Isolation now requires a provably temporary dir.
+check(
+    "pointing CLAUDE_CONFIG_DIR at the operator's REAL ~/.claude is NOT isolation",
+    lint.classify(
+        write(tmpdir, 'import os, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = os.path.expanduser("~/.claude")\n'
+              '_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              '_c.mkdir(parents=True, exist_ok=True)\n(_c / "access.json").write_text("{}")\n'
+              + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "seeding under the real config dir overwrites the operator's live allowlist",
+)
+check(
+    "HOME + literal suffix is NOT isolation",
+    lint.classify(
+        write(tmpdir, 'import os, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = os.environ["HOME"] + "/.claude"\n'
+              '_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              '_c.mkdir(parents=True, exist_ok=True)\n(_c / "access.json").write_text("{}")\n'
+              + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+)
+check(
+    "a bare literal path is NOT isolation (unprovable, so refused)",
+    lint.classify(
+        write(tmpdir, 'import os, pathlib\nos.environ["CLAUDE_CONFIG_DIR"] = "/tmp/x"\n'
+              '_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              '_c.mkdir(parents=True, exist_ok=True)\n(_c / "access.json").write_text("{}")\n'
+              + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "under-approximating CLEAN is this file's documented stance",
+)
+check(
+    "a name bound to tempfile.mkdtemp() IS isolation",
+    lint.classify(
+        write(tmpdir, 'import os, tempfile, pathlib\n_d = tempfile.mkdtemp()\n'
+              'os.environ["CLAUDE_CONFIG_DIR"] = _d\n'
+              '_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              '_c.mkdir(parents=True, exist_ok=True)\n(_c / "access.json").write_text("{}")\n'
+              + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+    "the narrowing must not reject the ordinary two-step temp-dir shape",
+)
+check(
+    "TemporaryDirectory().name IS isolation",
+    lint.classify(
+        write(tmpdir, 'import os, tempfile, pathlib\n_t = tempfile.TemporaryDirectory()\n'
+              'os.environ["CLAUDE_CONFIG_DIR"] = _t.name\n'
+              '_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
+              '_c.mkdir(parents=True, exist_ok=True)\n(_c / "access.json").write_text("{}")\n'
+              + IMPORTS_BRIDGE)
+    )
+    == lint.CLEAN,
+)
 check(
     "setdefault is NOT isolation — it is a no-op when the var is already inherited",
     lint.classify(
