@@ -224,6 +224,37 @@ for _label, _body, _want in (
     r = hc.check_memory_index_integrity()
     check(f"fence indent: {_label}", r and r["status"] == _want, f"got {r and r['status']} :: {r}")
 
+# qingyun-wu: the SAME 0-3-column bound governs the comment marker, not just the
+# fence marker. A four-space- or TAB-indented `<!--` is indented CODE CONTENT and
+# counts toward the runtime's 25KB prefix; stripping it made a 30KB fixture
+# measure 18 bytes and report `ok` while the entry began past the real cut.
+for _label, _body, _want in (
+    ("4-space indented comment is CONTENT (counts)", "    " + _BIGC2 + _ENTRY, "fail"),
+    ("TAB indented comment is CONTENT (counts)",     "\t" + _BIGC2 + _ENTRY,   "fail"),
+    ("3-space indented comment is still a comment",  "   " + _BIGC2 + _ENTRY,  "ok"),
+    ("control: unindented comment still strips",     _BIGC2 + _ENTRY,          "ok"),
+):
+    _mem_with(_body)
+    r = hc.check_memory_index_integrity()
+    check(f"comment indent: {_label}", r and r["status"] == _want, f"got {r and r['status']} :: {r}")
+
+# john-the-dev: a BACKTICK fence's info string may not contain a backtick, so
+# ```bad`info is an ordinary paragraph line rather than an opener. Accepting it
+# opened a phantom fence that preserved the comment after it — a 31KB fixture
+# measured 31KB and reported `fail`, telling the operator to compact an index
+# that loads fine. Tilde fences carry no such restriction.
+for _label, _body, _want in (
+    ("backtick in a BACKTICK info string is not an opener",
+     "```bad`info\n" + _BIGC2 + "```\n" + _ENTRY, "ok"),
+    ("control: a valid backtick info string IS an opener",
+     "```py\n" + _BIGC2 + "```\n" + _ENTRY, "fail"),
+    ("control: backtick in a TILDE info string IS still an opener",
+     "~~~a`b\n" + _BIGC2 + "~~~\n" + _ENTRY, "fail"),
+):
+    _mem_with(_body)
+    r = hc.check_memory_index_integrity()
+    check(f"info string: {_label}", r and r["status"] == _want, f"got {r and r['status']} :: {r}")
+
 # qingyun-wu: the byte limit cuts THROUGH a line; the filename before the cut is
 # still read, so the memory loads and must not be reported lost.
 _mem_with(("x" * (25 * 1024 - 100)) + "\n- [Good](good-memory.md) " + ("d" * 4000) + "\n")

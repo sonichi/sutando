@@ -140,18 +140,33 @@ def _index_effective_text(text: str) -> str:
     fence_char = ""
     fence_len = 0
     in_comment = False
-    def _fence_indent_ok(raw: str) -> bool:
-        # CommonMark bounds a fence marker to at most THREE spaces of
-        # indentation; at four it is an indented code line, not a fence. A bare
-        # lstrip() accepted any indent, so a 4-space ```html was treated as a
-        # fence and the comment inside it was PRESERVED — a false `fail` on an
-        # index that loads fine (qingyun-wu, #2449). Applies to opener AND
-        # closer: an over-indented closer must not close a real fence either.
-        return len(raw) - len(raw.lstrip(" ")) <= 3
+    def _block_indent_ok(raw: str) -> bool:
+        # CommonMark bounds a block-level marker to at most THREE columns of
+        # indentation; at four the line is indented CODE, not a marker. This
+        # gates BOTH markers we track:
+        #   fence  — a 4-space ```html is not a fence, so the comment inside it
+        #            must be stripped, not preserved (false `fail`; qingyun-wu).
+        #   <!--   — a 4-space or TAB indented comment is code CONTENT and must
+        #            count toward the 25KB prefix, not be stripped (false `ok`
+        #            on a 30KB fixture that measured 18 bytes; qingyun-wu).
+        # Counted in COLUMNS, not characters: a bare lstrip(" ") ignored tabs, and
+        # one tab already reaches the 4-column stop. Applies to a fence closer
+        # too — an over-indented closer must not close a real fence.
+        n = 0
+        for ch in raw:
+            if ch == " ":
+                n += 1
+            elif ch == "\t":
+                n += 4 - (n % 4)          # advance to the next 4-column tab stop
+            else:
+                break
+            if n >= 4:
+                return False
+        return True
 
     for line in text.splitlines(keepends=True):
         stripped = line.lstrip()
-        indent_ok = _fence_indent_ok(line)
+        indent_ok = _block_indent_ok(line)
         if in_fence:
             out.append(line)
             # CommonMark: a fence closes only on the SAME character, repeated at
@@ -170,13 +185,23 @@ def _index_effective_text(text: str) -> str:
                 in_comment = False
             continue
         m = re.match(r"(`{3,}|~{3,})", stripped) if indent_ok else None
+        if m and m.group(1)[0] == "`" and "`" in stripped[m.end():]:
+            # CommonMark: a BACKTICK fence's info string may not contain a
+            # backtick (it would be ambiguous with inline code). ```bad`info is
+            # therefore an ordinary paragraph line, not an opener. Accepting it
+            # opened a phantom fence, so the block comment that followed was
+            # PRESERVED and a 31KB fixture measured 31KB: a false `fail` telling
+            # the operator to compact an index that loads fine (john-the-dev,
+            # #2449). Tilde fences have no such rule — ~~~a`b IS a valid opener.
+            out.append(line)
+            continue
         if m:
             in_fence = True
             fence_char = m.group(1)[0]
             fence_len = len(m.group(1))     # FULL length — see the close check above
             out.append(line)
             continue
-        if stripped.startswith("<!--"):
+        if indent_ok and stripped.startswith("<!--"):
             if "-->" not in line:
                 in_comment = True
             continue                      # whole-line block comment: dropped
