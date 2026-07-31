@@ -1,23 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-// Behavioral spec for the voice-agent output sanitizer (src/voice-agent.ts,
-// fix #1 of #1410). The detection logic lives inside main()'s wiring IIFE and is
-// not exported, so this test mirrors its exact contract: the regex below MUST stay
-// in sync with FABRICATED_OUTPUT_RE, and the reducer mirrors the per-turn buffer.
+// Exercises the PRODUCTION sanitizer from src/voice-agent.ts — not a copy of it.
 //
-// Covers the two gaps from the 2026-06-20 review:
-//   Gap 1 — bare `Silence\.?` dropped (no longer false-positives on natural speech).
-//   Gap 2 — per-turn buffer catches a fabricated prefix split across streamed chunks.
-const FABRICATED_OUTPUT_RE = /^\s*(\[System:|System:|\[Silence\.?\]|<ctrl\d+>)/i;
+// The previous version of this file declared its own FABRICATED_OUTPUT_RE and its
+// own reducer, with a comment saying the regex "MUST stay in sync". That is a test
+// that CANNOT FAIL when production drifts: change the real regex and this suite
+// still passes green. qingyun caught it on #1414 ("the added test mirrors sanitizer
+// logic instead of importing/exercising the production implementation, so it can
+// pass while the actual stream wiring regresses").
+//
+// The sanitizer was inside main()'s wiring IIFE and therefore unimportable, so it
+// is now a pure companion module (src/output_sanitizer.ts) that voice-agent.ts
+// imports. Behaviour unchanged; the streamed handler calls the same predicate
+// this suite calls, and the test no longer drags dotenv/transports into scope.
+import { FABRICATED_OUTPUT_RE, isFabricatedOutput } from '../src/output_sanitizer.js';
 
-// Mirrors the streamed handler: feed delta chunks for one turn, return whether the
-// running buffer was flagged as a fabrication (turn suppressed).
+// Drives the real predicate the way the streamed handler does: accumulate per-turn
+// deltas and test the running buffer. The ACCUMULATION is the test's own (it models
+// the caller); the DETECTION is production's.
 function turnFabricated(chunks: string[]): boolean {
 	let buffer = '';
 	for (const chunk of chunks) {
 		buffer += chunk ?? '';
-		if (FABRICATED_OUTPUT_RE.test(buffer.trim())) return true;
+		if (isFabricatedOutput(buffer)) return true;
 	}
 	return false;
 }
@@ -92,4 +98,15 @@ test('gap 3: bracketed/ctrl fabrications stay fully suppressed, nothing forwarde
 		assert.equal(r.suppressed, true, JSON.stringify(chunks));
 		assert.equal(r.forwarded, '', JSON.stringify(chunks));
 	}
+});
+
+test('the suite is bound to the PRODUCTION regex, not a local copy', () => {
+	// If someone re-introduces a mirrored regex, this fails: the imported symbol
+	// must be the same object the module exports, and must be a RegExp.
+	assert.ok(FABRICATED_OUTPUT_RE instanceof RegExp);
+	assert.equal(FABRICATED_OUTPUT_RE.flags.includes('i'), true);
+	// And the predicate must agree with the exported regex on a known case —
+	// catching a future refactor that leaves the regex behind but rewires the
+	// predicate to something else.
+	assert.equal(isFabricatedOutput('  [System: x'), FABRICATED_OUTPUT_RE.test('[System: x'));
 });

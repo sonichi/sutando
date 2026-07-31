@@ -677,6 +677,8 @@ function resetSessionGateState(): void {
 // `meetingActive` boolean (this module owns that state) into the pure
 // resolver function.
 import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
+
+import { isFabricatedOutput } from './output_sanitizer.js';
 function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
@@ -1438,7 +1440,6 @@ async function main() {
 		// please …") and silently suppressed legitimate output. The #1410/#1356 fabrication
 		// signature is the *bracketed* `[Silence]`, which is kept; dropping the bare form
 		// removes the only real false-positive surface at ~no detection cost.
-		const FABRICATED_OUTPUT_RE = /^\s*(\[System:|System:|\[Silence\.?\]|<ctrl\d+>)/i;
 		const origOnOutputTranscription = transport.onOutputTranscription?.bind(transport);
 		// Gap 2 (review 2026-06-20): onOutputTranscription is fed incremental per-turn
 		// deltas, not whole-turn text, so a fabricated prefix split across chunks
@@ -1470,7 +1471,7 @@ async function main() {
 			if (turnCleared) { origOnOutputTranscription?.(chunk); return; } // confirmed clean → stream
 			outputBuffer += chunk;
 			heldText += chunk;                                               // hold; do not forward yet
-			if (FABRICATED_OUTPUT_RE.test(outputBuffer.trim())) {
+			if (isFabricatedOutput(outputBuffer)) {
 				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${outputBuffer.slice(0, 120)}`);
 				turnFabricated = true;
 				// Best-effort: suppress remaining audio chunks in this turn.
