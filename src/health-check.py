@@ -45,6 +45,7 @@ from util_paths import _host_label, claude_home_path, shared_personal_path  # no
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
+from result_markers import parse_markers  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -2566,6 +2567,8 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
       * `question-*` / `proactive-*` have their own delivery lifecycles.
       * age-gated, because between our write and the consumer's claim the task
         is legitimately still present for a few seconds.
+      * shared-protocol skip markers are terminal cleanup debt, not delivery
+        loss. They still warn until archived, but never claim a reply was lost.
     """
     name = "orphaned-results"
     results_dir = WORKSPACE_DIR / "results"
@@ -2578,6 +2581,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn", "detail": f"could not scan results/: {e}"}
     orphans: list[tuple[str, int]] = []
+    terminal_results: list[tuple[str, int]] = []
     unreadable = 0
     for path in entries:
         # Per-file isolation on purpose. One unreadable entry must not decide
@@ -2606,21 +2610,41 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         # locator (it is what the bridge archive paths already use).
         if find_task_file(tasks_dir, path.stem) is not None:
             continue
-        orphans.append((path.name, int(age)))
+        try:
+            parsed = parse_markers(path.read_text(errors="replace"))
+        except OSError:
+            unreadable += 1
+            continue
+        if any(action.kind == "skip" for action in parsed.actions):
+            terminal_results.append((path.name, int(age)))
+        else:
+            orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
     partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
-    if not orphans:
+    if not orphans and not terminal_results:
         status = "warn" if unreadable else "ok"
         return {"name": name, "status": status,
                 "detail": f"no undeliverable results{partial}"}
     orphans.sort(key=lambda item: -item[1])
-    oldest_name, oldest_age = orphans[0]
+    terminal_results.sort(key=lambda item: -item[1])
+    details = []
+    if orphans:
+        oldest_name, oldest_age = orphans[0]
+        details.append(
+            f"{len(orphans)} result(s) whose task is already archived — never delivered; "
+            f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
+        )
+    if terminal_results:
+        oldest_name, oldest_age = terminal_results[0]
+        details.append(
+            f"{len(terminal_results)} terminal result(s) await archival (no delivery intended); "
+            f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
+        )
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"{len(orphans)} result(s) whose task is already archived — never delivered; "
-                   f"oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m){partial}"),
+        "detail": "; ".join(details) + partial,
     }
 
 

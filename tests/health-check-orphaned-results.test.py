@@ -48,9 +48,9 @@ class OrphanedResultsTest(unittest.TestCase):
         hc.WORKSPACE_DIR = self._saved
         self._tmp.cleanup()
 
-    def _write(self, rel: str, age_sec: int = 0) -> Path:
+    def _write(self, rel: str, age_sec: int = 0, body: str = "body") -> Path:
         path = self.ws / rel
-        path.write_text("body")
+        path.write_text(body)
         if age_sec:
             stamp = time.time() - age_sec
             os.utime(path, (stamp, stamp))
@@ -71,6 +71,45 @@ class OrphanedResultsTest(unittest.TestCase):
         self.assertEqual(result["status"], "warn")
         self.assertIn("2 result(s)", result["detail"])
         self.assertIn("task-old.txt", result["detail"])
+
+    def test_terminal_skip_markers_are_cleanup_not_delivery_loss(self):
+        for name, body in (
+            ("task-no-send.txt", "[no-send]"),
+            ("task-replied.txt", "[REPLIED]"),
+            ("task-deduped.txt", "[deduped: task-holder]"),
+        ):
+            self._write(f"results/{name}", TWO_HOURS_AGO, body)
+
+        result = hc.check_orphaned_results()
+
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("3 terminal result(s) await archival", result["detail"])
+        self.assertIn("no delivery intended", result["detail"])
+        self.assertNotIn("never delivered", result["detail"])
+
+    def test_task_orphan_done_transition_does_not_claim_delivery_loss(self):
+        """Archiving a DONE task leaves terminal cleanup debt, not a lost reply."""
+        task = self._write("tasks/task-done.txt", TWO_HOURS_AGO)
+        self._write("results/task-done.txt", TWO_HOURS_AGO, "[no-send]")
+        archive = self.ws / "tasks" / "archive"
+        archive.mkdir()
+        task.rename(archive / task.name)
+
+        result = hc.check_orphaned_results()
+
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("1 terminal result(s) await archival", result["detail"])
+        self.assertNotIn("never delivered", result["detail"])
+
+    def test_mixed_terminal_and_ordinary_results_keep_delivery_warning(self):
+        self._write("results/task-lost.txt", TWO_HOURS_AGO)
+        self._write("results/task-skip.txt", TWO_HOURS_AGO, "[no-send]")
+
+        result = hc.check_orphaned_results()
+
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("1 result(s) whose task is already archived — never delivered", result["detail"])
+        self.assertIn("1 terminal result(s) await archival", result["detail"])
 
     # --- negative: the guards that keep a 'warn' meaningful -------------
 
