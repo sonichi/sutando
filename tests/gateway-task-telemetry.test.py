@@ -20,6 +20,7 @@ Exit 0 on pass, 1 on fail.
 """
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -230,6 +231,35 @@ check("owner-activity stamp under temp root",
       rgb.OWNER_ACTIVITY_FILE == tmp7 / "state" / "last-owner-activity.json"
       and rgb.OWNER_ACTIVITY_FILE.exists(),
       f"OWNER_ACTIVITY_FILE={rgb.OWNER_ACTIVITY_FILE}")
+
+# 7a. the documented events acceptance entrypoint must expose the host's real
+#     telemetry module to the imported sparrow TaskifyHandler. Run isolated so
+#     neither the test runner's sys.path nor a fake sys.modules entry can make
+#     this pass accidentally (qingyun-wu CR on #2432 round 3).
+acceptance = REPO / "skills" / "agent-room-ops" / "events_acceptance.py"
+telemetry_py = (REPO / "src" / "telemetry.py").resolve()
+probe = subprocess.run(
+    [
+        sys.executable,
+        "-I",
+        "-c",
+        (
+            "import importlib.util, pathlib, sys\n"
+            "entry = pathlib.Path(sys.argv[1])\n"
+            "spec = importlib.util.spec_from_file_location('events_acceptance', entry)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "import telemetry\n"
+            "print(pathlib.Path(telemetry.__file__).resolve())\n"
+        ),
+        str(acceptance),
+    ],
+    text=True,
+    capture_output=True,
+)
+check("events acceptance resolves real host telemetry",
+      probe.returncode == 0 and probe.stdout.strip() == str(telemetry_py),
+      f"rc={probe.returncode} stdout={probe.stdout!r} stderr={probe.stderr!r}")
 
 # 7b. the REAL taskify path: TaskifyHandler._promote() writes its task file
 #     directly (never through _write_task), so it carries its own emit — test
