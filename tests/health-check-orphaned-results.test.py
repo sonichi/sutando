@@ -100,6 +100,20 @@ class OrphanedResultsTest(unittest.TestCase):
         self.assertIn("1 completed/non-delivery result(s) await archival", result["detail"])
         self.assertNotIn("never delivered", result["detail"])
 
+    def test_archived_api_result_remains_owned_by_poll_endpoint(self):
+        self._write("results/task-api.txt", TWO_HOURS_AGO, "answer")
+        (self.ws / "tasks" / "archive").mkdir()
+        self._write(
+            "tasks/archive/task-api.txt",
+            TWO_HOURS_AGO,
+            "id: task-api\nsource: api\ntask: work\n",
+        )
+
+        result = hc.check_orphaned_results()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["detail"], "no undeliverable results")
+
     def test_task_orphan_done_transition_does_not_claim_delivery_loss(self):
         """Archiving a DONE task leaves terminal cleanup debt, not a lost reply."""
         task = self._write("tasks/task-done.txt", TWO_HOURS_AGO)

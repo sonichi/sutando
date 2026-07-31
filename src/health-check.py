@@ -2608,6 +2608,17 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
 
+def _archived_task_headers(tasks_dir: Path, task_id: str) -> dict[str, str]:
+    """Read trusted first-occurrence metadata from an archived task."""
+    task_path = find_archived_task(tasks_dir, task_id)
+    if task_path is None:
+        return {}
+    try:
+        return parse_task_headers_lenient(task_path.read_text(errors="replace"))
+    except OSError:
+        return {}
+
+
 def _is_local_completion_result(tasks_dir: Path, task_id: str) -> bool:
     """True when an archived task belongs to a non-bridge local result path.
 
@@ -2622,17 +2633,16 @@ def _is_local_completion_result(tasks_dir: Path, task_id: str) -> bool:
     remote task's real pre-body source cannot be overwritten by forged body
     lines.
     """
-    task_path = find_archived_task(tasks_dir, task_id)
-    if task_path is None:
-        return False
-    try:
-        headers = parse_task_headers_lenient(task_path.read_text(errors="replace"))
-    except OSError:
-        return False
+    headers = _archived_task_headers(tasks_dir, task_id)
     return (
         headers.get("source") == "chat"
         and headers.get("channel_id") in {"local-chat", "local-live-test"}
     )
+
+
+def _is_pollable_api_result(tasks_dir: Path, task_id: str) -> bool:
+    """True when GET /result/<id> remains the owning pull-side consumer."""
+    return _archived_task_headers(tasks_dir, task_id).get("source") == "api"
 
 
 def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
@@ -2702,6 +2712,11 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         # trains its readers to ignore it. `find_task_file()` is the canonical
         # locator (it is what the bridge archive paths already use).
         if find_task_file(tasks_dir, path.stem) is not None:
+            continue
+        # Agent API callers poll GET /result/<id>; the top-level result file is
+        # their durable response store even after the task has been archived.
+        # It is actively claimable, not an orphaned bridge reply.
+        if _is_pollable_api_result(tasks_dir, path.stem):
             continue
         try:
             parsed = parse_markers(path.read_text(errors="replace"))
