@@ -135,7 +135,7 @@ def _prev_word(code, i):
 _TUPLE_LANG_SUFFIXES = (".py", ".pyi")
 
 
-def _is_candidate_container(code, i, path=None):
+def _is_candidate_container(code, i, path=None, prev_code=None):
     """Is `code[i]` the opener of a syntactic candidate COLLECTION?
 
     * `[` — an array/list literal. An INDEX is excluded, and the discriminator is
@@ -166,7 +166,15 @@ def _is_candidate_container(code, i, path=None):
         while k >= 0 and code[k] in " \t":
             k -= 1
         if k < 0:
-            return True                       # start of line -> literal
+            # Start of line. In JS a member expression may CONTINUE across the
+            # break, so `paths\n["k"]` is still an index — the bracket only looks
+            # standalone. Consult the previous added line: if it ends in something
+            # a subscript can attach to, this is a continuation, not a literal.
+            if prev_code is not None:
+                tail = prev_code.rstrip()
+                if tail and (tail[-1].isalnum() or tail[-1] in "_)]"):
+                    return False
+            return True                       # genuinely standalone -> literal
         if code[k] == "." and k >= 1 and code[k - 1] == "?":
             return False                      # optional element access
         if code[k] in ")]":
@@ -189,7 +197,7 @@ def _is_candidate_container(code, i, path=None):
     return bool(path) and str(path).endswith(_TUPLE_LANG_SUFFIXES)
 
 
-def _group_span(code, pos, path=None):
+def _group_span(code, pos, path=None, prev_code=None):
     """The innermost bracket group containing `pos`, as (start, end), or None.
 
     Only a syntactic candidate COLLECTION counts as a container (see
@@ -216,7 +224,7 @@ def _group_span(code, pos, path=None):
             stack.append(i)
         elif ch in closes and stack:
             start = stack.pop()
-            if not _is_candidate_container(code, start, path):
+            if not _is_candidate_container(code, start, path, prev_code):
                 continue          # not a syntactic candidate collection
             if start < pos < i and (best is None or start > best[0]):
                 best = (start, i)
@@ -251,7 +259,7 @@ def _siblings_only(code, start, end):
     return "".join(out)
 
 
-def paired_allowed(tok, line, pos=None, path=None):
+def paired_allowed(tok, line, pos=None, path=None, prev_code=None):
     """Contextual exemption for the portable candidate-list shape.
 
     `tok` is exempt only when the SAME line carries a companion path for the
@@ -293,7 +301,7 @@ def paired_allowed(tok, line, pos=None, path=None):
         pos = line.find(tok)
     if pos < 0 or pos >= len(code):
         return False
-    span = _group_span(code, pos, path)
+    span = _group_span(code, pos, path, prev_code)
     if span is None:
         return False          # no candidate container -> not a candidate list
     scope = _siblings_only(code, span[0], span[1])
@@ -352,6 +360,11 @@ def main():
     cur_file = ""
     hits = 0
     in_doc = False   # inside a triple-quoted docstring/string block (reset per hunk)
+    # Executable text of the PREVIOUS added line. A JS member expression can
+    # continue across a newline, so `paths\n["k"]` is an index even though the
+    # bracket starts its line. Reset per file and per hunk — a gap between hunks
+    # means the preceding line is unknown, and unknown must not read as "standalone".
+    prev_added = None
     for raw in diff.split("\n"):
         if raw.startswith("+++ "):
             f = raw[4:].split("\t")[0]
@@ -361,6 +374,7 @@ def main():
             ln = 0
             skip = bool(SKIP.search(f))
             in_doc = False
+            prev_added = None
             continue
         if raw.startswith("@@ "):
             m = re.search(r"\+(\d+)", raw)
@@ -370,6 +384,7 @@ def main():
             # (gaps between hunks); reset so a docstring opened + closed within
             # this hunk is tracked, without carrying stale state across a gap.
             in_doc = False
+            prev_added = None
             continue
         if raw.startswith("-"):
             continue
@@ -410,7 +425,7 @@ def main():
                     if pos < 0:
                         break
                     tok = token_at(line, pos)
-                    if not allowed(tok) and not paired_allowed(tok, line, pos, cur_file):
+                    if not allowed(tok) and not paired_allowed(tok, line, pos, cur_file, prev_added):
                         print("%s:%d: hardcoded path (%s): %s" % (cur_file, cur, tok, stripped))
                         hits += 1
                         reported = True
@@ -418,6 +433,7 @@ def main():
                     start = pos + len(p)   # advance past this occurrence
                 if reported:
                     break                  # one violation per line is enough
+            prev_added = _code_part(line)
     return 0
 
 

@@ -90,6 +90,10 @@ check "python tuple of the same shape still passes"     clean $'+++ b/skills/x/r
 check "whitespace before [ is still an index"           flag  $'+++ b/skills/x/r71.ts\n@@ -1,0 +1,1 @@\n+const cmd = paths ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"];'
 check "optional element access ?.[ is an index"         flag  $'+++ b/skills/x/r72.ts\n@@ -1,0 +1,1 @@\n+const cmd = paths?.["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"];'
 
+# Round 9: a member expression can continue across a newline.
+check "line-continued subscript is still an index"      flag  $'+++ b/skills/x/c9.ts\n@@ -1,0 +1,2 @@\n+const cmd = paths\n+["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"];'
+check "standalone line-start literal still passes"      clean $'+++ b/skills/x/c9b.ts\n@@ -1,0 +1,2 @@\n+const a = 1;\n+["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"];'
+
 # `"" in ")]"` is True in Python, so an unguarded prev-char test made a bracket at
 # COLUMN 0 read as a call on a returned value and falsely flagged a valid list.
 check "candidate list at column 0 still passes"         clean $'+++ b/skills/x/col0.ts\n@@ -1,0 +1,1 @@\n+["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'

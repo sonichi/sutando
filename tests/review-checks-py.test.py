@@ -575,6 +575,33 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 9 (qingyun-wu, review of 3d631b7). A JS member expression continues
+# across a newline, so a `[` that STARTS its line can still be a subscript:
+#     const cmd = paths
+#     ["/usr/local/...", "/opt/homebrew/..."];
+# The scanner is line-based, so it now carries the previous ADDED line's
+# executable text and treats a line-start `[` as an index when that line ends in
+# something a subscript attaches to. Reset per file and per hunk — across a hunk
+# gap the preceding line is unknown, and unknown must not read as "standalone".
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    P = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    ok("main(): a line-continued subscript is still an index",
+       "hardcoded path" in scan('+++ b/src/c9.ts\n@@ -1,0 +1,2 @@\n+const cmd = paths\n+' + P + ';')[1])
+    ok("main(): a genuinely standalone line-start literal still passes",
+       scan('+++ b/src/c9b.ts\n@@ -1,0 +1,2 @@\n+const a = 1;\n+'
+            '["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"];')[1].strip() == "")
+    ok("container: prev line ending in an identifier -> continuation, not literal",
+       not rc._is_candidate_container('["/a","/b"]', 0, "x.ts", "const cmd = paths"))
+    ok("container: prev line ending in `;` -> genuinely standalone literal",
+       rc._is_candidate_container('["/a","/b"]', 0, "x.ts", "const a = 1;"))
+    ok("container: no previous line (hunk start) -> literal, as before",
+       rc._is_candidate_container('["/a","/b"]', 0, "x.ts", None))
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so
