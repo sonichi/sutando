@@ -12,6 +12,31 @@
 # Run: bash tests/sync-workspace.test.sh
 
 set -euo pipefail
+
+# HERMETICITY: 9 fixtures below drive the host segment with the TEST-ONLY shim
+# $SUTANDO_HOST_OVERRIDE, but `_host()` resolves
+# ${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}} — the LABEL wins. On any host
+# that exports SUTANDO_HOST_LABEL (Sutando cores do), every one of those fixtures
+# is silently defeated: branches are created under the REAL host segment while the
+# assertions look for the simulated one, so Test 28 "deletes" a ref that never
+# existed and then reads the surviving real branch as "remote up to date".
+#
+# Observed on a core host: 87/89 with the variable set, 89/89 with it cleared.
+# The tests were not wrong about the product — they were reading someone else's
+# environment. Clear it once here so the shim can actually take effect.
+unset SUTANDO_HOST_LABEL
+
+# Same class, second inheritance: the suite makes real git commits in its
+# fixtures, so it also depends on the CALLER having a git identity. On a dev box
+# that is set globally and the dependency is invisible; on the ubuntu-latest
+# runner it is not, and every commit dies with
+#   Author identity unknown / *** Please tell me who you are.
+# which is why this suite sits in tests/shell-ci-known-failures.txt. Pin an
+# identity here so the suite carries its own, rather than borrowing one.
+export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-sync-workspace-test}"
+export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-sync-workspace-test@invalid}"
+export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-sync-workspace-test}"
+export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-sync-workspace-test@invalid}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
