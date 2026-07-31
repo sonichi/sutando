@@ -46,12 +46,14 @@ for name in ("brand-new-file.md", "pending-questions-unique-xyz.md", "stand-iden
         f"escaped to {p}",
     )
 
-# It should land in the documented canonical per-host home, not the workspace
-# root — otherwise a later reader probing hosts/<host>/ would miss it.
+# ...and at the write target #1717 chose — the workspace ROOT. Deliberately NOT
+# hosts/<host>/: `util-paths-hosts-resolution.test.py` pins "the fix is read-side
+# only; write target is untouched", and this PR changes WHOSE workspace answers,
+# not where inside it the file goes.
 p = pathlib.Path(personal_path("brand-new-file.md", ws))
 check(
-    "B and specifically under hosts/<host>/, the canonical per-host home",
-    p == ws / "hosts" / host / "brand-new-file.md",
+    "B at the workspace root, the write target #1717 chose",
+    p == ws / "brand-new-file.md",
     str(p),
 )
 
@@ -79,23 +81,29 @@ check(
 )
 
 # --- ambient resolution must be UNCHANGED --------------------------------
-# No workspace argument = the caller accepted ambient resolution, so the
-# env-based private dir stays correct. Regressing this would relocate every
-# existing per-host file on every host.
+# No workspace argument = the caller accepted ambient resolution, so whatever the
+# environment says stays correct. This must hold in BOTH environments: with
+# SUTANDO_MEMORY_DIR set (this fleet) the answer is the private machine dir; with
+# it unset (CI) there is no private dir and the answer is the ambient workspace.
+# The first version asserted only the former and failed in CI — the assertion had
+# baked in a property of my machine.
 amb = subprocess.run(
     [sys.executable, "-c",
      "import sys; sys.path.insert(0,'src');"
-     "from util_paths import personal_path, _private_machine_dir;"
+     "from util_paths import personal_path, _private_machine_dir, _workspace_root;"
      "p=personal_path('brand-new-ambient.md');"
      "d=_private_machine_dir();"
-     "print('MATCH' if d is not None and str(p)==str(d/'brand-new-ambient.md') else f'DIFF {p}')"],
+     "want=(d/'brand-new-ambient.md') if d is not None else (_workspace_root()/'brand-new-ambient.md');"
+     "print('MATCH' if str(p)==str(want) else f'DIFF got={p} want={want}');"
+     "print('PRIVATE_SET' if d is not None else 'PRIVATE_NONE')"],
     capture_output=True, text=True, cwd=REPO,
 )
 check(
-    "D ambient call (no workspace arg) still resolves to the private machine dir",
+    "D ambient call (no workspace arg) resolves per the environment, unchanged",
     "MATCH" in amb.stdout,
-    (amb.stdout + amb.stderr).strip()[:160],
+    (amb.stdout + amb.stderr).strip()[:200],
 )
+print(f"       (environment for D: {'private dir configured' if 'PRIVATE_SET' in amb.stdout else 'no private dir — CI shape'})")
 
 print()
 if failures:

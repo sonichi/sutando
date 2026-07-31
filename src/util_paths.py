@@ -195,9 +195,16 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     #
     # When no workspace was passed the caller has accepted ambient resolution,
     # so the env-based private dir remains correct and behavior is unchanged.
-    if explicit_ws:
-        return ws / "hosts" / _host_label() / filename
+    # The escape exists ONLY when a private dir is configured: that is the branch
+    # that answered from the environment instead of from `ws`. When it is None the
+    # code already fell through to `ws / filename`, which is inside the workspace
+    # and needs no change — and `tests/util-paths-hosts-resolution.test.py` pins
+    # that as a deliberate #1717 decision ("the fix is read-side only; write
+    # target is untouched"). So keep the write target where #1717 put it, the
+    # workspace root, and change only WHOSE workspace answers.
     if private is not None:
+        if explicit_ws:
+            return ws / filename
         return private / filename
     if filename in {"stand-avatar.png"}:
         return ws / "assets" / filename
