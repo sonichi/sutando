@@ -1,0 +1,86 @@
+#!/usr/bin/env node
+/**
+ * Profile-match guard — qingyun P1 on #2133.
+ *
+ * WHY THIS EXISTS: `releaseProfileLock()` SIGTERM/SIGKILLs every PID the profile
+ * predicate returns. That predicate was `line.includes('--user-data-dir=' + PROFILE_DIR)`,
+ * a substring test that ignores argument boundaries — so with `PROFILE_DIR=/tmp/x-profile`
+ * a browser running `--user-data-dir=/tmp/x-profile-copy` matched and got killed. qingyun
+ * reproduced it on the exact head. The blast radius is somebody's live browser session.
+ *
+ * These import the PRODUCTION predicate from profile-match.mjs — the same module
+ * x-post-browser.mjs imports. They deliberately do NOT re-implement the match: a test that
+ * mirrors the logic it checks can pass while the shipped path regresses (#1414).
+ *
+ * Run: node tests/x-post-profile-match.test.mjs
+ */
+import { lineHoldsProfile, pidsHoldingProfile } from '../skills/x-twitter/profile-match.mjs';
+
+let failures = 0;
+const check = (name, cond, detail = '') => {
+	if (cond) { console.log(`  ok   ${name}`); return; }
+	console.log(`  FAIL ${name}${detail ? ' — ' + detail : ''}`);
+	failures++;
+};
+
+const DIR = '/tmp/x-profile';
+const line = (path, extra = '') =>
+	`4242 /Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing --user-data-dir=${path}${extra}`;
+
+// --- the reported bug -------------------------------------------------------
+check(
+	'P1: a PREFIX-COLLIDING profile is NOT matched (would have been killed)',
+	lineHoldsProfile(line('/tmp/x-profile-copy'), DIR) === false,
+	'substring matching killed an unrelated browser',
+);
+check(
+	'P1: prefix collision with trailing args is still not matched',
+	lineHoldsProfile(line('/tmp/x-profile-copy', ' --no-first-run'), DIR) === false,
+);
+check(
+	'a deeper path under ours is a DIFFERENT profile, not ours',
+	lineHoldsProfile(line('/tmp/x-profile/nested'), DIR) === false,
+);
+check(
+	'a path we are a suffix of is not ours either',
+	lineHoldsProfile(line('/home/other/tmp/x-profile'), DIR) === false,
+);
+
+// --- must still match, or the lock cleanup silently stops working -----------
+check('exact match at end of line', lineHoldsProfile(line(DIR), DIR) === true);
+check('exact match followed by another flag', lineHoldsProfile(line(DIR, ' --no-first-run'), DIR) === true);
+check(
+	'matches when the flag is not the last argument',
+	lineHoldsProfile(`4242 chrome --enable-x --user-data-dir=${DIR} --remote-debugging-port=0`, DIR) === true,
+);
+
+// --- helper processes inherit the flag; killing them is wrong ---------------
+check(
+	'renderer/GPU helpers are excluded',
+	lineHoldsProfile(line(DIR, ' --type=renderer'), DIR) === false,
+);
+
+// --- degenerate inputs must not throw or match ------------------------------
+for (const [name, l, d] of [
+	['empty line', '', DIR],
+	['null line', null, DIR],
+	['empty profile dir', line(DIR), ''],
+	['no --user-data-dir at all', '4242 chrome --headless', DIR],
+]) {
+	check(`degenerate: ${name} does not match`, lineHoldsProfile(l, d) === false);
+}
+
+// --- pid extraction ---------------------------------------------------------
+const out = [
+	line(DIR),                                   // ours            -> 4242
+	line('/tmp/x-profile-copy').replace('4242', '5150'),  // NOT ours
+	line(DIR, ' --type=gpu-process').replace('4242', '6161'), // helper, skip
+	`7777 /Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing --user-data-dir=${DIR} --x`,
+].join('\n');
+const pids = pidsHoldingProfile(out, DIR);
+check('pidsHoldingProfile returns only our browser PIDs', JSON.stringify(pids) === JSON.stringify(['4242', '7777']), JSON.stringify(pids));
+check('pidsHoldingProfile tolerates empty input', JSON.stringify(pidsHoldingProfile('', DIR)) === '[]');
+check('pidsHoldingProfile tolerates null input', JSON.stringify(pidsHoldingProfile(null, DIR)) === '[]');
+
+console.log(failures ? `\nFAIL — ${failures} profile-match check(s)` : '\nPASS — x-post profile match');
+process.exit(failures ? 1 : 0);

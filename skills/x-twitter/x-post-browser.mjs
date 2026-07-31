@@ -42,6 +42,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
+import { pidsHoldingProfile } from './profile-match.mjs';
 
 async function readComposer(page) {
   return await page.$eval('[data-testid="tweetTextarea_0"]', (el) => el.innerText ?? el.textContent ?? '');
@@ -99,7 +100,8 @@ const { app: CHROME_APP, bin: CHROME_BIN } = resolveChromium();
 /** PIDs of Google-Chrome-for-Testing procs holding THIS profile. Argv-safe:
  *  pgrep runs via execFileSync (no shell), and PROFILE_DIR is matched in JS, so
  *  a profile path with quotes/metacharacters can't break or inject a command
- *  (qingyun review, #2133). */
+ *  (qingyun review, #2133). The match itself lives in ./profile-match.mjs — it
+ *  gates a SIGKILL, so it is exact and independently tested. */
 function pidsForProfile() {
   let out;
   try {
@@ -107,11 +109,7 @@ function pidsForProfile() {
   } catch {
     return []; // pgrep exits 1 when nothing matches
   }
-  return out
-    .split('\n')
-    .filter((l) => l.includes(`--user-data-dir=${PROFILE_DIR}`) && !l.includes('--type='))
-    .map((l) => l.trim().split(/\s+/)[0])
-    .filter(Boolean);
+  return pidsHoldingProfile(out, PROFILE_DIR);
 }
 
 /** Kill any GCfT holding THIS profile and clear the SingletonLock, so the next
