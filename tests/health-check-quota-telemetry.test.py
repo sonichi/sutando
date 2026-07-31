@@ -234,16 +234,89 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         p.write_text(json.dumps({"host": "h", "started_at": started_at}))
         return p
 
+    def _write_sessions(self, *starts: float) -> Path:
+        """`state/session-starts.log` — one JSON line per core launch. THIS is the
+        session boundary; the heartbeat is not (see below)."""
+        p = self.ws / "state" / "session-starts.log"
+        p.write_text("".join(json.dumps({"session_started_at": t, "source": "start-cli"}) + "\n"
+                             for t in starts))
+        return p
+
     def test_stale_codex_marker_from_a_previous_core_does_not_silence(self):
-        """The false NEGATIVE: switched to Claude, stale codex marker still on disk."""
+        """The false NEGATIVE: switched to Claude, stale codex marker still on disk.
+
+        Originally written against the heartbeat, which john-the-dev showed is not a
+        session boundary (#2446) — a retained heartbeat process can be OLDER than a
+        fresh marker. Re-pointed at `session-starts.log`, which both launchers append
+        to on every launch.
+        """
+        now = time.time()
         self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
         self._write_core_status(mtime_age_sec=60)
         (self.ws / "state" / "core-runtime.json").write_text(
-            json.dumps({"runtime": "codex", "started_at": time.time() - 86400})
+            json.dumps({"runtime": "codex", "started_at": now - 86400})
         )
-        self._write_alive(time.time() - 300)          # current core started AFTER the marker
+        self._write_sessions(now - 86400, now - 300)  # current core launched AFTER the marker
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "warn", r["detail"])
+
+    def test_long_lived_heartbeat_is_not_a_session_boundary(self):
+        """john-the-dev, #2446: the heartbeat CANNOT stand in for session start.
+
+        `core_heartbeat.py` stamps `_STARTED_AT` once at module load and both launch
+        paths RETAIN an existing heartbeat process, so `.alive.started_at` measures the
+        heartbeat process's age, not the session's. Here the heartbeat is an hour old
+        while the codex core launched 60s ago — comparing against it made the staleness
+        check silently useless. The boundary is `session-starts.log`, which both
+        launchers append to on every launch.
+        """
+        now = time.time()
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        (self.ws / "state" / "core-runtime.json").write_text(
+            json.dumps({"runtime": "codex", "started_at": now - 60})
+        )
+        self._write_alive(now - 3600)          # heartbeat far older than the marker
+        self._write_sessions(now - 60)         # ...but the core launched WITH the marker
+        r = self.hc.check_quota_telemetry("ok")
+        # codex genuinely IS the current runtime here, so silence is correct — and now
+        # it is correct for the right reason rather than by accident.
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_marker_from_a_previous_launch_warns_against_session_log(self):
+        """The case the guard exists for: Codex ran yesterday, Claude relaunched today."""
+        now = time.time()
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        (self.ws / "state" / "core-runtime.json").write_text(
+            json.dumps({"runtime": "codex", "started_at": now - 86400})
+        )
+        self._write_alive(now - 3600)
+        self._write_sessions(now - 86400, now - 600)   # newest launch is AFTER the marker
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "warn", r["detail"])
+
+    def test_unusable_session_log_is_no_evidence_not_stale(self):
+        """Every hop guarded, per the lesson from rounds 1-3: unreadable, non-JSON,
+        non-object, missing key. None of them may crash, and none may claim staleness."""
+        now = time.time()
+        for label, body in (("absent", None), ("empty", ""),
+                            ("garbage lines", 'null\n[]\n"x"\nnot json\n'),
+                            ("missing key", '{"source": "start-cli"}\n'),
+                            ("non-numeric", '{"session_started_at": "soon"}\n')):
+            with self.subTest(label=label):
+                self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+                self._write_core_status(mtime_age_sec=60)
+                (self.ws / "state" / "core-runtime.json").write_text(
+                    json.dumps({"runtime": "codex", "started_at": now - 86400})
+                )
+                p = self.ws / "state" / "session-starts.log"
+                if body is None:
+                    p.unlink(missing_ok=True)
+                else:
+                    p.write_text(body)
+                r = self.hc.check_quota_telemetry("ok")   # must not raise
+                self.assertEqual(r["status"], "ok", f"{label}: {r['detail']}")
 
     def test_current_codex_marker_still_silences(self):
         """A marker from the RUNNING core is authoritative — don't over-correct."""
@@ -253,7 +326,7 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         (self.ws / "state" / "core-runtime.json").write_text(
             json.dumps({"runtime": "codex", "started_at": now - 60})
         )
-        self._write_alive(now - 300)                  # core started BEFORE the marker
+        self._write_sessions(now - 300)               # launch BEFORE the marker -> not stale
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "ok", r["detail"])
 
@@ -262,12 +335,15 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
         self._write_core_status(mtime_age_sec=60)
         (self.ws / "state" / "core-runtime.json").write_text(json.dumps({"runtime": "codex"}))
-        self._write_alive(time.time() - 300)
+        self._write_sessions(time.time() - 300)
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "ok", r["detail"])
 
-    def test_missing_heartbeat_leaves_the_marker_trusted(self):
-        """Without a heartbeat there is nothing to compare against."""
+    def test_missing_session_log_leaves_the_marker_trusted(self):
+        """Without a launch record there is nothing to compare against.
+
+        (Was `test_missing_heartbeat_...` — renamed with the mechanism it now asserts,
+        so the name cannot outlive the thing it tests.)"""
         self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
         self._write_core_status(mtime_age_sec=60)
         (self.ws / "state" / "core-runtime.json").write_text(

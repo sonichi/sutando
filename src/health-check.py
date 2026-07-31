@@ -1885,25 +1885,61 @@ def _runtime_may_skip_proxy() -> bool:
     return runtime in NON_PROXY_RUNTIMES
 
 
+def _last_core_launch_at() -> "float | None":
+    """When the CURRENT core was launched, from `state/session-starts.log`.
+
+    Both launchers append one line per launch — `src/agent/claude/cli/start-cli.sh:610`
+    and `src/agent/codex/cli/start-cli.sh:243` — so the newest entry is the boundary of
+    the running session regardless of which runtime started it.
+
+    The heartbeat was the obvious candidate and is WRONG: `core_heartbeat.py` stamps
+    `_STARTED_AT` once at module load and both launch paths RETAIN an existing heartbeat
+    process, so `.alive.started_at` is the heartbeat process's age, not the session's.
+    After a Codex → Claude switch it can be far older than a freshly-written marker,
+    which made the staleness comparison silently useless (john-the-dev, #2446).
+
+    Every hop is validated rather than the one that last broke: unreadable file, a line
+    that isn't JSON, a decoded value that isn't an object, a missing key, a non-numeric
+    value. Anything uninformative yields None, and None means "no evidence", never
+    "stale".
+    """
+    try:
+        raw = (status_read_path("session-starts.log", WORKSPACE_DIR)).read_text()
+    except OSError:
+        return None
+    for line in reversed(raw.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue                      # a torn/partial line is not the boundary
+        if not isinstance(entry, dict):
+            continue
+        try:
+            return float(entry.get("session_started_at"))
+        except (TypeError, ValueError):
+            continue                      # keep looking further back
+    return None
+
+
 def _marker_predates_running_core(marker: dict) -> bool:
     """True when `core-runtime.json` describes a core older than the one running now.
 
-    The heartbeat (`state/cores/<host>.alive`) is written by the LIVE core and carries
-    its own `started_at`, so a runtime marker stamped before it was left behind by a
-    previous core. Both timestamps must be present and comparable — if either is
-    missing the marker is taken at face value, because "no evidence of staleness" is
-    not evidence of staleness.
+    Compared against the newest `session-starts.log` entry — a real per-launch boundary
+    — not the heartbeat. Both timestamps must be present and comparable; if either is
+    missing the marker is taken at face value, because "no evidence of staleness" is not
+    evidence of staleness.
     """
     try:
         started = float(marker.get("started_at"))
     except (TypeError, ValueError):
         return False
-    try:
-        alive = status_read_path("cores", WORKSPACE_DIR) / f"{_host_label()}.alive"
-        core_started = float(json.loads(alive.read_text()).get("started_at"))
-    except (OSError, ValueError, TypeError, AttributeError):
+    launched = _last_core_launch_at()
+    if launched is None:
         return False
-    return started < core_started
+    return started < launched
 
 
 def _agent_activity_age() -> "float | None":
