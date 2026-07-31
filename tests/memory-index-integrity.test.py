@@ -64,131 +64,105 @@ with tempfile.TemporaryDirectory() as t:
     check("backup-stranded memory → warn", r and r["status"] == "warn", str(r))
     check("warn names the stranded file", r and "gmail-imap-capability.md" in r["detail"], str(r))
 
-# --- (c) the index itself outgrowing the session read limit --------------
-# Modes (a) and (b) each lose ONE memory. This one loses the whole index at
-# once, silently, while every memory file on disk still looks healthy — so it
-# is tested at the boundary rather than with a single comfortable value.
-# Thresholds are pinned to explicit test values so the assertions do not drift
-# when the shipped defaults are retuned.
-_FAIL = hc.MEMORY_INDEX_FAIL_BYTES
-_WARN = hc.MEMORY_INDEX_WARN_BYTES
-check("shipped defaults leave real headroom (warn strictly below fail)", _WARN < _FAIL,
-      f"warn={_WARN} fail={_FAIL}")
+# --- (c) the index outgrowing what a SESSION ACTUALLY READS ---------------
+# Claude Code loads the first 200 lines or 25KB of a memory file, whichever
+# comes first; content beyond that is dropped (the prefix still loads), and
+# YAML frontmatter + block-level HTML comments are stripped BEFORE the limits
+# are measured. https://code.claude.com/docs/en/memory#how-it-works
+#
+# These expectations are written as LITERALS from that document, deliberately
+# not as `hc.MEMORY_INDEX_LOAD_*`. An earlier revision derived its assertions
+# from the shipped constants, so the suite agreed with whatever the code said
+# and could not detect a wrong cutoff at all (qingyun-wu, #2449).
+check("shipped line limit matches the documented 200", hc.MEMORY_INDEX_LOAD_LINES == 200,
+      f"got {hc.MEMORY_INDEX_LOAD_LINES}")
+check("shipped byte limit matches the documented 25KB", hc.MEMORY_INDEX_LOAD_BYTES == 25 * 1024,
+      f"got {hc.MEMORY_INDEX_LOAD_BYTES}")
 
-def _index_of(mem: Path, nbytes: int) -> None:
-    """Write a MEMORY.md of exactly nbytes that indexes one real memory."""
-    head = "# Index\n- [Good](good-memory.md) — "
-    (mem / "good-memory.md").write_text("body")
-    pad = "x" * max(0, nbytes - len(head.encode()) - 1)
-    (mem / "MEMORY.md").write_text(head + pad + "\n")
-
-for label, size, want in (
-    ("well under warn        → ok",   _WARN - 2048, "ok"),
-    ("one byte under warn    → ok",   _WARN - 1,    "ok"),
-    ("exactly at warn        → warn", _WARN,        "warn"),
-    ("between warn and fail  → warn", (_WARN + _FAIL) // 2, "warn"),
-    ("one byte under fail    → warn", _FAIL - 1,    "warn"),
-    ("exactly at fail        → fail", _FAIL,        "fail"),
-    ("far over fail          → fail", _FAIL + 8192, "fail"),
-):
-    with tempfile.TemporaryDirectory() as t:
-        mem = make_tree(Path(t))
-        _index_of(mem, size)
-        hc.MEMORY_DIR = mem
-        r = hc.check_memory_index_integrity()
-        check(f"index size: {label}", r and r["status"] == want,
-              f"size={size} got={r and r['status']} want={want} :: {r and r['detail'][:90]}")
-
-# The ok path should still report the size, so the number is visible BEFORE it
-# becomes a problem — a threshold you only see once it trips is a threshold you
-# cannot plan around.
-with tempfile.TemporaryDirectory() as t:
-    mem = make_tree(Path(t))
-    _index_of(mem, 1024)
-    hc.MEMORY_DIR = mem
-    r = hc.check_memory_index_integrity()
-    check("ok detail states the index size", r and "KB index" in r["detail"], str(r))
-
-# Size and the pre-existing modes are independent: an oversized index must
-# still name the orphan, and must not be downgraded to warn by its presence.
-with tempfile.TemporaryDirectory() as t:
-    mem = make_tree(Path(t))
-    _index_of(mem, _FAIL + 512)
-    (mem / "orphan-memory.md").write_text("stranded rule that never loads")
-    hc.MEMORY_DIR = mem
-    r = hc.check_memory_index_integrity()
-    check("oversized + orphan → still fail", r and r["status"] == "fail", str(r))
-    check("oversized + orphan → still names the orphan",
-          r and "orphan-memory.md" in r["detail"], str(r))
-
-# An absent MEMORY.md is 0 bytes, not "oversized" — a fresh install must not
-# trip the size guard.
-with tempfile.TemporaryDirectory() as t:
+def _mem_with(index_body: str, extra=()):
+    """A memory tree whose MEMORY.md is exactly `index_body`."""
+    t = tempfile.mkdtemp()
     mem = make_tree(Path(t))
     (mem / "good-memory.md").write_text("body")
+    for name in extra:
+        (mem / name).write_text("body")
+    (mem / "MEMORY.md").write_text(index_body)
     hc.MEMORY_DIR = mem
-    r = hc.check_memory_index_integrity()
-    check("no MEMORY.md at all → not a size failure", r and r["status"] != "fail", str(r))
+    return mem
 
-# --- threshold OVERRIDES: the two limits are independent and can invert ----
-# qingyun-wu (#2449): a runtime measuring a SMALLER read limit sets only
-# ..._FAIL_BYTES and leaves the warn default alone, so fail < warn. An index
-# between them is over the fail limit while `outgrowing` is still False.
-# Gating the healthy return on `outgrowing` alone returned `ok` at exactly the
-# moment the index had stopped loading. Her exact repro is the first row.
-_shipped_fail, _shipped_warn = hc.MEMORY_INDEX_FAIL_BYTES, hc.MEMORY_INDEX_WARN_BYTES
-try:
-    for label, nbytes, fail, warn, want in (
-        ("her repro: fail<warn, between them   ", 150, 100, 200, "fail"),
-        ("fail<warn, under both                ",  50, 100, 200, "ok"),
-        ("fail<warn, over both                 ", 250, 100, 200, "fail"),
-        ("fail<warn, exactly at fail           ", 100, 100, 200, "fail"),
-        ("one-sided: only FAIL lowered         ", 150, 100, _shipped_warn, "fail"),
-        ("one-sided: only WARN raised past fail", 150, _shipped_fail, 999999, "ok"),
-        ("equal thresholds, at the boundary    ", 100, 100, 100, "fail"),
-        ("equal thresholds, just below         ",  99, 100, 100, "ok"),
-    ):
-        with tempfile.TemporaryDirectory() as t_:
-            mem = make_tree(Path(t_))
-            _index_of(mem, nbytes)
-            hc.MEMORY_DIR = mem
-            hc.MEMORY_INDEX_FAIL_BYTES, hc.MEMORY_INDEX_WARN_BYTES = fail, warn
-            r = hc.check_memory_index_integrity()
-            check(f"override {label} → {want}", r and r["status"] == want,
-                  f"bytes={nbytes} fail={fail} warn={warn} got={r and r['status']}")
-finally:
-    hc.MEMORY_INDEX_FAIL_BYTES, hc.MEMORY_INDEX_WARN_BYTES = _shipped_fail, _shipped_warn
+_ENTRY = "- [Good](good-memory.md)\n"
 
-check("shipped thresholds restored after override tests",
-      (hc.MEMORY_INDEX_FAIL_BYTES, hc.MEMORY_INDEX_WARN_BYTES) == (_shipped_fail, _shipped_warn))
+# john-the-dev's fixture 1: the ONLY index entry sits on line 201. The runtime
+# drops that line, so the memory never loads — reading the whole file instead
+# of the loaded prefix reported this as healthy.
+r = hc.check_memory_index_integrity() if _mem_with(
+    "".join(f"- filler {i}\n" for i in range(200)) + _ENTRY) else None
+check("entry parked on line 201 → fail", r and r["status"] == "fail", str(r))
+check("...and names the memory that will not load",
+      r and "good-memory.md" in r["detail"], str(r))
+check("...and does NOT claim the whole index stops loading",
+      r and "WHOLE index" not in r["detail"] and "whole index" not in r["detail"], str(r))
 
-# --- env parsing happens at IMPORT: a typo must not take health-check down ---
-# A bare int(os.environ[...]) raised ValueError during module import, so one
-# mistyped tuning variable removed ALL monitoring — worse than the problem the
-# threshold exists to catch.
-import os as _os
-for raw, want in (("24k", 24 * 1024), ("", 24 * 1024), ("0", 24 * 1024),
-                  ("-1", 24 * 1024), ("  ", 24 * 1024), ("12.5", 24 * 1024),
-                  ("8192", 8192), (" 8192 ", 8192)):
-    _os.environ["_TEST_MEM_IDX"] = raw
-    got = hc._positive_int_env("_TEST_MEM_IDX", 24 * 1024)
-    check(f"env {raw!r:9} → {want}", got == want, f"got {got}")
-_os.environ.pop("_TEST_MEM_IDX", None)
-check("unset env → default", hc._positive_int_env("_TEST_MEM_IDX_UNSET", 777) == 777)
+# john-the-dev's fixture 2: one visible entry plus a 25KiB block-level HTML
+# comment. The runtime strips the comment before measuring, so the index is
+# tiny in practice — counting raw bytes reported a hard failure.
+_mem_with(_ENTRY + "<!--\n" + ("padding padding padding\n" * 1100) + "-->\n")
+r = hc.check_memory_index_integrity()
+check("25KiB block HTML comment → not a failure", r and r["status"] != "fail", str(r))
 
-# The property that actually matters: the module still IMPORTS with a bad value.
-import subprocess as _sp   # `sys` is already imported at the top of this file
-_env = dict(_os.environ, SUTANDO_MEMORY_INDEX_FAIL_BYTES="24k",
-            SUTANDO_MEMORY_INDEX_WARN_BYTES="oops")
-_r = _sp.run([sys.executable, "-c",
-              "import importlib.util;s=importlib.util.spec_from_file_location('hc',%r);"
-              "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
-              "print(m.MEMORY_INDEX_FAIL_BYTES, m.MEMORY_INDEX_WARN_BYTES)" % str(HC)],
-             capture_output=True, text=True, env=_env)
-check("health-check still imports with unparseable thresholds",
-      _r.returncode == 0, (_r.stderr or "")[-160:])
-check("and falls back to the shipped defaults",
-      _r.stdout.strip() == f"{24 * 1024} {19 * 1024}", _r.stdout.strip())
+# Same idea for YAML frontmatter.
+_mem_with("---\n" + ("meta: x\n" * 900) + "---\n" + _ENTRY)
+r = hc.check_memory_index_integrity()
+check("large YAML frontmatter → not a failure", r and r["status"] != "fail", str(r))
+
+# The BYTE limit binds too, not just the line limit: few lines, but the entry
+# is pushed past 25KB.
+_mem_with(("x" * 4000 + "\n") * 7 + _ENTRY)
+r = hc.check_memory_index_integrity()
+check("entry pushed past the 25KB byte limit → fail", r and r["status"] == "fail", str(r))
+
+# ...and "whichever comes first" means the LINE limit can bind while the file
+# is nowhere near 25KB.
+_mem_with("".join(f"- f{i}\n" for i in range(400)) + _ENTRY)
+r = hc.check_memory_index_integrity()
+check("line limit binds well under 25KB → fail", r and r["status"] == "fail", str(r))
+
+# Approaching the limit warns while everything still loads, so there is room to
+# compact deliberately rather than after entries have already been dropped.
+_mem_with(_ENTRY + "".join(f"- f{i}\n" for i in range(185)))
+r = hc.check_memory_index_integrity()
+check("near the line limit, nothing dropped yet → warn", r and r["status"] == "warn", str(r))
+check("...and the warn is about approaching, not loss",
+      r and "approaching" in r["detail"], str(r))
+
+# A comfortable index stays quiet and still reports its size.
+_mem_with(_ENTRY)
+r = hc.check_memory_index_integrity()
+check("small clean index → ok", r and r["status"] == "ok", str(r))
+check("ok detail states the loadable size", r and "session read limit" in r["detail"], str(r))
+
+# Loss and the pre-existing modes are independent.
+_mem_with("".join(f"- filler {i}\n" for i in range(200)) + _ENTRY, extra=("orphan-memory.md",))
+r = hc.check_memory_index_integrity()
+check("dropped entry + orphan → still fail", r and r["status"] == "fail", str(r))
+check("dropped entry + orphan → still names the orphan",
+      r and "orphan-memory.md" in r["detail"], str(r))
+
+# An absent MEMORY.md is not a size failure — a fresh install must stay quiet.
+t = tempfile.mkdtemp(); mem = make_tree(Path(t))
+(mem / "good-memory.md").write_text("body"); hc.MEMORY_DIR = mem
+r = hc.check_memory_index_integrity()
+check("no MEMORY.md at all → not a size failure", r and r["status"] != "fail", str(r))
+
+# --- the undeclared env knobs are GONE ------------------------------------
+# AGENTS.md forbids inventing undocumented env vars, and these mirrored a
+# documented external contract that a deployment cannot legitimately retune
+# (qingyun-wu, #2449). Asserted structurally so they cannot quietly return.
+for _gone in ("MEMORY_INDEX_FAIL_BYTES", "MEMORY_INDEX_WARN_BYTES", "_positive_int_env"):
+    check(f"removed: hc.{_gone}", not hasattr(hc, _gone), f"{_gone} is back")
+_src = HC.read_text()
+for _var in ("SUTANDO_MEMORY_INDEX_FAIL_BYTES", "SUTANDO_MEMORY_INDEX_WARN_BYTES"):
+    check(f"no undeclared env var {_var}", _var not in _src)
 
 # 4) Missing memory dir → None (no false alarm on fresh installs).
 with tempfile.TemporaryDirectory() as t:

@@ -92,36 +92,64 @@ def _default_memory_dir() -> str:
 # redirecting.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
-# MEMORY.md is read whole into every session. Past the runtime's read limit it
-# is not truncated — it is skipped — so EVERY indexed memory stops loading at
-# once, silently, while each memory file still looks fine on disk.
-# Env-overridable on purpose: the limit belongs to the session runtime, not to
-# this repo, so a deployment that measures a different one can declare it
-# rather than patch code. Defaults encode what was observed on this fleet
-# 2026-07-31 (index hit 22.0KB against a 24.4KB limit, uncaught).
-def _positive_int_env(name: str, default: int) -> int:
-    """Read a positive-int env override, falling back to `default` if unusable.
+# How much of MEMORY.md a session actually loads. These are the RUNTIME's
+# documented numbers, not this repo's guess:
+#
+#   "Claude Code reads the first 200 lines or 25KB of a memory file, whichever
+#    comes first" — content BEYOND that point is dropped; the prefix still
+#    loads. YAML frontmatter and block-level HTML comments are stripped before
+#    those limits are measured.
+#   https://code.claude.com/docs/en/memory#how-it-works
+#
+# Earlier revisions of this check encoded a measured-by-eye ~24KB cutoff and
+# claimed the WHOLE index stops loading past it. Both were wrong (john-the-dev,
+# #2449): the limit is line-OR-byte, and truncation is a suffix drop, not total
+# loss. They are plain constants rather than env knobs on purpose — they mirror
+# a documented external contract, so a deployment that "tunes" them is just
+# lying to itself about what its runtime does. Undeclared env vars are also
+# forbidden by AGENTS.md (qingyun-wu, #2449).
+MEMORY_INDEX_LOAD_LINES = 200
+MEMORY_INDEX_LOAD_BYTES = 25 * 1024
+# Warn while there is still room to compact deliberately rather than in a panic.
+MEMORY_INDEX_NEAR_LIMIT = 0.9
 
-    These are parsed at IMPORT time, so a bare `int(os.environ[...])` turns a
-    typo into an exception that takes the ENTIRE health check down — a tuning
-    mistake would cost all monitoring, which is strictly worse than the stale
-    index this threshold exists to catch (qingyun-wu, #2449). `24k`, ``, `0`
-    and `-1` all fall back rather than raise.
+
+def _index_effective_text(text: str) -> str:
+    """Drop what the runtime strips BEFORE it measures the 200-line/25KB limits.
+
+    Counting raw bytes over-reports: a file whose bulk is frontmatter or a block
+    HTML comment measures large here but small to the runtime. That produced a
+    false `fail` on a 25.6KB fixture whose visible content was one line
+    (john-the-dev, #2449).
     """
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
+    if text.startswith("---"):
+        m = re.match(r"^---\r?\n.*?\r?\n---[ \t]*\r?\n?", text, re.DOTALL)
+        if m:
+            text = text[m.end():]
+    # Block-level HTML comments only — a comment sharing a line with visible
+    # content is not block-level, so leave that line alone.
+    return re.sub(r"(?ms)^[ \t]*<!--.*?-->[ \t]*\r?\n?", "", text)
 
 
-MEMORY_INDEX_FAIL_BYTES = _positive_int_env("SUTANDO_MEMORY_INDEX_FAIL_BYTES", 24 * 1024)
-# Warn with enough headroom to compact deliberately rather than in a panic —
-# a few more filed memories is all the margin there is at the default.
-MEMORY_INDEX_WARN_BYTES = _positive_int_env("SUTANDO_MEMORY_INDEX_WARN_BYTES", 19 * 1024)
+def _index_loaded_prefix(text: str) -> "tuple[str, int, int]":
+    """Return (prefix_that_loads, bytes_loaded, lines_loaded) per the contract.
+
+    Whichever of the two limits is reached first stops the read. A line that
+    would straddle the byte limit is treated as not loaded — the conservative
+    reading, and the one that matters here since a half-read index line cannot
+    be relied on to name its memory file.
+    """
+    kept: list[str] = []
+    total = 0
+    for i, line in enumerate(text.splitlines(keepends=True)):
+        if i >= MEMORY_INDEX_LOAD_LINES:
+            break
+        nbytes = len(line.encode("utf-8"))
+        if total + nbytes > MEMORY_INDEX_LOAD_BYTES:
+            break
+        kept.append(line)
+        total += nbytes
+    return "".join(kept), total, len(kept)
 
 
 def _resolve_dotenv() -> Path:
@@ -794,21 +822,44 @@ def check_memory_index_integrity() -> "dict | None":
     ``*-BACKUP`` tree (created by scripts/sutando-migrate.sh) that never made it
     into the live index — so the rule it carried was written yet never recalled.
 
-    Warn (never fail) listing the orphaned/stranded files so the divergence is
-    visible instead of silently dropping the memory. Returns None on a clean
-    index or when the memory dir does not exist yet.
+    A third mode has the same consequence: the entry EXISTS but sits past the
+    point a session stops reading (200 lines or 25KB of post-strip content,
+    whichever comes first — see MEMORY_INDEX_LOAD_*). Truncation drops the
+    suffix, not the file, so this is measured by asking whether each memory is
+    named in the prefix that actually loads.
+
+    Fails only when a memory is demonstrably lost that way; warns for orphaned/
+    stranded files and for an index merely approaching the limit. Returns None
+    on a clean index or when the memory dir does not exist yet.
     """
     if not MEMORY_DIR.exists():
         return None
     index = MEMORY_DIR / "MEMORY.md"
     index_text = index.read_text(errors="ignore") if index.exists() else ""
 
+    # What the session actually sees: strip what the runtime strips, then keep
+    # only the prefix that fits inside 200 lines / 25KB.
+    effective_text = _index_effective_text(index_text)
+    loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
+    truncated = len(loaded_text) < len(effective_text)
+
+    def _referenced_in(hay: str, name: str) -> bool:
+        return name in hay or name[:-3] in hay
+
     # (a) live memory files not referenced anywhere in MEMORY.md → won't load.
-    unindexed = [
-        p.name for p in sorted(MEMORY_DIR.glob("*.md"))
-        if p.name != "MEMORY.md"
-        and p.name not in index_text and p.name[:-3] not in index_text
-    ]
+    # (c) referenced, but ONLY beyond the load cut → equally won't load. Same
+    #     consequence, different cause, so they are found the same way: ask the
+    #     prefix that actually loads, not the whole file. Testing the whole file
+    #     reported an index entry parked on line 201 as healthy (john-the-dev,
+    #     #2449) because the bytes were on disk — just never read.
+    unindexed: list[str] = []
+    beyond_cut: list[str] = []
+    for p in sorted(MEMORY_DIR.glob("*.md")):
+        if p.name == "MEMORY.md":
+            continue
+        if _referenced_in(loaded_text, p.name):
+            continue
+        (beyond_cut if _referenced_in(effective_text, p.name) else unindexed).append(p.name)
 
     # (b) memories stranded in a sibling *-BACKUP tree, absent from the live dir.
     stranded: list[str] = []
@@ -825,55 +876,40 @@ def check_memory_index_integrity() -> "dict | None":
     except Exception:  # pragma: no cover — best-effort backup scan; never break the health check
         pass
 
-    # (c) the INDEX ITSELF outgrowing the per-session read limit. This is the
-    # same failure the check already exists for — "a memory that will never
-    # load" — but at the largest possible blast radius: past the limit the
-    # index file is not truncated, it simply is not read, so EVERY indexed
-    # memory stops loading at once. Modes (a) and (b) lose one memory each;
-    # this one loses all of them, and it arrives silently while every
-    # individual memory file still looks perfectly healthy on disk.
-    #
-    # Observed on this fleet 2026-07-31: MEMORY.md reached 22.0KB against a
-    # 24.4KB limit — roughly 2KB, or a few more filed memories, from dropping
-    # a 250-entry index with no warning anywhere. Nothing caught it.
-    #
-    # The thresholds are env-overridable because the limit is a property of the
-    # session runtime, not of this repo: the default encodes what was observed
-    # rather than a documented constant, so a deployment that measures a
-    # different limit can say so instead of editing code.
-    index_bytes = len(index_text.encode("utf-8")) if index.exists() else 0
-    oversized = index_bytes >= MEMORY_INDEX_FAIL_BYTES
-    outgrowing = index_bytes >= MEMORY_INDEX_WARN_BYTES
+    # (c) the index outgrowing what a session reads. Truncation is a SUFFIX
+    # drop, so the damage is exactly the entries past the cut — reported above
+    # as `beyond_cut`. What is left to say here is whether the index is close
+    # enough to the cut to be worth compacting before entries start falling off.
+    effective_bytes = len(effective_text.encode("utf-8"))
+    effective_lines = len(effective_text.splitlines())
+    near_limit = (
+        effective_bytes >= MEMORY_INDEX_LOAD_BYTES * MEMORY_INDEX_NEAR_LIMIT
+        or effective_lines >= MEMORY_INDEX_LOAD_LINES * MEMORY_INDEX_NEAR_LIMIT
+    )
 
-    # Both size conditions gate the healthy return, not just `outgrowing`.
-    # They are independent env overrides, so they can invert: a runtime that
-    # measures a SMALLER read limit sets only ..._FAIL_BYTES and leaves the warn
-    # default alone, giving fail < warn. An index between them is then over the
-    # fail limit while `outgrowing` is still False — and testing `outgrowing`
-    # alone returned `ok` at exactly the point the index had stopped loading
-    # (qingyun-wu's repro, #2449: bytes=150, fail=100, warn=200 -> ok).
-    #
-    # Checking both explicitly is preferred over normalising warn to
-    # min(warn, fail): normalisation would make the branches agree but changes
-    # no observable verdict here (the `if oversized` branch already wins), so
-    # it would add a silent rewrite of operator-declared config for no gain.
-    if not unindexed and not stranded and not outgrowing and not oversized:
+    def _size_note() -> str:
+        return (f"{effective_bytes / 1024:.1f}KB / {effective_lines} lines of loadable "
+                f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1024:.0f}KB / "
+                f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
+
+    if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
-                "detail": ("all memory files present in the MEMORY.md index "
-                           f"({index_bytes / 1024:.1f}KB index)")}
+                "detail": f"all memory files present in the loaded MEMORY.md index ({_size_note()})"}
     parts = []
-    if oversized:
+    if beyond_cut:
         parts.append(
-            f"MEMORY.md is {index_bytes / 1024:.1f}KB, at/over the "
-            f"{MEMORY_INDEX_FAIL_BYTES / 1024:.1f}KB session read limit — the WHOLE index "
-            "stops loading, not part of it. Compact it now: one line per entry, "
-            "detail belongs in the topic files"
+            f"{len(beyond_cut)} memory file(s) ARE indexed but sit past the load cut "
+            f"(index stops at line {loaded_lines} / {loaded_bytes / 1024:.1f}KB), so the "
+            f"session never reads their entry: {', '.join(beyond_cut[:6])}"
+            f"{'…' if len(beyond_cut) > 6 else ''}. Compact the index — the prefix still "
+            f"loads, only the tail is dropped ({_size_note()})"
         )
-    elif outgrowing:
+    elif near_limit:
         parts.append(
-            f"MEMORY.md is {index_bytes / 1024:.1f}KB, approaching the "
-            f"{MEMORY_INDEX_FAIL_BYTES / 1024:.1f}KB session read limit — compact it "
-            "before it crosses; past the limit EVERY indexed memory stops loading"
+            f"MEMORY.md is approaching the session read limit ({_size_note()})"
+            + (" and is already truncated" if truncated else "")
+            + " — compact it now; entries past the cut are dropped silently while "
+              "every memory file still looks fine on disk"
         )
     if unindexed:
         parts.append(
@@ -885,10 +921,13 @@ def check_memory_index_integrity() -> "dict | None":
             f"{len(stranded)} memory file(s) stranded in a *-BACKUP tree, absent from the live dir: "
             + ", ".join(sorted(set(stranded))[:6]) + ("…" if len(set(stranded)) > 6 else "")
         )
-    # An index that is already over the limit is not "up but degraded" — it is
-    # not loading at all, so it reports as a failure rather than a warning.
+    # `fail` only for demonstrated loss: named memory files whose index entry is
+    # past the cut and therefore never read. Everything else — orphans, strays,
+    # merely approaching the limit — is degradation, not loss, so it warns.
+    # (Earlier revisions failed on a raw-byte threshold, which fired on indexes
+    # that still loaded fine once frontmatter/comments were excluded.)
     return {"name": "memory-index",
-            "status": "fail" if oversized else "warn",
+            "status": "fail" if beyond_cut else "warn",
             "detail": "; ".join(parts)}
 
 
