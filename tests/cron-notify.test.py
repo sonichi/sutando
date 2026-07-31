@@ -277,6 +277,43 @@ def main() -> int:
               (not Path(sf).exists()) or json.loads(sf.read_text()) == {},
               sf.read_text() if Path(sf).exists() else "(no file)")
 
+    # ── #2346 review: a flock() failure AFTER os.open must fail closed AND close
+    # the just-opened fd (no leak). john's repro forces the REAL _StateLock's
+    # fcntl.flock to raise, then probes the captured descriptor.
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"; sf.write_text("{}")
+        posted = []
+        captured = {}
+        _real_open = _os.open
+
+        def _capturing_open(*a, **k):
+            fd = _real_open(*a, **k)
+            captured["fd"] = fd
+            return fd
+
+        def _boom_flock(fd, op):
+            raise OSError("simulated flock acquisition failure")
+
+        with um.patch("os.open", _capturing_open), \
+             um.patch("fcntl.flock", _boom_flock), \
+             um.patch.object(cn, "_post_to_room",
+                             side_effect=lambda *a, **k: posted.append(a) or "$evt"):
+            rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                          "--room", "!r:x", "--state-file", str(sf), "--now", "10000"])
+        check("flock failure: REFUSES to post (fail-closed)", posted == [], posted)
+        check("flock failure: exit 2", rc == 2, rc)
+        check("flock failure: no reservation written", json.loads(sf.read_text()) == {},
+              sf.read_text())
+
+        def _fd_open(fd):
+            try:
+                _os.fstat(fd)
+                return True
+            except OSError:
+                return False
+        check("flock failure: the opened fd was CLOSED (no leak)",
+              "fd" in captured and not _fd_open(captured["fd"]), captured)
+
     # dry-run must also honor the rate-limit (covers the dry-run suppressed path).
     with tempfile.TemporaryDirectory() as td:
         sf = Path(td) / "s.json"; sf.write_text(json.dumps({"c": 9000}))

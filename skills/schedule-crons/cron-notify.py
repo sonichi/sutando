@@ -273,10 +273,17 @@ class _StateLock:
     def __enter__(self):
         import fcntl
         import os
-        # os.open or flock raising OSError propagates → the caller fails closed.
-        # __exit__ only runs if this returns, so a raise here leaks no context.
-        self._fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        # os.open raising OSError propagates with no fd yet → caller fails closed.
+        # If flock raises AFTER open, __enter__ does not return so __exit__ never
+        # runs — we must close the just-opened fd here or it leaks (one per faulted
+        # invocation). Publish self._fd only once the lock is fully held.
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
         return self
 
     def __exit__(self, *exc):
