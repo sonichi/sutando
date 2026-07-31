@@ -65,16 +65,29 @@ def cli(*argv: str) -> tuple[int, str]:
 SESSION = "aaaa-bbbb-cccc"
 STALE_S = 15 * 60
 
-# 1. concurrency: 8 simultaneous claimers, exactly one winner
-d1 = Path(tempfile.mkdtemp(prefix="claim-race-"))
-with ThreadPoolExecutor(max_workers=8) as pool:
-    with redirect_stdout(io.StringIO()):
-        codes = list(pool.map(
-            lambda _: rc.claim(d1, SESSION, STALE_S), range(8)))
-check("race: exactly one of 8 concurrent claims wins",
-      codes.count(0) == 1 and codes.count(1) == 7, str(codes))
-check("race: claim file names the session",
-      json.loads((d1 / rc.CLAIM_NAME).read_text())["session"] == SESSION)
+# 1. concurrency: 8 simultaneous claimers, exactly one winner — repeated 20
+# rounds. One round passes on timing luck (the original create-then-write
+# implementation went green locally, then produced 5-of-8 winners on the
+# 2-core CI runner when a claimer read a nascent claim as corrupt→stale and
+# unlinked it); the repeat makes the test actually sensitive to the race.
+bad_rounds = []
+for rnd in range(20):
+    dr = Path(tempfile.mkdtemp(prefix=f"claim-race-{rnd}-"))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        with redirect_stdout(io.StringIO()):
+            codes = list(pool.map(
+                lambda _: rc.claim(dr, SESSION, STALE_S), range(8)))
+    claim_ok = ((dr / rc.CLAIM_NAME).exists() and
+                json.loads((dr / rc.CLAIM_NAME).read_text())["session"]
+                == SESSION)
+    leftover_tmp = list(dr.glob(".recap-claim-*"))
+    if codes.count(0) != 1 or codes.count(1) != 7 or not claim_ok \
+            or leftover_tmp:
+        bad_rounds.append((rnd, codes, claim_ok, leftover_tmp))
+    d1 = dr  # last round's dir feeds the lifecycle checks below
+check("race: exactly one of 8 concurrent claims wins, every round (x20), "
+      "claim intact, no temp litter",
+      not bad_rounds, str(bad_rounds[:3]))
 
 # 2. a fresh claim blocks a later claimer
 code, msg = cli("claim", SESSION, "--state-dir", str(d1))
@@ -117,23 +130,25 @@ d3 = Path(tempfile.mkdtemp(prefix="claim-corrupt-"))
 code, msg = cli("claim", SESSION, "--state-dir", str(d3))
 check("corrupt claim treated as stale and reclaimed", code == 0, msg)
 
-# 6b. defensive loop exit: if every O_EXCL round collides (claim keeps
+# 6b. defensive loop exit: if every link round collides (claim keeps
 # reading stale), the claimer gives up with exit 1 instead of spinning
 d4 = Path(tempfile.mkdtemp(prefix="claim-lostrace-"))
-real_open = rc.os.open
+real_link = rc.os.link
 
 
 def always_busy(*a, **k):
     raise FileExistsError
 
 
-rc.os.open = always_busy
+rc.os.link = always_busy
 try:
     with redirect_stdout(io.StringIO()):
         code = rc.claim(d4, SESSION, STALE_S)
 finally:
-    rc.os.open = real_open
+    rc.os.link = real_link
 check("exhausted re-race gives up with exit 1", code == 1)
+check("temp file cleaned up even on give-up",
+      not list(d4.glob(".recap-claim-*")))
 
 # 7. state_dir default resolution reaches <workspace>/state (no override)
 resolved = rc.state_dir(None)

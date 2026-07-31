@@ -17,9 +17,14 @@ atomic and is the required gate BEFORE spawning the worker:
                                     --stamp (failure path) the claim is
                                     dropped so a later run can retry.
 
-Atomicity: the claim file (state/recap-inflight.json) is created with
-O_CREAT|O_EXCL — the kernel picks exactly one winner among concurrent
-claimers. A claim older than --stale-minutes (default 15) is a dead worker:
+Atomicity: the payload is written to a private temp file first, then
+os.link()ed to the claim path (state/recap-inflight.json) — link is atomic
+and fails if the target exists, so the kernel picks exactly one winner among
+concurrent claimers AND a claim is never visible with a partial/empty
+payload. (The first cut used O_CREAT|O_EXCL then wrote the payload into the
+opened fd; a concurrent claimer could read the not-yet-written file, judge
+it corrupt→stale, unlink it, and win too — 5-of-8 winners on the 2-core CI
+runner.) A claim older than --stale-minutes (default 15) is a dead worker:
 claimers unlink it and re-race, again with exactly one winner, so a crashed
 worker can never wedge boot recaps.
 """
@@ -30,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -60,30 +66,38 @@ def claim(sdir: Path, session: str, stale_s: float) -> int:
     path = sdir / CLAIM_NAME
     payload = json.dumps({"session": session, "ts": time.time(),
                           "pid": os.getpid()})
-    # At most two rounds: a fresh claim skips inside round 1; a stale claim
-    # is unlinked and re-raced once — the re-race loser then sees the
-    # winner's fresh claim and skips.
-    for _ in range(2):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            try:
-                cur = json.loads(path.read_text())
-            except (OSError, ValueError):
-                cur = {}
-            age = time.time() - float(cur.get("ts") or 0)
-            if age < stale_s:
-                print(f"skip: in-flight ({cur.get('session', '?')}, "
-                      f"{age:.0f}s old)")
-                return 1
-            path.unlink(missing_ok=True)  # dead worker — re-race
-            continue
+    # Full payload lands in a private temp file BEFORE the claim becomes
+    # visible: os.link is atomic-or-FileExistsError, so no claimer can ever
+    # observe a partial/empty claim (the corrupt→stale misread that produced
+    # multiple winners with the create-then-write approach).
+    fd, tmp = tempfile.mkstemp(dir=sdir, prefix=".recap-claim-")
+    try:
         with os.fdopen(fd, "w") as f:
             f.write(payload)
-        print("claimed")
-        return 0
-    print("skip: lost re-race")
-    return 1
+        # At most two rounds: a fresh claim skips inside round 1; a stale
+        # claim is unlinked and re-raced once — the re-race loser then sees
+        # the winner's fresh claim and skips.
+        for _ in range(2):
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                try:
+                    cur = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    cur = {}
+                age = time.time() - float(cur.get("ts") or 0)
+                if age < stale_s:
+                    print(f"skip: in-flight ({cur.get('session', '?')}, "
+                          f"{age:.0f}s old)")
+                    return 1
+                path.unlink(missing_ok=True)  # dead worker — re-race
+                continue
+            print("claimed")
+            return 0
+        print("skip: lost re-race")
+        return 1
+    finally:
+        os.unlink(tmp)
 
 
 def release(sdir: Path, session: str, stamp: bool) -> int:
