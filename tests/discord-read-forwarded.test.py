@@ -85,6 +85,43 @@ check("D3 control: empty non-forward stays empty (no phantom label)",
 check("D4 control: missing content key does not raise",
       dr._render({}) == "")
 
+
+# --- end-to-end through main(): the forward must reach STDOUT ---------------
+# The unit checks above prove `_render` is correct; this proves the RENDER LOOP
+# actually uses it. That is the line that was wrong in production — the helper
+# never existed, so a suite that only exercised a helper would have passed
+# against a reader that still printed blanks.
+import io
+import contextlib
+
+_SAMPLE = [
+    {"id": "2", "timestamp": "2026-07-30T17:17:20.000000+00:00",
+     "author": {"username": "susanliu_"}, "content": "",
+     "message_snapshots": [{"message": {"content": "the 1602-char transcript lives here",
+                                        "attachments": [], "embeds": []}}]},
+    {"id": "1", "timestamp": "2026-07-30T16:58:00.000000+00:00",
+     "author": {"username": "susanliu_"}, "content": "an ordinary message"},
+]
+
+dr._load_token = lambda env: "test-token"
+dr._fetch = lambda extra, channel_id, page, headers: list(_SAMPLE)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = dr.main(["1532071853219385394"])
+printed = buf.getvalue()
+
+check("E1 main() exits 0 with a stubbed fetch", rc == 0, f"rc={rc}")
+check("E2 the ordinary message still prints its text",
+      "an ordinary message" in printed, repr(printed))
+check("E3 THE FORWARD REACHES STDOUT (the production failure)",
+      "1602-char transcript" in printed, repr(printed))
+check("E4 the forward is labelled in the output",
+      "[forwarded]" in printed, repr(printed))
+check("E5 output stays oldest-first",
+      printed.index("an ordinary message") < printed.index("1602-char transcript"),
+      repr(printed))
+
 print()
 if failures:
     print(f"FAIL — {len(failures)} check(s) failed")
