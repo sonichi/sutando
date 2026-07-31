@@ -34,8 +34,29 @@ _rcg_content_digest() {
           printf '%s ' "$f"
           shasum -a 256 "$dir/$f" 2>/dev/null | awk '{print $1}'
         done
+    # THE REPO'S OWN CONTROL SURFACE. `git status` and `git diff` describe the
+    # WORKING TREE; they say nothing about .git/ itself. Found by shape-hunt after
+    # the HEAD and status-code rounds: a suite could drop a post-commit HOOK into
+    # the operator's clone (arbitrary code on their next commit) or repoint
+    # remote.origin.url (redirecting where the vault pushes) and this guard
+    # returned success. Both are worse than the data write it was built to catch.
+    #
+    # Only config + hooks are covered, deliberately. The rest of .git/ churns on
+    # ordinary reads (index mtime, logs/HEAD, packed refs), so hashing it wholesale
+    # would produce false positives and the guard would be disabled within a week.
+    shasum -a 256 "$dir/.git/config" 2>/dev/null | awk '{print $1}'
+    find "$dir/.git/hooks" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r h; do
+      printf '%s ' "${h#$dir/}"
+      shasum -a 256 "$h" 2>/dev/null | awk '{print $1}'
+    done
   } | shasum -a 256 | awk '{print $1}'
 }
+
+# KNOWN, NAMED LIMITATION — a write to a path matching .gitignore is NOT detected.
+# `ls-files --others --exclude-standard` skips ignored files by design, and dropping
+# --exclude-standard would walk node_modules-scale trees on a real clone: slow, and
+# noisy enough that the guard would get switched off. Recorded rather than silently
+# accepted, because "the guard covers every write" would be false.
 
 # rcg_snapshot <dir> — record HEAD + porcelain status + content digest into RCG_* globals.
 rcg_snapshot() {

@@ -119,6 +119,52 @@ rcg_snapshot "$D"; rcg_assert >/dev/null 2>&1
 check "already-dirty clone left alone is not a false positive" 0 $?
 rm -rf "$D"
 
+# --- Shape-hunt round (self-audit, not review) ---------------------------------
+# After HEAD-only and status-code-only, I went looking for the same SHAPE — a proxy
+# for "the clone changed" rather than the change itself — instead of waiting for the
+# next review. Three hypotheses, all three hit. Two are fixed below; the third is a
+# named limitation, pinned here so it cannot be quietly forgotten.
+
+# 10. DISCRIMINATING: a hook dropped into .git/hooks (arbitrary code on next commit)
+D="$(mkfixture)"; rcg_snapshot "$D"
+S_BEFORE="$(git -C "$D" status --porcelain -uall)"
+printf '#!/bin/sh\necho pwned\n' > "$D/.git/hooks/post-commit"; chmod +x "$D/.git/hooks/post-commit"
+rcg_assert >/dev/null 2>&1
+check "a hook written into .git/hooks fails" 1 $?
+[ "$S_BEFORE" = "$(git -C "$D" status --porcelain -uall)" ] \
+  && { echo "  ok  ...and git status reported NOTHING (working-tree checks are blind here)"; pass=$((pass+1)); } \
+  || { echo "  FAIL status changed — not a discriminating case"; fail=$((fail+1)); }
+rm -rf "$D"
+
+# 11. DISCRIMINATING: remote.origin.url repointed — redirects where a sync PUSHES
+D="$(mkfixture)"; rcg_snapshot "$D"
+git -C "$D" config remote.origin.url "https://elsewhere.invalid/x.git"
+rcg_assert >/dev/null 2>&1
+check "repointing remote.origin.url fails" 1 $?
+rm -rf "$D"
+
+# 12. ordinary git reads must NOT trip it (the false-positive that would get the
+#     guard switched off — .git/ churns on index refresh, logs/HEAD, packed refs)
+D="$(mkfixture)"; rcg_snapshot "$D"
+git -C "$D" status >/dev/null 2>&1; git -C "$D" log -1 >/dev/null 2>&1
+git -C "$D" diff >/dev/null 2>&1; git -C "$D" rev-parse HEAD >/dev/null 2>&1
+rcg_assert >/dev/null 2>&1
+check "read-only git commands are not a false positive" 0 $?
+rm -rf "$D"
+
+# 13. NAMED LIMITATION (documented, not a defect to be surprised by later): a write
+#     to a .gitignore-matched path is NOT detected. --exclude-standard skips ignored
+#     files by design, and dropping it would walk node_modules-scale trees.
+D="$(mkfixture)"
+echo "secrets/" > "$D/.gitignore"; git -C "$D" add .gitignore; git -C "$D" commit -qm ignore
+rcg_snapshot "$D"
+mkdir -p "$D/secrets"; echo leaked > "$D/secrets/probe.txt"
+rcg_assert >/dev/null 2>&1
+check "KNOWN GAP: a write to an ignored path is not detected" 0 $?
+echo "      (asserted as 0 on purpose — pins the limitation so it stays visible)"
+
+rm -rf "$D"
+
 echo "===================="
 echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"
 [ "$fail" -eq 0 ] || exit 1
