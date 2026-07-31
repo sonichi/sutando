@@ -140,8 +140,18 @@ def _index_effective_text(text: str) -> str:
     fence_char = ""
     fence_len = 0
     in_comment = False
+    def _fence_indent_ok(raw: str) -> bool:
+        # CommonMark bounds a fence marker to at most THREE spaces of
+        # indentation; at four it is an indented code line, not a fence. A bare
+        # lstrip() accepted any indent, so a 4-space ```html was treated as a
+        # fence and the comment inside it was PRESERVED — a false `fail` on an
+        # index that loads fine (qingyun-wu, #2449). Applies to opener AND
+        # closer: an over-indented closer must not close a real fence either.
+        return len(raw) - len(raw.lstrip(" ")) <= 3
+
     for line in text.splitlines(keepends=True):
         stripped = line.lstrip()
+        indent_ok = _fence_indent_ok(line)
         if in_fence:
             out.append(line)
             # CommonMark: a fence closes only on the SAME character, repeated at
@@ -150,7 +160,7 @@ def _index_effective_text(text: str) -> str:
             # fence early — the comment after it then fell outside any fence, was
             # stripped, and a 28KB file measured 39 bytes: false `ok`
             # (rui-sutando-codex, #2449).
-            if (stripped[:1] == fence_char
+            if (indent_ok and stripped[:1] == fence_char
                     and re.fullmatch(re.escape(fence_char) + "{%d,}" % fence_len,
                                      stripped.rstrip())):
                 in_fence = False
@@ -159,7 +169,7 @@ def _index_effective_text(text: str) -> str:
             if "-->" in line:
                 in_comment = False
             continue
-        m = re.match(r"(`{3,}|~{3,})", stripped)
+        m = re.match(r"(`{3,}|~{3,})", stripped) if indent_ok else None
         if m:
             in_fence = True
             fence_char = m.group(1)[0]

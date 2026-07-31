@@ -203,6 +203,27 @@ _mem_with("```\n<!--\n-->\n```\n" + _ENTRY)
 check("control: a fence still CLOSES (small fenced comment stays ok)",
       (hc.check_memory_index_integrity() or {}).get("status") == "ok")
 
+# qingyun-wu: CommonMark bounds a fence marker to at most THREE spaces of
+# indentation. At four it is an indented code line, so a comment after it is NOT
+# fenced and must still be stripped — treating it as a fence produced a false
+# `fail` on an index that loads fine. Pinned in both directions plus the closer.
+_BIGC2 = "<!--\n" + ("padding padding padding\n" * 1200) + "-->\n"
+for _label, _body, _want in (
+    ("4-space opener is NOT a fence (comment strips)",
+     "    ```html\n" + _BIGC2 + "    ```\n" + _ENTRY, "ok"),
+    ("4-space tilde opener is NOT a fence",
+     "    ~~~\n" + _BIGC2 + "    ~~~\n" + _ENTRY, "ok"),
+    ("3-space opener IS a fence (comment preserved)",
+     "   ```html\n" + _BIGC2 + "   ```\n" + _ENTRY, "fail"),
+    ("0-space opener IS a fence (regression)",
+     "```html\n" + _BIGC2 + "```\n" + _ENTRY, "fail"),
+    ("a 4-space CLOSER must not close a real fence",
+     "```html\n" + _BIGC2 + "    ```\n" + _ENTRY, "fail"),
+):
+    _mem_with(_body)
+    r = hc.check_memory_index_integrity()
+    check(f"fence indent: {_label}", r and r["status"] == _want, f"got {r and r['status']} :: {r}")
+
 # qingyun-wu: the byte limit cuts THROUGH a line; the filename before the cut is
 # still read, so the memory loads and must not be reported lost.
 _mem_with(("x" * (25 * 1024 - 100)) + "\n- [Good](good-memory.md) " + ("d" * 4000) + "\n")
