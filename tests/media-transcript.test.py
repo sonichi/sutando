@@ -84,6 +84,39 @@ TAGGED_VTT = """WEBVTT
 00:01:02.000 --> 00:01:04.000
 <c.colorE5E5E5>dinosaurs</c> first appeared &amp; thrived
 """
+
+# A line already emitted two cues ago resurfaces after an intervening cue —
+# the per-line output-tail check must drop it without losing its neighbors.
+RESURFACE_VTT = """WEBVTT
+
+00:00:01.000 --> 00:00:02.000
+alpha line
+beta line
+
+00:00:02.000 --> 00:00:03.000
+alpha line
+
+00:00:03.000 --> 00:00:04.000
+beta line
+gamma line
+"""
+check("vtt: line resurfacing across cues deduped against output tail",
+      mt.parse_vtt(RESURFACE_VTT).splitlines() == ["alpha line", "beta line", "gamma line"],
+      repr(mt.parse_vtt(RESURFACE_VTT)))
+
+NUMBERED_VTT = """WEBVTT
+
+1
+00:00:01.000 --> 00:00:02.000
+first cue
+
+2
+00:00:02.000 --> 00:00:03.000
+second cue
+"""
+check("vtt: numeric cue-sequence lines skipped",
+      mt.parse_vtt(NUMBERED_VTT).splitlines() == ["first cue", "second cue"],
+      repr(mt.parse_vtt(NUMBERED_VTT)))
 check("vtt: tags and entities stripped",
       mt.parse_vtt(TAGGED_VTT) == "dinosaurs first appeared & thrived",
       repr(mt.parse_vtt(TAGGED_VTT)))
@@ -95,15 +128,20 @@ check("vtt: hour-long cue formats h:mm:ss",
 # ---------------------------------------------------------------------------
 # end-to-end with a STUB yt-dlp on PATH (no network)
 # ---------------------------------------------------------------------------
-def make_stub_bin(vtt_body: str, fail: bool = False) -> str:
+def make_stub_bin(vtt_body: str, fail: bool = False, no_output: bool = False,
+                  args_log: str | None = None) -> str:
     d = tempfile.mkdtemp(prefix="mt-stub-")
     stub = Path(d) / "yt-dlp"
+    log_line = f"printf '%s\\n' \"$@\" > {args_log}\n" if args_log else ""
     if fail:
-        stub.write_text("#!/bin/bash\necho 'ERROR: Video unavailable' >&2\nexit 1\n")
+        stub.write_text(f"#!/bin/bash\n{log_line}echo 'ERROR: Video unavailable' >&2\nexit 1\n")
+    elif no_output:
+        stub.write_text(f"#!/bin/bash\n{log_line}exit 0\n")
     else:
         # find the value after -o, write the vtt next to it
         stub.write_text(
             "#!/bin/bash\n"
+            f"{log_line}"
             "out=''\n"
             "prev=''\n"
             "for a in \"$@\"; do if [ \"$prev\" = '-o' ]; then out=\"$a\"; fi; prev=\"$a\"; done\n"
@@ -127,11 +165,58 @@ rc, out, err = run_main(["https://youtube.com/watch?v=fake", "--json"],
 check("e2e: --json shape", rc == 0 and json.loads(out.strip())["ok"] is True
       and "machines" in json.loads(out.strip())["text"], out[:120])
 
+rc, out, err = run_main(["https://youtube.com/watch?v=fake", "--timestamps"],
+                        env={**BASE_ENV, "PATH": f"{stub_dir}:/usr/bin:/bin"})
+check("e2e: --timestamps flag threads through to cue markers",
+      rc == 0 and out.startswith("[00:01] "), f"rc={rc} out={out[:40]!r}")
+
+# non-en language: the sub-langs request must be exact codes with the en
+# fallback pair appended (the 429 fix — never a glob)
+langs_log = str(Path(tempfile.mkdtemp(prefix="mt-log-")) / "args.txt")
+stub_de = make_stub_bin(ROLLING_VTT, args_log=langs_log)
+rc, out, err = run_main(["https://youtube.com/watch?v=fake", "--lang", "de"],
+                        env={**BASE_ENV, "PATH": f"{stub_de}:/usr/bin:/bin"})
+logged = Path(langs_log).read_text().splitlines()
+sub_langs = logged[logged.index("--sub-langs") + 1] if "--sub-langs" in logged else ""
+check("e2e: --lang de requests de,de-orig,en,en-orig exactly",
+      rc == 0 and sub_langs == "de,de-orig,en,en-orig", f"rc={rc} sub_langs={sub_langs!r}")
+
 stub_fail = make_stub_bin("", fail=True)
 rc, out, err = run_main(["https://youtube.com/watch?v=gone"],
                         env={**BASE_ENV, "PATH": f"{stub_fail}:/usr/bin:/bin"})
 check("e2e: extractor failure → exit 1 with its message",
       rc == 1 and "Video unavailable" in err, f"rc={rc} err={err.strip()[:120]}")
+
+rc, out, err = run_main(["https://youtube.com/watch?v=gone", "--json"],
+                        env={**BASE_ENV, "PATH": f"{stub_fail}:/usr/bin:/bin"})
+check("e2e: failure in --json mode → ok:false with the error",
+      rc == 1 and json.loads(out.strip())["ok"] is False
+      and "Video unavailable" in json.loads(out.strip())["error"], out[:120])
+
+stub_none = make_stub_bin("", no_output=True)
+rc, out, err = run_main(["https://youtube.com/watch?v=nocaps"],
+                        env={**BASE_ENV, "PATH": f"{stub_none}:/usr/bin:/bin"})
+check("e2e: no caption track produced → 'no captions' error, exit 1",
+      rc == 1 and "no captions available" in err, f"rc={rc} err={err.strip()[:120]}")
+
+stub_empty = make_stub_bin("WEBVTT\nKind: captions\n")
+rc, out, err = run_main(["https://youtube.com/watch?v=empty"],
+                        env={**BASE_ENV, "PATH": f"{stub_empty}:/usr/bin:/bin"})
+check("e2e: caption track empty after parsing → exit 1",
+      rc == 1 and "empty after parsing" in err, f"rc={rc} err={err.strip()[:120]}")
+
+# no PATH binary but the python module IS importable → module-invocation fallback
+import types
+sys.modules["yt_dlp"] = types.ModuleType("yt_dlp")
+real_which = mt.shutil.which
+mt.shutil.which = lambda name: None
+try:
+    resolved = mt._resolve_ytdlp()
+finally:
+    mt.shutil.which = real_which
+    del sys.modules["yt_dlp"]
+check("resolver: PATH miss + importable module → python -m yt_dlp",
+      resolved == [sys.executable, "-m", "yt_dlp"], repr(resolved))
 
 # yt-dlp entirely absent (PATH empty and module import blocked)
 import builtins
