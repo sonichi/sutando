@@ -189,7 +189,30 @@ check "refused push leaves peer file in the remote host branch" \
         refs/heads/host/local-host/guard1:hosts/peer-host/state.json
 
 echo
-echo "Test 4: guard permits the owning host to delete its own state"
+echo "Test 4: foreign-host deletion guard catches a peer file move"
+setup_fixture "move-guard"
+git -C "$FIXTURE_WS" mv \
+    hosts/peer-host/state.json hosts/local-host/moved-peer-state.json
+set +e
+out="$(
+    env "${SYNC_ENV[@]}" bash "$SYNC" \
+        --vault-url "$FIXTURE_VAULT" --push-only 2>&1
+)"
+rc=$?
+set -e
+check "push is refused when a rename removes foreign-host state" \
+    test "$rc" -ne 0
+check "rename refusal names the foreign-host deletion guard" \
+    grep -qF 'foreign host' <<<"$out"
+check "rename refusal restores the peer source path to the index" \
+    git -C "$FIXTURE_WS" ls-files --error-unmatch \
+        hosts/peer-host/state.json
+check "refused rename leaves the peer file in the remote host branch" \
+    git --git-dir="$FIXTURE_VAULT" cat-file -e \
+        refs/heads/host/local-host/guard1:hosts/peer-host/state.json
+
+echo
+echo "Test 5: guard permits the owning host to delete its own state"
 setup_fixture "own-host-delete"
 rm "$FIXTURE_WS/hosts/local-host/state.json"
 set +e

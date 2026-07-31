@@ -641,11 +641,13 @@ _refuse_staged_secrets() {
     return 0
 }
 
-# A host is the sole writer of its own hosts/<label>/ subtree. Refuse any
-# staged deletion below a foreign label before commit/push: this catches both
-# stale carrier rules and future writers that accidentally treat absence as
-# permission to delete a peer's durable state. The existing explicit force
-# switch remains the operator escape hatch for intentional recovery.
+# A host owns its own hosts/<label>/ subtree. This deletion-focused guard
+# refuses any staged removal below a foreign label before commit/push,
+# including the source side of a rename. It catches both stale carrier rules
+# and future writers that accidentally treat absence as permission to delete a
+# peer's durable state. In-place foreign-file modifications are outside this
+# guard's #2391 deletion scope. The existing explicit force switch remains the
+# operator escape hatch for intentional recovery.
 _refuse_foreign_host_deletions() {
     [ "${SUTANDO_FORCE_SYNC:-0}" = "1" ] && return 0
 
@@ -662,7 +664,7 @@ _refuse_foreign_host_deletions() {
                 fi
                 ;;
         esac
-    done < <(git diff --cached --name-only --diff-filter=D -z)
+    done < <(git diff --cached --no-renames --name-only --diff-filter=D -z)
 
     if [ "$foreign_hits" -eq 0 ]; then
         return 0
