@@ -32,9 +32,26 @@ check('identical text matches', composerMatches('hello world', 'hello world'));
 check('zero-width space between words is NOT silently accepted',
   composerMatches('hello world', 'hello​world') === false,
   'ZWSP joins the words — meaning changed, must mismatch');
-check('leading/trailing whitespace tolerated', composerMatches('hello', '  hello  '));
+// INVERTED (qingyun blocker 1, #2133). These two previously asserted that whitespace
+// differences were TOLERATED — i.e. the suite was defending the defect. Posting is
+// irreversible, so edge whitespace is significant in BOTH directions:
+//   * composer LOST whitespace the user asked for -> we'd publish altered text
+//   * composer ADDED whitespace the user didn't    -> we'd publish altered text
+// Neither is a match. A guard that launders either as "ok" is worse than no guard.
+check('composer ADDING edge whitespace is a mismatch', !composerMatches('hello', '  hello  '));
+check('composer ADDING per-line trailing spaces is a mismatch', !composerMatches('a\nb', 'a   \nb'));
+
+// qingyun's exact repro cases: requested whitespace that the composer DROPPED.
+check('requested LEADING space dropped by composer is caught', !composerMatches(' hello', 'hello'));
+check('requested TRAILING space dropped by composer is caught', !composerMatches('hello ', 'hello'));
+check('requested trailing NEWLINE dropped by composer is caught', !composerMatches('hello\n', 'hello'));
+
+// Guard against a future re-widening: the transforms that ARE editor-injected must
+// still normalise, so this fix cannot be "fixed" by disabling normalisation wholesale.
+check('NFC normalisation still applies', composerMatches('caf\u00e9', 'cafe\u0301'));
+check('zero-width space still stripped', composerMatches('ab', 'a\u200Bb'));
+check('CRLF still normalised', composerMatches('a\nb', 'a\r\nb'));
 check('CRLF vs LF tolerated', composerMatches('a\nb', 'a\r\nb'));
-check('trailing per-line spaces tolerated', composerMatches('a\nb', 'a   \nb'));
 check('BOM stripped', composerMatches('hi', '﻿hi'));
 
 // --- emoji + CJK (explicitly requested in the review) ---------------------------
