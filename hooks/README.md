@@ -61,6 +61,48 @@ Test: `python3 tests/skip-ask-user-question.test.py` (hook) and
 Config paths are env-overridable for testing: `SUTANDO_DISCORD_ACCESS_FILE`,
 `SUTANDO_DISCORD_ENV_FILE`, `SUTANDO_WORKSPACE`. Test: `python3 tests/context-source-guard.test.py`.
 
+## `human-action-bridge.py`
+
+Upgrades the `AskUserQuestion` hard-deny into a **remote ask** (human-action
+bridge v1 step 1 — design: `workspace notes/tasks-events/human_action_bridge_design.md`).
+On an `AskUserQuestion` call it writes a durable pending-action file
+(`<workspace>/state/human-actions/ha_*.json`), drops a question card for the
+owner (`results/proactive-ha-*.txt` — the sanctioned proactive path), and
+polls the action file for a bounded window. A resolved decision returns
+PreToolUse `allow` with `updatedInput.answers` (Claude continues as if answered
+locally); **timeout or cancellation denies** with the same decide-autonomously
+guidance `skip-ask-user-question.py` ships — so with no resolver present the
+behavior is exactly today's. Timeout NEVER approves; fail-**open** for the
+session, fail-**closed** for the decision. Decisions are written by the sparrow
+`DecisionHandler` (bridge v1 step 3) or by the core when the owner's answer
+arrives as a normal task.
+
+Register under `PreToolUse` matcher `"AskUserQuestion"` **instead of**
+`skip-ask-user-question.py` (the timeout branch subsumes it). Not yet
+auto-registered — flipping `build-core-settings.mjs` over is a follow-up once
+the decision path is live end-to-end.
+
+Test: `python3 tests/human-action-bridge.test.py`. Test-only env overrides:
+`SUTANDO_HA_DIR`, `SUTANDO_HA_CARD_DIR`, `SUTANDO_HA_TIMEOUT`, `SUTANDO_HA_POLL`.
+
+## `activity-emitter.py`
+
+Journals the core's activity as AWP activity objects (Activity outbox Phase 2,
+step 1). Async command hook for SessionStart / UserPromptSubmit / PreToolUse /
+PostToolUse / PostToolUseFailure / Notification / Stop / SessionEnd — each fires
+this emitter, which normalizes the hook JSON to an activity object and appends
+it to `<workspace>/state/activity-journal/YYYY-MM-DD.jsonl`. Attribution rides
+in from the Execution Binding Registry when present. Secret hygiene: tool input
+reduces to a display hint (description/file_path/pattern/url — deliberately
+never the raw `command`). Fail-OPEN + fast; register every entry with
+`"async": true`. Upstream HTTP delivery is a later step (broker `/v1/activities`);
+until then the journal is the local activity feed.
+
+Not yet auto-registered. Manual registration: async command-hook entries for the
+events above, argv[1] = hook name as a stdin fallback. Test:
+`python3 tests/activity-emitter.test.py`. Test-only env override:
+`SUTANDO_ACTIVITY_DIR`.
+
 ## `gmail-write-guard.py`
 
 Denies the **claude.ai Gmail MCP connector's WRITE-scoped tools** (create_draft,

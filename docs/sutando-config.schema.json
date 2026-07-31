@@ -18,6 +18,12 @@
             "codex"
           ],
           "default": "claude"
+        },
+        "expected_branch": {
+          "type": "string",
+          "minLength": 1,
+          "default": "main",
+          "description": "Branch the live checkout is expected to be on; health-check's live-checkout-branch probe warns on drift. Set on hosts intentionally pinned to a non-main branch (e.g. dual-run pinned nodes). SUTANDO_EXPECTED_BRANCH env var overrides per-invocation."
         }
       }
     },

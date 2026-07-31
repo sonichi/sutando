@@ -142,7 +142,8 @@ class LatestTranscriptTests(unittest.TestCase):
             old.write_text(json.dumps(_user("old")) + "\n")
             new = d / "new.jsonl"
             new.write_text(json.dumps(_user("new")) + "\n")
-            import os, time
+            import os
+            import time
             past = time.time() - 1000
             os.utime(old, (past, past))
         return tmp

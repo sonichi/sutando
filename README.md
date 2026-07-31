@@ -77,6 +77,10 @@ We're looking for contributors to help test and harden these capabilities. If yo
 
 ## How it works
 
+See [Sutando architecture boundaries](docs/architecture-boundaries.md) for the
+normative definitions of core, adapters, apps, skills, tooling, and workspace
+state.
+
 ```
     You ──voice (browser)──► Voice agent ─────────┐
      │                       (Gemini Live,        │
@@ -183,6 +187,7 @@ bash src/verify-setup.sh
 - Screen recording produces 0-second files? `screencapture -v` needs a TTY. Sutando uses `ffmpeg` instead — make sure it's installed: `brew install ffmpeg`
 - Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
 - Sutando acting confused, contradicting itself, or giving stale answers after a long session? Restart the selected core CLI session to reset its context.
+- **Still stuck?** [Join the official Discord](https://discord.gg/uZHWXXmrCS) — real humans and community-run agents answer support questions there.
 - Phone call answers with "We are sorry, an error has occurred"? The conversation server (`skills/phone-conversation/scripts/conversation-server.ts`, port 3100) isn't running. Run `bash src/startup.sh` or `bash src/restart.sh` to relaunch all services.
 
 **Shutting down:**
@@ -285,7 +290,7 @@ When running, Sutando exposes these local ports:
 
 ## Keyboard shortcuts
 
-The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It launches automatically via `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published in [`state/hotkeys.json`](state/hotkeys.json) (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
+The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It launches automatically via `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published at runtime to `<workspace>/state/hotkeys.json` (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
 
 | Action | Default binding |
 |--------|-----------------|
@@ -319,6 +324,13 @@ The binary auto-compiles on `startup.sh` if missing. To compile manually: `cd sr
 
 It consumes API quota proportional to how much work it finds to do.
 
+Autonomous self-development is enabled by default. To run Sutando in a stable
+product context without idle-time code evolution, set
+`SUTANDO_SELF_DEVELOPMENT_ENABLED=0` in `.env` and restart the core. Sutando
+continues to process owner requests, monitor health, and deliver tasks; it only
+stops choosing and executing autonomous improvement work. An explicit
+owner-requested code change is still allowed.
+
 ---
 
 ## Security
@@ -340,6 +352,9 @@ It consumes API quota proportional to how much work it finds to do.
 - **Contacts / Calendar / Reminders** → asked on demand by the features that use them (contact lookup before a call, `gws calendar +agenda`, `reminders.py add/list/complete`). You can grant these when first prompted rather than up front.
 
 See **[SECURITY.md](SECURITY.md)** for full details, best practices, and how to test your setup.
+
+For setup guides, operator runbooks, architecture, protocols, and release
+policy, start at the **[documentation hub](docs/README.md)**.
 
 ---
 

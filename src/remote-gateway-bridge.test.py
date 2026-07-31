@@ -442,7 +442,7 @@ def main() -> int:
     # 6e. malformed media URLs never crash task intake (drop-in-safe)
     #     (re-review 2026-07-03: `.port` raises ValueError at ACCESS time)
     rtc._download_bytes = lambda url, headers, cap: b"X"
-    for bad in (f"https://127.0.0.1:bad/media/p", "https://hs.example:bad/_matrix/media/v3/download/hs/id",
+    for bad in ("https://127.0.0.1:bad/media/p", "https://hs.example:bad/_matrix/media/v3/download/hs/id",
                 "https://[broken/media/p"):
         try:
             out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {bad} name=x.bin]")
@@ -566,6 +566,183 @@ def main() -> int:
     _ro_only = (rtc.TASKS_DIR / "task-ROPSONLY.txt").read_text()
     check("AGENTS.md" not in _ro_only and "room-ops metadata" not in _ro_only.lower(),
           "metadata-only task file carries no injected block (empty task body)")
+
+    # #2267 parity: a token pasted into a room message must never persist —
+    # not in the task file, not in the owner-presence summary.
+    _secret = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2  # GitHub-token shaped
+    rtc._write_task({**TASK, "id": "task-SECRET",
+                     "task": f"[AG2Space @qingyun] deploy with {_secret} please"})
+    _sec_body = (rtc.TASKS_DIR / "task-SECRET.txt").read_text()
+    check(_secret not in _sec_body and "deploy with" in _sec_body,
+          "pasted GitHub token REDACTED from persisted task body (#2267 parity)")
+    check("REDACTED" in _sec_body or "[" in _sec_body,
+          "redaction leaves an explicit placeholder, not silent deletion")
+    _oa = getattr(rtc, "OWNER_ACTIVITY_FILE", None)
+    if _oa is not None and _oa.exists():
+        check(_secret not in _oa.read_text(),
+              "pasted token never reaches last-owner-activity summary")
+    # #2267 parity second half: the in-band security notice rides the task so
+    # the core neither reproduces nor re-requests the value — and stays absent
+    # from clean tasks. access_tier must still parse as the LAST header line.
+    check("SUTANDO SECURITY NOTICE" in _sec_body,
+          "security notice appended when a secret was redacted")
+    # Fine-grained PATs use a different prefix the legacy pattern misses
+    # (review P1): github_pat_ + 22-char id + _ + 59-char body in the wild;
+    # any 36+ [A-Za-z0-9_] run after the prefix must redact.
+    _fg = "github_pat_" + "11AAAAAAA" + "0" * 13 + "_" + "a" * 40
+    rtc._write_task({**TASK, "id": "task-FGPAT",
+                     "task": f"[AG2Space @qingyun] use {_fg} for the repo"})
+    _fg_body = (rtc.TASKS_DIR / "task-FGPAT.txt").read_text()
+    check(_fg not in _fg_body and "github_pat_" not in _fg_body.replace(
+              "GitHub Fine-Grained PAT", ""),
+          "fine-grained github_pat_ token REDACTED from persisted body")
+    check("SUTANDO SECURITY NOTICE" in _fg_body,
+          "fine-grained PAT redaction also carries the security notice")
+    # Relay/onboarding tokens carry the separator in BOTH forms — the desktop
+    # connect flow writes the URL-encoded one — so redaction must match what
+    # `_SEPARATOR_RE` accepts. Matching only the literal `|` let a valid
+    # `…/relay%7C<secret>` paste reach disk unredacted (review blocker).
+    for _sep_label, _sep in (("literal", "|"), ("upper", "%7C"), ("lower", "%7c")):
+        _rt = "https://chat.ag2.space/relay" + _sep + ("a" * 24)
+        rtc._write_task({**TASK, "id": f"task-RELAY{_sep_label.upper()}",
+                         "task": f"[AG2Space @qingyun] token is {_rt}"})
+        _rt_body = (rtc.TASKS_DIR / f"task-RELAY{_sep_label.upper()}.txt").read_text()
+        check(_rt not in _rt_body and "SUTANDO SECURITY NOTICE" in _rt_body,
+              f"relay token with {_sep_label} separator REDACTED from persisted body")
+    rtc._write_task({**TASK, "id": "task-CLEANBODY",
+                     "task": "[AG2Space @qingyun] plain request, nothing secret"})
+    check("SUTANDO SECURITY NOTICE" not in
+          (rtc.TASKS_DIR / "task-CLEANBODY.txt").read_text(),
+          "no security notice on clean tasks")
+    _hdrs = [ln for ln in _sec_body.split("\n") if ln.startswith("access_tier: ")]
+    check(len(_hdrs) == 1, "notice introduces no second access_tier line")
+    # Onboarding-token parse: the combined "url|secret" form, and the %7C-encoded
+    # separator the desktop connect flow emits (ag2space-cinny-desktop#231). A
+    # %7C token must decode so URL is populated — otherwise it parses as a bare
+    # secret with empty URL and FATALs at startup (the Vidhu "connected but not
+    # responding" failure, 2026-07-24).
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay|deadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: literal | splits into (url, secret)")
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7Cdeadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: %7C-encoded separator decodes to (url, secret)")
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7cdeadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: lowercase %7c also decodes")
+    check(rtc._parse_onboarding_token("baresecret") == ("", "baresecret"),
+          "token parse: bare secret yields empty url (REMOTE_TASK_URL supplies it)")
+    check(rtc._parse_onboarding_token("https://gw|a|b") == ("https://gw", "a|b"),
+          "token parse: splits on the FIRST separator only (secret may contain |)")
+    # #2307 review: never mutate token bytes — the secret is returned verbatim.
+    check(rtc._parse_onboarding_token("https://gw|AB%7CCD") == ("https://gw", "AB%7CCD"),
+          "token parse: %7C INSIDE the secret is preserved, not decoded (split on the literal |)")
+    check(rtc._parse_onboarding_token("AB%7CCD") == ("", "AB%7CCD"),
+          "token parse: a bare secret containing %7C is opaque — returned untouched")
+    check(rtc._parse_onboarding_token("bare|secret") == ("", "bare|secret"),
+          "token parse: a bare secret with no URL scheme is not split on its own | bytes")
+
+    # ── env-fallback: token from channels/ag2space/.env when the launcher never
+    # got it into the env. startup.sh exports it and the gateway window sources the
+    # file once at launch — but a supervisor-spawned core reliably hits neither, so
+    # without this the bridge sees an empty env token and never connects (every new
+    # desktop-only user reproduces it — mark, 2026-07-26). Read the file directly.
+    # Save/clear BOTH the current names and their legacy aliases (the production URL
+    # chain reads AG2_REMOTE_URL too), so an ambient value can't contaminate these
+    # imports.
+    _saved = {k: os.environ.get(k) for k in
+              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
+               "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV")}
+    try:
+        for _k in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
+                   "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV"):
+            os.environ.pop(_k, None)
+        _cfg = tempfile.mkdtemp()
+        _chan = Path(_cfg) / "channels" / "ag2space"
+        _chan.mkdir(parents=True)
+        # connect writes AG2_REMOTE_TOKEN='<url|secret>' (quoted) — lib.rs CONNECT_ENV_KEY.
+        (_chan / ".env").write_text("# relay onboarding\nAG2_REMOTE_TOKEN='https://gw.example/relay|s3cr3t'\n")
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg
+        _fspec = importlib.util.spec_from_file_location(
+            "rtc_fallback", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _frtc = importlib.util.module_from_spec(_fspec)
+        _fspec.loader.exec_module(_frtc)
+        check(_frtc.TOKEN == "s3cr3t",
+              "env-fallback: token read from channels/ag2space/.env (quote-stripped, legacy alias) when env empty")
+        check(_frtc.URL == "https://gw.example/relay",
+              "env-fallback: URL comes from the file token's url|secret form")
+
+        # negative: no env token AND no file → empty token, no crash at import.
+        os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()
+        _nspec = importlib.util.spec_from_file_location(
+            "rtc_nofile", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _nrtc = importlib.util.module_from_spec(_nspec)
+        _nspec.loader.exec_module(_nrtc)
+        check(_nrtc.TOKEN == "",
+              "env-fallback: no env token and no file yields empty token (no crash)")
+
+        # env token still wins over the file when both are present.
+        os.environ["REMOTE_TASK_TOKEN"] = "https://env.example/relay|envwins"
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg
+        _wspec = importlib.util.spec_from_file_location(
+            "rtc_envwins", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _wrtc = importlib.util.module_from_spec(_wspec)
+        _wspec.loader.exec_module(_wrtc)
+        check(_wrtc.TOKEN == "envwins",
+              "env-fallback: env token takes precedence over the file fallback")
+
+        # The desktop case: CLAUDE_CONFIG_DIR is NOT passed into the gateway
+        # window (launch-sutando.sh passes only SUTANDO_APP_SUPPORT / SUTANDO_PY /
+        # AG2_DEVICE_ENV), so the fallback MUST resolve via AG2_DEVICE_ENV — the
+        # absolute path the launcher lays in. This is the scenario the fix targets.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ["AG2_DEVICE_ENV"] = str(_chan / ".env")
+        _dspec2 = importlib.util.spec_from_file_location(
+            "rtc_deviceenv", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _drtc2 = importlib.util.module_from_spec(_dspec2)
+        _dspec2.loader.exec_module(_drtc2)
+        check(_drtc2.TOKEN == "s3cr3t",
+              "env-fallback: AG2_DEVICE_ENV resolves the token when CLAUDE_CONFIG_DIR is absent (desktop case)")
+
+        # AG2_DEVICE_ENV wins over CLAUDE_CONFIG_DIR when both point at a token.
+        _cfg2 = tempfile.mkdtemp()
+        _chan2 = Path(_cfg2) / "channels" / "ag2space"
+        _chan2.mkdir(parents=True)
+        (_chan2 / ".env").write_text("AG2_REMOTE_TOKEN='https://cfg.example/relay|cfgtok'\n")
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg2
+        os.environ["AG2_DEVICE_ENV"] = str(_chan / ".env")  # still points at s3cr3t
+        _pspec = importlib.util.spec_from_file_location(
+            "rtc_devpriority", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _prtc = importlib.util.module_from_spec(_pspec)
+        _pspec.loader.exec_module(_prtc)
+        check(_prtc.TOKEN == "s3cr3t",
+              "env-fallback: AG2_DEVICE_ENV takes precedence over CLAUDE_CONFIG_DIR")
+
+        # split-key layout: bare REMOTE_TASK_TOKEN + a SEPARATE REMOTE_TASK_URL
+        # (not the combined url|secret token). The fallback must carry the URL too,
+        # else the bridge gets a token but URL='' and fatals on "no gateway URL" —
+        # the exact failure for a split-layout desktop .env in the target scenario.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("REMOTE_TASK_URL", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        _split_chan = Path(tempfile.mkdtemp()) / "channels" / "ag2space"
+        _split_chan.mkdir(parents=True)
+        (_split_chan / ".env").write_text(
+            "REMOTE_TASK_TOKEN='splitsecret'\nREMOTE_TASK_URL='https://split.example/relay'\n")
+        os.environ["AG2_DEVICE_ENV"] = str(_split_chan / ".env")
+        _sspec = importlib.util.spec_from_file_location(
+            "rtc_split", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _srtc = importlib.util.module_from_spec(_sspec)
+        _sspec.loader.exec_module(_srtc)
+        check(_srtc.TOKEN == "splitsecret" and _srtc.URL == "https://split.example/relay",
+              "env-fallback: split-layout file (bare token + REMOTE_TASK_URL) resolves BOTH token and URL")
+    finally:
+        for _k, _v in _saved.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
 
     srv.shutdown()
     if FAILS:

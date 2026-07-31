@@ -18,6 +18,7 @@ import os
 import uuid
 import re
 import secrets
+import shutil
 import sys
 import time
 import urllib.request
@@ -392,7 +393,9 @@ def download_file(file_id, name_hint="file"):
     local_name = f"{int(time.time()*1000)}{ext}"
     local_path = INBOX_DIR / local_name
     try:
-        urllib.request.urlretrieve(url, str(local_path))
+        req = urllib.request.Request(url, headers={"User-Agent": "Sutando"})
+        with urllib.request.urlopen(req, timeout=30) as resp, open(local_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
         return str(local_path)
     except Exception as e:
         print(f"  Download failed: {e}")
@@ -624,7 +627,7 @@ def poll_progress(pending_replies: dict) -> None:
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
-    print(f"Telegram bridge started. Polling for messages...", flush=True)
+    print("Telegram bridge started. Polling for messages...", flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loop starts. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
@@ -639,10 +642,10 @@ def main():  # pragma: no cover
     if not ACCESS_FILE.exists():
         _TOFU_ENROLLMENT_CODE = secrets.token_hex(3)  # 6-char hex, 16M combinations
         print("", flush=True)
-        print(f"  *** TOFU enrollment required ***", flush=True)
+        print("  *** TOFU enrollment required ***", flush=True)
         print(f"  Enrollment code: {_TOFU_ENROLLMENT_CODE}", flush=True)
-        print(f"  Send this code in your first DM to register as owner.", flush=True)
-        print(f"  Anyone who sends this code first becomes owner — keep it private.", flush=True)
+        print("  Send this code in your first DM to register as owner.", flush=True)
+        print("  Anyone who sends this code first becomes owner — keep it private.", flush=True)
         print("", flush=True)
 
     offset = None
