@@ -298,6 +298,62 @@ rc._release_ownership_lock(busy_fd)
 cli("release", "session-next", "--token", token_of(msg),
     "--state-dir", str(d9))
 
+# 4b4. ambiguous stamp reads fail CLOSED (#2454 round 8): a stamp that
+# exists but cannot be read (permissions, transient I/O — simulated
+# deterministically by a DIRECTORY at the stamp path, which raises
+# IsADirectoryError, an OSError that is not FileNotFoundError) must never
+# admit work. Pre-fix, `except OSError: pass` treated it as "no stamp".
+d10 = Path(tempfile.mkdtemp(prefix="claim-ambig-"))
+(d10 / rc.STAMP_NAME).mkdir()
+code, msg = cli("claim", "session-x", "--state-dir", str(d10))
+check("pre-link ambiguous stamp refuses to claim",
+      code == 1 and "state unknown" in msg, msg)
+check("no claim was published on pre-link ambiguity",
+      not (d10 / rc.CLAIM_NAME).exists())
+
+# ...and after publication: B pauses before os.link with NO stamp, the
+# stamp path turns unreadable mid-pause, B resumes — the post-link recheck
+# must retract and fail closed (A may have stamped this very session).
+d11 = Path(tempfile.mkdtemp(prefix="claim-ambig2-"))
+b11_paused, b11_resume = threading.Event(), threading.Event()
+pause11 = {"armed": True}
+
+
+def pausing_link11(src, dst):
+    if pause11["armed"]:
+        pause11["armed"] = False
+        b11_paused.set()
+        assert b11_resume.wait(5), "ambig-link pause never resumed"
+    return real_link(src, dst)
+
+
+b11_out: dict = {}
+
+
+def run_b11():
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        b11_out["code"] = rc.claim(d11, "session-y", 0.0)
+    b11_out["msg"] = buf.getvalue()
+
+
+rc.os.link = pausing_link11
+t11 = threading.Thread(target=run_b11)
+t11.start()
+try:
+    check("ambig-B paused before publishing", b11_paused.wait(5))
+    (d11 / rc.STAMP_NAME).mkdir()  # stamp becomes unreadable mid-pause
+finally:
+    b11_resume.set()
+    t11.join(5)
+    rc.os.link = real_link
+check("post-link ambiguous stamp retracts and fails closed",
+      b11_out.get("code") == 1
+      and "unreadable after publication" in b11_out.get("msg", ""),
+      str(b11_out))
+check("no live claim survives the ambiguity retraction",
+      not (d11 / rc.CLAIM_NAME).exists())
+
 # 4d. compare-and-delete reap (#2454 round 4): the deterministic hazard —
 # after a claimer reads a STALE claim, the claim is reaped-and-replaced by
 # a FRESH one; the late deleter must NOT remove the fresh claim.

@@ -165,14 +165,32 @@ def _retract_own_claim(sdir: Path, token: str) -> None:
         _release_ownership_lock(lock_fd)
 
 
+def _read_stamp(stamp: Path) -> "tuple[str | None, bool]":
+    """(stamped_session, ambiguous). A MISSING stamp is (None, False) —
+    the normal fresh-boot case and the only error that may admit work.
+    Any other read failure (permissions, transient I/O) is (None, True):
+    the state is UNKNOWN, and callers must fail CLOSED — the session may
+    already be stamped, so admitting a worker risks a duplicate recap
+    (round-8 review: the broad `except OSError: pass` treated both the
+    same and failed open)."""
+    try:
+        return stamp.read_text().strip(), False
+    except FileNotFoundError:
+        return None, False
+    except OSError:
+        return None, True
+
+
 def claim(sdir: Path, session: str, stale_s: float) -> int:
     stamp = sdir / STAMP_NAME
-    try:
-        if stamp.read_text().strip() == session:
-            print("skip: already-recapped")
-            return 1
-    except OSError:
-        pass  # no stamp yet — normal on a fresh boot
+    stamped, ambiguous = _read_stamp(stamp)
+    if ambiguous:
+        print("skip: stamp unreadable (present but failing to read) — "
+              "state unknown, refusing to claim")
+        return 1
+    if stamped == session:
+        print("skip: already-recapped")
+        return 1
     path = sdir / CLAIM_NAME
     token = secrets.token_hex(8)
     payload = json.dumps({"session": session, "ts": time.time(),
@@ -210,14 +228,17 @@ def claim(sdir: Path, session: str, stale_s: float) -> int:
             # race happened the stamp is guaranteed visible now. Without
             # this, a same-session claimer paused before os.link would
             # publish AFTER completion and admit a duplicate recap.
-            try:
-                if stamp.read_text().strip() == session:
-                    _retract_own_claim(sdir, token)
-                    print("skip: already-recapped (stamp landed during "
-                          "publication)")
-                    return 1
-            except OSError:
-                pass
+            stamped, ambiguous = _read_stamp(stamp)
+            if ambiguous or stamped == session:
+                # Ambiguity after publication also fails CLOSED: A may
+                # have stamped this very session; retract and let a later
+                # boot retry once the stamp is readable again.
+                _retract_own_claim(sdir, token)
+                print("skip: already-recapped (stamp landed during "
+                      "publication)" if not ambiguous else
+                      "skip: stamp unreadable after publication — claim "
+                      "retracted, state unknown (fail closed)")
+                return 1
             print(f"claimed token={token}")
             return 0
         print("skip: lost re-race")
