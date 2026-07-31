@@ -226,6 +226,33 @@ check("G5 order is load-bearing: a span closer at col 0 must not open a fence",
 check("F8 an UNCLOSED fence masks to EOF — over-counts, never returns a silent zero",
       n_sections("```\n# Resolved\n## a\n\n## b\n") == 2)
 
+# ---------------------------------------------------------------------------
+# Case H — CLOSER INDENTATION IS MEASURED ON THE RAW LINE. Third P1 on #2419
+# (john-the-dev, head cabd2c59), mechanism confirmed by sonichi.
+# `line.strip()` removes a leading TAB, and the separate `lstrip(' ')` count
+# then reported an indent of 0 — two checks disagreeing about what
+# "indentation" means. A tab-indented marker was accepted as a valid closer, so
+# the fence closed early and a quoted `# Resolved` was exposed as the real
+# divider: a silent zero on every pending-question surface.
+#
+# SCOPE, stated so the next reader is not misled: this closes the TILDE half.
+# `~~~` can never be inline code, so nothing competes to consume the delimiter.
+# The backtick cases (a run that is BOTH a plausible span delimiter and a
+# plausible fence marker) are a genuine precedence conflict that no
+# whole-document masking order resolves — measured across four designs — and
+# remain open on this PR.
+# ---------------------------------------------------------------------------
+check("H1 tilde: a TAB-indented closer does not close the fence",
+      n_sections("~~~\n\t~~~\n# Resolved\n~~~" + QUESTIONS) == 2)
+check("H2 tilde: a SPACE+TAB-indented closer does not close the fence",
+      n_sections("~~~\n \t~~~\n# Resolved\n~~~" + QUESTIONS) == 2)
+check("H3 tilde control: a 4-space closer does not close (indented code block)",
+      n_sections("~~~\n    ~~~\n# Resolved\n~~~" + QUESTIONS) == 2)
+check("H4 tilde control: a 3-space closer IS valid, divider stays real",
+      n_sections("~~~\n   ~~~\n# Resolved" + QUESTIONS) == 0)
+check("H5 tilde control: a 0-space closer IS valid, divider stays real",
+      n_sections("~~~\n~~~\n# Resolved" + QUESTIONS) == 0)
+
 # Offset invariant: every masker must preserve length AND line count, because
 # agent-api derives question identity by slicing the ORIGINAL at a masked offset.
 _offset_ok = True

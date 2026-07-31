@@ -103,8 +103,15 @@ def mask_fenced_code(text: str) -> str:
         else:
             out.append(_blank(line))
             stripped = line.strip()
+            # Indentation is measured on the RAW line with an explicit
+            # `^ {0,3}\S`, not by counting leading spaces after `strip()`.
+            # `line.strip()` removes a leading TAB, and the separate
+            # `lstrip(' ')` count then reported an indent of 0 — two checks
+            # disagreeing about what "indentation" means, so `\t```` was
+            # accepted as a valid closer and the fence closed early, exposing a
+            # quoted `# Resolved` as the real divider (silent zero).
             if (stripped and set(stripped) == {char} and len(stripped) >= size
-                    and len(line) - len(line.lstrip(' ')) <= 3):
+                    and re.match(r'^ {0,3}\S', line) is not None):
                 in_fence = False
     return '\n'.join(out)
 
