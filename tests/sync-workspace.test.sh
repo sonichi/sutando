@@ -26,6 +26,47 @@ set -euo pipefail
 # environment. Clear it once here so the shim can actually take effect.
 unset SUTANDO_HOST_LABEL
 
+# ── REAL-REPO DENY-BY-DEFAULT + TRIPWIRE (incident 2026-07-30, Mini second-host) ──
+# This suite drives the REAL sync scripts 17 times. Neutralising ONE case (Test 18)
+# was not enough — another path also resolved the operator's real memory repo.
+#
+# Capture the real target FIRST, from the INHERITED env, resolved the way the scripts
+# resolve it. That capture is what the tripwire checks.
+#
+# Two things the first fix got wrong, both surfaced only by running on a second host:
+#   * GIT_ALLOW_PROTOCOL=none does NOT stop a FILE-PATH remote, and a core can carry
+#     SUTANDO_MEMORY_REPO=/Users/.../.sutando/memory-sync — a path, not a URL.
+#   * The leak is TWO-HOP: test -> real LOCAL CLONE -> origin on the next legit sync.
+#     "origin unchanged" therefore proves nothing. The first hop is the harm, so the
+#     tripwire watches the LOCAL CLONE.
+_REAL_SYNC_DIR="${SUTANDO_MEMORY_SYNC_DIR:-$HOME/.sutando/memory-sync}"
+_REAL_HEAD_BEFORE=""
+if [ -d "$_REAL_SYNC_DIR/.git" ]; then
+  _REAL_HEAD_BEFORE="$(git -C "$_REAL_SYNC_DIR" rev-parse HEAD 2>/dev/null || echo '')"
+fi
+
+# Deny by default. Per-test fixtures still set these explicitly per invocation.
+_DENIED_SYNC_DIR="$(mktemp -d -t sync-ws-denied.XXXXXX)"
+export SUTANDO_MEMORY_REPO=
+export SUTANDO_MEMORY_SYNC_DIR="$_DENIED_SYNC_DIR"
+
+_assert_real_clone_untouched() {
+  # Runs on EXIT regardless of pass/fail. The suite can be 89/89 green and still have
+  # written to the operator's clone — that is precisely what happened. Assert the HARM,
+  # not the absence of the particular paths we thought of.
+  [ -n "$_REAL_HEAD_BEFORE" ] || return 0
+  local after
+  after="$(git -C "$_REAL_SYNC_DIR" rev-parse HEAD 2>/dev/null || echo '')"
+  if [ "$after" != "$_REAL_HEAD_BEFORE" ]; then
+    echo ""
+    echo "  ✖ TRIPWIRE: the suite wrote to the REAL memory clone $_REAL_SYNC_DIR"
+    echo "      HEAD before: $_REAL_HEAD_BEFORE"
+    echo "      HEAD after : $after"
+    echo "      A test reached a real repo. FAILURE even if every check passed."
+    exit 1
+  fi
+}
+
 # Same class, second inheritance: the suite makes real git commits in its
 # fixtures, so it also depends on the CALLER having a git identity. On a dev box
 # that is set globally and the dependency is invisible; on the ubuntu-latest
@@ -41,7 +82,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEST_ROOT="$(mktemp -d -t sync-workspace-test.XXXXXX)"
-trap "rm -rf '$TEST_ROOT'" EXIT
+# bash traps REPLACE rather than stack, so the tripwire must run from the SAME EXIT
+# trap as the cleanup or a later trap silently discards it.
+trap '_assert_real_clone_untouched; rm -rf "$TEST_ROOT" "$_DENIED_SYNC_DIR"' EXIT
 
 fail=0
 pass=0
