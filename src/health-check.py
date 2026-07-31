@@ -4733,7 +4733,17 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
             mtime = alive_file.stat().st_mtime
             if now - mtime >= 90.0:
                 continue  # stale heartbeat — not a live core
-            sock = json.loads(alive_file.read_text()).get("socket")
+            payload = json.loads(alive_file.read_text())
+            # A heartbeat that decodes to a NON-OBJECT (`null`, `[]`, `"x"`, `3`)
+            # raises AttributeError on `.get`, which this handler does not catch —
+            # so one junk file takes down the caller. That caller is
+            # `_rearm_core_crons()`, a RECOVERY path, so it fails exactly when
+            # something is already wrong. The writer is atomic (tmp + replace in
+            # core_heartbeat.py), but this globs `*.alive` for EVERY host, so the
+            # file may come from another machine running different code.
+            if not isinstance(payload, dict):
+                continue
+            sock = payload.get("socket")
         except (OSError, ValueError):
             continue
         if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
