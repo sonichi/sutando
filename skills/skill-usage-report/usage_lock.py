@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 LOCK_SUFFIX = ".lock"
+RUN_LOCK_SUFFIX = ".runlock"
 # Hook-side budget. Deliberately small: the only thing that ever holds this lock
 # is a rename or a short append, so a wait beyond this means something is wrong
 # and a PostToolUse hook must not keep a tool call waiting to find out.
@@ -84,6 +85,71 @@ def claim_lock(log: Path, timeout: float = DEFAULT_TIMEOUT_S, blocking: bool = F
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(POLL_S)
+        yield acquired
+    finally:
+        if fh is not None:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                fh.close()
+
+
+def run_lock_path(log: Path) -> Path:
+    """Sibling lock file for the reporter-run lock. Distinct from lock_path()."""
+    return log.with_name(log.name + RUN_LOCK_SUFFIX)
+
+
+@contextlib.contextmanager
+def reporter_run_lock(log: Path):
+    """Exclude a SECOND reporter for the whole duration of a report.
+
+    Why this is a separate lock from claim_lock (#2180 review, second [P1]):
+
+    claim_lock is deliberately released right after `log.rename(pending)` so the
+    hook never waits on a 20s HTTP POST. That solved hook-vs-reporter, but left
+    reporter-vs-reporter wide open, and the claim FILENAME is not an ownership
+    marker:
+
+        A: rename -> pending, release claim lock, begin POST
+        B: starts, sees `.reporting` exists, treats it as a CRASHED run,
+           folds A's live claim back into the active log, re-POSTs the same
+           events, and unlinks the claim
+        A: finishes POST, `pending.unlink()` -> FileNotFoundError -> exit 1
+
+    Net: duplicate reports, a destroyed claim, and a reporter that no longer
+    always exits 0 — from nothing more exotic than a cron overlapping a manual
+    run.
+
+    This lock is held across the ENTIRE reporter run, POST included. That is safe
+    precisely because it is a DIFFERENT file from the hook's claim lock: a hook
+    contends only for claim_lock, which the reporter still holds for a rename and
+    nothing more. Two locks, two lifetimes, one reason each.
+
+    It also disambiguates recovery: while this lock is held, any `.reporting`
+    present at startup genuinely IS orphaned, because no other reporter can be
+    running. That is what makes the existing crash-recovery branch sound rather
+    than a race.
+
+    Non-blocking by design — a second reporter should exit 0 immediately and let
+    the next scheduled run do the work, not queue up behind a network call.
+    """
+    p = run_lock_path(log)
+    fh = None
+    acquired = False
+    try:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fh = p.open("a+")
+        except OSError:
+            yield False
+            return
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
         yield acquired
     finally:
         if fh is not None:

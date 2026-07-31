@@ -91,37 +91,15 @@ def _skill_dir() -> Path:
 
 sys.path.insert(0, str(_skill_dir()))
 from usage_lock import claim_lock as _claim_lock  # noqa: E402
+from usage_lock import reporter_run_lock  # noqa: E402
 
 
 def repo_root() -> Path:
     return Path(os.path.realpath(__file__)).parents[3]
 
 
-def main() -> int:
-    root = repo_root()
-    sys.path.insert(0, str(root / "src"))
-    try:
-        from workspace_default import resolve_workspace  # type: ignore
-
-        ws = Path(resolve_workspace())
-    except Exception as exc:
-        # No ad-hoc fallback: `root / "workspace"` would defeat configured
-        # resolution and read/create a second telemetry store inside the
-        # checkout (#2180 review). resolve_workspace() already defaults to
-        # <repo>/workspace/ when nothing is configured, so a local fallback can
-        # only DISAGREE with it, never add capability.
-        #
-        # Exit 0 with state untouched: this runs from a cron/hook context where a
-        # non-zero exit is noise, and there is nothing to report if we cannot
-        # find the log. Print to stderr so the reason is visible rather than
-        # silent — the failure mode being fixed was invisibility, so swallowing
-        # this quietly would trade one blind spot for another.
-        print(f"report-usage: workspace unresolved ({exc}) — nothing reported",
-              file=sys.stderr)
-        return 0
-
-    log = ws / "state" / "skill-usage-log.jsonl"
-    pending = log.with_suffix(".jsonl.reporting")
+def _report(ws: Path, log: Path, pending: Path) -> int:
+    """The whole report, run while holding the reporter-run lock."""
 
     # Recover a previously claimed log (failed or crashed mid-report) by
     # folding it back INTO the active log — the same append direction as
@@ -256,6 +234,48 @@ def main() -> int:
     pending.unlink()
     print(f"usage-report: {sent} slug(s) reported — accepted={accepted} skipped={skipped}")
     return 0
+
+
+def main() -> int:
+    root = repo_root()
+    sys.path.insert(0, str(root / "src"))
+    try:
+        from workspace_default import resolve_workspace  # type: ignore
+
+        ws = Path(resolve_workspace())
+    except Exception as exc:
+        # No ad-hoc fallback: `root / "workspace"` would defeat configured
+        # resolution and read/create a second telemetry store inside the
+        # checkout (#2180 review). resolve_workspace() already defaults to
+        # <repo>/workspace/ when nothing is configured, so a local fallback can
+        # only DISAGREE with it, never add capability.
+        #
+        # Exit 0 with state untouched: this runs from a cron/hook context where a
+        # non-zero exit is noise, and there is nothing to report if we cannot
+        # find the log. Print to stderr so the reason is visible rather than
+        # silent.
+        print(f"report-usage: workspace unresolved ({exc}) — nothing reported",
+              file=sys.stderr)
+        return 0
+
+    log = ws / "state" / "skill-usage-log.jsonl"
+    pending = log.with_suffix(".jsonl.reporting")
+
+    # Exclude a SECOND reporter for the WHOLE run, POST included. Distinct file
+    # from the hook's claim lock, so holding it this long never makes a hook
+    # wait (#2180 review, second [P1]): without it, reporter B mistook reporter
+    # A's live `.reporting` for a crashed run, re-posted the same events, and
+    # unlinked A's claim — leaving A to fail its own `pending.unlink()` and exit
+    # 1. Holding it also makes the crash-recovery branch below sound: while we
+    # hold this, a `.reporting` on disk genuinely IS orphaned.
+    with reporter_run_lock(log) as owned:
+        if not owned:
+            # Another report is in flight. Exit 0 and let the next scheduled run
+            # do the work — queueing behind a network POST is worse than waiting
+            # for the next tick, and nothing is lost by reporting later.
+            print("usage-report: another report is in flight — skipping this run")
+            return 0
+        return _report(ws, log, pending)
 
 
 if __name__ == "__main__":
