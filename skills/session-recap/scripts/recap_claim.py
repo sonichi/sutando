@@ -85,28 +85,49 @@ def _read_claim(path: Path) -> tuple[str | None, float]:
             return None, float("inf")
 
 
+def _acquire_ownership_lock(sdir: Path, tries: int = 1,
+                            delay: float = 0.05) -> bool:
+    """O_EXCL lock serializing EVERY mutation of the claim path — reaping
+    AND releasing (round-5 review: release validated ownership then
+    stamped/unlinked unlocked, so a reaper could replace the claim between
+    A's validate and A's unlink). An expired lock (dead holder) is cleared
+    and re-raced. tries=1 = non-blocking (reapers skip); releases retry
+    briefly since their hold time is ~1ms."""
+    lock = sdir / REAP_LOCK_NAME
+    for _ in range(tries):
+        try:
+            os.close(os.open(lock,
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > REAP_LOCK_TTL_S:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                continue
+            if tries > 1:
+                time.sleep(delay)
+    return False
+
+
+def _release_ownership_lock(sdir: Path) -> None:
+    (sdir / REAP_LOCK_NAME).unlink(missing_ok=True)
+
+
 def _try_reap(sdir: Path, stale_token: str | None, stale_s: float) -> None:
-    """Compare-and-delete of a stale claim, serialized by a reaper lock.
+    """Compare-and-delete of a stale claim, serialized by the ownership
+    lock.
 
     A bare unlink between 'read stale' and 'delete' can destroy a FRESH
     claim another reclaimer just linked (round-4 review repro: 24
     concurrent claimers on one stale claim -> two winners). Deletion is
-    therefore allowed only (a) while holding the O_EXCL reaper lock and
-    (b) after a re-read under that lock confirms the claim is still the
-    exact stale one the caller judged (token identity + still stale).
-    Losers of the lock delete nothing and simply re-race."""
-    lock = sdir / REAP_LOCK_NAME
+    therefore allowed only (a) while holding the lock and (b) after a
+    re-read under that lock confirms the claim is still the exact stale
+    one the caller judged (token identity + still stale). Losers of the
+    lock delete nothing and simply re-race."""
     path = sdir / CLAIM_NAME
-    try:
-        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
-    except FileExistsError:
-        # A reaper is active or died inside the section < TTL ago. Never
-        # reap without the lock; clear it only once it has expired.
-        try:
-            if time.time() - lock.stat().st_mtime > REAP_LOCK_TTL_S:
-                lock.unlink(missing_ok=True)
-        except OSError:
-            pass
+    if not _acquire_ownership_lock(sdir):
         return
     try:
         tok, age = _read_claim(path)
@@ -120,7 +141,7 @@ def _try_reap(sdir: Path, stale_token: str | None, stale_s: float) -> None:
         if age != float("inf") and tok == stale_token and age >= stale_s:
             path.unlink(missing_ok=True)
     finally:
-        lock.unlink(missing_ok=True)
+        _release_ownership_lock(sdir)
 
 
 def claim(sdir: Path, session: str, stale_s: float) -> int:
@@ -174,24 +195,37 @@ def release(sdir: Path, session: str, stamp: bool, token: str) -> int:
     # whose claim was stale-reclaimed must not unlink the reclaimer's live
     # reservation, and a late `release --stamp` must not stamp over the
     # reclaimer's in-progress run (the stale-A/reclaimed-B lifecycle race).
-    path = sdir / CLAIM_NAME
+    #
+    # The validate + stamp + unlink sequence runs UNDER the ownership lock
+    # (round-5 review): validated-then-unlocked lets a reaper replace the
+    # claim between our read and our unlink, and we'd then stamp our
+    # session and delete the reclaimer's fresh reservation. With the lock,
+    # reapers are excluded for the ~1ms this section takes.
+    if not _acquire_ownership_lock(sdir, tries=40):
+        print("skip: ownership lock busy — not stamping (a later boot "
+              "will retry the recap)")
+        return 1
     try:
-        cur = json.loads(path.read_text())
-    except (OSError, ValueError):
-        print("skip: no live claim to release (reclaimed or already "
-              "released) — not stamping")
-        return 1
-    if cur.get("token") != token or cur.get("session") != session:
-        print(f"skip: live claim is not ours "
-              f"(live session={cur.get('session', '?')}) — not stamping")
-        return 1
-    if stamp:
-        tmp = sdir / (STAMP_NAME + ".tmp")
-        tmp.write_text(session + "\n")
-        os.replace(tmp, sdir / STAMP_NAME)
-    path.unlink(missing_ok=True)
-    print("released" + (" + stamped" if stamp else ""))
-    return 0
+        path = sdir / CLAIM_NAME
+        try:
+            cur = json.loads(path.read_text())
+        except (OSError, ValueError):
+            print("skip: no live claim to release (reclaimed or already "
+                  "released) — not stamping")
+            return 1
+        if cur.get("token") != token or cur.get("session") != session:
+            print(f"skip: live claim is not ours "
+                  f"(live session={cur.get('session', '?')}) — not stamping")
+            return 1
+        if stamp:
+            tmp = sdir / (STAMP_NAME + ".tmp")
+            tmp.write_text(session + "\n")
+            os.replace(tmp, sdir / STAMP_NAME)
+        path.unlink(missing_ok=True)
+        print("released" + (" + stamped" if stamp else ""))
+        return 0
+    finally:
+        _release_ownership_lock(sdir)
 
 
 def main() -> int:

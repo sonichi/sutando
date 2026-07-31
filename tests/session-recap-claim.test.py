@@ -164,6 +164,61 @@ code, msg = cli("release", "session-b", "--stamp", "--token", tok_b,
 check("release after claim gone refuses without stamping",
       code == 1 and "no live claim" in msg, msg)
 
+# 4b2. release-vs-reap barrier regression (#2454 round 5): A's release is
+# PAUSED between its ownership validation and its unlink (the pause point
+# is os.replace — the stamp write that sits exactly between them). While
+# paused, B attempts a full stale reclaim; on the pre-fix head B reaped
+# A's claim + linked fresh, and A's resume then stamped A and deleted B's
+# reservation. With release under the ownership lock, B must LOSE while A
+# is inside the section, and A must complete untouched.
+import threading
+
+d8 = Path(tempfile.mkdtemp(prefix="claim-relrace-"))
+_, msg = cli("claim", "session-a", "--state-dir", str(d8))
+tok_a8 = token_of(msg)
+paused, resume = threading.Event(), threading.Event()
+real_replace = rc.os.replace
+
+
+def pausing_replace(src, dst):
+    paused.set()
+    assert resume.wait(5), "release pause never resumed"
+    return real_replace(src, dst)
+
+
+rc.os.replace = pausing_replace
+rel_out: dict = {}
+
+
+def run_release():
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rel_out["code"] = rc.release(d8, "session-a", True, tok_a8)
+    rel_out["msg"] = buf.getvalue()
+
+
+t = threading.Thread(target=run_release)
+t.start()
+try:
+    check("release reached its critical section", paused.wait(5))
+    # B races a stale reclaim mid-release (stale-minutes=0 makes A's fresh
+    # claim look reclaimable). It must not win while A holds the lock.
+    with redirect_stdout(io.StringIO()):
+        b_code = rc.claim(d8, "session-b", 0.0)
+    check("B cannot reclaim while A's release holds the lock", b_code == 1)
+finally:
+    resume.set()
+    t.join(5)
+    rc.os.replace = real_replace
+check("A's paused release completed normally",
+      rel_out.get("code") == 0 and "stamped" in rel_out.get("msg", ""),
+      str(rel_out))
+check("stamp is A's and A's claim is gone",
+      (d8 / rc.STAMP_NAME).read_text().strip() == "session-a"
+      and not (d8 / rc.CLAIM_NAME).exists())
+code, _ = cli("claim", "session-b", "--state-dir", str(d8))
+check("B claims cleanly after A's release finishes", code == 0)
+
 # 4d. compare-and-delete reap (#2454 round 4): the deterministic hazard —
 # after a claimer reads a STALE claim, the claim is reaped-and-replaced by
 # a FRESH one; the late deleter must NOT remove the fresh claim.
