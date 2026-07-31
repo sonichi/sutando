@@ -258,7 +258,8 @@ class SkipBranchesRunInProcess(unittest.TestCase):
 
     def test_hook_drops_the_record_rather_than_blocking(self):
         """log-usage: cannot acquire promptly -> exit 0, write nothing."""
-        import importlib.util, io
+        import importlib.util
+        import io
         spec = importlib.util.spec_from_file_location(
             "log_usage_mod", SKILL / "hooks" / "log-usage.py")
         hook = importlib.util.module_from_spec(spec)
