@@ -773,9 +773,30 @@ SYNC_MEM="$FIXTURE_REPO/scripts/sync-memory.sh"
 
 # Invoke with a flag that triggers early exit (e.g. SUTANDO_MEMORY_REPO unset
 # → script bails). We just want to see if the banner emits.
+# NEUTRALISE the REAL memory-repo resolution before invoking (incident 2026-07-30).
+# The comment above assumed "SUTANDO_MEMORY_REPO unset -> script bails". On a host
+# where it IS set (from .env or sutando.config.local.json) the script does NOT bail:
+# it rsyncs the operator's real memory tree into ~/.sutando/memory-sync and PUSHES
+# to the real remote. That happened — commit 8de3582 landed on
+# github.com/sonichi/sutando-memory authored `sync-workspace-test@invalid`, 360
+# files, while this suite reported 89/89 PASS.
+#
+# It was previously masked: the push died on "Author identity unknown". Pinning a git
+# identity for CI (#2438) removed that accidental brake and turned a hard failure into
+# a silent successful push. The identity pin is correct; relying on its ABSENCE as a
+# safety net was the latent bug.
+#
+# So: override every input the script uses to find a real repo — the URL, the local
+# clone dir, and HOME (which the default clone path is derived from). A test must not
+# be able to reach a real remote even when the host is fully configured.
+_t18_home="$(mktemp -d)"
 out_banner=$(env \
     SUTANDO_REPO_DIR="$FIXTURE_REPO" \
     SUTANDO_WORKSPACE="$FIXTURE_WS" \
+    HOME="$_t18_home" \
+    SUTANDO_MEMORY_REPO= \
+    SUTANDO_MEMORY_SYNC_DIR="$_t18_home/memory-sync" \
+    GIT_ALLOW_PROTOCOL=none \
     bash "$SYNC_MEM" 2>&1 || true)
 
 case "$out_banner" in
