@@ -79,7 +79,11 @@ with tempfile.TemporaryDirectory() as td:
     # 4. XLSX primary path (openpyxl) — driven with a fake module so it runs on
     #    ANY host (CI has no openpyxl; a skip there left the primary path uncovered).
     xlsx = tmp / "inv.xlsx"
-    xlsx.write_bytes(b"PK\x03\x04fake")  # openpyxl is faked, so contents are irrelevant
+    with zipfile.ZipFile(xlsx, "w") as zf:
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            "<worksheet><sheetData><row><c><v>1</v></c></row></sheetData></worksheet>",
+        )
     fake_openpyxl = types.ModuleType("openpyxl")
 
     class _WS:
@@ -408,5 +412,41 @@ with tempfile.TemporaryDirectory() as td:
     code, out, _ = run_cli([str(ext)])
     check("csv-extreme-exponent-bounded",
           code == 0 and "numeric" not in out and len(out) < 500, f"len={len(out)}")
+
+    # 32. Oversized CSV input fails before parsing, and row/cell accounting is
+    #     shared with the incremental summary rather than materializing the
+    #     whole attachment before the display cap applies.
+    bounded_csv = tmp / "bounded.csv"
+    bounded_csv.write_text("h\n1\n2\n3\n4\n")
+    with mock.patch.object(ingest, "MAX_TABLE_BYTES", 4):
+        try:
+            ingest.extract_csv(bounded_csv, 2)
+            check("csv-byte-budget", False, "expected hard byte-budget failure")
+        except RuntimeError as exc:
+            check("csv-byte-budget", "byte budget" in str(exc), str(exc))
+    with mock.patch.object(ingest, "MAX_TABLE_ROWS", 3):
+        try:
+            ingest.extract_csv(bounded_csv, 2)
+            check("csv-row-budget", False, "expected hard row-budget failure")
+        except RuntimeError as exc:
+            check("csv-row-budget", "row budget" in str(exc), str(exc))
+
+    # 33. XLSX preflights the uncompressed worksheet bytes before either
+    #     openpyxl or the fallback XML parser can inflate/materialize them.
+    oversized_xlsx = tmp / "oversized.xlsx"
+    with zipfile.ZipFile(oversized_xlsx, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            "<worksheet><sheetData>" + (" " * 2000)
+            + "</sheetData></worksheet>",
+        )
+    with mock.patch.object(ingest, "MAX_TABLE_BYTES", 400):
+        try:
+            ingest.extract_xlsx(oversized_xlsx, 2)
+            check("xlsx-uncompressed-byte-budget", False,
+                  "expected hard uncompressed-byte failure")
+        except RuntimeError as exc:
+            check("xlsx-uncompressed-byte-budget",
+                  "uncompressed byte budget" in str(exc), str(exc))
 
 print(f"OK — {len(passed)} checks passed: {', '.join(passed)}")

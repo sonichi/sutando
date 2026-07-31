@@ -16,10 +16,15 @@ import sys
 import zipfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Optional
 
 DEFAULT_MAX_CHARS = 200_000
 DEFAULT_MAX_ROWS = 500
 MAX_ARCHIVE_DEPTH = 8
+MAX_TABLE_BYTES = 64 * 1024 * 1024
+MAX_TABLE_ROWS = 100_000
+MAX_TABLE_CELLS = 1_000_000
+MAX_TABLE_TEXT_CHARS = 16 * 1024 * 1024
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".heic"}
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus"}
@@ -72,56 +77,131 @@ def _fmt_num(x: Decimal) -> str:
     return str(integral) if x == integral else format(x.normalize(), "f")
 
 
+class _TableCollector:
+    """Incrementally render/digest an untrusted table within hard resource caps."""
+
+    def __init__(self, max_rows: int, *, budget: Optional[dict[str, int]] = None):
+        self.max_rows = max_rows
+        self.budget = budget if budget is not None else {
+            "rows": MAX_TABLE_ROWS,
+            "cells": MAX_TABLE_CELLS,
+            "text": MAX_TABLE_TEXT_CHARS,
+        }
+        self.total_rows = 0
+        self.width = 0
+        self.header: list[str] = []
+        self.shown: list[list[str]] = []
+        self.stats: list[dict] = []
+
+    def add(self, raw_row) -> None:
+        row = ["" if cell is None else str(cell) for cell in raw_row]
+        row_text = sum(len(cell) for cell in row)
+        if self.budget["rows"] <= 0:
+            raise RuntimeError(
+                f"table exceeds shared row budget ({MAX_TABLE_ROWS}); extraction stopped"
+            )
+        if len(row) > self.budget["cells"]:
+            raise RuntimeError(
+                f"table exceeds shared cell budget ({MAX_TABLE_CELLS}); extraction stopped"
+            )
+        if row_text > self.budget["text"]:
+            raise RuntimeError(
+                f"table exceeds shared text budget ({MAX_TABLE_TEXT_CHARS} chars); extraction stopped"
+            )
+        self.budget["rows"] -= 1
+        self.budget["cells"] -= len(row)
+        self.budget["text"] -= row_text
+        self.total_rows += 1
+        self.width = max(self.width, len(row))
+        if not self.max_rows or len(self.shown) < self.max_rows:
+            self.shown.append(row)
+        if self.total_rows == 1:
+            self.header = row
+            return
+        while len(self.stats) < len(row):
+            self.stats.append({
+                "count": 0,
+                "numeric": True,
+                "sum": Decimal(0),
+                "min": None,
+                "max": None,
+            })
+        for j, cell in enumerate(row):
+            value = cell.strip()
+            if not value:
+                continue
+            stat = self.stats[j]
+            stat["count"] += 1
+            if not stat["numeric"]:
+                continue
+            number = _parse_number(value)
+            if number is None:
+                stat["numeric"] = False
+                continue
+            stat["sum"] += number
+            stat["min"] = number if stat["min"] is None else min(stat["min"], number)
+            stat["max"] = number if stat["max"] is None else max(stat["max"], number)
+
+    def summary(self) -> str:
+        if self.total_rows < 2:
+            return ""
+        out = [
+            f"**Table summary:** {self.total_rows - 1} data rows × {self.width} columns."
+        ]
+        for j in range(self.width):
+            stat = self.stats[j] if j < len(self.stats) else {
+                "count": 0, "numeric": False, "sum": Decimal(0), "min": None, "max": None,
+            }
+            name = (
+                self.header[j].strip()
+                if j < len(self.header) and self.header[j].strip()
+                else f"col{j + 1}"
+            )
+            seg = f"- **{name}**: {stat['count']} non-empty"
+            if stat["count"] and stat["numeric"]:
+                seg += (
+                    f"; numeric → sum {_fmt_num(stat['sum'])}, "
+                    f"min {_fmt_num(stat['min'])}, max {_fmt_num(stat['max'])}"
+                )
+            out.append(seg)
+        return "\n".join(out)
+
+    def render(self, *, summary: bool = False) -> str:
+        if not self.shown:
+            return "(empty table)"
+        shown = self.shown
+        width = max(len(r) for r in shown)
+        norm = [r + [""] * (width - len(r)) for r in shown]
+        lines = ["| " + " | ".join(str(c) for c in norm[0]) + " |",
+                 "|" + "---|" * width]
+        lines += ["| " + " | ".join(str(c) for c in r) + " |" for r in norm[1:]]
+        if self.total_rows > len(shown):
+            lines.append(
+                f"\n[doc-ingest: showing {len(shown)} of {self.total_rows} rows]"
+            )
+        table = "\n".join(lines)
+        digest = self.summary() if summary else ""
+        return digest + "\n\n" + table if digest else table
+
+
+def _collect_table(rows, max_rows: int, *, summary: bool = False,
+                   budget: Optional[dict[str, int]] = None) -> str:
+    collector = _TableCollector(max_rows, budget=budget)
+    for row in rows:
+        collector.add(row)
+    return collector.render(summary=summary)
+
+
 def _table_summary(rows: list[list[str]]) -> str:
-    """Computed structural digest of a data table, over the FULL row set (not the
-    display-truncated view). Row 0 is treated as the header. For each column:
-    non-empty count, and — when every non-empty cell parses as a *finite* number —
-    exact sum, min, max. This grounds count/sum/aggregate questions in *computed*
-    facts instead of a solver visually counting a long rendered table (the failure
-    mode on GAIA spreadsheet tasks). General tabular-reasoning aid, not a benchmark
-    trick. Non-finite / non-numeric cells make the column report as plain text — the
-    digest never crashes extraction and never rounds a large exact integer."""
-    if len(rows) < 2:
-        return ""
-    header, body = rows[0], rows[1:]
-    width = max((len(r) for r in rows), default=0)
-    out = [f"**Table summary:** {len(body)} data rows × {width} columns."]
-    for j in range(width):
-        col = [str(r[j]).strip() for r in body if j < len(r)]
-        nonempty = [c for c in col if c]
-        name = str(header[j]).strip() if j < len(header) and str(header[j]).strip() else f"col{j + 1}"
-        nums, all_numeric = [], bool(nonempty)
-        for c in nonempty:
-            d = _parse_number(c)
-            if d is None:
-                all_numeric = False
-                break
-            nums.append(d)
-        seg = f"- **{name}**: {len(nonempty)} non-empty"
-        if all_numeric:
-            seg += (f"; numeric → sum {_fmt_num(sum(nums))}, "
-                    f"min {_fmt_num(min(nums))}, max {_fmt_num(max(nums))}")
-        out.append(seg)
-    return "\n".join(out)
+    """Computed structural digest over the full row stream."""
+    collector = _TableCollector(0)
+    for row in rows:
+        collector.add(row)
+    return collector.summary()
 
 
 def _rows_to_markdown(rows: list[list[str]], max_rows: int, *, summary: bool = False) -> str:
-    if not rows:
-        return "(empty table)"
-    shown = rows[: max_rows or None]
-    width = max(len(r) for r in shown)
-    norm = [r + [""] * (width - len(r)) for r in shown]
-    lines = ["| " + " | ".join(str(c) for c in norm[0]) + " |",
-             "|" + "---|" * width]
-    lines += ["| " + " | ".join(str(c) for c in r) + " |" for r in norm[1:]]
-    if max_rows and len(rows) > max_rows:
-        lines.append(f"\n[doc-ingest: showing {max_rows} of {len(rows)} rows]")
-    table = "\n".join(lines)
-    if summary:
-        digest = _table_summary(rows)
-        if digest:
-            return digest + "\n\n" + table
-    return table
+    return _collect_table(rows, max_rows, summary=summary)
 
 
 def _xml_text(payload: bytes) -> str:
@@ -186,6 +266,17 @@ def _xlsx_zip_fallback(path: Path, max_rows: int) -> str:
 
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
+        table_names = [
+            name for name in names
+            if name == "xl/sharedStrings.xml"
+            or re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)
+        ]
+        table_bytes = sum(zf.getinfo(name).file_size for name in table_names)
+        if table_bytes > MAX_TABLE_BYTES:
+            raise RuntimeError(
+                f"XLSX table XML exceeds uncompressed byte budget "
+                f"({MAX_TABLE_BYTES // (1024 * 1024)} MiB); extraction stopped"
+            )
         shared: list[str] = []
         if "xl/sharedStrings.xml" in names:
             root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
@@ -194,55 +285,94 @@ def _xlsx_zip_fallback(path: Path, max_rows: int) -> str:
 
         sheets = sorted(n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
         parts: list[str] = []
+        budget = {
+            "rows": MAX_TABLE_ROWS,
+            "cells": MAX_TABLE_CELLS,
+            "text": MAX_TABLE_TEXT_CHARS,
+        }
         for i, sheet_name in enumerate(sheets, 1):
-            root = ET.fromstring(zf.read(sheet_name))
-            sheet_data = next((c for c in root if local(c.tag) == "sheetData"), None)
-            rows: list[list[str]] = []
-            for row in sheet_data or []:
-                cells: dict[int, str] = {}
-                for c in row:
-                    if local(c.tag) != "c":
-                        continue
-                    col = _col_index(c.get("r", ""))
-                    ctype = c.get("t")
-                    if ctype == "s":  # shared string: <v> holds the index
-                        v = next((x for x in c if local(x.tag) == "v"), None)
-                        try:
-                            val = shared[int(v.text)] if v is not None and v.text else ""
-                        except (ValueError, IndexError):
-                            val = ""
-                    elif ctype == "inlineStr":  # inline: <is><t>…</t></is>
-                        val = "".join(x.text or "" for x in c.iter() if local(x.tag) == "t")
-                    else:  # numeric/boolean/raw: <v>
-                        v = next((x for x in c if local(x.tag) == "v"), None)
-                        val = (v.text or "") if v is not None else ""
-                    cells[col] = val
-                width = max(cells) + 1 if cells else 0
-                rows.append([cells.get(j, "") for j in range(width)])
-            body = _rows_to_markdown(rows, max_rows, summary=True) if rows else "(empty sheet)"
+            collector = _TableCollector(max_rows, budget=budget)
+            with zf.open(sheet_name) as sheet_fh:
+                row_iter = (
+                    elem for _event, elem in ET.iterparse(sheet_fh, events=("end",))
+                    if local(elem.tag) == "row"
+                )
+                for row in row_iter:
+                    cells: dict[int, str] = {}
+                    for c in row:
+                        if local(c.tag) != "c":
+                            continue
+                        col = _col_index(c.get("r", ""))
+                        ctype = c.get("t")
+                        if ctype == "s":  # shared string: <v> holds the index
+                            v = next((x for x in c if local(x.tag) == "v"), None)
+                            try:
+                                val = shared[int(v.text)] if v is not None and v.text else ""
+                            except (ValueError, IndexError):
+                                val = ""
+                        elif ctype == "inlineStr":  # inline: <is><t>…</t></is>
+                            val = "".join(x.text or "" for x in c.iter() if local(x.tag) == "t")
+                        else:  # numeric/boolean/raw: <v>
+                            v = next((x for x in c if local(x.tag) == "v"), None)
+                            val = (v.text or "") if v is not None else ""
+                        cells[col] = val
+                    width = max(cells) + 1 if cells else 0
+                    collector.add([cells.get(j, "") for j in range(width)])
+                    row.clear()
+            body = collector.render(summary=True)
             parts.append(f"## Sheet {i}\n\n{body}")
         return "\n\n".join(parts) if parts else "(xlsx: no worksheet data found)"
 
 
 def extract_xlsx(path: Path, max_rows: int) -> str:
+    if path.stat().st_size > MAX_TABLE_BYTES:
+        raise RuntimeError(
+            f"XLSX exceeds compressed byte budget "
+            f"({MAX_TABLE_BYTES // (1024 * 1024)} MiB); extraction stopped"
+        )
+    with zipfile.ZipFile(path) as zf:
+        table_bytes = sum(
+            info.file_size for info in zf.infolist()
+            if info.filename == "xl/sharedStrings.xml"
+            or re.fullmatch(r"xl/worksheets/sheet\d+\.xml", info.filename)
+        )
+    if table_bytes > MAX_TABLE_BYTES:
+        raise RuntimeError(
+            f"XLSX table XML exceeds uncompressed byte budget "
+            f"({MAX_TABLE_BYTES // (1024 * 1024)} MiB); extraction stopped"
+        )
     try:
         import openpyxl  # noqa: PLC0415
 
         wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
         parts = []
+        budget = {
+            "rows": MAX_TABLE_ROWS,
+            "cells": MAX_TABLE_CELLS,
+            "text": MAX_TABLE_TEXT_CHARS,
+        }
         for ws in wb.worksheets:
-            rows = [["" if c is None else c for c in row] for row in ws.iter_rows(values_only=True)]
-            parts.append(f"## Sheet: {ws.title}\n\n" + _rows_to_markdown(rows, max_rows, summary=True))
+            body = _collect_table(
+                ws.iter_rows(values_only=True),
+                max_rows,
+                summary=True,
+                budget=budget,
+            )
+            parts.append(f"## Sheet: {ws.title}\n\n" + body)
         return "\n\n".join(parts)
     except ImportError:
         return _xlsx_zip_fallback(path, max_rows)
 
 
 def extract_csv(path: Path, max_rows: int) -> str:
+    if path.stat().st_size > MAX_TABLE_BYTES:
+        raise RuntimeError(
+            f"table exceeds input byte budget "
+            f"({MAX_TABLE_BYTES // (1024 * 1024)} MiB); extraction stopped"
+        )
     delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
     with open(path, newline="", encoding="utf-8", errors="replace") as fh:
-        rows = [list(r) for r in csv.reader(fh, delimiter=delimiter)]
-    return _rows_to_markdown(rows, max_rows, summary=True)
+        return _collect_table(csv.reader(fh, delimiter=delimiter), max_rows, summary=True)
 
 
 def extract_docx(path: Path, max_rows: int) -> str:

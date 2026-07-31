@@ -34,7 +34,13 @@ Not for:
 
 Exit codes: `0` all files extracted · `1` at least one failed · `2` bad invocation · `3` file type is handled elsewhere (image/audio pointer printed).
 
-Row caps for tabular formats default to 500 rows per sheet (`--max-rows`); a truncation notice is appended whenever any cap fires, so a consumer never mistakes a prefix for the whole document.
+Tabular rendering defaults to 500 rows per sheet (`--max-rows`). CSV and XLSX
+rows are consumed incrementally: only the rendered prefix is retained while the
+computed summary is updated over the stream. Hard shared safety budgets cap
+compressed/uncompressed table bytes, rows, cells, and cell text; exceeding one
+fails the file explicitly instead of risking unbounded attachment memory use.
+A display-truncation notice is appended whenever the rendered row cap fires, so
+a consumer never mistakes a prefix for the whole document.
 
 ## Design notes
 
