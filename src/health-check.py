@@ -1899,8 +1899,16 @@ def _runtime_may_skip_proxy() -> bool:
     return runtime in NON_PROXY_RUNTIMES
 
 
-def _last_core_launch_at() -> "float | None":
+def _last_core_launch_at() -> "tuple[float, str | None] | None":
     """When the CURRENT core was launched, from `state/session-starts.log`.
+
+    Returns `(timestamp, runtime)`, where `runtime` is the identity the launcher
+    recorded for that launch — `"codex"` from the Codex launcher, and None from the
+    Claude launcher, which writes no such field
+    (`src/agent/claude/cli/start-cli.sh:608`). The identity is returned rather than
+    discarded because the skew tolerance below is only safe when the launch record
+    and the marker positively agree on the runtime; see
+    `_marker_predates_running_core`.
 
     Both launchers append one line per launch — `src/agent/claude/cli/start-cli.sh:610`
     and `src/agent/codex/cli/start-cli.sh:243` — so the newest entry is the boundary of
@@ -1932,9 +1940,13 @@ def _last_core_launch_at() -> "float | None":
         if not isinstance(entry, dict):
             continue
         try:
-            return float(entry.get("session_started_at"))
+            ts = float(entry.get("session_started_at"))
         except (TypeError, ValueError):
             continue                      # keep looking further back
+        launch_runtime = entry.get("runtime")
+        if not isinstance(launch_runtime, str):
+            launch_runtime = None         # absent or wrong type -> no identity claim
+        return ts, launch_runtime
     return None
 
 
@@ -1945,15 +1957,35 @@ def _marker_predates_running_core(marker: dict) -> bool:
     — not the heartbeat. Both timestamps must be present and comparable; if either is
     missing the marker is taken at face value, because "no evidence of staleness" is not
     evidence of staleness.
+
+    The skew tolerance is IDENTITY-AWARE, and only sound that way. It exists solely
+    because the Codex launcher stamps the marker and the session line with two separate
+    `date +%s` calls (`src/agent/codex/cli/start-cli.sh:240` and `:242`), so one real
+    launch can record `started_at=N` and `session_started_at=N+1`. That case always
+    carries `"runtime":"codex"` on BOTH records. Granting the same margin when the
+    runtimes do not positively agree would swallow the fast Codex -> Claude switch: a
+    stale Codex marker at N against a Claude launch at N+1 is a genuinely different core,
+    and Claude is proxy-routed, so silencing it there hides stale quota telemetry
+    indefinitely on the one runtime that needs the warning (qingyun-wu + john-the-dev,
+    independently reproduced on f887b2a7).
+
+    So the margin applies only on a positive runtime match; otherwise the comparison is
+    strict. A Claude launch record carries no `runtime` field at all, which is exactly
+    the ambiguity that must NOT earn the tolerance.
     """
     try:
         started = float(marker.get("started_at"))
     except (TypeError, ValueError):
         return False
-    launched = _last_core_launch_at()
-    if launched is None:
+    launch = _last_core_launch_at()
+    if launch is None:
         return False
-    return started < launched - LAUNCH_RECORD_SKEW_SEC
+    launched, launch_runtime = launch
+    same_runtime = (
+        launch_runtime is not None and launch_runtime == marker.get("runtime")
+    )
+    margin = LAUNCH_RECORD_SKEW_SEC if same_runtime else 0
+    return started < launched - margin
 
 
 def _agent_activity_age() -> "float | None":

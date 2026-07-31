@@ -234,12 +234,26 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         p.write_text(json.dumps({"host": "h", "started_at": started_at}))
         return p
 
-    def _write_sessions(self, *starts: float) -> Path:
+    def _write_sessions(self, *starts: float, runtime: "str | None" = None) -> Path:
         """`state/session-starts.log` — one JSON line per core launch. THIS is the
-        session boundary; the heartbeat is not (see below)."""
+        session boundary; the heartbeat is not (see below).
+
+        `runtime` mirrors the launcher that wrote the line, and the difference is
+        load-bearing rather than cosmetic: the Codex launcher emits
+        `"runtime":"codex"` (`src/agent/codex/cli/start-cli.sh:241`) while the Claude
+        launcher emits no such field (`src/agent/claude/cli/start-cli.sh:608`). Passing
+        nothing therefore produces the CLAUDE shape. Omitting it while intending a Codex
+        launch is what made the original skew regression pin the ambiguous case as
+        healthy instead of the real one (qingyun-wu + john-the-dev, #2446).
+        """
         p = self.ws / "state" / "session-starts.log"
-        p.write_text("".join(json.dumps({"session_started_at": t, "source": "start-cli"}) + "\n"
-                             for t in starts))
+        lines = []
+        for t in starts:
+            entry = {"session_started_at": t, "source": "start-cli"}
+            if runtime is not None:
+                entry["runtime"] = runtime
+            lines.append(json.dumps(entry) + "\n")
+        p.write_text("".join(lines))
         return p
 
     def test_stale_codex_marker_from_a_previous_core_does_not_silence(self):
@@ -319,9 +333,37 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
                 (self.ws / "state" / "core-runtime.json").write_text(
                     json.dumps({"runtime": "codex", "started_at": marker_at})
                 )
-                self._write_sessions(session_at)
+                self._write_sessions(session_at, runtime="codex")
                 r = self.hc.check_quota_telemetry("ok")
                 self.assertEqual(r["status"], "ok", f"{label}: {r['detail']}")
+
+    def test_skew_margin_requires_a_matching_runtime_identity(self):
+        """The discriminating pair: identical 1000/1001 timestamps, opposite verdicts.
+
+        Both reviewers reproduced this independently on f887b2a7. The margin is only
+        justified by the Codex launcher's two separate `date +%s` calls, and that case
+        stamps `"runtime":"codex"` on BOTH records. A Claude launch writes no `runtime`
+        field at all, so the same 1-second gap there is not one launch racing itself —
+        it is a fast Codex -> Claude switch, i.e. a genuinely different core.
+
+        Granting the tolerance to the ambiguous shape is the worst direction to be
+        wrong in: Claude is the proxy-routed runtime, so a stale Codex marker would
+        silence its quota warning permanently. Same numbers, so nothing but the
+        launcher identity can account for the difference.
+        """
+        for label, launch_runtime, expected in (
+            ("real Codex launch (runtime:codex)", "codex", "ok"),
+            ("real Claude launch (no runtime field)", None, "warn"),
+        ):
+            with self.subTest(label=label):
+                self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+                self._write_core_status(mtime_age_sec=60)
+                (self.ws / "state" / "core-runtime.json").write_text(
+                    json.dumps({"runtime": "codex", "started_at": 1000})
+                )
+                self._write_sessions(1001, runtime=launch_runtime)
+                r = self.hc.check_quota_telemetry("ok")
+                self.assertEqual(r["status"], expected, f"{label}: {r['detail']}")
 
     def test_margin_does_not_mask_a_real_previous_core(self):
         """The slack must not swallow genuine staleness — a previous core is separated
