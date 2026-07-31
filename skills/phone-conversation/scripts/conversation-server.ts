@@ -45,7 +45,7 @@
 // Load .env from the project root (3 levels up from this script), not cwd —
 // override: true ensures .env values win over stale shell env vars
 import { config as _dotenvConfig } from 'dotenv';
-_dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
+_dotenvConfig({ path: fileURLToPath(new URL('../../../.env', import.meta.url)), override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
