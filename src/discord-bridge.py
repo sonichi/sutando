@@ -4387,6 +4387,36 @@ async def poll_results():
 _progress_msgs: dict = {}
 
 
+def _newest_alive_mtime():
+    """Newest per-host core heartbeat mtime (state/cores/*.alive), or None
+    when no heartbeat file exists (graceful shutdown unlinks it)."""
+    try:
+        return max((p.stat().st_mtime for p in (STATE_DIR / "cores").glob("*.alive")),
+                   default=None)
+    except Exception:
+        return None
+
+
+def _queued_task_count():
+    """Live (unarchived) task files waiting in tasks/."""
+    try:
+        return sum(1 for _ in TASKS_DIR.glob("task-*.txt"))
+    except Exception:
+        return 0
+
+
+def _render_progress_content(now, elapsed):
+    """Placeholder body for poll_progress: the live core step normally, or the
+    honest outage copy (frozen status + stale heartbeat + queue depth) when the
+    core looks dead (sonichi#2398 — the 2026-07-30 'restart in flight (1625s)'
+    class: never narrate progress the core is not making)."""
+    status = progress_stream.read_core_status(STATE_DIR)
+    if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):
+        return progress_stream.format_outage(
+            progress_stream.status_age_s(status, now), _queued_task_count())
+    return progress_stream.format_progress(progress_stream.current_step(status), elapsed)
+
+
 async def poll_progress():
     """Hermes-style streaming tool output (2026-06-05).
 
@@ -4444,12 +4474,9 @@ async def poll_progress():
                         _progress_msgs[task_id] = {"expired": True}  # terminal
                         continue
                     if progress_stream.should_edit(now, info["last_edit"]):
-                        step = progress_stream.current_step(
-                            progress_stream.read_core_status(STATE_DIR)
-                        )
                         try:
                             await info["msg"].edit(
-                                content=progress_stream.format_progress(step, elapsed)
+                                content=_render_progress_content(now, elapsed)
                             )
                             info["last_edit"] = now
                         except Exception:
@@ -4477,12 +4504,9 @@ async def poll_progress():
                     created = now
                 elapsed = now - created
                 if progress_stream.should_post_placeholder(elapsed):
-                    step = progress_stream.current_step(
-                        progress_stream.read_core_status(STATE_DIR)
-                    )
                     try:
                         msg = await channel.send(
-                            progress_stream.format_progress(step, elapsed)
+                            _render_progress_content(now, elapsed)
                         )
                         _progress_msgs[task_id] = {
                             "msg": msg,
