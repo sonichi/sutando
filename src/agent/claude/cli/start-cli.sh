@@ -20,6 +20,22 @@ set -e
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 
+# Resolve the Python interpreter (same policy as scripts/sutando-config.sh). On a
+# fresh Mac there is NO system python3 — bare `python3` resolves to Apple's
+# Xcode-CLT stub, which returns nothing, so the onboarding seed below (which runs
+# an inline python3 to write hasCompletedClaudeInChromeOnboarding) would silently
+# no-op and the detached core hangs at the Chrome prompt — the exact bug the seed
+# exists to prevent. Prefer SUTANDO_PY (set by launch-sutando.sh), else the
+# bundle-vendored relocatable python (`<engine>/runtime/python`, i.e. REPO/../runtime),
+# else system python3.
+if [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
+  PY="$SUTANDO_PY"
+elif [ -x "$REPO/../runtime/python/bin/python3" ]; then
+  PY="$REPO/../runtime/python/bin/python3"
+else
+  PY="python3"
+fi
+
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
 # Backward-compatible: unset → identical to the previous hardcoded value.
@@ -174,8 +190,8 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # This is the single launch chokepoint (Sutando.app's launchCore, the
     # terminal-server Core CLI pane, and src/startup.sh all exec this script),
     # so seeding here covers every path.
-    if command -v python3 > /dev/null 2>&1; then
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+    if "$PY" -c 'import sys' > /dev/null 2>&1; then
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -194,9 +210,23 @@ try:
 except Exception:
     pass
 changed = False
+chrome_seeded = False
 if cfg.get("hasCompletedOnboarding") is not True:
     cfg["hasCompletedOnboarding"] = True
     changed = True
+# Claude-in-Chrome onboarding seed. The core launches with --chrome (see the
+# CORE_CMD below), which on first run in a fresh scoped config shows a "Claude
+# in Chrome" acknowledgement prompt ("Enter to confirm · Esc to cancel").
+# --dangerously-skip-permissions does NOT bypass it, so a detached no-TTY core
+# hangs there — process alive but never reaching /schedule-crons, and the
+# desktop onboarding "Say hello" local probe times out with no reply
+# (owner-hit 2026-07-28, fresh install). Pre-accept it the same way as
+# hasCompletedOnboarding: Claude Code records acceptance as
+# hasCompletedClaudeInChromeOnboarding=true in .claude.json.
+if cfg.get("hasCompletedClaudeInChromeOnboarding") is not True:
+    cfg["hasCompletedClaudeInChromeOnboarding"] = True
+    changed = True
+    chrome_seeded = True
 if cfg.get("theme") is None and glob.get("theme") is not None:
     cfg["theme"] = glob["theme"]
     changed = True
@@ -252,6 +282,8 @@ if changed:
         json.dump(cfg, f, indent=2)
     os.replace(tmp, target)
     print("  ✓ onboarding-seed: hasCompletedOnboarding set in .claude.json")
+    if chrome_seeded:
+        print("  ✓ chrome-seed: hasCompletedClaudeInChromeOnboarding set in .claude.json")
     if trusted_dir:
         print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
 PY
@@ -496,7 +528,7 @@ ensure_core_monitor() {
   mon_out="$ws/state/core-supervisor.json"
   # Monitor (PR #2100): launch unless one for this exact socket+out is running.
   if ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
-    python3 "$REPO/src/core-input-watch.py" \
+    "$PY" "$REPO/src/core-input-watch.py" \
       --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
       > /tmp/core-input-watch.log 2>&1 &
   fi
@@ -517,7 +549,7 @@ ensure_core_monitor() {
     # blocks on the pipe until this infinite loop closes it (never) and times out.
     # Mirrors the monitor launch above, which redirects to /tmp/core-input-watch.log.
     ( while true; do
-        python3 "$REPO/src/core-supervisor-relay.py" \
+        "$PY" "$REPO/src/core-supervisor-relay.py" \
           --signal "$mon_out" --state-file "$relay_state" \
           --active-from "$ws/state/last-owner-activity.json"
         sleep 30

@@ -9,7 +9,6 @@
 tests/codex-bounded.test.sh
 tests/cron-gate.test.sh
 tests/migration-safety-helpers.test.sh
-tests/start-cli-claude-config-dir.test.sh
 tests/startup-env-token-persist.test.sh
 tests/startup-self-log-tmp.test.sh
 tests/sutando-migrate.test.sh
