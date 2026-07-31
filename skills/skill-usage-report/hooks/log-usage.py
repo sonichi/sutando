@@ -22,9 +22,19 @@ def _skill_dir() -> Path:
 
 
 # The claim lock MUST be the same implementation the reporter uses — a drifted
-# copy looks synchronised while it is not. Import the one module; if that import
-# fails, fall back to a no-op contextmanager that yields True so the hook keeps
-# working exactly as before rather than silently logging nothing.
+# copy looks synchronised while it is not.
+#
+# FAIL CLOSED if that import breaks. The first version yielded True here, on the
+# reasoning that the hook should "keep working exactly as before" — but "as
+# before" IS the pre-rename-fd data-loss race this PR exists to close, so the
+# degraded path silently reopened the bug on any partial install. Measured
+# (#2180 review): break only `usage_lock.py` in place and the hook returns 0
+# AND writes `skill-usage-log.jsonl` with no lock held.
+#
+# Yielding False routes into the branch that already drops the record and
+# returns 0, so the hook's never-block-a-tool-call contract is unchanged; what
+# changes is that an unsynchronised write is no longer the fallback. Losing
+# telemetry beats corrupting it.
 sys.path.insert(0, str(_skill_dir()))
 try:
     from usage_lock import claim_lock as _claim_lock  # type: ignore
@@ -33,7 +43,7 @@ except Exception:  # pragma: no cover - degraded path
 
     @_ctx.contextmanager
     def _claim_lock(_log, *_a, **_kw):
-        yield True
+        yield False
 
 
 def repo_root() -> Path:

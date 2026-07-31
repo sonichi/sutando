@@ -98,6 +98,36 @@ def repo_root() -> Path:
     return Path(os.path.realpath(__file__)).parents[3]
 
 
+def _renderable(ts: int) -> bool:
+    """Can datetime actually format this timestamp?
+
+    Called INSIDE the per-record guard, and that placement is the whole point.
+    `int(rec["ts"])` happily accepts an arbitrarily large integer, but the
+    `datetime.fromtimestamp()` that renders it runs AFTER the claim is taken
+    below. An out-of-range value therefore raised past the guard and exited
+    nonzero with the claim stranded — so every later run re-folded the same
+    poison record and re-stranded it, and valid usage never drained again. One
+    corrupt byte disabled the reporter permanently.
+
+    (Deliberately no literal call syntax for the claim step in this docstring:
+    the claim-lock suite locates that step by scanning this file's source, and
+    prose shaped like code is indistinguishable from code to a substring scan.)
+
+    Repro (#2180 review, reproduced before this fix):
+        {"slug": "corrupt-ts", "ts": 999999999999999999999999999}
+        -> OverflowError: timestamp out of range for platform time_t
+        -> ACTIVE_EXISTS=False, PENDING_EXISTS=True, exit nonzero
+
+    Validating here demotes it to an ordinary malformed record: skipped, like a
+    bad slug or a bad count, with the claim released normally.
+    """
+    try:
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        return True
+    except (OverflowError, OSError, ValueError):
+        return False
+
+
 def _report(ws: Path, log: Path, pending: Path) -> int:
     """The whole report, run while holding the reporter-run lock."""
 
@@ -159,6 +189,11 @@ def _report(ws: Path, log: Path, pending: Path) -> int:
                 # non-empty string is malformed (a list slug raised unhashable
                 # at aggregation time, stranding the claim — review round 4).
                 if not isinstance(slug, str) or not slug:
+                    continue
+                # Range-check ts HERE, not at render time — see _renderable().
+                # Every ts that reaches `last` is validated, so the max() below
+                # is renderable too and the events comprehension cannot raise.
+                if not _renderable(ts):
                     continue
                 # count is reporter-authored (fold_back) but must stay inside
                 # the malformed-record guard: a bad value would otherwise raise
