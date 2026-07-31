@@ -161,17 +161,91 @@ def mask_code_spans(text: str) -> str:
     return ''.join(out)
 
 
-def mask_markup(text: str) -> str:
-    """All three maskers, composed. Each preserves offsets.
+def _opens_span(text: str, start: int, length: int) -> bool:
+    """Is the backtick run at `start` unambiguously an INLINE span delimiter?
 
-    ORDER IS LOAD-BEARING: code spans must be masked BEFORE fences. A span's
-    closing run often sits at column 0 on its own line, and `mask_fenced_code`
-    would read that as a fence OPENER, find no closer, and blank to end of
-    document — hiding the real divider and, worse, the questions after it.
-    Masking spans first removes those delimiters before the fence scanner sees
-    them. Measured on the 11-case matrix: spans-first 11/11, fences-first 10/11.
+    True only when the run cannot be read as a fence marker for a reason that
+    makes it inline:
+
+      * TEXT BEFORE IT on the line  — a fence marker must begin its line;
+      * a run shorter than 3        — never a fence;
+      * a backtick in its info string — a backtick fence may not carry one.
+
+    Deliberately NOT included: a run alone on its line but indented by a tab or
+    4+ spaces. That is an INVALID FENCE MARKER, not an inline delimiter — it is
+    ordinary text inside the enclosing fence. Treating it as a span opener let
+    it pair with the fence's real closer and blank it, so the fence ran to end
+    of document and swallowed the REAL divider along with the quoted one. The
+    suite caught that as `## archived` being counted; the fixture's own trailing
+    `# Resolved` is what makes the over-mask visible.
     """
-    return mask_fenced_code(mask_code_spans(mask_html_comments(text)))
+    line_start = text.rfind("\n", 0, start) + 1
+    if text[line_start:start].strip(" \t") != "":
+        return True           # text before it -> inline
+    if length < 3:
+        return True           # too short to fence
+    line_end = text.find("\n", start)
+    info = text[start + length:] if line_end < 0 else text[start + length:line_end]
+    return "`" in info        # invalid fence info -> inline
+
+
+def _mask_nonfence_spans(text: str) -> str:
+    """Blank inline spans whose OPENER cannot be a fence marker.
+
+    Such an opener is unambiguously a span delimiter, so it may close on the next
+    equal-length maximal run even when that run sits at column zero and could
+    otherwise have opened a fence — which is exactly G1, where a span opened
+    mid-line must reach across an intervening ```` fence.
+
+    Runs that ARE fence-eligible never open a span here; they are left for
+    `mask_fenced_code`, which applies the raw 0-3-space closer contract. That is
+    what keeps the tab, space+tab, 4-space and trailing-text closers rejected.
+    """
+    runs = _backtick_runs(text)
+    opens = [_opens_span(text, s, n) for s, n in runs]
+    out = list(text)
+    k = 0
+    while k < len(runs):
+        if not opens[k]:
+            k += 1
+            continue
+        start, length = runs[k]
+        m = k + 1
+        while m < len(runs) and runs[m][1] != length:
+            m += 1
+        if m < len(runs):
+            end = runs[m][0] + runs[m][1]
+            for q in range(start, end):
+                if out[q] != "\n":
+                    out[q] = " "
+            k = m + 1
+        else:
+            k += 1
+    return "".join(out)
+
+
+def mask_markup(text: str) -> str:
+    """Comments, then non-fence-opened spans, then fences.
+
+    NOT a global precedence ordering — every ordering breaks a real case,
+    measured across five designs. The runs are instead PARTITIONED by whether
+    each one could be a fence marker at all (`_fence_eligible`):
+
+      * a run with TEXT BEFORE IT, a run shorter than 3, or a backtick in its
+        info string can only be an inline delimiter -> resolved first, and
+        allowed to close on any equal-length run, crossing fences if need be
+        (G1, G2, F7, G5);
+      * every other run — including one alone on its line but indented by a tab
+        or 4+ spaces — is left to `mask_fenced_code` and its raw 0-3-space
+        closer contract, so those closers are rejected and the fence keeps
+        running (H1/I1, S1/I2, S2/I3).
+
+    The two classes do not compete, so there is nothing left to arbitrate.
+
+    Every step preserves length and line count, so a caller may search the
+    masked text and slice the ORIGINAL at the same offsets.
+    """
+    return mask_fenced_code(_mask_nonfence_spans(mask_html_comments(text)))
 
 
 def active_region(text: str, divider: re.Pattern = DIVIDER_RE) -> str:

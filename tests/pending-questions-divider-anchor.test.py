@@ -253,6 +253,32 @@ check("H4 tilde control: a 3-space closer IS valid, divider stays real",
 check("H5 tilde control: a 0-space closer IS valid, divider stays real",
       n_sections("~~~\n~~~\n# Resolved" + QUESTIONS) == 0)
 
+# ---------------------------------------------------------------------------
+# Case I — BACKTICK AMBIGUITY, the half no precedence ordering could resolve.
+#
+# A backtick run can be a fence marker OR a span delimiter, and the two
+# requirements pull opposite ways: G1 needs a span to reach ACROSS a fence,
+# while these need the fence to SURVIVE an invalid closer. Five whole-document
+# orderings were measured (spans-first, fences-first, fence-regions, union,
+# candidate-containment) and each satisfied one by breaking the other.
+#
+# The resolution is not an ordering. Runs are PARTITIONED by whether each one
+# could be a fence marker at all: a run with text before it, a tab indent, or a
+# backtick in its info string can only ever be a span delimiter, so it is
+# resolved first and may cross fences. Every other run is left to the fence
+# parser and its raw 0-3-space closer contract. The two classes never compete.
+# ---------------------------------------------------------------------------
+check("I1 backtick: a TAB-indented closer does not close the fence",
+      n_sections("```\n\t```\n# Resolved\n```" + QUESTIONS) == 2)
+check("I2 backtick: a 4-space-indented closer does not close the fence",
+      n_sections("```\n    ```\n# Resolved\n```" + QUESTIONS) == 2)
+check("I3 backtick: an equal-length run with TRAILING TEXT is not a closer",
+      n_sections("````\n```` x\n# Resolved\n````" + QUESTIONS) == 2)
+check("I4 control: a properly closed backtick fence leaves an OUTSIDE divider real",
+      n_sections("```\ncode\n```\n# Resolved" + QUESTIONS) == 0)
+check("I5 control: a fence-eligible run does not open a span across the document",
+      n_sections("```\ncode\n```\n## a\n\n## b\n# Resolved\n") == 2)
+
 # Offset invariant: every masker must preserve length AND line count, because
 # agent-api derives question identity by slicing the ORIGINAL at a masked offset.
 _offset_ok = True
