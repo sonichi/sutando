@@ -84,11 +84,102 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         """Deliberate: a quiet core legitimately writes nothing for a long
         time. An age threshold would fire on healthy idle hosts, so absence —
         not staleness — is the signal. Pin it so nobody 'improves' this into
-        a flaky check later."""
+        a flaky check later.
+
+        Still true, and deliberately left byte-identical: age ALONE never
+        warns. The stale branch added below fires only when a second signal
+        rules the quiet-core explanation out."""
         self._write_quota(mtime_age_sec=60 * 60 * 24 * 3)
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "ok")
         self.assertIn("4320m ago", r["detail"])
+
+    # --- presence is satisfied by a HISTORICAL write ------------------------
+    # The check exists to catch "proxy up, nothing routing through it". It sees
+    # only the never-wired shape: a host that WAS wired, wrote the file once and
+    # then lost the wiring keeps that file forever and reads green forever.
+
+    def _write_core_status(self, mtime_age_sec: float = 0.0) -> Path:
+        p = self.ws / "state" / "core-status.json"
+        p.write_text('{"status": "running"}')
+        if mtime_age_sec:
+            past = time.time() - mtime_age_sec
+            os.utime(p, (past, past))
+        return p
+
+    def test_stale_quota_while_agent_is_working_warns(self):
+        """The uncaught shape: wiring lost after the first write.
+
+        Observed on this fleet — quota-state 323h old, credential-proxy ok,
+        quota-telemetry ok, and the loop's budget gate quoting 13-day-old
+        percentages as current."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("stale", r["detail"])
+        # Name the cause and both ages, or the reader cannot act on it.
+        self.assertIn("ANTHROPIC_BASE_URL", r["detail"])
+        self.assertIn("312h", r["detail"])
+        self.assertIn("1m", r["detail"])
+
+    def test_idle_host_with_stale_quota_stays_silent(self):
+        """The false positive the original decision was protecting against,
+        now pinned explicitly: nothing has run, so nothing SHOULD have written
+        quota headers. A stale core-status is what makes 'quiet' evidence."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60 * 60 * 9)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_unknown_agent_activity_stays_silent(self):
+        """No core-status.json = no evidence either way. 'Unknown' must not
+        collapse into 'idle' OR 'working' — a check that cannot rule out the
+        quiet-core explanation has not earned a warning."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_fresh_quota_with_active_agent_is_ok(self):
+        """The healthy wired host — the case that must never be warned at."""
+        self._write_quota(mtime_age_sec=5 * 60)
+        self._write_core_status(mtime_age_sec=10)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertIn("present", r["detail"])
+
+    def test_just_under_the_stale_threshold_is_ok(self):
+        """Boundary, so the threshold is a decision rather than an accident."""
+        self._write_quota(mtime_age_sec=self.hc.QUOTA_STATE_STALE_SEC - 120)
+        self._write_core_status(mtime_age_sec=10)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_unreadable_core_status_is_unknown_not_idle(self):
+        """A core-status.json that exists but cannot be stat'd is UNKNOWN, so
+        the stale branch must stay closed. Treating a read error as 'the agent
+        is working' would turn one unlucky race into a spurious warning."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        real_stat = Path.stat
+
+        def _boom(self, *a, **kw):
+            if self.name == "core-status.json":
+                raise OSError("boom")
+            return real_stat(self, *a, **kw)
+
+        with mock.patch.object(Path, "stat", _boom):
+            r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_stale_quota_with_proxy_down_stays_silent(self):
+        """Proxy-down short-circuits before any staleness reasoning: its own
+        check already reports it, and warning twice for one cause is noise."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        for status in ("warn", "down"):
+            r = self.hc.check_quota_telemetry(status)
+            self.assertEqual(r["status"], "ok", f"status={status}")
 
     def test_stat_failure_still_reports_present(self):
         """`exists()` true but `stat()` raising is rare (file removed mid-check,
