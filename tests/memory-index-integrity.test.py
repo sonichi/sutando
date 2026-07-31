@@ -130,6 +130,66 @@ with tempfile.TemporaryDirectory() as t:
     r = hc.check_memory_index_integrity()
     check("no MEMORY.md at all → not a size failure", r and r["status"] != "fail", str(r))
 
+# --- threshold OVERRIDES: the two limits are independent and can invert ----
+# qingyun-wu (#2449): a runtime measuring a SMALLER read limit sets only
+# ..._FAIL_BYTES and leaves the warn default alone, so fail < warn. An index
+# between them is over the fail limit while `outgrowing` is still False.
+# Gating the healthy return on `outgrowing` alone returned `ok` at exactly the
+# moment the index had stopped loading. Her exact repro is the first row.
+_shipped_fail, _shipped_warn = hc.MEMORY_INDEX_FAIL_BYTES, hc.MEMORY_INDEX_WARN_BYTES
+try:
+    for label, nbytes, fail, warn, want in (
+        ("her repro: fail<warn, between them   ", 150, 100, 200, "fail"),
+        ("fail<warn, under both                ",  50, 100, 200, "ok"),
+        ("fail<warn, over both                 ", 250, 100, 200, "fail"),
+        ("fail<warn, exactly at fail           ", 100, 100, 200, "fail"),
+        ("one-sided: only FAIL lowered         ", 150, 100, _shipped_warn, "fail"),
+        ("one-sided: only WARN raised past fail", 150, _shipped_fail, 999999, "ok"),
+        ("equal thresholds, at the boundary    ", 100, 100, 100, "fail"),
+        ("equal thresholds, just below         ",  99, 100, 100, "ok"),
+    ):
+        with tempfile.TemporaryDirectory() as t_:
+            mem = make_tree(Path(t_))
+            _index_of(mem, nbytes)
+            hc.MEMORY_DIR = mem
+            hc.MEMORY_INDEX_FAIL_BYTES, hc.MEMORY_INDEX_WARN_BYTES = fail, warn
+            r = hc.check_memory_index_integrity()
+            check(f"override {label} → {want}", r and r["status"] == want,
+                  f"bytes={nbytes} fail={fail} warn={warn} got={r and r['status']}")
+finally:
+    hc.MEMORY_INDEX_FAIL_BYTES, hc.MEMORY_INDEX_WARN_BYTES = _shipped_fail, _shipped_warn
+
+check("shipped thresholds restored after override tests",
+      (hc.MEMORY_INDEX_FAIL_BYTES, hc.MEMORY_INDEX_WARN_BYTES) == (_shipped_fail, _shipped_warn))
+
+# --- env parsing happens at IMPORT: a typo must not take health-check down ---
+# A bare int(os.environ[...]) raised ValueError during module import, so one
+# mistyped tuning variable removed ALL monitoring — worse than the problem the
+# threshold exists to catch.
+import os as _os
+for raw, want in (("24k", 24 * 1024), ("", 24 * 1024), ("0", 24 * 1024),
+                  ("-1", 24 * 1024), ("  ", 24 * 1024), ("12.5", 24 * 1024),
+                  ("8192", 8192), (" 8192 ", 8192)):
+    _os.environ["_TEST_MEM_IDX"] = raw
+    got = hc._positive_int_env("_TEST_MEM_IDX", 24 * 1024)
+    check(f"env {raw!r:9} → {want}", got == want, f"got {got}")
+_os.environ.pop("_TEST_MEM_IDX", None)
+check("unset env → default", hc._positive_int_env("_TEST_MEM_IDX_UNSET", 777) == 777)
+
+# The property that actually matters: the module still IMPORTS with a bad value.
+import subprocess as _sp, sys as _sys
+_env = dict(_os.environ, SUTANDO_MEMORY_INDEX_FAIL_BYTES="24k",
+            SUTANDO_MEMORY_INDEX_WARN_BYTES="oops")
+_r = _sp.run([_sys.executable, "-c",
+              "import importlib.util;s=importlib.util.spec_from_file_location('hc',%r);"
+              "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+              "print(m.MEMORY_INDEX_FAIL_BYTES, m.MEMORY_INDEX_WARN_BYTES)" % str(HC)],
+             capture_output=True, text=True, env=_env)
+check("health-check still imports with unparseable thresholds",
+      _r.returncode == 0, (_r.stderr or "")[-160:])
+check("and falls back to the shipped defaults",
+      _r.stdout.strip() == f"{24 * 1024} {19 * 1024}", _r.stdout.strip())
+
 # 4) Missing memory dir → None (no false alarm on fresh installs).
 with tempfile.TemporaryDirectory() as t:
     hc.MEMORY_DIR = Path(t) / "does-not-exist" / "memory"

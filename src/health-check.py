@@ -99,10 +99,29 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # this repo, so a deployment that measures a different one can declare it
 # rather than patch code. Defaults encode what was observed on this fleet
 # 2026-07-31 (index hit 22.0KB against a 24.4KB limit, uncaught).
-MEMORY_INDEX_FAIL_BYTES = int(os.environ.get("SUTANDO_MEMORY_INDEX_FAIL_BYTES", str(24 * 1024)))
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive-int env override, falling back to `default` if unusable.
+
+    These are parsed at IMPORT time, so a bare `int(os.environ[...])` turns a
+    typo into an exception that takes the ENTIRE health check down — a tuning
+    mistake would cost all monitoring, which is strictly worse than the stale
+    index this threshold exists to catch (qingyun-wu, #2449). `24k`, ``, `0`
+    and `-1` all fall back rather than raise.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+MEMORY_INDEX_FAIL_BYTES = _positive_int_env("SUTANDO_MEMORY_INDEX_FAIL_BYTES", 24 * 1024)
 # Warn with enough headroom to compact deliberately rather than in a panic —
 # a few more filed memories is all the margin there is at the default.
-MEMORY_INDEX_WARN_BYTES = int(os.environ.get("SUTANDO_MEMORY_INDEX_WARN_BYTES", str(19 * 1024)))
+MEMORY_INDEX_WARN_BYTES = _positive_int_env("SUTANDO_MEMORY_INDEX_WARN_BYTES", 19 * 1024)
 
 
 def _resolve_dotenv() -> Path:
@@ -826,7 +845,19 @@ def check_memory_index_integrity() -> "dict | None":
     oversized = index_bytes >= MEMORY_INDEX_FAIL_BYTES
     outgrowing = index_bytes >= MEMORY_INDEX_WARN_BYTES
 
-    if not unindexed and not stranded and not outgrowing:
+    # Both size conditions gate the healthy return, not just `outgrowing`.
+    # They are independent env overrides, so they can invert: a runtime that
+    # measures a SMALLER read limit sets only ..._FAIL_BYTES and leaves the warn
+    # default alone, giving fail < warn. An index between them is then over the
+    # fail limit while `outgrowing` is still False — and testing `outgrowing`
+    # alone returned `ok` at exactly the point the index had stopped loading
+    # (qingyun-wu's repro, #2449: bytes=150, fail=100, warn=200 -> ok).
+    #
+    # Checking both explicitly is preferred over normalising warn to
+    # min(warn, fail): normalisation would make the branches agree but changes
+    # no observable verdict here (the `if oversized` branch already wins), so
+    # it would add a silent rewrite of operator-declared config for no gain.
+    if not unindexed and not stranded and not outgrowing and not oversized:
         return {"name": "memory-index", "status": "ok",
                 "detail": ("all memory files present in the MEMORY.md index "
                            f"({index_bytes / 1024:.1f}KB index)")}
