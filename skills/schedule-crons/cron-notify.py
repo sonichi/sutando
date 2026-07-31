@@ -273,20 +273,15 @@ class _StateLock:
     def __enter__(self):
         import fcntl
         import os
-        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)  # OSError → caller fails closed
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError:
-            os.close(fd)
-            raise
-        self._fd = fd
+        # os.open or flock raising OSError propagates → the caller fails closed.
+        # __exit__ only runs if this returns, so a raise here leaks no context.
+        self._fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
         return self
 
     def __exit__(self, *exc):
         import fcntl
         import os
-        if self._fd is None:
-            return False
         try:
             fcntl.flock(self._fd, fcntl.LOCK_UN)
         finally:

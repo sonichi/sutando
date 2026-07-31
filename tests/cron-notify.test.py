@@ -277,6 +277,65 @@ def main() -> int:
               (not Path(sf).exists()) or json.loads(sf.read_text()) == {},
               sf.read_text() if Path(sf).exists() else "(no file)")
 
+    # dry-run must also honor the rate-limit (covers the dry-run suppressed path).
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"; sf.write_text(json.dumps({"c": 9000}))
+        rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                      "--room", "!r:x", "--state-file", str(sf), "--now", "10000",
+                      "--dry-run"])
+        check("dry-run + rate-limited: suppressed exit 3", rc == 3, rc)
+
+    # save fails while the lock IS acquirable (state path is a directory, so
+    # os.replace fails but the sidecar `.lock` opens fine) → refuse to post.
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"; _os.mkdir(str(sf))   # state path is a directory
+        posted = []
+        with um.patch.object(cn, "_post_to_room",
+                             side_effect=lambda *a, **k: posted.append(a) or "$evt"):
+            rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                          "--room", "!r:x", "--state-file", str(sf), "--now", "10000"])
+        check("save-fails (lock ok): REFUSES to post", posted == [], posted)
+        check("save-fails (lock ok): exit 2", rc == 2, rc)
+
+    # rollback tolerates a lock-acquisition failure (best-effort): reserve
+    # succeeds, the send fails, and the rollback lock can't be acquired → the
+    # reservation is KEPT (suppresses the next fire, never duplicates).
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"; sf.write_text("{}")
+        enters = {"n": 0}
+
+        class _LockOkThenFail:
+            def __init__(self, path):
+                pass
+
+            def __enter__(self):
+                enters["n"] += 1
+                if enters["n"] >= 2:            # the rollback acquisition
+                    raise OSError("simulated rollback lock unavailable")
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with um.patch.object(cn, "_StateLock", _LockOkThenFail), \
+             um.patch.object(cn, "_post_to_room", return_value=None):   # send fails
+            rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                          "--room", "!r:x", "--state-file", str(sf), "--now", "7777"])
+        check("rollback lock failure: exit 2", rc == 2, rc)
+        check("rollback lock failure: reservation kept (best-effort)",
+              json.loads(sf.read_text()).get("c") == 7777, sf.read_text())
+
+    # failed send with a PRIOR stamp → rollback RESTORES the prior value (not
+    # pop): the cron had pinged before, long enough ago to re-ping now.
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "s.json"; sf.write_text(json.dumps({"c": 1000}))
+        with um.patch.object(cn, "_post_to_room", return_value=None):   # send fails
+            rc = cn.main(["--cron", "c", "--summary", "s", "--kind", "digest",
+                          "--room", "!r:x", "--state-file", str(sf), "--now", "10000"])
+        check("failed send with prior: exit 2", rc == 2, rc)
+        check("failed send with prior: rollback RESTORES prior (not pop)",
+              json.loads(sf.read_text()).get("c") == 1000, sf.read_text())
+
     # ── #2346 review blocker (CONCURRENCY): load→check→reserve must be ONE
     # cross-process-exclusive transaction. john forced two same-cron processes to
     # both finish _load_state() before either reserved → both posted, defeating
