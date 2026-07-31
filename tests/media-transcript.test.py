@@ -252,6 +252,55 @@ rc, out, _ = run_main([str(local), "--json"])
 check("local media pointer in --json mode",
       rc == 3 and json.loads(out.strip())["ok"] is False)
 
+# ---------------------------------------------------------------------------
+# CR regressions (qingyun 2026-07-31): option injection + subtitle ranking
+# ---------------------------------------------------------------------------
+# 1. Option-shaped / non-URL targets are refused BEFORE yt-dlp is invoked.
+_logd = tempfile.mkdtemp(prefix="mt-args-")
+_arglog = f"{_logd}/args.txt"
+_stub_log = make_stub_bin(ROLLING_VTT, args_log=_arglog)
+for bad in ("--exec=touch /tmp/pwned", "ftp://example.com/x", "watch this video"):
+    rc, out, err = run_main([bad], env={**BASE_ENV, "PATH": f"{_stub_log}:/usr/bin:/bin"})
+    check(f"non-URL target refused ({bad[:12]!r}...): exit 2, yt-dlp never ran",
+          rc == 2 and "http(s) URL" in err and not os.path.exists(_arglog),
+          f"rc={rc} err={err.strip()[:80]} ran={os.path.exists(_arglog)}")
+rc, out, _ = run_main(["--exec=x", "--json"],
+                      env={**BASE_ENV, "PATH": f"{_stub_log}:/usr/bin:/bin"})
+check("non-URL target --json shape", rc == 2 and json.loads(out.strip())["ok"] is False)
+
+# 2. The real invocation passes `--` immediately before the URL (second wall).
+rc, out, err = run_main(["https://youtube.com/watch?v=fake"],
+                        env={**BASE_ENV, "PATH": f"{_stub_log}:/usr/bin:/bin"})
+_argv = Path(_arglog).read_text().splitlines() if os.path.exists(_arglog) else []
+check("yt-dlp argv ends with `--` then the URL",
+      rc == 0 and _argv[-2:] == ["--", "https://youtube.com/watch?v=fake"],
+      f"rc={rc} tail={_argv[-3:]}")
+
+# 3. Two-track regression: uploader subtitles (sub.en.vtt) beat auto-captions
+# (sub.en-orig.vtt) — lexicographic sort alone puts en-orig FIRST ('-' < '.'),
+# which is exactly the bug.
+MANUAL_VTT = ROLLING_VTT.replace("in the future machines will think",
+                                 "uploader subtitle track wins")
+AUTO_VTT = ROLLING_VTT.replace("in the future machines will think",
+                               "auto caption track must lose")
+_d2 = tempfile.mkdtemp(prefix="mt-stub2-")
+_stub2 = Path(_d2) / "yt-dlp"
+_stub2.write_text(
+    "#!/bin/bash\n"
+    "out=''\nprev=''\n"
+    "for a in \"$@\"; do if [ \"$prev\" = '-o' ]; then out=\"$a\"; fi; prev=\"$a\"; done\n"
+    "dir=$(dirname \"$out\")\n"
+    f"cat > \"$dir/sub.en.vtt\" << 'VTT'\n{MANUAL_VTT}\nVTT\n"
+    f"cat > \"$dir/sub.en-orig.vtt\" << 'VTT'\n{AUTO_VTT}\nVTT\n"
+    "exit 0\n")
+_stub2.chmod(_stub2.stat().st_mode | stat.S_IEXEC)
+rc, out, err = run_main(["https://youtube.com/watch?v=fake"],
+                        env={**BASE_ENV, "PATH": f"{_d2}:/usr/bin:/bin"})
+check("two tracks: uploader subtitles win over auto-captions",
+      rc == 0 and "uploader subtitle track wins" in out
+      and "auto caption track must lose" not in out,
+      f"rc={rc} out={out.strip()[:80]}")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

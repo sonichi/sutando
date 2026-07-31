@@ -123,6 +123,10 @@ def fetch_vtt(url: str, lang: str) -> tuple[str, str]:
             "--sub-format", "vtt",
             "-o", str(Path(td) / "sub.%(ext)s"),
             "--no-playlist",
+            # `--` terminates option parsing: even if a hostile target slips
+            # past main()'s URL gate, yt-dlp can never read it as an option
+            # (qingyun CR: `--exec=...` must not cross the option boundary).
+            "--",
             url,
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -134,9 +138,14 @@ def fetch_vtt(url: str, lang: str) -> tuple[str, str]:
             raise RuntimeError(
                 "no captions available for this video (neither uploader subtitles nor "
                 "auto-generated captions in the requested language)")
-        # Uploader subs land as sub.<lang>.vtt; auto-captions the same name — the
-        # yt-dlp run downloads whichever exists, preferring manual when both do.
-        preferred = next((p for p in vtts if f".{lang}" in p.name), vtts[0])
+        # Uploader subs land as sub.<lang>.vtt; the `-orig` suffix marks the
+        # untranslated AUTO-caption track. Rank the exact manual-language file
+        # first — a substring test accepts sub.en-orig.vtt and lexicographic
+        # sort puts it BEFORE sub.en.vtt ('-' < '.'), which is how auto-captions
+        # were beating uploader subtitles when both exist (qingyun CR).
+        rank = {f"sub.{lang}.vtt": 0, f"sub.{lang}-orig.vtt": 1,
+                "sub.en.vtt": 2, "sub.en-orig.vtt": 3}
+        preferred = sorted(vtts, key=lambda p: (rank.get(p.name, 4), p.name))[0]
         kind = "captions"
         return preferred.read_text(encoding="utf-8", errors="replace"), kind
 
@@ -175,6 +184,19 @@ def main(argv: list[str]) -> int:
         else:
             print(f"media-transcript: {msg}", file=sys.stderr)
         return 3
+
+    # Untrusted task text can reach this argv (qingyun CR): only http(s) URLs
+    # are valid targets, so a dash-leading string like `--exec=...` is rejected
+    # here — and fetch_vtt's `--` terminator is the second wall if anything
+    # option-shaped ever gets through.
+    if not re.match(r"^https?://", target, re.IGNORECASE):
+        msg = ("target must be an http(s) URL — refusing a non-URL argument "
+               "(untrusted text must never become a yt-dlp option)")
+        if as_json:
+            print(json.dumps({"url": target, "ok": False, "error": msg}))
+        else:
+            print(f"media-transcript: {msg}", file=sys.stderr)
+        return 2
 
     try:
         vtt, kind = fetch_vtt(target, lang)
