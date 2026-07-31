@@ -496,7 +496,15 @@ def _tier_for(user_id):
 # exact fleet-sibling command. Checked on startup and whenever access.json
 # changes (mtime); warned once per distinct divergence set.
 
-_ALLOWDIV_STATE = {"mtime": None, "warned_hash": None}
+# /v1/agents is a registry endpoint newer than the core bridge protocol
+# (tasks/ack/results/heartbeat) — an older gateway answers 404/405. Mirror the
+# /ack pattern: time-gated cooldown rather than a permanent latch, so a broker
+# that GAINS the endpoint (deploy) is picked up without a worker restart, and a
+# broker that lacks it is asked once per cooldown, not once per poll loop
+# (qingyun CR 2026-07-30: protocol-compatibility regression + log spam).
+ALLOWDIV_UNSUPPORTED_COOLDOWN = int(
+    os.environ.get("REMOTE_ALLOWDIV_RETRY_COOLDOWN") or "300")
+_ALLOWDIV_STATE = {"mtime": None, "warned_hash": None, "unsupported_until": 0.0}
 
 
 def allowlist_divergence(local_allow, broker_allow, agent_id):
@@ -557,13 +565,29 @@ def _broker_allow_for(agent_id):
     """GET /v1/agents (own bearer → the owner's fleet, safe metadata only) →
     this agent's allowFrom, or None when unreadable. None is fail-OPEN for the
     warning (no divergence spam off a flaky read) — the mtime is left unmarked
-    so the next loop retries."""
+    so the next loop retries.
+
+    Unsupported endpoint (404/405 = pre-registry gateway) is NOT transient:
+    it enters a time-gated cooldown with ONE log line, so existing onboarded
+    clients see one request + one line per cooldown window instead of a
+    failing call after every long-poll. Any other failure stays transient
+    (silent retry next loop, mtime unmarked)."""
+    if time.time() < _ALLOWDIV_STATE["unsupported_until"]:
+        return None
     try:
         resp = _req("GET", "/v1/agents", timeout=15)
         for rec in (resp or {}).get("agents", []):
             if str(rec.get("id", "")).strip().lower() == str(agent_id).strip().lower():
                 return [str(x) for x in rec.get("allowFrom") or []]
         _log(f"allowlist-divergence: own record {agent_id} not in /v1/agents — skipping")
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 405):
+            _ALLOWDIV_STATE["unsupported_until"] = (
+                time.time() + ALLOWDIV_UNSUPPORTED_COOLDOWN)
+            _log(f"allowlist-divergence: /v1/agents unsupported by this gateway "
+                 f"({e.code}) — cooling down {ALLOWDIV_UNSUPPORTED_COOLDOWN}s")
+        else:
+            _log(f"allowlist-divergence: broker read failed ({e}) — will retry")
     except Exception as e:  # noqa: BLE001 — diagnostics only; never disturb the task loop
         _log(f"allowlist-divergence: broker read failed ({e}) — will retry")
     return None

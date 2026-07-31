@@ -170,6 +170,57 @@ try:
 finally:
     rgb._req = _orig_req
 
+# 7. unsupported endpoint (404/405 = pre-registry gateway): mirror the /ack
+# cooldown (qingyun CR 2026-07-30). Two consecutive loops must make exactly ONE
+# /v1/agents attempt and ONE log line; after the cooldown expires the request
+# is retried (self-healing, no worker restart needed). mtime stays unmarked so
+# a gateway that gains the endpoint still gets the real divergence check.
+import io
+import urllib.error
+
+tmp = fresh()
+rgb._ALLOWDIV_STATE["unsupported_until"] = 0.0
+write_access(["@rui:hs", "@mark:hs"])
+_404_calls = {"n": 0}
+_404_logs: list[str] = []
+
+
+def fake_404(method, path, payload=None, timeout=35):
+    _404_calls["n"] += 1
+    raise urllib.error.HTTPError("/v1/agents", 404, "Not Found", {}, io.BytesIO(b""))
+
+
+_orig_log = rgb._log
+rgb._req = fake_404
+rgb._log = lambda msg: _404_logs.append(msg)
+try:
+    rgb._maybe_warn_allowlist_divergence()
+    rgb._maybe_warn_allowlist_divergence()
+    check("404: two loops make exactly one /v1/agents attempt",
+          _404_calls["n"] == 1, f"calls={_404_calls['n']}")
+    check("404: exactly one log line (no per-loop spam)",
+          len([m for m in _404_logs if "unsupported" in m]) == 1
+          and len(_404_logs) == 1, repr(_404_logs))
+    check("404: no warning files written", len(proactive_files(tmp)) == 0,
+          repr(proactive_files(tmp)))
+    check("404: mtime left unmarked (endpoint may appear later)",
+          rgb._ALLOWDIV_STATE["mtime"] is None, repr(rgb._ALLOWDIV_STATE))
+    # cooldown expiry → retried exactly once more
+    rgb._ALLOWDIV_STATE["unsupported_until"] = time.time() - 1
+    rgb._maybe_warn_allowlist_divergence()
+    check("404: retried after the cooldown (self-healing)",
+          _404_calls["n"] == 2, f"calls={_404_calls['n']}")
+    # broker later GAINS the endpoint → divergence detection works immediately
+    rgb._ALLOWDIV_STATE["unsupported_until"] = 0.0
+    rgb._req = fake_req_factory([{"id": AGENT, "allowFrom": ["@rui:hs"]}])
+    rgb._maybe_warn_allowlist_divergence()
+    check("gained endpoint after cooldown: divergence warns",
+          len(proactive_files(tmp)) == 1, repr(proactive_files(tmp)))
+finally:
+    rgb._req = _orig_req
+    rgb._log = _orig_log
+    rgb._ALLOWDIV_STATE["unsupported_until"] = 0.0
+
 # agent-id resolution from the seeded .env (no $AGENT_ID in env)
 check("agent id read from channel .env", rgb._agent_id() == AGENT, rgb._agent_id())
 
