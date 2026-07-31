@@ -332,7 +332,21 @@ def _expr_root_segments(expr: ast.AST, roots: "set[str]", rooted: "dict[str, set
     return is_rooted, segs
 
 
-def _access_seed_line(tree: ast.Module) -> "int | None":
+def _imported_bridge_channels(text: str) -> "set[str]":
+    """Which bridge channels this test loads — {'discord'}, {'telegram'}, ...
+
+    `channel_access_path()` resolves per CHANNEL, so seeding
+    `channels/discord/access.json` does nothing for a test that imports
+    `telegram-bridge.py`: the canonical telegram file is still absent and the
+    import falls back to the operator's real Telegram allowlist. qingyun
+    demonstrated exactly that on #2429 — and my own positive fixture had
+    accidentally locked the shape in by seeding `slack` while the fixture loaded
+    the Discord bridge.
+    """
+    return set(BRIDGE_IMPORT.findall(text))
+
+
+def _access_seed_line(tree: ast.Module, channels: "set[str]") -> "int | None":
     """Earliest module-level WRITE that creates the CANONICAL
     `$CLAUDE_CONFIG_DIR/channels/<ch>/access.json`.
 
@@ -358,13 +372,29 @@ def _access_seed_line(tree: ast.Module) -> "int | None":
     rooted = _rooted_segments(tree)
     consts = _literal_segment_names(tree)
 
-    def _is_canonical_access_path(expr: ast.AST) -> bool:
+    def _seeded_channel(expr: ast.AST) -> "str | None":
+        """The channel this write seeds, or None if it is not a canonical seed."""
         is_rooted, segs = _expr_root_segments(expr, roots, rooted, consts)
         if not is_rooted:
-            return False
-        has_channels = any("channels" in seg for seg in segs)
-        has_access = any("access.json" in seg for seg in segs)
-        return has_channels and has_access
+            return None
+        if not any("channels" in seg for seg in segs):
+            return None
+        if not any("access.json" in seg for seg in segs):
+            return None
+        # The channel is a segment naming a bridge we know about. Matching against
+        # the known set (rather than "the segment after channels") keeps this robust
+        # to a path assembled across several assignments, where ordering is lost.
+        for ch in ("discord", "slack", "telegram"):
+            if any(ch == seg or ch in seg.split("/") for seg in segs):
+                return ch
+        return None
+
+    # channel -> earliest module-level line that seeds it
+    seeded: dict[str, int] = {}
+
+    def _record(ch: "str | None", lineno: int) -> None:
+        if ch and ch not in seeded:
+            seeded[ch] = lineno
 
     for node in tree.body:
         for sub in ast.walk(node):
@@ -372,8 +402,8 @@ def _access_seed_line(tree: ast.Module) -> "int | None":
                 continue
             # Method style: (dir / "access.json").write_text(...) — path is the RECEIVER.
             if isinstance(sub.func, ast.Attribute):
-                if sub.func.attr in _WRITE_METHODS and _is_canonical_access_path(sub.func.value):
-                    return node.lineno
+                if sub.func.attr in _WRITE_METHODS:
+                    _record(_seeded_channel(sub.func.value), node.lineno)
             # Helper style: write_private_text(dir / "access.json", data) — path is an
             # ARGUMENT. #2356 makes this the canonical way access files are written, so
             # a receiver-only check would start false-flagging correctly-seeded tests
@@ -383,11 +413,14 @@ def _access_seed_line(tree: ast.Module) -> "int | None":
                 else sub.func.id if isinstance(sub.func, ast.Name)
                 else None
             )
-            if name in _WRITE_HELPERS and any(
-                _is_canonical_access_path(a) for a in sub.args
-            ):
-                return node.lineno
-    return None
+            if name in _WRITE_HELPERS:
+                for a in sub.args:
+                    _record(_seeded_channel(a), node.lineno)
+    # EVERY imported bridge must be seeded. Return the LATEST such line so the
+    # caller's `seed_line < exec_line` ordering check covers all of them.
+    if not channels or any(ch not in seeded for ch in channels):
+        return None
+    return max(seeded[ch] for ch in channels)
 
 
 def _bridge_load_call(tree: ast.AST):
@@ -483,7 +516,7 @@ def classify(path: Path) -> str | None:
     iso_line = _isolation_line(tree)
     # Isolation only counts when it EXECUTES BEFORE the bridge import. Setting the env
     # afterwards leaves the module-level resolution already done against host config.
-    seed_line = _access_seed_line(tree)
+    seed_line = _access_seed_line(tree, _imported_bridge_channels(text))
     # CLEAN needs BOTH, both before the load: the env override AND a seeded canonical
     # access.json. Env-var-only leaves channel_access_path() on its legacy real-home
     # fallback, which is the very read this gate exists to prevent.

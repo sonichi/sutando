@@ -245,7 +245,7 @@ check(
 check(
     "canonical HELPER seed under the configured dir IS a seed",
     lint.classify(
-        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"\n'
+        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"\n'
               'write_private_text(cfg / "access.json", "{}")\n' + IMPORTS_BRIDGE)
     )
     == lint.CLEAN,
@@ -270,6 +270,55 @@ check(
     )
     == lint.VIOLATION,
     "channel_access_path() reads channels/<ch>/access.json — the root alone is not that file",
+)
+
+# Review 11 (qingyun, #2429): the seed was not CHANNEL-SPECIFIC. It accepted any
+# rooted path containing `channels` + `access.json` without proving the seeded
+# channel matches the bridge being imported. `channel_access_path()` resolves per
+# channel, so seeding discord does nothing for a telegram import — the canonical
+# telegram file is still absent and the load falls back to the operator's real
+# allowlist. The positive fixture just above had itself locked the shape in by
+# seeding `slack` while IMPORTS_BRIDGE loads the DISCORD bridge; that is corrected.
+_TELEGRAM_BRIDGE = IMPORTS_BRIDGE.replace("discord-bridge.py", "telegram-bridge.py")
+_SLACK_BRIDGE = IMPORTS_BRIDGE.replace("discord-bridge.py", "slack-bridge.py")
+
+
+def _seed(channel):
+    return (_ENV + f'_c = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "{channel}"\n'
+            '_c.mkdir(parents=True, exist_ok=True)\n'
+            '(_c / "access.json").write_text("{}")\n')
+
+
+check(
+    "MISMATCH: seed discord, import telegram -> violation",
+    lint.classify(write(tmpdir, _seed("discord") + _TELEGRAM_BRIDGE)) == lint.VIOLATION,
+    "telegram resolves channels/telegram/access.json; a discord seed leaves it absent",
+)
+check(
+    "MISMATCH: seed telegram, import slack -> violation",
+    lint.classify(write(tmpdir, _seed("telegram") + _SLACK_BRIDGE)) == lint.VIOLATION,
+)
+check(
+    "MISMATCH via HELPER write: seed slack, import discord -> violation",
+    lint.classify(
+        write(tmpdir, _ENV + 'cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"\n'
+              'write_private_text(cfg / "access.json", "{}")\n' + IMPORTS_BRIDGE)
+    )
+    == lint.VIOLATION,
+    "the helper shape must carry the same channel requirement as the method shape",
+)
+check(
+    "MATCH: seed telegram, import telegram -> clean",
+    lint.classify(write(tmpdir, _seed("telegram") + _TELEGRAM_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "MATCH: seed slack, import slack -> clean",
+    lint.classify(write(tmpdir, _seed("slack") + _SLACK_BRIDGE)) == lint.CLEAN,
+)
+check(
+    "a test importing TWO bridges needs BOTH seeded",
+    lint.classify(write(tmpdir, _seed("discord") + _TELEGRAM_BRIDGE + IMPORTS_BRIDGE)) == lint.VIOLATION,
+    "one seed cannot cover two channels",
 )
 
 # --- receiver + ordering bypasses (qingyun, #2429 review 7) ----------------
