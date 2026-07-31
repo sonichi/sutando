@@ -2021,8 +2021,26 @@ def check_quota_telemetry(proxy_status: str) -> dict:
             check["detail"] = "quota state present"
             return check
         agent_age = _agent_activity_age()
+        skipped_for_runtime = _runtime_may_skip_proxy()
         if quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
-                and agent_age < AGENT_ACTIVE_SEC and not _runtime_may_skip_proxy():
+                and agent_age < AGENT_ACTIVE_SEC and skipped_for_runtime \
+                and _last_core_launch_at() is None:
+            # Silenced by a runtime marker we could NOT date. `session-starts.log`
+            # only exists on checkouts carrying the launcher write-sites (first
+            # landed 17d094f4, 2026-07-13), and a pinned older node has no such
+            # file — a live counter-example on this fleet, not a hypothesis. The
+            # conservative reading is kept, because refusing to trust the marker
+            # would reinstate the false warn on every healthy pre-Jul-13 Codex
+            # host, which is the defect this check was opened to remove. But the
+            # no-op is stated rather than silent: an unqualified `ok` here would
+            # be indistinguishable from a check that actually verified something.
+            check["detail"] += (
+                " — runtime marker present but UNVERIFIABLE on this checkout "
+                "(no state/session-starts.log), so a stale marker cannot be "
+                "detected; staleness check inactive here"
+            )
+        elif quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
+                and agent_age < AGENT_ACTIVE_SEC and not skipped_for_runtime:
             check["status"] = "warn"
             check["detail"] = (
                 f"quota state is {int(quota_age / 3600)}h stale while the agent is "

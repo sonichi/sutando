@@ -296,6 +296,43 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "warn", r["detail"])
 
+    def test_unverifiable_marker_says_so_instead_of_a_bare_ok(self):
+        """A pinned pre-Jul-13 checkout has no `session-starts.log` at all.
+
+        The launcher write-sites first landed in `17d094f4` (2026-07-13), and a fleet
+        node pinned at `ea8745a4` (Jun 21) has no such file — a live counter-example,
+        not a hypothesis. There the marker cannot be dated, so a stale one silences the
+        check. We KEEP that conservative reading (refusing to trust the marker would
+        reinstate the false warn on every healthy pre-Jul-13 Codex host, i.e. the defect
+        this check exists to remove) but we must not report a bare `ok`, which would be
+        indistinguishable from a check that actually verified something.
+        """
+        now = time.time()
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        (self.ws / "state" / "core-runtime.json").write_text(
+            json.dumps({"runtime": "codex", "started_at": now - 86400})
+        )
+        (self.ws / "state" / "session-starts.log").unlink(missing_ok=True)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertIn("UNVERIFIABLE", r["detail"])
+        self.assertIn("session-starts.log", r["detail"])
+
+    def test_verifiable_current_marker_gets_a_clean_ok_no_caveat(self):
+        """The caveat must appear ONLY when it is true — otherwise it is noise that
+        trains the reader to skip the detail string."""
+        now = time.time()
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        (self.ws / "state" / "core-runtime.json").write_text(
+            json.dumps({"runtime": "codex", "started_at": now - 60})
+        )
+        self._write_sessions(now - 60)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertNotIn("UNVERIFIABLE", r["detail"])
+
     def test_unusable_session_log_is_no_evidence_not_stale(self):
         """Every hop guarded, per the lesson from rounds 1-3: unreadable, non-JSON,
         non-object, missing key. None of them may crash, and none may claim staleness."""
