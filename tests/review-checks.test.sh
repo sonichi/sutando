@@ -61,6 +61,14 @@ check "two independently paired lists both pass"       clean $'+++ b/skills/x/i.
 check "direct use beside a valid same-binary list flags" flag  $'+++ b/skills/x/j.ts\n@@ -1,0 +1,1 @@\n+const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]; spawn("/opt/homebrew/bin/ffmpeg");'
 check "positive control: that same list alone passes"   clean $'+++ b/skills/x/k.ts\n@@ -1,0 +1,1 @@\n+const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];'
 
+# Container semantics: the companion must be a SIBLING in the same immediate
+# list, and a token in no container is never exempt (review of f3c9751).
+check "nested list does not vouch for outer arg"        flag  $'+++ b/skills/x/n1.ts\n@@ -1,0 +1,1 @@\n+const x=use(["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"], "/opt/homebrew/bin/ffmpeg");'
+check "no-container direct use is not exempt"           flag  $'+++ b/skills/x/n2.ts\n@@ -1,0 +1,1 @@\n+const A="/opt/homebrew/bin/ffmpeg", B="/usr/local/bin/ffmpeg", DIRECT="/opt/homebrew/bin/ffmpeg";'
+check "valid list does not vouch for a later bare use"  flag  $'+++ b/skills/x/n3.ts\n@@ -1,0 +1,1 @@\n+const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]; const DIRECT="/opt/homebrew/bin/ffmpeg";'
+check "control: tuple candidate list still passes"      clean $'+++ b/skills/x/n4.py\n@@ -1,0 +1,1 @@\n+C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")'
+check "control: nested list passes on its own tokens"   clean $'+++ b/skills/x/n5.ts\n@@ -1,0 +1,1 @@\n+const x=use(["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]);'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

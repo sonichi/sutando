@@ -93,17 +93,18 @@ def _code_part(s):
 
 
 def _group_span(code, pos):
-    """The innermost bracket group containing `pos`, as (start, end) into `code`.
+    """The innermost bracket group containing `pos`, as (start, end), or None.
 
-    The candidate-list shape is an EXPRESSION — `["/opt/homebrew/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg"]` — not a line. Scoping the companion search to the
-    flagged token's own group is what stops a valid list from vouching for an
-    unrelated direct use of the same binary later on the same line.
+    Returns None when `pos` sits inside no bracket. That is a FAIL-CLOSED
+    answer, not a fallback: an earlier version searched the whole line in that
+    case, which let a valid list vouch for a bare direct use later on the same
+    line —
 
-    Falls back to the whole string when `pos` is inside no bracket (a bare
-    `A = "..."; B = "..."` has no grouping) or when brackets are unbalanced.
-    That fallback is the pre-existing line-wide behaviour, and the basename
-    check still guards it.
+        const C = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"];
+        const DIRECT = "/opt/homebrew/bin/ffmpeg";
+
+    A token that is not inside a candidate container is not part of a candidate
+    list, so it has no companion by construction.
     """
     opens, closes = "([{", ")]}"
     stack, best = [], None
@@ -114,7 +115,35 @@ def _group_span(code, pos):
             start = stack.pop()
             if start < pos < i and (best is None or start > best[0]):
                 best = (start, i)
-    return best if best is not None else (0, len(code))
+    return best
+
+
+def _siblings_only(code, start, end):
+    """`code[start+1:end]` with every DEEPER-nested region blanked.
+
+    The companion must be a sibling in the SAME immediate list/tuple, not merely
+    somewhere inside a containing group. Without this, an outer call vouches for
+    its own argument via a nested list:
+
+        use(["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"],
+            "/opt/homebrew/bin/ffmpeg")
+
+    The direct argument's innermost container is `use(...)`, whose contents
+    include the nested list's companion. Blanking depth>0 leaves only true
+    siblings. Length is preserved so callers may reason about offsets.
+    """
+    opens, closes = "([{", ")]}"
+    out, depth = [], 0
+    for ch in code[start + 1:end]:
+        if ch in opens:
+            depth += 1
+            out.append(" ")
+        elif ch in closes:
+            depth -= 1
+            out.append(" ")
+        else:
+            out.append(ch if depth == 0 else (" " if ch != "\n" else ch))
+    return "".join(out)
 
 
 def paired_allowed(tok, line, pos=None):
@@ -141,7 +170,14 @@ def paired_allowed(tok, line, pos=None):
 
     The third token has the same basename, so it reused the list's companion and
     was exempted while the runtime still launched an Apple-Silicon-only path on
-    Intel. `pos` is the occurrence's index in `line`; it defaults to the first
+    Intel.
+
+    The companion must be a SIBLING in that same immediate group (see
+    `_siblings_only`), and an occurrence inside no group at all is never exempt
+    (see `_group_span`). Both are fail-closed: a token that is not part of a
+    candidate list has no companion by construction.
+
+    `pos` is the occurrence's index in `line`; it defaults to the first
     occurrence so existing two-argument callers keep their behaviour.
     """
     base = tok.rsplit("/", 1)[-1]
@@ -152,8 +188,10 @@ def paired_allowed(tok, line, pos=None):
         pos = line.find(tok)
     if pos < 0 or pos >= len(code):
         return False
-    start, end = _group_span(code, pos)
-    scope = code[start:end]
+    span = _group_span(code, pos)
+    if span is None:
+        return False          # no candidate container -> not a candidate list
+    scope = _siblings_only(code, span[0], span[1])
     for prefix, companion in paired:
         if not tok.startswith(prefix):
             continue

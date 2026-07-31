@@ -362,6 +362,59 @@ try:
 finally:
     rc.flags.remove("/opt/")
 
+# ---------------------------------------------------------------------------
+# Container semantics (qingyun-wu, review of f3c9751). Two shapes survived the
+# innermost-group fix because "innermost group" is not the same question as
+# "same candidate list":
+#   N1 the direct token's innermost container is an OUTER call whose contents
+#      include a NESTED list's companion;
+#   N2/N3 the direct token is inside no bracket at all, and the old whole-line
+#      fallback then recreated the original same-basename reuse.
+# Both are now fail-closed: companion must be a SIBLING at the same depth, and
+# no container means no exemption.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    def _scan1(src):
+        return scan('+++ b/src/n.ts\n@@ -1,0 +1,1 @@\n+' + src)[1]
+
+    ok("main(): nested list does not vouch for the outer call's own argument",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" in _scan1(
+           'const x=use(["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"], '
+           '"/opt/homebrew/bin/ffmpeg");'))
+    ok("main(): bare direct use with NO container is not exempt (comma decls)",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" in _scan1(
+           'const A="/opt/homebrew/bin/ffmpeg", B="/usr/local/bin/ffmpeg", '
+           'DIRECT="/opt/homebrew/bin/ffmpeg";'))
+    ok("main(): a valid list does not vouch for a bare direct use after it",
+       "hardcoded path (/opt/homebrew/bin/ffmpeg)" in _scan1(
+           'const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]; '
+           'const DIRECT="/opt/homebrew/bin/ffmpeg";'))
+
+    # Positive controls — the exemption must survive, or this is just "flag all".
+    ok("main(): array candidate list still passes", _scan1(
+        'const C=["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"];').strip() == "")
+    ok("main(): tuple candidate list still passes", _scan1(
+        'C = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")').strip() == "")
+    ok("main(): nested candidate list still passes on its OWN tokens", _scan1(
+        'const x=use(["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"]);').strip() == "")
+
+    # Unit level.
+    _n = 'use(["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"], "/opt/homebrew/bin/ffmpeg")'
+    ok("paired: sibling-only — nested companion does not exempt the outer arg",
+       not rc.paired_allowed("/opt/homebrew/bin/ffmpeg", _n,
+                             _n.rfind("/opt/homebrew/bin/ffmpeg")))
+    ok("paired: the nested list's OWN token is still exempt",
+       rc.paired_allowed("/opt/homebrew/bin/ffmpeg", _n,
+                         _n.find("/opt/homebrew/bin/ffmpeg")))
+    ok("paired: no bracket container -> never exempt (fail closed)",
+       not rc.paired_allowed("/opt/homebrew/bin/ffmpeg",
+                             'A="/opt/homebrew/bin/ffmpeg", B="/usr/local/bin/ffmpeg"'))
+    ok("_group_span returns None when the position is in no bracket",
+       rc._group_span('A="/opt/x", B="/usr/local/x"', 3) is None)
+finally:
+    rc.flags.remove("/opt/")
+
 print("---")
 if failed:
     print("FAILED — %d of %d" % (failed, passed + failed))
