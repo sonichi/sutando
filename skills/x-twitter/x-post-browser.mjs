@@ -7,9 +7,10 @@
  * headless with the saved session. This is the zero-dev-portal alternative
  * to the OAuth1 API path in x-post.py.
  *
- * Profile dir (persists the login) resolves from $X_BROWSER_PROFILE, else
- * a per-host x-browser-profile dir under the Sutando home. It is per-host
- * and should NOT be synced.
+ * Profile dir (persists the login) resolves from $X_BROWSER_PROFILE (declared
+ * in this skill's manifest.json), else `<workspace>/data/x-browser-profile` via
+ * scripts/sutando-config.sh. It is per-host, holds live session cookies, and is
+ * excluded from vault sync by the workspace contract's `data/` exclusion.
  *
  * === Keychain consistency (the load-bearing invariant) ===
  * All three commands MUST encrypt/decrypt cookies with the SAME key or the
@@ -39,10 +40,12 @@
 import { chromium } from 'playwright';
 import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
 import { pidsHoldingProfile } from './profile-match.mjs';
+import { resolveProfileDir } from './profile-dir.mjs';
 
 async function readComposer(page) {
   return await page.$eval('[data-testid="tweetTextarea_0"]', (el) => el.innerText ?? el.textContent ?? '');
@@ -80,8 +83,36 @@ const cmd = process.argv[2];
 const arg = process.argv[3];
 const dryRun = process.argv.includes('--dry-run');
 
-const PROFILE_DIR =
-  process.env.X_BROWSER_PROFILE || join(homedir(), '.sutando', 'x-browser-profile');
+/** Repo root, so the canonical workspace resolver can be invoked from here. */
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+/** The workspace, via the ONE resolver every other service uses. Empty if it
+ *  cannot be resolved (running outside a checkout). */
+function workspaceDir() {
+  try {
+    return execFileSync('bash', [join(REPO_ROOT, 'scripts', 'sutando-config.sh'), 'workspace'], {
+      encoding: 'utf8',
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+/** Where the profile lived before #2133 declared this setting. Kept as ONE
+ *  constant, referenced only to migrate — never as a default. */
+const LEGACY_PROFILE_DIR = join(homedir(), '.sutando', 'x-browser-profile');
+
+/** Durable Chrome profile holding the X login. Precedence + rationale live in
+ *  ./profile-dir.mjs, which is importable and unit-tested; this only supplies the
+ *  real filesystem and the real workspace resolver. */
+const _profile = resolveProfileDir({
+  env: process.env.X_BROWSER_PROFILE,
+  workspace: workspaceDir(),
+  legacyDir: LEGACY_PROFILE_DIR,
+  exists: existsSync,
+});
+if (_profile.notice) console.error(`[x-twitter] ${_profile.notice}`);
+const PROFILE_DIR = _profile.dir;
 const SHOT_DIR = '/tmp/sutando-screenshots';
 mkdirSync(PROFILE_DIR, { recursive: true });
 mkdirSync(SHOT_DIR, { recursive: true });

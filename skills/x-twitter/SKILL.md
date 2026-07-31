@@ -28,7 +28,12 @@ node skills/x-twitter/x-post-browser.mjs post "Your tweet text" --dry-run
 node skills/x-twitter/x-post-browser.mjs post "Your tweet text"
 ```
 
-- Profile: a per-host `x-browser-profile` dir under the Sutando home (override `$X_BROWSER_PROFILE`). Sign-in
+- Profile: `<workspace>/data/x-browser-profile`, resolved through `scripts/sutando-config.sh workspace`
+  (override with `$X_BROWSER_PROFILE`, declared in this skill's `manifest.json`). Per-host, holds live
+  session cookies, and never synced — `data/` is in the vault `exclude` list. A profile still sitting at
+  the pre-#2133 location is used with a one-line notice until you move it, so upgrading does not cost you
+  a fresh sign-in. `$X_LOGIN_DONE_SENTINEL` and `$X_LOGIN_TIMEOUT_ITERS` are declared alongside it but are
+  test/CI controls — there is no reason to set them by hand. Sign-in
   survives ONLY because `check`/`post` strip Playwright's `--use-mock-keychain` so
   cookies decrypt with the real login keychain — see
   `memory/reference_x_browser_signin_oauth_blocked_use_email_phone.md`.
