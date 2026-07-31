@@ -1845,18 +1845,49 @@ def _runtime_may_skip_proxy() -> bool:
     treated as non-proxy and stays silent: a corrupted status file must not manufacture
     a health warning.
 
-    When a Claude-side writer lands (#2406 emits `core-runtime.json` on Claude launch),
-    tighten this to positive identification of a proxy-routed runtime instead of
-    inferring it from absence.
+    A marker left by a PREVIOUS core is ignored. Today only the Codex launcher writes
+    this file and nothing resets it, so after a Codex -> Claude switch a stale
+    `{"runtime": "codex"}` sits there describing a core that is no longer running
+    (#2406 documents exactly that happening live on 2026-07-30). Trusting it would
+    silence this check on a host that IS proxy-routed — the mirror of the false
+    positive this function was added to fix. So a marker whose `started_at` predates
+    the running core's own start is treated as absent, i.e. proxy-routed.
+
+    When #2406 lands a Claude-side writer, tighten this to positive identification of
+    a proxy-routed runtime instead of inferring it from absence.
     """
     path = status_read_path("core-runtime.json", WORKSPACE_DIR)
     try:
         if not path.exists():
             return False          # no Codex launcher ever ran here -> proxy-routed
-        runtime = json.loads(path.read_text()).get("runtime")
+        marker = json.loads(path.read_text())
+        runtime = marker.get("runtime")
     except (OSError, ValueError):
         return True               # cannot rule Codex out -> stay silent
+    if _marker_predates_running_core(marker):
+        return False              # belongs to a previous core -> no information
     return runtime in NON_PROXY_RUNTIMES
+
+
+def _marker_predates_running_core(marker: dict) -> bool:
+    """True when `core-runtime.json` describes a core older than the one running now.
+
+    The heartbeat (`state/cores/<host>.alive`) is written by the LIVE core and carries
+    its own `started_at`, so a runtime marker stamped before it was left behind by a
+    previous core. Both timestamps must be present and comparable — if either is
+    missing the marker is taken at face value, because "no evidence of staleness" is
+    not evidence of staleness.
+    """
+    try:
+        started = float(marker.get("started_at"))
+    except (TypeError, ValueError):
+        return False
+    try:
+        alive = status_read_path("cores", WORKSPACE_DIR) / f"{_host_label()}.alive"
+        core_started = float(json.loads(alive.read_text()).get("started_at"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return started < core_started
 
 
 def _agent_activity_age() -> "float | None":

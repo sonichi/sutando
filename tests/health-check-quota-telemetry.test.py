@@ -221,6 +221,61 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "ok", r["detail"])
 
+    # --- a marker left by a PREVIOUS core carries no information -------------
+    # Nothing resets core-runtime.json, and only the Codex launcher writes it, so a
+    # Codex -> Claude switch leaves a stale {"runtime":"codex"} behind (#2406 saw this
+    # live on 2026-07-30). Trusting it silences this check on a host that IS
+    # proxy-routed — the mirror of the false positive the runtime gate was added for.
+
+    def _write_alive(self, started_at: float) -> Path:
+        d = self.ws / "state" / "cores"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{self.hc._host_label()}.alive"
+        p.write_text(json.dumps({"host": "h", "started_at": started_at}))
+        return p
+
+    def test_stale_codex_marker_from_a_previous_core_does_not_silence(self):
+        """The false NEGATIVE: switched to Claude, stale codex marker still on disk."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        (self.ws / "state" / "core-runtime.json").write_text(
+            json.dumps({"runtime": "codex", "started_at": time.time() - 86400})
+        )
+        self._write_alive(time.time() - 300)          # current core started AFTER the marker
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "warn", r["detail"])
+
+    def test_current_codex_marker_still_silences(self):
+        """A marker from the RUNNING core is authoritative — don't over-correct."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        now = time.time()
+        (self.ws / "state" / "core-runtime.json").write_text(
+            json.dumps({"runtime": "codex", "started_at": now - 60})
+        )
+        self._write_alive(now - 300)                  # core started BEFORE the marker
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_marker_without_started_at_is_taken_at_face_value(self):
+        """No evidence of staleness is not evidence of staleness."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        (self.ws / "state" / "core-runtime.json").write_text(json.dumps({"runtime": "codex"}))
+        self._write_alive(time.time() - 300)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_missing_heartbeat_leaves_the_marker_trusted(self):
+        """Without a heartbeat there is nothing to compare against."""
+        self._write_quota(mtime_age_sec=60 * 60 * 24 * 13)
+        self._write_core_status(mtime_age_sec=60)
+        (self.ws / "state" / "core-runtime.json").write_text(
+            json.dumps({"runtime": "codex", "started_at": time.time() - 86400})
+        )
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok", r["detail"])
+
     def test_codex_runtime_does_not_suppress_the_ABSENT_file_warning(self):
         """Runtime scoping applies only to the staleness branch. A proxy that never
         wrote quota-state at all is still broken wiring worth reporting."""
