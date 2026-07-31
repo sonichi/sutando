@@ -14,7 +14,12 @@ import assert from 'node:assert/strict';
 // is now a pure companion module (src/output_sanitizer.ts) that voice-agent.ts
 // imports. Behaviour unchanged; the streamed handler calls the same predicate
 // this suite calls, and the test no longer drags dotenv/transports into scope.
-import { FABRICATED_OUTPUT_RE, isFabricatedOutput } from '../src/output_sanitizer.js';
+import {
+	FABRICATED_OUTPUT_RE,
+	isFabricatedOutput,
+	couldStillBeFabrication,
+	createOutputSanitizer,
+} from '../src/output_sanitizer.js';
 
 // Drives the real predicate the way the streamed handler does: accumulate per-turn
 // deltas and test the running buffer. The ACCUMULATION is the test's own (it models
@@ -54,31 +59,26 @@ test('ordinary speech passes through untouched', () => {
 	assert.equal(turnFabricated(['']), false);
 });
 
-// Gap 3 (Pro re-review 2026-06-26): hold-output model. Mirrors the handler's
-// suppress / hold / flush behavior and reports what actually reached the transcript
-// ("forwarded") so we can assert a split fabricated prefix leaks NOTHING. A turn
-// boundary flushes any still-held CLEAN text.
-const FAB_PREFIXES = ['[system:', 'system:', '[silence', '<ctrl'];
-function couldStillBeFabrication(raw: string): boolean {
-	const s = raw.replace(/^\s+/, '').toLowerCase();
-	if (s.length === 0) return true;
-	if (s.length > 24) return false;
-	return FAB_PREFIXES.some((p) => p.startsWith(s) || s.startsWith(p));
-}
-function runStream(chunks: string[], turnEnd = true): { forwarded: string; suppressed: boolean } {
-	let outputBuffer = '', heldText = '', turnFab = false, turnCleared = false, forwarded = '';
-	for (const c of chunks) {
-		const chunk = c ?? '';
-		if (turnFab) continue;
-		if (turnCleared) { forwarded += chunk; continue; }
-		outputBuffer += chunk; heldText += chunk;
-		if (FABRICATED_OUTPUT_RE.test(outputBuffer.trim())) { turnFab = true; continue; }
-		if (!couldStillBeFabrication(outputBuffer)) { turnCleared = true; forwarded += heldText; heldText = ''; }
-	}
-	// No trailing `heldText = ''` here: the function returns on the next line, so the
-	// reset is dead (eslint no-useless-assignment). Kept inside the loop, where it matters.
-	if (turnEnd && heldText && !turnFab) { forwarded += heldText; }
-	return { forwarded, suppressed: turnFab };
+// Gap 3 (Pro re-review 2026-06-26): hold-output model.
+//
+// This DRIVES THE PRODUCTION STATE MACHINE. It used to declare its own FAB_PREFIXES,
+// couldStillBeFabrication and runStream — a mirror that stayed correct (and green)
+// even if the real wrapper flushed heldText early, failed to reset, or stopped
+// setting _suppressAudio. qingyun rejected exactly that twice on #1414. The machine
+// now lives in src/output_sanitizer.ts, so `runStream` is a thin harness over
+// createOutputSanitizer that records the side effects instead of reimplementing them.
+function runStream(chunks: string[], turnEnd = true): { forwarded: string; suppressed: boolean; audioSuppressed: boolean } {
+	let forwarded = '';
+	let blocked = false;
+	let audioSuppressed = false;
+	const s = createOutputSanitizer({
+		forward: (t) => { forwarded += t; },
+		setSuppressAudio: (on) => { audioSuppressed = on; },
+		onBlocked: () => { blocked = true; },
+	});
+	for (const c of chunks) s.handleChunk(c);
+	if (turnEnd) s.resetTurn();
+	return { forwarded, suppressed: blocked, audioSuppressed };
 }
 
 test('gap 3: a fabricated prefix split across chunks leaks NOTHING to the transcript', () => {
@@ -111,4 +111,86 @@ test('the suite is bound to the PRODUCTION regex, not a local copy', () => {
 	// catching a future refactor that leaves the regex behind but rewires the
 	// predicate to something else.
 	assert.equal(isFabricatedOutput('  [System: x'), FABRICATED_OUTPUT_RE.test('[System: x'));
+});
+
+// ---------------------------------------------------------------------------
+// The behaviours a MIRRORED state machine could never have caught. Each of these
+// asserts an effect of the production wrapper itself, so a regression in
+// voice-agent.ts's contract shows up here instead of shipping green.
+// ---------------------------------------------------------------------------
+
+test('_suppressAudio is raised on a fabricated turn and lowered on reset', () => {
+	let audio: boolean | null = null;
+	const s = createOutputSanitizer({ forward: () => {}, setSuppressAudio: (on) => { audio = on; } });
+	s.handleChunk('[Sys');
+	assert.equal(audio, null, 'must not touch audio before the buffer actually matches');
+	s.handleChunk('tem: do X');
+	assert.equal(audio, true, 'a matched fabrication must suppress remaining audio');
+	s.resetTurn();
+	assert.equal(audio, false, 'the next turn must start with audio un-suppressed');
+});
+
+test('reset actually clears state — the turn after a fabrication is not poisoned', () => {
+	let forwarded = '';
+	const s = createOutputSanitizer({ forward: (t) => { forwarded += t; } });
+	s.handleChunk('[System: nope');
+	assert.equal(forwarded, '');
+	s.resetTurn();
+	s.handleChunk('Hello there');
+	assert.equal(forwarded, 'Hello there', 'a stuck turnFabricated flag would drop all later speech');
+});
+
+test('a cleared turn streams later chunks without re-holding them', () => {
+	const seen: string[] = [];
+	const s = createOutputSanitizer({ forward: (t) => seen.push(t) });
+	s.handleChunk('Hello');            // diverges immediately → flush
+	s.handleChunk(' world');           // already cleared → straight through
+	assert.deepEqual(seen, ['Hello', ' world']);
+});
+
+test('held clean text is flushed at the turn boundary, not dropped', () => {
+	let forwarded = '';
+	const s = createOutputSanitizer({ forward: (t) => { forwarded += t; } });
+	s.handleChunk('S');                // still a possible "system:" prefix → held
+	assert.equal(forwarded, '', 'a one-char ambiguous prefix must be held, not forwarded');
+	s.resetTurn();
+	assert.equal(forwarded, 'S', 'a short turn ending mid-hold must still be spoken');
+});
+
+test('a fabricated turn flushes NOTHING at the boundary', () => {
+	let forwarded = '';
+	const s = createOutputSanitizer({ forward: (t) => { forwarded += t; } });
+	s.handleChunk('[Silence]');
+	s.resetTurn();
+	assert.equal(forwarded, '', 'resetTurn must not leak the suppressed buffer');
+});
+
+test('null/undefined deltas do not throw and do not clear the turn', () => {
+	let forwarded = '';
+	const s = createOutputSanitizer({ forward: (t) => { forwarded += t; } });
+	s.handleChunk(undefined as unknown as string);
+	s.handleChunk(null as unknown as string);
+	s.handleChunk('[System: x');
+	assert.equal(forwarded, '', 'a null delta must not be treated as divergence');
+});
+
+test('a forward() that throws at the boundary does not escape resetTurn', () => {
+	const s = createOutputSanitizer({ forward: () => { throw new Error('transport gone'); } });
+	s.handleChunk('S');
+	assert.doesNotThrow(() => s.resetTurn(), 'a dead transport must not break turn teardown');
+});
+
+test('the hooks are optional — no setSuppressAudio/onBlocked must not throw', () => {
+	const s = createOutputSanitizer({ forward: () => {} });
+	assert.doesNotThrow(() => { s.handleChunk('[System: x'); s.resetTurn(); });
+});
+
+test('the suite is bound to the PRODUCTION state machine, not a local copy', () => {
+	// The mirror this replaced defined its own FAB_PREFIXES + couldStillBeFabrication.
+	// Importing them proves the harness and the wrapper share one implementation.
+	assert.equal(typeof createOutputSanitizer, 'function');
+	assert.equal(couldStillBeFabrication('['), true);
+	assert.equal(couldStillBeFabrication('Hello'), false);
+	assert.equal(couldStillBeFabrication(''), true);
+	assert.equal(couldStillBeFabrication('x'.repeat(25)), false); // safety cap
 });
