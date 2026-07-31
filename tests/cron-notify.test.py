@@ -277,6 +277,31 @@ def main() -> int:
               (not Path(sf).exists()) or json.loads(sf.read_text()) == {},
               sf.read_text() if Path(sf).exists() else "(no file)")
 
+    # ── #2346 review: the MANAGED default path must create its own state/ parent
+    # so a clean install (no state/ yet) can lock+post — otherwise fail-closed
+    # refuses every default ping. Explicit --state-file parents stay fail-closed.
+    import sys as _sys
+    _srcp = str(REPO / "src")
+    if _srcp not in _sys.path:
+        _sys.path.insert(0, _srcp)
+    import workspace_default as _wd
+    with tempfile.TemporaryDirectory() as wsdir:
+        with um.patch.object(_wd, "resolve_workspace", lambda: Path(wsdir)):
+            statedir = Path(wsdir) / "state"
+            check("default path: state/ absent before resolve", not statedir.exists())
+            dp = cn._default_state_file()
+            check("default path: creates state/ parent", statedir.is_dir(), dp)
+            check("default path: resolves under <workspace>/state/",
+                  dp == str(statedir / "cron-notify-cooldown.json"), dp)
+        # end-to-end: a fresh workspace (state/ removed) still posts on the default
+        import shutil as _shutil
+        _shutil.rmtree(str(Path(wsdir) / "state"), ignore_errors=True)
+        with um.patch.object(_wd, "resolve_workspace", lambda: Path(wsdir)), \
+             um.patch.object(cn, "_post_to_room", return_value="$evt"):
+            rc = cn.main(["--cron", "c", "--summary", "news", "--kind", "digest",
+                          "--room", "!r:x", "--now", "10000"])
+        check("default path: clean install (no state/) still posts, exit 0", rc == 0, rc)
+
     # ── #2346 review: a flock() failure AFTER os.open must fail closed AND close
     # the just-opened fd (no leak). john's repro forces the REAL _StateLock's
     # fcntl.flock to raise, then probes the captured descriptor.

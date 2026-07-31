@@ -221,13 +221,25 @@ def _default_state_file():
     {} and the cooldown never applied, so the default invocation posted on every
     fire with no rate limit (#2346 review). Anchored to the resolved workspace so
     the cooldown persists across processes regardless of cwd."""
+    import os
     import sys
     from pathlib import Path
     src = str(Path(__file__).resolve().parents[2] / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
     from workspace_default import resolve_workspace
-    return str(resolve_workspace() / "state" / "cron-notify-cooldown.json")
+    path = resolve_workspace() / "state" / "cron-notify-cooldown.json"
+    # Create the managed default's parent so a CLEAN install (no state/ yet) can
+    # acquire the sidecar lock — otherwise fail-closed refuses every default ping
+    # until some unrelated service happens to create state/ (#2346 review). This
+    # applies ONLY to the managed default: an explicit --state-file with a missing
+    # parent stays fail-closed by design (an unwritable target refuses to post).
+    # Best-effort — if the mkdir fails the lock still fails closed, never posts.
+    try:
+        os.makedirs(path.parent, exist_ok=True)
+    except OSError:
+        pass
+    return str(path)
 
 
 def _load_state(path):
