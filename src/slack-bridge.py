@@ -198,7 +198,7 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         # rename can publish torn JSON. A per-PID temp is never shared, and
         # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        write_private_text(tmp, json.dumps(payload))
+        tmp.write_text(json.dumps(payload))
         os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
