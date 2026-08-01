@@ -952,6 +952,46 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 20 (john-the-dev, review of c97ca6d). The lookahead was bounded at a
+# fixed number of PHYSICAL lines and running out returned "not selected", so 24
+# blank lines before the selector put it out of reach.
+#
+# The generalisation matters more than the case: a PERMISSIVE bound is defeated
+# by writing bound+1 lines, so every value of it is wrong. Two changes make the
+# bound un-gameable instead of merely larger:
+#   * blank lines cost nothing, so formatting cannot spend the budget;
+#   * exhausting it emits `_CHAIN_TRUNCATED` and the walk FAILS CLOSED.
+# The accepted cost is stated rather than hidden: a genuine chain longer than
+# `_CHAIN_LOOKAHEAD` non-blank lines now flags even if it ends in a probe.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    def dl(mid, last):
+        body = [f"const cmd = {L}"] + mid + [last]
+        return ("+++ b/src/t.ts\n@@ -1,0 +1,%d @@\n" % len(body)
+                + "".join("+" + b + "\n" for b in body))
+
+    ok("main(): blank lines do not spend the lookahead budget",
+       "hardcoded path" in scan(dl([""] * 24, "  [1];"))[1])
+    ok("main(): far more blank lines than the budget still reach the selector",
+       "hardcoded path" in scan(dl([""] * 60, "  [1];"))[1])
+    ok("main(): blanks then a PROBE is still permitted",
+       scan(dl([""] * 24, "  .find(exists);"))[1].strip() == "")
+
+    ok("main(): a chain longer than the budget FAILS CLOSED, not open",
+       "hardcoded path" in scan(dl(["  .map(x => x)"] * 30, "  [1];"))[1])
+    ok("main(): and fails closed even ending in a probe (the accepted cost)",
+       "hardcoded path" in scan(dl(["  .map(x => x)"] * 30, "  .find(exists);"))[1])
+    ok("main(): a chain within the budget ending in a probe still passes",
+       scan(dl(["  .map(x => x)"] * 3, "  .find(exists);"))[1].strip() == "")
+
+    ok("_is_selected_from: the truncation sentinel fails closed",
+       rc._is_selected_from('["/a","/b"]', 10, (rc._CHAIN_TRUNCATED,)))
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so

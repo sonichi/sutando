@@ -324,7 +324,17 @@ def _call_end(code, name_end):
     return None
 
 
+# A chain is carried until it RESOLVES or TERMINATES. `_CHAIN_LOOKAHEAD` bounds
+# only the WORK — how many non-blank continuation lines are read per token — so a
+# large hunk is not rescanned endlessly. Blank lines cost nothing and do not spend
+# it, and running out does NOT mean "not selected": the walk emits
+# `_CHAIN_TRUNCATED` and fails CLOSED.
+#
+# That direction is the whole point. A permissive bound is defeatable by writing
+# bound+1 lines, so every value of it is wrong; a conservative one cannot be,
+# because exhausting it flags. Same rule as an unreadable call chain.
 _CHAIN_LOOKAHEAD = 24
+_CHAIN_TRUNCATED = "\x00truncated"
 
 
 def _as_lines(next_code):
@@ -398,6 +408,8 @@ def _is_selected_from(code, close_idx, next_code=None):
         rest = tuple(_as_lines(next_code)[k + 1:])
         if nxt.startswith("["):
             return True
+        if follow is _CHAIN_TRUNCATED:
+            return True                   # unresolved at the budget — fail CLOSED
         if nxt.startswith("."):
             # Re-enter with a synthetic close at index 0 so exactly the same
             # rules apply as on one line, carrying the REMAINING lines so a
@@ -655,16 +667,24 @@ def main():
         not rescanned per token, and the cap is stated rather than implicit.
         """
         out = []
+        budget = _CHAIN_LOOKAHEAD
         j = i + 1
-        while j < len(_lines) and len(out) < _CHAIN_LOOKAHEAD:
+        while j < len(_lines):
             nxt = _lines[j]
             if nxt.startswith("+++"):
                 break
-            if nxt.startswith("+") or nxt.startswith(" "):
-                out.append(_code_part(nxt[1:]))
-                j += 1
-                continue
-            break
+            if not (nxt.startswith("+") or nxt.startswith(" ")):
+                break
+            code = _code_part(nxt[1:])
+            if code.strip():
+                if budget == 0:
+                    # Budget spent with the chain still open. Emit the sentinel
+                    # so the walk fails CLOSED instead of running out quietly.
+                    out.append(_CHAIN_TRUNCATED)
+                    break
+                budget -= 1
+            out.append(code)
+            j += 1
         return tuple(out) or None
 
     for _i, raw in enumerate(_lines):
