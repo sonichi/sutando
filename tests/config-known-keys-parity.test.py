@@ -25,6 +25,23 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+# Extraction FLOOR. Not an exact count — adding a key must not break this test.
+# It exists because "the extractor silently narrowed" is the one degradation an
+# equality check alone cannot catch reliably: three extractors that all failed the
+# same way would still compare equal. Set well below the real count (7, as of
+# `stand` + `migrate`) so it only fires on catastrophic narrowing, never on growth.
+MIN_KEYS = 5
+
+
+def _floor(name: str, keys: set) -> set:
+    if len(keys) < MIN_KEYS:
+        raise AssertionError(
+            f"{name} yielded only {len(keys)} key(s) ({sorted(keys)}) — below the "
+            f"MIN_KEYS={MIN_KEYS} extraction floor. The declaration moved or the "
+            f"parse narrowed; fix the extractor rather than lowering the floor."
+        )
+    return keys
+
 
 def python_keys() -> set[str]:
     """Import the real module — no regex over source we can execute."""
@@ -34,7 +51,7 @@ def python_keys() -> set[str]:
     keys = set(_KNOWN_TOP_LEVEL_KEYS)
     if not keys:
         raise AssertionError("python _KNOWN_TOP_LEVEL_KEYS is empty — refusing to compare nothing")
-    return keys
+    return _floor("python _KNOWN_TOP_LEVEL_KEYS", keys)
 
 
 def ts_keys() -> set[str]:
@@ -49,7 +66,7 @@ def ts_keys() -> set[str]:
     keys = set(re.findall(r"['\"]([A-Za-z0-9_]+)['\"]", m.group(1)))
     if not keys:
         raise AssertionError("parsed an EMPTY key set from sutando_config.ts — parse is broken")
-    return keys
+    return _floor("ts KNOWN_TOP_LEVEL_KEYS", keys)
 
 
 def schema_keys() -> tuple[set[str], bool]:
@@ -57,7 +74,7 @@ def schema_keys() -> tuple[set[str], bool]:
     props = set(schema.get("properties", {}))
     if not props:
         raise AssertionError("schema has no `properties` — refusing to compare nothing")
-    return props, schema.get("additionalProperties") is False
+    return _floor("schema properties", props), schema.get("additionalProperties") is False
 
 
 def main() -> int:
