@@ -80,13 +80,51 @@ rm -f .coverage coverage.xml diff-cover.md
 find . -maxdepth 1 -name '.coverage.*' -delete
 
 failed=0
+# Skip accounting. The loop below captures each file's output and previously
+# echoed it ONLY on failure, so a file whose every case skipped produced
+# byte-identical output to one whose every case passed. A suite that silently
+# stopped running — a missing toolchain, an absent optional dep, a
+# host-specific guard that is false on the runner — was indistinguishable
+# from a green one. unittest already reports this on stderr; we were
+# discarding it.
+skipped_total=0
+fully_skipped=()
+partly_skipped=()
 while IFS= read -r f; do
     if ! output=$(python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1); then
         echo "✖ test failed under instrumentation: $f"
         echo "$output"
         failed=1
+        continue
+    fi
+    # "Ran N tests" / "OK (skipped=M)" — unittest's own summary.
+    ran=$(printf '%s' "$output" | sed -nE 's/^Ran ([0-9]+) tests?.*/\1/p' | tail -1)
+    skips=$(printf '%s' "$output" | sed -nE 's/.*skipped=([0-9]+).*/\1/p' | tail -1)
+    [ -n "$ran" ] || ran=0
+    [ -n "$skips" ] || skips=0
+    skipped_total=$((skipped_total + skips))
+    if [ "$ran" -gt 0 ] && [ "$skips" -eq "$ran" ]; then
+        fully_skipped+=("$f ($ran/$ran skipped)")
+    elif [ "$skips" -gt 0 ]; then
+        partly_skipped+=("$f ($skips/$ran skipped)")
     fi
 done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
+
+if [ "$skipped_total" -gt 0 ]; then
+    echo "coverage-gate: $skipped_total test case(s) SKIPPED in this environment."
+    # Attribute them. A bare total tells you something is skipping but not
+    # WHAT, so it cannot answer the question the total provokes: does this
+    # environment skip different things than a developer's machine? Naming
+    # the files makes a macOS-vs-Linux difference visible in the log instead
+    # of requiring a local re-run to guess at.
+    for entry in "${partly_skipped[@]}"; do echo "    - $entry"; done
+fi
+if [ "${#fully_skipped[@]}" -gt 0 ]; then
+    echo "coverage-gate: ${#fully_skipped[@]} file(s) skipped EVERY case — they assert nothing here:"
+    for entry in "${fully_skipped[@]}"; do echo "    - $entry"; done
+    echo "coverage-gate: not a failure (optional deps / host toolchains are legitimately absent),"
+    echo "coverage-gate: but a fully-skipped file is not a passing file. Verify that is intended."
+fi
 if [ "$failed" -ne 0 ]; then
     publish_summary "❌ **Test suite failed under instrumentation** — coverage not measurable. See the job log."
     echo "coverage-gate: suite must be green before coverage is meaningful." >&2
