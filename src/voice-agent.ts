@@ -38,7 +38,7 @@ import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { VoiceSession } from 'bodhi-realtime-agent';
+import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
@@ -205,6 +205,16 @@ if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
 const VOICE_AGENT_CONFIG = loadVoiceConfig(VOICE_AGENT_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = VOICE_AGENT_CONFIG.model;
 const VOICE_GOOGLE_SEARCH = VOICE_AGENT_CONFIG.googleSearch;
+// Shadow STT (config/voice-agent.json "shadowStt": true — default OFF).
+// A Live-model mishear is self-consistent (transcript = what the model heard;
+// live incident 2026-07-30: "what's this" → "what's the news", answered with
+// news, nothing looked wrong). With this on, the same audio also goes to a
+// batch gemini-2.5-flash pass and a disagreement is LOGGED (observation-only —
+// nothing about hearing/answering/storage changes). bodhi PR #25.
+const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
+// "divergenceCorrection": true — additionally SPEAK a self-correction when the
+// shadow detects a mishear (owner option ①, bodhi PR #26). Needs shadowStt.
+const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 
@@ -756,6 +766,18 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		...(VOICE_SHADOW_STT
+			? {
+					shadowSttProvider: new GeminiBatchSTTProvider({
+						apiKey: GEMINI_VOICE_API_KEY,
+						model: 'gemini-2.5-flash',
+					}),
+					divergenceCorrection: VOICE_DIVERGENCE_CORRECTION,
+					onTranscriptionDivergence: (live: string, shadow: string, turnId?: number) => {
+						console.log(`${ts()} [ShadowSTT] model heard ≠ said (turn ${turnId ?? '?'}): live="${live}" shadow="${shadow}"`);
+					},
+				}
+			: {}),
 		hooks: {
 			onSessionStart: (e) => {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
