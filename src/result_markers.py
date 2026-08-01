@@ -134,6 +134,17 @@ _ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
 # occurrences are stripped from the delivered body.
 _DMONLY_RE = re.compile(r"\[dm-only\]\s*\n?", re.IGNORECASE)
 
+#: STRIPPING is narrower than DETECTION, deliberately. Detection stays
+#: `search()`-anywhere so the privacy guard cannot be defeated by marker
+#: ORDER (see the docstring). But removing every occurrence also removed
+#: the literal from PROSE that merely discusses the marker, mangling
+#: owner-facing text with no indication:
+#:     in   - #2170 [dm-only]: closes the leak vector
+#:     out  - #2170 : closes the leak vector
+#: Routing over-triggering fails SAFE; silently editing the body does not.
+#: So only a STANDALONE marker — alone on its line — is stripped.
+_DMONLY_STRIP_RE = re.compile(r"^[ \t]*\[dm-only\][ \t]*\r?\n?", re.IGNORECASE | re.MULTILINE)
+
 
 def parse_markers(text: str) -> ParseResult:
     """Parse a result-body string and return body + action list.
@@ -194,7 +205,7 @@ def parse_markers(text: str) -> ParseResult:
     dm_only = bool(_DMONLY_RE.search(body))
     if dm_only:
         actions.append(Action(kind="dm-only", value=""))
-        body = _DMONLY_RE.sub("", body)
+        body = _DMONLY_STRIP_RE.sub("", body)
 
     # 3. REDIRECT — must be the first non-empty line (after any D7 header).
     # Suppressed entirely when dm-only is set: strip a leading `[channel:]`
