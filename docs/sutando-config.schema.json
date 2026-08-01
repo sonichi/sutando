@@ -143,6 +143,38 @@
           "description": "Seconds between sync runs when sync is enabled. Minimum 60 to avoid hammering the remote."
         }
       }
+    },
+    "bridges": {
+      "type": "object",
+      "description": "Bridge-wide toggles shared by the Discord/Telegram/Slack bridges.",
+      "additionalProperties": false,
+      "properties": {
+        "progress_stream": {
+          "type": "boolean",
+          "description": "Emit in-channel '\u23f3 working\u2026 (Ns)' progress placeholders while a task runs."
+        }
+      }
+    },
+    "migrate": {
+      "type": "object",
+      "description": "Per-clone migration hints consumed by scripts/sutando-config.sh (migrate-stale-hosts, migrate-skip-skills).",
+      "additionalProperties": false,
+      "properties": {
+        "stale_hosts": {
+          "type": "array",
+          "description": "Per-clone machine-<host> dirs treated as stale during migration.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "skip_skills": {
+          "type": "array",
+          "description": "Host-only skill names excluded from the migration sweep.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
     }
   }
 }
