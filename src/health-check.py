@@ -932,20 +932,6 @@ def check_memory_index_integrity() -> "dict | None":
     index = MEMORY_DIR / "MEMORY.md"
     index_text = index.read_text(errors="ignore") if index.exists() else ""
 
-    # MEMORY.md is not the only index. Once a corpus outgrows the load budget the
-    # overflow moves to sibling HUB indexes (MEMORY-reference.md, MEMORY-wire.md,
-    # …) that MEMORY.md links to. A hub entry deliberately does not auto-load — it
-    # only has to be findable — so it is not a loss and must not be reported as
-    # one. Discovered by glob, not hardcoded, so a host that adds its own hub gets
-    # the same treatment without editing this probe.
-    index_names = {"MEMORY.md"}
-    hub_text = ""
-    for hub in sorted(MEMORY_DIR.glob("MEMORY*.md")):
-        if hub.name == "MEMORY.md":
-            continue
-        index_names.add(hub.name)
-        hub_text += "\n" + hub.read_text(errors="ignore")
-
     # What the session actually sees: strip what the runtime strips, then keep
     # only the prefix that fits inside 200 lines / 25KB.
     effective_text = _index_effective_text(index_text)
@@ -954,6 +940,30 @@ def check_memory_index_integrity() -> "dict | None":
 
     def _referenced_in(hay: str, name: str) -> bool:
         return name in hay or name[:-3] in hay
+
+    # MEMORY.md is not the only index. Once a corpus outgrows the load budget the
+    # overflow moves to sibling HUB indexes (MEMORY-reference.md, MEMORY-wire.md,
+    # …). A hub entry deliberately does not auto-load — it only has to be findable
+    # — so it is not a loss.
+    #
+    # But a hub is only findable if the LOADED prefix of MEMORY.md links to it.
+    # Trusting every MEMORY*.md glob match instead lets an unlinked file (a stale
+    # copy, a backup, an ordinary memory that happens to match the glob) launder
+    # itself AND every filename it mentions into a false green — inside the one
+    # probe that exists to prevent silent loss. A hub linked only PAST the cut is
+    # equally unreachable, so `loaded_text` is the correct gate, not `index_text`.
+    # (john-the-dev, #2483: an earlier revision of this change trusted the glob
+    # and its test suite explicitly blessed the unlinked case.)
+    #
+    # An untrusted MEMORY*.md is therefore not an index at all: it falls through
+    # to the classification below and is reported like any other unindexed file.
+    index_names = {"MEMORY.md"}
+    hub_text = ""
+    for hub in sorted(MEMORY_DIR.glob("MEMORY*.md")):
+        if hub.name == "MEMORY.md" or not _referenced_in(loaded_text, hub.name):
+            continue
+        index_names.add(hub.name)
+        hub_text += "\n" + hub.read_text(errors="ignore")
 
     # (a) live memory files not referenced anywhere in MEMORY.md → won't load.
     # (c) referenced, but ONLY beyond the load cut → equally won't load. Same
