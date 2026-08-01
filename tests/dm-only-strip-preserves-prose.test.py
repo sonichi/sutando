@@ -99,7 +99,7 @@ class TestStandaloneStrippingStillWorks(unittest.TestCase):
 
 
 class TestTaskBridgeTsParity(unittest.TestCase):
-    """`src/task-bridge.ts` is the one result consumer that CANNOT call
+    r"""`src/task-bridge.ts` is the one result consumer that CANNOT call
     parse_markers (wrong language), so `tests/bridge-marker-no-leak.test.py`'s
     route-through-the-parser invariant structurally cannot cover it — and that
     hole is exactly where this regression landed.
@@ -118,7 +118,7 @@ class TestTaskBridgeTsParity(unittest.TestCase):
         return m.group(1)
 
     def test_expression_is_anchored_multiline_and_case_insensitive(self):
-        """The regression was an UNANCHORED /[dm-only]\s*/gi."""
+        r"""The regression was an UNANCHORED /[dm-only]\s*/gi."""
         e = self._expr()
         flags = e.rsplit("/", 1)[1]
         self.assertIn("^", e, "must anchor to line start = standalone only")

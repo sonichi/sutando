@@ -201,10 +201,18 @@ def parse_markers(text: str) -> ParseResult:
             return ParseResult(body="", actions=actions)
 
     # 2. DM-ONLY — privacy guard, checked BEFORE redirect so it can suppress
-    # it. Matched anywhere (not anchored), so `[dm-only]` overrides a
-    # `[channel:]` redirect no matter which appears first. Strip every
-    # occurrence from the body; a bridge that sees the dm-only action (or,
-    # equivalently, the ABSENCE of a redirect action) delivers to the DM.
+    # it. DETECTION and STRIPPING are deliberately different scopes:
+    #   detect  — anywhere (not anchored), so `[dm-only]` overrides a
+    #             `[channel:]` redirect no matter which appears first. That is
+    #             what makes the guard undefeatable by marker ORDER, and
+    #             over-triggering it fails SAFE (a reply goes to the DM).
+    #   strip   — standalone only (`_DMONLY_STRIP_RE`, marker alone on its
+    #             line). Stripping every occurrence rewrote the owner's own
+    #             prose: a result DISCUSSING the marker had it silently
+    #             excised, which is not a routing outcome and does not fail
+    #             safe. An inline mention is detected but delivered verbatim.
+    # A bridge that sees the dm-only action (or, equivalently, the ABSENCE of a
+    # redirect action) delivers to the DM.
     dm_only = bool(_DMONLY_RE.search(body))
     if dm_only:
         actions.append(Action(kind="dm-only", value=""))
