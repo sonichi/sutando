@@ -359,6 +359,34 @@ _emit_exclude_lines() {
     fi
 }
 
+# Return success only for a literal host label that is safe to compare as a
+# path segment. In particular, reject gitignore glob metacharacters and dot
+# segments: vault.sync.include intentionally accepts patterns, and those are
+# operator customizations rather than legacy per-host labels.
+_is_literal_host_label() {
+    local label="$1"
+    [ "$label" != "." ] \
+        && [ "$label" != ".." ] \
+        && [[ "$label" =~ ^[[:alnum:]_.-]+$ ]]
+}
+
+# A pre-multi-host local config may still scope the carrier to exactly this
+# machine's `hosts/<label>/` directory. That shape is unsafe now that peer
+# subtrees form one durable aggregate: after a pull, carrier enforcement
+# interprets every peer path as newly excluded and propagates its deletion.
+# Widen only the literal validated current host label; gitignore patterns and
+# nested paths retain their explicit operator-authored meaning.
+_normalize_include_path() {
+    local path="$1" own_host
+    own_host="$(_host)"
+    if _is_literal_host_label "$own_host" \
+        && [ "$path" = "hosts/$own_host/" ]; then
+        printf '%s\n' "hosts/*/"
+        return 0
+    fi
+    printf '%s\n' "$path"
+}
+
 # Compose the sync rule set written to `<workspace>/.git/info/exclude`.
 #
 # Why `.git/info/exclude` and not `<workspace>/.gitignore`:
@@ -393,6 +421,7 @@ _compose_exclude_content() {
         echo "# Carrier set — from vault.sync.include"
         while IFS= read -r path; do
             [ -z "$path" ] && continue
+            path="$(_normalize_include_path "$path")"
             _emit_include_lines "$path"
         done <<<"$include_list"
     fi
@@ -431,6 +460,30 @@ _compose_exclude_content() {
     echo "*.ppk"
     echo "*.keystore"
     echo "*.jks"
+}
+
+# Return success only when an existing generated rule set differs from the
+# desired one solely because one or more legacy `!hosts/<label>/` entries need
+# widening to `!hosts/*/`. This narrow comparison preserves the existing
+# operator-edit protection while allowing the #2391 safety migration to heal
+# automatically on the next sync tick.
+_is_safe_legacy_host_scope_widening() {
+    local existing="$1" desired="$2" own_host
+    own_host="$(_host)"
+    _is_literal_host_label "$own_host" || return 1
+    cmp -s <(
+        awk -v host="$own_host" '
+            $0 == "!hosts/" host "/" {
+                print "!hosts/*/"
+                next
+            }
+            $0 == "!hosts/" host "/**" {
+                print "!hosts/*/**"
+                next
+            }
+            { print }
+        ' "$existing"
+    ) "$desired"
 }
 
 # Write `<workspace>/.git/info/exclude` from the composed content. Also
@@ -493,6 +546,9 @@ generate_exclude() {
         # operator-customized" and overwrite without prompting.
         if ! grep -qE '^[^#]' "$exclude_path" 2>/dev/null; then
             log "generate_exclude: existing $exclude_path is stock comments only; overwriting"
+        elif _is_safe_legacy_host_scope_widening "$exclude_path" "$tmp_path"; then
+            log "generate_exclude: safely widened legacy hosts/<label>/ carrier rules to hosts/*/"
+            color_warn "sync-workspace: widened legacy hosts/<label>/ carrier rules to hosts/*/ so peer host state remains durable"
         elif [ "$FORCE_GITIGNORE" != "1" ]; then
             color_warn "sync-workspace: $exclude_path EXISTS and DIFFERS from the generated content."
             color_warn "Refusing to overwrite (operator-authored content may block carrier-set paths)."
@@ -583,6 +639,41 @@ _refuse_staged_secrets() {
     [ "$_secret_hits" -gt 0 ] && log "_refuse_staged_secrets: refused $_secret_hits credential-shaped file(s)"
     return 0
     return 0
+}
+
+# A host owns its own hosts/<label>/ subtree. This deletion-focused guard
+# refuses any staged removal below a foreign label before commit/push,
+# including the source side of a rename. It catches both stale carrier rules
+# and future writers that accidentally treat absence as permission to delete a
+# peer's durable state. In-place foreign-file modifications are outside this
+# guard's #2391 deletion scope. The existing explicit force switch remains the
+# operator escape hatch for intentional recovery.
+_refuse_foreign_host_deletions() {
+    [ "${SUTANDO_FORCE_SYNC:-0}" = "1" ] && return 0
+
+    local own_host foreign_hits=0 path relative path_host first_path=""
+    own_host="$(_host)"
+    while IFS= read -r -d '' path; do
+        case "$path" in
+            hosts/*/*)
+                relative="${path#hosts/}"
+                path_host="${relative%%/*}"
+                if [ -n "$path_host" ] && [ "$path_host" != "$own_host" ]; then
+                    foreign_hits=$((foreign_hits + 1))
+                    [ -z "$first_path" ] && first_path="$path"
+                fi
+                ;;
+        esac
+    done < <(git diff --cached --no-renames --name-only --diff-filter=D -z)
+
+    if [ "$foreign_hits" -eq 0 ]; then
+        return 0
+    fi
+
+    log "_refuse_foreign_host_deletions: ABORT — would delete $foreign_hits foreign host file(s); first=$first_path own_host=$own_host"
+    echo "sync-workspace: refusing push — would delete $foreign_hits foreign host file(s) (first: $first_path). Only '$own_host' may write its hosts/<label>/ subtree. Restore/pull the peer state, or set SUTANDO_FORCE_SYNC=1 for an intentional recovery." >&2
+    git reset -q
+    return 1
 }
 
 # Snapshot the per-host config from the canonical Claude config dir into
@@ -1134,6 +1225,9 @@ _push_only_impl() {
     _enforce_carrier_set_pre
     git add -A
     _refuse_staged_secrets
+    if ! _refuse_foreign_host_deletions; then
+        return 1
+    fi
     if git diff --cached --quiet; then
         log "_push_only_impl: nothing to commit"
         # A clean tree does NOT mean "done": a prior push may have failed (auth

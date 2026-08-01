@@ -93,6 +93,13 @@ The workspace tree is the unit of sync. Every file under `<workspace>/` is poten
 
 Patterns are standard gitignore syntax.
 
+`hosts/*/` is the fleet-wide durable namespace and should remain in any local
+override of `vault.sync.include`; do not narrow it to only this machine's
+`hosts/<label>/` directory. The sync engine widens that exact legacy shape
+automatically. It also refuses to push staged deletions under another host's
+subtree unless `SUTANDO_FORCE_SYNC=1` is explicitly set, so a stale carrier
+rule cannot silently erase peer state.
+
 ## Conflict model
 
 Concurrent writes from two machines land on different branches (`host/<host-A>/<wsId>` and `host/<host-B>/<wsId>`); the merge happens locally on each host's next sync tick via git's standard 3-way merge. Same-file edits within the same minute on two hosts produce a normal git merge conflict that gets surfaced via stderr — `sync-workspace.sh` doesn't silently pick a winner.
