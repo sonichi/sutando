@@ -330,7 +330,8 @@ def main() -> int:
     src = (REPO / "src" / "health-check.py").read_text()
     fn = src[src.index("def check_live_checkout_branch"):]
     fn = fn[:fn.index("\ndef ", 1)]
-    check('git_bin = "git"' in fn, "v) probe defines one git_bin swap point")
+    check("resolve_git()" in fn,
+          "v) probe RESOLVES the git binary rather than shelling a literal")
     check('["git", "-C"' not in fn, "v) no hardcoded \"git\" left in the probe body")
     check("_commits_behind(repo, expected, git_bin)" in fn,
           "v) the stale-check receives the same binary as the branch call")
@@ -389,6 +390,60 @@ def main() -> int:
         f = REPO / rel
         check(f.exists() and needle in f.read_text(),
               f"y) core.checkout_behind_warn declared in {rel}")
+
+    # z) COMPOSITION with #2469's resolver. The previous cut left a literal
+    #    `git_bin = "git"` behind a comment promising a future swap; at the
+    #    merged tree of both heads `resolve_git` was imported and used elsewhere
+    #    while this probe still shelled the literal, so the cumulative state
+    #    kept the CLT shim modal #2469 removes. Pin both directions.
+    import types
+
+    real_mod = sys.modules.get("git_binary")
+    try:
+        # z1) resolver present and returning a path -> BOTH calls use that path
+        stub = types.ModuleType("git_binary")
+        stub.resolve_git = lambda: "/opt/fake/git"
+        sys.modules["git_binary"] = stub
+        seen: list = []
+        real_run = hc.subprocess.run
+
+        def _spy(cmd, *a, **k):
+            seen.append(cmd[0])
+            raise OSError("stop after recording")
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = _mk_repo(Path(td))
+            hc.subprocess.run = _spy
+            try:
+                hc.check_live_checkout_branch(repo)
+            finally:
+                hc.subprocess.run = real_run
+        check(seen == ["/opt/fake/git"],
+              f"z1) resolved binary is what gets shelled, got {seen}")
+
+        # z2) resolver saying there is NO runnable git -> degrade, shell nothing
+        stub.resolve_git = lambda: None
+        seen2: list = []
+
+        def _spy2(cmd, *a, **k):
+            seen2.append(cmd[0])
+            raise OSError("should not be reached")
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = _mk_repo(Path(td))
+            hc.subprocess.run = _spy2
+            try:
+                r = hc.check_live_checkout_branch(repo)
+            finally:
+                hc.subprocess.run = real_run
+        check(r["status"] == "ok" and "no runnable git" in r["detail"],
+              f"z2) resolver None -> ok degrade, got {r}")
+        check(seen2 == [], f"z2) nothing shelled when there is no git, got {seen2}")
+    finally:
+        if real_mod is None:
+            sys.modules.pop("git_binary", None)
+        else:
+            sys.modules["git_binary"] = real_mod
 
     if FAILS:
         print(f"\n{len(FAILS)} failure(s)")

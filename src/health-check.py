@@ -1363,14 +1363,29 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
         except Exception:
             expected = None  # config unreadable — fall through to the default
     expected = expected or "main"
-    # SINGLE SWAP POINT for the git binary. Both subprocesses in this probe use
-    # this one value, so when #2469's shared resolver lands, `resolve_git()`
-    # replaces this line and BOTH calls are fixed together. Previously the
-    # branch call hardcoded "git" inline and the stale-check added a second
-    # hardcoded "git" — two places to miss, and missing the second reopens the
-    # Xcode-CLT shim modal on a toolchain-free host that the first call's fix
-    # was meant to close.
-    git_bin = "git"
+    # Resolve the git binary ONCE for both subprocesses in this probe.
+    #
+    # This used to be `git_bin = "git"` with a comment promising that #2469's
+    # resolver "replaces this line when it lands". That was a TODO wearing a
+    # design rationale: at the merged tree of both heads, `resolve_git` was
+    # imported at module scope and used elsewhere while this probe still shelled
+    # the literal — so the cumulative state kept the Xcode-CLT shim modal that
+    # #2469 exists to remove. A swap point nobody swaps is not a fix.
+    #
+    # Imported lazily and defensively so this composes in EITHER merge order:
+    # before #2469 lands the module is absent and we behave exactly as today;
+    # after it lands both calls go through the resolver with no further edit.
+    try:
+        from git_binary import resolve_git  # noqa: PLC0415
+        git_bin = resolve_git()
+    except Exception:
+        git_bin = "git"
+    if git_bin is None:
+        # Resolver says there is no runnable git (CLT absent, only the stub).
+        # Degrade like the OSError path below rather than shelling the shim —
+        # that modal is the whole point of #2469.
+        return {"name": name, "status": "ok",
+                "detail": "no runnable git (resolver) — skipping"}
     try:
         out = subprocess.run(
             [git_bin, "-C", str(repo), "branch", "--show-current"],
