@@ -19,7 +19,7 @@ REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
 
 
-def _run_probe(env_overrides: dict[str, str | None]) -> tuple[str, str, int]:
+def _run_probe(env_overrides: dict[str, str | None], home: str | None = None) -> tuple[str, str, int]:
     """Run a minimal Python probe that imports util_paths and calls
     claude_home_path() three times, then prints the resolved base.
     Return (stdout, stderr, returncode). env_overrides=None unsets the key.
@@ -28,6 +28,12 @@ def _run_probe(env_overrides: dict[str, str | None]) -> tuple[str, str, int]:
     # Always start from a clean slate for these vars.
     for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER"):
         env.pop(k, None)
+    # Isolate HOME so the legacy reader-fallback added in claude_home_path()
+    # (resolve to ~/.claude/<file> when the file is absent under CCD but present
+    # in the legacy home) can't leak the dev machine's real ~/.claude/channels/
+    # into these assertions. Callers pass a fresh empty temp dir as `home`.
+    if home is not None:
+        env["HOME"] = home
     for k, v in env_overrides.items():
         if v is None:
             env.pop(k, None)
@@ -83,8 +89,8 @@ def main() -> int:
 
     # Test 1: CCD set → no banner, resolved path uses CCD.
     print("\n[1] CLAUDE_CONFIG_DIR set → no banner, resolves under CCD")
-    with tempfile.TemporaryDirectory() as ccd:
-        out, err, rc = _run_probe({"CLAUDE_CONFIG_DIR": ccd})
+    with tempfile.TemporaryDirectory() as ccd, tempfile.TemporaryDirectory() as home:
+        out, err, rc = _run_probe({"CLAUDE_CONFIG_DIR": ccd}, home=home)
         passed.append(assert_eq(rc, 0, "exit 0"))
         passed.append(assert_not_in(
             "CLAUDE_CONFIG_DIR not set", err,
@@ -95,45 +101,47 @@ def main() -> int:
 
     # Test 2: CLAUDE_HOME set (legacy test override) → no banner.
     print("\n[2] CLAUDE_HOME set (CCD unset) → no banner, resolves under CLAUDE_HOME")
-    with tempfile.TemporaryDirectory() as home:
-        out, err, rc = _run_probe({"CLAUDE_HOME": home})
+    with tempfile.TemporaryDirectory() as claude_home, tempfile.TemporaryDirectory() as home:
+        out, err, rc = _run_probe({"CLAUDE_HOME": claude_home}, home=home)
         passed.append(assert_eq(rc, 0, "exit 0"))
         passed.append(assert_not_in(
             "CLAUDE_CONFIG_DIR not set", err,
             "no fallback banner on stderr (CLAUDE_HOME is a test override, not the deprecated path)"))
         passed.append(assert_in(
-            f"RESOLVED: {home}/channels/discord/access.json", out,
+            f"RESOLVED: {claude_home}/channels/discord/access.json", out,
             "resolved path uses CLAUDE_HOME"))
 
     # Test 3: Both unset → banner fires ONCE.
     print("\n[3] CCD + CLAUDE_HOME unset → banner fires ONCE, falls back to ~/.claude/")
-    out, err, rc = _run_probe({})
-    passed.append(assert_eq(rc, 0, "exit 0"))
-    passed.append(assert_in(
-        "CLAUDE_CONFIG_DIR not set", err,
-        "fallback banner present on stderr"))
-    # Count banner occurrences — should be exactly 1 even though we called the
-    # helper three times in the probe.
-    occurrences = err.count("CLAUDE_CONFIG_DIR not set")
-    passed.append(assert_eq(
-        occurrences, 1,
-        f"banner fires exactly once across 3 helper calls (got {occurrences})"))
-    home_default = str(Path.home() / ".claude")
-    passed.append(assert_in(
-        f"RESOLVED: {home_default}/channels/discord/access.json", out,
-        "resolved path uses ~/.claude/ default"))
+    with tempfile.TemporaryDirectory() as home:
+        out, err, rc = _run_probe({}, home=home)
+        passed.append(assert_eq(rc, 0, "exit 0"))
+        passed.append(assert_in(
+            "CLAUDE_CONFIG_DIR not set", err,
+            "fallback banner present on stderr"))
+        # Count banner occurrences — should be exactly 1 even though we called the
+        # helper three times in the probe.
+        occurrences = err.count("CLAUDE_CONFIG_DIR not set")
+        passed.append(assert_eq(
+            occurrences, 1,
+            f"banner fires exactly once across 3 helper calls (got {occurrences})"))
+        home_default = str(Path(home) / ".claude")
+        passed.append(assert_in(
+            f"RESOLVED: {home_default}/channels/discord/access.json", out,
+            "resolved path uses ~/.claude/ default"))
 
     # Test 4: Suppression env var set → no banner even when both unset.
     print("\n[4] SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 → no banner, still falls back")
-    out, err, rc = _run_probe({"SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER": "1"})
-    passed.append(assert_eq(rc, 0, "exit 0"))
-    passed.append(assert_not_in(
-        "CLAUDE_CONFIG_DIR not set", err,
-        "no banner with suppression env var set"))
-    home_default = str(Path.home() / ".claude")
-    passed.append(assert_in(
-        f"RESOLVED: {home_default}/channels/discord/access.json", out,
-        "resolved path still uses ~/.claude/ default (suppression only silences banner)"))
+    with tempfile.TemporaryDirectory() as home:
+        out, err, rc = _run_probe({"SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER": "1"}, home=home)
+        passed.append(assert_eq(rc, 0, "exit 0"))
+        passed.append(assert_not_in(
+            "CLAUDE_CONFIG_DIR not set", err,
+            "no banner with suppression env var set"))
+        home_default = str(Path(home) / ".claude")
+        passed.append(assert_in(
+            f"RESOLVED: {home_default}/channels/discord/access.json", out,
+            "resolved path still uses ~/.claude/ default (suppression only silences banner)"))
 
     print("\n" + "=" * 50)
     failed = passed.count(False)
