@@ -87,6 +87,35 @@ def select_git(
     return found if clt_installed() else None
 
 
+class GitUnavailable(FileNotFoundError):
+    """Raised by `git_argv` when there is no runnable git.
+
+    Subclasses FileNotFoundError — and therefore OSError — on purpose: every
+    current call site already degrades on git failure by catching OSError, so
+    an unavailable git flows through the handling they already have instead of
+    needing a new branch at each site. That keeps the fix to one changed line
+    per caller and puts the whole decision in this module, where it is cheap to
+    test.
+    """
+
+
+def git_argv(*args: str) -> list:
+    """Build a full argv for a git invocation, or raise `GitUnavailable`.
+
+    Call this INSIDE the caller's existing try-block. Never assemble
+    `[resolve_git(), ...]` by hand — `resolve_git()` can return None, and
+    `subprocess.run(None)` fails with a TypeError that reads like a bug rather
+    than the intended "this host has no git" signal.
+    """
+    git = resolve_git()
+    if git is None:
+        raise GitUnavailable(
+            "no runnable git on this host; refusing to invoke the Xcode-CLT "
+            "shim at " + SYSTEM_GIT
+        )
+    return [git, *args]
+
+
 @lru_cache(maxsize=1)
 def resolve_git() -> Optional[str]:
     """Return a runnable git executable, or None if there isn't one.

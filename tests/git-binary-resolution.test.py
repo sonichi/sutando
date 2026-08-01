@@ -34,19 +34,35 @@ Run: python3 tests/git-binary-resolution.test.py
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
 
 _spec = importlib.util.spec_from_file_location("git_binary", SRC / "git_binary.py")
 git_binary = importlib.util.module_from_spec(_spec)
+sys.modules["git_binary"] = git_binary
 _spec.loader.exec_module(git_binary)
 
 SYSTEM_GIT = git_binary.SYSTEM_GIT
+
+# health-check.py is imported for the integration case below (the caller whose
+# degradation path this fix relies on). Banner suppressed so the suite output
+# stays readable; CLAUDE_CONFIG_DIR isolated so importing a src/ module never
+# reads or writes the host's real config (the rule scripts/lint-hermetic-bridge-
+# tests enforces, #2429).
+os.environ.setdefault("SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER", "1")
+os.environ.setdefault("CLAUDE_CONFIG_DIR", str(REPO / "workspace" / ".claude-sutando"))
+
+_hc_spec = importlib.util.spec_from_file_location("health_check", SRC / "health-check.py")
+health_check = importlib.util.module_from_spec(_hc_spec)
+sys.modules["health_check"] = health_check
+_hc_spec.loader.exec_module(health_check)
 
 
 class _Proc:
@@ -89,13 +105,13 @@ class NoHardcodedSystemGit(unittest.TestCase):
             path = SRC / name
             # assertTrue on a precomputed bool, not assertIn on the file body —
             # same reason as above: keep the failure message readable.
-            imports_resolver = "from git_binary import resolve_git" in path.read_text(
+            imports_resolver = "from git_binary import git_argv" in path.read_text(
                 encoding="utf-8"
             )
             with self.subTest(source=name):
                 self.assertTrue(
                     imports_resolver,
-                    f"{name} does not import resolve_git from src/git_binary.py",
+                    f"{name} does not import git_argv from src/git_binary.py",
                 )
 
 
@@ -166,6 +182,76 @@ class DeveloperToolsProbe(unittest.TestCase):
             raise subprocess.TimeoutExpired(cmd="xcode-select", timeout=5)
 
         self.assertFalse(git_binary.developer_tools_installed(run=_timeout))
+
+
+class ResolveGit(unittest.TestCase):
+    """`resolve_git` wires PATH lookup + the probe together (and caches)."""
+
+    def setUp(self):
+        git_binary.resolve_git.cache_clear()
+
+    def tearDown(self):
+        git_binary.resolve_git.cache_clear()
+
+    def test_returns_path_result_when_a_real_git_exists(self):
+        real = str(REPO / "fixture-bin" / "git")
+        with patch.object(git_binary.shutil, "which", return_value=real):
+            self.assertEqual(git_binary.resolve_git(), real)
+
+    def test_returns_none_when_path_has_nothing(self):
+        with patch.object(git_binary.shutil, "which", return_value=None):
+            self.assertIsNone(git_binary.resolve_git())
+
+    def test_is_cached(self):
+        real = str(REPO / "fixture-bin" / "git")
+        with patch.object(git_binary.shutil, "which", return_value=real) as which:
+            git_binary.resolve_git()
+            git_binary.resolve_git()
+        self.assertEqual(which.call_count, 1, "resolve_git re-probed PATH")
+
+
+class GitArgv(unittest.TestCase):
+    def test_builds_argv_when_git_is_available(self):
+        real = str(REPO / "fixture-bin" / "git")
+        with patch.object(git_binary, "resolve_git", return_value=real):
+            self.assertEqual(
+                git_binary.git_argv("log", "-1"), [real, "log", "-1"]
+            )
+
+    def test_raises_when_git_is_unavailable(self):
+        with patch.object(git_binary, "resolve_git", return_value=None):
+            with self.assertRaises(git_binary.GitUnavailable):
+                git_binary.git_argv("log", "-1")
+
+    def test_unavailable_is_an_oserror(self):
+        """Call sites absorb it through the OSError handling they already have.
+
+        If this ever stops being true, both callers silently start propagating
+        a hard error out of an optional-provenance path.
+        """
+        self.assertTrue(issubclass(git_binary.GitUnavailable, OSError))
+
+
+class HealthCheckDegradesWithoutGit(unittest.TestCase):
+    """The caller-side contract: no git ⇒ 'can't tell', not a crash or dialog."""
+
+    def test_returns_false_when_git_is_unavailable(self):
+        with patch.object(health_check, "git_argv", side_effect=git_binary.GitUnavailable("no git")):
+            self.assertFalse(
+                health_check._file_unchanged_since(SRC / "git_binary.py", 0.0)
+            )
+
+    def test_runs_against_a_real_git_without_raising(self):
+        """Exercises both git invocations on a host that does have git.
+
+        Asserts only the type: the value depends on the checkout's commit times,
+        which a test must not pin. The point is that the argv built by git_argv
+        is accepted by git and neither call raises.
+        """
+        if git_binary.resolve_git() is None:
+            self.skipTest("no runnable git on this host")
+        result = health_check._file_unchanged_since(SRC / "git_binary.py", 0.0)
+        self.assertIsInstance(result, bool)
 
 
 if __name__ == "__main__":

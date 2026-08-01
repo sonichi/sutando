@@ -41,7 +41,7 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from git_binary import resolve_git  # noqa: E402
+from git_binary import git_argv  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
@@ -1779,15 +1779,14 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
     content. Silent-failure: returns False on any git error so real stale
     deploys aren't hidden.
     """
-    git = resolve_git()
-    if git is None:
-        # No runnable git (clean Mac with no developer tools). Fail safe the
-        # same way a git error does — better a false stale-positive than a
-        # modal "install developer tools" dialog raised by a health check.
-        return False
     try:
+        # git_argv raises GitUnavailable (an OSError) when this host has no
+        # runnable git — caught below and treated as "can't tell", exactly like
+        # any other git error. Never invoke /usr/bin/git directly: on a Mac
+        # without developer tools that is the CLT shim and it raises a modal
+        # install dialog, which a health check must never be able to do.
         log = subprocess.run(
-            [git, "log", "-1", "--format=%ct", "HEAD", "--", str(src_file)],
+            git_argv("log", "-1", "--format=%ct", "HEAD", "--", str(src_file)),
             cwd=REPO_DIR, capture_output=True, text=True, timeout=5
         )
         if log.returncode != 0 or not log.stdout.strip():
@@ -1798,7 +1797,7 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
             return False
         # No commits since proc_start; check for uncommitted edits
         diff = subprocess.run(
-            [git, "diff", "--quiet", "HEAD", "--", str(src_file)],
+            git_argv("diff", "--quiet", "HEAD", "--", str(src_file)),
             cwd=REPO_DIR, capture_output=True, timeout=5
         )
         return diff.returncode == 0  # 0 = no diff
