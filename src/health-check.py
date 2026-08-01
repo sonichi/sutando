@@ -1399,11 +1399,15 @@ def _behind_warn_threshold(repo: "Path") -> int:
         raw = (load_config(repo_root=repo).get("core") or {}).get("checkout_behind_warn")
     except Exception:
         return _BEHIND_WARN_DEFAULT          # config unreadable/malformed
-    try:
-        n = int(raw)
-    except (TypeError, ValueError):
-        return _BEHIND_WARN_DEFAULT          # absent or non-integer
-    return n if n > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
+    # `bool` is a subclass of `int`, so `int(True)` is 1 and a plausible config
+    # typo — `"checkout_behind_warn": true` — would silently warn on every
+    # one-commit drift. That is precisely the alert fatigue the default of 10
+    # exists to prevent, and the probe would train users to ignore it. Accept a
+    # REAL integer only; the schema declares this key as an integer, so every
+    # other type (bool, float, numeric string) is invalid config and falls back.
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return _BEHIND_WARN_DEFAULT          # absent, bool, or non-integer
+    return raw if raw > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
 
 
 def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":

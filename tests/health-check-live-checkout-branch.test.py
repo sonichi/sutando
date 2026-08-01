@@ -50,6 +50,11 @@ path able to reopen the Xcode-CLT shim modal.
   p) zero            → falls back (would otherwise warn on a current checkout)
   q) negative        → falls back
   r) non-integer     → falls back, no ValueError
+  r2) JSON true      → falls back (bool is an int subclass: int(True) == 1, which
+                       would warn on EVERY one-commit drift — the alert fatigue
+                       the default of 10 exists to prevent)
+  r3) JSON false     → falls back
+  r4) float / numeric string → falls back (schema declares an integer)
   s) malformed config→ falls back
   t) absent key      → falls back
   u) the removed env var stays removed — a poisoned value is not even read
@@ -297,6 +302,10 @@ def main() -> int:
         ("p) zero falls back (would warn on a current checkout)", '{"core": {"checkout_behind_warn": 0}}', hc._BEHIND_WARN_DEFAULT),
         ("q) negative falls back", '{"core": {"checkout_behind_warn": -5}}', hc._BEHIND_WARN_DEFAULT),
         ("r) non-integer falls back (no ValueError)", '{"core": {"checkout_behind_warn": "not-a-number"}}', hc._BEHIND_WARN_DEFAULT),
+        ("r2) JSON true falls back (bool is an int subclass)", '{"core": {"checkout_behind_warn": true}}', hc._BEHIND_WARN_DEFAULT),
+        ("r3) JSON false falls back", '{"core": {"checkout_behind_warn": false}}', hc._BEHIND_WARN_DEFAULT),
+        ("r4) float falls back (schema says integer)", '{"core": {"checkout_behind_warn": 2.7}}', hc._BEHIND_WARN_DEFAULT),
+        ("r5) numeric string falls back", '{"core": {"checkout_behind_warn": "3"}}', hc._BEHIND_WARN_DEFAULT),
         ("s) malformed config falls back", '{not valid json', hc._BEHIND_WARN_DEFAULT),
         ("t) absent key falls back", '{"core": {}}', hc._BEHIND_WARN_DEFAULT),
     ]:
