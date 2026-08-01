@@ -1273,6 +1273,35 @@ def check_per_host_config_backup() -> dict:
     return {"name": name, "status": "ok", "detail": f"{checked} channel access.json backup(s) current"}
 
 
+# How far behind the expected branch before the checkout is worth nagging about.
+# Deliberately not 1: `main` on this repo moves several times a day, so warning on
+# any non-zero delta would fire constantly and train the reader to ignore it —
+# the failure mode that makes a health check worthless. Overridable per host.
+_BEHIND_WARN = int(os.environ.get("SUTANDO_CHECKOUT_BEHIND_WARN", "10") or 10)
+
+
+def _commits_behind(repo: "Path", branch: str) -> "int | None":
+    """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
+
+    Uses the LAST-FETCHED remote ref — deliberately does not fetch. A health
+    probe must stay fast and work offline, and a network call here would make
+    the whole run hang on a flaky link. The consequence is honest and stated in
+    the warning text: if the local ref is itself stale the count UNDERSTATES the
+    drift, so this can only under-report, never cry wolf.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "--count", f"HEAD..origin/{branch}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None          # no such remote ref (fresh clone, renamed remote)
+    raw = out.stdout.strip()
+    return int(raw) if raw.isdigit() else None
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -1329,7 +1358,27 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           "PR-branch checkout ships stale/unreviewed code (2026-07-29 "
                           "incident: 4 days on a Jul-25 PR branch). Author PRs in "
                           f"worktrees; switch back (git -C {repo} switch {expected})"}
-    return {"name": name, "status": "ok", "detail": f"live checkout on {expected!r}"}
+    # On the expected branch — but that is only half of "is this checkout current".
+    # A checkout can be on `main` and still be executing weeks-old code, and the
+    # branch-name comparison above returns ok for it. Observed 2026-08-01 on the
+    # 24/7 node: on `main`, 0 ahead, **15 commits behind**, and four merged guards
+    # were consequently not running — including the MEMORY.md load-limit warning
+    # (#2449), so the memory index silently truncated with nothing to report it.
+    # A peer node reproduced the same shape at 31 behind. Nothing anywhere
+    # surfaced either, because wrong-branch and stale-branch are different
+    # failure modes and only the first had a probe.
+    behind = _commits_behind(repo, expected)
+    if behind is not None and behind >= _BEHIND_WARN:
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on {expected!r} but {behind} commits behind "
+                          f"origin/{expected} — merged fixes are not running here, and a "
+                          "guard that never shipped to this machine reports nothing (so "
+                          "silence reads as health). Refresh with "
+                          f"`git -C {repo} pull --ff-only` + restart. Count is against the "
+                          "last-fetched ref; this probe does not fetch."}
+    return {"name": name, "status": "ok",
+            "detail": f"live checkout on {expected!r}"
+                      + (f", {behind} commits behind" if behind else "")}
 
 
 def check_migrate_reader_contract() -> dict:
