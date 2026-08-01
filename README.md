@@ -127,14 +127,23 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 
 ## Quick start
 
-**Prerequisites:**
+**Prerequisites** — required; `bash src/startup.sh` refuses to boot without these:
 - macOS 15+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) (sign in to the CLI you select)
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) — **signed in** to the CLI you select
 - Node.js 22+ (`brew install node`)
-- fswatch (`brew install fswatch`)
-- [Gemini API key](https://ai.google.dev) for voice (optional for text/core-only use)
-- *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls; you can run the browser + Telegram + Discord paths without them.
-- *(optional, for video/audio)* ffmpeg (`brew install ffmpeg`) — used by subtitle-burn, video-concat, and recording handoff.
+- Python 3 (`brew install python3`) — plus the bridge packages:
+  `pip3 install google-genai discord.py python-telegram-bot slack_bolt Pillow`
+- fswatch (`brew install fswatch`) and tmux (`brew install tmux`) — both auto-install via Homebrew on first start
+
+**Optional** — each unlocks one feature; absent means only that feature is unavailable:
+- [Gemini API key](https://ai.google.dev) — voice (text/core paths work without it)
+- ffmpeg (`brew install ffmpeg`) — subtitle-burn, video-concat, recording handoff
+- git — vault sync, self-upgrade, commit provenance
+- [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — phone calls and SMS; the browser, Telegram and Discord paths run without them
+
+Full list, including what to vendor when embedding Sutando in another
+application: **[External runtime dependencies](docs/runtime-dependencies.md)**.
+Check a host with `bash src/verify-setup.sh`.
 
 ```bash
 # Clone
