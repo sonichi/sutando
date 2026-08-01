@@ -26,6 +26,10 @@ RESULTS_DIR = WORKSPACE / "results"
 LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
 PRESENTER_SENTINEL = WORKSPACE / "state" / "presenter-mode.sentinel"
+# How long an UNCHANGED question set stays quiet before it is raised again. This
+# is the floor that stops "notify only when the set changes" from turning an
+# unanswered queue permanently mute — see should_notify().
+UNCHANGED_REMINDER_SEC = 86400  # 24h
 
 
 def presenter_mode_active():
@@ -194,8 +198,8 @@ def _last_notify_state():
 
 
 def should_notify(key=None):
-    """Notify when the SET changed, or when it is genuinely new. Never re-send an
-    unchanged set on a timer.
+    """Notify when the SET changed, when it is genuinely new, or when an unchanged
+    set has gone unmentioned for longer than UNCHANGED_REMINDER_SEC.
 
     The old rule was purely time-based — 3600s since the marker's mtime, with no
     awareness of whether anything had changed — so an unchanged queue re-notified
@@ -205,8 +209,20 @@ def should_notify(key=None):
 
     The script already computed the discriminator: `questions_key()` hashes the
     sorted titles and was used to name the proactive file. The cooldown simply
-    never consulted it. Passing `key=None` keeps the old time-only behaviour for
-    any caller that has no set to hash."""
+    never consulted it.
+
+    A FLOOR, NOT A CLIFF (2026-08-01, Mini's cold review). The first version of
+    this fix ended at `key != last_key`, which discarded mtime on that path — so
+    an unchanged set was announced exactly once, EVER. That is wrong in the case
+    the file exists for: questions are unchanged precisely BECAUSE nobody has
+    answered them, and one host already carries 54 such items. They would have
+    gone permanently silent, with no error — a queue that stops asking. Keeping
+    the daily floor bounds the spam (the bug above was 3 sends in 60 min) while
+    the queue stays audible.
+
+    `key=None` preserves the old time-only rule. No production caller passes it —
+    the only live call site hashes the set — so treat it as a compatibility
+    default for an embedder, not as a path this repo exercises."""
     mtime, last_key = _last_notify_state()
     if mtime is None:
         return True                      # never notified
@@ -214,7 +230,11 @@ def should_notify(key=None):
         return (time.time() - mtime) > 3600
     if last_key is None:
         return True                      # legacy marker: key unknown, notify once
-    return key != last_key               # unchanged set -> stay quiet
+    if key != last_key:
+        return True                      # the set changed
+    # Unchanged set: quiet, but not forever — re-raise once a day so an
+    # unanswered queue keeps asking instead of going mute.
+    return (time.time() - mtime) > UNCHANGED_REMINDER_SEC
 
 
 def notify_macos(count, titles):

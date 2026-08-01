@@ -70,6 +70,37 @@ with tempfile.TemporaryDirectory() as td:
     check("key=None keeps time-only behaviour (2h old -> notify)",
           cpq.should_notify(None) is True)
 
+    # --- A FLOOR, NOT A CLIFF (Mini's cold review, 2026-08-01) -----------------
+    # The first version of this fix ended at `key != last_key`, so an unchanged
+    # set was announced exactly ONCE, EVER — mtime was read and then discarded on
+    # that path. That is wrong in the case the file exists for: a set is unchanged
+    # precisely BECAUSE nobody answered it (one host carries 54 such items), so
+    # the queue would go permanently mute with no error.
+    #
+    # EVERY assertion in this block FAILS against that version, which returned
+    # False for the unchanged set at any age.
+    check("floor constant is a day, not a cliff", cpq.UNCHANGED_REMINDER_SEC == 86400)
+
+    for label, age, want in (
+        ("23h", 23 * 3600, False),          # still inside the quiet window
+        ("25h", 25 * 3600, True),           # floor fires — the queue asks again
+        ("30d", 30 * 86400, True),          # and keeps asking, not once-ever
+        ("1y",  365 * 86400, True),
+    ):
+        t = time.time() - age
+        marker.write_text(f"{int(t)} {ka}")
+        os.utime(marker, (t, t))
+        check(f"SAME set, marker {label} old -> {'notify again' if want else 'stay quiet'}",
+              cpq.should_notify(ka) is want)
+
+    # Control: the floor must not resurrect the ORIGINAL bug. An unchanged set
+    # one hour old stays quiet, which is what the hourly-spam fix bought.
+    t = time.time() - 3700
+    marker.write_text(f"{int(t)} {ka}")
+    os.utime(marker, (t, t))
+    check("CONTROL: unchanged set just past the OLD 1h cooldown -> still quiet",
+          cpq.should_notify(ka) is False)
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
