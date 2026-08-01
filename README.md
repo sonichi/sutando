@@ -127,14 +127,17 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 
 ## Quick start
 
-**Prerequisites** — `bash src/startup.sh` refuses to boot without these:
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) — **signed in** to the CLI you select
+**Prerequisites** — `bash src/startup.sh` checks that these are **installed** and refuses to boot otherwise:
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) — whichever you select
 - Node.js (`brew install node`)
 - Python 3 (`brew install python3`)
 - fswatch (`brew install fswatch`) — auto-installs via Homebrew on first start
 
-**Also expected, but not checked at boot** — a host can pass the checks above and still fail at runtime:
-- macOS 15+, Node.js 22+ — `bash src/verify-setup.sh` checks the Node version and whether your CLI is actually authenticated
+**Also required, but *not* checked at boot** — startup tests only that a command exists, so a host can pass every check above and still fail once running:
+- **Sign in to your agent CLI.** An unauthenticated CLI passes the presence check and then fails when the core starts.
+- macOS 15+, Node.js 22+.
+
+`bash src/verify-setup.sh` covers this second list — it checks the Node version and whether your CLI is actually authenticated. Run it if startup succeeds but the core doesn't.
 
 **Optional** — each unlocks one feature and degrades alone:
 - [Gemini API key](https://ai.google.dev) — voice (text/core paths work without it)
