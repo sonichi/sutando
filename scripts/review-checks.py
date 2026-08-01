@@ -154,114 +154,147 @@ _PROBING_METHODS = frozenset((
 _TRANSFORM_METHODS = frozenset(("map", "flatMap", "reduce", "forEach"))
 
 
-def _blank_strings(s):
-    """`s` with the CONTENTS of every string literal replaced by spaces.
-
-    Same length, so indices stay comparable with the original. Quote characters
-    themselves are kept — only what is BETWEEN them is blanked.
-
-    Bracket counting must not see punctuation that is data. Counting raw text let
-    a quoted `)` close a call early:
-
-        ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (")", x))[1]
-
-    `_call_end` stopped inside the callback, so `_is_selected_from` resumed there,
-    never reached the `[1]`, and exempted an Apple-Silicon-only command. Escapes
-    are honoured for the same reason `_code_part` honours them — a `\\"` does not
-    end the string.
-
-    REGEX LITERALS count as data too — `/\\)/` carries the same escaped `)`. Since
-    `_code_part` has already removed comments before anything here runs, quotes,
-    template literals and regex literals are the COMPLETE set of constructs that
-    can hold punctuation as data on one line of JS/TS. Python has no regex
-    literal, so the same set covers it. That is why this closes the class rather
-    than excluding one more shape: three rounds of this bug were three different
-    containers, each fixed on its own.
-    """
-    out = list(s)
-    q = None          # quote char, or "/" while inside a regex literal
-    cls = False       # inside a regex [...] character class, where "/" is literal
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        if q:
-            if ch == "\\":
-                out[i] = " "
-                if i + 1 < len(s):
-                    out[i + 1] = " "
-                i += 2
-                continue
-            if q == "/":
-                # A "/" inside a character class does not end the regex.
-                if ch == "[":
-                    cls = True
-                elif ch == "]":
-                    cls = False
-                if ch == "/" and not cls:
-                    q = None
-                else:
-                    out[i] = " "
-            elif ch == q:
-                q = None
-            else:
-                out[i] = " "
-        elif ch in "\"'`":
-            q = ch
-        elif ch == "/" and _starts_regex(s, i):
-            q = "/"
-            cls = False
-        i += 1
-    return "".join(out)
-
-
-# A `/` after one of these keywords opens a REGEX, not a division — the keyword
-# ends an identifier, which otherwise reads as "an expression to divide".
+# A `/` after one of these keywords opens a REGEX: each takes an operand, so the
+# identifier before the slash does not end an expression.
 _REGEX_KEYWORDS = frozenset((
     "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
     "case", "do", "else", "yield", "await", "throw",
 ))
 
-# A `/` directly after one of these is DIVISION: each can end an expression.
-# This is the standard JS token set, not an ad-hoc list — enumerating only the
-# shapes reported so far is what made this need three passes:
-#   * `)` `]`      — call/index/group results;
-#   * `}`          — an object literal or block;
-#   * `"` `'` `` ` `` — a string or template ( `"abc" / 2` divides );
-#   * identifiers, digits, `_`, `$` — unless the identifier is a keyword that
-#     takes an operand (`return /a/`), which `_REGEX_KEYWORDS` lists.
-# Handled separately below because they are TWO characters: postfix `++` / `--`.
-_DIV_PREV = set("_$)]}" + "\"'`")
+
+# Keywords after which a `{` opens a BLOCK even though an operand is expected.
+_STMT_KEYWORDS = frozenset(("else", "do", "try", "finally"))
+
+
+def _lex(s, probe=None):
+    """One left-to-right lex of a single line. Returns (blanked, probe_answer).
+
+    `blanked` is `s` with the CONTENTS of every string, template and regex
+    literal replaced by spaces — same length, delimiters kept, so indices stay
+    comparable with the original. Bracket counting must not see punctuation that
+    is data; a quoted or regex-escaped `)` used to close a call early, which let
+    `_call_end` stop inside a callback and miss a deterministic subscript.
+
+    `probe` is an index; `probe_answer` is True when a `/` there opens a REGEX
+    rather than divides.
+
+    Everything hangs off ONE piece of state: is an OPERAND expected at this
+    point? That single question answers all three ambiguous tokens, which is why
+    this replaced a growing list of per-token special cases —
+
+      *  `/`  opens a regex when an operand is expected, else it divides;
+      *  `{`  is an object LITERAL when an operand is expected, else a BLOCK;
+      *  `}`  ends an object (an expression, so a `/` after it divides) or ends
+              a block (a statement, so a `/` after it opens a regex) — which one
+              is known from the brace stack, not from the character.
+
+    That last pair is the reason for the stack. Reading `}` as always-division
+    let `if (x) {} /\\)/.test(x)` hide a `)` inside regex data; reading it as
+    always-regex blanked `{} / 2` and flagged valid code. Neither answer is
+    right for the character alone; both are right for the brace it closes.
+
+    Two positions need help beyond the operand flag, because a `{` there opens a
+    BLOCK even though an operand is expected: an arrow body (`x => {`) and the
+    statement keywords (`else {`, `do {`, `try {`, `finally {`).
+    """
+    out = list(s)
+    n = len(s)
+    operand = True        # an operand/expression is expected here
+    block_next = False    # the next `{` is a block body, not an object literal
+    braces = []           # True = object literal, False = statement block
+    ans = None
+    i = 0
+    while i < n:
+        ch = s[i]
+        if ch in " \t":
+            i += 1
+            continue
+        if ch in "\"'`":                       # string / template literal
+            j = i + 1
+            while j < n:
+                if s[j] == "\\":
+                    out[j] = " "
+                    if j + 1 < n:
+                        out[j + 1] = " "
+                    j += 2
+                    continue
+                if s[j] == ch:
+                    break
+                out[j] = " "
+                j += 1
+            operand, block_next, i = False, False, j + 1
+            continue
+        if ch == "/":
+            if probe == i:
+                ans = operand
+            if not operand:                     # division
+                operand, block_next, i = True, False, i + 1
+                continue
+            j = i + 1                           # regex literal
+            cls = False
+            while j < n:
+                if s[j] == "\\":
+                    out[j] = " "
+                    if j + 1 < n:
+                        out[j + 1] = " "
+                    j += 2
+                    continue
+                if s[j] == "[":
+                    cls = True
+                elif s[j] == "]":
+                    cls = False
+                elif s[j] == "/" and not cls:
+                    break
+                out[j] = " "
+                j += 1
+            operand, block_next, i = False, False, j + 1
+            continue
+        if ch == "{":
+            braces.append(operand and not block_next)
+            operand, block_next, i = True, False, i + 1
+            continue
+        if ch == "}":
+            # Closing an object literal ends an EXPRESSION; closing a block ends
+            # a STATEMENT. An empty stack means the `{` is off-line: assume the
+            # expression reading, which is what a bare `{...} / 2` fragment is.
+            operand = not (braces.pop() if braces else True)
+            block_next, i = False, i + 1
+            continue
+        if ch in "([":
+            operand, block_next, i = True, False, i + 1
+            continue
+        if ch in ")]":
+            operand, block_next, i = False, False, i + 1
+            continue
+        if ch.isalnum() or ch in "_$":
+            j = i
+            while j < n and (s[j].isalnum() or s[j] in "_$"):
+                j += 1
+            word = s[i:j]
+            operand = word in _REGEX_KEYWORDS or word in _STMT_KEYWORDS
+            block_next = word in _STMT_KEYWORDS
+            i = j
+            continue
+        if s[i:i + 2] in ("++", "--"):
+            # Postfix keeps the expression closed; prefix keeps an operand due.
+            i += 2
+            continue
+        if s[i:i + 2] == "=>":
+            operand, block_next, i = True, True, i + 2
+            continue
+        operand, block_next, i = True, False, i + 1   # any other operator
+    return "".join(out), ans
+
+
+def _blank_strings(s):
+    """`s` with the contents of every string, template and regex literal blanked."""
+    return _lex(s)[0]
 
 
 def _starts_regex(s, i):
-    """Does the `/` at `s[i]` open a regex literal rather than divide?
-
-    The standard JS disambiguation: a `/` opens a regex unless the preceding
-    token could END an expression. Comments never reach here — `_code_part`
-    strips them first — so the only two readings are regex and division.
-
-    Guessing "regex" wrongly is the EXPENSIVE direction for this scanner: the
-    rest of the line is blanked, `_call_end` then fails closed, and valid
-    portable code gets flagged — the exact asymmetry this PR exists to remove.
-    A single `+` or `-` still opens a regex (`a + /re/.test(b)`); only the
-    doubled postfix form ends an expression.
-    """
-    j = i - 1
-    while j >= 0 and s[j] in " \t":
-        j -= 1
-    if j < 0:
-        return True                       # line starts with it
-    if j >= 1 and s[j - 1:j + 1] in ("++", "--"):
-        return False                      # postfix increment/decrement
-    prev = s[j]
-    if prev.isalnum() or prev in _DIV_PREV:
-        if not (prev.isalpha() or prev in "_$"):
-            return False                  # digit / ) / ] / } / quote -> division
-        k = j
-        while k >= 0 and (s[k].isalnum() or s[k] in "_$"):
-            k -= 1
-        return s[k + 1:j + 1] in _REGEX_KEYWORDS
-    return True
+    """Does the `/` at `s[i]` open a regex literal rather than divide?"""
+    ans = _lex(s, probe=i)[1]
+    return True if ans is None else ans
 
 
 def _call_end(code, name_end):
@@ -305,8 +338,12 @@ def _is_selected_from(code, close_idx, next_code=None):
       * a subscript on the same line;
       * a method that is NOT a runtime probe (`.at`, `.pop`, ...) — the allowlist
         is `_PROBING_METHODS`, so an unrecognised method fails CLOSED;
-      * a subscript that opens the NEXT line, because JS lets the member
-        expression continue across the break. `next_code` carries it.
+      * a subscript OR a method that opens the NEXT line, because JS lets the
+        member expression continue across the break. `next_code` carries it.
+
+    Only ONE line of lookahead exists, so a chain whose selector sits on a THIRD
+    line is not reachable from here. That is stated rather than papered over:
+    `next_code` is all `main()` has.
 
     `.find(exists)` / `.filter(...)` stay permitted: they choose at RUNTIME by
     probing, which is exactly what makes a candidate list portable.
@@ -336,9 +373,17 @@ def _is_selected_from(code, close_idx, next_code=None):
                 return _is_selected_from(code, end, next_code)
             return True
         return False
-    # Group ended at end-of-line: a subscript may open the next line.
-    if next_code is not None and next_code.lstrip().startswith("["):
-        return True
+    # Group ended at end-of-line: the member expression may continue there.
+    if next_code is not None:
+        nxt = next_code.lstrip()
+        if nxt.startswith("["):
+            return True
+        if nxt.startswith("."):
+            # A METHOD continuing on the next line was previously invisible, so
+            # the whole chain — transform, selector and all — went unread and the
+            # list was exempted. Re-enter with a synthetic close at index 0 so
+            # exactly the same rules apply as on one line.
+            return _is_selected_from("]" + nxt, 0, None)
     return False
 
 

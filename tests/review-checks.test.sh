@@ -121,6 +121,19 @@ check "brace-ended expression division + probe passes"  clean $'+++ b/skills/x/d
 check "a single + still opens a regex"                  clean $'+++ b/skills/x/d5.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (a + /\\)/.source, x)).find(exists);'
 check "postfix division + author-time index still flags" flag $'+++ b/skills/x/d6.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (n++ / 2, x))[1];'
 
+# A method chain CONTINUING ON THE NEXT LINE was invisible: only a bare `[`
+# opener was followed, so `.map(...)[1]` split across the break went unread and
+# the list was exempted. Present since this branch first added the paired allow,
+# NOT introduced by the `}` change — the minimal shape below has no brace and no
+# regex and bypassed identically at every head of this PR.
+check "2-line chain: transform then index selects"     flag  $'+++ b/skills/x/L1.ts\n@@ -1,0 +1,2 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .map(x => x)[1];'
+check "2-line chain: selector method selects"          flag  $'+++ b/skills/x/L2.ts\n@@ -1,0 +1,2 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .at(1);'
+check "2-line chain: block-close regex then index"     flag  $'+++ b/skills/x/L3.ts\n@@ -1,0 +1,2 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .map(x => { if (x) {} /\\)/.test(x); return x; })[1];'
+check "2-line chain: transform then probe passes"      clean $'+++ b/skills/x/L4.ts\n@@ -1,0 +1,2 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .map(x => x).find(exists);'
+check "2-line chain: probe alone passes"               clean $'+++ b/skills/x/L5.ts\n@@ -1,0 +1,2 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .find(exists);'
+check "1-line block-close regex then index selects"    flag  $'+++ b/skills/x/L6.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => { if (x) {} /\\)/.test(x); return x; })[1];'
+check "object-literal division + index still selects"  flag  $'+++ b/skills/x/L7.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => ({} / 2, x))[1];'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

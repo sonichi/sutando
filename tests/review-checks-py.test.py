@@ -852,6 +852,64 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 18 (john-the-dev, review of db6dc00). TWO findings, and they are not the
+# same one.
+#
+# (a) `}` is genuinely ambiguous: it ends an object literal (an EXPRESSION, so a
+#     following `/` divides) or a block (a STATEMENT, so a `/` opens a regex).
+#     Round 17 answered "always division" and round 16 "always regex"; each is
+#     wrong half the time. `_lex` now decides from the BRACE STACK — one
+#     left-to-right pass whose single piece of state, "is an operand expected
+#     here?", also answers `/` and `{`. That is what retires the per-token
+#     special cases.
+#
+# (b) The reported repro also needed a CROSS-LINE chain, and that half was
+#     misattributed to (a). `_is_selected_from` followed only a `[` opening the
+#     next line, so a `.map(...)` continuing there went unread entirely. The
+#     minimal shape — no brace, no regex — bypassed identically at EVERY head of
+#     this branch including the one before round 14, so it is a gap in the
+#     feature this PR adds, not a regression from round 17. Round 17 merely
+#     removed an accidental fail-closed that had been masking it.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    D = '+++ b/src/x.ts\n@@ -1,0 +1,2 @@\n+const cmd = ' + L + '\n+'
+
+    ok("main(): a 2-line chain ending in a subscript selects",
+       "hardcoded path" in scan(D + '  .map(x => x)[1];')[1])
+    ok("main(): a 2-line chain ending in a selector method selects",
+       "hardcoded path" in scan(D + '  .at(1);')[1])
+    ok("main(): a 2-line chain ending in a PROBE is permitted",
+       scan(D + '  .map(x => x).find(exists);')[1].strip() == "")
+    ok("main(): a bare probe on the next line is permitted",
+       scan(D + '  .find(exists);')[1].strip() == "")
+
+    ok("main(): a block-closing `}` lets a regex follow (data, not syntax)",
+       "hardcoded path" in scan('+++ b/src/y.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L
+                                + '.map(x => { if (x) {} /\\)/.test(x); return x; })[1];')[1])
+    ok("main(): an object-literal `}` divides, and the index still selects",
+       "hardcoded path" in scan('+++ b/src/z.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L
+                                + '.map(x => ({} / 2, x))[1];')[1])
+    ok("main(): the same object-literal division with a PROBE is permitted",
+       scan('+++ b/src/z2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L
+            + '.map(x => ({} / 2, x)).find(exists);')[1].strip() == "")
+
+    # `_lex` decides `{` and `}` from the same operand state as `/`.
+    ok("_lex: `}` closing a BLOCK leaves an operand due, so `/` is a regex",
+       rc._starts_regex("if (x) {} /a/", 10))
+    ok("_lex: `}` closing an OBJECT ends an expression, so `/` divides",
+       not rc._starts_regex("{} / 2", 3))
+    ok("_lex: an arrow body `{` is a block, not an object literal",
+       rc._starts_regex("f(x => { if (y) {} /a/", 19))
+    ok("_lex: `else {` is a block even though an operand is expected",
+       rc._starts_regex("if (a) {} else {} /a/", 18))
+    ok("_lex: regex contents are still blanked", "(" not in rc._blank_strings("f(/a(b/)")[3:6])
+    ok("_lex: division is still not a regex", rc._blank_strings("a / b) c") == "a / b) c")
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so
