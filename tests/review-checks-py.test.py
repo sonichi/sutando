@@ -238,6 +238,49 @@ code, out = scan(
 )
 ok("code after a closed block comment is scanned", "/Users/after/block" in out)
 
+# --- JSDoc body whose opener is OUTSIDE the hunk (#2474 review) -------------
+# A unified diff carries 3 context lines, so editing a JSDoc body more than 3
+# lines below its `/**` leaves the opener out of the hunk. Block state must be
+# inferred from the hunk's own content, not reset to False.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -20,3 +20,4 @@\n'
+    ' * earlier prose\n'
+    '+ * On macOS /Users/legacy/thing is gone.\n'
+    ' */\n'
+    ' export function x() {}'
+)
+ok("JSDoc body is exempt when its opener is outside the hunk", out.strip() == "")
+
+# The path sits in the comment portion of the line that OPENS the comment, so a
+# line-level `state before this line` test gets it wrong.
+code, out = scan(
+    '+++ b/src/y.js\n'
+    '@@ -1,0 +1,2 @@\n'
+    '+/** helper for /Users/legacy/thing resolution\n'
+    '+ *  more prose'
+)
+ok("path inside the comment portion of an opening line is exempt", out.strip() == "")
+
+# ...but code AFTER a close on the same line is still scanned.
+code, out = scan(
+    '+++ b/src/z.js\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+/* note */ const p = "/Users/after/close";'
+)
+ok("code after a same-line comment close is scanned", "/Users/after/close" in out)
+
+# The inference must not swallow the bypass: no delimiters in the hunk at all
+# means "assume code".
+code, out = scan(
+    '+++ b/src/m.js\n'
+    '@@ -1,0 +1,2 @@\n'
+    '+const n = 2\n'
+    '+  * "/Users/alice/secret".length;'
+)
+ok("hunk inference does not resurrect the multiplication bypass",
+   "/Users/alice/secret" in out)
+
 # --- flag_exact: whole-token, not substring (#2474 review) ------------------
 # A full executable path must not reject longer siblings in the same directory
 # family: /usr/bin/swift-inspect is a separate REAL binary (own inode, link

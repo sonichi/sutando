@@ -81,20 +81,70 @@ def _block_transition(line, in_block):
     inside a string literal moves the state. Erring toward scanning is the safe
     direction, and the flagged-path cost of the reverse is what this fixes.
     """
+    return _mask_comments(line, in_block)[1]
+
+
+def _mask_comments(line, in_block):
+    """Blank out block-comment REGIONS of `line`; return (masked, state_after).
+
+    Position-level rather than line-level, because both halves of a line matter:
+
+        /** helper for /usr/bin/python3 resolution     ← path is inside the
+                                                         comment it opens: exempt
+        /* note */ const p = "/usr/bin/git";           ← path is after the close:
+                                                         still scanned
+
+    A line-level `was_in_block` test gets the first case wrong (the comment is
+    entered ON this line, so the state BEFORE it is False) — which flagged
+    legitimate resolver documentation (@john-the-dev, reviewing #2474).
+
+    Masking with spaces rather than deleting keeps every column index stable, so
+    the reported token and line number still line up with the real source.
+    """
+    out = []
     i = 0
     n = len(line)
     state = in_block
     while i < n:
         if not state and line.startswith("/*", i):
             state = True
+            out.append("  ")
             i += 2
             continue
         if state and line.startswith("*/", i):
             state = False
+            out.append("  ")
             i += 2
             continue
+        out.append(" " if state else line[i])
         i += 1
-    return state
+    return "".join(out), state
+
+
+def _hunk_opens_in_block(lines):
+    """True when a hunk's own content proves it began INSIDE a block comment.
+
+    A unified diff shows three lines of context, so editing a JSDoc body more
+    than three lines below its `/**` leaves the opener outside the hunk
+    entirely. Resetting block state at every `@@` therefore scanned ordinary
+    documentation as code — the single most likely way this gate would start
+    rejecting legitimate resolver docs (@john-the-dev, reviewing #2474).
+
+    The inference is deliberately one-directional: a `*/` appearing before any
+    `/*` can only happen if a comment was opened ABOVE the hunk. No closer, or
+    an opener first, means "assume code" — so the multiplication bypass
+    (`const n = 2` / `  * "…"`, which contains neither delimiter) is still
+    scanned.
+    """
+    for text in lines:
+        i = 0
+        while i < len(text):
+            if text.startswith("/*", i):
+                return False
+            if text.startswith("*/", i):
+                return True
+            i += 1
+    return False
 
 
 def _doc_transition(line, in_doc):
@@ -114,6 +164,21 @@ def _doc_transition(line, in_doc):
     return bool(_DOCSTRING_OPEN.match(line.lstrip())) and quotes % 2 == 1
 
 
+def _hunk_body(all_lines, start):
+    """New-file view of the hunk beginning after index `start`: context + added
+    lines with their diff marker stripped, stopping at the next hunk or file."""
+    body = []
+    j = start + 1
+    while j < len(all_lines):
+        nxt = all_lines[j]
+        if nxt.startswith("@@ ") or nxt.startswith("+++ ") or nxt.startswith("diff "):
+            break
+        if nxt.startswith(" ") or nxt.startswith("+"):
+            body.append(nxt[1:])
+        j += 1
+    return body
+
+
 def main():
     diff = sys.stdin.read()  # streamed by the runner — see module docstring (#2281)
     skip = False
@@ -121,8 +186,9 @@ def main():
     cur_file = ""
     hits = 0
     in_doc = False   # inside a triple-quoted docstring/string block (reset per hunk)
-    in_block = False # inside a /* … */ block comment (reset per hunk)
-    for raw in diff.split("\n"):
+    in_block = False # inside a /* … */ block comment (inferred per hunk)
+    all_lines = diff.split("\n")
+    for idx, raw in enumerate(all_lines):
         if raw.startswith("+++ "):
             f = raw[4:].split("\t")[0]
             if f.startswith("b/"):
@@ -141,7 +207,10 @@ def main():
             # (gaps between hunks); reset so a docstring opened + closed within
             # this hunk is tracked, without carrying stale state across a gap.
             in_doc = False
-            in_block = False
+            # Block state cannot simply reset: the `/**` opener is routinely
+            # outside the 3 lines of context. Infer it from the hunk's own
+            # content instead (see _hunk_opens_in_block).
+            in_block = _hunk_opens_in_block(_hunk_body(all_lines, idx))
             continue
         if raw.startswith("-"):
             continue
@@ -165,20 +234,22 @@ def main():
             # the opening `"""` line itself is still checked.
             was_in_doc = in_doc
             in_doc = _doc_transition(line, in_doc)
-            was_in_block = in_block
-            in_block = _block_transition(line, in_block)
+            # Mask block-comment REGIONS so a path is judged by where it sits on
+            # the line, not by the line's state before it. `scan` is what the
+            # patterns are matched against; `stripped` stays the real source so
+            # the reported line is readable.
+            scan_line, in_block = _mask_comments(line, in_block)
             stripped = line.lstrip()
-            if was_in_doc or was_in_block or stripped.startswith("#") \
-                    or stripped.startswith("//"):
+            if was_in_doc or stripped.startswith("#") or stripped.startswith("//"):
                 continue
             # (pattern, exact) — exact patterns fire only when the extracted
             # token IS the pattern, so a longer sibling filename in the same
             # directory family (swift-inspect vs swift) is untouched.
             for p, exact in [(f, False) for f in flags] + [(f, True) for f in flags_exact]:
-                pos = line.find(p)
+                pos = scan_line.find(p)
                 if pos < 0:
                     continue
-                tok = token_at(line, pos)
+                tok = token_at(scan_line, pos)
                 if exact and tok != p:
                     continue
                 if not allowed(tok):
