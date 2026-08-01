@@ -71,6 +71,49 @@ _resolve_conflicts_keep_ours "origin/dd2" "$TMP/bk2" 2>/dev/null
 [ -z "$(git diff --name-only --diff-filter=U)" ]
 check $? "DD conflict (no stage 3) resolves without crashing"
 
+# --- BLOCKER 1 regression: a backup WRITE FAILURE must be loud and must not
+# --- be summarised as success (john-the-dev #2476). Force it the way the
+# --- reviewer did: make the backup's parent dir a regular FILE.
+WS2="$TMP/ws2"; mkdir -p "$WS2"; cd "$WS2" || exit 1
+git init -q .; git config user.email t@t; git config user.name t
+mkdir -p dir; printf 'base\n' > dir/note.md
+git add dir/note.md; git commit -qm base
+git checkout -q -b peer2
+printf 'base\nPEER-ONLY\n' > dir/note.md; git commit -qam peer
+git checkout -q -; printf 'base\nOURS-ONLY\n' > dir/note.md; git commit -qam ours
+git merge peer2 >/dev/null 2>&1
+BK2="$WS2/backup"
+mkdir -p "$BK2"; : > "$BK2/dir"          # a FILE where mkdir -p needs a dir
+OUT="$(_resolve_conflicts_keep_ours "origin/peer2" "$BK2" 2>&1)"
+
+[ -z "$(git diff --name-only --diff-filter=U)" ]
+check $? "write-failure: merge still concludes (preservation stays non-blocking)"
+grep -q OURS-ONLY dir/note.md; check $? "write-failure: our side still kept"
+printf '%s' "$OUT" | grep -q "could NOT preserve"
+check $? "write-failure: the failing path is named LOUDLY"
+printf '%s' "$OUT" | grep -q "NOT saved"
+check $? "write-failure: summary reports the failure"
+# Match EVERY known phrasing of the total-preservation claim, including the
+# pre-fix one — greping only the new wording passes vacuously against the old
+# code, which is the defect this whole PR is about.
+printf '%s' "$OUT" | grep -qE "each discarded incoming file is preserved|all [0-9]+ discarded incoming file"
+[ $? -ne 0 ]; check $? "write-failure: summary does NOT claim everything was preserved (any wording)"
+
+# --- BLOCKER 2 regression: the DEFAULT backup location is git-private, so no
+# --- vault.sync.include configuration can stage it.
+cd "$WS2" || exit 1
+git checkout -q -b peer3 2>/dev/null; printf 'x\nP3\n' > dir/note.md; git commit -qam p3 >/dev/null 2>&1
+git checkout -q -; printf 'x\nO3\n' > dir/note.md; git commit -qam o3 >/dev/null 2>&1
+git merge peer3 >/dev/null 2>&1
+_resolve_conflicts_keep_ours "origin/peer3" >/dev/null 2>&1     # NO explicit root -> default
+GITDIR="$(git rev-parse --git-dir)"
+[ -d "$GITDIR/sutando-sync-conflicts" ]
+check $? "default backup root lives under the git dir (never trackable)"
+# (Removed a "cannot appear in git status" assertion here: against the pre-fix
+# code it passed for the wrong reason — that default root sat OUTSIDE the repo,
+# so git status was trivially clean. The under-the-git-dir check above is the
+# one that actually discriminates.)
+
 printf '\n%s: %d passed, %d failed\n' "sync conflict preserves theirs" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 printf 'PASS — sync-workspace conflict fallback preserves the discarded side\n'

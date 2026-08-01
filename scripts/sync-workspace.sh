@@ -907,27 +907,56 @@ cmd_pull_only() {
 # rebuilds the loop it checks passes just as happily against the unfixed script.
 _resolve_conflicts_keep_ours() {
     local peer="${1:-peer}" backup_root="${2:-}" f
-    [ -n "$backup_root" ] || backup_root="${WORKSPACE_DIR:-.}/state/sync-conflicts/$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%s' "$peer" | tr '/' '_')"
+    # Default location is INSIDE the git dir, not under state/. `state/` looked
+    # safe because it currently has 0 tracked files — but that is an observation
+    # of one config, not an invariant: `vault.sync.include` is user-configurable
+    # and _compose_exclude_content emits includes before excludes (last match
+    # wins), so a supported `state/` include un-ignores `state/**` and the next
+    # push would stage these backups. Anything under the git dir is never
+    # tracked by construction, whatever the carrier set says. `rev-parse
+    # --git-dir` resolves correctly for a worktree too, where .git is a file.
+    # (john-the-dev, #2476 review blocker 2.)
+    if [ -z "$backup_root" ]; then
+        local _gitdir; _gitdir="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+        backup_root="$_gitdir/sutando-sync-conflicts/$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%s' "$peer" | tr '/' '_')"
+    fi
+    # Counted, not assumed: the summary below must be a FUNCTION of what
+    # actually got written. v1 logged only on success and then claimed "each
+    # discarded incoming file is preserved" whenever the directory merely
+    # existed — so a failed mkdir/write discarded the peer's version silently
+    # while telling the operator it was recoverable (blocker 1, reproduced by
+    # the reviewer by making backup/dir a regular file).
+    local saved=0 failed=0 failed_list=""
     while IFS= read -r -d '' f; do
         if git show ":3:$f" >/dev/null 2>&1; then
             if mkdir -p "$backup_root/$(dirname "$f")" 2>/dev/null &&
                git show ":3:$f" > "$backup_root/$f" 2>/dev/null; then
+                saved=$((saved + 1))
                 log "_resolve_conflicts_keep_ours: discarded incoming $f -> $backup_root/$f"
+            else
+                failed=$((failed + 1))
+                failed_list="${failed_list:+$failed_list, }$f"
+                # Loud per-file: this one is genuinely unrecoverable.
+                log "_resolve_conflicts_keep_ours: FAILED to preserve $f — incoming version is LOST"
+                color_warn "sync-workspace: could NOT preserve the incoming version of $f (backup write failed under $backup_root) — that version is discarded unrecoverably"
             fi
         else
             log "_resolve_conflicts_keep_ours: discarded incoming $f (no stage-3 blob to preserve)"
         fi
         # `--ours` fails on DD-conflicts (both sides deleted) — the file isn't
         # on our side either. Fall back to `git rm` so the merge can complete
-        # cleanly. Surfaced by Mini #1445 v3 Test 12.
+        # cleanly. Surfaced by Mini #1445 v3 Test 12. Preservation stays
+        # best-effort: a backup failure must never block the merge.
         if git checkout --ours -- "$f" 2>/dev/null; then
             git add -- "$f"
         else
             git rm -f -- "$f" 2>/dev/null || true
         fi
     done < <(git diff --name-only --diff-filter=U -z)
-    if [ -d "$backup_root" ]; then
-        color_warn "sync-workspace: kept the local version on conflict with $peer; each discarded incoming file is preserved under $backup_root"
+    if [ "$failed" -gt 0 ]; then
+        color_warn "sync-workspace: kept the local version on conflict with $peer; $saved incoming file(s) preserved under $backup_root, $failed NOT saved ($failed_list)"
+    elif [ "$saved" -gt 0 ]; then
+        color_warn "sync-workspace: kept the local version on conflict with $peer; all $saved discarded incoming file(s) preserved under $backup_root"
     fi
 }
 
