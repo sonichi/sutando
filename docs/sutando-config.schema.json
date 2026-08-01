@@ -42,14 +42,14 @@
     "claude_sutando_config_dir": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Where the Sutando-scoped Claude Code config lives \u2014 set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
+      "description": "Where the Sutando-scoped Claude Code config lives — set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
       "properties": {
         "subdir": {
           "type": "string",
           "minLength": 1,
           "default": ".claude-sutando",
           "pattern": "^(?!.*\\.\\.)(?!/)[^/].*$",
-          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace \u2014 absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
+          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace — absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
         }
       }
     },
@@ -110,7 +110,7 @@
         "sync": {
           "type": "object",
           "additionalProperties": false,
-          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) \u2014 overriding in .local.json wipes the defaults for that array.",
+          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) — overriding in .local.json wipes the defaults for that array.",
           "properties": {
             "include": {
               "type": "array",
@@ -138,24 +138,35 @@
         }
       }
     },
+    "bridges": {
+      "type": "object",
+      "description": "Bridge-wide toggles shared by the Discord/Telegram/Slack bridges.",
+      "additionalProperties": false,
+      "properties": {
+        "progress_stream": {
+          "type": "boolean",
+          "description": "Emit in-channel '⏳ working… (Ns)' progress placeholders while a task runs."
+        }
+      }
+    },
     "migrate": {
       "type": "object",
+      "description": "Per-clone migration hints consumed by scripts/sutando-config.sh (migrate-stale-hosts, migrate-skip-skills).",
       "additionalProperties": false,
-      "description": "Legacy-import tuning for `scripts/sync-workspace.sh`. Per-clone and machine-specific, so it belongs in sutando.config.local.json (gitignored) rather than the tracked default config — it is config, not a secret, so it does NOT belong in .env either. Both lists default to empty (drop nothing / salvage everything). Read via `scripts/sutando-config.sh migrate-stale-hosts` and `migrate-skip-skills`.",
       "properties": {
         "stale_hosts": {
           "type": "array",
-          "items": { "type": "string" },
-          "default": [],
-          "description": "Per-clone `machine-<host>` directory names the legacy import should DROP rather than carry forward.",
-          "examples": [["Chis-MBP"]]
+          "description": "Per-clone machine-<host> dirs treated as stale during migration.",
+          "items": {
+            "type": "string"
+          }
         },
         "skip_skills": {
           "type": "array",
-          "items": { "type": "string" },
-          "default": [],
-          "description": "Host-only skill names the legacy import should NOT salvage into shared (stale or superseded elsewhere).",
-          "examples": [["old-experiment"]]
+          "description": "Host-only skill names excluded from the migration sweep.",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
