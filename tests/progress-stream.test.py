@@ -6,6 +6,8 @@ matching the repo's other *.test.py suites).
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -80,6 +82,49 @@ with tempfile.TemporaryDirectory() as _cd:
     check("resolve_progress_stream True", _resolve_with(True) is True)
     check("resolve_progress_stream False", _resolve_with(False) is False)
     check("resolve_progress_stream unset → None", _resolve_with(None) is None)
+
+    # --- ONLY a real JSON boolean counts (#2308 review, qingyun + john) ---
+    # The old `bool(val)` inverted intent on exactly the shapes people type
+    # when DISABLING something: `"false"` and `{"enabled": false}` both became
+    # True and switched owner-channel progress messages ON. The loader is
+    # deliberately schema-lenient at runtime, so the JSON schema does not
+    # protect a hand-edited sutando.config.local.json — the guard lives in the
+    # resolver and this is its regression.
+    #
+    # Deliberately the whole TYPE AXIS, not just the three values the reviewers
+    # named: the property is "non-bool ⇒ unset", so a fixture that only pins
+    # str/dict/int would stay green if a future branch special-cased lists or
+    # floats. Truthy AND falsy of each type, because the bug was a truthiness
+    # bug and a falsy-only fixture would have passed against the broken code.
+    def _resolve_capturing_stderr(val):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = _resolve_with(val)
+        return got, ("must be a JSON boolean" in err.getvalue())
+
+    for _label, _val in [
+        ('string "false"', "false"),          # the headline case
+        ('string "true"', "true"),
+        ('string "no"', "no"),
+        ("empty string", ""),
+        ('object {"enabled": false}', {"enabled": False}),
+        ("empty object", {}),
+        ("list [1]", [1]),
+        ("empty list", []),
+        ("int 1", 1),
+        ("int 0", 0),
+        ("float 1.0", 1.0),
+    ]:
+        _got, _warned = _resolve_capturing_stderr(_val)
+        check(f"non-bool {_label} → None (unset, streamer stays OFF)", _got is None)
+        check(f"non-bool {_label} emits a diagnostic", _warned)
+
+    # A real boolean must NOT draw the diagnostic — otherwise the warning is
+    # noise on every valid config and gets tuned out.
+    for _label, _val in (("True", True), ("False", False)):
+        _got, _warned = _resolve_capturing_stderr(_val)
+        check(f"bool {_label} still honored", _got is _val)
+        check(f"bool {_label} emits NO diagnostic", not _warned)
 sc._reset_cache_for_tests()
 
 # --- should_stream_task (owner-only) ---
