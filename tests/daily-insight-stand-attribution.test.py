@@ -13,6 +13,7 @@ Run: python3 tests/daily-insight-stand-attribution.test.py
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -90,14 +91,11 @@ class TestStandValueResolution(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         (repo / "src").mkdir()
         (repo / "scripts").mkdir()
+        shutil.copy2(ROOT / "src" / "sutando_config.py", repo / "src")
+        shutil.copy2(ROOT / "scripts" / "sutando-config.sh", repo / "scripts")
+        (repo / "sutando.config.json").write_text("{}\n")
         (repo / "sutando.config.local.json").write_text(
             '{"stand":"Echo Act IV Mini"}\n'
-        )
-        (repo / "scripts" / "sutando-config.sh").write_text(
-            "#!/bin/bash\n"
-            "ROOT=$(cd \"$(dirname \"$0\")/..\" && pwd)\n"
-            "python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"stand\"], end=\"\")' "
-            "\"$ROOT/sutando.config.local.json\"\n"
         )
         self.assertEqual(
             di._own_stand_value({}, repo_root=repo / "src"),
