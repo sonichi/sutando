@@ -134,6 +134,17 @@ check "2-line chain: probe alone passes"               clean $'+++ b/skills/x/L5
 check "1-line block-close regex then index selects"    flag  $'+++ b/skills/x/L6.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => { if (x) {} /\\)/.test(x); return x; })[1];'
 check "object-literal division + index still selects"  flag  $'+++ b/skills/x/L7.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => ({} / 2, x))[1];'
 
+# The chain must be carried until it RESOLVES or TERMINATES, not for a fixed
+# number of physical lines. Bounding it at one lookahead line meant ordinary
+# formatting — `.map(...)` and `[1]` on separate lines — slipped past.
+check "3-line chain: selector on the third line"       flag  $'+++ b/skills/x/M1.ts\n@@ -1,0 +1,3 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .map(x => x)\n+  [1];'
+check "3-line chain: selector METHOD on the third line" flag $'+++ b/skills/x/M2.ts\n@@ -1,0 +1,3 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .map(x => x)\n+  .at(1);'
+check "4-line chain still reaches the selector"        flag  $'+++ b/skills/x/M3.ts\n@@ -1,0 +1,4 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .map(x => x)\n+  .map(y => y)\n+  [1];'
+check "a blank line does not terminate the chain"      flag  $'+++ b/skills/x/M4.ts\n@@ -1,0 +1,4 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .map(x => x)\n+\n+  [1];'
+check "3-line chain ending in a PROBE passes"          clean $'+++ b/skills/x/M5.ts\n@@ -1,0 +1,3 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .map(x => x)\n+  .find(exists);'
+check "4-line chain ending in a PROBE passes"          clean $'+++ b/skills/x/M6.ts\n@@ -1,0 +1,4 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+  .map(x => x)\n+  .map(y => y)\n+  .find(exists);'
+check "a NON-continuation next line ends the chain"    clean $'+++ b/skills/x/M7.ts\n@@ -1,0 +1,2 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]\n+const other = 1;'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

@@ -910,6 +910,48 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 19 (john-the-dev, review of a25475f). Round 18 followed the chain across
+# ONE lookahead line and documented that as a limit. A documented limit is still
+# a hole: ordinary formatting puts `.map(...)` and `[1]` on separate lines, so a
+# selector on a THIRD line passed again. The walk now consumes following lines
+# until the chain RESOLVES (a probe) or TERMINATES (a selector, or a line that
+# is not a continuation), bounded by `_CHAIN_LOOKAHEAD` rather than by 1.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    def d(*rest):
+        return ('+++ b/src/m.ts\n@@ -1,0 +1,%d @@\n+const cmd = %s\n' % (len(rest) + 1, L)
+                + "".join("+" + r + "\n" for r in rest))
+
+    ok("main(): a selector on the THIRD line still selects",
+       "hardcoded path" in scan(d("  .map(x => x)", "  [1];"))[1])
+    ok("main(): a selector METHOD on the third line still selects",
+       "hardcoded path" in scan(d("  .map(x => x)", "  .at(1);"))[1])
+    ok("main(): a FOURTH-line selector is still reached",
+       "hardcoded path" in scan(d("  .map(x => x)", "  .map(y => y)", "  [1];"))[1])
+    ok("main(): a blank line does not terminate the chain",
+       "hardcoded path" in scan(d("  .map(x => x)", "", "  [1];"))[1])
+
+    ok("main(): a three-line chain ending in a PROBE is permitted",
+       scan(d("  .map(x => x)", "  .find(exists);"))[1].strip() == "")
+    ok("main(): a four-line chain ending in a PROBE is permitted",
+       scan(d("  .map(x => x)", "  .map(y => y)", "  .find(exists);"))[1].strip() == "")
+    ok("main(): a non-continuation line ENDS the chain (no false positive)",
+       scan(d("const other = 1;"))[1].strip() == "")
+
+    ok("_as_lines: a bare string is one lookahead line",
+       rc._as_lines("[1];") == ("[1];",))
+    ok("_as_lines: None is no lookahead", rc._as_lines(None) == ())
+    ok("_as_lines: a tuple passes through", rc._as_lines(("a", "b")) == ("a", "b"))
+    ok("_is_selected_from: walks a tuple to a later selector",
+       rc._is_selected_from('["/a","/b"]', 10, (".map(x => x)", "[1];")))
+    ok("_is_selected_from: a probe later in the tuple resolves",
+       not rc._is_selected_from('["/a","/b"]', 10, (".map(x => x)", ".find(e);")))
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so

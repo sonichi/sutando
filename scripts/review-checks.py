@@ -324,6 +324,22 @@ def _call_end(code, name_end):
     return None
 
 
+_CHAIN_LOOKAHEAD = 24
+
+
+def _as_lines(next_code):
+    """Normalise `next_code` to a tuple of following new-file lines.
+
+    Accepts a single string (one lookahead line, the shape the unit tests use)
+    or a tuple of them. `None` is no lookahead at all.
+    """
+    if next_code is None:
+        return ()
+    if isinstance(next_code, str):
+        return (next_code,)
+    return tuple(next_code)
+
+
 def _is_selected_from(code, close_idx, next_code=None):
     """True when the group closing at `close_idx` is SELECTED FROM rather than tried.
 
@@ -338,12 +354,13 @@ def _is_selected_from(code, close_idx, next_code=None):
       * a subscript on the same line;
       * a method that is NOT a runtime probe (`.at`, `.pop`, ...) — the allowlist
         is `_PROBING_METHODS`, so an unrecognised method fails CLOSED;
-      * a subscript OR a method that opens the NEXT line, because JS lets the
-        member expression continue across the break. `next_code` carries it.
-
-    Only ONE line of lookahead exists, so a chain whose selector sits on a THIRD
-    line is not reachable from here. That is stated rather than papered over:
-    `next_code` is all `main()` has.
+      * a subscript OR a method that opens a FOLLOWING line, because JS lets the
+        member expression continue across a break. `next_code` carries every
+        remaining new-file line, and the walk consumes them until the chain
+        RESOLVES (a probe) or TERMINATES (a selector, or something that is
+        neither) — not for a fixed number of lines. Bounding it at one physical
+        line meant ordinary formatting could put the selector on a third line
+        and slip past.
 
     `.find(exists)` / `.filter(...)` stay permitted: they choose at RUNTIME by
     probing, which is exactly what makes a candidate list portable.
@@ -373,17 +390,20 @@ def _is_selected_from(code, close_idx, next_code=None):
                 return _is_selected_from(code, end, next_code)
             return True
         return False
-    # Group ended at end-of-line: the member expression may continue there.
-    if next_code is not None:
-        nxt = next_code.lstrip()
+    # Group ended at end-of-line: the member expression may continue below.
+    for k, follow in enumerate(_as_lines(next_code)):
+        nxt = follow.lstrip()
+        if not nxt:
+            continue                      # a blank line does not end a chain
+        rest = tuple(_as_lines(next_code)[k + 1:])
         if nxt.startswith("["):
             return True
         if nxt.startswith("."):
-            # A METHOD continuing on the next line was previously invisible, so
-            # the whole chain — transform, selector and all — went unread and the
-            # list was exempted. Re-enter with a synthetic close at index 0 so
-            # exactly the same rules apply as on one line.
-            return _is_selected_from("]" + nxt, 0, None)
+            # Re-enter with a synthetic close at index 0 so exactly the same
+            # rules apply as on one line, carrying the REMAINING lines so a
+            # selector further down is still reached.
+            return _is_selected_from("]" + nxt, 0, rest)
+        return False                      # not a continuation — the chain ended
     return False
 
 
@@ -622,20 +642,30 @@ def main():
     _lines = diff.split("\n")
 
     def _next_code(i):
-        """Executable text of the next line that is part of the NEW file.
+        """Executable text of the following lines that are part of the NEW file.
 
-        A member expression may continue onto the following line, so a group that
-        ends at EOL can still be subscripted. Added AND context lines both exist
-        in the new file and both qualify; a `-`/`@@`/`+++` boundary does not.
+        A member expression may continue across a break, so a group that ends at
+        EOL can still be subscripted several lines down. Added AND context lines
+        both exist in the new file and both qualify; a `-`/`@@`/`+++` boundary
+        ends the run. Returns a TUPLE so the chain walk can keep consuming until
+        it resolves — a single line was not enough, because ordinary formatting
+        puts `.map(...)` and `[1]` on separate lines.
+
+        Capped at `_CHAIN_LOOKAHEAD` lines: a bound is needed so a huge hunk is
+        not rescanned per token, and the cap is stated rather than implicit.
         """
-        if i + 1 >= len(_lines):
-            return None
-        nxt = _lines[i + 1]
-        if nxt.startswith("+") and not nxt.startswith("+++"):
-            return _code_part(nxt[1:])
-        if nxt.startswith(" "):
-            return _code_part(nxt[1:])
-        return None
+        out = []
+        j = i + 1
+        while j < len(_lines) and len(out) < _CHAIN_LOOKAHEAD:
+            nxt = _lines[j]
+            if nxt.startswith("+++"):
+                break
+            if nxt.startswith("+") or nxt.startswith(" "):
+                out.append(_code_part(nxt[1:]))
+                j += 1
+                continue
+            break
+        return tuple(out) or None
 
     for _i, raw in enumerate(_lines):
         next_added = _next_code(_i)
