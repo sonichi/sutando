@@ -112,5 +112,56 @@ class ReviewPreflightTest(unittest.TestCase):
         self.assertNotIn("WARNING", out)
 
 
+class ReviewPreflightErrorPathTest(unittest.TestCase):
+    """The two failure branches CI measured as uncovered (91.8% diff coverage).
+
+    Both are the paths that run when the environment is degraded, which is
+    exactly when a reviewer needs the tool to behave predictably rather than
+    traceback.
+    """
+
+    def test_repo_root_falls_back_when_git_is_unavailable(self):
+        """`git rev-parse` raising must fall back to the script's own location."""
+        import unittest.mock as mock
+
+        def boom(*a, **kw):
+            raise FileNotFoundError("git not on PATH")
+
+        with mock.patch.object(pf.subprocess, "run", side_effect=boom):
+            root = pf.repo_root()
+        # The fallback is <script dir>/.. — i.e. the repo containing scripts/.
+        self.assertEqual(root, Path(pf.__file__).resolve().parent.parent)
+        self.assertTrue((root / "REVIEW.md").is_file(),
+                        "fallback must still locate the shipped guide")
+
+    def test_repo_root_falls_back_when_git_returns_empty(self):
+        """A git that succeeds but prints nothing must not yield Path('')."""
+        import subprocess as _sp
+        import unittest.mock as mock
+        done = _sp.CompletedProcess(args=[], returncode=0, stdout="   \n", stderr="")
+        with mock.patch.object(pf.subprocess, "run", return_value=done):
+            root = pf.repo_root()
+        self.assertEqual(root, Path(pf.__file__).resolve().parent.parent)
+
+    def test_unreadable_guide_exits_nonzero_without_traceback(self):
+        """A guide that exists but cannot be read reports and exits 1."""
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as td:
+            g = Path(td) / "REVIEW.md"
+            g.write_text(GUIDE)
+            with mock.patch.object(pf, "render", side_effect=OSError("EIO")):
+                code, out, err = self._run_capture(["--guide", str(g)])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot read", err)
+        self.assertIn("EIO", err)
+        self.assertEqual(out, "")
+
+    def _run_capture(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = pf.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
