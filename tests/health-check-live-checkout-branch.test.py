@@ -357,6 +357,27 @@ def main() -> int:
     check(len(calls) == 1 and "rev-list" not in " ".join(map(str, calls[0])),
           f"w) exactly ONE git invocation attempted, and not the stale-check: {calls}")
 
+    # x) `_commits_behind` own failure branch. Reached ONLY by calling it
+    #    directly: w) proves the branch call short-circuits first, so no
+    #    end-to-end path exercises this except clause — which is exactly why
+    #    diff-cover flagged these two lines. The branch is real: git can vanish
+    #    between the two calls, and rev-list can hit the 10s timeout on a large
+    #    repo. Either way the probe must degrade to "unanswerable", not raise
+    #    inside a health check.
+    with tempfile.TemporaryDirectory() as td:
+        repo = _mk_repo(Path(td))
+        real_run = hc.subprocess.run
+        for exc, label in ((OSError("git vanished"), "OSError"),
+                           (subprocess.TimeoutExpired(cmd="git", timeout=10), "TimeoutExpired")):
+            def _raise(*_a, _e=exc, **_k):
+                raise _e
+            hc.subprocess.run = _raise
+            try:
+                got = hc._commits_behind(repo, "main")
+            finally:
+                hc.subprocess.run = real_run
+            check(got is None, f"x) rev-list raising {label} -> None, got {got!r}")
+
     if FAILS:
         print(f"\n{len(FAILS)} failure(s)")
         return 1
