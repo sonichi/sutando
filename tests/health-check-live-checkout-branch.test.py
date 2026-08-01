@@ -378,6 +378,18 @@ def main() -> int:
                 hc.subprocess.run = real_run
             check(got is None, f"x) rev-list raising {label} -> None, got {got!r}")
 
+    # y) The config key must be DECLARED, not just read. The reviewer asked for
+    #    the config route "with the documented precedence"; its sibling
+    #    expected_branch is declared in three places, and a key the code reads
+    #    but nothing documents is the same documented-vs-implemented drift this
+    #    probe exists to catch — pointed at ourselves.
+    for rel, needle in (("docs/sutando-config.schema.json", '"checkout_behind_warn"'),
+                        ("sutando.config.local.json.example", '"checkout_behind_warn"'),
+                        ("docs/workspace-config.md", "checkout_behind_warn")):
+        f = REPO / rel
+        check(f.exists() and needle in f.read_text(),
+              f"y) core.checkout_behind_warn declared in {rel}")
+
     if FAILS:
         print(f"\n{len(FAILS)} failure(s)")
         return 1
