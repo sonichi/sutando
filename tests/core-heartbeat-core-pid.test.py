@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import tempfile
+import pathlib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -104,6 +105,60 @@ with tempfile.TemporaryDirectory() as td2:
     (b / "tmux").write_text("#!/bin/sh\nexit 1\n")
     check("core_pid() returns None when tmux fails (no server / socket gone)",
           _REAL_CORE_PID("/tmp/x.sock") is None)
+
+# --- REGRESSION 1: heartbeat starts BEFORE the core (cold boot) --------------
+# startup.sh:632 launches this process before the core launcher, so `saw_core`
+# must ARM on first sighting, not be decided once up front. Against the reviewed
+# head this loop wrote three beats and left .alive present.
+with tempfile.TemporaryDirectory() as td3:
+    tmp3 = pathlib.Path(td3); a3 = tmp3 / "h.alive"
+    ch.CORES_DIR = tmp3; ch._alive_path = lambda: a3
+    seq = {"n": 0}
+    def late_then_gone(socket_path=None, session=None):
+        seq["n"] += 1
+        if seq["n"] <= 2:
+            return None        # cold boot: no core yet
+        if seq["n"] <= 5:
+            return 777         # core comes up
+        return None            # ...and dies
+    ch.core_pid = late_then_gone
+    # The bound lives in write_beat, NOT in the core_pid stub: on the pre-fix
+    # module `saw_core` is decided once and stays False, so core_pid() is never
+    # called again and a counter there would never advance — the loop would hang
+    # instead of failing. write_beat is called every iteration on BOTH versions,
+    # so this terminates either way and lets the .alive assertion be the verdict.
+    beats = {"n": 0}
+    def bounded_beat(status="running"):
+        beats["n"] += 1
+        a3.write_text("{}")
+        if beats["n"] > 12:
+            ch._SHUTDOWN_REQUESTED = True
+    ch.write_beat = bounded_beat
+    ch._SHUTDOWN_REQUESTED = False
+    rc3 = ch.run_forever(interval=0.01)
+    check("cold boot: gate arms on a LATER core and still fires when it dies", rc3 == 0)
+    check("cold boot: .alive removed once the late core vanished", not a3.exists())
+    check("cold boot: it did not stop before the core ever appeared", seq["n"] > 3)
+
+# --- REGRESSION 2: sibling pane / watcher session must not read as the core ---
+# Codex runs `${SESSION}-watcher` on the SAME socket; Claude preserves sibling
+# WINDOWS in the core session. A first-pane-wins lookup returns those.
+with tempfile.TemporaryDirectory() as td4:
+    b4 = pathlib.Path(td4) / "bin"; b4.mkdir(parents=True)
+    # tmux stub: the core session does NOT exist; only the watcher does.
+    (b4 / "tmux").write_text(
+        "#!/bin/sh\n"
+        "for a in \"$@\"; do\n"
+        "  case \"$a\" in =sutando-core) exit 1 ;; esac\n"   # exact session absent
+        "done\n"
+        "echo 99999\n")                                         # any pane query would yield this
+    (b4 / "tmux").chmod(0o755)
+    # no `claude --name sutando-core` process either
+    (b4 / "pgrep").write_text("#!/bin/sh\nexit 1\n"); (b4 / "pgrep").chmod(0o755)
+    os.environ["PATH"] = f"{b4}:{os.environ['PATH']}"
+    got = _REAL_CORE_PID("/tmp/x.sock")
+    check("dead core + live watcher/sibling on the socket -> core_pid() is None (not 99999)",
+          got is None)
 
 print()
 if _fails:
