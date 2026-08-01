@@ -125,6 +125,22 @@ with tempfile.TemporaryDirectory() as _cd:
         _got, _warned = _resolve_capturing_stderr(_val)
         check(f"bool {_label} still honored", _got is _val)
         check(f"bool {_label} emits NO diagnostic", not _warned)
+
+    # The diagnostic is ONE-TIME, matching _warn_unknown_top_level_keys. The
+    # resolver is called per bridge message, so a per-call warning would spam
+    # the log for as long as the bad value sits in the config. Every case above
+    # resets the flag via _reset_cache_for_tests(), so without this the
+    # already-warned early-return never executes.
+    sc._reset_cache_for_tests()
+    _cfgp.write_text(json.dumps({"bridges": {"progress_stream": "false"}}))
+    _errs = []
+    for _ in range(3):
+        _e = io.StringIO()
+        with contextlib.redirect_stderr(_e):
+            sc.resolve_progress_stream(repo_root=Path(_cd))   # no reset between calls
+        _errs.append("must be a JSON boolean" in _e.getvalue())
+    check("diagnostic fires on the FIRST bad read", _errs[0])
+    check("diagnostic is one-time, not once per call", _errs[1:] == [False, False])
 sc._reset_cache_for_tests()
 
 # --- should_stream_task (owner-only) ---
