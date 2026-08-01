@@ -38,6 +38,27 @@ truncated silently with nothing anywhere to report it.
      leaves the count unchanged; a network call here would hang the whole run,
      so this probe can only under-report, never cry wolf
 
+Threshold + git-binary hardening (review of #2471). The first cut read
+`int(os.environ["SUTANDO_CHECKOUT_BEHIND_WARN"])` at IMPORT time, so a
+non-numeric value raised ValueError before the module finished loading and took
+down the entire health check; a zero warned on an exactly-current checkout; and
+it was an undocumented ad-hoc env var against the repo config rule. It also
+hardcoded a second bare "git", so fixing only the first call would leave the new
+path able to reopen the Xcode-CLT shim modal.
+
+  o) valid positive threshold from core.checkout_behind_warn → honored
+  p) zero            → falls back (would otherwise warn on a current checkout)
+  q) negative        → falls back
+  r) non-integer     → falls back, no ValueError
+  s) malformed config→ falls back
+  t) absent key      → falls back
+  u) the removed env var stays removed — a poisoned value is not even read
+  v) ONE git_bin swap point; no hardcoded "git" left in the probe; the
+     stale-check receives the same binary as the branch call
+  w) no-runnable-git control → ok degrade, and EXACTLY ONE git invocation is
+     attempted (the branch call), so the added stale-check cannot invoke a shim
+     the pre-existing call did not already hit
+
 Run: python3 tests/health-check-live-checkout-branch.test.py
 Exit code: 0 on pass, 1 on fail.
 """
@@ -210,10 +231,10 @@ def main() -> int:
 
     # j) THE GAP: on the expected branch, but far behind it -> warn.
     with tempfile.TemporaryDirectory() as td:
-        work = _mk_clone_behind(Path(td), hc._BEHIND_WARN + 2)
+        work = _mk_clone_behind(Path(td), hc._BEHIND_WARN_DEFAULT + 2)
         r = hc.check_live_checkout_branch(work)
         check(r["status"] == "warn", f"j) on main but behind -> warn, got {r['status']}")
-        check("behind" in r["detail"] and str(hc._BEHIND_WARN + 2) in r["detail"],
+        check("behind" in r["detail"] and str(hc._BEHIND_WARN_DEFAULT + 2) in r["detail"],
               f"j) warning names the count, got {r['detail'][:90]}")
 
     # k) A few commits behind is normal on a fast-moving main -> ok, but the
@@ -256,6 +277,85 @@ def main() -> int:
         after = hc._commits_behind(work, "main")
         check(before == after == 1,
               f"n) no implicit fetch: count stayed {before} -> {after} (want 1 -> 1)")
+
+    # --- threshold config + invalid classes (review of #2471) --------------
+    # The first cut read `int(os.environ["SUTANDO_CHECKOUT_BEHIND_WARN"])` at
+    # IMPORT time, so a non-numeric value raised ValueError before the module
+    # finished loading and took down the whole health check — a probe meant to
+    # reveal stale guards instead reporting no health at all. And a zero warned
+    # on an exactly-current checkout. Threshold now comes from the same durable
+    # `core` config as expected_branch, read lazily, with every invalid class
+    # falling back instead of crashing or crying wolf.
+    def _with_core(td: Path, cfg: str) -> Path:
+        repo = _mk_repo(td)
+        (repo / "sutando.config.local.json").write_text(cfg)
+        _reset_config_cache()
+        return repo
+
+    for label, cfg, want in [
+        ("o) valid positive threshold honored", '{"core": {"checkout_behind_warn": 3}}', 3),
+        ("p) zero falls back (would warn on a current checkout)", '{"core": {"checkout_behind_warn": 0}}', hc._BEHIND_WARN_DEFAULT),
+        ("q) negative falls back", '{"core": {"checkout_behind_warn": -5}}', hc._BEHIND_WARN_DEFAULT),
+        ("r) non-integer falls back (no ValueError)", '{"core": {"checkout_behind_warn": "not-a-number"}}', hc._BEHIND_WARN_DEFAULT),
+        ("s) malformed config falls back", '{not valid json', hc._BEHIND_WARN_DEFAULT),
+        ("t) absent key falls back", '{"core": {}}', hc._BEHIND_WARN_DEFAULT),
+    ]:
+        with tempfile.TemporaryDirectory() as td:
+            repo = _with_core(Path(td), cfg)
+            try:
+                got = hc._behind_warn_threshold(repo)
+            finally:
+                _reset_config_cache()
+            check(got == want, f"{label}: got {got}, want {want}")
+
+    # u) the removed env var must stay removed — a poisoned value must not be
+    #    read at all, let alone crash the module.
+    os.environ["SUTANDO_CHECKOUT_BEHIND_WARN"] = "not-a-number"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            repo = _mk_repo(Path(td))
+            _reset_config_cache()
+            try:
+                check(hc._behind_warn_threshold(repo) == hc._BEHIND_WARN_DEFAULT,
+                      "u) poisoned env var is ignored, not parsed")
+            finally:
+                _reset_config_cache()
+    finally:
+        os.environ.pop("SUTANDO_CHECKOUT_BEHIND_WARN", None)
+
+    # --- git-binary single swap point (review of #2471) --------------------
+    # Both subprocesses in this probe must go through ONE binary value, so the
+    # #2469 resolver swap fixes both together. Two hardcoded "git" strings meant
+    # fixing one and leaving the other able to reopen the Xcode-CLT shim modal.
+    src = (REPO / "src" / "health-check.py").read_text()
+    fn = src[src.index("def check_live_checkout_branch"):]
+    fn = fn[:fn.index("\ndef ", 1)]
+    check('git_bin = "git"' in fn, "v) probe defines one git_bin swap point")
+    check('["git", "-C"' not in fn, "v) no hardcoded \"git\" left in the probe body")
+    check("_commits_behind(repo, expected, git_bin)" in fn,
+          "v) the stale-check receives the same binary as the branch call")
+
+    # w) no-runnable-git control: when the branch call cannot run git, the probe
+    #    returns ok and NEVER reaches the second subprocess — so the added call
+    #    cannot invoke a shim the first call did not already hit.
+    calls: list = []
+    with tempfile.TemporaryDirectory() as td:
+        probe_repo = _mk_repo(Path(td))      # build the fixture BEFORE patching
+        real_run = hc.subprocess.run
+
+        def _boom(cmd, *a, **k):
+            calls.append(cmd)
+            raise OSError("no git")
+
+        hc.subprocess.run = _boom
+        try:
+            r = hc.check_live_checkout_branch(probe_repo)
+        finally:
+            hc.subprocess.run = real_run
+    check(r["status"] == "ok" and "git not runnable" in r["detail"],
+          f"w) no runnable git -> ok degrade, got {r}")
+    check(len(calls) == 1 and "rev-list" not in " ".join(map(str, calls[0])),
+          f"w) exactly ONE git invocation attempted, and not the stale-check: {calls}")
 
     if FAILS:
         print(f"\n{len(FAILS)} failure(s)")

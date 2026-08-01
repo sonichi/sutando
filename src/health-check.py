@@ -1276,11 +1276,39 @@ def check_per_host_config_backup() -> dict:
 # How far behind the expected branch before the checkout is worth nagging about.
 # Deliberately not 1: `main` on this repo moves several times a day, so warning on
 # any non-zero delta would fire constantly and train the reader to ignore it —
-# the failure mode that makes a health check worthless. Overridable per host.
-_BEHIND_WARN = int(os.environ.get("SUTANDO_CHECKOUT_BEHIND_WARN", "10") or 10)
+# the failure mode that makes a health check worthless.
+_BEHIND_WARN_DEFAULT = 10
 
 
-def _commits_behind(repo: "Path", branch: str) -> "int | None":
+def _behind_warn_threshold(repo: "Path") -> int:
+    """Positive commits-behind threshold from the durable core config.
+
+    Read through the SAME `core` config path as `expected_branch` below — no
+    ad-hoc env var (repo rule: config belongs in the declared config block, not
+    in an invented environment variable).
+
+    Read LAZILY and validated, because the first cut of this did neither: it
+    ran `int(os.environ[...])` at import time, so
+    `SUTANDO_CHECKOUT_BEHIND_WARN=not-a-number` raised ValueError before the
+    module finished loading and took down the ENTIRE health check — a probe
+    meant to reveal stale guards instead reporting no health at all. A zero
+    was equally bad: it warned on an exactly-current checkout. So every
+    invalid class — unreadable config, non-integer, zero, negative — falls
+    back to the default rather than crashing or crying wolf.
+    """
+    try:
+        from sutando_config import load_config  # noqa: PLC0415
+        raw = (load_config(repo_root=repo).get("core") or {}).get("checkout_behind_warn")
+    except Exception:
+        return _BEHIND_WARN_DEFAULT          # config unreadable/malformed
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _BEHIND_WARN_DEFAULT          # absent or non-integer
+    return n if n > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
+
+
+def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
     """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
 
     Uses the LAST-FETCHED remote ref — deliberately does not fetch. A health
@@ -1291,7 +1319,7 @@ def _commits_behind(repo: "Path", branch: str) -> "int | None":
     """
     try:
         out = subprocess.run(
-            ["git", "-C", str(repo), "rev-list", "--count", f"HEAD..origin/{branch}"],
+            [git_bin, "-C", str(repo), "rev-list", "--count", f"HEAD..origin/{branch}"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1335,9 +1363,17 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
         except Exception:
             expected = None  # config unreadable — fall through to the default
     expected = expected or "main"
+    # SINGLE SWAP POINT for the git binary. Both subprocesses in this probe use
+    # this one value, so when #2469's shared resolver lands, `resolve_git()`
+    # replaces this line and BOTH calls are fixed together. Previously the
+    # branch call hardcoded "git" inline and the stale-check added a second
+    # hardcoded "git" — two places to miss, and missing the second reopens the
+    # Xcode-CLT shim modal on a toolchain-free host that the first call's fix
+    # was meant to close.
+    git_bin = "git"
     try:
         out = subprocess.run(
-            ["git", "-C", str(repo), "branch", "--show-current"],
+            [git_bin, "-C", str(repo), "branch", "--show-current"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1367,8 +1403,8 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # A peer node reproduced the same shape at 31 behind. Nothing anywhere
     # surfaced either, because wrong-branch and stale-branch are different
     # failure modes and only the first had a probe.
-    behind = _commits_behind(repo, expected)
-    if behind is not None and behind >= _BEHIND_WARN:
+    behind = _commits_behind(repo, expected, git_bin)
+    if behind is not None and behind >= _behind_warn_threshold(repo):
         return {"name": name, "status": "warn",
                 "detail": f"live checkout is on {expected!r} but {behind} commits behind "
                           f"origin/{expected} — merged fixes are not running here, and a "
