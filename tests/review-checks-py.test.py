@@ -314,6 +314,20 @@ code, out = scan(
 )
 ok("mid-line comment close does not suppress later code", "/Users/mid/line" in out)
 
+# --- a line-start */ hidden in a MULTI-LINE template literal (#2474 review) --
+# _blank_string_literals is single-line, so it loses the opening backtick before
+# the next line is examined. A closer therefore only counts when an earlier line
+# in the hunk already looks like comment body.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,3 @@\n'
+    '+const p = "/Users/alice/secret"; const tpl = `\n'
+    '+*/\n'
+    '+`;'
+)
+ok("a */ inside a multi-line template does not establish block state",
+   "/Users/alice/secret" in out)
+
 # --- flag_exact: whole-token, not substring (#2474 review) ------------------
 # A full executable path must not reject longer siblings in the same directory
 # family: /usr/bin/swift-inspect is a separate REAL binary (own inode, link

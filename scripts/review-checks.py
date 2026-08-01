@@ -130,12 +130,27 @@ def _hunk_opens_in_block(lines):
     documentation as code — the single most likely way this gate would start
     rejecting legitimate resolver docs (@john-the-dev, reviewing #2474).
 
-    The inference is deliberately one-directional: a `*/` appearing before any
-    `/*` can only happen if a comment was opened ABOVE the hunk. No closer, or
-    an opener first, means "assume code" — so the multiplication bypass
-    (`const n = 2` / `  * "…"`, which contains neither delimiter) is still
-    scanned.
+    The inference requires CORROBORATION, not just a closer. A line-start `*/`
+    alone is not proof: it is reachable from ordinary code via a multi-line
+    template literal, whose opening backtick the single-line
+    `_blank_string_literals` cannot carry across lines —
+
+        const p = "/usr/bin/python3"; const tpl = `
+        */
+        `;
+
+    — which let a hidden closer start the whole hunk in block state and mask the
+    executable stub path on line 1 (@john-the-dev, reviewing #2474; an earlier
+    revision of this docstring claimed the line-start rule prevented exactly
+    that, and this control disproved it).
+
+    So a closer only counts when some EARLIER line in the hunk already looks
+    like comment body (`*` or `/*` leading). Real JSDoc always has that; the
+    template literal does not. Everything else means "assume code" — so the
+    multiplication bypass (`const n = 2` / `  * "…"`, which has no closer at
+    all) is still scanned.
     """
+    saw_comment_body = False
     for text in lines:
         # Delimiter-aware: a `*/` inside a string literal is data, not a comment
         # close. Without this, `const closer = "*/";` established block state for
@@ -148,8 +163,11 @@ def _hunk_opens_in_block(lines):
         # Require the closer to be the first thing on its line — the canonical
         # JSDoc shape (` */`). A mid-line `*/` that survived string-blanking is
         # not evidence a comment was opened ABOVE this hunk.
-        if bare.lstrip().startswith("*/"):
-            return True
+        stripped = bare.lstrip()
+        if stripped.startswith("*/"):
+            return saw_comment_body
+        if stripped.startswith("*"):
+            saw_comment_body = True
     return False
 
 
