@@ -36,7 +36,6 @@ raise a modal system dialog on a machine that never asked for developer tools.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from typing import Callable, Optional
@@ -61,13 +60,45 @@ def developer_tools_installed(run: Callable = subprocess.run) -> bool:
     return proc.returncode == 0
 
 
+def path_candidates(
+    name: str = "git",
+    path_env: Optional[str] = None,
+    is_exec: Optional[Callable[[str], bool]] = None,
+) -> list:
+    """Every executable `name` on PATH, in PATH order.
+
+    `shutil.which` returns only the FIRST match, which is not enough here: if a
+    stub-first PATH puts /usr/bin ahead of a real install, `which` hands back
+    the stub and a later runnable git is never considered — contradicting this
+    module's own stated order (@john-the-dev, reviewing #2469). Service PATHs
+    routinely look like that.
+    """
+    env = os.environ.get("PATH", "") if path_env is None else path_env
+    if is_exec is None:
+        def is_exec(p: str) -> bool:  # noqa: E306
+            return os.path.isfile(p) and os.access(p, os.X_OK)
+    out = []
+    for directory in env.split(os.pathsep):
+        if not directory:
+            continue
+        candidate = os.path.join(directory, name)
+        if is_exec(candidate):
+            out.append(candidate)
+    return out
+
+
 def select_git(
-    found: Optional[str],
+    candidates: list,
     *,
     is_darwin: bool,
     clt_installed: Callable[[], bool],
+    realpath: Callable[[str], str] = os.path.realpath,
 ) -> Optional[str]:
-    """Pure selection step, given whatever PATH resolution returned.
+    """First runnable non-stub git in PATH order; the stub only as a fallback.
+
+    Walks every candidate rather than judging one: a stub-first PATH must not
+    hide a real git further along. The system stub is remembered and returned
+    only when the developer tools are installed (which makes it a working git).
 
     Split out from `resolve_git` so the ordering is testable without touching
     the host's real PATH or toolchain (same rationale as `selectFfprobe` in
@@ -75,15 +106,17 @@ def select_git(
 
     `clt_installed` is a callable rather than a bool so the `xcode-select`
     probe is only spawned when it can change the answer — i.e. never on a host
-    that already has a non-shim git.
+    where a real git was found first.
     """
-    if not found:
-        return None
-    if not is_darwin:
-        return found
-    if os.path.realpath(found) != SYSTEM_GIT:
-        return found
-    return found if clt_installed() else None
+    stub = None
+    for candidate in candidates:
+        if not is_darwin or realpath(candidate) != SYSTEM_GIT:
+            return candidate
+        if stub is None:
+            stub = candidate
+    if stub is not None and clt_installed():
+        return stub
+    return None
 
 
 class GitUnavailable(FileNotFoundError):
@@ -143,7 +176,7 @@ def resolve_git() -> Optional[str]:
     if _resolved is not None:
         return _resolved
     _resolved = select_git(
-        shutil.which("git"),
+        path_candidates("git"),
         is_darwin=sys.platform == "darwin",
         clt_installed=developer_tools_installed,
     )

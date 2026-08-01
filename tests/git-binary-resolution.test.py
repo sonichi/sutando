@@ -122,14 +122,14 @@ class SelectGitOrdering(unittest.TestCase):
 
     def test_nothing_on_path_is_none(self):
         self.assertIsNone(
-            git_binary.select_git(None, is_darwin=True, clt_installed=lambda: True)
+            git_binary.select_git([], is_darwin=True, clt_installed=lambda: True)
         )
 
     def test_non_darwin_uses_path_result_directly(self):
         # No shim outside macOS, so the system path is a real git there.
         self.assertEqual(
             git_binary.select_git(
-                SYSTEM_GIT, is_darwin=False, clt_installed=self._never_called
+                [SYSTEM_GIT], is_darwin=False, clt_installed=self._never_called
             ),
             SYSTEM_GIT,
         )
@@ -139,7 +139,7 @@ class SelectGitOrdering(unittest.TestCase):
         brew_git = str(REPO / "fixture-bin" / "git")
         self.assertEqual(
             git_binary.select_git(
-                brew_git, is_darwin=True, clt_installed=self._never_called
+                [brew_git], is_darwin=True, clt_installed=self._never_called
             ),
             brew_git,
         )
@@ -148,17 +148,64 @@ class SelectGitOrdering(unittest.TestCase):
         """The clean-VM case — the whole point of the fix."""
         self.assertIsNone(
             git_binary.select_git(
-                SYSTEM_GIT, is_darwin=True, clt_installed=lambda: False
+                [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: False
             )
         )
+
+    def test_a_later_real_git_beats_a_stub_first_path(self):
+        """A stub-first PATH must not hide a real git further along.
+
+        `shutil.which` returns only the FIRST match, so the previous
+        implementation handed back the stub and returned None on a no-CLT host —
+        contradicting this module's own stated order (@john-the-dev, #2469).
+        Service PATHs routinely put /usr/bin ahead of a real install.
+        """
+        real = "/usr/fake/brew/bin/git"
+        picked = git_binary.select_git(
+            [SYSTEM_GIT, real],
+            is_darwin=True,
+            clt_installed=self._never_called,   # must not even be consulted
+            realpath=lambda p: p,
+        )
+        self.assertEqual(picked, real)
+
+    def test_stub_is_remembered_as_a_fallback_not_discarded(self):
+        """Stub first, no other candidate, CLT present -> the stub is usable."""
+        picked = git_binary.select_git(
+            [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: True,
+            realpath=lambda p: p,
+        )
+        self.assertEqual(picked, SYSTEM_GIT)
 
     def test_shim_with_developer_tools_is_usable(self):
         self.assertEqual(
             git_binary.select_git(
-                SYSTEM_GIT, is_darwin=True, clt_installed=lambda: True
+                [SYSTEM_GIT], is_darwin=True, clt_installed=lambda: True
             ),
             SYSTEM_GIT,
         )
+
+
+class PathCandidates(unittest.TestCase):
+    def test_returns_every_executable_in_path_order(self):
+        found = git_binary.path_candidates(
+            "git", path_env="/usr/fake/a:/usr/fake/b",
+            is_exec=lambda p: p in ("/usr/fake/a/git", "/usr/fake/b/git"),
+        )
+        self.assertEqual(found, ["/usr/fake/a/git", "/usr/fake/b/git"])
+
+    def test_skips_empty_path_entries(self):
+        self.assertEqual(
+            git_binary.path_candidates("git", path_env="::", is_exec=lambda p: False),
+            [],
+        )
+
+    def test_skips_non_executables(self):
+        found = git_binary.path_candidates(
+            "git", path_env="/usr/fake/a:/usr/fake/b",
+            is_exec=lambda p: p == "/usr/fake/b/git",
+        )
+        self.assertEqual(found, ["/usr/fake/b/git"])
 
 
 class DeveloperToolsProbe(unittest.TestCase):
@@ -196,16 +243,16 @@ class ResolveGit(unittest.TestCase):
 
     def test_returns_path_result_when_a_real_git_exists(self):
         real = str(REPO / "fixture-bin" / "git")
-        with patch.object(git_binary.shutil, "which", return_value=real):
+        with patch.object(git_binary, "path_candidates", return_value=[real]):
             self.assertEqual(git_binary.resolve_git(), real)
 
     def test_returns_none_when_path_has_nothing(self):
-        with patch.object(git_binary.shutil, "which", return_value=None):
+        with patch.object(git_binary, "path_candidates", return_value=[]):
             self.assertIsNone(git_binary.resolve_git())
 
     def test_a_positive_answer_is_cached(self):
         real = str(REPO / "fixture-bin" / "git")
-        with patch.object(git_binary.shutil, "which", return_value=real) as which:
+        with patch.object(git_binary, "path_candidates", return_value=[real]) as which:
             git_binary.resolve_git()
             git_binary.resolve_git()
         self.assertEqual(which.call_count, 1, "resolve_git re-probed PATH")
@@ -218,7 +265,7 @@ class ResolveGit(unittest.TestCase):
         service — while health-check on the same host, being re-exec'd each run,
         reported git as fine. (@sonichi, reviewing #2469.)
         """
-        with patch.object(git_binary.shutil, "which", return_value=None) as which:
+        with patch.object(git_binary, "path_candidates", return_value=[]) as which:
             self.assertIsNone(git_binary.resolve_git())
             self.assertIsNone(git_binary.resolve_git())
         self.assertEqual(which.call_count, 2, "a negative answer was cached")
@@ -226,10 +273,10 @@ class ResolveGit(unittest.TestCase):
     def test_install_after_start_is_picked_up(self):
         """The exact install-after-start ordering a post-restart test cannot reach."""
         real = str(REPO / "fixture-bin" / "git")
-        with patch.object(git_binary.shutil, "which", return_value=None):
+        with patch.object(git_binary, "path_candidates", return_value=[]):
             self.assertIsNone(git_binary.resolve_git())
         # ...user installs the tools; no restart.
-        with patch.object(git_binary.shutil, "which", return_value=real):
+        with patch.object(git_binary, "path_candidates", return_value=[real]):
             self.assertEqual(git_binary.resolve_git(), real)
 
 
@@ -276,7 +323,7 @@ class HealthCheckDegradesWithoutGit(unittest.TestCase):
         """
         git_binary.reset_cache_for_tests()
         try:
-            with patch.object(git_binary.shutil, "which", return_value=None):
+            with patch.object(git_binary, "path_candidates", return_value=[]):
                 result = health_check.check_live_checkout_branch()
         finally:
             git_binary.reset_cache_for_tests()
