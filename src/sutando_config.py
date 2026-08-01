@@ -57,6 +57,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "core_config_dirs",
     "vault",
     "migrate",
+    "stand",          # this instance's `Stand:` commit-trailer value
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
