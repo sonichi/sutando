@@ -32,6 +32,7 @@ import {
 	requirePython,
 	resetCacheForTests,
 	resolvePython,
+	pythonOnPath,
 	selectPython,
 	shellQuote,
 } from '../src/python-binary.js';
@@ -76,24 +77,55 @@ describe('selectPython ordering', () => {
 		assert.equal(py, '/usr/fake/bundled-py');
 	});
 
-	it('falls back to a BARE python3, never the absolute stub path', () => {
+	it('uses a NON-stub python from PATH with no developer tools', () => {
+		// A python.org framework install (/usr/local/bin/python3) or pyenv has
+		// nothing to do with the CLT. An earlier revision declined it whenever
+		// the tools were absent, withholding an interpreter that works.
 		const py = selectPython({
 			bundled: [],
+			onPath: '/usr/fake/local/bin/python3',
 			isExecutable: () => false,
-			toolsInstalled: () => true,
+			toolsInstalled: never,           // must not even be consulted
+			isSystemStub: () => false,
 		});
-		assert.equal(py, 'python3');
-		assert.notEqual(py, STUB, 'must never return the absolute CLT stub path');
+		assert.equal(py, '/usr/fake/local/bin/python3');
 	});
 
-	it('returns null rather than spawning the stub', () => {
+	it('gates ONLY the system stub on developer tools', () => {
+		const args = {
+			bundled: [] as string[],
+			onPath: STUB,
+			isExecutable: () => false,
+			isSystemStub: () => true,
+		};
+		assert.equal(selectPython({ ...args, toolsInstalled: () => true }), STUB);
+		assert.equal(selectPython({ ...args, toolsInstalled: () => false }), null);
+	});
+
+	it('returns null when PATH has no python at all', () => {
 		// The clean-VM case — the whole point of the fix.
 		const py = selectPython({
 			bundled: [],
+			onPath: null,
 			isExecutable: () => false,
-			toolsInstalled: () => false,
+			toolsInstalled: never,
 		});
 		assert.equal(py, null);
+	});
+});
+
+describe('pythonOnPath', () => {
+	it('returns the first executable python3 on PATH', () => {
+		const found = pythonOnPath('/usr/fake/a:/usr/fake/b', (p) => p === '/usr/fake/b/python3');
+		assert.equal(found, '/usr/fake/b/python3');
+	});
+
+	it('returns null when PATH has none', () => {
+		assert.equal(pythonOnPath('/usr/fake/a', () => false), null);
+	});
+
+	it('skips empty PATH entries', () => {
+		assert.equal(pythonOnPath('::', () => false), null);
 	});
 });
 

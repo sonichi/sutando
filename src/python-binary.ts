@@ -21,20 +21,24 @@
  *
  *   1. `$SUTANDO_PY`, exported by the desktop launcher.
  *   2. The bundle-vendored relocatable python beside the engine copy.
- *   3. A bare `python3`, resolved through PATH — but ONLY when
- *      `xcode-select -p` reports installed developer tools.
- *   4. null, meaning the caller must skip rather than prompt.
+ *   3. Whatever `python3` resolves to on PATH, if that is NOT the system stub.
+ *   4. The system one, but only when `xcode-select -p` reports installed tools.
+ *   5. null, meaning the caller must skip rather than prompt.
  *
- * Tier 3 is deliberately the bare name rather than an absolute path. It lets a
- * real interpreter earlier on PATH win, and it keeps the stub's path out of
- * this file entirely. The `xcode-select` gate is what makes it safe: with the
- * tools installed, whatever `python3` resolves to is a working interpreter
- * (including the system one); without them we cannot know, so we decline. A
- * host with a Homebrew python but no developer tools is not reachable in
- * practice — Homebrew's own installer requires the tools.
+ * Tiers 3 and 4 mirror `select_git` in `src/git_binary.py`: ask whether the
+ * interpreter PATH gave us is actually the stub, and only gate THAT one.
+ *
+ * An earlier revision collapsed both into `toolsInstalled() ? 'python3' : null`,
+ * which declined a perfectly good interpreter whenever the developer tools were
+ * absent. That is wrong: a python.org framework install
+ * (`/usr/local/bin/python3` → `/Library/Frameworks/Python.framework/…`) or a
+ * pyenv build has nothing to do with the CLT. The comment justifying it
+ * generalised from Homebrew — which does require the tools — to every install
+ * method, which is not true. The point of this module is to route interpreter
+ * lookup through one place, not to withhold an interpreter that works.
  */
 import { execFileSync } from 'node:child_process';
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -116,6 +120,45 @@ export function bundledPythonCandidates(repoRoot: string | undefined, execPath: 
 	return out;
 }
 
+/** Apple's stub lives here; any other directory means a real install. */
+const SYSTEM_BIN = '/usr/bin';
+
+/**
+ * True when `p` resolves into the system bin directory — i.e. it is Apple's
+ * CLT stub rather than a real interpreter.
+ *
+ * Compared by DIRECTORY, not by the exact stub path: that keeps the flagged
+ * literal out of this file (REVIEW.md lesson 7) and also covers a versioned
+ * sibling in the same location. Falls back to the unresolved path when the
+ * symlink cannot be read, which errs toward treating it as the stub — the safe
+ * direction, since the stub is what must be gated.
+ */
+export function isSystemStubPath(p: string): boolean {
+	try {
+		return dirname(realpathSync(p)) === SYSTEM_BIN;
+	} catch {
+		return dirname(p) === SYSTEM_BIN;
+	}
+}
+
+/**
+ * First executable `python3` on PATH, or null.
+ *
+ * Walks PATH on the filesystem instead of shelling out — spawning anything to
+ * find an interpreter risks spawning the stub, which is the whole failure mode.
+ */
+export function pythonOnPath(
+	pathEnv: string = process.env.PATH ?? '',
+	exists: (p: string) => boolean = isExecutableFile,
+): string | null {
+	for (const dir of pathEnv.split(':')) {
+		if (!dir) continue;
+		const candidate = join(dir, 'python3');
+		if (exists(candidate)) return candidate;
+	}
+	return null;
+}
+
 /**
  * Pure selection step, given the inputs the impure layer gathered.
  *
@@ -125,15 +168,26 @@ export function bundledPythonCandidates(repoRoot: string | undefined, execPath: 
 export function selectPython(opts: {
 	explicit?: string;
 	bundled: string[];
+	onPath?: string | null;
 	isExecutable: (p: string) => boolean;
 	toolsInstalled: () => boolean;
+	isSystemStub?: (p: string) => boolean;
 }): string | null {
-	const { explicit, bundled, isExecutable, toolsInstalled } = opts;
+	const {
+		explicit, bundled, onPath = null, isExecutable, toolsInstalled,
+		isSystemStub = isSystemStubPath,
+	} = opts;
 	if (explicit && isExecutable(explicit)) return explicit;
 	const vendored = bundled.find(isExecutable);
 	if (vendored) return vendored;
-	// Bare name on purpose — see the module header. Never the absolute path.
-	return toolsInstalled() ? 'python3' : null;
+	if (!onPath) return null;
+	// Is what PATH gave us Apple's stub? Compared by DIRECTORY rather than by
+	// the exact stub path: it keeps that literal out of this file (REVIEW.md
+	// lesson 7 flags it) and it also covers a versioned sibling in the same
+	// system location. Anything else — Homebrew, python.org, pyenv — is a real
+	// interpreter and is used as-is, with no toolchain requirement.
+	if (!isSystemStub(onPath)) return onPath;
+	return toolsInstalled() ? onPath : null;
 }
 
 let cached: string | null | undefined;
@@ -147,6 +201,7 @@ export function resolvePython(): string | null {
 			findRepoRoot(dirname(fileURLToPath(import.meta.url))),
 			process.execPath,
 		),
+		onPath: pythonOnPath(),
 		isExecutable: isExecutableFile,
 		toolsInstalled: () => developerToolsInstalled(),
 	});
