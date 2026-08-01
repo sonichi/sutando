@@ -50,7 +50,7 @@ echo "0. CONCURRENT double-click → EXACTLY ONE restart decision (sonichi#2334 
 # PASSES against the broken script and proves nothing. N pairs, and the run
 # fails if ANY pair produced two decisions.
 N_CONC="${GR_TEST_CONC_ITERS:-10}"
-doubles=0; deferrals=0; reaped=0; bad_sentinel=0
+doubles=0; deferrals=0; reaped=0; bad_sentinel=0; rc_bad=0
 for _i in $(seq 1 "$N_CONC"); do
   # DEAD core (no .alive): this is where the double-restart actually races.
   # With a live+idle core the pre-fix failure mode is STARVATION instead —
@@ -64,8 +64,19 @@ for _i in $(seq 1 "$N_CONC"); do
   pa=$!
   ( GR_WS="$WS0" GR_SYNC_CMD="true" GR_POLL_S=0 bash "$GR" --dry-run >"$b_out" 2>&1 ) &
   pb=$!
-  wait "$pa" || true
-  wait "$pb" || true
+  ra=0; rb=0
+  wait "$pa" || ra=$?
+  wait "$pb" || rb=$?
+  # Exit codes matter as much as stdout. A peer that DIES (set -e on a bad
+  # arithmetic operand, say) also fails to restart, so the "exactly one
+  # decision" count alone cannot distinguish a correct deferral from a crash.
+  # Not hypothetical: CI caught exactly that when `stat -f %m` (BSD) emitted a
+  # filesystem dump on GNU/Linux, the arithmetic died under `set -euo pipefail`,
+  # and the peer vanished silently while "exactly one" still reported PASS.
+  case "$ra:$rb" in
+    0:4|4:0) : ;;
+    *) rc_bad=$((${rc_bad:-0} + 1)) ;;
+  esac
   d=0
   grep -q "would exec" "$a_out" && d=$((d + 1))
   grep -q "would exec" "$b_out" && d=$((d + 1))
@@ -83,6 +94,9 @@ done
 [ "$deferrals" = "$N_CONC" ] \
   && say ok "the losing peer deferred with a reason every time" \
   || say FAIL "peer deferred with a reason in only $deferrals/$N_CONC pairs"
+[ "$rc_bad" = 0 ] \
+  && say ok "winner exited 0 and loser exited 4 in every pair" \
+  || say FAIL "$rc_bad/$N_CONC pairs had an unexpected exit-code pair (a CRASHED peer is indistinguishable from a deferring one by count alone)"
 # A LIVE lock must never be reaped: an unreadable age has to fail CLOSED. The
 # first cut of this fix wrote the holder ts AFTER mkdir, so a peer landing in
 # that gap read no ts, computed age=now-0, called a 1s-old lock stale and reaped

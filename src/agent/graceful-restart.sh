@@ -80,7 +80,19 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
   # the very race being fixed: a peer arriving in the gap read no ts, computed
   # `age = now - 0` (a full epoch), declared a one-second-old lock stale, reaped
   # it, and both runs restarted. Caught by the 30-iteration probe below.
-  held_ts="$(stat -f %m "$LOCKDIR" 2>/dev/null || echo '')"
+  # Portable mtime. `stat -f %m` is BSD/macOS; on GNU/Linux `-f` means
+  # --file-system and emits a multi-line filesystem dump, which then fed
+  # `$(( ... ))` and — under `set -euo pipefail` — killed the script SILENTLY:
+  # the peer neither restarted nor logged a reason. CI caught it as
+  # "peer deferred with a reason in only 0/10 pairs" while the "exactly one
+  # restart decision" assertion still passed, because a silently-dead peer and
+  # a correctly-deferring peer are indistinguishable by that check alone.
+  # The digit guard is the load-bearing part: ANY unexpected output becomes
+  # empty and takes the fail-closed branch instead of reaching arithmetic.
+  held_ts="$(stat -f %m "$LOCKDIR" 2>/dev/null || stat -c %Y "$LOCKDIR" 2>/dev/null || true)"
+  case "$held_ts" in
+    ''|*[!0-9]*) held_ts="" ;;
+  esac
   if [ -z "$held_ts" ]; then
     # Cannot read the holder's age -> assume LIVE and defer. Failing closed is
     # the only safe default when the alternative is a spurious destructive kill.
