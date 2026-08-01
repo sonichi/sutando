@@ -322,6 +322,55 @@ def resolve_voice_health_config(
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
 
 
+def resolve_web_client_port(
+    env: Optional[dict] = None,
+    env_path: Optional[Path] = None,
+) -> dict:
+    """Resolve CLIENT_PORT with the same sourced-dotenv precedence as startup."""
+    env = os.environ if env is None else env
+    env_path = _resolve_dotenv() if env_path is None else env_path
+    file_value: Optional[str] = None
+    file_has_value = False
+
+    if env_path.exists():
+        try:
+            lines = env_path.read_text().splitlines()
+        except OSError as exc:
+            return {"error": f"{env_path.name} unreadable ({exc})"}
+        for line_no, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            assignment = line
+            if assignment.startswith("export "):
+                assignment = assignment[len("export "):].lstrip()
+            if not assignment.startswith("CLIENT_PORT"):
+                continue
+            if "=" not in assignment:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT assignment"}
+            key, value = assignment.split("=", 1)
+            if key.strip() != "CLIENT_PORT":
+                continue
+            try:
+                parsed = shlex.split(value, comments=True, posix=True)
+            except ValueError as exc:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT value ({exc})"}
+            if len(parsed) > 1:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT value"}
+            file_value = parsed[0] if parsed else ""
+            file_has_value = True
+
+    configured = file_value if file_has_value else env.get("CLIENT_PORT")
+    value = str(configured or "8080").strip()
+    try:
+        port = int(value)
+    except ValueError:
+        return {"error": f"invalid CLIENT_PORT={value!r}"}
+    if not 1 <= port <= 65535:
+        return {"error": f"invalid CLIENT_PORT={value!r}"}
+    return {"port": port}
+
+
 def check_voice_stack(
     env: Optional[dict] = None,
     env_path: Optional[Path] = None,
@@ -3824,7 +3873,15 @@ def run_all_checks() -> list[dict]:
     # Core services (required)
     checks.extend(check_voice_stack())
 
-    web_check = check_port(8080, "web-client", probe=True)
+    web_config = resolve_web_client_port()
+    if web_config.get("error"):
+        web_check = {
+            "name": "web-client",
+            "status": "down",
+            "detail": web_config["error"],
+        }
+    else:
+        web_check = check_port(web_config["port"], "web-client", probe=True)
     if web_check["status"] == "ok":
         mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
     checks.append(web_check)
