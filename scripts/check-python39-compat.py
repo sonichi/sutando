@@ -25,12 +25,17 @@ WHAT IT DOES AND DOES NOT CATCH
 -------------------------------
 This is a *syntax* gate — it compiles, it does not import or execute.
 
-  caught      3.10+ grammar: match/case, parenthesized context managers,
-              PEP-604 unions in positions that are evaluated at runtime.
-  NOT caught  runtime-only 3.10+ features that parse fine on 3.9:
+  caught      3.10+ grammar that 3.9 genuinely rejects — `match`/`case` is
+              the verified example.
+  NOT caught  (a) runtime-only 3.10+ features that parse fine on 3.9:
               `datetime.UTC`, `tomllib`, `itertools.batched`, `typing.Self`,
               `StrEnum`, and PEP-604 annotations in modules WITHOUT
               `from __future__ import annotations`.
+              (b) constructs DOCUMENTED as 3.10 that CPython 3.9's PEG parser
+              accepts anyway — parenthesized context managers are the one
+              measured here. Do not assume the version a feature shipped in
+              equals the version whose parser rejects it; that assumption
+              cost a control that fired on the floor itself.
 
 That limit is deliberate and stated rather than discovered later: importing
 all of src/ would require the full dependency set in CI, which is a much
@@ -117,20 +122,10 @@ def scan(targets: "tuple[str, ...]", repo: Path) -> "list[tuple[Path, str]]":
     return failures
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--self-test", action="store_true",
-                    help="verify the detector can go positive, then exit")
-    ap.add_argument("--target", action="append", default=None,
-                    help="directory to scan (repeatable; default: src)")
-    args = ap.parse_args()
-
-    if args.self_test:
-        return self_test()
-
-    repo = Path(__file__).resolve().parent.parent
-    targets = tuple(args.target) if args.target else DEFAULT_TARGETS
-
+def run(targets: "tuple[str, ...]", repo: Path) -> int:
+    """Controls + scan + reporting. Separated from `main` so the failure
+    branch is testable against a temp tree instead of requiring a broken file
+    to be planted in the real src/."""
     # The controls run before every real scan too: a vacuous pass is worse
     # than a red, because it is indistinguishable from a healthy tree.
     if self_test() != 0:
@@ -156,5 +151,21 @@ def main() -> int:
     return 0
 
 
+def main(argv: "list[str] | None" = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--self-test", action="store_true",
+                    help="verify the detector can go positive, then exit")
+    ap.add_argument("--target", action="append", default=None,
+                    help="directory to scan (repeatable; default: src)")
+    args = ap.parse_args(argv)
+
+    if args.self_test:
+        return self_test()
+
+    repo = Path(__file__).resolve().parent.parent
+    targets = tuple(args.target) if args.target else DEFAULT_TARGETS
+    return run(targets, repo)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main())  # pragma: no cover

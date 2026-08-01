@@ -12,14 +12,14 @@ on:
     paths:
       - 'src/**/*.py'
       - 'scripts/check-python39-compat.py'
-      - 'scripts/check-python39-compat.test.py'
+      - 'tests/check-python39-compat.test.py'
       - '.github/workflows/python39-compat.yml'
   push:
     branches: [main]
     paths:
       - 'src/**/*.py'
       - 'scripts/check-python39-compat.py'
-      - 'scripts/check-python39-compat.test.py'
+      - 'tests/check-python39-compat.test.py'
       - '.github/workflows/python39-compat.yml'
 
 jobs:
@@ -45,7 +45,7 @@ jobs:
         run: python3 scripts/check-python39-compat.py --self-test
 
       - name: Unit tests
-        run: python3 scripts/check-python39-compat.test.py
+        run: python3 tests/check-python39-compat.test.py
 
       - name: Scan src/ on the floor interpreter
         run: python3 scripts/check-python39-compat.py
