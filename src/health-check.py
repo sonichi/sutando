@@ -2035,6 +2035,221 @@ QUOTA_STATE_STALE_SEC = 6 * 60 * 60
 AGENT_ACTIVE_SEC = 30 * 60
 
 
+# Runtimes whose request path is NOT expected to traverse the Anthropic credential
+# proxy. A Codex pass refreshes the very same `core-status.json` this check reads for
+# activity, but produces no Anthropic quota headers — so "agent working + stale quota"
+# is a perfectly healthy shape there, and warning on it would train operators to ignore
+# the check this whole probe exists to make actionable (qingyun, #2445).
+NON_PROXY_RUNTIMES = {"codex"}
+
+# The two launch records are stamped by SEPARATE `date +%s` calls in the same
+# launcher — `src/agent/codex/cli/start-cli.sh:240` writes core-runtime.json and
+# :243 appends session-starts.log — so one launch can legitimately produce
+# started_at=N and session_started_at=N+1 if the second rolls between them. A
+# strict `<` then reads a CURRENT marker as stale and emits the exact false proxy
+# warning this check exists to suppress (qingyun, #2446).
+#
+# A few seconds of slack cannot mask a real previous-core marker: that marker is
+# separated from the next launch by the entire lifetime of the core that wrote it,
+# which is minutes at the very least. So the margin is generous on purpose — it
+# costs nothing on the true-positive side and closes the whole race, rather than
+# assuming the gap is exactly one second.
+LAUNCH_RECORD_SKEW_SEC = 5
+
+
+def _runtime_may_skip_proxy() -> bool:
+    """True when this core's runtime is not expected to produce Anthropic quota headers.
+
+    Read from `state/core-runtime.json`. Today the **Codex launcher is its only writer**
+    (`src/agent/codex/cli/start-cli.sh` writes it unconditionally once the workspace
+    resolves), so its ABSENCE positively excludes Codex rather than merely being
+    unknown — which is why absence is treated as proxy-routed instead of silencing the
+    check everywhere. An unreadable or malformed file cannot rule Codex out, so it is
+    treated as non-proxy and stays silent: a corrupted status file must not manufacture
+    a health warning.
+
+    A marker left by a PREVIOUS core is ignored. Today only the Codex launcher writes
+    this file and nothing resets it, so after a Codex -> Claude switch a stale
+    `{"runtime": "codex"}` sits there describing a core that is no longer running
+    (#2406 documents exactly that happening live on 2026-07-30). Trusting it would
+    silence this check on a host that IS proxy-routed — the mirror of the false
+    positive this function was added to fix. So a marker whose `started_at` predates
+    the running core's own start is treated as absent, i.e. proxy-routed.
+
+    When #2406 lands a Claude-side writer, tighten this to positive identification of
+    a proxy-routed runtime instead of inferring it from absence.
+    """
+    path = status_read_path("core-runtime.json", WORKSPACE_DIR)
+    try:
+        if not path.exists():
+            return False          # no Codex launcher ever ran here -> proxy-routed
+        marker = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return True               # cannot rule Codex out -> stay silent
+    # Valid JSON is not necessarily an OBJECT. `null`, `[]`, `"codex"` and `3` all
+    # decode fine and then raise AttributeError on `.get`, which the handler above
+    # does not catch — so a junk state file would crash the entire health run inside
+    # the very branch this check hardens (qingyun, #2446). A non-object marker is
+    # exactly as uninformative as malformed JSON, so it takes the same silent path.
+    if not isinstance(marker, dict):
+        return True               # cannot rule Codex out -> stay silent
+    runtime = marker.get("runtime")
+    # The FIELD has a schema too, not just the container. `{"runtime": []}` and
+    # `{"runtime": {}}` reach the membership test and raise TypeError (unhashable);
+    # `{"runtime": 3}`, `{"runtime": true}` and a marker with no `runtime` key at all
+    # don't crash but fall through to "proxy-routed" and manufacture the very warning
+    # this check exists to suppress. A field that isn't a string tells us nothing about
+    # the runtime, so it takes the same fail-silent path as malformed JSON
+    # (qingyun, #2446 — the same shape one level in from the container guard above).
+    if not isinstance(runtime, str):
+        return True               # cannot rule Codex out -> stay silent
+    if _marker_predates_running_core(marker):
+        return False              # belongs to a previous core -> no information
+    return runtime in NON_PROXY_RUNTIMES
+
+
+def _local_host_labels() -> "set[str]":
+    r"""Every label a launcher on THIS host could plausibly have persisted.
+
+    The reader and the writers do NOT share a host-label contract, and comparing
+    against only one of them discards this host's real launch records:
+
+      reader  `util_paths._host_label()`  -> SUTANDO_HOST_LABEL > scutil
+                                             LocalHostName > short hostname
+      writers `hostname | sed 's/\..*//'` -> short hostname, always
+              (src/agent/codex/cli/start-cli.sh:242,
+               src/agent/claude/cli/start-cli.sh:609)
+
+    On macOS those routinely differ — LocalHostName is the stable Bonjour name
+    while `hostname` follows DHCP — and with SUTANDO_HOST_LABEL set they differ by
+    construction. When they do, EVERY local line is skipped as foreign, the
+    boundary becomes None, and a stale `runtime:codex` marker stays trusted
+    forever: the stale-quota warning goes permanently silent. That is strictly
+    worse than the cross-host false positive the host filter was added to fix
+    (qingyun-wu + john-the-dev, #2446, independently reproduced).
+
+    This host is not hypothetical evidence: its own vault carries BOTH
+    `host/Chis-MacBook-Pro/…` and `host/Chis-MBP/…` branches, so the short name
+    has already drifted here at least once.
+
+    Accepting the union is deliberately the conservative direction. A foreign host
+    would have to share one of these exact labels to be mistaken for local, which
+    is the pre-existing collision risk; discarding local records, by contrast,
+    silences a real alert on every affected host.
+    """
+    labels = {_host_label()}
+    try:
+        labels.add(socket.gethostname().split(".")[0])
+    except Exception:  # pragma: no cover — gethostname failing is not a reason to go blind
+        pass
+    return {x for x in labels if x}
+
+
+def _last_core_launch_at() -> "tuple[float, str | None] | None":
+    """When the CURRENT core was launched, from `state/session-starts.log`.
+
+    Returns `(timestamp, runtime)`, where `runtime` is the identity the launcher
+    recorded for that launch — `"codex"` from the Codex launcher, and None from the
+    Claude launcher, which writes no such field
+    (`src/agent/claude/cli/start-cli.sh:608`). The identity is returned rather than
+    discarded because the skew tolerance below is only safe when the launch record
+    and the marker positively agree on the runtime; see
+    `_marker_predates_running_core`.
+
+    Both launchers append one line per launch — `src/agent/claude/cli/start-cli.sh:610`
+    and `src/agent/codex/cli/start-cli.sh:243` — and both stamp the `host` that launched.
+
+    Only THIS host's records are eligible. `session-starts.log` lives in a workspace that
+    is synced across hosts, so the newest line globally is not this host's boundary: a
+    later launch on host B would otherwise become host A's boundary and age host A's
+    perfectly current marker into a false `warn` — the exact false-positive class this
+    check exists to suppress (qingyun-wu + john-the-dev, #2446, independently reproduced:
+    local Codex marker at now-60 alone => ok; add a foreign Codex launch at now => warn).
+
+    Legacy policy, stated explicitly: a record whose `host` is absent, non-string, or
+    belongs to another host is SKIPPED, never treated as local. Pre-`host` lines cannot
+    be attributed, and guessing "probably local" reintroduces the same poisoning from
+    older synced logs. Skipping them can leave no boundary at all, which yields None —
+    and None already means "no evidence", never "stale", so the failure direction is
+    silence rather than a false alarm.
+
+    The heartbeat was the obvious candidate and is WRONG: `core_heartbeat.py` stamps
+    `_STARTED_AT` once at module load and both launch paths RETAIN an existing heartbeat
+    process, so `.alive.started_at` is the heartbeat process's age, not the session's.
+    After a Codex → Claude switch it can be far older than a freshly-written marker,
+    which made the staleness comparison silently useless (john-the-dev, #2446).
+
+    Every hop is validated rather than the one that last broke: unreadable file, a line
+    that isn't JSON, a decoded value that isn't an object, a missing key, a non-numeric
+    value. Anything uninformative yields None, and None means "no evidence", never
+    "stale".
+    """
+    try:
+        raw = (status_read_path("session-starts.log", WORKSPACE_DIR)).read_text()
+    except OSError:
+        return None
+    for line in reversed(raw.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue                      # a torn/partial line is not the boundary
+        if not isinstance(entry, dict):
+            continue
+        entry_host = entry.get("host")
+        if not isinstance(entry_host, str) or entry_host not in _local_host_labels():
+            continue                      # another host's launch, or unattributable
+        try:
+            ts = float(entry.get("session_started_at"))
+        except (TypeError, ValueError):
+            continue                      # keep looking further back
+        launch_runtime = entry.get("runtime")
+        if not isinstance(launch_runtime, str):
+            launch_runtime = None         # absent or wrong type -> no identity claim
+        return ts, launch_runtime
+    return None
+
+
+def _marker_predates_running_core(marker: dict) -> bool:
+    """True when `core-runtime.json` describes a core older than the one running now.
+
+    Compared against the newest `session-starts.log` entry — a real per-launch boundary
+    — not the heartbeat. Both timestamps must be present and comparable; if either is
+    missing the marker is taken at face value, because "no evidence of staleness" is not
+    evidence of staleness.
+
+    The skew tolerance is IDENTITY-AWARE, and only sound that way. It exists solely
+    because the Codex launcher stamps the marker and the session line with two separate
+    `date +%s` calls (`src/agent/codex/cli/start-cli.sh:240` and `:242`), so one real
+    launch can record `started_at=N` and `session_started_at=N+1`. That case always
+    carries `"runtime":"codex"` on BOTH records. Granting the same margin when the
+    runtimes do not positively agree would swallow the fast Codex -> Claude switch: a
+    stale Codex marker at N against a Claude launch at N+1 is a genuinely different core,
+    and Claude is proxy-routed, so silencing it there hides stale quota telemetry
+    indefinitely on the one runtime that needs the warning (qingyun-wu + john-the-dev,
+    independently reproduced on f887b2a7).
+
+    So the margin applies only on a positive runtime match; otherwise the comparison is
+    strict. A Claude launch record carries no `runtime` field at all, which is exactly
+    the ambiguity that must NOT earn the tolerance.
+    """
+    try:
+        started = float(marker.get("started_at"))
+    except (TypeError, ValueError):
+        return False
+    launch = _last_core_launch_at()
+    if launch is None:
+        return False
+    launched, launch_runtime = launch
+    same_runtime = (
+        launch_runtime is not None and launch_runtime == marker.get("runtime")
+    )
+    margin = LAUNCH_RECORD_SKEW_SEC if same_runtime else 0
+    return started < launched - margin
+
+
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
 
@@ -2114,8 +2329,26 @@ def check_quota_telemetry(proxy_status: str) -> dict:
             check["detail"] = "quota state present"
             return check
         agent_age = _agent_activity_age()
+        skipped_for_runtime = _runtime_may_skip_proxy()
         if quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
-                and agent_age < AGENT_ACTIVE_SEC:
+                and agent_age < AGENT_ACTIVE_SEC and skipped_for_runtime \
+                and _last_core_launch_at() is None:
+            # Silenced by a runtime marker we could NOT date. `session-starts.log`
+            # only exists on checkouts carrying the launcher write-sites (first
+            # landed 17d094f4, 2026-07-13), and a pinned older node has no such
+            # file — a live counter-example on this fleet, not a hypothesis. The
+            # conservative reading is kept, because refusing to trust the marker
+            # would reinstate the false warn on every healthy pre-Jul-13 Codex
+            # host, which is the defect this check was opened to remove. But the
+            # no-op is stated rather than silent: an unqualified `ok` here would
+            # be indistinguishable from a check that actually verified something.
+            check["detail"] += (
+                " — runtime marker present but UNVERIFIABLE on this checkout "
+                "(no state/session-starts.log), so a stale marker cannot be "
+                "detected; staleness check inactive here"
+            )
+        elif quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
+                and agent_age < AGENT_ACTIVE_SEC and not skipped_for_runtime:
             check["status"] = "warn"
             check["detail"] = (
                 f"quota state is {int(quota_age / 3600)}h stale while the agent is "

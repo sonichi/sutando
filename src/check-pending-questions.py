@@ -74,6 +74,42 @@ def voice_client_connected():
     return False
 
 
+# A `## ` heading is not always a question. Two forms are structural, and both
+# must be classified HERE rather than by each consumer, so the notifier and the
+# briefing cannot report different counts for the same file.
+#
+# Both rules are anchored to SHAPE, not to a keyword appearing somewhere. Earlier
+# versions matched the word and each one deleted a live, `Status: open` question:
+#
+#   `^HELD\b`            -> "## HELD deployment until the owner approves the
+#                            migration" is a real ask, not a section shell.
+#   `.search()` for the
+#   inline marker        -> "## Confirm whether the UI should render a [DONE]
+#                            badge" is a question ABOUT a badge.
+#
+# So: an organizer shell is a keyword followed by a separator ("## ACTIVE — …",
+# "## FRESH – …", "## HELD: …") — a grouping label, never a sentence. And a
+# resolution marker is a bracketed group at the START of the title
+# ("## [RESOLVED 2026-07-03] shipped"), never one mentioned mid-sentence.
+_ORG_HEADING = re.compile(
+    r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\s*(?:[—–\-:]|$)',
+    re.IGNORECASE,
+)
+# Anchored with ^ and \s* — a marker leads the title or it is not a marker. The
+# closed-bracket grammar (keyword then `]` or whitespace-then-content-then-`]`)
+# rejects `[RESOLVED?]` / `[done-ish]`, which named an open uncertainty.
+# `(?:\d+[.)]\s*)?` — real entries carry an enumeration prefix
+# ("## 2. [RESOLVED 2026-07-03] shipped already"), so the marker leads the title
+# CONTENT, not necessarily character 0. Anchoring at character 0 alone dropped
+# that form (caught by tests/morning-briefing-pending-extract.test.py). It stays
+# anchored otherwise: "render a [DONE] badge" has the bracket mid-sentence and is
+# still a live question.
+_INLINE_RESOLVED = re.compile(
+    r'^\s*(?:\d+[.)]\s*)?\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]',
+    re.IGNORECASE,
+)
+
+
 def get_waiting_questions():
     """Parse pending-questions.md — matches the legacy `## Q1 — Title` and
     `## Title` / `- **Status:** unanswered` section formats AND the free-form
@@ -104,6 +140,8 @@ def get_waiting_questions():
         title_line, _, body = sec.partition('\n')
         title = title_line.strip()
         if not title:
+            continue
+        if _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title):
             continue
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
         if status_m:
