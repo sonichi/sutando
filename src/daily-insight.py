@@ -147,30 +147,43 @@ def _git_author_identity(repo_root):
     return ""
 
 
-def _own_stand_value(env=None):
+def _own_stand_value(env=None, repo_root=None):
     """This instance's `Stand:` trailer value, or "" when it cannot be determined.
 
-    Both Sutando instances commit under the owner's GH-mapped email (required for
-    CLA), so `--author` cannot tell them apart — on 2026-08-01 a local-branch scan
-    on Mini returned 17 `Echo Act IV Mini` commits alongside 16 `Echo Act IV Pro`
-    ones, the latter pulled in only because worktrees had been created at the
-    peer's PR heads. Attributing those to "you shipped N" is the exact misleading
-    personal metric this insight exists to avoid (CR #2257).
+    Both Sutando instances commit under the owner's GH-mapped email (CLA requires
+    it), so `--author` cannot separate them — a local-branch scan on one host
+    returned 17 `Echo Act IV Mini` commits beside 16 `Echo Act IV Pro` ones, the
+    peer's present only because worktrees had been created at its PR heads.
 
-    Returns "" if no host label resolves, in which case the caller counts every
-    commit by the author — the pre-existing behaviour, never a wrong attribution
-    dressed up as a right one.
+    Resolution order, all canonical — no host-name guessing:
+      1. ``SUTANDO_STAND`` (explicit override)
+      2. ``bash scripts/sutando-config.sh stand`` — the per-clone config key,
+         which resolves with NO environment and is therefore what the scheduled
+         cron actually sees (john-the-dev, #2484: the activated path exports
+         neither env var, so an env-only reader silently returns "").
+
+    An earlier revision mapped host labels containing ``mac-mini``/``macbook`` to
+    this owner's Stand names. That is installation-specific policy in shared
+    code: on another user's machine it would assign a foreign identity and filter
+    out all of their legitimate commits. Removed.
+
+    Returns "" when nothing resolves — and the CALLER must then decline to report,
+    not count everything (see analyze_dev_activity).
     """
     env = os.environ if env is None else env
-    label = (env.get("SUTANDO_STAND") or "").strip()
-    if label:
-        return label
-    host = (env.get("SUTANDO_HOST_LABEL") or "").strip()
-    if "mac-mini" in host.lower() or host.lower().startswith("chis-mac-mini"):
-        return "Echo Act IV Mini"
-    if "macbook" in host.lower():
-        return "Echo Act IV Pro"
-    return ""
+    explicit = (env.get("SUTANDO_STAND") or "").strip()
+    if explicit:
+        return explicit
+    root = Path(repo_root) if repo_root else SRC_DIR
+    script = root / "scripts" / "sutando-config.sh"
+    if not script.is_file():
+        return ""
+    try:
+        r = subprocess.run(["bash", str(script), "stand"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def analyze_dev_activity(repo_root=SRC_DIR, now=None):
@@ -206,21 +219,35 @@ def analyze_dev_activity(repo_root=SRC_DIR, now=None):
         return None
     if out.returncode != 0:
         return None
-    stand = _own_stand_value()
+    stand = _own_stand_value(repo_root=repo_root)
     commits = 0
     dirs = Counter()
     counting = False
+    seen_stands = set()
     for line in out.stdout.splitlines():
         if line.startswith("C:"):
             # "C:<sha>\x1f<Stand trailer value>" — the trailer is the ONLY thing
             # that separates this instance from its peer, because both commit
             # under the owner's GH-mapped email (see _own_stand_value).
             trailer = line.split("\x1f", 1)[1].strip() if "\x1f" in line else ""
+            if trailer:
+                seen_stands.add(trailer)
             counting = (not stand) or (trailer == stand)
             if counting:
                 commits += 1
         elif counting and line.strip() and "/" in line:
             dirs[line.split("/", 1)[0]] += 1
+    if not stand and len(seen_stands) > 1:
+        # No resolvable instance AND the scan spans MORE THAN ONE — we cannot say
+        # which commits are ours, and counting them all would credit the peer's
+        # work as this instance's (john-the-dev, #2484). Decline.
+        #
+        # Deliberately narrower than "decline whenever identity is unknown": that
+        # also silences every single-instance install which has never set the
+        # config key, producing the other failure john named — "reports no work
+        # despite real commits". Ambiguity, not ignorance, is what makes a count
+        # unsafe.
+        return None
     if commits == 0:
         return None
     return {"commits_24h": commits, "top_dirs": dirs.most_common(3)}

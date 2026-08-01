@@ -52,20 +52,34 @@ class TestStandValueResolution(unittest.TestCase):
         self.assertEqual(di._own_stand_value({"SUTANDO_STAND": "Echo Act IV Mini"}),
                          "Echo Act IV Mini")
 
-    def test_mac_mini_host_maps_to_mini(self):
-        self.assertEqual(di._own_stand_value({"SUTANDO_HOST_LABEL": "Chis-Mac-mini"}),
-                         "Echo Act IV Mini")
+    def test_host_label_is_NOT_mapped_to_an_owner_stand(self):
+        """Installation-specific policy must not live in shared code.
 
-    def test_macbook_host_maps_to_pro(self):
-        self.assertEqual(di._own_stand_value({"SUTANDO_HOST_LABEL": "Chis-MacBook-Pro"}),
-                         "Echo Act IV Pro")
+        An earlier revision mapped any label containing `mac-mini`/`macbook` to
+        THIS owner's Stand values — on another user's machine that assigns a
+        foreign identity and filters out all their commits (john-the-dev, #2484).
+        """
+        for label in ("Chis-Mac-mini", "Chis-MacBook-Pro", "Someone-Else-MacBook"):
+            with self.subTest(label=label):
+                got = di._own_stand_value({"SUTANDO_HOST_LABEL": label},
+                                          repo_root=Path(tempfile.mkdtemp()))
+                self.assertEqual(got, "", f"{label} must not resolve a Stand by host name")
 
-    def test_unknown_host_returns_empty_not_a_guess(self):
-        """Empty means 'do not filter' — never attribute on a guess."""
-        self.assertEqual(di._own_stand_value({"SUTANDO_HOST_LABEL": "some-other-box"}), "")
+    def test_no_env_and_no_config_returns_empty(self):
+        """The REAL cron shape: neither env var exported, no config key."""
+        self.assertEqual(di._own_stand_value({}, repo_root=Path(tempfile.mkdtemp())), "")
 
-    def test_no_env_returns_empty(self):
-        self.assertEqual(di._own_stand_value({}), "")
+
+class TestUnknownIdentityDeclinesRatherThanMisattributing(unittest.TestCase):
+    """The activated-path blocker: "" must mean DECLINE, never count-everything."""
+
+    def test_no_stand_returns_None_not_a_count(self):
+        import os
+        repo = build_repo([("a.py", "Echo Act IV Mini"), ("b.py", "Echo Act IV Pro")])
+        for k in ("SUTANDO_STAND", "SUTANDO_HOST_LABEL"):
+            os.environ.pop(k, None)
+        got = di.analyze_dev_activity(repo)
+        self.assertIsNone(got, "unknown identity must decline, not credit the peer")
 
 
 class TestCountsOnlyOwnCommits(unittest.TestCase):
@@ -97,17 +111,12 @@ class TestCountsOnlyOwnCommits(unittest.TestCase):
         finally:
             os.environ.pop("SUTANDO_STAND", None)
 
-    def test_unknown_stand_counts_everything(self):
-        """Control: with no resolvable instance we keep the old behaviour."""
+    def test_unknown_stand_declines(self):
+        """Was 'counts everything' — inverted after #2484: that credited the peer."""
         import os
         for k in ("SUTANDO_STAND", "SUTANDO_HOST_LABEL"):
             os.environ.pop(k, None)
-        os.environ["SUTANDO_HOST_LABEL"] = "some-other-box"
-        try:
-            got = di.analyze_dev_activity(self.repo)
-        finally:
-            os.environ.pop("SUTANDO_HOST_LABEL", None)
-        self.assertEqual(got["commits_24h"], 4, got)
+        self.assertIsNone(di.analyze_dev_activity(self.repo))
 
 
 class TestSeesWorkOnBranches(unittest.TestCase):
