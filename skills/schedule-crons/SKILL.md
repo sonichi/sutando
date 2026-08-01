@@ -135,3 +135,34 @@ This installs `com.sutando.cron-runner` (launchd, every 60s → `src/cron-runner
 When the selected core runtime is Codex on macOS, `src/agent/codex/cli/start-cli.sh` performs this installation/reconciliation automatically. Manual installation remains the opt-in path for Claude-core hosts.
 
 **Ownership partition (no double-fire):** the launchd runner handles ONLY `"launchd": true` entries; this session skill (step 3) skips those same entries. Exactly one scheduler owns each cron. Leave `main-loop` / `/proactive-loop` session-owned (it drives the session itself — it is not a task and must never be launchd-owned).
+
+## Digest cron delivery — write one `results/proactive-*.txt`, nothing else
+
+`notify.py` is for **progress pings only** (≤280 chars). Digest-style cron prompts that produce research summaries (1000–2000 chars) are silently dropped by notify.py's hard limit — the user sees nothing.
+
+**Correct delivery pattern for digest crons — the shared proactive primitive:**
+
+```
+DELIVERY: Write the complete digest to results/proactive-<name>-$(date +%s).txt
+(and nothing else). Do NOT use notify.py for the final result — it rejects
+messages over 280 chars (it is a progress-ping tool, not a delivery channel).
+```
+
+`results/proactive-*.txt` is the **one cross-surface delivery contract** — every
+configured bridge (Discord, Telegram, Slack) drains it, and `proactive_routing.py`
+routes each file to the channel where the owner was **most recently active**, exactly
+once (atomic `.sending` claim). That's why it's the primitive to use.
+
+**Do NOT** write `results/briefing-*` and **do NOT** mint a synthetic
+`tasks/task-cron-*` "for Tasks-tab visibility":
+- `briefing-*` is not a universal prefix — only Discord (`FALLBACK_PREFIXES` in
+  `poll_dm_fallback`) and Telegram (a briefing-as-proactive patch) drain it; **Slack
+  never delivers it**, so a `briefing-*` digest is silently archived on a Slack-only
+  install. `proactive-*` has no such gap.
+- A hand-written `tasks/task-cron-*` is an **orphan**: nothing writes a matching
+  `results/task-cron-*` keyed to that id, so the task never "completes" — the watcher
+  re-processes it (duplicate/noisy execution) and the task-id-keyed consumers
+  (Slack/Telegram/agent-api) deliver nothing. Delivery comes from the `proactive-*`
+  file alone; you don't need a task file for it.
+
+See `crons.example.json` for the `example-digest` entry that shows this pattern. Scripts (like `src/morning-briefing.py`) already emit `results/proactive-*.txt` themselves and don't need this — only inline prompt crons that produce long output.
