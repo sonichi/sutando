@@ -160,6 +160,56 @@ with tempfile.TemporaryDirectory() as td4:
     check("dead core + live watcher/sibling on the socket -> core_pid() is None (not 99999)",
           got is None)
 
+# --- REAL core_pid() through fake tmux+pgrep: every branch, not just the stub ---
+# The regressions above monkeypatch core_pid, which is right for the LOOP but leaves
+# the resolver's own branches unexecuted (diff-cover flagged 14 such lines).
+def _stub(d: pathlib.Path, name: str, body: str):
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / name; f.write_text(body); f.chmod(0o755); return f
+
+_ORIG_PATH = os.environ["PATH"]
+with tempfile.TemporaryDirectory() as td5:
+    b = pathlib.Path(td5) / "bin"
+    # session EXISTS (exit 0 for =sutando-core), pgrep finds the core claude
+    _stub(b, "tmux", "#!/bin/sh\nexit 0\n")
+    _stub(b, "pgrep", "#!/bin/sh\necho '4242 claude --name sutando-core --foo'\n")
+    os.environ["PATH"] = f"{b}:{_ORIG_PATH}"
+    check("REAL: pgrep match on `--name <session>` returns the core pid",
+          _REAL_CORE_PID("/tmp/s.sock") == 4242)
+
+    # same, the `--name=<session>` spelling
+    _stub(b, "pgrep", "#!/bin/sh\necho '4243 claude --name=sutando-core'\n")
+    check("REAL: the `--name=<session>` spelling also matches",
+          _REAL_CORE_PID("/tmp/s.sock") == 4243)
+
+    # a NON-core claude must not match (someone else's claude on the box)
+    _stub(b, "pgrep", "#!/bin/sh\necho '999 claude --name something-else'\n")
+    _stub(b, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) echo 777; exit 0;; esac; done\nexit 0\n")
+    check("REAL: a claude for a DIFFERENT session falls through to the pane path",
+          _REAL_CORE_PID("/tmp/s.sock") == 777)
+
+    # pgrep finds nothing -> pane fallback, scoped to the session
+    _stub(b, "pgrep", "#!/bin/sh\nexit 1\n")
+    check("REAL: no core claude -> pane fallback returns the session pane pid",
+          _REAL_CORE_PID("/tmp/s.sock") == 777)
+
+    # pane list empty -> None (not a stale value)
+    _stub(b, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) exit 0;; esac; done\nexit 0\n")
+    check("REAL: session exists but NO panes -> None", _REAL_CORE_PID("/tmp/s.sock") is None)
+
+    # list-panes itself fails -> None
+    _stub(b, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) exit 1;; esac; done\nexit 0\n")
+    check("REAL: list-panes failure -> None", _REAL_CORE_PID("/tmp/s.sock") is None)
+os.environ["PATH"] = _ORIG_PATH
+
+# tmux BINARY ABSENT entirely -> _tmux swallows the OSError and core_pid is None.
+# PATH is emptied rather than stubbed, so this exercises the except branch for real.
+with tempfile.TemporaryDirectory() as td6:
+    os.environ["PATH"] = td6
+    check("REAL: tmux binary missing -> _tmux returns None, core_pid None (no crash)",
+          _REAL_CORE_PID("/tmp/s.sock") is None)
+os.environ["PATH"] = _ORIG_PATH
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
