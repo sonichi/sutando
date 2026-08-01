@@ -14,6 +14,12 @@ import re
 import sys
 
 flags = [p for p in os.environ.get("RC_FLAGS", "").split("\n") if p]
+# Patterns that must equal the WHOLE path token rather than appear inside it.
+# A full executable path needs this: '/usr/bin/swift' as a substring also
+# rejects '/usr/bin/swift-inspect', a separate real binary (its own inode, link
+# count 1) — so a substring rule turns the gate into a blocker for legitimate
+# platform tools, which is how a check gets disabled (#2474 review).
+flags_exact = [p for p in os.environ.get("RC_FLAGS_EXACT", "").split("\n") if p]
 allows = [a for a in os.environ.get("RC_ALLOWS", "").split("\n") if a]
 DELIMS = set("\"'()" + ", ;=" + chr(96) + chr(9))   # quotes, brackets, backtick, tab, etc.
 SKIP = re.compile(r"\.md$|(^|/)tests/|\.test\.|review-checks\.(sh|py)$")
@@ -132,11 +138,16 @@ def main():
             if was_in_doc or stripped.startswith("#") or stripped.startswith("//") \
                     or _BLOCK_COMMENT_CONT.match(stripped):
                 continue
-            for p in flags:
+            # (pattern, exact) — exact patterns fire only when the extracted
+            # token IS the pattern, so a longer sibling filename in the same
+            # directory family (swift-inspect vs swift) is untouched.
+            for p, exact in [(f, False) for f in flags] + [(f, True) for f in flags_exact]:
                 pos = line.find(p)
                 if pos < 0:
                     continue
                 tok = token_at(line, pos)
+                if exact and tok != p:
+                    continue
                 if not allowed(tok):
                     print("%s:%d: hardcoded path (%s): %s" % (cur_file, cur, tok, stripped))
                     hits += 1

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tests REVIEW.md lesson 7's machine-readable half: the Xcode-CLT stub patterns
-# in `checks.hardcoded-paths.flag`.
+# in `checks.hardcoded-paths.flag_exact`.
 #
 # On macOS /usr/bin/{git,python3,swift,swiftc,clang,gcc,make} are one inode
 # hardlinked as the CLT stub. Invoking one on a host without developer tools
@@ -15,7 +15,9 @@
 #   2. a comment that merely MENTIONS a stub path is not (this repo discusses
 #      these paths constantly in prose — a check that flagged comments would be
 #      turned off within a week),
-#   3. genuinely-real /usr/bin binaries are never flagged.
+#   3. genuinely-real /usr/bin binaries are never flagged — including
+#      prefix-family siblings like swift-inspect, which a substring rule
+#      wrongly rejected (#2474 review).
 #
 # Run: bash tests/review-checks-clt-shims.test.sh
 set -u
@@ -54,8 +56,9 @@ scan() {
 }
 
 # --- 1. every stub path is caught in executable code -------------------------
-# swiftc is covered by the '/usr/bin/swift' prefix rather than its own entry;
-# asserting it here is what keeps that implicit coverage honest.
+# Each stub is named exactly under flag_exact — swiftc no longer rides on a
+# '/usr/bin/swift' prefix, because that prefix also rejected the real
+# swift-inspect binary (see 2b).
 for stub in git python3 swift swiftc clang gcc make; do
     scan "+    subprocess.run([\"/usr/bin/$stub\", \"--version\"])"
     if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "/usr/bin/$stub"; then
@@ -73,6 +76,23 @@ if [ "$RC" -eq 0 ]; then
 else
     ok "comment mentions of a stub path are not flagged" "no (rc=$RC out=$OUT)"
 fi
+
+# --- 2b. prefix-family siblings are NOT flagged ------------------------------
+# The stub entries are whole-token matches (`flag_exact`), not substrings.
+# /usr/bin/swift-inspect is a REAL separate binary — its own inode, link count
+# 1 — while /usr/bin/swift and /usr/bin/swiftc share the stub inode with 76
+# other names. A substring rule rejected the real tool too, which is how a
+# mandatory gate gets disabled rather than fixed (#2474 review, john-the-dev).
+# makeinfo is the same shape against /usr/bin/make; it is absent on the current
+# host, so it is pinned here as a synthetic control rather than left to chance.
+for sibling in swift-inspect swift-frontend makeinfo gcc-14; do
+    scan "+    p = \"/usr/bin/$sibling\""
+    if [ "$RC" -eq 0 ]; then
+        ok "prefix-family sibling /usr/bin/$sibling is not flagged" yes
+    else
+        ok "prefix-family sibling /usr/bin/$sibling is not flagged" "no (rc=$RC out=$OUT)"
+    fi
+done
 
 # --- 3. real /usr/bin binaries stay usable -----------------------------------
 # These are NOT stubs (separate inodes, link count 1) and the codebase addresses
@@ -95,13 +115,21 @@ fi
 # Guards against someone deleting the flag entries while leaving lesson 7's
 # prose in place — the prose alone is not enforcement.
 missing=""
-for pat in '/usr/bin/git' '/usr/bin/python3' '/usr/bin/swift' '/usr/bin/clang' '/usr/bin/gcc' '/usr/bin/make'; do
+for pat in '/usr/bin/git' '/usr/bin/python3' '/usr/bin/swift' '/usr/bin/swiftc' '/usr/bin/clang' '/usr/bin/gcc' '/usr/bin/make'; do
     grep -q "'$pat'" "$REPO/REVIEW.md" || missing="$missing $pat"
 done
 if [ -z "$missing" ]; then
     ok "REVIEW.md checks: block lists every stub pattern" yes
 else
     ok "REVIEW.md checks: block lists every stub pattern" "no (missing:$missing)"
+fi
+
+# The stubs must live under flag_exact, not flag — under `flag` they are
+# substrings again and the prefix-family controls above regress silently.
+if awk '/^[[:space:]]*flag_exact:/{f=1} f && /usr\/bin\/swiftc/{found=1} END{exit !found}' "$REPO/REVIEW.md"; then
+    ok "stub patterns live under flag_exact (whole-token), not flag" yes
+else
+    ok "stub patterns live under flag_exact (whole-token), not flag" "no"
 fi
 
 echo

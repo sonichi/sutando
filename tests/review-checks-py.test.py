@@ -16,6 +16,7 @@ MODPATH = REPO / "scripts" / "review-checks.py"
 
 # Module reads RC_FLAGS / RC_ALLOWS at import time — set them first.
 os.environ["RC_FLAGS"] = "\n".join(["/Users/", "/home/", "~/.claude"])
+os.environ["RC_FLAGS_EXACT"] = "\n".join(["/usr/bin/swift", "/usr/bin/make"])
 os.environ["RC_ALLOWS"] = "\n".join(["/tmp/", "/nonexistent", "example.com"])
 
 spec = importlib.util.spec_from_file_location("review_checks", MODPATH)
@@ -204,6 +205,24 @@ code, out = scan(
     '+  *gen() { return "/Users/a/b"; }'
 )
 ok("a generator method is not mistaken for a comment", "src/app.ts:1:" in out)
+
+# --- flag_exact: whole-token, not substring (#2474 review) ------------------
+# A full executable path must not reject longer siblings in the same directory
+# family: /usr/bin/swift-inspect is a separate REAL binary (own inode, link
+# count 1) while /usr/bin/swift is the stub.
+code, out = scan('+++ b/src/a.swift\n@@ -1,0 +1,1 @@\n+p = "/usr/bin/swift"')
+ok("flag_exact matches the exact token", "/usr/bin/swift" in out)
+
+code, out = scan('+++ b/src/a.swift\n@@ -1,0 +1,1 @@\n+p = "/usr/bin/swift-inspect"')
+ok("flag_exact does NOT match a longer sibling (swift-inspect)", out.strip() == "")
+
+code, out = scan('+++ b/src/a.sh\n@@ -1,0 +1,1 @@\n+p = "/usr/bin/makeinfo"')
+ok("flag_exact does NOT match a longer sibling (makeinfo)", out.strip() == "")
+
+# `flag` keeps its substring semantics — /Users/ must still match a longer path.
+code, out = scan('+++ b/src/a.py\n@@ -1,0 +1,1 @@\n+p = "/Users/alice/deep/path"')
+ok("flag (substring) semantics unchanged alongside flag_exact",
+   "/Users/alice/deep/path" in out)
 
 print("---")
 if failed:

@@ -64,9 +64,14 @@ and loads whichever repo it reviews.
    resolve via the workspace/config helpers instead. Enforced by the `checks:` block.
 7. **Never invoke a developer-tool binary at an absolute `/usr/bin/` path.** On macOS
    `/usr/bin/git`, `python3`, `swift`, `swiftc`, `clang`, `gcc` and `make` are not those
-   tools — they are one inode hardlinked as the Xcode Command Line Tools *stub*. The
+   tools — they are one inode hardlinked **78 ways** (`cc`, `c++`, `g++`, `clang++`,
+   `gnumake`, `bison`, `flex`, `git-upload-pack` … re-derive with
+   `ls -li /usr/bin | awk '$3==78'`) as the Xcode Command Line Tools *stub*. The
    file exists whether or not the tools are installed; running it without them raises a
-   modal "install command line developer tools" dialog and returns nothing. Three
+   modal "install command line developer tools" dialog and returns nothing. Note the
+   converse: a *longer* name in the same family is often a real binary —
+   `/usr/bin/swift-inspect` has its own inode — so match these paths whole, never as a
+   prefix. Three
    consequences a reviewer should check for: an absolute path **cannot be shadowed** by
    a real install on PATH, so the user's own git/python never wins; every existence
    probe (`test -x`, `command -v`, `shutil.which`, `FileManager.fileExists`) **passes
@@ -98,19 +103,33 @@ checks:
       - '/private/'
       - '~/.claude'
       - '~/.sutando'
-      # Xcode-CLT stubs (lesson 7). Not machine-specific — these exist on every
-      # Mac — but invoking one on a host without developer tools raises a modal
-      # install dialog and returns nothing, and the absolute path cannot be
-      # shadowed by a real install on PATH. '/usr/bin/swift' also covers
-      # '/usr/bin/swiftc' by prefix. Non-stub /usr/bin binaries (env, pgrep,
-      # lsof, osascript, open, id, pmset, xcode-select) are deliberately absent:
-      # they are real binaries and safe to address absolutely.
+    # Whole-token matches (lesson 7): the Xcode-CLT stubs. Listed here rather
+    # than under `flag` because these are full executable paths, and a substring
+    # rule would also reject longer siblings in the same directory family —
+    # '/usr/bin/swift-inspect' is a separate REAL binary (its own inode, link
+    # count 1), unlike '/usr/bin/swift' and '/usr/bin/swiftc' which share the
+    # stub inode with 76 other names. Blocking a legitimate platform tool is how
+    # a mandatory gate gets disabled, so each stub is named exactly.
+    #
+    # To re-derive the family on a Mac: `ls -li /usr/bin | awk '$3==78'` — every
+    # entry sharing that inode is the same stub. Only the names this repo
+    # plausibly invokes are listed; add others as they come up.
+    #
+    # Non-stub /usr/bin binaries (env, pgrep, lsof, osascript, open, id, pmset,
+    # xcode-select) are deliberately absent: they are real binaries and safe to
+    # address absolutely.
+    flag_exact:
       - '/usr/bin/git'
       - '/usr/bin/python3'
       - '/usr/bin/swift'
+      - '/usr/bin/swiftc'
       - '/usr/bin/clang'
+      - '/usr/bin/clang++'
       - '/usr/bin/gcc'
+      - '/usr/bin/g++'
+      - '/usr/bin/cc'
       - '/usr/bin/make'
+      - '/usr/bin/gnumake'
     # ...unless the path token also matches one of these (fixtures / system noise).
     allow:
       - '/nonexistent'
