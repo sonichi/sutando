@@ -290,6 +290,99 @@ with tempfile.TemporaryDirectory() as t:
     names = [c.get("name") for c in hc.run_all_checks()]
     check("run_all_checks() includes memory-index", "memory-index" in names, str(names))
 
+# 6) Sibling HUB indexes. Overflow entries live in MEMORY-reference.md /
+#    MEMORY-wire.md, which MEMORY.md links to. They are grep-reachable by
+#    design, so they are NOT losses — but counting them as such buried 104
+#    by-design entries inside a 1010-file warn on the live host.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text(
+        "# Index\n- Lookups live in [MEMORY-reference.md](MEMORY-reference.md)\n")
+    (mem / "MEMORY-reference.md").write_text("# Lookups\n- [Hub entry](hub-entry.md)\n")
+    (mem / "hub-entry.md").write_text("a lookup that is found by grepping the hub")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    # Fails against the pre-change probe, which called this a warn.
+    check("hub-only memory → ok, not a loss", r and r["status"] == "ok", str(r))
+    check("ok detail counts the hub entry", r and "1 reachable via a sibling hub" in r["detail"],
+          str(r))
+    check("hub entry is never listed as lost",
+          r and "in NO index" not in r["detail"] and "won't load" not in r["detail"], str(r))
+
+# 6b) A genuine orphan alongside a hub entry: the orphan is named, the hub entry
+#     is only counted — that separation is the whole point of the change.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text("# Index\n- [ref](MEMORY-reference.md)\n")
+    (mem / "MEMORY-reference.md").write_text("# Lookups\n- [Hub](hub-entry.md)\n")
+    (mem / "hub-entry.md").write_text("findable")
+    (mem / "truly-dark.md").write_text("in no index at all — this is the real loss")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("orphan alongside hub entry → warn", r and r["status"] == "warn", str(r))
+    check("warn names the truly-dark file", r and "truly-dark.md" in r["detail"], str(r))
+    check("warn does NOT name the hub entry", r and "hub-entry.md" not in r["detail"], str(r))
+    check("warn counts 1 lost, not 2", r and "1 memory file(s) in NO index" in r["detail"], str(r))
+
+# 6c) FAIL-SAFE: a MEMORY*.md the loaded index does NOT link is not a hub. If it
+#     were trusted, a stale/backup file would launder itself AND everything it
+#     names into a false green — inside the probe whose whole job is catching
+#     silent loss. (john-the-dev, #2483 P1: an earlier revision of this change
+#     trusted the glob, and this very test blessed it.)
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text("# Index\n")          # deliberately does not link the hub
+    (mem / "MEMORY-stale.md").write_text("# stale copy\n- [hidden](hidden.md)\n")
+    (mem / "hidden.md").write_text("a real memory, reachable from nowhere that loads")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("unlinked MEMORY*.md cannot launder a dark memory into ok",
+          r and r["status"] == "warn", str(r))
+    check("the laundered memory is still named", r and "hidden.md" in r["detail"], str(r))
+    check("the unlinked file is itself reported", r and "MEMORY-stale.md" in r["detail"], str(r))
+    check("nothing is credited to a hub here",
+          r and "reachable via a sibling hub" not in r["detail"], str(r))
+
+# 6c-2) A hub linked ONLY past the load cut is equally unreachable, so it must not
+#       be trusted either — `loaded_text` is the gate, not the whole file.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    filler = "\n".join(f"- filler line {i}" for i in range(hc.MEMORY_INDEX_LOAD_LINES + 10))
+    (mem / "MEMORY.md").write_text("# Index\n" + filler + "\n- [ref](MEMORY-late.md)\n")
+    (mem / "MEMORY-late.md").write_text("# Lookups\n- [buried](buried.md)\n")
+    (mem / "buried.md").write_text("named only by a hub the session never reaches")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("hub linked only beyond the cut is not trusted",
+          r and "buried.md" in r["detail"], str(r))
+    check("beyond-cut hub credits nothing as reachable",
+          r and "reachable via a sibling hub" not in r["detail"], str(r))
+
+# 6c-3) Control: the SAME shape, but linked inside the loaded prefix → trusted.
+#       Without this, 6c/6c-2 would pass even if hub support were removed entirely.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text("# Index\n- lookups: [MEMORY-late.md](MEMORY-late.md)\n")
+    (mem / "MEMORY-late.md").write_text("# Lookups\n- [buried](buried.md)\n")
+    (mem / "buried.md").write_text("same file, now reachable")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("linked hub IS trusted (control for 6c/6c-2)",
+          r and r["status"] == "ok" and "1 reachable via a sibling hub" in r["detail"], str(r))
+
+# 6d) Positive control on SCOPE: the #2449 fail path is untouched. A memory whose
+#     only index entry sits past the load cut is still a demonstrated loss, and a
+#     hub must not launder it into "fine".
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    filler = "\n".join(f"- filler line {i}" for i in range(hc.MEMORY_INDEX_LOAD_LINES + 10))
+    (mem / "MEMORY.md").write_text("# Index\n" + filler + "\n- [Past cut](past-cut.md)\n")
+    (mem / "past-cut.md").write_text("entry exists but is never read")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("beyond-the-cut entry still FAILS (scope unchanged)",
+          r and r["status"] == "fail", str(r))
+
 print()
 if _failed:
     print(f"FAIL — {_failed} check(s) failed"); sys.exit(1)

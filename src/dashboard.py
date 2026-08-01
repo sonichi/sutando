@@ -154,6 +154,15 @@ def get_quota_status() -> dict:
     a stale leftover copy under skills/quota-tracker/ silently shadowed the
     fresh file and froze this dashboard's quota panel for ~12h (2026-05-21).
     One path, one source of truth.
+
+    The file is only as fresh as its writer. When the credential proxy is not
+    in the boot path (sonichi#2211) nothing rewrites it, and the panel keeps
+    rendering the last snapshot as if it were current — Chi hit this with a
+    file **332 hours** old still showing "4% used, resets 16:40 Jul 17".
+    A MISSING file degrades honestly (`available: True`, no numbers); a STALE
+    one is confidently wrong, which is the worse failure. So the age travels
+    with the data: `age_h` always, `stale` past QUOTA_STALE_HOURS, and the
+    caller renders it instead of implying freshness it cannot vouch for.
     """
     quota_file = status_read_path("quota-state.json", WORKSPACE_DIR)
     if not quota_file.exists():
@@ -168,10 +177,63 @@ def get_quota_status() -> dict:
             data["reset_5h"] = datetime.fromtimestamp(int(reset_5h)).strftime("%H:%M %b %d")
         if reset_7d:
             data["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).strftime("%H:%M %b %d")
+        data.update(_quota_freshness(data, quota_file))
         return data
     except Exception:
         return {"available": True}
 
+
+# Past this, the reading is old enough that acting on it is a mistake. Matches
+# the 6h "down" threshold the comm-sweep freshness probe already uses, so the
+# fleet has one staleness vocabulary rather than a per-panel invention.
+QUOTA_STALE_HOURS = 6.0
+
+
+def _quota_freshness(data: dict, quota_file) -> dict:
+    """Age of the reading, from `last_checked` — falling back to file mtime.
+
+    `last_checked` is what the WRITER observed; mtime is only when the file was
+    last touched. Prefer the writer's own timestamp and fall back, rather than
+    trusting mtime, so a rewrite that carries an old reading still reads old.
+    Unparseable/absent timestamps yield `age_h: None` + `stale: True` — unknown
+    age is treated as stale, because the whole point is to stop presenting
+    unverified numbers as current.
+    """
+    checked = data.get("last_checked")
+    ts = None
+    if isinstance(checked, str) and checked:
+        try:
+            ts = datetime.fromisoformat(checked.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            ts = None
+    if ts is None:
+        try:
+            ts = quota_file.stat().st_mtime
+        except OSError:
+            return {"age_h": None, "stale": True}
+    age_h = max(0.0, (datetime.now().timestamp() - ts) / 3600.0)
+    return {"age_h": round(age_h, 1), "stale": age_h >= QUOTA_STALE_HOURS}
+
+
+
+def _quota_age_label(quota: dict) -> str:
+    """One short string for the panel: how old this reading is.
+
+    Rendered for EVERY state, not only the bad one — a panel that says nothing
+    when fresh and something when stale trains the eye to ignore the absence.
+    """
+    if not quota.get("headers") and quota.get("age_h") is None:
+        return "no data"
+    age = quota.get("age_h")
+    if age is None:
+        return "age unknown"
+    if age >= 24:
+        return f"STALE {age/24:.1f}d old"
+    if quota.get("stale"):
+        return f"STALE {age:.1f}h old"
+    if age >= 1:
+        return f"{age:.1f}h ago"
+    return f"{int(age*60)}m ago"
 
 def get_system_stats() -> dict:
     import os
@@ -645,7 +707,7 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{stats['battery']}{charge}</div><div class="stat-label">Battery</div></div>
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
 <div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
-<div class="stat"><div class="stat-val">{"✓" if stats["quota"].get("available", True) else "✗"}</div><div class="stat-label">Quota</div></div>
+<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("✓" if stats["quota"].get("available", True) else "✗")}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
 <div class="stat"><div class="stat-val">{int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)}%</div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
 <div class="stat"><div class="stat-val">{int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)}%</div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
 </div></div>""")
