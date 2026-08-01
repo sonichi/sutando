@@ -23,6 +23,10 @@ from discord_http import request_json  # noqa: E402
 # 200 pages * 100 = 20k messages before we refuse to loop forever.
 MAX_PAGES = 200
 
+# Ordinary messages are clipped so a long scroll stays scannable; FORWARDS are
+# exempt (see _render) because a forward is usually the substance, not chatter.
+CLIP = 200
+
 
 def _load_token(env):
     """Populate DISCORD_BOT_TOKEN from the channel .env (if present) and return it."""
@@ -41,6 +45,41 @@ def _fetch(extra, channel_id, page, headers):
     # request_json honors 429 Retry-After + retries transient 5xx, so a rate
     # limit mid-pagination no longer aborts the read (2026-07-24 truncation fix).
     return request_json(req, timeout=10)
+
+
+def _render(msg):
+    """One message's readable body, INCLUDING forwarded content.
+
+    A Discord *forward* carries empty top-level `content` and puts the real
+    payload in `message_snapshots[0].message` (the bridge already knows this —
+    `discord-bridge.py` reads it, `discord_addressee.py` documents it). This
+    reader did not, so every forwarded message rendered as a BLANK LINE — and
+    this is the reader the context-reconstruct step runs on every pass.
+
+    Measured 2026-07-31: two forwards in #research-eval printed as empty while
+    holding the only record of a live AMA failure (a 1,602-char transcript plus
+    the reporter's own words). They were nearly deleted on the strength of that
+    blank output — see feedback_forwarded_discord_msgs_hide_content_in_message_snapshots.
+
+    The forward is LABELLED rather than silently inlined: attributing a quoted
+    message to the forwarder is its own misreading. Forwards are also exempt
+    from the 200-char clip — the clip exists to keep ordinary chatter scannable,
+    and a forward is usually carrying the substance someone moved deliberately.
+    """
+    body = (msg.get("content") or "").strip()
+    snaps = msg.get("message_snapshots") or []
+    if not snaps:
+        return body[:CLIP]
+    fwd = (snaps[0].get("message") or {})
+    fwd_body = (fwd.get("content") or "").strip()
+    extra = []
+    for a in fwd.get("attachments") or []:
+        extra.append(f"<attachment: {a.get('filename', '?')}>")
+    for e in fwd.get("embeds") or []:
+        extra.append(f"<embed: {e.get('title') or e.get('type') or '?'}>")
+    inner = " ".join(x for x in (fwd_body, *extra) if x) or "(forward with no readable body)"
+    prefix = f"{body} " if body else ""
+    return f"{prefix}[forwarded] {inner}"
 
 
 def _at_or_before_boundary(msg, until):
@@ -108,9 +147,8 @@ def main(argv=None):
         if args.until and _strictly_older_than_boundary(msg, args.until):
             continue
         author = msg.get("author", {}).get("username", "?")
-        content = msg.get("content", "")[:200]
         ts = msg.get("timestamp", "")[:19]
-        print(f"[{ts}] {author}: {content}")
+        print(f"[{ts}] {author}: {_render(msg)}")
     return 0
 
 
