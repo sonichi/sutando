@@ -135,14 +135,46 @@ def _prev_word(code, i):
 _TUPLE_LANG_SUFFIXES = (".py", ".pyi")
 
 
-# Methods that RESOLVE a candidate list at runtime by probing. Anything else that
-# consumes the list selects deterministically at author time (`.at(1)`) and is
-# therefore not a fallback chain. Allowlisted, not denylisted: an unknown method
-# fails CLOSED.
-_RESOLVER_METHODS = frozenset((
-    "find", "filter", "some", "includes", "indexOf", "findIndex", "map",
-    "flatMap", "reduce", "forEach", "next",
+# Methods that RESOLVE a candidate list at runtime, by narrowing it with a
+# predicate the runtime evaluates. Their RESULT is runtime-determined, so a
+# subscript on it still is: `.filter(exists)[0]` is a genuine probe. The chain
+# ends here.
+_PROBING_METHODS = frozenset((
+    "find", "filter", "some", "includes", "indexOf", "findIndex", "next",
 ))
+
+# Methods that pass the list THROUGH without narrowing it by a runtime predicate.
+# They neither resolve nor select, so reading them as resolvers and stopping let a
+# deterministic selector hide one link further down the chain:
+#
+#     ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => x)[1]
+#
+# `map` is 1:1, so `[1]` is the same AUTHOR-time pick as `[1]` on the literal —
+# the /usr/local string is present but dead. Keep walking instead.
+_TRANSFORM_METHODS = frozenset(("map", "flatMap", "reduce", "forEach"))
+
+
+def _call_end(code, name_end):
+    """Index of the `)` closing the call whose name ends at `name_end`, else None.
+
+    None means the shape could not be read (no call parens, or unbalanced because
+    the diff truncated the line). Callers treat that as UNKNOWN and fail closed —
+    an unreadable chain must not read as a resolved one.
+    """
+    j = name_end
+    while j < len(code) and code[j] in " \t":
+        j += 1
+    if j >= len(code) or code[j] != "(":
+        return None
+    depth = 0
+    for k in range(j, len(code)):
+        if code[k] == "(":
+            depth += 1
+        elif code[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return k
+    return None
 
 
 def _is_selected_from(code, close_idx, next_code=None):
@@ -157,13 +189,18 @@ def _is_selected_from(code, close_idx, next_code=None):
 
     Three consumers count:
       * a subscript on the same line;
-      * a method that is NOT a runtime resolver (`.at`, `.pop`, ...) — the
-        allowlist is `_RESOLVER_METHODS`, so an unrecognised method fails CLOSED;
+      * a method that is NOT a runtime probe (`.at`, `.pop`, ...) — the allowlist
+        is `_PROBING_METHODS`, so an unrecognised method fails CLOSED;
       * a subscript that opens the NEXT line, because JS lets the member
         expression continue across the break. `next_code` carries it.
 
     `.find(exists)` / `.filter(...)` stay permitted: they choose at RUNTIME by
     probing, which is exactly what makes a candidate list portable.
+
+    A pass-through transform (`_TRANSFORM_METHODS`) is neither: it does not
+    resolve the list, so the chain is READ ON past it rather than accepted. That
+    is what stops `.map(x => x)[1]` — deterministic selection one link further
+    down — while `.map(x => x).find(exists)` still resolves at runtime.
     """
     j = close_idx + 1
     while j < len(code) and code[j] in " \t":
@@ -175,7 +212,15 @@ def _is_selected_from(code, close_idx, next_code=None):
             k = j + 1
             while k < len(code) and (code[k].isalnum() or code[k] == "_"):
                 k += 1
-            return code[j + 1:k] not in _RESOLVER_METHODS
+            name = code[j + 1:k]
+            if name in _PROBING_METHODS:
+                return False
+            if name in _TRANSFORM_METHODS:
+                end = _call_end(code, k)
+                if end is None:
+                    return True       # unreadable chain — fail closed
+                return _is_selected_from(code, end, next_code)
+            return True
         return False
     # Group ended at end-of-line: a subscript may open the next line.
     if next_code is not None and next_code.lstrip().startswith("["):

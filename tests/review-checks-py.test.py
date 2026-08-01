@@ -672,6 +672,53 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 14 (qingyun-wu, review of 8c6859b3). A PASS-THROUGH transform ended the
+# chain scan, so a deterministic selector one link further down was never seen:
+#
+#     ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => x)[1]
+#
+# `map` is 1:1, so that `[1]` is the same AUTHOR-time pick as indexing the
+# literal directly. The split is by what the method does to the candidate SET:
+# a probe narrows it at runtime (so a subscript on its result is still runtime-
+# determined — `.filter(exists)[0]`), a transform does not (so the chain must be
+# read on). Unknown methods keep failing CLOSED.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    ok("main(): `.map(x => x)[1]` selects through the transform",
+       "hardcoded path" in scan('+++ b/src/m1.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => x)[1];')[1])
+    ok("main(): `.flatMap(...)[0]` selects through the transform",
+       "hardcoded path" in scan('+++ b/src/m2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.flatMap(x => [x])[0];')[1])
+    ok("main(): `.map(...).at(1)` selects through the transform",
+       "hardcoded path" in scan('+++ b/src/m3.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => x).at(1);')[1])
+
+    ok("main(): `.map(...).find(exists)` still resolves at runtime",
+       scan('+++ b/src/m4.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => x).find(exists);')[1].strip() == "")
+    ok("main(): `.filter(exists)[0]` is a probe, not a selection",
+       scan('+++ b/src/m5.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.filter(exists)[0];')[1].strip() == "")
+
+    ok("_is_selected_from: transform then subscript selects",
+       rc._is_selected_from('["/a","/b"].map(x => x)[1]', 10))
+    ok("_is_selected_from: transform then probe is permitted",
+       not rc._is_selected_from('["/a","/b"].map(x => x).find(e)', 10))
+    ok("_is_selected_from: transform whose args nest parens is still walked",
+       rc._is_selected_from('["/a","/b"].map(f(a, b)).at(0)', 10))
+    ok("_is_selected_from: a probe still ends the chain",
+       not rc._is_selected_from('["/a","/b"].filter(e)[0]', 10))
+
+    # `_call_end` returns None for a shape it cannot read; the caller must treat
+    # that as UNKNOWN and fail closed, never as "resolved".
+    ok("_call_end: nested parens close at the outer paren",
+       rc._call_end('.map(f(a, b))x', 4) == 12)
+    ok("_call_end: no call parens is unreadable", rc._call_end('.map x', 4) is None)
+    ok("_call_end: an unbalanced call is unreadable", rc._call_end('.map(f(a, b)', 4) is None)
+    ok("_is_selected_from: an unreadable transform chain fails CLOSED",
+       rc._is_selected_from('["/a","/b"].map', 10))
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so
