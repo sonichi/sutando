@@ -89,6 +89,7 @@ failed=0
 # discarding it.
 skipped_total=0
 fully_skipped=()
+partly_skipped=()
 while IFS= read -r f; do
     if ! output=$(python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1); then
         echo "✖ test failed under instrumentation: $f"
@@ -104,11 +105,19 @@ while IFS= read -r f; do
     skipped_total=$((skipped_total + skips))
     if [ "$ran" -gt 0 ] && [ "$skips" -eq "$ran" ]; then
         fully_skipped+=("$f ($ran/$ran skipped)")
+    elif [ "$skips" -gt 0 ]; then
+        partly_skipped+=("$f ($skips/$ran skipped)")
     fi
 done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
 
 if [ "$skipped_total" -gt 0 ]; then
     echo "coverage-gate: $skipped_total test case(s) SKIPPED in this environment."
+    # Attribute them. A bare total tells you something is skipping but not
+    # WHAT, so it cannot answer the question the total provokes: does this
+    # environment skip different things than a developer's machine? Naming
+    # the files makes a macOS-vs-Linux difference visible in the log instead
+    # of requiring a local re-run to guess at.
+    for entry in "${partly_skipped[@]}"; do echo "    - $entry"; done
 fi
 if [ "${#fully_skipped[@]}" -gt 0 ]; then
     echo "coverage-gate: ${#fully_skipped[@]} file(s) skipped EVERY case — they assert nothing here:"

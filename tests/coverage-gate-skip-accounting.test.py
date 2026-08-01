@@ -129,6 +129,22 @@ class TestGateWiring(unittest.TestCase):
         self.assertNotIn("failed=1", block.split("continue", 1)[-1],
                          "surfacing skips must not set the failure flag")
 
+    def test_gate_attributes_partial_skips_not_just_the_total(self):
+        """A bare total says something skips but not WHAT, so it cannot answer
+        the question it provokes: does CI skip different things than a laptop?
+        Naming the files makes a platform difference visible in the log."""
+        self.assertIn("partly_skipped", GATE_SRC)
+        # ...and the list is actually printed, not merely collected.
+        tail = GATE_SRC[GATE_SRC.index("skipped_total\" -gt 0"):]
+        self.assertIn('for entry in "${partly_skipped[@]}"', tail)
+
+    def test_partial_and_full_skips_are_reported_separately(self):
+        """A file skipping 1 of 30 is normal; one skipping 30 of 30 asserts
+        nothing. Collapsing them would hide the second in the first."""
+        self.assertIn("fully_skipped+=", GATE_SRC)
+        self.assertIn("partly_skipped+=", GATE_SRC)
+        self.assertIn("elif", GATE_SRC[GATE_SRC.index("fully_skipped+="):])
+
     def test_gate_still_fails_on_a_real_failure(self):
         """The pre-existing behaviour must survive the change."""
         self.assertIn('echo "✖ test failed under instrumentation: $f"', GATE_SRC)
