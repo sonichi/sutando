@@ -127,23 +127,24 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 
 ## Quick start
 
-**Prerequisites** — required; `bash src/startup.sh` refuses to boot without these:
-- macOS 15+
+**Prerequisites** — `bash src/startup.sh` refuses to boot without these:
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) — **signed in** to the CLI you select
-- Node.js 22+ (`brew install node`)
-- Python 3 (`brew install python3`) — plus the bridge packages:
-  `pip3 install google-genai discord.py python-telegram-bot slack_bolt Pillow`
-- fswatch (`brew install fswatch`) and tmux (`brew install tmux`) — both auto-install via Homebrew on first start
+- Node.js (`brew install node`)
+- Python 3 (`brew install python3`)
+- fswatch (`brew install fswatch`) — auto-installs via Homebrew on first start
 
-**Optional** — each unlocks one feature; absent means only that feature is unavailable:
+**Also expected, but not checked at boot** — a host can pass the checks above and still fail at runtime:
+- macOS 15+, Node.js 22+ — `bash src/verify-setup.sh` checks the Node version and whether your CLI is actually authenticated
+
+**Optional** — each unlocks one feature and degrades alone:
 - [Gemini API key](https://ai.google.dev) — voice (text/core paths work without it)
+- `pip3 install discord.py` / `slack_bolt` — Discord / Slack bridges (Telegram needs no package)
 - ffmpeg (`brew install ffmpeg`) — subtitle-burn, video-concat, recording handoff
+- tmux (`brew install tmux`) — Sutando.app watcher auto-restart; the core starts without it
 - git — vault sync, self-upgrade, commit provenance
-- [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — phone calls and SMS; the browser, Telegram and Discord paths run without them
+- [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — phone calls and SMS
 
-Full list, including what to vendor when embedding Sutando in another
-application: **[External runtime dependencies](docs/runtime-dependencies.md)**.
-Check a host with `bash src/verify-setup.sh`.
+Full list with the line enforcing each, plus what to vendor when embedding Sutando in another application: **[External runtime dependencies](docs/runtime-dependencies.md)**.
 
 ```bash
 # Clone
