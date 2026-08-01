@@ -61,13 +61,27 @@ class TestHeartbeatWrite(unittest.TestCase):
 
     def test_write_beat_payload_schema(self):
         import core_heartbeat
-        core_heartbeat.write_beat(status="custom-status")
+        # Pin the core-pid resolver. Before schema 3 this test asserted
+        # `pid == os.getpid()` and passed only because CI runners have no tmux
+        # server on the socket — on a machine that DID, it would have failed.
+        # Pinning makes the contract, not the environment, decide.
+        _orig = core_heartbeat.core_pid
+        core_heartbeat.core_pid = lambda socket_path=None: 4242
+        try:
+            core_heartbeat.write_beat(status="custom-status")
+        finally:
+            core_heartbeat.core_pid = _orig
         data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
         # Required fields
         self.assertEqual(data["host"], _short_host())
-        self.assertEqual(data["pid"], os.getpid())
+        # schema 3: `pid` is the CORE's (what the docstring always claimed);
+        # the writer's own pid moved to `heartbeat_pid`. Before this, a dead
+        # core read as healthy because the writer outlives core restarts.
+        self.assertEqual(data["pid"], 4242)
+        self.assertEqual(data["heartbeat_pid"], os.getpid())
+        self.assertNotEqual(data["pid"], data["heartbeat_pid"])
         self.assertEqual(data["status"], "custom-status")
-        self.assertEqual(data["schema_version"], 2)
+        self.assertEqual(data["schema_version"], 3)
         # locality (Track 10): {kind, host}, self-reported. Default kind=local.
         self.assertEqual(data["locality"], {"kind": "local", "host": _short_host()})
         # socket: the runtime-authored tmux socket the core runs on. Consumed by
