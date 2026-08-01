@@ -11,8 +11,9 @@ nothing. It is one inode hardlinked across git / python3 / swiftc / clang / gcc
 
 Two call sites invoked it by ABSOLUTE path:
 
-    src/health-check.py   _file_unchanged_since()  (git log / git diff)
-    src/agent-api.py      GET /activity            (git log --oneline)
+    src/health-check.py   _file_unchanged_since()          (git log / git diff)
+    src/health-check.py   check_live_checkout_branch()     (git branch, bare `git`)
+    src/agent-api.py      GET /activity                    (git log --oneline)
 
 Absolute means PATH cannot shadow it, so a user who installs a real git
 (Homebrew, git-scm.com, a static build) still gets the dialog. And health-check
@@ -188,10 +189,10 @@ class ResolveGit(unittest.TestCase):
     """`resolve_git` wires PATH lookup + the probe together (and caches)."""
 
     def setUp(self):
-        git_binary.resolve_git.cache_clear()
+        git_binary.reset_cache_for_tests()
 
     def tearDown(self):
-        git_binary.resolve_git.cache_clear()
+        git_binary.reset_cache_for_tests()
 
     def test_returns_path_result_when_a_real_git_exists(self):
         real = str(REPO / "fixture-bin" / "git")
@@ -202,12 +203,34 @@ class ResolveGit(unittest.TestCase):
         with patch.object(git_binary.shutil, "which", return_value=None):
             self.assertIsNone(git_binary.resolve_git())
 
-    def test_is_cached(self):
+    def test_a_positive_answer_is_cached(self):
         real = str(REPO / "fixture-bin" / "git")
         with patch.object(git_binary.shutil, "which", return_value=real) as which:
             git_binary.resolve_git()
             git_binary.resolve_git()
         self.assertEqual(which.call_count, 1, "resolve_git re-probed PATH")
+
+    def test_a_negative_answer_is_NOT_cached(self):
+        """agent-api.py is a long-lived serve_forever() process.
+
+        If a None were memoised, a user installing the developer tools mid-run
+        would leave GET /activity permanently empty until someone restarted the
+        service — while health-check on the same host, being re-exec'd each run,
+        reported git as fine. (@sonichi, reviewing #2469.)
+        """
+        with patch.object(git_binary.shutil, "which", return_value=None) as which:
+            self.assertIsNone(git_binary.resolve_git())
+            self.assertIsNone(git_binary.resolve_git())
+        self.assertEqual(which.call_count, 2, "a negative answer was cached")
+
+    def test_install_after_start_is_picked_up(self):
+        """The exact install-after-start ordering a post-restart test cannot reach."""
+        real = str(REPO / "fixture-bin" / "git")
+        with patch.object(git_binary.shutil, "which", return_value=None):
+            self.assertIsNone(git_binary.resolve_git())
+        # ...user installs the tools; no restart.
+        with patch.object(git_binary.shutil, "which", return_value=real):
+            self.assertEqual(git_binary.resolve_git(), real)
 
 
 class GitArgv(unittest.TestCase):
@@ -240,6 +263,25 @@ class HealthCheckDegradesWithoutGit(unittest.TestCase):
             self.assertFalse(
                 health_check._file_unchanged_since(SRC / "git_binary.py", 0.0)
             )
+
+    def test_live_checkout_branch_degrades_without_git(self):
+        """check_live_checkout_branch is registered UNCONDITIONALLY.
+
+        It called bare `git`, which PATH resolves to /usr/bin/git — the stub —
+        on a Mac without developer tools, so the modal fired before the
+        return-code degradation below could run. It ran on every health pass.
+        The source-tied scan above only covers the two originally-changed call
+        sites, so it passed while this activated caller stayed broken
+        (@john-the-dev, reviewing #2469).
+        """
+        git_binary.reset_cache_for_tests()
+        try:
+            with patch.object(git_binary.shutil, "which", return_value=None):
+                result = health_check.check_live_checkout_branch()
+        finally:
+            git_binary.reset_cache_for_tests()
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("git not runnable", result["detail"])
 
     def test_runs_against_a_real_git_without_raising(self):
         """Exercises both git invocations on a host that does have git.

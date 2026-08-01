@@ -39,7 +39,6 @@ import os
 import shutil
 import subprocess
 import sys
-from functools import lru_cache
 from typing import Callable, Optional
 
 # The Xcode-CLT shim path. Never invoke this without confirming the tools are
@@ -116,16 +115,42 @@ def git_argv(*args: str) -> list:
     return [git, *args]
 
 
-@lru_cache(maxsize=1)
+_resolved: Optional[str] = None
+
+
 def resolve_git() -> Optional[str]:
     """Return a runnable git executable, or None if there isn't one.
 
-    Cached: the answer cannot change within a process lifetime without the user
-    installing a toolchain mid-run, and the callers are on polling paths
-    (health-check runs on a timer) where re-probing every pass is pure waste.
+    Caches only a POSITIVE answer, on purpose.
+
+    An earlier revision memoised both outcomes, reasoning that the answer cannot
+    change within a process lifetime. That holds for `health-check.py`, which is
+    re-exec'd on a timer — but not for `agent-api.py`, a long-lived
+    `serve_forever()` HTTP server that calls this inside `do_GET`. There, "the
+    user installs the developer tools mid-run" is the EXPECTED case, not an
+    exotic one: they may well be installing them *because* something told them
+    to. A cached None left `GET /activity` permanently empty until someone
+    restarted the service, while health-check on the same host reported git as
+    fine — the two callers disagreeing, with the never-restarted one wrong.
+    (Caught by @sonichi reviewing #2469.)
+
+    A negative therefore stays re-probed. `shutil.which` on a warm filesystem is
+    not a cost worth a permanently wrong answer; the `xcode-select` spawn behind
+    it only runs when PATH resolves to the stub, which is the already-degraded
+    host.
     """
-    return select_git(
+    global _resolved
+    if _resolved is not None:
+        return _resolved
+    _resolved = select_git(
         shutil.which("git"),
         is_darwin=sys.platform == "darwin",
         clt_installed=developer_tools_installed,
     )
+    return _resolved
+
+
+def reset_cache_for_tests() -> None:
+    """Drop the memoised positive answer. Tests only."""
+    global _resolved
+    _resolved = None

@@ -1308,8 +1308,14 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
             expected = None  # config unreadable — fall through to the default
     expected = expected or "main"
     try:
+        # Bare `git` resolves through PATH, which on a Mac without developer
+        # tools lands on /usr/bin/git — the CLT stub — and the modal install
+        # dialog fires BEFORE the return-code check below can degrade. This
+        # check is registered unconditionally, so it ran on every health pass.
+        # git_argv raises GitUnavailable (an OSError), caught just below and
+        # already reported as "git not runnable — skipping".
         out = subprocess.run(
-            ["git", "-C", str(repo), "branch", "--show-current"],
+            git_argv("-C", str(repo), "branch", "--show-current"),
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
