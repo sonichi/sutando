@@ -58,6 +58,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "vault",
     "migrate",
     "bridges",
+    "stand",          # this instance's `Stand:` commit-trailer value
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
