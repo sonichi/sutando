@@ -3,7 +3,9 @@
 
   "core": {
     "_comment": "Persistent task-execution CLI. Set codex for Codex CLI or omit this block to keep the default claude runtime.",
-    "runtime": "codex"
+    "runtime": "codex",
+    "_comment_expected_branch": "Branch the live checkout should stay on (default main). Set on hosts intentionally pinned elsewhere (e.g. dual-run pinned nodes) so health-check's live-checkout-branch probe honors the pin across restarts; SUTANDO_EXPECTED_BRANCH overrides per-invocation.",
+    "expected_branch": "main"
   },
 
   "workspace": {
@@ -19,6 +21,7 @@
     "sync": {
       "include": [
         "notes/",
+        "hosts/*/",
         "memory/"
       ]
     }

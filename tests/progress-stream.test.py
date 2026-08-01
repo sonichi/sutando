@@ -96,6 +96,21 @@ long_step = "z" * 500
 out = ps.format_progress(long_step, 3, max_len=180)
 check("format truncates long step", len(out) < 220 and out.endswith("(3s)") and "…" in out)
 
+# --- is_progress_placeholder (ingestion-gate flood guard) ---
+check("placeholder: working…", ps.is_progress_placeholder("⏳ working… (9s)") is True)
+check("placeholder: with step", ps.is_progress_placeholder("⏳ Checked 42 open PRs (137s)") is True)
+check("placeholder: leading/trailing ws", ps.is_progress_placeholder("  ⏳ working… (0s)  ") is True)
+check("placeholder: round-trips format_progress", ps.is_progress_placeholder(ps.format_progress("reviewing", 45)) is True)
+check("placeholder: round-trips None step", ps.is_progress_placeholder(ps.format_progress(None, 3)) is True)
+# false positives — real owner tasks must NOT be dropped
+check("not placeholder: emoji mid-sentence", ps.is_progress_placeholder("check the ⏳ status? (see #1)") is False)
+check("not placeholder: no (Ns) tail", ps.is_progress_placeholder("⏳ waiting on review") is False)
+check("not placeholder: no leading marker", ps.is_progress_placeholder("Please review PR (3s)") is False)
+check("not placeholder: multi-line", ps.is_progress_placeholder("⏳ a\nreal task (5s)") is False)
+check("not placeholder: empty", ps.is_progress_placeholder("") is False)
+check("not placeholder: None", ps.is_progress_placeholder(None) is False)
+check("not placeholder: non-str", ps.is_progress_placeholder(42) is False)
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")

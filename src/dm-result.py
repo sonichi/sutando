@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from util_paths import claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 import discord_config  # noqa: E402  — workspace-local Sutando discord config (#1147)
+from result_markers import parse_markers  # noqa: E402  — skip markers ([no-send] etc.)
 REPO = resolve_workspace()
 ACCESS_JSON = claude_home_path("channels", "discord", "access.json")
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
@@ -393,6 +394,22 @@ def main():
         text = Path(sys.argv[2]).read_text().strip()
     else:
         text = " ".join(sys.argv[1:])
+
+    # Honor the skip markers before any delivery path. This script is the LAST
+    # consumer in the result chain (poll_dm_fallback shells out to it only when
+    # nothing else claimed the file), so a marker it ignores becomes exactly the
+    # DM the marker existed to prevent:
+    #   [no-send]      internally handled, no user-visible reply
+    #   [REPLIED]      already delivered through another path
+    #   [deduped: …]   superseded by another task's result
+    # The file markers below are already parsed for the same stated reason —
+    # "without parsing these markers it would deliver the literal text" — and
+    # that argument is stronger here, since these do not merely look wrong in a
+    # DM, they mean do-not-deliver.
+    skip = next((a for a in parse_markers(text).actions if a.kind == "skip"), None)
+    if skip:
+        print(f"dm-result: [{skip.value}] marker — not delivering")
+        return
 
     if voice_connected():
         print("dm-result: voice client connected, skipping DM (voice will deliver)")
