@@ -106,6 +106,14 @@ check("nack is a valid kind", "nack" in b2b.VALID_KINDS)
 
 _DOC = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "SKILL.md"
 _doc_kinds = set(re.findall(r"`([a-z-]+):`", _DOC.read_text())) if _DOC.exists() else set()
+# FLOOR, and it is the load-bearing half. Without it this check is disableable by
+# the very event it exists to catch: if SKILL.md is moved/renamed, or the tags stop
+# matching the backtick form, `_doc_kinds` degrades to set(), the gap below is empty,
+# and the drift assertion PASSES — reporting green on an unmonitored vocabulary.
+# An assertion that a mechanism exists is only meaningful if it cannot pass in the
+# broken state, and "source of truth unreadable" is one of the broken states.
+check(f"documented-kind extraction is non-degenerate ({len(_doc_kinds)} found, floor 5)",
+      len(_doc_kinds) >= 5)
 # `opinion-requested:` is the prose name for the `opinion` kind; map it.
 _doc_kinds = {"opinion" if k == "opinion-requested" else k for k in _doc_kinds}
 _undocumented_gap = _doc_kinds - b2b.VALID_KINDS
