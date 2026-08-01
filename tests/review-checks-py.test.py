@@ -719,6 +719,50 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 15 (john-the-dev, review of 11755396). `_call_end` counted parentheses
+# inside STRING LITERALS as syntax, so a quoted `)` in a transform callback
+# closed the call early. `_is_selected_from` then resumed INSIDE the callback,
+# never reached the trailing subscript, and exempted the paired paths:
+#
+#     ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (")", x))[1]
+#
+# The callback's comma expression returns `x`, so this is the same author-time
+# selection as the round-14 identity-map repro — reachable because the scanner
+# read data as punctuation. Counting now happens on `_blank_strings()`.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    ok("main(): a quoted `)` in the callback does not end the call",
+       "hardcoded path" in scan('+++ b/src/q1.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => (")", x))[1];')[1])
+    ok("main(): the escaped-quote variant is caught too",
+       "hardcoded path" in scan('+++ b/src/q2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => ("\\")", x))[1];')[1])
+    ok("main(): a quoted `(` is not counted either (opposite calibration)",
+       "hardcoded path" in scan('+++ b/src/q3.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => ("(", x))[1];')[1])
+    ok("main(): genuine nested parens still resolve the call end",
+       "hardcoded path" in scan('+++ b/src/q4.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(f(a, b)).at(0);')[1])
+    ok("main(): a quoted paren followed by a PROBE stays permitted",
+       scan('+++ b/src/q5.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => (")", x)).find(exists);')[1].strip() == "")
+
+    ok("_blank_strings: string CONTENTS are blanked, quotes kept",
+       rc._blank_strings('a(")", x)') == 'a(" ", x)')
+    ok("_blank_strings: an escaped quote does not end the string",
+       rc._blank_strings('("\\")")') == '("   ")')
+    ok("_blank_strings: length is preserved so indices stay comparable",
+       len(rc._blank_strings('f(")", `a)b`, \'c)d\')')) == len('f(")", `a)b`, \'c)d\')'))
+    ok("_blank_strings: a template literal is a string too",
+       ")" not in rc._blank_strings('f(`a)b`)')[3:-1])
+    ok("_blank_strings: code outside strings is untouched",
+       rc._blank_strings('f(a, b)') == 'f(a, b)')
+
+    ok("_call_end: a quoted close-paren does not end the call",
+       rc._call_end('.map(x => (")", x))[1]', 4) == 18)
+    ok("_call_end: genuine nested parens still close at the outer paren",
+       rc._call_end('.map(f(a, b))x', 4) == 12)
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so

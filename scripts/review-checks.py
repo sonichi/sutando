@@ -154,13 +154,55 @@ _PROBING_METHODS = frozenset((
 _TRANSFORM_METHODS = frozenset(("map", "flatMap", "reduce", "forEach"))
 
 
+def _blank_strings(s):
+    """`s` with the CONTENTS of every string literal replaced by spaces.
+
+    Same length, so indices stay comparable with the original. Quote characters
+    themselves are kept — only what is BETWEEN them is blanked.
+
+    Bracket counting must not see punctuation that is data. Counting raw text let
+    a quoted `)` close a call early:
+
+        ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (")", x))[1]
+
+    `_call_end` stopped inside the callback, so `_is_selected_from` resumed there,
+    never reached the `[1]`, and exempted an Apple-Silicon-only command. Escapes
+    are honoured for the same reason `_code_part` honours them — a `\\"` does not
+    end the string.
+    """
+    out = list(s)
+    q = None
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if q:
+            if ch == "\\":
+                out[i] = " "
+                if i + 1 < len(s):
+                    out[i + 1] = " "
+                i += 2
+                continue
+            if ch == q:
+                q = None
+            else:
+                out[i] = " "
+        elif ch in "\"'`":
+            q = ch
+        i += 1
+    return "".join(out)
+
+
 def _call_end(code, name_end):
     """Index of the `)` closing the call whose name ends at `name_end`, else None.
+
+    Counts on `_blank_strings(code)` so a `)` inside a callback's string literal
+    is data, not syntax.
 
     None means the shape could not be read (no call parens, or unbalanced because
     the diff truncated the line). Callers treat that as UNKNOWN and fail closed —
     an unreadable chain must not read as a resolved one.
     """
+    code = _blank_strings(code)
     j = name_end
     while j < len(code) and code[j] in " \t":
         j += 1
