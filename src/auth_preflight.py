@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import platform
+import shlex
 import subprocess
 import sys
 
@@ -90,15 +91,27 @@ def check_auth_state(config_dir: str, *, keychain_check=keychain_has_credentials
                 "config_dir": config_dir}
 
     return {"verdict": "login_required", "reasons": reasons,
-            "remedy": _login_remedy(ssh), "ssh": ssh, "config_dir": config_dir}
+            "remedy": _login_remedy(ssh, config_dir), "ssh": ssh,
+            "config_dir": config_dir}
 
 
-def _login_remedy(ssh: bool) -> str:
-    """The exact owner-facing fix for a login-class state (matches the
-    core-supervisor-relay copy shipped in #2403)."""
+def _login_remedy(ssh: bool, config_dir: str) -> str:
+    """The exact owner-facing fix for a login-class state (supersedes the
+    #2403 copy: that text said restart-then-login, which loops straight
+    back into the boot gate this branch adds — restart execs startup.sh,
+    startup.sh aborts on login_required, and no login-capable CLI ever
+    appears). The remedy must reach /login WITHOUT routing through the
+    gate: a bare CLI launch runs no services, so there is nothing to
+    abort; restart comes only after login succeeds."""
     host = platform.node().split(".")[0] or "the host"
-    remedy = (f"needs GUI /login on {host}: open Terminal there, run"
-              " `bash src/restart.sh` from the repo, then complete /login.")
+    # shlex.quote: the remedy is copy/paste shell syntax — an unquoted
+    # config dir with spaces/metacharacters splits the assignment and
+    # breaks the recovery path exactly when the operator needs it.
+    remedy = (f"needs GUI /login on {host}: open Terminal there and run"
+              f" `CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} claude` (bare CLI, no"
+              " services — the boot gate does not run, so this cannot loop"
+              " back here), complete /login, then run `bash src/restart.sh`"
+              " to bring the core up.")
     if ssh:
         remedy = ("SSH session detected — a locked keychain cannot be unlocked"
                   " from here, so /login WILL stall if started over SSH. " + remedy)
@@ -144,7 +157,7 @@ def main(argv=None):
             # cannot yield one when the on-disk state still looks fine.
             result["verdict"] = "login_required"
             result["reasons"].append(f"live probe failed: {detail}")
-            result["remedy"] = _login_remedy(result["ssh"])
+            result["remedy"] = _login_remedy(result["ssh"], a.config_dir)
 
     if a.json:
         print(json.dumps(result, indent=2))
