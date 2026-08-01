@@ -206,6 +206,38 @@ code, out = scan(
 )
 ok("a generator method is not mistaken for a comment", "src/app.ts:1:" in out)
 
+# --- block-comment suppression must be STATEFUL (#2474 review, bypass) ------
+# `* ` at the start of a line is not proof of a comment: it is also a continued
+# multiplication. Suppressing on that shape alone let a real path through.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,2 @@\n'
+    '+const n = 2\n'
+    '+  * "/Users/alice/secret".length;'
+)
+ok("continued multiplication is NOT mistaken for JSDoc (scanner bypass)",
+   "/Users/alice/secret" in out)
+
+# Genuine JSDoc prose stays exempt...
+code, out = scan(
+    '+++ b/src/x.ts\n'
+    '@@ -1,0 +1,4 @@\n'
+    '+/**\n'
+    '+ * Legacy note: the old path was /Users/legacy/thing.\n'
+    '+ *\n'
+    '+ */'
+)
+ok("JSDoc body inside a real /* */ span is exempt", out.strip() == "")
+
+# ...and code AFTER the block closes is scanned again.
+code, out = scan(
+    '+++ b/src/x.ts\n'
+    '@@ -1,0 +1,3 @@\n'
+    '+/** note */\n'
+    '+const p = "/Users/after/block";'
+)
+ok("code after a closed block comment is scanned", "/Users/after/block" in out)
+
 # --- flag_exact: whole-token, not substring (#2474 review) ------------------
 # A full executable path must not reject longer siblings in the same directory
 # family: /usr/bin/swift-inspect is a separate REAL binary (own inode, link

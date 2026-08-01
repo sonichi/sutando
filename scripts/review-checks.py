@@ -57,17 +57,44 @@ def allowed(tok):
 # the old count-only toggle suppressed ANY multi-line string, a scanner bypass).
 _DOCSTRING_OPEN = re.compile(r"^[rbuf]{0,2}('''|" + '"' * 3 + ")", re.IGNORECASE)
 
-# A JSDoc / block-comment CONTINUATION line: ` * text`, a bare ` *`, or ` */`.
-# The Python `#` and `//` skips above had no equivalent for these, so prose
-# inside a /** … */ block was scanned as code — which matters now that the flag
-# list carries the Xcode-CLT stub paths, because the modules that resolve those
-# tools necessarily document the hazard in JSDoc (see src/python-binary.ts).
-#
-# Deliberately NOT matched: an opening `/*` (a `/* … */ code` one-liner must
-# stay scannable, so the comment cannot be used to smuggle a path onto a code
-# line) and a generator method `*name()` (no space after the star). Requiring
-# whitespace, end-of-line, or `/` after the star is what separates them.
-_BLOCK_COMMENT_CONT = re.compile(r"^\*(\s|$|/)")
+
+def _block_transition(line, in_block):
+    """Block-comment (`/* … */`) state AFTER `line`, given the state before it.
+
+    STATEFUL on purpose. A first attempt skipped any line whose stripped form
+    began with `* `, on the theory that only JSDoc bodies look like that. It is
+    also valid JavaScript for a continued multiplication:
+
+        const n = 2
+          * "/usr/bin/python3".length;
+
+    …so the second line was treated as prose and the path went unflagged — a
+    scanner bypass, not a false negative on prose (@john-the-dev, reviewing
+    #2474). Tracking the real `/*` … `*/` span means a line is exempt because
+    it IS inside a comment, never because of how it happens to start.
+
+    A one-liner `/* … */ code` opens and closes within the line, so it ends
+    OUTSIDE the block and the code on it is still scanned — a comment cannot
+    smuggle a path onto a code line.
+
+    Known limitation, shared with the docstring tracker above: a `/*` or `*/`
+    inside a string literal moves the state. Erring toward scanning is the safe
+    direction, and the flagged-path cost of the reverse is what this fixes.
+    """
+    i = 0
+    n = len(line)
+    state = in_block
+    while i < n:
+        if not state and line.startswith("/*", i):
+            state = True
+            i += 2
+            continue
+        if state and line.startswith("*/", i):
+            state = False
+            i += 2
+            continue
+        i += 1
+    return state
 
 
 def _doc_transition(line, in_doc):
@@ -94,6 +121,7 @@ def main():
     cur_file = ""
     hits = 0
     in_doc = False   # inside a triple-quoted docstring/string block (reset per hunk)
+    in_block = False # inside a /* … */ block comment (reset per hunk)
     for raw in diff.split("\n"):
         if raw.startswith("+++ "):
             f = raw[4:].split("\t")[0]
@@ -103,6 +131,7 @@ def main():
             ln = 0
             skip = bool(SKIP.search(f))
             in_doc = False
+            in_block = False
             continue
         if raw.startswith("@@ "):
             m = re.search(r"\+(\d+)", raw)
@@ -112,6 +141,7 @@ def main():
             # (gaps between hunks); reset so a docstring opened + closed within
             # this hunk is tracked, without carrying stale state across a gap.
             in_doc = False
+            in_block = False
             continue
         if raw.startswith("-"):
             continue
@@ -120,6 +150,7 @@ def main():
             # new-file line counter just like additions do — and they move the
             # docstring state (a docstring may open on unchanged context).
             in_doc = _doc_transition(raw[1:], in_doc)
+            in_block = _block_transition(raw[1:], in_block)
             ln += 1
             continue
         if raw.startswith("+"):
@@ -134,9 +165,11 @@ def main():
             # the opening `"""` line itself is still checked.
             was_in_doc = in_doc
             in_doc = _doc_transition(line, in_doc)
+            was_in_block = in_block
+            in_block = _block_transition(line, in_block)
             stripped = line.lstrip()
-            if was_in_doc or stripped.startswith("#") or stripped.startswith("//") \
-                    or _BLOCK_COMMENT_CONT.match(stripped):
+            if was_in_doc or was_in_block or stripped.startswith("#") \
+                    or stripped.startswith("//"):
                 continue
             # (pattern, exact) — exact patterns fire only when the extracted
             # token IS the pattern, so a longer sibling filename in the same
