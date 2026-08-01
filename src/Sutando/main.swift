@@ -2054,12 +2054,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let logPath = workspace + "/logs/health-check.log"
         let scriptPath = repoRoot + "/src/health-check.py"
-        // Match the (retired) launchd plist's interpreter so behavior is
-        // identical. Falls back to /usr/bin/env python3 if homebrew python
-        // is missing on this host.
-        let homebrewPython = "/opt/homebrew/opt/python@3.11/libexec/bin/python3"
-        let pythonPath = FileManager.default.fileExists(atPath: homebrewPython)
-            ? homebrewPython : "/usr/bin/env"
+        // Resolve an interpreter that will actually run: $SUTANDO_PY -> the
+        // bundle-vendored runtime -> the system python3 only when developer
+        // tools are installed. See SutandoConfig.resolvePython.
+        //
+        // This previously probed a hardcoded homebrew python@3.11 and fell back
+        // to `/usr/bin/env python3`. That fallback is the Xcode-CLT stub on a
+        // machine without developer tools, and this Timer fires every 60s — so
+        // a clean install got the "install command line developer tools" dialog
+        // over and over. Skipping is correct: a health check must never be able
+        // to raise a modal system dialog.
+        guard let pythonPath = SutandoConfig.resolvePython(repoRoot: repoRoot) else {
+            logToFile("runHealthCheck: no runnable python3 "
+                + "(no $SUTANDO_PY, no bundled runtime, no developer tools) — skipping")
+            return
+        }
         // `--emit-task` writes tasks/task-health-{ts}.txt on failure (with
         // built-in dedup: 1h cooldown per failure-set hash). The agent picks
         // it up via the bridge as a regular owner task — gives the trio's
@@ -2067,9 +2076,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // health failures the trio's coverage scanner suppresses by cooldown
         // (or the LLM step archives by judgment) still reach the agent. Per
         // Chi 2026-05-07 PT.
-        let arguments: [String] = (pythonPath == "/usr/bin/env")
-            ? ["python3", scriptPath, "--fix", "--emit-task"]
-            : [scriptPath, "--fix", "--emit-task"]
+        // resolvePython always returns a real interpreter path (never the
+        // `/usr/bin/env` indirection), so the argv no longer needs a special
+        // case that prepends "python3".
+        let arguments: [String] = [scriptPath, "--fix", "--emit-task"]
 
         DispatchQueue.global(qos: .background).async { [weak self] in
             guard let self = self else { return }

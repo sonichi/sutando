@@ -296,4 +296,76 @@ enum SutandoConfig {
         }
         return nil
     }
+
+    // MARK: - Python interpreter resolution
+
+    /// Apple's Xcode-CLT stub, NOT a python interpreter.
+    ///
+    /// On macOS this file exists whether or not the developer tools are
+    /// installed. Without them it prints "No developer tools were found,
+    /// requesting install", raises a modal install dialog, and returns nothing
+    /// — one inode hardlinked across python3 / git / swiftc / clang / gcc /
+    /// make. Never spawn it without confirming the tools are present.
+    static let systemPython = "/usr/bin/python3"
+
+    /// True when `xcode-select -p` reports an installed developer directory.
+    ///
+    /// This is the ONLY safe probe: `/usr/bin/xcode-select` is a real binary
+    /// rather than one of the stubs, so asking it does not raise the dialog.
+    /// Same check `src/migrate.sh` uses before its Swift build steps.
+    /// Any failure to probe is treated as "not installed" — failing closed
+    /// here means we skip python, which beats raising a modal dialog.
+    static func developerToolsInstalled() -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        proc.arguments = ["-p"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            return false
+        }
+        proc.waitUntilExit()
+        return proc.terminationStatus == 0
+    }
+
+    /// Resolve a python3 that will actually RUN, or nil.
+    ///
+    /// Order, matching `scripts/sutando-config.sh` and
+    /// `src/agent/claude/cli/start-cli.sh` (which already resolve `$PY` this
+    /// way — this process never had the logic):
+    ///
+    ///   1. `$SUTANDO_PY`, set by the desktop launcher.
+    ///   2. The bundle-vendored relocatable python beside the engine copy,
+    ///      `<repoRoot>/../runtime/python/bin/python3`.
+    ///   3. `/usr/bin/python3`, but ONLY when the developer tools are
+    ///      installed — otherwise that path is the stub above.
+    ///   4. nil — the caller must SKIP its work rather than prompt the user.
+    ///
+    /// Returning nil is the point. The previous implementation fell back to
+    /// `/usr/bin/env python3`, which on a machine without developer tools
+    /// resolves to the stub; because the caller runs on a 60-second Timer, the
+    /// install dialog reappeared indefinitely on a clean install.
+    ///
+    /// The dependencies are injected with defaults so tests can drive every
+    /// tier without mutating the host's toolchain.
+    static func resolvePython(
+        repoRoot: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) },
+        toolsInstalled: () -> Bool = SutandoConfig.developerToolsInstalled
+    ) -> String? {
+        if let explicit = environment["SUTANDO_PY"], !explicit.isEmpty, isExecutable(explicit) {
+            return explicit
+        }
+        let bundled = URL(fileURLWithPath: repoRoot)
+            .deletingLastPathComponent()
+            .appendingPathComponent("runtime/python/bin/python3")
+            .path
+        if isExecutable(bundled) {
+            return bundled
+        }
+        return toolsInstalled() ? systemPython : nil
+    }
 }
