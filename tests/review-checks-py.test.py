@@ -812,6 +812,46 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 17 (john-the-dev, review of a1ab861). `_starts_regex` inspected ONE
+# preceding character, so the two-character postfix operators — and `}` — were
+# read as "an operator, therefore a regex follows". The scanner then blanked the
+# rest of the line and `_call_end` failed closed, FLAGGING valid portable code:
+#
+#     [...].map(x => (n++ / 2, x)).find(exists)
+#
+# That is the expensive direction for a lint gate: a false negative hides one
+# bad line, a false positive freezes good ones. `_DIV_PREV` is now the standard
+# JS expression-ending token set rather than the shapes reported so far, which
+# is what made this take three passes.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    ok("main(): postfix `++` division does not flag a probed list",
+       scan('+++ b/src/p1.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => (n++ / 2, x)).find(exists);')[1].strip() == "")
+    ok("main(): postfix `--` division does not flag a probed list",
+       scan('+++ b/src/p2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => (n-- / 2, x)).find(exists);')[1].strip() == "")
+    ok("main(): a `}`-ended expression divides",
+       scan('+++ b/src/p3.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => ({} / 2, x)).find(exists);')[1].strip() == "")
+    # The bypass control: same division, AUTHOR-TIME selection. Must still flag.
+    ok("main(): postfix division + `[1]` is still selection",
+       "hardcoded path" in scan('+++ b/src/p4.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => (n++ / 2, x))[1];')[1])
+
+    ok("_starts_regex: after postfix `++` it is division",
+       not rc._starts_regex("n++ / 2", 4))
+    ok("_starts_regex: after postfix `--` it is division",
+       not rc._starts_regex("n-- / 2", 4))
+    ok("_starts_regex: after `}` it is division", not rc._starts_regex("{} / 2", 3))
+    ok("_starts_regex: a SINGLE `+` still opens a regex",
+       rc._starts_regex("a + /re/", 4))
+    ok("_starts_regex: a SINGLE `-` still opens a regex",
+       rc._starts_regex("a - /re/", 4))
+    ok("_starts_regex: `++` at the very start of the line still opens a regex",
+       rc._starts_regex("/re/", 0))
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so

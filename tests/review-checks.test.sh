@@ -107,6 +107,20 @@ check "context expr + added bracket is a continuation" flag  $'+++ b/skills/x/n3
 # COLUMN 0 read as a call on a returned value and falsely flagged a valid list.
 check "candidate list at column 0 still passes"         clean $'+++ b/skills/x/col0.ts\n@@ -1,0 +1,1 @@\n+["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]'
 
+# Regex-vs-division at the WRAPPER level. Guessing "regex" wrongly blanks the rest
+# of the line, so `_call_end` fails closed and VALID portable code is flagged —
+# the asymmetry this check exists to remove. The identifier case is the ordinary
+# control; postfix `++`/`--` and `}` are expression-enders that a prev-char-only
+# test misreads as operators. The last row is the one that matters most: the same
+# postfix division with an AUTHOR-TIME index must still flag, so fixing the false
+# positive did not open a bypass.
+check "identifier division + probe passes"              clean $'+++ b/skills/x/d1.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (n / 2, x)).find(exists);'
+check "postfix ++ division + probe passes"              clean $'+++ b/skills/x/d2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (n++ / 2, x)).find(exists);'
+check "postfix -- division + probe passes"              clean $'+++ b/skills/x/d3.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (n-- / 2, x)).find(exists);'
+check "brace-ended expression division + probe passes"  clean $'+++ b/skills/x/d4.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => ({} / 2, x)).find(exists);'
+check "a single + still opens a regex"                  clean $'+++ b/skills/x/d5.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (a + /\\)/.source, x)).find(exists);'
+check "postfix division + author-time index still flags" flag $'+++ b/skills/x/d6.ts\n@@ -1,0 +1,1 @@\n+const cmd = ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (n++ / 2, x))[1];'
+
 # --- file-skip: path literals are legit DATA in docs/tests/runner -------------
 check "docs (.md) not scanned"                        clean $'+++ b/docs/x.md\n@@ -1,0 +1,1 @@\n+example path: /Users/a/b'
 check "tests/ not scanned"                            clean $'+++ b/tests/x.test.sh\n@@ -1,0 +1,1 @@\n+D="/Users/alice/app"'

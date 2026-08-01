@@ -222,10 +222,15 @@ _REGEX_KEYWORDS = frozenset((
 ))
 
 # A `/` directly after one of these is DIVISION: each can end an expression.
-# Closing quotes are included because `"abc" / 2` divides a string — without
-# them a trailing division would open a regex that never closes and swallow the
-# rest of the line.
-_DIV_PREV = set("_$)]" + "\"'`")
+# This is the standard JS token set, not an ad-hoc list — enumerating only the
+# shapes reported so far is what made this need three passes:
+#   * `)` `]`      — call/index/group results;
+#   * `}`          — an object literal or block;
+#   * `"` `'` `` ` `` — a string or template ( `"abc" / 2` divides );
+#   * identifiers, digits, `_`, `$` — unless the identifier is a keyword that
+#     takes an operand (`return /a/`), which `_REGEX_KEYWORDS` lists.
+# Handled separately below because they are TWO characters: postfix `++` / `--`.
+_DIV_PREV = set("_$)]}" + "\"'`")
 
 
 def _starts_regex(s, i):
@@ -234,16 +239,24 @@ def _starts_regex(s, i):
     The standard JS disambiguation: a `/` opens a regex unless the preceding
     token could END an expression. Comments never reach here — `_code_part`
     strips them first — so the only two readings are regex and division.
+
+    Guessing "regex" wrongly is the EXPENSIVE direction for this scanner: the
+    rest of the line is blanked, `_call_end` then fails closed, and valid
+    portable code gets flagged — the exact asymmetry this PR exists to remove.
+    A single `+` or `-` still opens a regex (`a + /re/.test(b)`); only the
+    doubled postfix form ends an expression.
     """
     j = i - 1
     while j >= 0 and s[j] in " \t":
         j -= 1
     if j < 0:
         return True                       # line starts with it
+    if j >= 1 and s[j - 1:j + 1] in ("++", "--"):
+        return False                      # postfix increment/decrement
     prev = s[j]
     if prev.isalnum() or prev in _DIV_PREV:
         if not (prev.isalpha() or prev in "_$"):
-            return False                  # digit / ) / ] / quote -> division
+            return False                  # digit / ) / ] / } / quote -> division
         k = j
         while k >= 0 and (s[k].isalnum() or s[k] in "_$"):
             k -= 1
