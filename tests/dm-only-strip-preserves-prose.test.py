@@ -24,6 +24,9 @@ Run: python3 tests/dm-only-strip-preserves-prose.test.py
 """
 from __future__ import annotations
 
+import re
+import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -93,6 +96,59 @@ class TestStandaloneStrippingStillWorks(unittest.TestCase):
     def test_stripping_does_not_eat_surrounding_content(self):
         body = "[dm-only]\nline one\nline two"
         self.assertEqual(out_body(body), "line one\nline two")
+
+
+class TestTaskBridgeTsParity(unittest.TestCase):
+    """`src/task-bridge.ts` is the one result consumer that CANNOT call
+    parse_markers (wrong language), so `tests/bridge-marker-no-leak.test.py`'s
+    route-through-the-parser invariant structurally cannot cover it — and that
+    hole is exactly where this regression landed.
+
+    After the Python strip was narrowed, task-bridge kept its own
+    `/\[dm-only\]\s*/gi`, so the SAME body was preserved on
+    Discord/Slack/Telegram and silently rewritten on voice/task. Inconsistent
+    delivery is worse than uniformly-wrong delivery. If it must hand-roll, the
+    expression is pinned here to the Python semantics."""
+
+    TS = REPO / "src" / "task-bridge.ts"
+
+    def _expr(self) -> str:
+        m = re.search(r"\.replace\(\s*(/[^\n]*?dm-only[^\n]*?/[gimsuy]*)", self.TS.read_text())
+        self.assertIsNotNone(m, "could not find the dm-only replace() in task-bridge.ts")
+        return m.group(1)
+
+    def test_expression_is_anchored_multiline_and_case_insensitive(self):
+        """The regression was an UNANCHORED /[dm-only]\s*/gi."""
+        e = self._expr()
+        flags = e.rsplit("/", 1)[1]
+        self.assertIn("^", e, "must anchor to line start = standalone only")
+        self.assertIn("m", flags, "needs multiline or ^ only matches the body start")
+        self.assertIn("i", flags, "Python side is IGNORECASE")
+
+    def _run_js(self, body: str) -> str:
+        if not shutil.which("node"):
+            self.skipTest("node not available")
+        e = self._expr()
+        pat, flags = e.rsplit("/", 1)
+        js = ("const s=%r;process.stdout.write(s.replace(%s/%s,'').trim());"
+              % (body, pat, flags))
+        return subprocess.run(["node", "-e", js], capture_output=True,
+                              text=True, timeout=30).stdout
+
+    def test_inline_prose_survives_the_voice_task_path(self):
+        """Executed against the shipped expression, not asserted from source."""
+        self.assertEqual(self._run_js(PROSE), PROSE)
+
+    def test_standalone_marker_is_still_stripped(self):
+        self.assertEqual(self._run_js("[dm-only]\nPrivate body."), "Private body.")
+
+    def test_ts_and_python_agree_on_every_dm_only_case(self):
+        """Parity, both engines, same inputs."""
+        for body in (PROSE, "[dm-only]\nPrivate body.",
+                     "   [dm-only]   \nPrivate.",
+                     "We set [dm-only] mid-sentence."):
+            with self.subTest(body=body[:32]):
+                self.assertEqual(self._run_js(body), out_body(body))
 
 
 if __name__ == "__main__":

@@ -39,8 +39,11 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
   practice the private producer (the morning briefing's calendar + email) is
   emitted as a proactive result (results/proactive-*.txt), which every bridge
   already delivers to the owner's DM; dm-only reinforces that by guaranteeing
-  no stray [channel:] redirect can override it. The marker is stripped from
-  the delivered text. dm-only overrides redirect regardless of marker order;
+  no stray [channel:] redirect can override it. A STANDALONE marker (alone on
+  its line) is stripped from the delivered text; an INLINE mention is left
+  verbatim, because rewriting prose that merely discusses the marker silently
+  corrupts owner-facing text. Detection is unaffected — it still matches
+  anywhere, so the order-independence guarantee holds. dm-only overrides redirect regardless of marker order;
   it does NOT override a SKIP (a skipped body is delivered nowhere anyway).
 
   ATTACH markers — anywhere in the body:
@@ -131,7 +134,7 @@ _ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
 
 # DM-only privacy marker — matched ANYWHERE in the body (not anchored) so it
 # suppresses a [channel:] redirect regardless of which came first. All
-# occurrences are stripped from the delivered body.
+# occurrences are DETECTED anywhere; only STANDALONE ones are stripped.
 _DMONLY_RE = re.compile(r"\[dm-only\]\s*\n?", re.IGNORECASE)
 
 #: STRIPPING is narrower than DETECTION, deliberately. Detection stays
