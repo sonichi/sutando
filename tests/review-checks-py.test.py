@@ -294,16 +294,17 @@ ok("a quoted */ does not establish block state (scanner bypass)",
    "/Users/alice/secret" in out)
 
 # _blank_string_literals directly: escapes and each quote style.
+# _blank_string_literals returns (blanked, carry) — index [0] for the text.
 ok("blank: double-quoted span is blanked",
-   rc._blank_string_literals('a = "*/" ; b') == 'a =      ; b')
+   rc._blank_string_literals('a = "*/" ; b')[0] == 'a =      ; b')
 ok("blank: single-quoted span is blanked",
-   "*/" not in rc._blank_string_literals("a = '*/'"))
+   "*/" not in rc._blank_string_literals("a = '*/'")[0])
 ok("blank: template literal is blanked",
-   "*/" not in rc._blank_string_literals("a = `*/`"))
+   "*/" not in rc._blank_string_literals("a = `*/`")[0])
 ok("blank: escaped quote does not end the span early",
-   "*/" not in rc._blank_string_literals('a = "x\\"*/" ; end'))
+   "*/" not in rc._blank_string_literals('a = "x\\"*/" ; end')[0])
 ok("blank: code outside strings is preserved",
-   rc._blank_string_literals("const x = 1;") == "const x = 1;")
+   rc._blank_string_literals("const x = 1;")[0] == "const x = 1;")
 
 # An UNquoted mid-line */ still does not establish block state — only a
 # line-start closer does, so a stray token cannot suppress the rest of a hunk.
@@ -327,6 +328,31 @@ code, out = scan(
 )
 ok("a */ inside a multi-line template does not establish block state",
    "/Users/alice/secret" in out)
+
+# --- corroboration must not come from INSIDE a template literal (#2474) -----
+# Both the evidence line and the closer can sit in one multiline template, which
+# is valid JS. Line-at-a-time string blanking treated them as comment evidence.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,4 @@\n'
+    '+const p = "/Users/alice/secret"; const tpl = `\n'
+    '+* template content\n'
+    '+*/\n'
+    '+`;'
+)
+ok("comment-body evidence inside a template does not establish block state",
+   "/Users/alice/secret" in out)
+
+# _blank_string_literals now reports carry-over state: a backtick survives the
+# line, a single/double quote does not (unterminated is a syntax error, not state).
+_b, q = rc._blank_string_literals("const t = `open")
+ok("blank: an open backtick carries to the next line", q == "`")
+_b, q = rc._blank_string_literals('const s = "closed"')
+ok("blank: a balanced quote carries nothing", q is None)
+_b, q = rc._blank_string_literals("const s = 'unterminated")
+ok("blank: an unterminated single quote does not carry", q is None)
+_b, q = rc._blank_string_literals("still inside", "`")
+ok("blank: content stays blanked while inside a template", "still" not in _b)
 
 # --- flag_exact: whole-token, not substring (#2474 review) ------------------
 # A full executable path must not reject longer siblings in the same directory

@@ -151,13 +151,14 @@ def _hunk_opens_in_block(lines):
     all) is still scanned.
     """
     saw_comment_body = False
+    quote = None
     for text in lines:
         # Delimiter-aware: a `*/` inside a string literal is data, not a comment
         # close. Without this, `const closer = "*/";` established block state for
         # the whole hunk and masked the executable code before it — a bypass in
         # the SUPPRESSION direction, the reverse of the string-literal caveat on
         # _mask_comments (@john-the-dev, reviewing #2474).
-        bare = _blank_string_literals(text)
+        bare, quote = _blank_string_literals(text, quote)
         if "/*" in bare:
             return False
         # Require the closer to be the first thing on its line — the canonical
@@ -171,16 +172,29 @@ def _hunk_opens_in_block(lines):
     return False
 
 
-def _blank_string_literals(text):
-    """Replace quoted spans with spaces so delimiters inside them are ignored.
+def _blank_string_literals(text, quote=None):
+    """Blank quoted spans so delimiters inside them are ignored.
 
-    Single-line only, which is the right trade here: a template literal spanning
-    lines could still hide a delimiter, but this function is used ONLY to decide
-    whether a hunk began inside a comment, and the paired line-start requirement
-    above means a hidden token cannot establish block state on its own.
+    Returns (blanked, quote_after). `quote_after` is a BACKTICK or None: a
+    template literal is the only JS string that survives a newline, so it is the
+    only state worth carrying to the next line. An unterminated ' or " is a
+    single-line syntax error, not state.
+
+    Carrying that state is what closes the corroboration bypass. Both the
+    evidence line AND the closer can sit inside one multiline template:
+
+        const p = "/usr/bin/python3"; const tpl = `
+        * template content
+        */
+        `;
+
+    which is valid JS. Line-at-a-time blanking saw `* template content` as
+    comment-body evidence and `*/` as a closer, inferred the hunk had opened
+    inside a comment, and masked the executable path on line 1
+    (@john-the-dev, reviewing #2474). With the backtick carried, lines 2-3 are
+    blanked as string content and provide no evidence at all.
     """
     out = []
-    quote = None
     i = 0
     n = len(text)
     while i < n:
@@ -202,7 +216,8 @@ def _blank_string_literals(text):
             continue
         out.append(ch)
         i += 1
-    return "".join(out)
+    # Only a template literal survives to the next line.
+    return "".join(out), (quote if quote == "`" else None)
 
 
 def _doc_transition(line, in_doc):
