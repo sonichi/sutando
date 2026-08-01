@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("di", ROOT / "src" / "daily-insight.py")
@@ -68,6 +69,20 @@ class TestStandValueResolution(unittest.TestCase):
     def test_no_env_and_no_config_returns_empty(self):
         """The REAL cron shape: neither env var exported, no config key."""
         self.assertEqual(di._own_stand_value({}, repo_root=Path(tempfile.mkdtemp())), "")
+
+    def test_git_root_resolution_failure_returns_empty(self):
+        with patch.object(di.subprocess, "run", side_effect=OSError("git missing")):
+            self.assertEqual(di._own_stand_value({}, repo_root=Path("/tmp/inside")), "")
+
+    def test_config_command_failure_returns_empty(self):
+        repo = Path(tempfile.mkdtemp())
+        (repo / "scripts").mkdir()
+        (repo / "scripts" / "sutando-config.sh").write_text("#!/bin/bash\n")
+        top = subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout=f"{repo}\n", stderr=""
+        )
+        with patch.object(di.subprocess, "run", side_effect=[top, OSError("bash failed")]):
+            self.assertEqual(di._own_stand_value({}, repo_root=repo), "")
 
     def test_config_resolves_when_activated_call_starts_inside_src(self):
         """The scheduled default passes <repo>/src, not the checkout root."""
