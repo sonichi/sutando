@@ -84,7 +84,12 @@ and loads whichever repo it reviews.
    *Grounded by:* #2469 (`health-check.py`, `agent-api.py` hardcoding `/usr/bin/git`)
    and #2473 (`Sutando.app` falling back to `/usr/bin/env python3` behind a dead
    `python@3.11` probe) — both reported from a clean macOS VM installing a bundled
-   Sutando, where the dialog returned every 60 seconds. Enforced by the `checks:` block.
+   Sutando, where the dialog returned every 60 seconds. Enforced by the `checks:` block —
+   but note its **limit**: the machine gate matches explicit `/usr/bin/…` tokens only. A
+   bare `git` or `python3` resolved through PATH lands on the same stub and the scanner
+   cannot see it, so a green scan is *not* proof this class is absent. #2469 fixed exactly
+   such a caller (`check_live_checkout_branch`, a bare `git`) that no pattern would flag.
+   Read the activated path.
 8. **A verdict must state merge-readiness explicitly** — "ready to merge" /
    "changes requested: …" / "LGTM, non-blocking". And it is only honest if you actually
    ran these criteria on *this* PR — a readiness claim with no evidence attached

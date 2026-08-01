@@ -281,6 +281,39 @@ code, out = scan(
 ok("hunk inference does not resurrect the multiplication bypass",
    "/Users/alice/secret" in out)
 
+# --- a quoted "*/" must not establish block state (#2474 review, bypass) ----
+# The hunk-start inference treated the first `*/` anywhere as proof the hunk
+# began inside a comment, so a string literal containing it masked the
+# executable code before it.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+const p = "/Users/alice/secret"; const closer = "*/";'
+)
+ok("a quoted */ does not establish block state (scanner bypass)",
+   "/Users/alice/secret" in out)
+
+# _blank_string_literals directly: escapes and each quote style.
+ok("blank: double-quoted span is blanked",
+   rc._blank_string_literals('a = "*/" ; b') == 'a =      ; b')
+ok("blank: single-quoted span is blanked",
+   "*/" not in rc._blank_string_literals("a = '*/'"))
+ok("blank: template literal is blanked",
+   "*/" not in rc._blank_string_literals("a = `*/`"))
+ok("blank: escaped quote does not end the span early",
+   "*/" not in rc._blank_string_literals('a = "x\\"*/" ; end'))
+ok("blank: code outside strings is preserved",
+   rc._blank_string_literals("const x = 1;") == "const x = 1;")
+
+# An UNquoted mid-line */ still does not establish block state — only a
+# line-start closer does, so a stray token cannot suppress the rest of a hunk.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+foo(); /* note */ const p = "/Users/mid/line";'
+)
+ok("mid-line comment close does not suppress later code", "/Users/mid/line" in out)
+
 # --- flag_exact: whole-token, not substring (#2474 review) ------------------
 # A full executable path must not reject longer siblings in the same directory
 # family: /usr/bin/swift-inspect is a separate REAL binary (own inode, link

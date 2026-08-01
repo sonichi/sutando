@@ -137,14 +137,54 @@ def _hunk_opens_in_block(lines):
     scanned.
     """
     for text in lines:
-        i = 0
-        while i < len(text):
-            if text.startswith("/*", i):
-                return False
-            if text.startswith("*/", i):
-                return True
-            i += 1
+        # Delimiter-aware: a `*/` inside a string literal is data, not a comment
+        # close. Without this, `const closer = "*/";` established block state for
+        # the whole hunk and masked the executable code before it — a bypass in
+        # the SUPPRESSION direction, the reverse of the string-literal caveat on
+        # _mask_comments (@john-the-dev, reviewing #2474).
+        bare = _blank_string_literals(text)
+        if "/*" in bare:
+            return False
+        # Require the closer to be the first thing on its line — the canonical
+        # JSDoc shape (` */`). A mid-line `*/` that survived string-blanking is
+        # not evidence a comment was opened ABOVE this hunk.
+        if bare.lstrip().startswith("*/"):
+            return True
     return False
+
+
+def _blank_string_literals(text):
+    """Replace quoted spans with spaces so delimiters inside them are ignored.
+
+    Single-line only, which is the right trade here: a template literal spanning
+    lines could still hide a delimiter, but this function is used ONLY to decide
+    whether a hunk began inside a comment, and the paired line-start requirement
+    above means a hidden token cannot establish block state on its own.
+    """
+    out = []
+    quote = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                out.append("  ")
+                i += 2
+                continue
+            out.append(" ")
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'`":
+            quote = ch
+            out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _doc_transition(line, in_doc):
