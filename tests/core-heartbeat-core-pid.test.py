@@ -16,7 +16,11 @@ Hermetic by construction — `_alive_path` is redirected into a tmpdir, so nothi
 real workspace (`$SUTANDO_WORKSPACE` is no longer honored as of v0.8, so setting it would NOT
 isolate; the resolved path is what matters).
 """
-import importlib, json, os, subprocess, sys, tempfile
+import importlib
+import json
+import os
+import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
