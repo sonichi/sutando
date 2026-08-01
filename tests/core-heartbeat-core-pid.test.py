@@ -210,6 +210,46 @@ with tempfile.TemporaryDirectory() as td6:
           _REAL_CORE_PID("/tmp/s.sock") is None)
 os.environ["PATH"] = _ORIG_PATH
 
+# --- the three defensive branches, which only a hostile environment reaches ----
+with tempfile.TemporaryDirectory() as td7:
+    b7 = pathlib.Path(td7) / "bin"; b7.mkdir(parents=True)
+    _stub(b7, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) echo 555; exit 0;; esac; done\nexit 0\n")
+    # pgrep prints a NON-NUMERIC first token before the real row. Without the
+    # `continue` this would crash on int(); with it, the real row still matches.
+    _stub(b7, "pgrep", "#!/bin/sh\necho 'PID COMMAND'\necho '4321 claude --name sutando-core'\n")
+    os.environ["PATH"] = f"{b7}:{_ORIG_PATH}"
+    check("a non-numeric pgrep line is skipped, the real row still matches",
+          _REAL_CORE_PID("/tmp/s.sock") == 4321)
+os.environ["PATH"] = _ORIG_PATH
+
+with tempfile.TemporaryDirectory() as td8:
+    b8 = pathlib.Path(td8) / "bin"; b8.mkdir(parents=True)
+    # tmux PRESENT but pgrep ABSENT -> the subprocess call raises, the except
+    # swallows it, and resolution falls through to the pane path rather than
+    # propagating an exception out of a heartbeat.
+    _stub(b8, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) echo 556; exit 0;; esac; done\nexit 0\n")
+    os.environ["PATH"] = str(b8)
+    check("pgrep missing entirely -> swallowed, falls through to the pane path",
+          _REAL_CORE_PID("/tmp/s.sock") == 556)
+os.environ["PATH"] = _ORIG_PATH
+
+# .alive unlink raising must not crash the vanish path — the beat is stopping
+# either way, and an unremovable file is not worth a traceback in a daemon.
+class _Boom:
+    def unlink(self, missing_ok=False):
+        raise OSError("read-only filesystem")
+ch.core_pid = lambda socket_path=None, session=None: None
+ch._alive_path = lambda: _Boom()
+ch.write_beat = lambda status="running": None
+ch._SHUTDOWN_REQUESTED = False
+_seen = {"n": 0}
+def _once(socket_path=None, session=None):
+    _seen["n"] += 1
+    return 4242 if _seen["n"] == 1 else None
+ch.core_pid = _once
+check("vanish path survives an unlink that raises (returns 0, no traceback)",
+      ch.run_forever(interval=0.01) == 0)
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
