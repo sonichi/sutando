@@ -2,9 +2,16 @@
 """Per-host heartbeat for sutando-core sessions.
 
 Writes a small JSON file at `<workspace>/state/cores/<hostname>.alive` every
-30 seconds while running. The file's content reports the core's pid, host,
-start time, last beat, and a free-form status string; the file's mtime is
-the cross-host "is this core still up?" signal.
+30 seconds while the core is up. `pid` is the CORE's pid (resolved from the
+tmux pane on the recorded socket); `heartbeat_pid` is this writer's own. The
+file's mtime is the cross-host "is this core still up?" signal.
+
+Until 2026-08-01 `pid` was `os.getpid()` — the *writer's* pid — while this
+docstring already claimed it was the core's. The writer is started detached by
+startup.sh (PPID 1), is never killed by restart.sh, and is only started `if !
+pgrep`, so it outlived every core restart: the file kept a fresh mtime with a
+pid that was never the core's, and a DEAD core read as healthy. Measured on two
+hosts. The beat is now gated on the core actually existing.
 
 Why
 ---
@@ -39,6 +46,7 @@ import argparse
 import json
 import os
 import signal
+import subprocess
 import socket
 import sys
 import time
@@ -100,14 +108,50 @@ def _locality() -> dict[str, str]:
     return {"kind": kind, "host": _hostname()}
 
 
+def _socket_path() -> str:
+    """The tmux socket this core runs on. Mirrors start-cli.sh's resolution."""
+    return os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+
+
+def core_pid(socket_path: str | None = None) -> int | None:
+    """The pid of the process the core actually runs as, or None if it is gone.
+
+    Resolved from the tmux pane on the recorded socket rather than from a
+    remembered number, because `workspace_lock.py` already records that pid
+    RECYCLING makes a bare `kill(0, pid)` unreliable — a recycled pid would
+    resurrect a dead core's heartbeat. Asking tmux each beat asks the question
+    that actually matters: is the core's pane still there?
+    """
+    sock = socket_path or _socket_path()
+    try:
+        out = subprocess.run(
+            ["tmux", "-S", sock, "list-panes", "-a", "-F", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.split():
+        if line.strip().isdigit():
+            return int(line.strip())
+    return None
+
+
 def write_beat(status: str = "running") -> None:
     """Write one heartbeat record. Atomic-via-tmp-then-rename so a concurrent
     reader never sees a partial file."""
     CORES_DIR.mkdir(parents=True, exist_ok=True)
     target = _alive_path()
+    cpid = core_pid()
     payload = {
         "host": _hostname(),
-        "pid": os.getpid(),
+        # The CORE's pid — what this file has always claimed to carry. Falls
+        # back to the writer's own pid ONLY when tmux cannot be consulted, so a
+        # missing/!broken tmux degrades to the pre-2026-08-01 behaviour rather
+        # than blanking a field readers may come to depend on.
+        "pid": cpid if cpid is not None else os.getpid(),
+        "heartbeat_pid": os.getpid(),
         "started_at": _STARTED_AT,
         "last_beat_at": time.time(),
         "status": status,
@@ -122,7 +166,7 @@ def write_beat(status: str = "running") -> None:
         # and informational — mtime remains the liveness signal — so readers
         # that don't know the field are unaffected.
         "locality": _locality(),
-        "schema_version": 2,
+        "schema_version": 3,
     }
     tmp = target.with_suffix(".alive.tmp")
     tmp.write_text(json.dumps(payload, indent=2))
@@ -149,7 +193,19 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     """Heartbeat loop. Returns the exit code (0 on graceful shutdown)."""
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+    # Fail-open: if tmux is unusable at startup we never learned the core's
+    # pid, so gating would silently stop all liveness reporting. Only a core
+    # that was OBSERVED and then vanished stops the beat.
+    saw_core = core_pid() is not None
     while not _SHUTDOWN_REQUESTED:
+        if saw_core and core_pid() is None:
+            print("core_heartbeat: core pane is gone — stopping beat and "
+                  "removing .alive so readers see it leave", file=sys.stderr, flush=True)
+            try:
+                _alive_path().unlink(missing_ok=True)
+            except Exception:
+                pass
+            return 0
         try:
             write_beat(status=status)
         except Exception as e:
