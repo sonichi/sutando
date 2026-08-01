@@ -38,6 +38,30 @@ chk = _load("check_python39_compat", "check-python39-compat.py")
 ON_39 = sys.version_info < (3, 10)
 MATCH_SRC = "match 1:\n    case 1: pass\n"
 
+#: A control that fails to parse on EVERY interpreter. Substituting it lets the
+#: post-self-test branches of run() be exercised on any python, instead of
+#: skipping above the floor. Those branches (missing target, empty target,
+#: failure reporting) contain no version-dependent logic — they were only
+#: unreachable because run() refuses when the real control stops discriminating.
+#: Without this the CI coverage job, which runs stock 3.12, skips them and
+#: reports ~66% on lines that are fully tested locally under 3.9.
+ALWAYS_INVALID = (("always-invalid", "$$$ not python $$$\n"),)
+
+
+class _FloorShim:
+    """Context manager: make self_test() pass on whatever interpreter is running."""
+
+    def __enter__(self):
+        self._saved = chk.CONTROL_MUST_FAIL
+        chk.CONTROL_MUST_FAIL = ALWAYS_INVALID
+        return self
+
+    def __exit__(self, *exc):
+        chk.CONTROL_MUST_FAIL = self._saved
+        return False
+
+
+
 
 class TestDetector(unittest.TestCase):
     def test_plain_source_always_compiles(self):
@@ -110,26 +134,23 @@ class TestScan(unittest.TestCase):
         printed "0 file(s) parse cleanly" and exited 0."""
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(chk.scan(("nope",), Path(td)), [])   # walker: quiet
-            if ON_39:
-                import io
-                import contextlib
-                err = io.StringIO()
-                with contextlib.redirect_stderr(err):
-                    rc = chk.run(("nope",), Path(td))             # gate: loud
-                self.assertEqual(rc, 1)
-                self.assertIn("do not exist", err.getvalue())
+            import io
+            import contextlib
+            err = io.StringIO()
+            with _FloorShim(), contextlib.redirect_stderr(err):
+                rc = chk.run(("nope",), Path(td))                 # gate: loud
+            self.assertEqual(rc, 1)
+            self.assertIn("do not exist", err.getvalue())
 
     def test_run_refuses_a_target_that_exists_but_holds_no_python(self):
         """Second vacuous shape: the directory is there and simply empty."""
-        if not ON_39:
-            self.skipTest("run() refuses above the floor for a different reason")
         import io
         import contextlib
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
             (repo / "empty").mkdir()
             err = io.StringIO()
-            with contextlib.redirect_stderr(err):
+            with _FloorShim(), contextlib.redirect_stderr(err):
                 rc = chk.run(("empty",), repo)
         self.assertEqual(rc, 1, "zero files scanned must never report clean")
         self.assertIn("no .py files", err.getvalue())
@@ -154,20 +175,16 @@ class TestRunAndMain(unittest.TestCase):
         return repo
 
     def test_run_returns_zero_on_a_clean_tree(self):
-        if not ON_39:
-            self.skipTest("run() refuses above the floor by design")
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, _FloorShim():
             self.assertEqual(chk.run(("src",), self._tree(td, "x = 1\n")), 0)
 
     def test_run_returns_one_and_names_the_file_on_a_bad_tree(self):
-        if not ON_39:
-            self.skipTest("run() refuses above the floor by design")
         import io
         import contextlib
         with tempfile.TemporaryDirectory() as td:
-            repo = self._tree(td, MATCH_SRC)
+            repo = self._tree(td, ALWAYS_INVALID[0][1])
             err = io.StringIO()
-            with contextlib.redirect_stderr(err):
+            with _FloorShim(), contextlib.redirect_stderr(err):
                 rc = chk.run(("src",), repo)
         self.assertEqual(rc, 1)
         self.assertIn("mod.py", err.getvalue())
@@ -245,9 +262,8 @@ class TestEdgeCases(unittest.TestCase):
 
     def test_main_with_no_args_scans_the_real_repo(self):
         """Covers the default path main() takes in CI."""
-        if not ON_39:
-            self.skipTest("main() refuses above the floor by design")
-        self.assertEqual(chk.main([]), 0)
+        with _FloorShim():
+            self.assertEqual(chk.main([]), 0)
 
 
 if __name__ == "__main__":
