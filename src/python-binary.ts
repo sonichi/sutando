@@ -92,11 +92,27 @@ export function developerToolsInstalled(run: ExecProbe = defaultProbe): boolean 
  * the running node binary is checked too.
  */
 export function bundledPythonCandidates(repoRoot: string | undefined, execPath: string): string[] {
-	const rel = join('runtime', 'python', 'bin', 'python3');
 	const out: string[] = [];
-	if (repoRoot) out.push(join(dirname(repoRoot), rel));
-	out.push(join(dirname(execPath), rel));
-	out.push(join(dirname(dirname(execPath)), rel));
+	// Engine-sibling layout, documented in scripts/sutando-config.sh:
+	//   <repo>/../runtime/python/bin/python3
+	if (repoRoot) out.push(join(dirname(repoRoot), 'runtime', 'python', 'bin', 'python3'));
+	// Packaged layout, derived from the RUNTIME ROOT rather than from the node
+	// binary's directory. The vendored tree is
+	//   <Resources>/runtime/{bin/node, python/bin/python3}
+	// so python is a sibling of node's `bin/`, i.e. one level ABOVE dirname(node).
+	//
+	// An earlier revision appended the full 'runtime/python/bin/python3' to both
+	// dirname(execPath) and dirname(dirname(execPath)), which doubled the segment
+	// and produced '<Resources>/runtime/bin/runtime/python/…' and
+	// '<Resources>/runtime/runtime/python/…' — neither of which exists. The
+	// resolver then fell through to the xcode-select tier and returned null on a
+	// packaged, no-CLT host that HAD a working vendored python: exactly the
+	// install this module is for. (Caught by @john-the-dev reviewing #2475; the
+	// old test only asserted the candidates ENDED with the relative path, so it
+	// blessed both malformed forms.)
+	out.push(join(dirname(dirname(execPath)), 'python', 'bin', 'python3'));
+	// …and the flatter variant where node sits directly in the runtime root.
+	out.push(join(dirname(execPath), 'python', 'bin', 'python3'));
 	return out;
 }
 

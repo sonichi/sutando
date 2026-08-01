@@ -15,15 +15,18 @@
  *
  * Sibling fixes: #2469 (git, Python side), #2473 (python, Swift side).
  */
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { execFileSync, execSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { ExecProbe } from '../src/python-binary.js';
 import {
 	PythonUnavailableError,
+	isExecutableFile,
 	bundledPythonCandidates,
 	developerToolsInstalled,
 	requirePython,
@@ -127,10 +130,33 @@ describe('bundledPythonCandidates', () => {
 		);
 	});
 
+	it('produces the EXACT packaged-app path, with no doubled runtime segment', () => {
+		// Asserted exactly, not by endsWith. An endsWith check passes against
+		// '<Resources>/runtime/bin/runtime/python/bin/python3' — a path that does
+		// not exist — which is how the doubled segment shipped (#2475 review).
+		const execPath = '/Applications/Sutando.app/Contents/Resources/runtime/bin/node';
+		const expected = '/Applications/Sutando.app/Contents/Resources/runtime/python/bin/python3';
+		const cands = bundledPythonCandidates(undefined, execPath);
+		assert.ok(
+			cands.includes(expected),
+			`packaged sibling ${expected} missing from ${JSON.stringify(cands, null, 2)}`,
+		);
+	});
+
+	it('never emits a doubled runtime segment', () => {
+		const cands = bundledPythonCandidates(
+			'/usr/fake/engine',
+			'/Applications/Sutando.app/Contents/Resources/runtime/bin/node',
+		);
+		const doubled = cands.filter((c) => c.includes(join('runtime', 'bin', 'runtime'))
+			|| c.includes(join('runtime', 'runtime')));
+		assert.deepEqual(doubled, [], `malformed candidates: ${JSON.stringify(doubled)}`);
+	});
+
 	it('tolerates an unknown repo root', () => {
 		const cands = bundledPythonCandidates(undefined, '/usr/fake/node/bin/node');
 		assert.ok(cands.length > 0);
-		assert.ok(cands.every((c) => c.endsWith(join('runtime', 'python', 'bin', 'python3'))));
+		assert.ok(cands.every((c) => c.endsWith(join('python', 'bin', 'python3'))));
 	});
 });
 
@@ -154,6 +180,62 @@ describe('requirePython', () => {
 			else process.env.SUTANDO_PY = saved;
 			resetCacheForTests();
 		}
+	});
+});
+
+describe('activated call-site shapes (executable probe)', () => {
+	// The two consumers both swallow failures in a `catch`, so a unit-correct
+	// resolver can still leave both GUI actions silently dead. These probes
+	// execute the resolved interpreter through the EXACT shape each call site
+	// uses, under a packaged layout whose path contains a space — which is the
+	// case shellQuote exists for (#2475 review, P1 activated-path evidence).
+	let tmp: string;
+	let bundledPy: string;
+
+	before(() => {
+		tmp = mkdtempSync(join(tmpdir(), 'sutando-pyprobe-'));
+		// Deliberate space, mirroring "/Applications/Sutando.app/...".
+		const resources = join(tmp, 'My App', 'Contents', 'Resources');
+		mkdirSync(join(resources, 'runtime', 'bin'), { recursive: true });
+		mkdirSync(join(resources, 'runtime', 'python', 'bin'), { recursive: true });
+		writeFileSync(join(resources, 'runtime', 'bin', 'node'), '', { mode: 0o755 });
+		bundledPy = join(resources, 'runtime', 'python', 'bin', 'python3');
+		// A real, runnable interpreter shim so the probe proves EXECUTION, not
+		// just path arithmetic.
+		writeFileSync(bundledPy, '#!/bin/sh\nexec python3 "$@"\n', { mode: 0o755 });
+	});
+
+	after(() => rmSync(tmp, { recursive: true, force: true }));
+
+	it('resolves the vendored python from the real packaged layout', () => {
+		const fakeNode = join(tmp, 'My App', 'Contents', 'Resources', 'runtime', 'bin', 'node');
+		const picked = selectPython({
+			bundled: bundledPythonCandidates(undefined, fakeNode),
+			isExecutable: isExecutableFile,
+			toolsInstalled: () => false,   // no CLT — the case this must survive
+		});
+		assert.equal(picked, bundledPy);
+	});
+
+	it('meeting-tools shape: execFileSync runs the resolved path', () => {
+		const out = execFileSync(bundledPy, ['-c', 'print("meet-ok")'], {
+			encoding: 'utf8', timeout: 20_000,
+		});
+		assert.equal(out.trim(), 'meet-ok');
+	});
+
+	it('zoom shape: execSync runs the shell-quoted path containing a space', () => {
+		assert.ok(bundledPy.includes(' '), 'fixture must contain a space to be meaningful');
+		const out = execSync(`${shellQuote(bundledPy)} -c "print('zoom-ok')"`, {
+			encoding: 'utf8', timeout: 20_000,
+		});
+		assert.equal(out.trim(), 'zoom-ok');
+	});
+
+	it('zoom shape FAILS without shellQuote — proving the quoting is load-bearing', () => {
+		assert.throws(() => execSync(`${bundledPy} -c "print('nope')"`, {
+			encoding: 'utf8', stdio: 'pipe', timeout: 20_000,
+		}));
 	});
 });
 
