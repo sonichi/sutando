@@ -36,5 +36,8 @@
       ]
     },
     "interval_seconds": 1800
+  },
+  "bridges": {
+    "progress_stream": false
   }
 }
