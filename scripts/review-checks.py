@@ -169,9 +169,18 @@ def _blank_strings(s):
     never reached the `[1]`, and exempted an Apple-Silicon-only command. Escapes
     are honoured for the same reason `_code_part` honours them — a `\\"` does not
     end the string.
+
+    REGEX LITERALS count as data too — `/\\)/` carries the same escaped `)`. Since
+    `_code_part` has already removed comments before anything here runs, quotes,
+    template literals and regex literals are the COMPLETE set of constructs that
+    can hold punctuation as data on one line of JS/TS. Python has no regex
+    literal, so the same set covers it. That is why this closes the class rather
+    than excluding one more shape: three rounds of this bug were three different
+    containers, each fixed on its own.
     """
     out = list(s)
-    q = None
+    q = None          # quote char, or "/" while inside a regex literal
+    cls = False       # inside a regex [...] character class, where "/" is literal
     i = 0
     while i < len(s):
         ch = s[i]
@@ -182,14 +191,64 @@ def _blank_strings(s):
                     out[i + 1] = " "
                 i += 2
                 continue
-            if ch == q:
+            if q == "/":
+                # A "/" inside a character class does not end the regex.
+                if ch == "[":
+                    cls = True
+                elif ch == "]":
+                    cls = False
+                if ch == "/" and not cls:
+                    q = None
+                else:
+                    out[i] = " "
+            elif ch == q:
                 q = None
             else:
                 out[i] = " "
         elif ch in "\"'`":
             q = ch
+        elif ch == "/" and _starts_regex(s, i):
+            q = "/"
+            cls = False
         i += 1
     return "".join(out)
+
+
+# A `/` after one of these keywords opens a REGEX, not a division — the keyword
+# ends an identifier, which otherwise reads as "an expression to divide".
+_REGEX_KEYWORDS = frozenset((
+    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+    "case", "do", "else", "yield", "await", "throw",
+))
+
+# A `/` directly after one of these is DIVISION: each can end an expression.
+# Closing quotes are included because `"abc" / 2` divides a string — without
+# them a trailing division would open a regex that never closes and swallow the
+# rest of the line.
+_DIV_PREV = set("_$)]" + "\"'`")
+
+
+def _starts_regex(s, i):
+    """Does the `/` at `s[i]` open a regex literal rather than divide?
+
+    The standard JS disambiguation: a `/` opens a regex unless the preceding
+    token could END an expression. Comments never reach here — `_code_part`
+    strips them first — so the only two readings are regex and division.
+    """
+    j = i - 1
+    while j >= 0 and s[j] in " \t":
+        j -= 1
+    if j < 0:
+        return True                       # line starts with it
+    prev = s[j]
+    if prev.isalnum() or prev in _DIV_PREV:
+        if not (prev.isalpha() or prev in "_$"):
+            return False                  # digit / ) / ] / quote -> division
+        k = j
+        while k >= 0 and (s[k].isalnum() or s[k] in "_$"):
+            k -= 1
+        return s[k + 1:j + 1] in _REGEX_KEYWORDS
+    return True
 
 
 def _call_end(code, name_end):

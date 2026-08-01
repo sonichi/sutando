@@ -763,6 +763,55 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 16 (john-the-dev, review of e07028d). Third instance of ONE class:
+# punctuation that is DATA read as syntax. Rounds 14/15/16 were the chain, then
+# string literals, then REGEX literals — `/\)/` carries the same escaped `)`.
+#
+#     ["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].map(x => (/\)/, x))[1]
+#
+# `_code_part` strips comments before any of this runs, so quotes, template
+# literals and regex literals are the COMPLETE set of one-line data containers
+# in JS/TS (Python has no regex literal). Closing the set is why this is not
+# another exclusion.
+#
+# The cost of getting regex detection wrong is a FALSE POSITIVE on division, so
+# the division cases below are controls, not decoration: a `/` after an
+# identifier, a digit, a `)`/`]`, or a CLOSING QUOTE divides. Without the quote
+# case, `"abc" / 2` opens a regex that never closes and eats the line.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+    ok("main(): an escaped `)` inside a regex literal is data",
+       "hardcoded path" in scan('+++ b/src/r1.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => (/\\)/, x))[1];')[1])
+    ok("main(): a regex character class holding `/` and `)` is data",
+       "hardcoded path" in scan('+++ b/src/r2.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => (/[/)]/, x))[1];')[1])
+    ok("main(): a regex literal followed by a PROBE stays permitted",
+       scan('+++ b/src/r3.ts\n@@ -1,0 +1,1 @@\n+const cmd = ' + L + '.map(x => (/\\)/, x)).find(exists);')[1].strip() == "")
+
+    ok("_starts_regex: after `(` it opens a regex", rc._starts_regex("f(/a/", 2))
+    ok("_starts_regex: after an identifier it is division", not rc._starts_regex("a / b", 2))
+    ok("_starts_regex: after a digit it is division", not rc._starts_regex("2 / b", 2))
+    ok("_starts_regex: after `)` it is division", not rc._starts_regex("f() / b", 4))
+    ok("_starts_regex: after a CLOSING QUOTE it is division",
+       not rc._starts_regex('"abc" / 2', 6))
+    ok("_starts_regex: after the keyword `return` it opens a regex",
+       rc._starts_regex("return /a/", 7))
+    ok("_starts_regex: an identifier merely ENDING in a keyword still divides",
+       not rc._starts_regex("return_val / 2", 11))
+    ok("_starts_regex: at the start of the line it opens a regex",
+       rc._starts_regex("/a/.test(x)", 0))
+
+    ok("_blank_strings: regex contents are blanked, delimiters kept",
+       rc._blank_strings('f(/\\)/, x)') == 'f(/  /, x)')
+    ok("_blank_strings: division is NOT treated as a regex",
+       rc._blank_strings('a / b) c') == 'a / b) c')
+    ok("_call_end: an escaped `)` in a regex does not end the call",
+       rc._call_end('.map(x => (/\\)/, x))[1]', 4) == 19)
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so
