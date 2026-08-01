@@ -6,7 +6,7 @@
       "audience": ["users", "operators", "contributors", "maintainers"],
       "status": "canonical",
       "canonical_for": "external tool and package requirements, and what to vendor when embedding Sutando",
-      "last_verified": "2026-08-01"
+      "last_verified": "2026-08-02"
     },
     "docs/README.md": {
       "title": "Sutando documentation",
