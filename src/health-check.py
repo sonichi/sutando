@@ -2280,6 +2280,61 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300) -> 
     return {"name": name, "status": "ok", "detail": f"{len(files)} task(s), oldest {oldest_age}s"}
 
 
+def check_stranded_results(min_age_sec: int = 900) -> dict:
+    """Detect result files the Discord bridge can never deliver.
+
+    The bridge maps task-<id> -> channel in state/discord-pending-replies.json
+    and POPS the entry the moment it delivers that task's first result. A
+    SECOND result written to the same id afterwards — a correction, an
+    addendum — therefore has no channel to go to. It is never delivered and
+    never logged as a failure; it just sits in results/ forever.
+
+    Found 2026-08-01 by accident: 10 stranded files, oldest 50h, including a
+    correction owed to the owner and research she had explicitly asked for.
+    Every one was written correctly and none reached her. That is the same
+    user-visible symptom as the sweeper race (#the bridge ate dvoice results):
+    the answer exists, the delivery path drops it, and the agent looks like it
+    ignored her.
+
+    Fresh files are excluded: a result written seconds ago is mid-flight, not
+    stranded.
+    """
+    name = "stranded-results"
+    results_dir = WORKSPACE_DIR / "results"
+    pending_file = WORKSPACE_DIR / "state" / "discord-pending-replies.json"
+    if not results_dir.exists():
+        return {"name": name, "status": "ok", "detail": "results/ not yet created"}
+    try:
+        tracked = set(json.loads(pending_file.read_text())) if pending_file.exists() else set()
+    except Exception:  # noqa: BLE001 — an unreadable map must not fail the check
+        return {"name": name, "status": "ok", "detail": "pending-replies map unreadable — skipped"}
+
+    now = time.time()
+    stranded = []
+    for p in results_dir.glob("task-*.txt"):
+        if p.stem in tracked:
+            continue
+        try:
+            age = now - p.stat().st_mtime
+        except OSError:
+            continue
+        if age > min_age_sec:
+            stranded.append((p.name, age))
+    if not stranded:
+        return {"name": name, "status": "ok", "detail": "no undeliverable results"}
+    stranded.sort(key=lambda x: -x[1])
+    oldest_h = stranded[0][1] / 3600
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (
+            f"{len(stranded)} result(s) no bridge will deliver, oldest {oldest_h:.1f}h "
+            f"({stranded[0][0]}) — answers written but unreachable; "
+            f"send follow-ups as proactive-<ts>.txt with a [channel:] line, not a 2nd task-<id>.txt"
+        ),
+    }
+
+
 def _proc_argv(pid: int) -> str:
     """argv of `pid`, or "" if no such process.
 
@@ -3309,6 +3364,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_stranded_results())
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
