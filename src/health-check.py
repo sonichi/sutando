@@ -718,6 +718,94 @@ def check_cron_runner(
     }
 
 
+_MONTH_MAX_DAYS = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
+                   7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
+
+
+def _cron_field_values(field: str, lo: int, hi: int) -> "set[int] | None":
+    """Expand one numeric cron field to its value set, or None if not understood.
+
+    None means "do not reason about this expression" — every caller below treats
+    an unparseable field as schedulable, so a parser gap can never invent a
+    never-fires verdict.
+    """
+    out: "set[int]" = set()
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            return None
+        step = 1
+        if "/" in part:
+            part, _, raw_step = part.partition("/")
+            if not raw_step.isdigit() or int(raw_step) < 1:
+                return None
+            step = int(raw_step)
+        if part in ("*", "?"):
+            start, end = lo, hi
+        elif "-" in part.lstrip("-"):
+            start_s, _, end_s = part.partition("-")
+            if not (start_s.isdigit() and end_s.isdigit()):
+                return None
+            start, end = int(start_s), int(end_s)
+        elif part.isdigit():
+            start = end = int(part)
+        else:
+            return None  # names (JAN/MON), L, W, # — not our business
+        if start > end or start < lo or end > hi:
+            return None
+        out.update(range(start, end + 1, step))
+    return out or None
+
+
+def _cron_can_never_fire(expr: str) -> bool:
+    """True only when a 5-field cron's day-of-month/month pair is impossible.
+
+    A deliberately-parked entry is the real case: this host carries
+    `wire-newsroom-nightly-DISABLED-...` at `0 0 31 2 *` — February 31st, which
+    is syntactically valid and can never occur. /schedule-crons cannot register
+    it, so it was counted as expected-but-missing and the session-crons guard
+    warned on every run, permanently. A guard that always warns is a guard
+    nobody reads, and this one exists to catch a SILENT failure (a peer
+    instance registered 2/18 with no error) — so a standing false positive
+    disables exactly the signal it was built to raise.
+
+    Deliberately conservative: day-of-week must be unrestricted, because cron
+    ORs day-of-month with day-of-week — `0 0 31 2 MON` still fires on Mondays.
+    Anything unparseable returns False (schedulable).
+    """
+    parts = expr.split()
+    if len(parts) != 5:
+        return False
+    _, _, dom_f, month_f, dow_f = parts
+    if dow_f.strip() not in ("*", "?"):
+        return False  # OR-semantics with day-of-week — it can still fire
+    doms = _cron_field_values(dom_f, 1, 31)
+    months = _cron_field_values(month_f, 1, 12)
+    if doms is None or months is None:
+        return False
+    return not any(d <= _MONTH_MAX_DAYS[m] for m in months for d in doms)
+
+
+def _entry_marked_parked(entry: dict) -> bool:
+    """True when the entry carries an explicit "deliberately disabled" signal.
+
+    An impossible date alone must NOT qualify. `0 0 31 2 *` is equally the
+    signature of a parked job and of an active typo — someone meaning "the 31st,
+    monthly" and writing February. Excluding on the date alone would let a
+    mistyped ACTIVE schedule vanish from `expected`, so CronCreate silently
+    omits it and this guard reports green forever: the precise silent-miss class
+    the check exists to surface.
+
+    Two accepted signals: an explicit `disabled: true` field, and the
+    established convention of DISABLED in the entry name (used by this host's
+    `wire-newsroom-nightly-DISABLED-2026-06-09-...`, which also records why).
+    """
+    if entry.get("disabled") is True:
+        return True
+    name = entry.get("name")
+    return isinstance(name, str) and "DISABLED" in name
+
+
 def check_session_cron_registration(
     workspace_dir: Optional[Path] = None,
     host_label: Optional[str] = None,
@@ -755,7 +843,18 @@ def check_session_cron_registration(
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
             return False
-        if entry.get("loop") == "dynamic" or not entry.get("cron"):
+        cron_expr = entry.get("cron")
+        if entry.get("loop") == "dynamic" or not cron_expr:
+            return False
+        if (
+            _entry_marked_parked(entry)
+            and isinstance(cron_expr, str)
+            and _cron_can_never_fire(cron_expr)
+        ):
+            # BOTH signals required. Marked-disabled AND unregistrable (e.g.
+            # `0 0 31 2 *`): /schedule-crons cannot register it, so counting it
+            # as expected warns forever. An impossible date WITHOUT a disabled
+            # marker is an active typo and must still warn.
             return False
         return True
 
