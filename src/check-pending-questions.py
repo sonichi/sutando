@@ -178,6 +178,11 @@ def notify_voice(questions):
     ts = int(time.time() * 1000)
     path = RESULTS_DIR / f"question-{ts}.txt"
     titles = [q["title"] for q in questions]
+    # Same dm-ban gate as the proactive write below: THIS file is what produced
+    # 31 "pending questions waiting" DMs in one day (2026-08-01 census).
+    if (RESULTS_DIR.parent / "state" / "dm-ban.sentinel").exists():
+        print("dm-ban.sentinel present — question-file DM suppressed")
+        return
     path.write_text(
         f"You have {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting for your answer: "
         + "; ".join(titles)

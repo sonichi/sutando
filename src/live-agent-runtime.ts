@@ -13,7 +13,7 @@
  * it carries only control/durable-work traffic into the session.
  */
 
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
@@ -130,6 +130,13 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				// (some users keep the web UI open).
 				console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
 				try {
+					// dm-ban sentinel (owner 2026-08-01): this fallback DM'd her 19 times in
+					// one day during voice churn. While the sentinel exists, skip the DM —
+					// the result file itself still lands in results/ for the normal path.
+					if (existsSync(join(WORKSPACE_DIR, 'state', 'dm-ban.sentinel'))) {
+						console.log(`${ts()} [TaskBridge] dm-ban.sentinel present — stuck-voice DM suppressed`);
+						throw new Error('__dm_ban_skip__');
+					}
 					const proactiveTs = Math.floor(Date.now() / 1000);
 					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}.txt`);
 					const dmBody = `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${result}`;
