@@ -131,9 +131,30 @@ def run(targets: "tuple[str, ...]", repo: Path) -> int:
     if self_test() != 0:
         return 1
 
+    # Same principle applied to the TARGETS. A mistyped --target, or a target
+    # that exists but holds no .py, previously printed "0 file(s) parse
+    # cleanly" and exited 0 — a green that means "scanned nothing", which is
+    # indistinguishable from "scanned everything and it was fine". That is the
+    # failure this whole script exists to prevent, so it is an error here too.
+    missing = [t for t in targets if not (repo / t).is_dir()]
+    if missing:
+        print("python39-compat: target(s) do not exist under %s: %s"
+              % (repo, ", ".join(sorted(missing))), file=sys.stderr)
+        print("Refusing to report a clean scan over a directory that is not "
+              "there — a mistyped --target must not look like a pass.",
+              file=sys.stderr)
+        return 1
+
     failures = scan(targets, repo)
     scanned = sum(len(list((repo / t).rglob("*.py"))) for t in targets
                   if (repo / t).is_dir())
+    if scanned == 0:
+        print("python39-compat: target(s) %s contain no .py files — nothing "
+              "was scanned" % ", ".join(sorted(targets)), file=sys.stderr)
+        print("Refusing to report a clean scan over zero files.",
+              file=sys.stderr)
+        return 1
+
     if failures:
         print("\npython39-compat: %d file(s) do NOT parse on %s"
               % (len(failures), ".".join(str(v) for v in sys.version_info[:3])),

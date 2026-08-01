@@ -101,9 +101,38 @@ class TestScan(unittest.TestCase):
                 "from __future__ import annotations\nx = 1\n")
             self.assertEqual(chk.scan(("src",), repo), [])
 
-    def test_missing_target_dir_is_not_an_error(self):
+    def test_scan_skips_a_missing_dir_but_run_refuses_it(self):
+        """`scan()` is the raw walker and stays permissive; `run()` is the
+        GATE and must not turn "directory absent" into a green.
+
+        This assertion replaces `test_missing_target_dir_is_not_an_error`,
+        which pinned the vacuous behaviour: `--target definitely-missing`
+        printed "0 file(s) parse cleanly" and exited 0."""
         with tempfile.TemporaryDirectory() as td:
-            self.assertEqual(chk.scan(("nope",), Path(td)), [])
+            self.assertEqual(chk.scan(("nope",), Path(td)), [])   # walker: quiet
+            if ON_39:
+                import io
+                import contextlib
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = chk.run(("nope",), Path(td))             # gate: loud
+                self.assertEqual(rc, 1)
+                self.assertIn("do not exist", err.getvalue())
+
+    def test_run_refuses_a_target_that_exists_but_holds_no_python(self):
+        """Second vacuous shape: the directory is there and simply empty."""
+        if not ON_39:
+            self.skipTest("run() refuses above the floor for a different reason")
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / "empty").mkdir()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = chk.run(("empty",), repo)
+        self.assertEqual(rc, 1, "zero files scanned must never report clean")
+        self.assertIn("no .py files", err.getvalue())
 
     def test_the_real_src_tree_parses_on_this_interpreter(self):
         """The regression this ships to protect."""
