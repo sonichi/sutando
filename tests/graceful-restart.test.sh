@@ -36,6 +36,66 @@ mkws() {  # fresh workspace with a live heartbeat + idle status
   printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$ws/state/core-status.json"
 }
 
+echo "0. CONCURRENT double-click → EXACTLY ONE restart decision (sonichi#2334 review)"
+# The sentinels are per-WORKSPACE and every run clears them at startup, so two
+# orchestrators could each validate a sentinel carrying their OWN rid and both
+# reach the destructive restart — the second killing the core the first just
+# relaunched. Measured on the pre-fix script: 50/50 iterations restarted twice.
+#
+# NOT a timing-luck test: the two processes are started before either can
+# finish, and the assertion is on the INVARIANT (exactly one decision), so a
+# scheduler that serializes them still fails the run if both decide.
+# ITERATE. A single pair is timing-dependent: verified that with a live+idle
+# core one unfixed pair often lets only one through by luck, so a 1-shot check
+# PASSES against the broken script and proves nothing. N pairs, and the run
+# fails if ANY pair produced two decisions.
+N_CONC="${GR_TEST_CONC_ITERS:-10}"
+doubles=0; deferrals=0; reaped=0; bad_sentinel=0
+for _i in $(seq 1 "$N_CONC"); do
+  # DEAD core (no .alive): this is where the double-restart actually races.
+  # With a live+idle core the pre-fix failure mode is STARVATION instead —
+  # one run deletes the other's sentinel and the loser exits 3 — so a
+  # live-core fixture reports "exactly one" against the BROKEN script and
+  # the assertion proves nothing. Verified both ways before choosing this.
+  WS0="$TMP/ws0-$_i"; mkdir -p "$WS0/state/cores" "$WS0/tasks"
+  printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS0/state/core-status.json"
+  a_out="$TMP/conc-a-$_i.log"; b_out="$TMP/conc-b-$_i.log"
+  ( GR_WS="$WS0" GR_SYNC_CMD="true" GR_POLL_S=0 bash "$GR" --dry-run >"$a_out" 2>&1 ) &
+  pa=$!
+  ( GR_WS="$WS0" GR_SYNC_CMD="true" GR_POLL_S=0 bash "$GR" --dry-run >"$b_out" 2>&1 ) &
+  pb=$!
+  wait "$pa" || true
+  wait "$pb" || true
+  d=0
+  grep -q "would exec" "$a_out" && d=$((d + 1))
+  grep -q "would exec" "$b_out" && d=$((d + 1))
+  [ "$d" -ge 2 ] && doubles=$((doubles + 1))
+  cat "$a_out" "$b_out" | grep -q "another restart is in progress" && deferrals=$((deferrals + 1))
+  cat "$a_out" "$b_out" | grep -q "reaping stale restart lock" && reaped=$((reaped + 1))
+  if [ ! -f "$WS0/state/restart-ready.json" ] || \
+     ! grep -q '"restart_id":"grp-' "$WS0/state/restart-ready.json" 2>/dev/null; then
+    bad_sentinel=$((bad_sentinel + 1))
+  fi
+done
+[ "$doubles" = 0 ] \
+  && say ok "exactly one restart decision in all $N_CONC concurrent pairs" \
+  || say FAIL "$doubles/$N_CONC pairs BOTH restarted — the #2334 race"
+[ "$deferrals" = "$N_CONC" ] \
+  && say ok "the losing peer deferred with a reason every time" \
+  || say FAIL "peer deferred with a reason in only $deferrals/$N_CONC pairs"
+# A LIVE lock must never be reaped: an unreadable age has to fail CLOSED. The
+# first cut of this fix wrote the holder ts AFTER mkdir, so a peer landing in
+# that gap read no ts, computed age=now-0, called a 1s-old lock stale and reaped
+# it — both then restarted. Age now comes from the lock dir's own mtime, which
+# mkdir sets atomically as part of claiming the lock.
+[ "$reaped" = 0 ] \
+  && say ok "no live lock was reaped in $N_CONC pairs" \
+  || say FAIL "$reaped/$N_CONC pairs reaped a LIVE lock (ts-written-after-mkdir race)"
+# One run must not be able to delete or overwrite the other's terminal state.
+[ "$bad_sentinel" = 0 ] \
+  && say ok "surviving sentinel intact + rid-stamped in all $N_CONC pairs" \
+  || say FAIL "$bad_sentinel/$N_CONC pairs lost or corrupted the terminal sentinel"
+
 echo "1. quiet core → prep runs directly → ready sentinel → dry-run restart"
 WS1="$TMP/ws1"; mkws "$WS1"
 out="$(GR_WS="$WS1" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)"; rc=$?
