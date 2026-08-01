@@ -182,12 +182,39 @@ def get_waiting_questions():
     return questions
 
 
-def should_notify():
-    """Only notify once per hour to avoid spam."""
+def _last_notify_state():
+    """(mtime, key) of the last notification. `key` is None for the pre-2026-08-01
+    format, which stored a bare timestamp — so the first run after upgrading is
+    treated as "set unknown" and notifies once rather than silently suppressing."""
     if not LAST_NOTIFY_FILE.exists():
-        return True
-    last = LAST_NOTIFY_FILE.stat().st_mtime
-    return (time.time() - last) > 3600  # 1 hour
+        return None, None
+    mtime = LAST_NOTIFY_FILE.stat().st_mtime
+    parts = LAST_NOTIFY_FILE.read_text().split()
+    return mtime, (parts[1] if len(parts) > 1 else None)
+
+
+def should_notify(key=None):
+    """Notify when the SET changed, or when it is genuinely new. Never re-send an
+    unchanged set on a timer.
+
+    The old rule was purely time-based — 3600s since the marker's mtime, with no
+    awareness of whether anything had changed — so an unchanged queue re-notified
+    every hour, forever. Observed 2026-08-01: the identical 17 items reached the
+    owner three times inside 60 minutes (05:43 cron, 06:17 briefing, 06:4x cron),
+    content hash unchanged across all three.
+
+    The script already computed the discriminator: `questions_key()` hashes the
+    sorted titles and was used to name the proactive file. The cooldown simply
+    never consulted it. Passing `key=None` keeps the old time-only behaviour for
+    any caller that has no set to hash."""
+    mtime, last_key = _last_notify_state()
+    if mtime is None:
+        return True                      # never notified
+    if key is None:
+        return (time.time() - mtime) > 3600
+    if last_key is None:
+        return True                      # legacy marker: key unknown, notify once
+    return key != last_key               # unchanged set -> stay quiet
 
 
 def notify_macos(count, titles):
@@ -329,7 +356,7 @@ def main():
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
         return
 
-    if not force and not should_notify():
+    if not force and not should_notify(questions_key(questions)):
         print(f"(cooldown) {len(questions)} pending questions — skipping notification")
         return
 
@@ -341,7 +368,7 @@ def main():
     # exact "claimed an outcome it never achieved" failure this script exists to
     # remove, reproduced in its own control flow.
     summary = deliver(questions, count, titles)
-    LAST_NOTIFY_FILE.write_text(str(int(time.time())))
+    LAST_NOTIFY_FILE.write_text(f"{int(time.time())} {questions_key(questions)}")
     print(summary)
 
 
