@@ -239,6 +239,16 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
   rm -f "$_ccd_err"
 fi
 
+# Boot gate (#2396): verify the resolved CLAUDE_CONFIG_DIR can boot the CLI
+# authenticated BEFORE any service launches. A logged-out CLI (locked keychain
+# on SSH boots, fresh config dir) otherwise yields a half-up core — tmux +
+# bridges alive, CLI parked at /login, processing nothing (2026-07-30 outage).
+# The gate fails loud (stderr + notification + pending-questions + proactive
+# DM file) and aborts; SUTANDO_SKIP_AUTH_PREFLIGHT=1 is the escape hatch.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  bash "$REPO/src/auth-preflight-gate.sh" "$CLAUDE_CONFIG_DIR" || exit $?
+fi
+
 # Git committer attribution: REMOVED (2026-05-21). This block used to set
 # committer.name/committer.email from stand-identity.json so `git log %cn`
 # showed which fleet host crafted a commit. But git 2.31+ honors committer.*

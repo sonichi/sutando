@@ -342,3 +342,35 @@ def _emit_claude_home_fallback_banner_once() -> None:
         "location post-#1454. Suppress with SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1.",
         file=sys.stderr,
     )
+
+def write_private_text(path: "Path", text: str) -> None:
+    """Write ``text`` to ``path`` as an owner-only (0600) file, with no window.
+
+    ``Path.write_text()`` creates at the process umask — commonly 0644 — so the
+    familiar ``write_text(...)`` + ``os.chmod(..., 0o600)`` pair leaves the file
+    world-readable for the interval between the two calls. For access-control
+    data (allowlists, owner ids, tier maps) that interval is the whole exposure.
+
+    ``os.open`` applies the mode at CREATION, and ``fchmod`` covers the case
+    where the file already existed (the mode argument is ignored then). O_TRUNC
+    rather than O_EXCL deliberately: this is used on best-effort paths wrapped in
+    broad excepts, and O_EXCL would turn a leftover temp file from a crash into a
+    permanent silent failure.
+    """
+    # Order matters for DATA INTEGRITY, not just permissions. O_TRUNC empties the
+    # file at OPEN, so with `O_CREAT|O_TRUNC` then fchmod, a hardening failure
+    # leaves an EXISTING backup empty -- a permission error would destroy exactly
+    # the durable copy that exists to survive a wipe. (The old
+    # write_text()+chmod at least failed with correct data and loose perms.)
+    #
+    # So: open WITHOUT O_TRUNC, harden first, and only truncate once nothing can
+    # still fail destructively.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)   # existing file: mode arg above was ignored
+        os.ftruncate(fd, 0)    # nothing destroyed until hardening succeeded
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "w") as fh:  # fdopen takes ownership of fd from here
+        fh.write(text)

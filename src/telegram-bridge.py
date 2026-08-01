@@ -18,6 +18,7 @@ import os
 import uuid
 import re
 import secrets
+import shutil
 import sys
 import time
 import urllib.request
@@ -54,7 +55,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from util_paths import channel_access_path, claude_home_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
@@ -336,8 +337,7 @@ def tofu_onboard(sender_id, username):
         "tofuOnboardedAt": int(time.time()),
         "tofuOnboardedUsername": username or None,
     }
-    ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
-    os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Telegram user ID
+    write_private_text(ACCESS_FILE, json.dumps(payload, indent=2) + "\n")  # don't inherit umask 644 — file holds owner's Telegram user ID
     print(f"  TOFU: auto-onboarded @{username} (id={sender_id}) as owner — wrote {ACCESS_FILE}")
     return {sender_id}
 
@@ -392,7 +392,9 @@ def download_file(file_id, name_hint="file"):
     local_name = f"{int(time.time()*1000)}{ext}"
     local_path = INBOX_DIR / local_name
     try:
-        urllib.request.urlretrieve(url, str(local_path))
+        req = urllib.request.Request(url, headers={"User-Agent": "Sutando"})
+        with urllib.request.urlopen(req, timeout=30) as resp, open(local_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
         return str(local_path)
     except Exception as e:
         print(f"  Download failed: {e}")
