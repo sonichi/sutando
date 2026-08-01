@@ -322,6 +322,55 @@ def resolve_voice_health_config(
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
 
 
+def resolve_web_client_port(
+    env: Optional[dict] = None,
+    env_path: Optional[Path] = None,
+) -> dict:
+    """Resolve CLIENT_PORT with the same sourced-dotenv precedence as startup."""
+    env = os.environ if env is None else env
+    env_path = _resolve_dotenv() if env_path is None else env_path
+    file_value: Optional[str] = None
+    file_has_value = False
+
+    if env_path.exists():
+        try:
+            lines = env_path.read_text().splitlines()
+        except OSError as exc:
+            return {"error": f"{env_path.name} unreadable ({exc})"}
+        for line_no, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            assignment = line
+            if assignment.startswith("export "):
+                assignment = assignment[len("export "):].lstrip()
+            if not assignment.startswith("CLIENT_PORT"):
+                continue
+            if "=" not in assignment:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT assignment"}
+            key, value = assignment.split("=", 1)
+            if key.strip() != "CLIENT_PORT":
+                continue
+            try:
+                parsed = shlex.split(value, comments=True, posix=True)
+            except ValueError as exc:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT value ({exc})"}
+            if len(parsed) > 1:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT value"}
+            file_value = parsed[0] if parsed else ""
+            file_has_value = True
+
+    configured = file_value if file_has_value else env.get("CLIENT_PORT")
+    value = str(configured or "8080").strip()
+    try:
+        port = int(value)
+    except ValueError:
+        return {"error": f"invalid CLIENT_PORT={value!r}"}
+    if not 1 <= port <= 65535:
+        return {"error": f"invalid CLIENT_PORT={value!r}"}
+    return {"port": port}
+
+
 def check_voice_stack(
     env: Optional[dict] = None,
     env_path: Optional[Path] = None,
@@ -917,6 +966,12 @@ def check_memory_index_integrity() -> "dict | None":
     suffix, not the file, so this is measured by asking whether each memory is
     named in the prefix that actually loads.
 
+    Not every absence from MEMORY.md is a loss, though: overflow entries live in
+    sibling HUB indexes (``MEMORY-reference.md``, ``MEMORY-wire.md``, …) which
+    MEMORY.md links to. Those are grep-reachable by design and are counted
+    separately — lumping them in produced a 1010-file warn on this host whose
+    real content was 906, and a warn nobody can read is a warn nobody reads.
+
     Fails only when a memory is demonstrably lost that way; warns for orphaned/
     stranded files and for an index merely approaching the limit. Returns None
     on a clean index or when the memory dir does not exist yet.
@@ -935,20 +990,55 @@ def check_memory_index_integrity() -> "dict | None":
     def _referenced_in(hay: str, name: str) -> bool:
         return name in hay or name[:-3] in hay
 
+    # MEMORY.md is not the only index. Once a corpus outgrows the load budget the
+    # overflow moves to sibling HUB indexes (MEMORY-reference.md, MEMORY-wire.md,
+    # …). A hub entry deliberately does not auto-load — it only has to be findable
+    # — so it is not a loss.
+    #
+    # But a hub is only findable if the LOADED prefix of MEMORY.md links to it.
+    # Trusting every MEMORY*.md glob match instead lets an unlinked file (a stale
+    # copy, a backup, an ordinary memory that happens to match the glob) launder
+    # itself AND every filename it mentions into a false green — inside the one
+    # probe that exists to prevent silent loss. A hub linked only PAST the cut is
+    # equally unreachable, so `loaded_text` is the correct gate, not `index_text`.
+    # (john-the-dev, #2483: an earlier revision of this change trusted the glob
+    # and its test suite explicitly blessed the unlinked case.)
+    #
+    # An untrusted MEMORY*.md is therefore not an index at all: it falls through
+    # to the classification below and is reported like any other unindexed file.
+    index_names = {"MEMORY.md"}
+    hub_text = ""
+    for hub in sorted(MEMORY_DIR.glob("MEMORY*.md")):
+        if hub.name == "MEMORY.md" or not _referenced_in(loaded_text, hub.name):
+            continue
+        index_names.add(hub.name)
+        hub_text += "\n" + hub.read_text(errors="ignore")
+
     # (a) live memory files not referenced anywhere in MEMORY.md → won't load.
     # (c) referenced, but ONLY beyond the load cut → equally won't load. Same
     #     consequence, different cause, so they are found the same way: ask the
     #     prefix that actually loads, not the whole file. Testing the whole file
     #     reported an index entry parked on line 201 as healthy (john-the-dev,
     #     #2449) because the bytes were on disk — just never read.
+    # (d) reachable only from a sibling hub index → by design, NOT a loss. Kept
+    #     separate so the genuinely-lost names stay readable: on this host 104
+    #     by-design entries were mixed into a single 1010-file warn, which is
+    #     unreadable and therefore unread — 8 truly dark memories sat inside it
+    #     for months while the probe "warned" about them on every run.
     unindexed: list[str] = []
     beyond_cut: list[str] = []
+    hub_only: list[str] = []
     for p in sorted(MEMORY_DIR.glob("*.md")):
-        if p.name == "MEMORY.md":
+        if p.name in index_names:  # an index is not a memory it indexes
             continue
         if _referenced_in(loaded_text, p.name):
             continue
-        (beyond_cut if _referenced_in(effective_text, p.name) else unindexed).append(p.name)
+        if _referenced_in(effective_text, p.name):
+            beyond_cut.append(p.name)
+        elif _referenced_in(hub_text, p.name):
+            hub_only.append(p.name)
+        else:
+            unindexed.append(p.name)
 
     # (b) memories stranded in a sibling *-BACKUP tree, absent from the live dir.
     stranded: list[str] = []
@@ -981,9 +1071,15 @@ def check_memory_index_integrity() -> "dict | None":
                 f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1024:.0f}KB / "
                 f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
 
+    def _hub_note() -> str:
+        return (f"; {len(hub_only)} reachable via a sibling hub index "
+                f"({', '.join(sorted(index_names - {'MEMORY.md'}))}) — by design, not loaded"
+                if hub_only else "")
+
     if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
-                "detail": f"all memory files present in the loaded MEMORY.md index ({_size_note()})"}
+                "detail": (f"all memory files reachable from the loaded MEMORY.md index"
+                           f"{_hub_note()} ({_size_note()})")}
     parts = []
     if beyond_cut:
         parts.append(
@@ -1002,8 +1098,10 @@ def check_memory_index_integrity() -> "dict | None":
         )
     if unindexed:
         parts.append(
-            f"{len(unindexed)} memory file(s) not in MEMORY.md (won't load): "
+            f"{len(unindexed)} memory file(s) in NO index — neither MEMORY.md nor any "
+            f"sibling hub — so they never load and cannot be found: "
             + ", ".join(unindexed[:6]) + ("…" if len(unindexed) > 6 else "")
+            + _hub_note()
         )
     if stranded:
         parts.append(
@@ -3875,7 +3973,15 @@ def run_all_checks() -> list[dict]:
     # Core services (required)
     checks.extend(check_voice_stack())
 
-    web_check = check_port(8080, "web-client", probe=True)
+    web_config = resolve_web_client_port()
+    if web_config.get("error"):
+        web_check = {
+            "name": "web-client",
+            "status": "down",
+            "detail": web_config["error"],
+        }
+    else:
+        web_check = check_port(web_config["port"], "web-client", probe=True)
     if web_check["status"] == "ok":
         mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
     checks.append(web_check)
