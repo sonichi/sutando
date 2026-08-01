@@ -92,6 +92,54 @@ try:
     b2b.main()
     check("main: --to member → posts to bot2bot channel", _posted.get("channel") == BOT2BOT)
     check("main: member post carries the mention", _posted.get("text", "").startswith(f"<@{MEMBER_B}> "))
+
+    # --- multi-peer NO-GUESS (2026-07-29 double misfire regression) ---
+    # With 2+ peer bots allowlisted and no --to, the old code picked
+    # bot_candidates[0] arbitrarily (Pro pinged Air meaning Mini; Mini pinged
+    # Air meaning Pro; each stray ping triggered the target's team-tier
+    # auto-refusal). New contract: post WITHOUT any mention.
+    _posted.clear()
+    sys.argv = ["post.py", "ping", "who is around"]
+    b2b.main()
+    check("main: no --to with 2 peers → posts WITHOUT a mention",
+          _posted.get("text", "").startswith("ping: ") and "<@" not in _posted.get("text", ""))
+
+    # single-peer fleets keep the convenient auto-mention
+    single_access = {
+        "allowFrom": ["1"],
+        "groups": {"chan_bot2bot": {"role": "bot2bot",
+                                    "allowFrom": [MEMBER_A, MEMBER_SELF]}},
+    }
+    b2b.load_access = lambda: single_access
+    _posted.clear()
+    sys.argv = ["post.py", "ping", "you there?"]
+    b2b.main()
+    check("main: no --to with exactly 1 peer → auto-mentions that peer",
+          _posted.get("text", "").startswith(f"<@{MEMBER_A}> "))
+    b2b.load_access = lambda: ACCESS
+
+    # resolve_other_bot unit view: multi-peer → None, single-peer → the peer
+    check("resolve_other_bot: 2 peers → None (no guess)",
+          b2b.resolve_other_bot(ACCESS, MEMBER_SELF, BOT2BOT) is None)
+    check("resolve_other_bot: 1 peer → that peer",
+          b2b.resolve_other_bot(single_access, MEMBER_SELF, BOT2BOT) == MEMBER_A)
+
+    # legacy configs: owner+bot share the top-level allowFrom, so the
+    # not-in-global heuristic yields no bot_candidates. Same no-guess rule.
+    legacy_single = {
+        "allowFrom": [MEMBER_A, MEMBER_SELF],
+        "groups": {"chan_bot2bot": {"role": "bot2bot",
+                                    "allowFrom": [MEMBER_A, MEMBER_SELF]}},
+    }
+    check("resolve_other_bot: legacy 1 non-self id → that id",
+          b2b.resolve_other_bot(legacy_single, MEMBER_SELF, BOT2BOT) == MEMBER_A)
+    legacy_multi = {
+        "allowFrom": [MEMBER_A, MEMBER_B, MEMBER_SELF],
+        "groups": {"chan_bot2bot": {"role": "bot2bot",
+                                    "allowFrom": [MEMBER_A, MEMBER_B, MEMBER_SELF]}},
+    }
+    check("resolve_other_bot: legacy 2 non-self ids → None (no guess)",
+          b2b.resolve_other_bot(legacy_multi, MEMBER_SELF, BOT2BOT) is None)
 finally:
     _restore()
 
@@ -140,6 +188,25 @@ check(f"--help `Kinds:` line matches VALID_KINDS exactly "
       f"(help-only: {sorted(_help_kinds - b2b.VALID_KINDS)}, "
       f"code-only: {sorted(b2b.VALID_KINDS - _help_kinds)})",
       _help_kinds == b2b.VALID_KINDS)
+
+# --- contract-drift guard: the shipped agent-facing docs must describe the
+# no-guess contract this suite pins. If someone reverts the behavior (or the
+# docs) without the other, these assertions catch the divergence.
+_SKILL_DIR = _POST.parent
+_skill_md = (_SKILL_DIR / "SKILL.md").read_text()
+_manifest = (_SKILL_DIR / "manifest.json").read_text()
+check("SKILL.md documents --to targeting", "--to <peer|id>" in _skill_md)
+check("SKILL.md documents multi-peer no-guess (no mention + NOTE)",
+      "without any mention" in _skill_md and "never guesses" in _skill_md)
+check("SKILL.md documents single-peer auto-mention",
+      "exactly ONE peer" in _skill_md and "auto-mentions that peer" in _skill_md)
+check("SKILL.md documents the member-guard refusal", "REFUSES" in _skill_md)
+check("SKILL.md documents the peers.json roster", "peers.json" in _skill_md)
+check("manifest description matches the no-guess contract",
+      "--to" in _manifest and "never guess" in _manifest)
+check("stale auto-mention contract is gone from the docs",
+      "the other Sutando node" not in _skill_md.split("\n---")[0]
+      and "@-mentioning the other Sutando node" not in _manifest)
 
 # main() accepts nack end-to-end, and an unknown kind is still refused (guard not disabled)
 _install_mocks()
