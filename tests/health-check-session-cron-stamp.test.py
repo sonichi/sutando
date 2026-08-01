@@ -219,7 +219,7 @@ class ParkedCronNotExpectedTest(unittest.TestCase):
         """The real host shape: 1 live + 1 parked, 1 registered -> ok, not 1/2."""
         entries = [
             {"name": "main-loop", "cron": "*/3 * * * *", "prompt_skill": "proactive-loop"},
-            {"name": "wire-nightly-DISABLED", "cron": "0 0 31 2 *", "prompt": "x"},
+            {"name": "wire-newsroom-nightly-DISABLED-2026-06-09", "cron": "0 0 31 2 *", "prompt": "x"},
         ]
         with tempfile.TemporaryDirectory() as td:
             res = self._check(self._workspace(Path(td), entries, registered=1))
@@ -231,12 +231,55 @@ class ParkedCronNotExpectedTest(unittest.TestCase):
         entries = [
             {"name": "main-loop", "cron": "*/3 * * * *", "prompt": "x"},
             {"name": "digest", "cron": "2 6 * * *", "prompt": "y"},
-            {"name": "parked", "cron": "0 0 31 2 *", "prompt": "z"},
+            {"name": "parked-DISABLED", "cron": "0 0 31 2 *", "prompt": "z"},
         ]
         with tempfile.TemporaryDirectory() as td:
             res = self._check(self._workspace(Path(td), entries, registered=1))
         self.assertEqual(res["status"], "warn")
         self.assertIn("1/2", res["detail"])  # parked one excluded from BOTH sides
+
+    def test_active_impossible_schedule_still_warns(self):
+        """qingyun-wu #2498: an impossible date with NO disabled marker is a typo.
+
+        Someone means "the 31st, monthly" and writes February. CronCreate omits
+        it; if `expected` dropped it too, health-check would read green forever
+        — the silent miss this guard exists to catch.
+        """
+        entries = [
+            {"name": "main-loop", "cron": "*/3 * * * *", "prompt": "x"},
+            {"name": "monthly-report", "cron": "0 0 31 2 *", "prompt": "y"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            res = self._check(self._workspace(Path(td), entries, registered=1))
+        self.assertEqual(res["status"], "warn", res["detail"])
+        self.assertIn("1/2", res["detail"])
+
+    def test_parked_signal_matrix(self):
+        """Exclusion needs BOTH a parked marker AND an unregistrable date.
+
+        Axis, not just the reviewer's case: {DISABLED-name, disabled:true field,
+        no marker} x {impossible cron, valid cron}.
+        """
+        live = {"name": "main-loop", "cron": "*/3 * * * *", "prompt": "x"}
+        IMPOSSIBLE, VALID = "0 0 31 2 *", "0 4 * * *"
+        cases = [
+            ({"name": "wire-DISABLED-2026", "cron": IMPOSSIBLE}, True,  "parked name + impossible"),
+            ({"name": "parked", "disabled": True, "cron": IMPOSSIBLE}, True,  "disabled field + impossible"),
+            ({"name": "monthly-report", "cron": IMPOSSIBLE},      False, "NO marker + impossible = typo"),
+            ({"name": "wire-DISABLED-2026", "cron": VALID},       False, "parked name + registrable"),
+            ({"name": "parked", "disabled": True, "cron": VALID}, False, "disabled field + registrable"),
+            ({"name": "ordinary", "cron": VALID},                 False, "plain active entry"),
+        ]
+        for entry, excluded, label in cases:
+            entry = {**entry, "prompt": "y"}
+            with tempfile.TemporaryDirectory() as td:
+                ws = self._workspace(Path(td), [live, entry], registered=1)
+                res = self._check(ws)
+            if excluded:
+                self.assertEqual(res["status"], "ok", f"{label}: {res['detail']}")
+            else:
+                self.assertEqual(res["status"], "warn", f"{label}: {res['detail']}")
+                self.assertIn("1/2", res["detail"], label)
 
     def test_never_fires_predicate(self):
         never = ["0 0 31 2 *", "0 0 30 2 *", "0 0 31 4,6 *", "0 0 31 2 ?"]
@@ -249,6 +292,31 @@ class ParkedCronNotExpectedTest(unittest.TestCase):
         ]
         for e in fires:
             self.assertFalse(health._cron_can_never_fire(e), e)
+
+    def test_cron_field_expansion_branches(self):
+        """Every branch of the field expander, incl. the ones a bare `31 2 *` skips.
+
+        Ranges, valid steps, empty list segments and out-of-range bounds were all
+        unexercised — CI measured the diff at 83.7% (missing 736, 742, 746-749,
+        755). Each case below names the branch it drives.
+        """
+        # range branch + valid step, and genuinely impossible (Feb has <30 days)
+        self.assertTrue(health._cron_can_never_fire("0 0 30-31 2 *"))   # range, both > Feb max
+        self.assertTrue(health._cron_can_never_fire("0 0 30-31/1 2 *")) # + valid step
+        # range that reaches a real day -> schedulable
+        self.assertFalse(health._cron_can_never_fire("0 0 28-31 2 *"))  # 28 and 29 exist
+        self.assertFalse(health._cron_can_never_fire("0 0 1-31/5 2 *")) # step lands on 1,6,...
+        # unparseable / malformed -> schedulable, never a never-fires verdict
+        for expr, why in [
+            ("0 0 31, 2 *",    "empty list segment"),
+            ("0 0 31/0 2 *",   "step below 1"),
+            ("0 0 31/x 2 *",   "non-numeric step"),
+            ("0 0 a-b 2 *",    "non-numeric range bounds"),
+            ("0 0 40 2 *",     "day-of-month above the field max"),
+            ("0 0 20-10 2 *",  "inverted range"),
+            ("0 0 0 2 *",      "day-of-month below the field min"),
+        ]:
+            self.assertFalse(health._cron_can_never_fire(expr), why)
 
     def test_unparseable_is_treated_as_schedulable(self):
         """A parser gap must never invent a never-fires verdict."""

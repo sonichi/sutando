@@ -786,6 +786,26 @@ def _cron_can_never_fire(expr: str) -> bool:
     return not any(d <= _MONTH_MAX_DAYS[m] for m in months for d in doms)
 
 
+def _entry_marked_parked(entry: dict) -> bool:
+    """True when the entry carries an explicit "deliberately disabled" signal.
+
+    An impossible date alone must NOT qualify. `0 0 31 2 *` is equally the
+    signature of a parked job and of an active typo — someone meaning "the 31st,
+    monthly" and writing February. Excluding on the date alone would let a
+    mistyped ACTIVE schedule vanish from `expected`, so CronCreate silently
+    omits it and this guard reports green forever: the precise silent-miss class
+    the check exists to surface.
+
+    Two accepted signals: an explicit `disabled: true` field, and the
+    established convention of DISABLED in the entry name (used by this host's
+    `wire-newsroom-nightly-DISABLED-2026-06-09-...`, which also records why).
+    """
+    if entry.get("disabled") is True:
+        return True
+    name = entry.get("name")
+    return isinstance(name, str) and "DISABLED" in name
+
+
 def check_session_cron_registration(
     workspace_dir: Optional[Path] = None,
     host_label: Optional[str] = None,
@@ -826,9 +846,15 @@ def check_session_cron_registration(
         cron_expr = entry.get("cron")
         if entry.get("loop") == "dynamic" or not cron_expr:
             return False
-        if isinstance(cron_expr, str) and _cron_can_never_fire(cron_expr):
-            # Parked-on-purpose (e.g. `0 0 31 2 *`): /schedule-crons cannot
-            # register it, so counting it as expected warns forever.
+        if (
+            _entry_marked_parked(entry)
+            and isinstance(cron_expr, str)
+            and _cron_can_never_fire(cron_expr)
+        ):
+            # BOTH signals required. Marked-disabled AND unregistrable (e.g.
+            # `0 0 31 2 *`): /schedule-crons cannot register it, so counting it
+            # as expected warns forever. An impossible date WITHOUT a disabled
+            # marker is an active typo and must still warn.
             return False
         return True
 
