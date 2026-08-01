@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-180 modules indexed.
+181 modules indexed.
 
 ## `src/`
 
@@ -49,6 +49,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
+- **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
