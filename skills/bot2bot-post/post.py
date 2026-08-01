@@ -61,7 +61,7 @@ def _claude_home() -> Path:
 _DISCORD_DIR = _claude_home() / "channels" / "discord"
 ACCESS_JSON = _DISCORD_DIR / "access.json"
 ENV_FILE = _DISCORD_DIR / ".env"
-VALID_KINDS = {"claim", "blocked", "done", "ping", "opinion"}
+VALID_KINDS = {"claim", "blocked", "done", "ping", "opinion", "nack"}
 
 
 def load_token() -> str:

@@ -15,6 +15,7 @@ Run: python3 tests/bot2bot-post.test.py   (exit 0 pass / non-zero on failure)
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -94,8 +95,46 @@ try:
 finally:
     _restore()
 
+# --- kind vocabulary: every tag the docs tell agents to use must be accepted ---
+# Regression for the 2026-08-01 drift: proactive-loop/SKILL.md documents `nack:`
+# ("vetoing another bot's pending claim") but VALID_KINDS omitted it, so post.py
+# exited 2 on a documented primitive. That is not a cosmetic mismatch — a rejected
+# coordination tag degrades to "the retraction lands AFTER the claim it retracts",
+# which is exactly how it was found: a nack post was refused, went unnoticed, and
+# the correction arrived after the message it corrected.
+check("nack is a valid kind", "nack" in b2b.VALID_KINDS)
+
+_DOC = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "SKILL.md"
+_doc_kinds = set(re.findall(r"`([a-z-]+):`", _DOC.read_text())) if _DOC.exists() else set()
+# `opinion-requested:` is the prose name for the `opinion` kind; map it.
+_doc_kinds = {"opinion" if k == "opinion-requested" else k for k in _doc_kinds}
+_undocumented_gap = _doc_kinds - b2b.VALID_KINDS
+check(f"every kind documented in proactive-loop SKILL.md is accepted (gap: {sorted(_undocumented_gap)})",
+      not _undocumented_gap)
+
+# main() accepts nack end-to-end, and an unknown kind is still refused (guard not disabled)
+_install_mocks()
+try:
+    _posted.clear()
+    sys.argv = ["post.py", "--to", MEMBER_B, "nack", "vetoing that claim"]
+    b2b.main()
+    check("main: nack posts to bot2bot channel", _posted.get("channel") == BOT2BOT)
+    check("main: nack body carries the tag", "nack:" in _posted.get("text", ""))
+
+    _posted.clear()
+    sys.argv = ["post.py", "--to", MEMBER_B, "definitely-not-a-kind", "x"]
+    refused = False
+    try:
+        b2b.main()
+    except SystemExit:
+        refused = True
+    check("main: unknown kind STILL refused (positive control — guard not disabled)",
+          refused and not _posted)
+finally:
+    _restore()
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
     sys.exit(1)
-print("all tests passed — bot2bot-channel scope guard")
+print("all tests passed — bot2bot-channel scope guard + kind vocabulary")
