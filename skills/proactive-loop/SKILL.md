@@ -44,7 +44,9 @@ This resolves through `bash scripts/sutando-config.sh workspace`, which reads `s
 
 Each pass, in order:
 
-0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to `$WORKSPACE/state/core-status.json` (with `WORKSPACE` resolved as above). The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
+0. **Signal loop start.** Write `{"status":"running","step":"<short description of what you are actually doing>","ts":DATE_NOW}` to `$WORKSPACE/state/core-status.json` (with `WORKSPACE` resolved as above). The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
+
+   **`step` is an owner-facing live message, not internal telemetry.** With `SUTANDO_PROGRESS_STREAM=1` (ON in the running bridge) the Discord bridge renders it to the owner verbatim as `⏳ <step> (Ns)` while he waits on an owner task, via `progress_stream.format_progress`. A generic placeholder ("Starting pass...", "running") shows up in his DM as noise; when processing an owner task, `step` should say what he is waiting on. Rewrite it on every pivot — a stale `step` actively lies to him. See memory `feedback_rich_core_status_step`. (This template previously read `"Starting pass..."` — the exact string that memory names as the anti-pattern, which is why the mistake kept recurring across compactions: this file is loaded every pass, the memory only when recalled.)
 
 0.5. **Check quota.** Run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
    - **Budget per pass** = remaining % / (minutes until reset / 5)
