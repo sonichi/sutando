@@ -313,6 +313,11 @@ if _have_discord:
     spec.loader.exec_module(dmod)
     _df = Path(tempfile.mkdtemp(prefix="dc-acl-")) / "access.json"
     dmod.ACCESS_FILE = _df
+    # Isolate the durable access backup too — ensure_tier_map_seeded() now
+    # mirrors every valid write to ACCESS_BACKUP_FILE. Without this override the
+    # grandfather write below would scribble test data into the real workspace
+    # state/auth/discord-access-backup.json (mirrors the slack override above).
+    dmod.ACCESS_BACKUP_FILE = _df.parent / "discord-access-backup.json"
 
     # 5. grandfather
     _df.write_text(json.dumps({"allowFrom": ["111", "222"]}))
