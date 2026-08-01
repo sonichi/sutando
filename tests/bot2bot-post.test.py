@@ -120,6 +120,27 @@ _undocumented_gap = _doc_kinds - b2b.VALID_KINDS
 check(f"every kind documented in proactive-loop SKILL.md is accepted (gap: {sorted(_undocumented_gap)})",
       not _undocumented_gap)
 
+# The SAME drift, on the surface an agent reads FIRST. The check above only covers
+# SKILL.md; post.py's own `Kinds:` help line is a second, independent copy of the
+# vocabulary, and the original fix updated VALID_KINDS while leaving it at five —
+# so `--help` still told the caller `nack` did not exist even once the code accepted
+# it. Widening to the AXIS (every copy of the vocabulary) rather than patching the
+# one instance found: a tool whose help contradicts its enforcement misinforms the
+# reader in whichever direction the two disagree.
+_help_kinds = set()
+for _line in (b2b.__doc__ or "").splitlines():
+    if _line.strip().startswith("Kinds:"):
+        _help_kinds = {k.strip() for k in _line.split(":", 1)[1].split("|") if k.strip()}
+        break
+# Same floor discipline as above: if the `Kinds:` line is reworded or removed,
+# _help_kinds degrades to set() and the equality below would pass vacuously.
+check(f"--help kind list is non-degenerate ({len(_help_kinds)} found, floor 5)",
+      len(_help_kinds) >= 5)
+check(f"--help `Kinds:` line matches VALID_KINDS exactly "
+      f"(help-only: {sorted(_help_kinds - b2b.VALID_KINDS)}, "
+      f"code-only: {sorted(b2b.VALID_KINDS - _help_kinds)})",
+      _help_kinds == b2b.VALID_KINDS)
+
 # main() accepts nack end-to-end, and an unknown kind is still refused (guard not disabled)
 _install_mocks()
 try:

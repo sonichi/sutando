@@ -8,7 +8,7 @@ Usage:
     python3 skills/bot2bot-post/post.py --to lucy opinion "disagreement axis below"
     python3 skills/bot2bot-post/post.py done "shipped PR #472"
 
-Kinds: claim | blocked | done | ping | opinion
+Kinds: claim | blocked | done | ping | nack | opinion
 Peers (for --to): a name from ~/.claude/channels/discord/peers.json, or a raw numeric id
 
 The target channel ID is read from `$CLAUDE_CONFIG_DIR/channels/discord/access.json`:
