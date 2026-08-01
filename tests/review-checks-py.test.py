@@ -992,6 +992,50 @@ finally:
     rc.flags.remove("/opt/")
 
 # ---------------------------------------------------------------------------
+# Round 21 (john-the-dev, review of 351851f). Making blanks free cost the
+# resource bound it claimed to keep: the walk re-read and re-materialised the
+# whole blank suffix per input line, which is QUADRATIC. Measured on that head —
+# 1k blanks 0.14s, 4k 1.64s, 8k 6.14s (4x input, ~12x time). A whitespace-heavy
+# PR could drive a REQUIRED gate toward CI timeout.
+#
+# `main()` now precomputes next-MEANINGFUL-line links in one backward pass, so
+# blanks are skipped by the link rather than collected: O(lines) to build,
+# O(_CHAIN_LOOKAHEAD) to follow. Semantics are unchanged — that is what the
+# selector/probe pairs below assert, since a perf fix that quietly changed a
+# verdict would be the worse bug.
+#
+# The threshold is deliberately generous (seconds, not milliseconds): this must
+# catch a return to quadratic, not police normal variance on a busy CI box.
+# ---------------------------------------------------------------------------
+rc.flags.append("/opt/")
+try:
+    import time as _time
+    L = '["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]'
+
+    def _blank_diff(n, last):
+        body = [f"const cmd = {L}"] + [""] * n + [last]
+        return ("+++ b/src/perf.ts\n@@ -1,0 +1,%d @@\n" % len(body)
+                + "".join("+" + b + "\n" for b in body))
+
+    # Semantics first: blanks must not change the verdict at any scale.
+    ok("main(): 8000 blank lines then a selector still flags",
+       "hardcoded path" in scan(_blank_diff(8000, "  [1];"))[1])
+    ok("main(): 8000 blank lines then a PROBE is still permitted",
+       scan(_blank_diff(8000, "  .find(exists);"))[1].strip() == "")
+
+    _t = _time.monotonic()
+    scan(_blank_diff(8000, "  [1];"))
+    _elapsed = _time.monotonic() - _t
+    # Linear behaviour lands ~0.04s here; the pre-fix quadratic scan took ~6.1s.
+    ok(f"main(): 8000 blank lines stay linear (took {_elapsed:.2f}s, budget 3.0s)",
+       _elapsed < 3.0)
+
+    ok("_next_code is not exercised directly — it is a closure over main()'s diff",
+       "_nm" not in dir(rc))          # documents WHY there is no unit test for it
+finally:
+    rc.flags.remove("/opt/")
+
+# ---------------------------------------------------------------------------
 # Branch coverage for the container predicate. The diff-coverage gate flagged
 # these ten lines; each is a real branch the behavioural cases never reach
 # because they all take an earlier return. Asserted directly at the predicate so

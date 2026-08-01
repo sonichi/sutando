@@ -653,38 +653,48 @@ def main():
     prev_added = None
     _lines = diff.split("\n")
 
+    # Next-MEANINGFUL-line links, precomputed once in a single backward pass.
+    #
+    # The walk must be blank-insensitive (formatting must not hide a selector) but
+    # scanning the blank suffix per input line is QUADRATIC: a hunk with N added
+    # blank lines re-reads and re-materialises nearly the whole suffix N times.
+    # Measured before this table existed: 1k blanks 0.14s, 4k 1.64s, 8k 6.14s —
+    # 4x input for ~12x time, which lets a whitespace-heavy PR drive a REQUIRED
+    # gate toward CI timeout.
+    #
+    # `_nm[i]` is the first continuation-eligible new-file line AFTER `i` whose
+    # executable text is non-blank, or None when a hunk boundary intervenes.
+    # Building it is O(lines); following it is O(_CHAIN_LOOKAHEAD) per token, so
+    # blanks cost nothing at either end.
+    _codes = [None] * len(_lines)
+    _nm = [None] * len(_lines)
+    _carry = None
+    for _k in range(len(_lines) - 1, -1, -1):
+        _l = _lines[_k]
+        if _l.startswith("+++") or not (_l.startswith("+") or _l.startswith(" ")):
+            _carry = None                 # boundary: nothing past it is reachable
+            continue
+        _codes[_k] = _code_part(_l[1:])
+        _nm[_k] = _carry
+        if _codes[_k].strip():
+            _carry = _k
+
     def _next_code(i):
-        """Executable text of the following lines that are part of the NEW file.
+        """The next meaningful new-file lines after `i`, following `_nm`.
 
-        A member expression may continue across a break, so a group that ends at
-        EOL can still be subscripted several lines down. Added AND context lines
-        both exist in the new file and both qualify; a `-`/`@@`/`+++` boundary
-        ends the run. Returns a TUPLE so the chain walk can keep consuming until
-        it resolves — a single line was not enough, because ordinary formatting
-        puts `.map(...)` and `[1]` on separate lines.
-
-        Capped at `_CHAIN_LOOKAHEAD` lines: a bound is needed so a huge hunk is
-        not rescanned per token, and the cap is stated rather than implicit.
+        Blank lines are skipped by the links rather than collected, so the tuple
+        holds at most `_CHAIN_LOOKAHEAD` entries however much whitespace sits in
+        between. A chain still open at the cap gets `_CHAIN_TRUNCATED` appended so
+        the walk fails CLOSED.
         """
         out = []
-        budget = _CHAIN_LOOKAHEAD
-        j = i + 1
-        while j < len(_lines):
-            nxt = _lines[j]
-            if nxt.startswith("+++"):
+        j = _nm[i] if i < len(_nm) else None
+        while j is not None:
+            if len(out) == _CHAIN_LOOKAHEAD:
+                out.append(_CHAIN_TRUNCATED)
                 break
-            if not (nxt.startswith("+") or nxt.startswith(" ")):
-                break
-            code = _code_part(nxt[1:])
-            if code.strip():
-                if budget == 0:
-                    # Budget spent with the chain still open. Emit the sentinel
-                    # so the walk fails CLOSED instead of running out quietly.
-                    out.append(_CHAIN_TRUNCATED)
-                    break
-                budget -= 1
-            out.append(code)
-            j += 1
+            out.append(_codes[j])
+            j = _nm[j]
         return tuple(out) or None
 
     for _i, raw in enumerate(_lines):
