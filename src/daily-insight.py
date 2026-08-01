@@ -147,6 +147,32 @@ def _git_author_identity(repo_root):
     return ""
 
 
+def _own_stand_value(env=None):
+    """This instance's `Stand:` trailer value, or "" when it cannot be determined.
+
+    Both Sutando instances commit under the owner's GH-mapped email (required for
+    CLA), so `--author` cannot tell them apart — on 2026-08-01 a local-branch scan
+    on Mini returned 17 `Echo Act IV Mini` commits alongside 16 `Echo Act IV Pro`
+    ones, the latter pulled in only because worktrees had been created at the
+    peer's PR heads. Attributing those to "you shipped N" is the exact misleading
+    personal metric this insight exists to avoid (CR #2257).
+
+    Returns "" if no host label resolves, in which case the caller counts every
+    commit by the author — the pre-existing behaviour, never a wrong attribution
+    dressed up as a right one.
+    """
+    env = os.environ if env is None else env
+    label = (env.get("SUTANDO_STAND") or "").strip()
+    if label:
+        return label
+    host = (env.get("SUTANDO_HOST_LABEL") or "").strip()
+    if "mac-mini" in host.lower() or host.lower().startswith("chis-mac-mini"):
+        return "Echo Act IV Mini"
+    if "macbook" in host.lower():
+        return "Echo Act IV Pro"
+    return ""
+
+
 def analyze_dev_activity(repo_root=SRC_DIR, now=None):
     """Real code output in the last 24h, straight from git.
 
@@ -171,20 +197,29 @@ def analyze_dev_activity(repo_root=SRC_DIR, now=None):
         return None
     try:
         out = subprocess.run(
-            ["git", "-C", str(repo_root), "log", "--since=24 hours ago",
-             f"--author={author}", "--pretty=format:C:%H", "--name-only"],
+            ["git", "-C", str(repo_root), "log", "--branches", "--since=24 hours ago",
+             f"--author={author}",
+             "--pretty=format:C:%H\x1f%(trailers:key=Stand,valueonly)", "--name-only"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
         return None
+    stand = _own_stand_value()
     commits = 0
     dirs = Counter()
+    counting = False
     for line in out.stdout.splitlines():
         if line.startswith("C:"):
-            commits += 1
-        elif line.strip() and "/" in line:
+            # "C:<sha>\x1f<Stand trailer value>" — the trailer is the ONLY thing
+            # that separates this instance from its peer, because both commit
+            # under the owner's GH-mapped email (see _own_stand_value).
+            trailer = line.split("\x1f", 1)[1].strip() if "\x1f" in line else ""
+            counting = (not stand) or (trailer == stand)
+            if counting:
+                commits += 1
+        elif counting and line.strip() and "/" in line:
             dirs[line.split("/", 1)[0]] += 1
     if commits == 0:
         return None
