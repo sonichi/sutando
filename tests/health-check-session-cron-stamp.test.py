@@ -187,6 +187,74 @@ class SessionCronStampTest(unittest.TestCase):
             (cores / "test-host.alive").write_text(json.dumps([]))
             self.assertEqual(self._check(ws)["status"], "ok")
 
+class ParkedCronNotExpectedTest(unittest.TestCase):
+    """A cron parked on an impossible date must not count toward `expected`.
+
+    Observed on Chis-Mac-mini 2026-08-01: crons.json carries
+    `wire-newsroom-nightly-DISABLED-...` at `0 0 31 2 *` (February 31st).
+    /schedule-crons registers the other 8 and cannot register that one, so the
+    stamp reads 8/9 and the guard warned on every health-check run, forever.
+    It can only be cleared by re-enabling the parked job (owner's call alone) or
+    by deleting the disabled record — so the guard was permanently crying wolf
+    while existing to catch a SILENT failure.
+    """
+
+    def _check(self, workspace):
+        return health.check_session_cron_registration(
+            workspace, host_label="test-host", runtime="claude"
+        )
+
+    def _workspace(self, root: Path, entries, registered: int) -> Path:
+        workspace = root / "workspace"
+        config = workspace / "hosts" / "test-host" / "crons.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps(entries))
+        (workspace / "state").mkdir(parents=True, exist_ok=True)
+        (config.parent / "schedule-crons-stamp.json").write_text(
+            json.dumps({"ts": 2000, "registered": registered, "config_total": len(entries)})
+        )
+        return workspace
+
+    def test_parked_entry_is_not_expected(self):
+        """The real host shape: 1 live + 1 parked, 1 registered -> ok, not 1/2."""
+        entries = [
+            {"name": "main-loop", "cron": "*/3 * * * *", "prompt_skill": "proactive-loop"},
+            {"name": "wire-nightly-DISABLED", "cron": "0 0 31 2 *", "prompt": "x"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            res = self._check(self._workspace(Path(td), entries, registered=1))
+        self.assertEqual(res["status"], "ok", res["detail"])
+        self.assertIn("1 session cron", res["detail"])
+
+    def test_a_genuinely_missing_cron_still_warns(self):
+        """The guard must keep its teeth — a real shortfall still warns."""
+        entries = [
+            {"name": "main-loop", "cron": "*/3 * * * *", "prompt": "x"},
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "y"},
+            {"name": "parked", "cron": "0 0 31 2 *", "prompt": "z"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            res = self._check(self._workspace(Path(td), entries, registered=1))
+        self.assertEqual(res["status"], "warn")
+        self.assertIn("1/2", res["detail"])  # parked one excluded from BOTH sides
+
+    def test_never_fires_predicate(self):
+        never = ["0 0 31 2 *", "0 0 30 2 *", "0 0 31 4,6 *", "0 0 31 2 ?"]
+        for e in never:
+            self.assertTrue(health._cron_can_never_fire(e), e)
+        fires = [
+            "*/3 * * * *", "57 6 * * *", "0 0 29 2 *",     # Feb 29 exists in leap years
+            "0 0 31 1 *", "0 0 31 2 MON",                   # day-of-week ORs it back in
+            "0 0 31 2 1", "0 0 * * *", "13 3 * * 1",
+        ]
+        for e in fires:
+            self.assertFalse(health._cron_can_never_fire(e), e)
+
+    def test_unparseable_is_treated_as_schedulable(self):
+        """A parser gap must never invent a never-fires verdict."""
+        for e in ["0 0 31 FEB *", "not a cron", "0 0 31 2", "0 0 L 2 *", "0 0 31 2 * *", "0 0 /0 2 *"]:
+            self.assertFalse(health._cron_can_never_fire(e), e)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
