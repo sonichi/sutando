@@ -62,7 +62,25 @@ and loads whichever repo it reviews.
 6. **No hardcoded absolute paths.** Machine- or user-specific path literals
    (`/Users/…`, `/home/<user>/…`, `~/.claude`, `~/.sutando`, …) break on other hosts;
    resolve via the workspace/config helpers instead. Enforced by the `checks:` block.
-7. **A verdict must state merge-readiness explicitly** — "ready to merge" /
+7. **Never invoke a developer-tool binary at an absolute `/usr/bin/` path.** On macOS
+   `/usr/bin/git`, `python3`, `swift`, `swiftc`, `clang`, `gcc` and `make` are not those
+   tools — they are one inode hardlinked as the Xcode Command Line Tools *stub*. The
+   file exists whether or not the tools are installed; running it without them raises a
+   modal "install command line developer tools" dialog and returns nothing. Three
+   consequences a reviewer should check for: an absolute path **cannot be shadowed** by
+   a real install on PATH, so the user's own git/python never wins; every existence
+   probe (`test -x`, `command -v`, `shutil.which`, `FileManager.fileExists`) **passes
+   against the stub**, so none of them is a usable guard; and on a timer or polling path
+   the dialog **reappears forever**, not once. Resolve through the repo's helpers
+   instead — `git_argv` (`src/git_binary.py`), `SutandoConfig.resolvePython`, the `$PY`
+   cascade in `scripts/sutando-config.sh` — gate the system path on `xcode-select -p`
+   (the one probe that does not prompt), and degrade when nothing runnable is found. A
+   background health check must never be able to raise a system dialog.
+   *Grounded by:* #2469 (`health-check.py`, `agent-api.py` hardcoding `/usr/bin/git`)
+   and #2473 (`Sutando.app` falling back to `/usr/bin/env python3` behind a dead
+   `python@3.11` probe) — both reported from a clean macOS VM installing a bundled
+   Sutando, where the dialog returned every 60 seconds. Enforced by the `checks:` block.
+8. **A verdict must state merge-readiness explicitly** — "ready to merge" /
    "changes requested: …" / "LGTM, non-blocking". And it is only honest if you actually
    ran these criteria on *this* PR — a readiness claim with no evidence attached
    (no test run, no failure-mode named, no blast-radius call) is an over-claim.
@@ -80,6 +98,19 @@ checks:
       - '/private/'
       - '~/.claude'
       - '~/.sutando'
+      # Xcode-CLT stubs (lesson 7). Not machine-specific — these exist on every
+      # Mac — but invoking one on a host without developer tools raises a modal
+      # install dialog and returns nothing, and the absolute path cannot be
+      # shadowed by a real install on PATH. '/usr/bin/swift' also covers
+      # '/usr/bin/swiftc' by prefix. Non-stub /usr/bin binaries (env, pgrep,
+      # lsof, osascript, open, id, pmset, xcode-select) are deliberately absent:
+      # they are real binaries and safe to address absolutely.
+      - '/usr/bin/git'
+      - '/usr/bin/python3'
+      - '/usr/bin/swift'
+      - '/usr/bin/clang'
+      - '/usr/bin/gcc'
+      - '/usr/bin/make'
     # ...unless the path token also matches one of these (fixtures / system noise).
     allow:
       - '/nonexistent'
