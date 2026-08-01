@@ -149,6 +149,15 @@ class TestInsightPriority(unittest.TestCase):
         self.assertIn("1 commit in the last 24h", insight)
         self.assertNotIn("1 commits", insight)
 
+    def test_agent_output_is_not_attributed_to_owner(self):
+        insight = self.mod.dev_activity_insight({
+            "commits_24h": 2,
+            "top_dirs": [("src", 2)],
+            "stand": "Echo Act IV Mini",
+        })
+        self.assertIn("Sutando's Echo Act IV Mini instance shipped 2 commits", insight)
+        self.assertNotIn("You shipped", insight)
+
 
 if __name__ == "__main__":
     import os
