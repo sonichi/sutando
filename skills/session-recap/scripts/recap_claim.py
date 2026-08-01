@@ -15,6 +15,10 @@ atomic and is the required gate BEFORE spawning the worker:
                                     worker for release.
                                     exit 1 -> skip (already recapped, or a
                                               live claim exists)
+  renew <session-uuid> --token T worker refreshes its lease at milestones
+                                    and immediately before every output/post;
+                                    exit 1 means ownership was lost and the
+                                    worker MUST stop without side effects.
   release <session-uuid> --token T [--stamp]
                                     worker calls on completion; --stamp
                                     records the session as recapped. Without
@@ -36,7 +40,10 @@ opened fd; a concurrent claimer could read the not-yet-written file, judge
 it corrupt→stale, unlink it, and win too — 5-of-8 winners on the 2-core CI
 runner.) A claim older than --stale-minutes (default 15) is a dead worker:
 claimers unlink it and re-race, again with exactly one winner, so a crashed
-worker can never wedge boot recaps.
+worker can never wedge boot recaps. A live worker refreshes the claim timestamp
+with ``renew`` while it runs. Because a stalled worker can be reclaimed after
+the lease, it MUST renew immediately before writing the recap and again before
+posting the private brief; a failed renew means a successor owns the session.
 """
 from __future__ import annotations
 
@@ -286,16 +293,56 @@ def release(sdir: Path, session: str, stamp: bool, token: str) -> int:
         _release_ownership_lock(lock_fd)
 
 
+def renew(sdir: Path, session: str, token: str) -> int:
+    """Refresh a live worker's lease, only while it still owns the claim.
+
+    The timestamp update is an atomic replace under the same ownership lock
+    used by reaping/release. A worker that wakes after its lease was reclaimed
+    therefore gets exit 1 and must stop before writing or posting anything.
+    """
+    lock_fd = _acquire_ownership_lock(sdir, tries=40)
+    if lock_fd is None:
+        print("skip: ownership lock busy — lease not renewed")
+        return 1
+    tmp = None
+    try:
+        path = sdir / CLAIM_NAME
+        try:
+            cur = json.loads(path.read_text())
+        except (OSError, ValueError):
+            print("skip: no live claim to renew (reclaimed or released)")
+            return 1
+        if cur.get("token") != token or cur.get("session") != session:
+            print(f"skip: live claim is not ours "
+                  f"(live session={cur.get('session', '?')}) — lease lost")
+            return 1
+        cur["ts"] = time.time()
+        fd, tmp = tempfile.mkstemp(dir=sdir, prefix=".recap-renew-")
+        with os.fdopen(fd, "w") as f:
+            json.dump(cur, f)
+        os.replace(tmp, path)
+        tmp = None
+        print("renewed")
+        return 0
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+        _release_ownership_lock(lock_fd)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["claim", "release"])
+    ap.add_argument("cmd", choices=["claim", "renew", "release"])
     ap.add_argument("session", help="session transcript uuid being recapped")
     ap.add_argument("--stamp", action="store_true",
                     help="release only: record the session as recapped")
     ap.add_argument("--token", default=None,
-                    help="release only (required there): the ownership "
+                    help="renew/release (required there): the ownership "
                          "token printed by the winning claim")
     ap.add_argument("--stale-minutes", type=float, default=15.0,
                     help="claims older than this are dead workers (default 15)")
@@ -308,7 +355,10 @@ def main() -> int:
     if args.cmd == "claim":
         return claim(sdir, args.session, args.stale_minutes * 60)
     if not args.token:
-        ap.error("release requires --token (printed by the winning claim)")
+        ap.error(f"{args.cmd} requires --token "
+                 "(printed by the winning claim)")
+    if args.cmd == "renew":
+        return renew(sdir, args.session, args.token)
     return release(sdir, args.session, args.stamp, args.token)
 
 

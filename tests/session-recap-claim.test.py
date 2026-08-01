@@ -158,6 +158,90 @@ code, msg = cli("release", "session-b", "--stamp", "--token", tok_b,
 check("B's own release --stamp still works", code == 0
       and (d5 / rc.STAMP_NAME).read_text().strip() == "session-b", msg)
 
+# 4a. lease renewal: a live worker refreshes its age at bounded milestones;
+# a worker that wakes after stale reclaim loses the guard and must perform
+# neither durable recap write nor private-room post.
+d12 = Path(tempfile.mkdtemp(prefix="claim-renew-"))
+_, msg = cli("claim", "lease-a", "--state-dir", str(d12))
+tok_lease_a = token_of(msg)
+lease_payload = json.loads((d12 / rc.CLAIM_NAME).read_text())
+lease_payload["ts"] = time.time() - STALE_S - 60
+(d12 / rc.CLAIM_NAME).write_text(json.dumps(lease_payload))
+code, msg = cli("renew", "lease-a", "--token", tok_lease_a,
+                "--state-dir", str(d12))
+check("live worker renews an aged lease it still owns",
+      code == 0 and "renewed" in msg, msg)
+check("renew atomically refreshes the claim timestamp",
+      time.time() - json.loads(
+          (d12 / rc.CLAIM_NAME).read_text())["ts"] < 5)
+code, msg = cli("claim", "lease-b", "--state-dir", str(d12))
+check("refreshed lease blocks a second worker",
+      code == 1 and "in-flight" in msg, msg)
+
+# Age A again, let B legitimately reclaim it, then model the worker contract:
+# BOTH side effects are conditional on a successful immediate renew.
+lease_payload = json.loads((d12 / rc.CLAIM_NAME).read_text())
+lease_payload["ts"] = time.time() - STALE_S - 60
+(d12 / rc.CLAIM_NAME).write_text(json.dumps(lease_payload))
+code, msg = cli("claim", "lease-b", "--state-dir", str(d12))
+check("B reclaims A after the refreshed lease later expires", code == 0, msg)
+side_effects = {"file_write": 0, "room_post": 0}
+for effect in side_effects:
+    guard, guard_msg = cli("renew", "lease-a", "--token", tok_lease_a,
+                           "--state-dir", str(d12))
+    if guard == 0:
+        side_effects[effect] += 1
+    check(f"reclaimed A cannot pass the {effect} ownership guard",
+          guard == 1 and "not ours" in guard_msg, guard_msg)
+check("reclaimed worker performs no recap-write or room-post side effect",
+      side_effects == {"file_write": 0, "room_post": 0},
+      str(side_effects))
+
+# Renew fails closed when the claim disappeared or the mutation lock cannot
+# be acquired. These are not success-path curiosities: either state is
+# ambiguous ownership, so the worker must not proceed to an output.
+d13 = Path(tempfile.mkdtemp(prefix="claim-renew-missing-"))
+code, msg = cli("renew", "lease-a", "--token", tok_lease_a,
+                "--state-dir", str(d13))
+check("renew with no live claim fails closed",
+      code == 1 and "no live claim" in msg, msg)
+real_acquire = rc._acquire_ownership_lock
+rc._acquire_ownership_lock = lambda *args, **kwargs: None
+try:
+    code = rc.renew(d12, "lease-b", "irrelevant")
+finally:
+    rc._acquire_ownership_lock = real_acquire
+check("renew with a busy ownership lock fails closed", code == 1)
+
+# The CLI must not admit a token-less renew by accidentally treating it like
+# a claim. argparse owns this error path and exits 2.
+old_argv = sys.argv
+sys.argv = ["recap_claim.py", "renew", "lease-a", "--state-dir", str(d13)]
+try:
+    with redirect_stdout(io.StringIO()):
+        try:
+            rc.main()
+            missing_token_exit = None
+        except SystemExit as exc:
+            missing_token_exit = exc.code
+finally:
+    sys.argv = old_argv
+check("renew CLI requires the winning token", missing_token_exit == 2)
+
+# The helper is load-bearing only if the boot worker contract actually invokes
+# it around both externally visible side effects. Pin those prompt obligations
+# so a later prose rewrite cannot silently leave renew() unused.
+schedule_contract = (REPO / "skills" / "schedule-crons" / "SKILL.md").read_text()
+recap_contract = (REPO / "skills" / "session-recap" / "SKILL.md").read_text()
+for contract_name, contract in (("schedule", schedule_contract),
+                                ("recap", recap_contract)):
+    check(f"{contract_name} contract renews before recap file write",
+          "immediately before writing" in contract)
+    check(f"{contract_name} contract renews before private-room post",
+          "immediately before" in contract and "private-room post" in contract)
+    check(f"{contract_name} contract aborts after ownership loss",
+          "stop without writing" in contract)
+
 # 4c. release with no live claim at all: refuse, never stamp
 code, msg = cli("release", "session-b", "--stamp", "--token", tok_b,
                 "--state-dir", str(d5))
