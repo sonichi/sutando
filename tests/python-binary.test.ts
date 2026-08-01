@@ -200,9 +200,15 @@ describe('activated call-site shapes (executable probe)', () => {
 		mkdirSync(join(resources, 'runtime', 'python', 'bin'), { recursive: true });
 		writeFileSync(join(resources, 'runtime', 'bin', 'node'), '', { mode: 0o755 });
 		bundledPy = join(resources, 'runtime', 'python', 'bin', 'python3');
-		// A real, runnable interpreter shim so the probe proves EXECUTION, not
-		// just path arithmetic.
-		writeFileSync(bundledPy, '#!/bin/sh\nexec python3 "$@"\n', { mode: 0o755 });
+		// SELF-CONTAINED: this fixture must never invoke ambient `python3`.
+		// An earlier revision was `exec python3 "$@"`, which on the very clean Mac
+		// this PR targets resolves to the CLT stub — so running the regression
+		// suite there could raise the exact modal the fix prevents, and both probes
+		// failed outright under a python-less PATH (@john-the-dev, reviewing
+		// #2475). A /bin/sh fake that echoes the argument after `-c` proves the
+		// resolved path was executed and received its args intact, with no
+		// interpreter installed anywhere.
+		writeFileSync(bundledPy, '#!/bin/sh\necho "$2"\n', { mode: 0o755 });
 	});
 
 	after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -217,24 +223,28 @@ describe('activated call-site shapes (executable probe)', () => {
 		assert.equal(picked, bundledPy);
 	});
 
+	// PATH deliberately stripped: proves these probes touch no ambient
+	// interpreter, so the suite is safe to run on the target no-CLT host.
+	const NO_PATH = { PATH: '/nonexistent' };
+
 	it('meeting-tools shape: execFileSync runs the resolved path', () => {
-		const out = execFileSync(bundledPy, ['-c', 'print("meet-ok")'], {
-			encoding: 'utf8', timeout: 20_000,
+		const out = execFileSync(bundledPy, ['-c', 'meet-ok'], {
+			encoding: 'utf8', timeout: 20_000, env: NO_PATH,
 		});
 		assert.equal(out.trim(), 'meet-ok');
 	});
 
 	it('zoom shape: execSync runs the shell-quoted path containing a space', () => {
 		assert.ok(bundledPy.includes(' '), 'fixture must contain a space to be meaningful');
-		const out = execSync(`${shellQuote(bundledPy)} -c "print('zoom-ok')"`, {
-			encoding: 'utf8', timeout: 20_000,
+		const out = execSync(`${shellQuote(bundledPy)} -c zoom-ok`, {
+			encoding: 'utf8', timeout: 20_000, env: NO_PATH,
 		});
 		assert.equal(out.trim(), 'zoom-ok');
 	});
 
 	it('zoom shape FAILS without shellQuote — proving the quoting is load-bearing', () => {
-		assert.throws(() => execSync(`${bundledPy} -c "print('nope')"`, {
-			encoding: 'utf8', stdio: 'pipe', timeout: 20_000,
+		assert.throws(() => execSync(`${bundledPy} -c nope`, {
+			encoding: 'utf8', stdio: 'pipe', timeout: 20_000, env: NO_PATH,
 		}));
 	});
 });
