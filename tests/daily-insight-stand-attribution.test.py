@@ -69,6 +69,26 @@ class TestStandValueResolution(unittest.TestCase):
         """The REAL cron shape: neither env var exported, no config key."""
         self.assertEqual(di._own_stand_value({}, repo_root=Path(tempfile.mkdtemp())), "")
 
+    def test_config_resolves_when_activated_call_starts_inside_src(self):
+        """The scheduled default passes <repo>/src, not the checkout root."""
+        repo = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / "src").mkdir()
+        (repo / "scripts").mkdir()
+        (repo / "sutando.config.local.json").write_text(
+            '{"stand":"Echo Act IV Mini"}\n'
+        )
+        (repo / "scripts" / "sutando-config.sh").write_text(
+            "#!/bin/bash\n"
+            "ROOT=$(cd \"$(dirname \"$0\")/..\" && pwd)\n"
+            "python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"stand\"], end=\"\")' "
+            "\"$ROOT/sutando.config.local.json\"\n"
+        )
+        self.assertEqual(
+            di._own_stand_value({}, repo_root=repo / "src"),
+            "Echo Act IV Mini",
+        )
+
 
 class TestUnknownIdentityDeclinesRatherThanMisattributing(unittest.TestCase):
     """The activated-path blocker: "" must mean DECLINE, never count-everything."""

@@ -174,8 +174,17 @@ def _own_stand_value(env=None, repo_root=None):
     explicit = (env.get("SUTANDO_STAND") or "").strip()
     if explicit:
         return explicit
-    root = Path(repo_root) if repo_root else SRC_DIR
-    script = root / "scripts" / "sutando-config.sh"
+    inside_repo = Path(repo_root) if repo_root else SRC_DIR
+    try:
+        top = subprocess.run(
+            ["git", "-C", str(inside_repo), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if top.returncode != 0 or not top.stdout.strip():
+        return ""
+    script = Path(top.stdout.strip()) / "scripts" / "sutando-config.sh"
     if not script.is_file():
         return ""
     try:
@@ -250,7 +259,7 @@ def analyze_dev_activity(repo_root=SRC_DIR, now=None):
         return None
     if commits == 0:
         return None
-    return {"commits_24h": commits, "top_dirs": dirs.most_common(3)}
+    return {"commits_24h": commits, "top_dirs": dirs.most_common(3), "stand": stand}
 
 
 def dev_activity_insight(dev):
@@ -260,9 +269,11 @@ def dev_activity_insight(dev):
     n = dev["commits_24h"]
     where = ", ".join(f"{d}/" for d, _ in dev["top_dirs"]) or "the codebase"
     plural = "s" if n != 1 else ""
+    stand = (dev.get("stand") or "").strip()
+    subject = f"Sutando's {stand} instance" if stand else "Sutando"
     return (
-        f"You shipped {n} commit{plural} in the last 24h, mostly in {where}. "
-        f"That's the real headline of your day — steady build velocity."
+        f"{subject} shipped {n} commit{plural} in the last 24h, mostly in {where}. "
+        f"That's the real headline — steady build velocity."
     )
 
 
