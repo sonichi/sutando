@@ -23,10 +23,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // fallback). The Swift loader twin lives at
     // src/Sutando/SutandoConfig.swift and matches src/sutando_config.{py,ts}
     // byte-for-byte. Resolution order:
-    //   1. $SUTANDO_WORKSPACE env var (legacy escape hatch; warn once)
-    //   2. sutando.config.local.json -> workspace.path (per-clone override)
-    //   3. sutando.config.json -> workspace.path (tracked defaults)
-    //   4. ${REPO_DIR}/workspace baked-in default
+    //   1. sutando.config.local.json -> workspace.path (per-clone override)
+    //   2. sutando.config.json -> workspace.path (tracked defaults)
+    //   3. ${REPO_DIR}/workspace baked-in default
+    // $SUTANDO_WORKSPACE is NOT in the order — removed in v0.8; a set env var
+    // only warns. This comment claims to match sutando_config.{py,ts}
+    // byte-for-byte, so it has to track that removal too.
     //
     // Pre-#762 main.swift wrote tasks/logs/state under the repo checkout via
     // CLAUDE.md walk-up. Post-#762 that dir no longer exists, so writeTask

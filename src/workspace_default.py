@@ -429,10 +429,15 @@ def resolve_workspace(migrate: bool = True) -> Path:
     **Delegates to `src/sutando_config.py::resolve_workspace`** as of the
     M0 cutover. The new loader implements the resolution order:
 
-      1. `$SUTANDO_WORKSPACE` env var (legacy escape hatch; warn once)
-      2. `sutando.config.local.json` → `workspace.path` (per-clone override)
-      3. `sutando.config.json` → `workspace.path` (tracked defaults)
-      4. `${REPO_DIR}/workspace` baked-in default
+      1. `sutando.config.local.json` → `workspace.path` (per-clone override)
+      2. `sutando.config.json` → `workspace.path` (tracked defaults)
+      3. `${REPO_DIR}/workspace` baked-in default
+
+    `$SUTANDO_WORKSPACE` is NOT in that order — it was removed in v0.8 and the
+    resolver ignores its value (`sutando_config.py:297`); a set env var only
+    fires a one-time deprecation warning. This docstring listed it as step 1
+    until 2026-08-01, which is worse than silence: a reader (me, that day) set it
+    to isolate a test, saw no error, and the write landed in the REAL workspace.
 
     This wrapper is preserved so existing callers don't need code changes —
     the function name + signature + return type are unchanged. Behavior

@@ -21,7 +21,7 @@ The straightforward fix — sync the whole workspace — breaks the "rebuildable
 
 Add `<workspace>/state/.sync-allowlist` — a newline-delimited list of subpaths under `state/` that get synced across the fleet. Default (file missing) → nothing in State syncs. Existing single-machine installs are unaffected.
 
-> `<workspace>` resolves via `bash scripts/sutando-config.sh workspace` (M0 helper, PR #1395). Defaults to `<repo>/workspace/`; honors `$SUTANDO_WORKSPACE` as a legacy escape hatch internally. Bare references to `$SUTANDO_WORKSPACE` below (as a shell variable to `rm -rf` or similar) keep the env-var form intentionally — those are commands the user would type, not path literals.
+> `<workspace>` resolves via `bash scripts/sutando-config.sh workspace` (M0 helper, PR #1395). Defaults to `<repo>/workspace/`. **`$SUTANDO_WORKSPACE` is not honored** — removed in v0.8; setting it only warns. Bare references to `$SUTANDO_WORKSPACE` below (as a shell variable to `rm -rf` or similar) keep the env-var form intentionally — those are commands the user would type, not path literals.
 
 Example file:
 
