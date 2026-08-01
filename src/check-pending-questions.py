@@ -204,6 +204,14 @@ def notify_discord_dm(questions):
     lines.append(
         f"Reply here or edit pending-questions.md on {socket.gethostname().split('.')[0]} to resolve."
     )
+    # TOTAL DM BAN (owner 2026-08-01, repeated 7x: 「我明令禁止你发 dm 了」):
+    # while <workspace>/state/dm-ban.sentinel exists, the DM delivery is
+    # suppressed entirely — the macOS notification above still fires, and the
+    # questions stay in pending-questions.md for her to pull. Remove the
+    # sentinel to restore DM delivery.
+    if (RESULTS_DIR.parent / "state" / "dm-ban.sentinel").exists():
+        print("dm-ban.sentinel present — DM delivery suppressed (macOS-only)")
+        return
     path.write_text("\n".join(lines))
 
 
@@ -218,6 +226,9 @@ UNDRAINED_AGE_S = 600
 # (see notes/proactive-delivery-void-inventory.md). One unrelated stale file would
 # otherwise produce a confident, wrong "the DM path is not reaching the owner".
 PROACTIVE_PREFIX = "proactive-pending-q-"
+
+import pathlib as _pl
+_DM_BAN = None  # resolved lazily against the workspace at write time
 
 
 def undrained_proactive_files():
