@@ -202,6 +202,12 @@ def main() -> int:
         check("_gateway_configured: token only in a COMMENT → False",
               _configured(gw_env_path=_gw) is False)
 
+        # A non-UTF-8 byte must NOT turn a configured host into an unconfigured
+        # one: that would silence BOTH the bridge probe and the gateway-down warn.
+        _gw.write_bytes(b"REMOTE_TASK_TOKEN=abc\n\xff\xfe not utf-8\n")
+        check("_gateway_configured: token + invalid UTF-8 byte → still True",
+              _configured(gw_env_path=_gw) is True)
+
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1
