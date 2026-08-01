@@ -51,6 +51,18 @@ def allowed(tok):
 # the old count-only toggle suppressed ANY multi-line string, a scanner bypass).
 _DOCSTRING_OPEN = re.compile(r"^[rbuf]{0,2}('''|" + '"' * 3 + ")", re.IGNORECASE)
 
+# A JSDoc / block-comment CONTINUATION line: ` * text`, a bare ` *`, or ` */`.
+# The Python `#` and `//` skips above had no equivalent for these, so prose
+# inside a /** … */ block was scanned as code — which matters now that the flag
+# list carries the Xcode-CLT stub paths, because the modules that resolve those
+# tools necessarily document the hazard in JSDoc (see src/python-binary.ts).
+#
+# Deliberately NOT matched: an opening `/*` (a `/* … */ code` one-liner must
+# stay scannable, so the comment cannot be used to smuggle a path onto a code
+# line) and a generator method `*name()` (no space after the star). Requiring
+# whitespace, end-of-line, or `/` after the star is what separates them.
+_BLOCK_COMMENT_CONT = re.compile(r"^\*(\s|$|/)")
+
 
 def _doc_transition(line, in_doc):
     """Triple-quote (docstring) state AFTER `line`, given the state before it.
@@ -117,7 +129,8 @@ def main():
             was_in_doc = in_doc
             in_doc = _doc_transition(line, in_doc)
             stripped = line.lstrip()
-            if was_in_doc or stripped.startswith("#") or stripped.startswith("//"):
+            if was_in_doc or stripped.startswith("#") or stripped.startswith("//") \
+                    or _BLOCK_COMMENT_CONT.match(stripped):
                 continue
             for p in flags:
                 pos = line.find(p)

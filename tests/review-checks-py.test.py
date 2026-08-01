@@ -172,6 +172,39 @@ code, out = scan(
 )
 ok("prefixed (r) docstring prose is still NOT flagged", out.strip() == "")
 
+# --- JSDoc / block-comment continuation lines -------------------------------
+# The `#` and `//` skips had no equivalent for ` * ` continuation lines, so
+# prose inside a /** … */ block was scanned as code. That bites once the flag
+# list carries tool paths, because the modules that RESOLVE those tools
+# necessarily document the hazard in JSDoc.
+code, out = scan(
+    '+++ b/src/app.ts\n'
+    '@@ -1,0 +1,4 @@\n'
+    '+/**\n'
+    '+ * Legacy note: the old path was /Users/legacy/thing.\n'
+    '+ *\n'
+    '+ */'
+)
+ok("JSDoc continuation prose is NOT flagged", out.strip() == "")
+
+# The two shapes that must STAY scannable, so the skip cannot be used as a
+# bypass: a `/* … */ code` one-liner, and a generator method (`*name()`, no
+# space after the star).
+code, out = scan(
+    '+++ b/src/app.ts\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+/* inline */ const sneaky = "/Users/a/b";'
+)
+ok("an inline /* */ comment does not exempt code on the same line",
+   "src/app.ts:1:" in out)
+
+code, out = scan(
+    '+++ b/src/app.ts\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+  *gen() { return "/Users/a/b"; }'
+)
+ok("a generator method is not mistaken for a comment", "src/app.ts:1:" in out)
+
 print("---")
 if failed:
     print("FAILED — %d of %d" % (failed, passed + failed))
