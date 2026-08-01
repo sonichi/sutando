@@ -887,6 +887,50 @@ cmd_pull_only() {
     _pull_only_impl
 }
 
+# Resolve every unmerged path by keeping OUR side — after preserving THEIRS.
+#
+# `--ours` is right for host-local state and lossy for anything both hosts
+# append to. On 2026-07-31 it silently dropped two MEMORY.md index lines
+# (merge 64dec1b2) and a WIRE episode-index entry (merge 258c349b); the second
+# stayed missing for ~2 days. Neither surfaced: the log named the PEER but
+# never which files lost their incoming version, and `git log -- FILE` cannot
+# show a change destroyed IN a merge, because history simplification hides
+# merge commits — so the normal way of looking finds nothing.
+#
+# Stage 3 is "theirs". The copy goes under state/, which the sync excludes
+# (0 tracked files there), so a backup can never itself become a conflicting
+# tracked file. Best-effort throughout: a failure to preserve must never block
+# the merge, and a DD conflict (both sides deleted) has no stage 3 to save.
+#
+# Extracted from the caller so the behaviour can be tested against a REAL
+# conflicted index rather than a re-implementation of this loop — a test that
+# rebuilds the loop it checks passes just as happily against the unfixed script.
+_resolve_conflicts_keep_ours() {
+    local peer="${1:-peer}" backup_root="${2:-}" f
+    [ -n "$backup_root" ] || backup_root="${WORKSPACE_DIR:-.}/state/sync-conflicts/$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%s' "$peer" | tr '/' '_')"
+    while IFS= read -r -d '' f; do
+        if git show ":3:$f" >/dev/null 2>&1; then
+            if mkdir -p "$backup_root/$(dirname "$f")" 2>/dev/null &&
+               git show ":3:$f" > "$backup_root/$f" 2>/dev/null; then
+                log "_resolve_conflicts_keep_ours: discarded incoming $f -> $backup_root/$f"
+            fi
+        else
+            log "_resolve_conflicts_keep_ours: discarded incoming $f (no stage-3 blob to preserve)"
+        fi
+        # `--ours` fails on DD-conflicts (both sides deleted) — the file isn't
+        # on our side either. Fall back to `git rm` so the merge can complete
+        # cleanly. Surfaced by Mini #1445 v3 Test 12.
+        if git checkout --ours -- "$f" 2>/dev/null; then
+            git add -- "$f"
+        else
+            git rm -f -- "$f" 2>/dev/null || true
+        fi
+    done < <(git diff --name-only --diff-filter=U -z)
+    if [ -d "$backup_root" ]; then
+        color_warn "sync-workspace: kept the local version on conflict with $peer; each discarded incoming file is preserved under $backup_root"
+    fi
+}
+
 _pull_only_impl() {
     cd "$WORKSPACE_DIR" || die "pull-only: cannot cd to $WORKSPACE_DIR"
     [ -d ".git" ] || die "pull-only: $WORKSPACE_DIR is not a git repo; run --init first"
@@ -972,16 +1016,7 @@ _pull_only_impl() {
             # conflicts were never resolved — the merge stayed open while the
             # run still reported success, wedging every later sync behind
             # "You have not concluded your merge". Review #2 finding (2026-06-11).
-            while IFS= read -r -d '' f; do
-                # `--ours` fails on DD-conflicts (both sides deleted) — the file
-                # isn't on our side either. Fall back to `git rm` so the merge
-                # can complete cleanly. Surfaced by Mini #1445 v3 Test 12.
-                if git checkout --ours -- "$f" 2>/dev/null; then
-                    git add -- "$f"
-                else
-                    git rm -f -- "$f" 2>/dev/null || true
-                fi
-            done < <(git diff --name-only --diff-filter=U -z)
+            _resolve_conflicts_keep_ours "$peer"
             git -c core.editor=true commit --no-edit 2>/dev/null || true
             # Verify the merge actually concluded — unmerged entries here mean
             # the resolution above missed something; abort rather than leave a
