@@ -132,12 +132,44 @@ def derive():
     if not core:
         health, authed, detail = "offline", None, "Agent is not running"
     else:
-        if needs_login(_pane_text()):
-            health, authed, detail = "needs_login", False, "Agent needs to sign in"
-        else:
-            status, ts = _core_status(workspace)
+        # Read the status FIRST. The login probe used to short-circuit ahead of
+        # this, so a false marker did not merely add noise — it REPLACED the
+        # wedged-core verdict, hiding the one signal that catches an
+        # unresponsive agent. That inverts the rationale stated above for
+        # tolerating false positives (#2456).
+        status, ts = _core_status(workspace)
+        stale = ts is not None and (time.time() - ts) > STALE_STATUS_SECONDS
+        # "Acting" needs POSITIVE evidence, not merely the absence of proof to
+        # the contrary. A missing `ts` cannot show freshness any more than it can
+        # show staleness (see the "no ts -> working (can't prove stale)" case),
+        # so it must NOT license overriding a login marker — that would be the
+        # same absence-of-evidence mistake in the other direction.
+        acting = status in ("running", "idle") and ts is not None and not stale
+        login = needs_login(_pane_text())
+
+        if login and not acting:
+            # Marker AND no evidence of progress. A genuine sign-in prompt stops
+            # the loop, so a stale/unknown status is what a real one looks like —
+            # the two corroborate. Keep the staleness in the text so the wedge
+            # signal survives alongside the louder verdict rather than being
+            # erased by it.
+            health, authed = "needs_login", False
+            detail = "Agent needs to sign in"
+            if status == "running" and stale:
+                detail += " (status also stale — if the pane is clean, treat as possibly wedged)"
+        elif login and acting:
+            # The status says the agent advanced within the freshness window, so
+            # it is demonstrably acting. A sign-in prompt cannot be true at the
+            # same time; the marker is stale pane text or an unrelated log line.
+            # Reporting "needs to sign in" for a working agent is simply wrong,
+            # and the false-positive-is-cheap argument does not reach here — it
+            # was about an UNRESPONSIVE agent.
             authed = True
-            stale = ts is not None and (time.time() - ts) > STALE_STATUS_SECONDS
+            health = "working" if status == "running" else "idle"
+            detail = ("Agent is working" if status == "running" else "Agent is online and idle")
+            detail += " (login marker seen in pane but status is fresh — treating as a false positive)"
+        else:
+            authed = True
             if status == "running" and not stale:
                 health, detail = "working", "Agent is working"
             elif status == "running" and stale:
