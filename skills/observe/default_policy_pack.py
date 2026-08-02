@@ -169,7 +169,13 @@ def committed_evals_per_day(store: "op.SubscriptionStore") -> int:
     """
     total = 0
     for rec in store.list(status="active"):
-        if not (rec.get("pack") or {}).get("entry"):
+        prov = rec.get("pack") or {}
+        if not prov.get("entry"):
+            continue
+        if prov.get("over_budget"):
+            # Owner-approved past the cap — see seed_room's over-budget branch.
+            # Counting it would make an explicit approval shrink the automatic
+            # allowance, which is the one thing this budget must not do.
             continue
         cap = (rec.get("cost_cap") or {}).get("evals_per_day")
         if isinstance(cap, int):
@@ -306,7 +312,18 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
         if not _entry_still_live(store_dir, entry["key"], gen):
             return {"status": "refused", "policy_id": pid,
                     "reason": "entry was disabled or re-generated while this seed was in flight"}
-        normalized["pack"] = {"entry": entry["key"], "generation": gen}
+        # `over_budget` marks this record as one the OWNER must approve, not one
+        # the pack granted itself. committed_evals_per_day() skips it forever
+        # after — including once approved — because this module's own rule is
+        # that "approving something should never make the next automatic grant
+        # harder". Without the marker an approved draft keeps plain pack
+        # provenance and consumes the automatic allowance: measured on
+        # df4b7b3b, approving 3 queued rooms took the aggregate to 26/20 and
+        # then refused EVERY subsequent auto-seed, permanently, even after a
+        # room was cancelled. The budget bounds what the pack grants ITSELF;
+        # an explicit owner decision is deliberately outside it.
+        normalized["pack"] = {"entry": entry["key"], "generation": gen,
+                              "over_budget": True}
         store.save(normalized)
         return {"status": "refused", "policy_id": pid, "reason": why,
                 "draft": normalized, "awaiting": "owner-approval"}

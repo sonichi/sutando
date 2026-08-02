@@ -558,6 +558,55 @@ def test_disable_commits_its_flag_before_sweeping():
           f"the entry already reads DISABLED during every cancellation (saw {seen})")
 
 
+def test_owner_approval_does_not_consume_the_automatic_allowance():
+    """Found by enumerating the lifecycles rather than waiting for a review.
+
+    committed_evals_per_day()'s own docstring says approving something must
+    never make the next automatic grant harder. But an over-budget draft kept
+    plain pack provenance, so approving it counted against the pack's budget.
+    Measured on df4b7b3b: approving 3 queued rooms took the aggregate to 26/20
+    and then refused EVERY subsequent auto-seed — permanently, even after a room
+    was cancelled. The pack could never auto-seed again.
+    """
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(13)]      # 10 fit the budget, 3 do not
+    res = dpp.seed_defaults(d, OWNER, rooms)
+    store = op.SubscriptionStore(d)
+    drafts = [r for r in res if r["status"] == "refused"]
+    check(len(drafts) == 3, f"precondition: 3 rooms land over budget (got {len(drafts)})")
+    check(_aggregate(d) <= dpp.PACK_AGGREGATE_EVALS_PER_DAY,
+          f"precondition: auto-seeding is capped ({_aggregate(d)})")
+
+    for r in drafts:
+        check(store.transition(r["policy_id"], "active", note="owner approved") is True,
+              "the owner CAN approve a queued room (approval is not blocked)")
+    check(dpp.committed_evals_per_day(store) <= dpp.PACK_AGGREGATE_EVALS_PER_DAY,
+          f"owner approvals do not consume the automatic allowance "
+          f"(got {dpp.committed_evals_per_day(store)})")
+
+    # The consequence that makes it matter: the pack must still be able to seed.
+    auto = [x for x in store.list(status="active")
+            if (x.get("pack") or {}).get("entry") and not (x.get("pack") or {}).get("over_budget")]
+    store.transition(auto[0]["policy_id"], "cancelled", note="owner cancels an auto room")
+    r2 = dpp.on_room_join(d, OWNER, "!fresh:ag2.space",
+                          member_rooms=rooms + ["!fresh:ag2.space"])
+    check(r2 and r2[0]["status"] == "seeded",
+          f"...so freeing an auto slot still lets a new room seed (got {r2 and r2[0]['status']})")
+
+
+def test_the_cap_still_bounds_AUTOMATIC_grants():
+    """CALIBRATION. The guard above is satisfied by removing the budget entirely,
+    which would undo the original blocker. The cap must still bind auto-seeds."""
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(13)]
+    res = dpp.seed_defaults(d, OWNER, rooms)
+    seeded = [r for r in res if r["status"] == "seeded"]
+    check(len(seeded) * op.DEFAULT_EVALS_PER_DAY <= dpp.PACK_AGGREGATE_EVALS_PER_DAY,
+          f"automatic seeding is still capped at the budget ({len(seeded)} auto-seeds)")
+    check(len(seeded) < len(rooms),
+          "...and rooms beyond it are still refused, not silently granted")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
