@@ -444,13 +444,16 @@ def resolve_workspace(migrate: bool = True) -> Path:
     differs in two ways from the pre-cutover version:
 
       - Default location is `${REPO_DIR}/workspace` (in-repo), not
-        `~/.sutando/workspace/`. Users with `$SUTANDO_WORKSPACE` set keep
-        their old location with a one-time warning.
-      - `.env` declarations of `SUTANDO_WORKSPACE` no longer leak into
-        resolution when the env var itself is unset — only the env var
-        in the process environment matters. A separate one-time warning
-        fires if `.env` declares a value that disagrees with the resolved
-        workspace.
+        `~/.sutando/workspace/`.
+      - **Neither `$SUTANDO_WORKSPACE` nor a `SUTANDO_WORKSPACE=` line in
+        `.env` affects resolution.** The env var was removed from the order
+        in v0.8 (#1440) and the resolver ignores its value
+        (`sutando_config.py:297`); a set value only fires a one-time
+        deprecation warning and may trigger one-time auto-migration. A
+        separate one-time warning fires if `.env` declares a value that
+        disagrees with the resolved workspace. Both are notices about a
+        value that is *not* consulted — do not read either warning as
+        evidence the path was honored.
 
     The legacy-state notice (pointing users at `scripts/sutando-migrate.sh`)
     remains here — same behavior as before, gated by `migrate=True`.
