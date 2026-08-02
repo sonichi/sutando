@@ -374,33 +374,48 @@ def get_pending_questions() -> list[str]:
 
 
 
+# The statuses health-check.py itself treats as failures, minus "warn" — warns
+# are expected/known and were deliberately excluded from the briefing. Kept as a
+# named constant so it can be diffed against health-check.py's own predicate
+# (`("down", "missing", "not_loaded", "fail", "stale", "warn")`) rather than
+# re-derived from how a status happens to be *rendered*.
+_BRIEFING_FAILURE_STATUSES = frozenset(
+    {"down", "missing", "not_loaded", "fail", "stale", "wedged", "error", "empty"}
+)
+
+
 def get_health_issues() -> list[str]:
-    """Run health check and return only the failed/warn items, concisely."""
+    """Run health check and return only the failed items, concisely.
+
+    Reads `--json` and selects on `status`, not on the rendered glyph. The glyph
+    scrape this replaced tested `"✗" in line`, and health-check.py only renders
+    ✗ for down/missing/not_loaded — so `fail` (which includes critically-low
+    battery), `wedged` (a hung launchd service), `error` and `empty` all render
+    as the `~` catch-all, and `stale` as `♻`, and none of them could ever reach
+    the briefing. The briefing reported "no issues" while health-check.py's own
+    failure predicate counted them as failures.
+    """
     hc = Path(__file__).parent / "health-check.py"
     if not hc.exists():
         return []
     try:
         r = subprocess.run(
-            [sys.executable, str(hc)],
+            [sys.executable, str(hc), "--json"],
             capture_output=True, text=True, timeout=30,
             cwd=str(WORKSPACE)
         )
-        issues = []
-        for line in r.stdout.splitlines():
-            if "✗" in line:  # only real failures, not warns (warns are expected/known)
-                # Format: "  ✗ <name>   <status>   <detail>"
-                # Strip the symbol and collapse whitespace
-                clean = re.sub(r'^\s*[✗⚠]\s*', '', line)
-                # Split on 2+ spaces to get name, status, detail
-                parts = re.split(r'\s{2,}', clean.strip())
-                if len(parts) >= 3:
-                    name, status, detail = parts[0], parts[1], parts[2]
-                    issues.append(f"{name}: {detail}")
-                elif parts:
-                    issues.append(parts[0])
-        return issues[:3]
-    except (subprocess.TimeoutExpired, OSError):
+        checks = json.loads(r.stdout).get("checks", [])
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        # ValueError covers json.JSONDecodeError: a non-zero exit can leave
+        # stdout empty, and an empty parse must not read as "no issues" by
+        # accident — it returns [] here explicitly, as the caller's fallback.
         return []
+    issues = []
+    for c in checks:
+        if c.get("status") in _BRIEFING_FAILURE_STATUSES:
+            name, detail = c.get("name", "?"), c.get("detail", "")
+            issues.append(f"{name}: {detail}" if detail else name)
+    return issues[:3]
 
 
 def get_daily_insight() -> str | None:
