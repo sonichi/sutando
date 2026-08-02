@@ -327,6 +327,34 @@ def _load_notifier():
 _CPQ = _load_notifier()
 
 
+#: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
+#: DM'd, so a title clipped mid-word is read aloud as a mid-word fragment. A hard
+#: `title[:60]` produced, from a real 2026-08-02 run:
+#:     "WIRE - awaiting your verdict / steer (no urgency; nothing bl"
+#: - cut inside "blocked", and leaving an unmatched "(" so the parenthetical never
+#: closes. Clip on a word boundary instead, and drop a parenthetical that the clip
+#: left open rather than speaking half of it.
+def clip_for_speech(text: str, limit: int) -> str:
+    """Clip to <= limit chars without cutting a word or orphaning a "(".
+
+    Returns text unchanged when it already fits, so the common case is untouched.
+    Falls back to a hard slice only when there is no word boundary to cut on.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    # Reserve one char for the ellipsis so the result is never OVER the limit.
+    head = text[:limit - 1]
+    cut = head.rfind(" ")
+    head = head[:cut] if cut > 0 else head
+    # A clip can leave "(" open. Speaking half a parenthetical is worse than
+    # dropping it, so cut back to before the unmatched bracket.
+    if head.count("(") > head.count(")"):
+        head = head[:head.rfind("(")]
+    head = head.rstrip(" ,;:-\u2014/(")
+    return head + "\u2026" if head else text[:limit - 1] + "\u2026"
+
+
 def get_pending_questions() -> list[str]:
     """Return unanswered questions, delegating to check-pending-questions.py.
 
@@ -369,7 +397,7 @@ def get_pending_questions() -> list[str]:
         title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
         if not title:
             continue
-        out.append(title[:60])
+        out.append(clip_for_speech(title, 60))
     return out
 
 
