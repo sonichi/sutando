@@ -46,8 +46,15 @@ Verdicts:
   ALIVE_AS_OF      beating normally as of the snapshot                (exit 0)
   NOT_ARMED        no signal file / never armed                       (exit 1)
 
+Lives in `src/`, not `scripts/`, on purpose. It needs `workspace_default` as a
+sibling import; reaching `src/` from `scripts/` means walking the repo root, and
+`lint-workspace-resolution.sh` refuses that in new code — its comments name
+rewording the walk as `parents[1]` as evasion rather than a fix. Per CLAUDE.md's
+decision guide this is core infrastructure shared across hosts, so `src/` is
+where it belonged anyway and the import becomes honest instead of clever.
+
 Usage:
-  python3 scripts/peer-watch.py <peer-host-label> [--json] [--workspace PATH]
+  python3 src/peer-watch.py <peer-host-label> [--json] [--workspace PATH]
 """
 from __future__ import annotations
 
@@ -58,7 +65,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
 
 
 def _iso(s: str) -> "dt.datetime | None":
@@ -68,14 +76,6 @@ def _iso(s: str) -> "dt.datetime | None":
         return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-def _workspace() -> Path:
-    out = subprocess.run(["bash", str(REPO / "scripts/sutando-config.sh"), "workspace"],
-                         capture_output=True, text=True, timeout=60)
-    if out.returncode != 0 or not out.stdout.strip():
-        raise SystemExit(f"peer-watch: could not resolve workspace: {out.stderr.strip()[:200]}")
-    return Path(out.stdout.strip())
 
 
 def commit_time(workspace: Path, rel: str) -> "dt.datetime | None":
@@ -148,7 +148,7 @@ def main(argv=None) -> int:
         "is armed in the live workspace. Caught doing exactly that while testing."))
     args = ap.parse_args(argv)
 
-    ws = Path(args.workspace) if args.workspace else _workspace()
+    ws = Path(args.workspace) if args.workspace else resolve_workspace()
     rel = f"hosts/{args.peer}/restart-watch.json"
     path = ws / rel
     if not path.is_file():

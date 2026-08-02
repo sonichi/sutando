@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("peer_watch", REPO / "scripts" / "peer-watch.py")
+_spec = importlib.util.spec_from_file_location("peer_watch", REPO / "src" / "peer-watch.py")
 pw = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pw)
 
