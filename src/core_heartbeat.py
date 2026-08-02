@@ -185,6 +185,19 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     except Exception:
         pass
 
+    # A Claude session with no matching `claude --name <sess>` process is DEAD,
+    # not "fall back to whatever pane is left" (review-caught, john-the-dev on
+    # #2488). The pane fallback exists for NON-Claude runtimes; applied to a
+    # Claude session it resurrects a corpse — a sibling/shell pane pid is
+    # returned, `.alive` keeps beating, and peers plus the scheduler treat a
+    # dead core as live indefinitely, suppressing takeover.
+    #
+    # Deliberately narrow: only an AFFIRMATIVE "claude" identification skips the
+    # fallback. An undeterminable runtime keeps the previous behaviour, so this
+    # cannot turn a healthy non-Claude host into a permanent false death.
+    if (_session_runtime(sock, sess) or "").lower() == "claude":
+        return None
+
     # Non-Claude runtime: panes of THIS session only (never `-a`).
     lp = _tmux(sock, "list-panes", "-t", f"={sess}", "-F", "#{pane_pid}")
     if lp is None or lp.returncode != 0:
@@ -192,6 +205,37 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     for line in lp.stdout.split():
         if line.strip().isdigit():
             return int(line.strip())
+    return None
+
+
+def _session_runtime(sock: str, sess: str) -> "str | None":
+    """Which runtime this tmux session was launched as, or None if undeterminable.
+
+    Prefers the session's OWN environment (`tmux show-environment`), which
+    `src/agent/start-cli.sh` sets at session creation — runtime-authored state,
+    the same pattern `write_beat` already trusts for the socket. Falls back to
+    the repo config only if the session cannot answer.
+
+    Returns None rather than guessing: callers must treat unknown as "no
+    discrimination possible" and keep their pre-existing behaviour.
+    """
+    r = _tmux(sock, "show-environment", "-t", f"={sess}", "SUTANDO_CORE_RUNTIME")
+    if r is not None and r.returncode == 0:
+        line = r.stdout.strip()
+        if line.startswith("SUTANDO_CORE_RUNTIME=") and not line.startswith("-"):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                return val
+    try:
+        cp = subprocess.run(
+            ["bash", str(Path(__file__).resolve().parent.parent / "scripts" / "sutando-config.sh"),
+             "core-runtime"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if cp.returncode == 0 and cp.stdout.strip():
+            return cp.stdout.strip().splitlines()[0].strip()
+    except Exception:
+        pass
     return None
 
 

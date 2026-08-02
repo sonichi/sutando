@@ -32,6 +32,11 @@ spec = importlib.util.spec_from_file_location("ch", REPO / "src" / "core_heartbe
 ch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ch)
 
+# Captured BEFORE any monkeypatch below. The run_forever block replaces
+# ch.core_pid with a stub and does not restore it, so later sections MUST use
+# this reference or they silently exercise the stub instead of the resolver.
+_REAL_CORE_PID = ch.core_pid
+
 failures: list[str] = []
 
 
@@ -63,7 +68,7 @@ _bin(box, "ps", f'echo "claude --name {SESSION} --resume"')
 _orig_path = os.environ["PATH"]
 os.environ["PATH"] = f"{box}:{_orig_path}"
 try:
-    got = ch.core_pid("/tmp/does-not-matter.sock")
+    got = _REAL_CORE_PID("/tmp/does-not-matter.sock")
 finally:
     os.environ["PATH"] = _orig_path
 
@@ -98,6 +103,58 @@ check("a SINGLE absent read did not end the loop (blip at beat 2 survived)", cal
       f"stopped after {calls['n']} reads — one None was treated as death")
 check("consecutive absence DOES stop it", rc == 0)
 check(".alive removed once death is confirmed", not alive.exists())
+
+
+# ── 3. A CLAUDE session with no claude process is DEAD, not "any pane" ───────
+# john-the-dev, #2488: the pane fallback exists for NON-Claude runtimes. Applied
+# to a Claude session it returns a sibling/shell pane pid, .alive keeps beating,
+# and peers treat a dead core as live indefinitely. Only an AFFIRMATIVE "claude"
+# identification skips the fallback — unknown must keep the old behaviour, so a
+# healthy non-Claude host can never be turned into a permanent false death.
+
+def _farm(runtime_line: str, claude_alive: bool, kill_config: bool = False):
+    """Fake toolchain: tmux answers has-session / show-environment / list-panes."""
+    d = Path(tempfile.mkdtemp(prefix="ch-rt-"))
+    tmux = "\n".join([
+        'case "$*" in',
+        '  *has-session*)      exit 0 ;;',
+        f'  *show-environment*) {runtime_line}; exit 0 ;;',
+        '  *list-panes*)       echo 7777; exit 0 ;;',
+        'esac',
+        'exit 0',
+    ])
+    _bin(d, "tmux", tmux)
+    _bin(d, "pgrep", "echo 4242\nexit 0" if claude_alive else "exit 1")
+    _bin(d, "ps", f'echo "claude --name {SESSION} --resume"')
+    if kill_config:
+        # Truly-undeterminable runtime: the session env is unset AND the config
+        # fallback cannot answer. Without this the config in THIS repo says
+        # "claude", so the unknown branch is unreachable and the case would be
+        # testing the claude branch under a misleading name.
+        _bin(d, "bash", "exit 1")
+    return d
+
+
+CASES = [
+    ("claude session + claude process   -> the claude pid",
+     'echo SUTANDO_CORE_RUNTIME=claude', True,  4242),
+    ("CLAUDE session + NO claude proc   -> None (NOT pane 7777)",
+     'echo SUTANDO_CORE_RUNTIME=claude', False, None),
+    ("codex session + no claude proc    -> pane fallback still works",
+     'echo SUTANDO_CORE_RUNTIME=codex',  False, 7777),
+    ("UNKNOWN runtime + no claude proc  -> pane fallback preserved",
+     'echo "-SUTANDO_CORE_RUNTIME"',     False, 7777, True),
+]
+for case in CASES:
+    label, rt, alive, want = case[:4]
+    box = _farm(rt, alive, kill_config=(len(case) > 4 and case[4]))
+    _op = os.environ["PATH"]
+    os.environ["PATH"] = f"{box}:{_op}"
+    try:
+        got = _REAL_CORE_PID("/tmp/s.sock")
+    finally:
+        os.environ["PATH"] = _op
+    check(label, got == want, f"got {got!r}, want {want!r}")
 
 print()
 if failures:
