@@ -139,6 +139,12 @@ authentication gates, status/header emission, and JSON serialization belong in
 small handler helpers so every route uses one wire contract. Route branches retain
 endpoint-specific orchestration and payload construction. Refactors must preserve
 status codes, headers, and payload shapes with direct contract tests.
+### HTTP route boundaries
+
+HTTP route methods should remain dispatch layers: parse and authorize the request,
+call a named operation, then emit its result. Filesystem reconciliation and
+response assembly belong in module-level operations that can be tested without a
+socket. Protect both the operation contract and one route-wiring path.
 
 ## Current repository classification
 
