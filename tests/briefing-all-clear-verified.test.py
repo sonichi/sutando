@@ -115,6 +115,58 @@ ok("health issues still render when present", "disk: 91% full" in withdata)
 ok("a day with real items gets no all-clear", CLEAN not in withdata)
 
 
+# --- every "did not run" path returns None, not [] --------------------------
+# There are three ways each gather can fail to answer, and all three must be
+# distinguishable from a verified-empty result. Timeout and OSError are covered
+# above; these are the other two.
+
+
+class _Result:
+    def __init__(self, rc, out=""):
+        self.returncode = rc
+        self.stdout = out
+        self.stderr = ""
+
+
+_real_run = _mod.subprocess.run
+_real_path = _mod.Path
+try:
+    # non-zero exit: the script ran but failed -> unknown, not empty
+    _mod.subprocess.run = lambda *a, **k: _Result(1, "")
+    ok("get_reminders() returns None on non-zero exit", _mod.get_reminders() is None,
+       f"got {_mod.get_reminders()!r}")
+
+    # exit 0 with no rows IS a verified-empty answer, and must stay []
+    _mod.subprocess.run = lambda *a, **k: _Result(0, "No reminders.\n")
+    got = _mod.get_reminders()
+    ok("get_reminders() returns [] when the script ran and found nothing",
+       got == [], f"got {got!r}")
+finally:
+    _mod.subprocess.run = _real_run
+
+# missing script / missing health-check binary -> cannot answer
+class _NoSuchPath(type(_real_path())):
+    def exists(self):  # noqa: D102
+        return False
+
+
+try:
+    _mod.Path = lambda *a, **k: _NoSuchPath(_real_path(*a, **k))
+    ok("get_reminders() returns None when reminders.py is absent",
+       _mod.get_reminders() is None)
+    ok("get_health_issues() returns None when health-check.py is absent",
+       _mod.get_health_issues() is None)
+finally:
+    _mod.Path = _real_path
+
+# a briefing built entirely from unavailable gathers says nothing false
+allgone = _mod.synthesize(None, None, None, [], [], None)
+ok("all-unavailable briefing makes no all-clear claim", CLEAN not in allgone,
+   f"got {allgone!r}")
+ok("all-unavailable briefing still reports the calendar honestly",
+   "couldn't read your calendar" in allgone, f"got {allgone!r}")
+
+
 print(f"briefing-all-clear-verified: {_passed}/{_passed + _failed} passed"
       + (f" — {_failed} FAILED" if _failed else ""))
 raise SystemExit(1 if _failed else 0)
