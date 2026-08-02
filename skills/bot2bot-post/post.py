@@ -8,7 +8,7 @@ Usage:
     python3 skills/bot2bot-post/post.py --to lucy opinion "disagreement axis below"
     python3 skills/bot2bot-post/post.py done "shipped PR #472"
 
-Kinds: claim | blocked | done | ping | opinion
+Kinds: claim | blocked | done | ping | nack | opinion
 Peers (for --to): a name from ~/.claude/channels/discord/peers.json, or a raw numeric id
 
 The target channel ID is read from `$CLAUDE_CONFIG_DIR/channels/discord/access.json`:
@@ -64,7 +64,7 @@ def _claude_home() -> Path:
 _DISCORD_DIR = _claude_home() / "channels" / "discord"
 ACCESS_JSON = _DISCORD_DIR / "access.json"
 ENV_FILE = _DISCORD_DIR / ".env"
-VALID_KINDS = {"claim", "blocked", "done", "ping", "opinion"}
+VALID_KINDS = {"claim", "blocked", "done", "ping", "opinion", "nack"}
 
 
 def load_token() -> str:
