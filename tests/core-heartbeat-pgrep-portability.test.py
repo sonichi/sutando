@@ -25,6 +25,7 @@ import os
 import stat
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -131,8 +132,43 @@ def _farm(runtime_line: str, claude_alive: bool, kill_config: bool = False):
         # fallback cannot answer. Without this the config in THIS repo says
         # "claude", so the unknown branch is unreachable and the case would be
         # testing the claude branch under a misleading name.
+        # NOTE: stubbing `bash` alone stopped being sufficient once the resolver
+        # switched from `bash scripts/sutando-config.sh core-runtime` to a direct
+        # `from sutando_config import resolve_core_runtime` (the shell-out needed
+        # a repo-root walk that scripts/lint-workspace-resolution.sh rejects).
+        # A PATH stub cannot blind an in-process import, so `_blind_config()`
+        # below does that half. Both are kept: the `bash` stub still covers the
+        # subprocess path if it ever returns.
         _bin(d, "bash", "exit 1")
     return d
+
+
+def _blind_config():
+    """Make the in-process config fallback unanswerable; returns a restore token.
+
+    Mirrors the `bash` stub for the import-based lookup. Without this the
+    UNKNOWN-runtime case silently becomes a second CLAUDE case — it would still
+    pass by asserting None while claiming to prove the fallback is preserved.
+    """
+    saved = (True, sys.modules.get("sutando_config"))
+    stub = types.ModuleType("sutando_config")
+
+    def _unavailable(*a, **k):
+        raise RuntimeError("config unavailable (test)")
+
+    stub.resolve_core_runtime = _unavailable
+    sys.modules["sutando_config"] = stub
+    return saved
+
+
+def _restore_config(token):
+    if token is None:
+        return
+    _, saved = token
+    if saved is None:
+        sys.modules.pop("sutando_config", None)
+    else:
+        sys.modules["sutando_config"] = saved
 
 
 CASES = [
@@ -147,13 +183,16 @@ CASES = [
 ]
 for case in CASES:
     label, rt, alive, want = case[:4]
-    box = _farm(rt, alive, kill_config=(len(case) > 4 and case[4]))
+    _kill = bool(len(case) > 4 and case[4])
+    box = _farm(rt, alive, kill_config=_kill)
     _op = os.environ["PATH"]
     os.environ["PATH"] = f"{box}:{_op}"
+    _tok = _blind_config() if _kill else None
     try:
         got = _REAL_CORE_PID("/tmp/s.sock")
     finally:
         os.environ["PATH"] = _op
+        _restore_config(_tok)
     check(label, got == want, f"got {got!r}, want {want!r}")
 
 print()

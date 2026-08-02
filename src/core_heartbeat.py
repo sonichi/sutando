@@ -226,14 +226,20 @@ def _session_runtime(sock: str, sess: str) -> "str | None":
             val = line.split("=", 1)[1].strip()
             if val:
                 return val
+    # Config fallback. Import `resolve_core_runtime` directly rather than
+    # shelling out to `scripts/sutando-config.sh` — that shell-out had to walk
+    # two levels up from `__file__` to locate the script, which is the repo-root
+    # walk `scripts/lint-workspace-resolution.sh` rejects (and rightly: it
+    # breaks when `src/` is reached through an app-bundle symlink). This module
+    # already lives in `src/`, next to `sutando_config`, so the import needs no
+    # walking at all — and it drops a subprocess from every beat.
+    # (`src/` is already on sys.path — line ~62 inserts it for
+    # `workspace_default`, using a single `.parent`, which is not the banned form.)
     try:
-        cp = subprocess.run(
-            ["bash", str(Path(__file__).resolve().parent.parent / "scripts" / "sutando-config.sh"),
-             "core-runtime"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if cp.returncode == 0 and cp.stdout.strip():
-            return cp.stdout.strip().splitlines()[0].strip()
+        from sutando_config import resolve_core_runtime
+        val = (resolve_core_runtime() or "").strip()
+        if val:
+            return val.splitlines()[0].strip()
     except Exception:
         pass
     return None

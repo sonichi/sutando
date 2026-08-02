@@ -99,9 +99,24 @@ ch.core_pid = _REAL_CORE_PID   # undo the monkeypatches; without this these two
                                # assertions would call the stub and pass vacuously
 with tempfile.TemporaryDirectory() as td2:
     b = Path(td2) / "bin"; b.mkdir()
-    (b / "tmux").write_text("#!/bin/sh\necho 31337\n"); (b / "tmux").chmod(0o755)
+    # NON-Claude runtime, so the scoped-pane path is legitimately reachable.
+    # Under the repaired contract a session identified as Claude with no
+    # matching `claude --name <sess>` process resolves ABSENT and never reaches
+    # list-panes — that arm is asserted separately below.
+    (b / "tmux").write_text(
+        "#!/bin/sh\n"
+        "for a in \"$@\"; do\n"
+        "  case \"$a\" in show-environment) echo 'SUTANDO_CORE_RUNTIME=codex'; exit 0 ;; esac\n"
+        "done\n"
+        "echo 31337\n")
+    (b / "tmux").chmod(0o755)
+    # Stub pgrep too: without it this case calls the REAL pgrep, and on a host
+    # that is actually running a core (`claude --name sutando-core`) it would
+    # return that live pid instead of 31337. Host-dependent, green in CI only.
+    (b / "pgrep").write_text("#!/bin/sh\nexit 1\n"); (b / "pgrep").chmod(0o755)
     os.environ["PATH"] = f"{b}:{os.environ['PATH']}"
-    check("core_pid() parses the pane pid from tmux", _REAL_CORE_PID("/tmp/x.sock") == 31337)
+    check("core_pid() parses the pane pid from tmux (non-Claude runtime)",
+          _REAL_CORE_PID("/tmp/x.sock") == 31337)
     (b / "tmux").write_text("#!/bin/sh\nexit 1\n")
     check("core_pid() returns None when tmux fails (no server / socket gone)",
           _REAL_CORE_PID("/tmp/x.sock") is None)
@@ -188,24 +203,50 @@ with tempfile.TemporaryDirectory() as td5:
     check("REAL: the `--name=<session>` spelling also matches",
           _REAL_CORE_PID("/tmp/s.sock") == 4243)
 
+    # --- the repaired contract: the SESSION RUNTIME decides what "no matching
+    # claude process" means. Claude -> ABSENT (a preserved sibling window must
+    # never resurrect a dead core, john-the-dev on #2488). Non-Claude -> the
+    # scoped-pane fallback still applies. Each Claude arm below is paired with
+    # the identical state on a non-Claude session, so the assertion proves the
+    # DISCRIMINATION and not merely that something returned None.
+    def _tmux_runtime(rt: str) -> str:
+        return ("#!/bin/sh\n"
+                "for a in \"$@\"; do\n"
+                "  case \"$a\" in\n"
+                f"    show-environment) echo 'SUTANDO_CORE_RUNTIME={rt}'; exit 0 ;;\n"
+                "    list-panes) echo 777; exit 0 ;;\n"
+                "  esac\n"
+                "done\n"
+                "exit 0\n")
+
     # a NON-core claude must not match (someone else's claude on the box)
     _stub(b, "pgrep", "#!/bin/sh\necho 999\n")
     _stub(b, "ps", "#!/bin/sh\necho 'claude --name something-else'\n")
-    _stub(b, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) echo 777; exit 0;; esac; done\nexit 0\n")
-    check("REAL: a claude for a DIFFERENT session falls through to the pane path",
+    _stub(b, "tmux", _tmux_runtime("claude"))
+    check("REAL: a claude for a DIFFERENT session resolves ABSENT on a Claude session",
+          _REAL_CORE_PID("/tmp/s.sock") is None)
+    _stub(b, "tmux", _tmux_runtime("codex"))
+    check("CONTROL: identical state on a non-Claude session still uses the scoped pane",
           _REAL_CORE_PID("/tmp/s.sock") == 777)
 
-    # pgrep finds nothing -> pane fallback, scoped to the session
+    # pgrep finds nothing at all -> same discrimination
     _stub(b, "pgrep", "#!/bin/sh\nexit 1\n")
-    check("REAL: no core claude -> pane fallback returns the session pane pid",
+    _stub(b, "tmux", _tmux_runtime("claude"))
+    check("REAL: no core claude on a Claude session -> ABSENT (no pane resurrection)",
+          _REAL_CORE_PID("/tmp/s.sock") is None)
+    _stub(b, "tmux", _tmux_runtime("codex"))
+    check("CONTROL: no core claude on a non-Claude session -> scoped pane pid",
           _REAL_CORE_PID("/tmp/s.sock") == 777)
 
-    # pane list empty -> None (not a stale value)
-    _stub(b, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) exit 0;; esac; done\nexit 0\n")
+    # pane list empty -> None (not a stale value). Pinned to a non-Claude
+    # runtime deliberately: on a Claude session the resolver short-circuits
+    # ABOVE list-panes, so this would pass without ever exercising the branch
+    # it names — a test that cannot fail.
+    _stub(b, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in show-environment) echo 'SUTANDO_CORE_RUNTIME=codex'; exit 0;; list-panes) exit 0;; esac; done\nexit 0\n")
     check("REAL: session exists but NO panes -> None", _REAL_CORE_PID("/tmp/s.sock") is None)
 
     # list-panes itself fails -> None
-    _stub(b, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) exit 1;; esac; done\nexit 0\n")
+    _stub(b, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in show-environment) echo 'SUTANDO_CORE_RUNTIME=codex'; exit 0;; list-panes) exit 1;; esac; done\nexit 0\n")
     check("REAL: list-panes failure -> None", _REAL_CORE_PID("/tmp/s.sock") is None)
 os.environ["PATH"] = _ORIG_PATH
 
@@ -237,7 +278,10 @@ with tempfile.TemporaryDirectory() as td8:
     # tmux PRESENT but pgrep ABSENT -> the subprocess call raises, the except
     # swallows it, and resolution falls through to the pane path rather than
     # propagating an exception out of a heartbeat.
-    _stub(b8, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) echo 556; exit 0;; esac; done\nexit 0\n")
+    # Non-Claude runtime, so the pane path is the correct destination: on a
+    # Claude session the resolver returns ABSENT before list-panes, and this
+    # case would assert None while claiming to prove the exception was swallowed.
+    _stub(b8, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in show-environment) echo 'SUTANDO_CORE_RUNTIME=codex'; exit 0;; list-panes) echo 556; exit 0;; esac; done\nexit 0\n")
     os.environ["PATH"] = str(b8)
     check("pgrep missing entirely -> swallowed, falls through to the pane path",
           _REAL_CORE_PID("/tmp/s.sock") == 556)
