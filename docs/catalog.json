@@ -20,7 +20,7 @@
       "audience": ["contributors", "maintainers"],
       "status": "draft",
       "canonical_for": "proposed core, enterprise, and extension architecture boundaries",
-      "last_verified": "2026-07-27"
+      "last_verified": "2026-08-02"
     },
     "docs/adr/0001-pointer-teacher-brain.md": {
       "title": "Pointer Teacher brain: accessibility-first, Gemini-vision fallback",
