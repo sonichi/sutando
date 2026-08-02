@@ -182,6 +182,28 @@ with tempfile.TemporaryDirectory() as td:
     rc = pw.main(["PeerB", "--workspace", str(ws), "--json"])
     check("main() --json also exits 1 on the same input", rc == 1)
 
+# --- 9. Malformed / missing timestamps -------------------------------------
+# Not defensive padding: this file is written by ANOTHER host and reaches us
+# through a git sync, so a truncated or half-written value is a real arrival,
+# not a hypothetical. Every one of these must land on NOT_ARMED — the verdict
+# that says "I cannot judge" — and never on a healthy one.
+check("_iso('') is None", pw._iso("") is None)
+check("_iso(None-ish empty) is None", pw._iso(None or "") is None)
+check("_iso on a non-timestamp is None, not an exception",
+      pw._iso("not-a-timestamp") is None)
+check("_iso on a truncated ISO string is None",
+      pw._iso("2026-08-02T10:") is None)
+
+v = pw.evaluate({"state": "back", "valid_for_minutes": 45},
+                committed=T("2026-08-02T10:40:21Z"), now=T("2026-08-02T10:41:00Z"))
+check("a signal file with NO heartbeat_at is NOT_ARMED, never healthy",
+      v["verdict"] == "NOT_ARMED" and v["exit"] == 1, str(v))
+
+v = pw.evaluate({"state": "back", "heartbeat_at": "garbage", "valid_for_minutes": 45},
+                committed=T("2026-08-02T10:40:21Z"), now=T("2026-08-02T10:41:00Z"))
+check("an UNPARSEABLE heartbeat_at is NOT_ARMED, never healthy",
+      v["verdict"] == "NOT_ARMED" and v["exit"] == 1, str(v))
+
 print()
 if failures:
     print(f"{len(failures)} check(s) FAILED: {failures}")
