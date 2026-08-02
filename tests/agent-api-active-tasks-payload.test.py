@@ -39,6 +39,22 @@ def test_payload_reconciles_files_history_and_questions() -> None:
         archived = api.RESULT_DIR / "archive" / "2026-08" / task.name
         archived.write_text("archived result\n")
 
+        live_task = api.TASK_DIR / "task-live-result.txt"
+        live_task.write_text("source: api\ntask: live result wins\n")
+        os.utime(live_task, (2500, 2500))
+        (api.RESULT_DIR / live_task.name).write_text("live result\n")
+
+        remembered_task = api.TASK_DIR / "task-remembered.txt"
+        remembered_task.write_text("source: voice\ntask: remembered result survives\n")
+        os.utime(remembered_task, (1500, 1500))
+        api.task_history["task-remembered"] = {
+            "status": "done",
+            "text": "remembered result survives",
+            "time": 1500,
+            "result": "remembered result",
+            "source": "voice",
+        }
+
         result_only = api.RESULT_DIR / "task-result-only.txt"
         result_only.write_text("result summary\n")
         os.utime(result_only, (3000, 3000))
@@ -76,11 +92,12 @@ def test_payload_reconciles_files_history_and_questions() -> None:
     }
     assert rows["task-result-only"]["status"] == "done"
     assert rows["task-result-only"]["text"] == "result summary"
+    assert rows["task-live-result"]["result"] == "live result"
+    assert rows["task-remembered"]["result"] == "remembered result"
     assert payload["questions"][0]["text"] == "Choose a mode"
     assert payload["questions"][0]["options"] == ["A", "B"]
     assert "start" not in payload["questions"][0]
     assert "end" not in payload["questions"][0]
-
 
 def test_payload_excludes_workstream_classifier_tasks() -> None:
     """Classifier tasks are machinery, not user work, and must stay out of the
@@ -127,7 +144,41 @@ def test_payload_excludes_workstream_classifier_tasks() -> None:
     assert not leaked, f"classifier tasks leaked into /tasks/active: {leaked}"
 
 
+def test_rows_reconcile_result_after_result_scan() -> None:
+    """Cover the final reconciliation pass independently of result discovery."""
+    original = (api.TASK_DIR, api.RESULT_DIR)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        api.TASK_DIR = root / "tasks"
+        api.RESULT_DIR = root / "results"
+        api.TASK_DIR.mkdir()
+        api.RESULT_DIR.mkdir()
+        api.task_history.clear()
+        api.task_history["task-reconcile"] = {
+            "status": "working",
+            "text": "reconcile me",
+            "time": 1000,
+            "result": "",
+            "source": "api",
+        }
+        (api.RESULT_DIR / "task-reconcile.txt").write_text("finished later\n")
+
+        try:
+            # Isolate the final pass: the preceding result-file scan normally
+            # promotes this row through _remember_done_result_file first.
+            with mock.patch.object(api, "_remember_done_result_file"):
+                rows = api._active_task_rows()
+        finally:
+            api.TASK_DIR, api.RESULT_DIR = original
+            api.task_history.clear()
+
+    row = next(row for row in rows if row["id"] == "task-reconcile")
+    assert row["status"] == "done"
+    assert row["result"] == "finished later"
+
+
 if __name__ == "__main__":
     test_payload_reconciles_files_history_and_questions()
     test_payload_excludes_workstream_classifier_tasks()
+    test_rows_reconcile_result_after_result_scan()
     print("agent-api active tasks payload tests passed")
