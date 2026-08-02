@@ -698,6 +698,60 @@ def test_seed_racing_a_disable_after_its_live_check_never_activates():
           f"a seed that lost the race to a disable is never left ACTIVE (got {status!r})")
 
 
+def test_over_budget_draft_racing_a_disable_is_not_left_live():
+    """Same after-check/before-save window on the OVER-BUDGET branch.
+
+    Fixing only the activate path would be fixing one instance, not the class:
+    the over-budget branch also does `_entry_still_live()` (a READ) and then
+    `store.save()` (a WRITE) with nothing in between re-verifying. A disable
+    landing there strands a DRAFT on a disabled entry -- and this module's own
+    set_enabled() comment records why that is not benign: `draft -> active` is a
+    legal transition, so a stale approval card minted before the disable can
+    still activate the room afterwards (reproduced on adbd1b56).
+    """
+    d = _store()
+    entry = dpp._entry("react_baseline")
+    # Fill the aggregate budget so the next room takes the over-budget branch.
+    n = dpp.PACK_AGGREGATE_EVALS_PER_DAY // op.DEFAULT_EVALS_PER_DAY
+    rooms = [f"!r{i}:ag2.space" for i in range(n)]
+    dpp.seed_defaults(d, OWNER, rooms)
+
+    committed_before = dpp.committed_evals_per_day(op.SubscriptionStore(d))
+
+    real = dpp._entry_still_live
+    fired = []
+
+    def racing(store_dir, key, gen):
+        ok = real(store_dir, key, gen)
+        if not fired:
+            fired.append(True)
+            dpp.set_enabled(store_dir, key, False)
+        return ok
+
+    dpp._entry_still_live = racing
+    try:
+        r = dpp.seed_room(op.SubscriptionStore(d), d, entry, "!over:ag2.space",
+                          owner_mxid=OWNER, owner_rooms=rooms + ["!over:ag2.space"])
+    finally:
+        dpp._entry_still_live = real
+
+    check(bool(fired), "control: the disable injection fired on the over-budget path")
+    # Branch-independent control. Asserting on the RESULT here is worthless once
+    # the fix lands: the refusal reason flips from the budget message to the
+    # disabled message, so any "status == refused" check passes without proving
+    # the over-budget branch was ever reached. Assert the precondition instead --
+    # the aggregate really was exhausted before the racing seed ran.
+    check(committed_before == dpp.PACK_AGGREGATE_EVALS_PER_DAY,
+          f"control: budget really was exhausted first (got {committed_before}/"
+          f"{dpp.PACK_AGGREGATE_EVALS_PER_DAY})")
+
+    pid = r.get("policy_id")
+    rec = op.SubscriptionStore(d).get(pid) if pid else None
+    status = (rec or {}).get("status")
+    check(status in (None, "cancelled"),
+          f"no live draft is left on a disabled entry (got {status!r})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

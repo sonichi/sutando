@@ -324,7 +324,22 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
         # an explicit owner decision is deliberately outside it.
         normalized["pack"] = {"entry": entry["key"], "generation": gen,
                               "over_budget": True}
+        # PUBLISH, THEN VERIFY — the same compare-and-commit as the activate path
+        # below, and it belongs here for the same reason. The check above is a
+        # READ and this save is a WRITE; a disable landing between them is missed
+        # by the sweep (no record yet) and strands a draft on a disabled entry.
+        #
+        # A stranded DRAFT is not benign, which is the easy mistake here: it does
+        # not observe anything by itself, but `draft -> active` is a legal
+        # transition, so an approval card minted before the disable can still
+        # activate the room afterwards — reproduced on adbd1b56 and the reason
+        # set_enabled() sweeps pending drafts as well as active records.
         store.save(normalized)
+        if not _entry_still_live(store_dir, entry["key"], gen):
+            store.transition(pid, "cancelled",
+                             note="pack entry disabled while this over-budget draft was in flight")
+            return {"status": "refused", "policy_id": pid,
+                    "reason": "entry was disabled or re-generated while this seed was in flight"}
         return {"status": "refused", "policy_id": pid, "reason": why,
                 "draft": normalized, "awaiting": "owner-approval"}
 
