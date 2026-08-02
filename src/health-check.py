@@ -2562,6 +2562,69 @@ def _marker_predates_running_core(marker: dict) -> bool:
     return started < launched - margin
 
 
+def core_env_has_proxy_url(
+    socket_path: Optional[str] = None,
+    session: str = "sutando-core",
+    tmux_runner=None,
+    ps_runner=None,
+) -> Optional[bool]:
+    """Whether the RUNNING core process carries ANTHROPIC_BASE_URL in its environment.
+
+    ``True``  -> the core is routed through the credential proxy.
+    ``False`` -> it demonstrably is NOT (its environment was read, and the var is absent).
+    ``None``  -> could not be determined. **Never collapse None into False**: an
+                 unreadable environment is not evidence of a bypass, and a warning
+                 manufactured from it would be the same defect this check is fixing,
+                 pointed the other way.
+
+    Why this exists: ``quota-state.json`` is written by the credential proxy, not by
+    the core, so a FRESH file only proves *something* routed through the proxy — not
+    that the core did. Measured on 2026-08-02: one throwaway ``claude -p`` run with
+    the variable set refreshed the file and flipped this check from a truthful
+    ``warn`` (18h stale) to ``ok`` for the whole 6h staleness window, while the
+    production core was exactly as unrouted as before. Freshness is a property of the
+    artifact; routing is a property of the process.
+
+    The pid comes from ``tmux list-panes -F '#{pane_pid}'`` rather than ``pgrep``.
+    ``pgrep -f claude`` matches any argv containing the string — including the shell
+    running the check — and macOS ``pgrep -a`` lists ancestors, not argv. The pane pid
+    is the process tmux actually launched: verified on this host as pid 6648 ==
+    ``claude --name sutando-core``.
+
+    Both subprocess calls are injectable so the contract is testable without a live
+    core; production passes neither.
+    """
+    tmux_runner = tmux_runner or (lambda sock, *a: _run_tmux(sock, *a))
+    if ps_runner is None:
+        def ps_runner(pid):
+            return subprocess.run(
+                ["ps", "eww", "-o", "command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=15,
+            )
+    sock = socket_path or _live_core_socket()
+    panes = tmux_runner(sock, "list-panes", "-t", f"={session}", "-F", "#{pane_pid}")
+    if panes is None or getattr(panes, "returncode", 1) != 0:
+        return None                       # no such session / tmux unavailable
+    pid = (panes.stdout or "").split()
+    if not pid or not pid[0].isdigit():
+        return None
+    try:
+        proc = ps_runner(pid[0])
+    except Exception:                     # noqa: BLE001 — a probe failure is "unknown"
+        return None
+    if proc is None or getattr(proc, "returncode", 1) != 0:
+        return None
+    tokens = (proc.stdout or "").split()
+    # `ps eww` prints argv THEN the environment. On a process whose env we are not
+    # permitted to read it prints argv alone, which contains no KEY=VALUE pairs — and
+    # "no pairs" is indistinguishable from "an empty environment". Requiring at least
+    # one pair is what keeps an unreadable env reporting None instead of False.
+    env_pairs = [t for t in tokens if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
+    if not env_pairs:
+        return None
+    return any(t.startswith("ANTHROPIC_BASE_URL=") for t in env_pairs)
+
+
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
 
@@ -2635,6 +2698,21 @@ def check_quota_telemetry(proxy_status: str) -> dict:
             quota_age = time.time() - path.stat().st_mtime
             age_min = int(quota_age / 60)
             check["detail"] = f"quota state present (updated {age_min}m ago)"
+            # A FRESH file is not proof the CORE routed — the proxy writes this file
+            # for whatever talks to it. Only a demonstrated absence downgrades; None
+            # (env unreadable) leaves the fresh reading alone.
+            if quota_age <= QUOTA_STATE_STALE_SEC and not _runtime_may_skip_proxy() \
+                    and core_env_has_proxy_url() is False:
+                check["status"] = "warn"
+                check["detail"] = (
+                    f"quota state is fresh ({age_min}m) but the RUNNING core has no "
+                    "ANTHROPIC_BASE_URL in its environment, so the core is not routed "
+                    "through the proxy — something else produced that file (a one-off "
+                    "`claude -p`, another core, a manual probe). Quota-based budgeting "
+                    "is reading numbers this core did not generate. Relaunch the core "
+                    "via src/agent/start-cli.sh with the proxy listening on 7846."
+                )
+                return check
         except OSError:
             # Degrade to the less precise detail rather than raising — and with
             # no age there is nothing to call stale, so never warn from here.
