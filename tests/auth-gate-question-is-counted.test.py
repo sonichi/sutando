@@ -93,7 +93,11 @@ def extract_writer() -> str:
     """
     src = GATE.read_text()
     start = src.index('_pq="$_ws/hosts/$_host/pending-questions.md"')
-    end = src.index('rm -f "$_pq.new"', start) + len('rm -f "$_pq.new"')
+    # Anchor on a sentinel that occurs ONCE. `rmdir "$_lock"` also appears in
+    # the stale-lock breaker inside the spin loop, so anchoring there truncated
+    # the block mid-loop and produced a bash syntax error that looked like a
+    # gate bug.
+    end = src.index("# --- end pending-question write", start)
     return src[start:end]
 
 
@@ -185,6 +189,48 @@ if block:
                     sorted(p.name for p in pq2.parent.glob("*.tmp"))
         check("no .new/.tmp scratch files are left behind", not leftovers,
               str(leftovers))
+
+        # --- 7. CONCURRENT gates must not lose an entry ----------------------
+        # Found in review at f4e17019: fixed sibling scratch names (`$_pq.new`,
+        # `$_pq.tmp`) let two gates for the same host clobber each other —
+        # measured rcs [1, 0] with the reader seeing 2 of 3. That regresses the
+        # durability of the `>>` path this replaces, in the one record meant to
+        # explain why startup aborted. Visibility is not worth losing an entry.
+        import concurrent.futures as _cf
+
+        pq2.write_text(FIXTURE)
+        base = waiting(pq2)
+
+        def _fire(n: int):
+            e = dict(env)
+            e["_ts"] = f"2026-08-02T13:4{n}:00Z"
+            e["_remedy"] = f"remedy-{n}"
+            return subprocess.run(["bash", "-c", "set -e\n" + block],
+                                  capture_output=True, text=True, env=e, timeout=120)
+
+        N = 5
+        with _cf.ThreadPoolExecutor(max_workers=N) as pool:
+            results = list(pool.map(_fire, range(N)))
+
+        check("every concurrent gate exits 0",
+              all(r.returncode == 0 for r in results),
+              str([r.returncode for r in results]))
+        final = pq2.read_text()
+        present = [n for n in range(N) if f"remedy-{n}" in final]
+        check(f"all {N} concurrent boot-abort records survive",
+              len(present) == N,
+              f"only {present} present — a lost record is the exact regression under review")
+        check("...and the reader counts every one of them",
+              waiting(pq2) == base + N,
+              f"{base} -> {waiting(pq2)}, expected {base + N}")
+        check("...and they all sit above the divider",
+              all(final.index(f"remedy-{n}") < re.search(r'^#[ \t]+Resolved\b', final, re.M).start()
+                  for n in range(N)) if re.search(r'^#[ \t]+Resolved\b', final, re.M) else True,
+              "a concurrent write landed below the divider")
+        strays = sorted(p.name for p in pq2.parent.iterdir()
+                        if p.name.startswith("pending-questions.md.")
+                        and p.name != "pending-questions.md")
+        check("no per-invocation scratch or lock left behind", not strays, str(strays))
 
 print()
 if failures:

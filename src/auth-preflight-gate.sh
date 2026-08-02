@@ -89,25 +89,54 @@ if [ -n "$_ws" ] && [ -n "$_host" ]; then
   # edge cases #2419 catalogues (a quoted `# Resolved` in a comment, a fenced
   # block, an inline code span). A boot-abort question also belongs first.
   _pq="$_ws/hosts/$_host/pending-questions.md"
+  # Serialise the read-modify-write, and use PER-INVOCATION scratch names.
+  #
+  # The first cut of this used fixed `$_pq.new` / `$_pq.tmp` siblings. Two gates
+  # tripping for the same host at once clobber each other's scratch file: one
+  # boot-abort record is lost and one writer can fail while the other succeeds
+  # (reproduced in review at f4e17019 — rcs [1,0], reader saw 2 of 3). That
+  # regresses the durability of the `>>` path it replaces, in exactly the record
+  # that is meant to explain why startup aborted. Visibility is not worth losing
+  # an entry for.
+  #
+  # `mkdir` is the portable atomic test-and-set here — `flock(1)` is not present
+  # on stock macOS. Bounded spin, then break a lock older than 30s so a killed
+  # gate cannot wedge every later boot (a stuck lock would be the same class of
+  # silent loss one layer up).
+  _lock="$_pq.lock"
+  _waited=0
+  while ! mkdir "$_lock" 2>/dev/null; do
+    if [ -d "$_lock" ]; then
+      _age=$(( $(date +%s) - $(stat -f %m "$_lock" 2>/dev/null || stat -c %Y "$_lock" 2>/dev/null || date +%s) ))
+      if [ "$_age" -ge 30 ]; then rmdir "$_lock" 2>/dev/null || true; continue; fi
+    fi
+    _waited=$((_waited + 1))
+    # NOT `[ ... ] && break`: as the last statement of a loop body that compound
+    # returns 1 when the test is false, and under `set -e` the shell exits.
+    if [ "$_waited" -ge 100 ]; then break; fi   # ~10s: proceed unlocked rather than drop the record
+    sleep 0.1
+  done
+  _new="$_pq.new.$$"
+  _tmp="$_pq.tmp.$$"
   {
     echo "## [$_ts] BOOT ABORTED — CLI login required ($_host)"
     echo "auth-preflight-gate stopped startup before services launched."
     echo "Remedy: $_remedy"
     echo ""
-  } > "$_pq.new"
+  } > "$_new"
   if [ -f "$_pq" ]; then
-    # Keep a leading `# ` H1 as the first line if the file has one, so the
-    # insert goes into the active region rather than above the title.
     if head -1 "$_pq" | grep -qE '^# [^ ]'; then
-      { head -1 "$_pq"; echo ""; cat "$_pq.new"; tail -n +2 "$_pq"; } > "$_pq.tmp"
+      { head -1 "$_pq"; echo ""; cat "$_new"; tail -n +2 "$_pq"; } > "$_tmp"
     else
-      { cat "$_pq.new"; cat "$_pq"; } > "$_pq.tmp"
+      { cat "$_new"; cat "$_pq"; } > "$_tmp"
     fi
-    mv "$_pq.tmp" "$_pq"
+    mv -f "$_tmp" "$_pq"
   else
-    mv "$_pq.new" "$_pq"
+    mv -f "$_new" "$_pq"
   fi
-  rm -f "$_pq.new"
+  rm -f "$_new" "$_tmp"
+  rmdir "$_lock" 2>/dev/null || true
+  # --- end pending-question write (unique sentinel; tests extract to here) ---
   printf '[dm-only]\nSutando boot on %s ABORTED: CLI login required.\n%s\n' \
     "$_host" "$_remedy" > "$_ws/results/proactive-$(date +%s).txt"
 fi
