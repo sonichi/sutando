@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -120,6 +121,66 @@ verdicts = {
 }
 check("positive control: the two headline inputs produce DIFFERENT verdicts",
       len(verdicts) == 2, str(verdicts))
+
+# --- 7. commit_time() against a REAL repo, and against mtime ------------------
+# The whole design rests on commit time rather than mtime, so that choice needs a
+# test that can tell them apart. Touching the file AFTER committing makes mtime
+# newer than the commit; an implementation that reached for st_mtime would report
+# the snapshot as fresher than it is -- the exact inversion, and invisible to
+# every assertion above because those pass `committed` in directly.
+import os
+import subprocess
+import tempfile
+
+with tempfile.TemporaryDirectory() as td:
+    repo = Path(td)
+    env = {**os.environ, "GIT_AUTHOR_DATE": "2026-08-02T10:40:21+00:00",
+           "GIT_COMMITTER_DATE": "2026-08-02T10:40:21+00:00",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    run = lambda *a: subprocess.run(["git", "-C", str(repo), *a],
+                                    capture_output=True, text=True, env=env, timeout=60)
+    run("init", "-q")
+    rel = "hosts/PeerA/restart-watch.json"
+    (repo / "hosts" / "PeerA").mkdir(parents=True)
+    (repo / rel).write_text("{}")
+    run("add", rel)
+    run("commit", "-q", "-m", "add")
+
+    got = pw.commit_time(repo, rel)
+    check("commit_time reads the real commit date",
+          got is not None and got.astimezone(dt.timezone.utc).strftime("%H:%M:%S") == "10:40:21",
+          str(got))
+
+    # Now make mtime newer than the commit — a sync/checkout does exactly this.
+    os.utime(repo / rel, (2_000_000_000, 2_000_000_000))
+    still = pw.commit_time(repo, rel)
+    check("commit_time ignores mtime — a touched file still reports its COMMIT date",
+          still == got, f"got {still}, expected {got}")
+
+    check("commit_time on an untracked path is None, never a guess",
+          pw.commit_time(repo, "hosts/PeerA/not-committed.json") is None)
+
+with tempfile.TemporaryDirectory() as td2:
+    check("commit_time outside a git repo is None",
+          pw.commit_time(Path(td2), "anything.json") is None)
+
+# --- 8. main(): the CLI contract --------------------------------------------
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td)
+    rc = pw.main(["PeerMissing", "--workspace", str(ws)])
+    check("main() exits 1 for a peer with no signal file", rc == 1)
+
+    (ws / "hosts" / "PeerB").mkdir(parents=True)
+    (ws / "hosts" / "PeerB" / "restart-watch.json").write_text(json.dumps(
+        {"state": "back", "heartbeat_at": "2026-08-02T10:29:57Z", "valid_for_minutes": 45}))
+    # Untracked (no repo) -> NOT_ARMED rather than a healthy verdict: a file we
+    # cannot date is a file we cannot judge.
+    rc = pw.main(["PeerB", "--workspace", str(ws)])
+    check("main() on an undatable file exits 1, not 0", rc == 1)
+
+    rc = pw.main(["PeerB", "--workspace", str(ws), "--json"])
+    check("main() --json also exits 1 on the same input", rc == 1)
 
 print()
 if failures:
