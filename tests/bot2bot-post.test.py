@@ -15,6 +15,7 @@ Run: python3 tests/bot2bot-post.test.py   (exit 0 pass / non-zero on failure)
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -142,6 +143,52 @@ try:
 finally:
     _restore()
 
+# --- kind vocabulary: every tag the docs tell agents to use must be accepted ---
+# Regression for the 2026-08-01 drift: proactive-loop/SKILL.md documents `nack:`
+# ("vetoing another bot's pending claim") but VALID_KINDS omitted it, so post.py
+# exited 2 on a documented primitive. That is not a cosmetic mismatch — a rejected
+# coordination tag degrades to "the retraction lands AFTER the claim it retracts",
+# which is exactly how it was found: a nack post was refused, went unnoticed, and
+# the correction arrived after the message it corrected.
+check("nack is a valid kind", "nack" in b2b.VALID_KINDS)
+
+_DOC = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "SKILL.md"
+_doc_kinds = set(re.findall(r"`([a-z-]+):`", _DOC.read_text())) if _DOC.exists() else set()
+# FLOOR, and it is the load-bearing half. Without it this check is disableable by
+# the very event it exists to catch: if SKILL.md is moved/renamed, or the tags stop
+# matching the backtick form, `_doc_kinds` degrades to set(), the gap below is empty,
+# and the drift assertion PASSES — reporting green on an unmonitored vocabulary.
+# An assertion that a mechanism exists is only meaningful if it cannot pass in the
+# broken state, and "source of truth unreadable" is one of the broken states.
+check(f"documented-kind extraction is non-degenerate ({len(_doc_kinds)} found, floor 5)",
+      len(_doc_kinds) >= 5)
+# `opinion-requested:` is the prose name for the `opinion` kind; map it.
+_doc_kinds = {"opinion" if k == "opinion-requested" else k for k in _doc_kinds}
+_undocumented_gap = _doc_kinds - b2b.VALID_KINDS
+check(f"every kind documented in proactive-loop SKILL.md is accepted (gap: {sorted(_undocumented_gap)})",
+      not _undocumented_gap)
+
+# The SAME drift, on the surface an agent reads FIRST. The check above only covers
+# SKILL.md; post.py's own `Kinds:` help line is a second, independent copy of the
+# vocabulary, and the original fix updated VALID_KINDS while leaving it at five —
+# so `--help` still told the caller `nack` did not exist even once the code accepted
+# it. Widening to the AXIS (every copy of the vocabulary) rather than patching the
+# one instance found: a tool whose help contradicts its enforcement misinforms the
+# reader in whichever direction the two disagree.
+_help_kinds = set()
+for _line in (b2b.__doc__ or "").splitlines():
+    if _line.strip().startswith("Kinds:"):
+        _help_kinds = {k.strip() for k in _line.split(":", 1)[1].split("|") if k.strip()}
+        break
+# Same floor discipline as above: if the `Kinds:` line is reworded or removed,
+# _help_kinds degrades to set() and the equality below would pass vacuously.
+check(f"--help kind list is non-degenerate ({len(_help_kinds)} found, floor 5)",
+      len(_help_kinds) >= 5)
+check(f"--help `Kinds:` line matches VALID_KINDS exactly "
+      f"(help-only: {sorted(_help_kinds - b2b.VALID_KINDS)}, "
+      f"code-only: {sorted(b2b.VALID_KINDS - _help_kinds)})",
+      _help_kinds == b2b.VALID_KINDS)
+
 # --- contract-drift guard: the shipped agent-facing docs must describe the
 # no-guess contract this suite pins. If someone reverts the behavior (or the
 # docs) without the other, these assertions catch the divergence.
@@ -161,8 +208,29 @@ check("stale auto-mention contract is gone from the docs",
       "the other Sutando node" not in _skill_md.split("\n---")[0]
       and "@-mentioning the other Sutando node" not in _manifest)
 
+# main() accepts nack end-to-end, and an unknown kind is still refused (guard not disabled)
+_install_mocks()
+try:
+    _posted.clear()
+    sys.argv = ["post.py", "--to", MEMBER_B, "nack", "vetoing that claim"]
+    b2b.main()
+    check("main: nack posts to bot2bot channel", _posted.get("channel") == BOT2BOT)
+    check("main: nack body carries the tag", "nack:" in _posted.get("text", ""))
+
+    _posted.clear()
+    sys.argv = ["post.py", "--to", MEMBER_B, "definitely-not-a-kind", "x"]
+    refused = False
+    try:
+        b2b.main()
+    except SystemExit:
+        refused = True
+    check("main: unknown kind STILL refused (positive control — guard not disabled)",
+          refused and not _posted)
+finally:
+    _restore()
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
     sys.exit(1)
-print("all tests passed — bot2bot-channel scope guard")
+print("all tests passed — bot2bot-channel scope guard + kind vocabulary")
