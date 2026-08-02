@@ -155,6 +155,32 @@ with tempfile.TemporaryDirectory() as td3:
     check("cold boot: .alive removed once the late core vanished", not a3.exists())
     check("cold boot: it did not stop before the core ever appeared", seq["n"] > 3)
 
+# --- NEGATIVE CONTROL: a core that NEVER starts must never read healthy ------
+# Before this guard, every iteration called write_beat(), whose documented
+# resolver-failure fallback records the heartbeat writer pid. A failed cold
+# boot therefore refreshed .alive forever despite no core ever being observed.
+with tempfile.TemporaryDirectory() as td_never:
+    tmp_never = pathlib.Path(td_never); a_never = tmp_never / "h.alive"
+    ch.CORES_DIR = tmp_never; ch._alive_path = lambda: a_never
+    a_never.write_text("{}")       # stale record from an earlier process
+    probes = {"n": 0}
+    def never_appears(socket_path=None, session=None):
+        probes["n"] += 1
+        if probes["n"] >= 5:
+            ch._SHUTDOWN_REQUESTED = True
+        return None
+    writes = {"n": 0}
+    def count_beat(status="running"):
+        writes["n"] += 1
+        a_never.write_text("{}")
+    ch.core_pid = never_appears
+    ch.write_beat = count_beat
+    ch._SHUTDOWN_REQUESTED = False
+    rc_never = ch.run_forever(interval=0.01)
+    check("never-started core: loop remains responsive to shutdown", rc_never == 0)
+    check("never-started core: no heartbeat is published", writes["n"] == 0)
+    check("never-started core: stale .alive is removed", not a_never.exists())
+
 # --- REGRESSION 2: sibling pane / watcher session must not read as the core ---
 # Codex runs `${SESSION}-watcher` on the SAME socket; Claude preserves sibling
 # WINDOWS in the core session. A first-pane-wins lookup returns those.

@@ -327,7 +327,11 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     # once would leave the gate disarmed forever and a core that came up and
     # then died would keep a fresh `.alive` (review-caught, qingyun-wu on #2488,
     # reproduced with core_pid=None at start: three beats, .alive still present).
-    # Fail-open is preserved: never having seen a core means never stopping.
+    # Before first sighting, publish NOTHING: write_beat() deliberately falls
+    # back to the writer pid when resolution is unavailable, and refreshing
+    # that fallback forever when a cold-started core never appears advertises
+    # a failed boot as healthy. Keep waiting (so a late core can still arm the
+    # gate), but remove any stale prior record until the real core is observed.
     saw_core = False
     absent_streak = 0
     while not _SHUTDOWN_REQUESTED:
@@ -347,11 +351,17 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
             except Exception:
                 pass
             return 0
-        try:
-            write_beat(status=status)
-        except Exception as e:
-            # Don't die on transient FS hiccups — log + retry next tick.
-            print(f"core_heartbeat: write failed: {e}", file=sys.stderr, flush=True)
+        if saw_core:
+            try:
+                write_beat(status=status)
+            except Exception as e:
+                # Don't die on transient FS hiccups — log + retry next tick.
+                print(f"core_heartbeat: write failed: {e}", file=sys.stderr, flush=True)
+        else:
+            try:
+                _alive_path().unlink(missing_ok=True)
+            except Exception:
+                pass
         # Sleep in small slices so SIGTERM is responsive (signal handler
         # sets the flag; we check it between slices instead of blocking
         # for the full `interval`).
