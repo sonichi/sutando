@@ -607,6 +607,45 @@ def test_the_cap_still_bounds_AUTOMATIC_grants():
           "...and rooms beyond it are still refused, not silently granted")
 
 
+def test_list_pack_shows_rooms_awaiting_the_owners_approval():
+    """Continued lifecycle enumeration — the `list_pack` (owner-view) cell.
+
+    The over-budget refusal says the room "surfaces as an explicit card the owner
+    can approve". The one view built for her listed only `active_rooms`, so the
+    rooms actually awaiting her decision were invisible in it. Same defect
+    already fixed once on this PR at the RECORD layer (a promise of approval with
+    nothing approvable behind it), reappearing at the VIEW layer: a decision she
+    cannot see is not a decision she has.
+    """
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(13)]
+    res = dpp.seed_defaults(d, OWNER, rooms)
+    queued = sorted(r["room_id"] for r in res if r["status"] == "refused")
+    check(len(queued) == 3, f"precondition: 3 rooms are queued (got {len(queued)})")
+
+    view = dpp.list_pack(d)[0]
+    check(view.get("awaiting_approval") == queued,
+          f"the owner view lists every room awaiting her approval (got {view.get('awaiting_approval')})")
+    check(len(view["active_rooms"]) == 10,
+          "...and still reports the auto-activated rooms separately")
+
+    # Approving one must MOVE it, not duplicate it into both lists.
+    store = op.SubscriptionStore(d)
+    pid = [r for r in res if r["status"] == "refused"][0]["policy_id"]
+    store.transition(pid, "active", note="owner approved")
+    v2 = dpp.list_pack(d)[0]
+    check(not (set(v2["active_rooms"]) & set(v2["awaiting_approval"])),
+          "an approved room moves from awaiting -> active, never appears in both")
+    check(len(v2["active_rooms"]) == 11 and len(v2["awaiting_approval"]) == 2,
+          f"counts move together (active {len(v2['active_rooms'])}, awaiting {len(v2['awaiting_approval'])})")
+
+    # CALIBRATION: the field must be able to be EMPTY, or "always lists 3" would pass.
+    dpp.set_enabled(d, "react_baseline", False)
+    v3 = dpp.list_pack(d)[0]
+    check(v3["awaiting_approval"] == [],
+          f"a disabled entry shows nothing pending — drafts were revoked (got {v3['awaiting_approval']})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

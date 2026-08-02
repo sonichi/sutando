@@ -405,12 +405,21 @@ def list_pack(store_dir: str) -> "list[dict]":
     out = []
     for entry in PACK_ENTRIES:
         active = _active_records_for(store, entry["key"])
+        # Rooms held past the aggregate budget are AWAITING THE OWNER'S DECISION.
+        # Listing only `active_rooms` made them invisible in the one view built
+        # for her: the refusal says it "surfaces as an explicit card the owner can
+        # approve", and the surface it names did not include them. That is the
+        # same defect already fixed once on this PR at the record layer (a promise
+        # of approval with nothing approvable behind it) reappearing at the VIEW
+        # layer — a decision she cannot see is not a decision she has.
         out.append({
             "key": entry["key"],
             "label": entry["label"],
             "description": entry["description"],
             "enabled": is_enabled(store_dir, entry["key"]),
             "active_rooms": sorted(r["room_id"] for r in active),
+            "awaiting_approval": sorted(
+                r["room_id"] for r in _pending_drafts_for(store, entry["key"])),
         })
     return out
 
