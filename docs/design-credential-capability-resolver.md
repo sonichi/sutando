@@ -52,8 +52,12 @@ Three rules, all load-bearing (implemented by #2197's `src/credential-resolver.t
 
 Writers: the desktop onboarding flow (G1/G2, air's lane) or AU provisioning.
 Written atomically (tmp + rename), mode 0600, only under `state/auth/`.
-`version` gates future shape changes; unknown versions skip the tier (fail
-open to BYO, never crash a working voice setup).
+`version` is reserved for future schema changes. **Not yet enforced:** #2197's
+`readManaged()` reads `capabilities` regardless of `version`, so an unknown
+version does not currently skip the tier — a `{ "version": 999, … }` file with a
+valid capability still resolves as managed. Enforcing unknown-version → skip
+(fail open to BYO, never crash a working voice setup) is a follow-up on the
+resolver, not part of #2197.
 
 ## Capability vocabulary
 
