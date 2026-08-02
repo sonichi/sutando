@@ -181,6 +181,8 @@ ensure_codex_scheduler() {
   local ws host scheduler
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   host="${SUTANDO_HOST_LABEL:-}"
+  # Blank-but-set passes `[ -z ]`; trim so it falls through to the resolver.
+  host="${host#"${host%%[![:space:]]*}"}"; host="${host%"${host##*[![:space:]]}"}"
   if [ -z "$host" ]; then
     host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || return 0
   fi

@@ -627,7 +627,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// per-host paths from the scutil-named Chis-MacBook-Pro subtree; #1745).
     func perHostLabel() -> String {
         let env = ProcessInfo.processInfo.environment
-        if let v = env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"], !v.isEmpty {
+        // `!v.isEmpty` is false for "   ", so a blank-but-set override became the
+        // label and produced `hosts/   /`. Trim first; blank means unset, same as
+        // the scutil branch below already does. Lockstep with util_paths.py/.ts.
+        if let v = (env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
             return v
         }
         if let lhn = runShell("/usr/sbin/scutil", ["--get", "LocalHostName"])?

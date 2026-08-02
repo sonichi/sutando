@@ -33,7 +33,9 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -145,6 +147,61 @@ for case in (None, "   ", "  Chis-Mac-mini  ", "My Host", "Chis-MacBook-Pro"):
     check(f"python and bash agree for {case!r}",
           py_label(case) == sh_label(case),
           f"py={py_label(case)!r} sh={sh_label(case)!r}")
+
+# --- 5. TypeScript: the third RUNTIME, not just the third file ---------------
+# `if (label)` is truthy for "   " exactly as `if env:` was in Python. Missed in
+# the first cut of this fix and caught in review with a live repro; driving the
+# real module through tsx is the only thing that would have caught it here.
+TSX = REPO / "node_modules" / ".bin" / "tsx"
+if not TSX.exists():
+    print("  SKIP  typescript (node_modules/.bin/tsx absent — CI installs it)")
+else:
+    def ts_label(env_value):
+        env_lit = "{}" if env_value is None else "{ SUTANDO_HOST_LABEL: %r }" % env_value
+        prog = (
+            "import { resolveHostLabel } from './src/util_paths.ts';\n"
+            f"process.stdout.write(JSON.stringify(resolveHostLabel({env_lit}, () => 'RealHost', 'fallback.local')));"
+        ).replace("'", '"') if False else (
+            "import { resolveHostLabel } from './src/util_paths.ts';\n"
+            f"process.stdout.write(JSON.stringify(resolveHostLabel({env_lit}, () => 'RealHost', 'fallback.local')));"
+        )
+        r = subprocess.run([str(TSX), "-e", prog], capture_output=True, text=True,
+                           cwd=str(REPO), timeout=120)
+        if r.returncode != 0:
+            raise AssertionError(f"tsx failed: {r.stderr[-300:]}")
+        return json.loads(r.stdout.strip())
+
+    ts_unset = ts_label(None)
+    check("positive control: TS resolves a real host when the override is unset",
+          ts_unset == "RealHost", repr(ts_unset))
+    for blank in ("   ", "\t"):
+        check(f"typescript: blank {blank!r} falls through to the real host",
+              ts_label(blank) == ts_unset, repr(ts_label(blank)))
+    check("typescript: surrounding whitespace is trimmed",
+          ts_label("  Chis-Mac-mini  ") == "Chis-Mac-mini", repr(ts_label("  Chis-Mac-mini  ")))
+    check("typescript: an interior space is preserved, not compacted",
+          ts_label("  My Host  ") == "My Host", repr(ts_label("  My Host  ")))
+
+# --- 6. Swift: SOURCE-level, and labelled as such ----------------------------
+# `main.swift`'s perHostLabel() is inside the app entry point, so compiling it in
+# isolation would drag in AppKit. This asserts the SHAPE of the fix, not its
+# behaviour, and says so rather than implying a behavioural test ran.
+swift = (REPO / "src" / "Sutando" / "main.swift").read_text()
+m = re.search(r"func perHostLabel\(\) -> String \{(.*?)\n    \}", swift, re.S)
+check("swift: perHostLabel() was found in main.swift", m is not None)
+if m:
+    body = m.group(1)
+    # Split on the scutil CALL, not the word: my own explanatory comment above the
+    # env branch mentions "scutil", so splitting on the bare token truncated the
+    # branch before the line under test and failed for the wrong reason. Anchoring
+    # on a marker that also appears in prose is the same defect this suite is about.
+    CALL = 'runShell("/usr/sbin/scutil"'
+    env_branch = body[:body.index(CALL)] if CALL in body else body
+    check("swift (SOURCE-level): the env branch trims before the isEmpty test",
+          "trimmingCharacters" in env_branch,
+          "no trim between reading the env and returning it")
+    check("swift (SOURCE-level): the raw `!v.isEmpty` form is gone",
+          'env["SUTANDO_HOST_OVERRIDE"], !v.isEmpty' not in body, env_branch[:160])
 
 print()
 if failures:
