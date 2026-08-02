@@ -24,6 +24,13 @@ from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason
 
 DEFAULT_FOLDER = "room-live-context"
 
+# Statuses whose degrade_reason() text is a DIAGNOSIS the server's own message
+# must not overwrite — 401 points at the bearer token, 403 at room membership.
+# Kept as a named set rather than an inline `in (401, 403)` so the reason it
+# exists is attached to it: this is not "auth-ish codes", it is "codes where a
+# wrong reason sends someone to the wrong subsystem".
+_AUTH_STATUSES = frozenset({401, 403})
+
 
 def _result(ok, *, room_id=None, folder=None, name=None, content=None,
             sha=None, reason=None):
@@ -54,13 +61,38 @@ def _call(op, room_id, agent_mxid, gate, extra):
         # doc backend (observed 2026-07-28: a missing plan doc read as "verb
         # unimplemented", masking that prep_get was in fact working). Prefer the
         # server's own error string when it sent one; fall back to degrade_reason.
+        #
+        # But the override is NOT unconditional. degrade_reason() encodes one
+        # distinction the body must never be allowed to erase: 401 ("auth failed
+        # — check the gateway bearer token") vs 403 ("denied — agent not a joined
+        # member"). See _gateway.py's own comment at degrade_reason(). Those two
+        # send a debugger to different places — one to the credential, one to
+        # room membership — and the gateway's prose for either is not reliably
+        # about the same thing. Unscoped, a structured body on a 401 renders as a
+        # membership verdict, which is precisely backwards:
+        #
+        #   401 + {"error": "denied - agent not a joined member"}
+        #        -> read as a membership problem; the real fault is the token
+        #   403 + {"error": "roadmap/plan.md not found"}
+        #        -> read as a missing doc; the real fault is membership
+        #
+        # So for auth statuses the local diagnosis stays authoritative and the
+        # server's message is APPENDED, never substituted — surfacing what the
+        # server said without letting it overwrite what the status code means.
+        # Dropping it entirely would trade one silent loss for another.
         reason = degrade_reason(e.code)
         try:
             parsed = json.loads(e.read().decode("utf-8") or "{}")
-            if isinstance(parsed, dict) and parsed.get("error"):
-                reason = str(parsed["error"])
         except Exception:
-            pass
+            parsed = None
+        server_msg = ""
+        if isinstance(parsed, dict) and parsed.get("error"):
+            server_msg = str(parsed["error"])
+        if server_msg:
+            if e.code in _AUTH_STATUSES:
+                reason = f"{reason} (server said: {server_msg})"
+            else:
+                reason = server_msg
         return _result(False, room_id=room_id, folder=extra.get("folder"),
                        name=extra.get("filename"), reason=reason)
     except (URLError, TimeoutError) as e:

@@ -80,10 +80,71 @@ def test_doc_get_wrapper_surfaces_reason():
           "doc_get() -> surfaces the structured not-found through the wrapper")
 
 
+def test_401_keeps_the_token_diagnosis_even_with_a_structured_body():
+    # bassilkhilo-ag2's blocker on #2375. The `except HTTPError` change reaches
+    # EVERY status the caller can receive, not only the 404 it was written for.
+    # A gateway 401 carrying a membership-flavoured body previously rendered as
+    # a membership verdict, sending a debugger to room membership when the real
+    # fault is the bearer token. degrade_reason() must stay authoritative here.
+    _patch(lambda *a, **k: (_ for _ in ()).throw(
+        _httperror(401, b'{"error": "denied - agent not a joined member"}')))
+    res = D._call("prep_get", "!r:x", "@me:x", {}, {})
+    reason = res.get("reason") or ""
+    check(reason.startswith("auth failed"),
+          "401 + membership-flavoured body -> still diagnoses the TOKEN")
+    check("(server said: denied - agent not a joined member)" in reason,
+          "401 -> the server's message is appended, not discarded")
+
+
+def test_403_keeps_the_membership_diagnosis_even_with_a_structured_body():
+    # The mirror case: a real membership denial worded like a missing doc must
+    # not read as "not found", or an access problem looks like a content problem.
+    _patch(lambda *a, **k: (_ for _ in ()).throw(
+        _httperror(403, b'{"error": "roadmap/plan.md not found"}')))
+    res = D._call("doc_get", "!r:x", "@me:x", {}, {"folder": "roadmap"})
+    reason = res.get("reason") or ""
+    check(reason.startswith("denied"),
+          "403 + not-found-flavoured body -> still diagnoses MEMBERSHIP")
+    check("(server said: roadmap/plan.md not found)" in reason,
+          "403 -> the server's message is appended, not discarded")
+
+
+def test_non_auth_statuses_still_prefer_the_server_message():
+    # CALIBRATION. The two guards above assert that a body did NOT win; both
+    # would also pass if the override had been deleted outright, which would
+    # regress this PR's entire purpose. Pin that the override still works where
+    # it is safe — 404 (the PR's target) and a generic 5xx, where degrade_reason
+    # has no diagnosis to protect and "HTTP 500" is strictly less useful.
+    _patch(lambda *a, **k: (_ for _ in ()).throw(
+        _httperror(404, b'{"error": "roadmap/plan.md not found"}')))
+    res = D._call("doc_get", "!r:x", "@me:x", {}, {"folder": "roadmap"})
+    check(res.get("reason") == "roadmap/plan.md not found",
+          "404 -> server message still wins (the PR's purpose is intact)")
+
+    _patch(lambda *a, **k: (_ for _ in ()).throw(
+        _httperror(500, b'{"error": "doc backend unavailable"}')))
+    res = D._call("doc_get", "!r:x", "@me:x", {}, {})
+    check(res.get("reason") == "doc backend unavailable",
+          "500 -> server message still wins over the generic 'HTTP 500'")
+
+
+def test_auth_status_without_a_body_is_unchanged():
+    # No body to append: the reason must be exactly degrade_reason(), with no
+    # dangling "(server said: )" fragment.
+    _patch(lambda *a, **k: (_ for _ in ()).throw(_httperror(401, b"")))
+    res = D._call("doc_get", "!r:x", "@me:x", {}, {})
+    check(res.get("reason") == "auth failed — check the gateway bearer token (401)",
+          "bodiless 401 -> plain degrade_reason, no empty 'server said' suffix")
+
+
 if __name__ == "__main__":
     test_structured_not_found_is_surfaced()
     test_bodiless_404_falls_back_to_degrade_reason()
     test_non_json_404_falls_back()
     test_doc_get_wrapper_surfaces_reason()
+    test_401_keeps_the_token_diagnosis_even_with_a_structured_body()
+    test_403_keeps_the_membership_diagnosis_even_with_a_structured_body()
+    test_non_auth_statuses_still_prefer_the_server_message()
+    test_auth_status_without_a_body_is_unchanged()
     print(f"\n{'FAILED: ' + '; '.join(FAILS) if FAILS else 'all passed'}")
     sys.exit(1 if FAILS else 0)
