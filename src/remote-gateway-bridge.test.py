@@ -485,6 +485,33 @@ def main() -> int:
     rtc._AUTH_HEADERS["Authorization"] = "Bearer testtoken"
     rtc.TOKEN_FILE = ""
 
+    # 5a-bis. Consumer-boundary BY-REFERENCE contract (#2323 review suggestion).
+    # Rotation reaches the long-lived consumers ONLY because they hold
+    # _AUTH_HEADERS by reference. Every producer-side assert above would still
+    # pass if a consumer __init__ copied the dict (the module dict is still
+    # mutated) while rotation silently stopped reaching that consumer — a
+    # bridge that keeps 401ing after rotation, the exact symptom this PR
+    # removes. Identity is the contract; assert it with `is`, constructed the
+    # way the bridge wires them (remote_gateway_bridge.py EventChannel/
+    # CardPoster call sites pass _AUTH_HEADERS itself).
+    from ag2_sparrow.event_channel import EventChannel as _ECBoundary
+    from ag2_sparrow.human_action import CardPoster as _CPBoundary
+
+    class _StubInbox:  # EventChannel.__init__ reads the durable cursor
+        def durable_cursor(self):
+            return ""
+    _bch = _ECBoundary(_StubInbox(), "https://gw", rtc._AUTH_HEADERS)
+    check(_bch._headers is rtc._AUTH_HEADERS,
+          "EventChannel holds _AUTH_HEADERS BY REFERENCE (is, not copy)")
+    _bcp = _CPBoundary(None, "https://gw", rtc._AUTH_HEADERS, "!room:x")
+    check(_bcp._headers is rtc._AUTH_HEADERS,
+          "CardPoster holds _AUTH_HEADERS BY REFERENCE (is, not copy)")
+    rtc._AUTH_HEADERS["Authorization"] = "Bearer boundary-rotated"
+    check(dict(_bch._headers)["Authorization"] == "Bearer boundary-rotated"
+          and {**_bcp._headers}["Authorization"] == "Bearer boundary-rotated",
+          "rotation reaches both consumers' per-request copies")
+    rtc._AUTH_HEADERS["Authorization"] = "Bearer testtoken"
+
     # 5b. DESKTOP recovery-arming regression (#2323): in the desktop-spawned case
     # startup.sh is skipped and ONLY AG2_DEVICE_ENV reaches the bridge — no
     # REMOTE_TASK_TOKEN and no REMOTE_TASK_TOKEN_FILE. A fresh import must not only
