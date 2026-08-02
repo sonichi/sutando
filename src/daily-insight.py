@@ -245,6 +245,8 @@ def analyze_note_activity():
         except ValueError:
             return None
 
+    unevidenced = []
+
     def _is_recent(n):
         iso = created.get(n.name)
         if iso is None and git_ran and created:
@@ -265,7 +267,10 @@ def analyze_note_activity():
             if verdict is not None:
                 return verdict
         # git unavailable, untracked, or an unparseable stamp: mtime is all
-        # there is, unreliable as it is here.
+        # there is, unreliable as it is here. Record which notes reached this
+        # branch — a count that mixes git dates with sync-reset mtimes is not a
+        # creation claim, however few of them there are.
+        unevidenced.append(n.name)
         return n.stat().st_mtime > cutoff
 
     recent = [n for n in notes if _is_recent(n)]
@@ -279,10 +284,17 @@ def analyze_note_activity():
     # workspace is the time of the last sync. Emitting it anyway is the original
     # 2026-08-02 bug ("356 notes in the last 7 days", true figure 50) in a
     # quieter form, so the caller is given the means to say nothing instead.
+    # `age_known` is per-CORPUS, not per-query. `bool(created)` was wrong: one
+    # tracked note flipped it True while every untracked note still contributed
+    # a sync-reset mtime to the same total — 1 tracked + 7 untracked reported
+    # "you created 7 notes", all seven from the source this function calls
+    # unreliable. A mixed tracked/untracked corpus is the normal state during a
+    # rolling sync or right after writing a note, not an exotic one.
     return {
         "total": len(notes),
         "recent_7d": len(recent),
-        "age_known": bool(created),
+        "age_known": bool(created) and not unevidenced,
+        "unevidenced": len(unevidenced),
         "top_tags": tags.most_common(5),
     }
 

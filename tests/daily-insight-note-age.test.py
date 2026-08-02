@@ -328,11 +328,29 @@ for _fn in (_mod._note_creation_dates, _mod._note_added_at):
 # direction: a confident zero is as unevidenced as a confident nine.
 
 def _insight_text(ws, notes):
+    """generate_insight() with every HIGHER-PRIORITY source silenced.
+
+    generate_insight() returns the dev-activity headline first and never reaches
+    the note branch when the ambient checkout has commits. Without these patches
+    the control passes only on a host with no commits today — it did here, and
+    failed on a reviewer host that read "Sutando shipped 17 commits...". A
+    control whose result depends on ambient git activity proves nothing about
+    note suppression.
+    """
     _o_ws, _o_dir = _mod.WORKSPACE, _mod.NOTES_DIR
+    _o_dev = _mod.analyze_dev_activity
+    _o_calls = _mod.load_calls
+    _o_tasks = _mod.analyze_task_patterns
     try:
         _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+        _mod.analyze_dev_activity = lambda *a, **k: None
+        _mod.load_calls = lambda *a, **k: []
+        _mod.analyze_task_patterns = lambda *a, **k: _mod.Counter()
         return _mod.generate_insight() or ""
     finally:
+        _mod.analyze_dev_activity = _o_dev
+        _mod.load_calls = _o_calls
+        _mod.analyze_task_patterns = _o_tasks
         _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
 
 
@@ -388,6 +406,66 @@ with tempfile.TemporaryDirectory() as _tmp:
        st["recent_7d"] == 7, f"got {st['recent_7d']}")
     txt = _insight_text(ws, notes)
     ok("CONTROL: with git history the claim IS emitted (suppression is not blanket)",
+       "notes in the last 7 days" in txt, f"emitted: {txt[:120]!r}")
+
+
+# --- mixed tracked/untracked must not be called evidenced (review rd 5) -----
+# `age_known = bool(created)` flipped True on a single tracked note while every
+# untracked note still contributed a sync-reset mtime to the SAME total. The
+# reviewer's repro: 1 note committed 2026-06-03 + 7 untracked with fresh mtimes
+# reported {total: 8, recent_7d: 7, age_known: True} — seven counted "creations"
+# all from the source this module calls unreliable. That is the normal state
+# during a rolling sync or just after writing a note, not an exotic one.
+
+with tempfile.TemporaryDirectory() as _tmp:
+    ws = Path(_tmp)
+    notes = ws / "notes"
+    notes.mkdir()
+    _git(ws, "init", "-q")
+    (notes / "tracked.md").write_text("---\ntags: [a]\n---\nbody\n")
+    _git(ws, "add", "notes/tracked.md")
+    _git(ws, "commit", "-qm", "old", when="2026-06-03T12:00:00 +0000")
+    for i in range(7):
+        (notes / f"untracked{i}.md").write_text("---\ntags: [a]\n---\nbody\n")
+
+    _o_ws, _o_dir = _mod.WORKSPACE, _mod.NOTES_DIR
+    try:
+        _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+        st = _mod.analyze_note_activity()
+    finally:
+        _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
+
+    ok("mixed corpus: age_known is False (1 tracked + 7 untracked)",
+       st["age_known"] is False, f"got {st}")
+    ok("mixed corpus: unevidenced counts the mtime-sourced notes",
+       st.get("unevidenced") == 7, f"got {st.get('unevidenced')}")
+    txt = _insight_text(ws, notes)
+    ok("mixed corpus: no note-creation claim is emitted",
+       "notes in the last 7 days" not in txt, f"emitted: {txt[:120]!r}")
+
+# and the fully-tracked control still emits, so the stricter rule is not blanket
+with tempfile.TemporaryDirectory() as _tmp:
+    ws = Path(_tmp)
+    notes = ws / "notes"
+    notes.mkdir()
+    _git(ws, "init", "-q")
+    for i in range(7):
+        f = notes / f"t{i}.md"
+        f.write_text("---\ntags: [b]\n---\nbody\n")
+        _git(ws, "add", f"notes/t{i}.md")
+    _git(ws, "commit", "-qm", "all tracked")
+
+    _o_ws, _o_dir = _mod.WORKSPACE, _mod.NOTES_DIR
+    try:
+        _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+        st = _mod.analyze_note_activity()
+    finally:
+        _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
+
+    ok("CONTROL: fully-tracked corpus is evidenced (unevidenced == 0)",
+       st["age_known"] is True and st.get("unevidenced") == 0, f"got {st}")
+    txt = _insight_text(ws, notes)
+    ok("CONTROL: fully-tracked corpus DOES emit the claim",
        "notes in the last 7 days" in txt, f"emitted: {txt[:120]!r}")
 
 
