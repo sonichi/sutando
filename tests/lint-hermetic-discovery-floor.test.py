@@ -31,6 +31,8 @@ Exit: 0 on pass, 1 on fail.
 from __future__ import annotations
 
 import importlib.util
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -210,6 +212,90 @@ check("an unresolvable base ref does NOT raise",
 check("...and returns the widen sentinel (None), not an empty list",
       widened is None,
       f"got {widened!r} — [] would silently scan nothing, which is the original bug")
+
+# --- 5. `no merge base` is the SAME failure, in git's other wording ------------
+# Section 4 above tests one spelling. Git has (at least) two for "this comparison
+# cannot be made here", and the first cut of the fallback recognised only the
+# first — so the shallow-checkout case it was written for still hard-failed.
+# Reproduced against real git, not asserted from the manual:
+#
+#     $ git init; git commit -m a; git checkout --orphan other; git commit -m b
+#     $ git diff --name-only --diff-filter=AM other...HEAD -- '*.txt'
+#     fatal: other...HEAD: no merge base
+#     rc=128
+#
+# `actions/checkout@v4` fetches depth 1, so a base ref that EXISTS can still share
+# no history with HEAD in the grafted shallow graph — which is this wording, not
+# "bad revision". Same class, same required response: widen, never crash.
+for stderr_wording, label in (
+    ("fatal: origin/main...HEAD: no merge base", "no merge base"),
+    ("fatal: bad revision 'origin/main...HEAD'", "bad revision"),
+    ("fatal: ambiguous argument 'origin/main...HEAD': unknown revision", "unknown revision"),
+):
+    class _Wording:
+        returncode = 128
+        stdout = ""
+        stderr = stderr_wording
+
+    real3 = subprocess.run
+
+    def fake_wording(cmd, *a, _w=_Wording, **k):
+        if isinstance(cmd, (list, tuple)) and cmd[:2] == ["git", "diff"]:
+            return _w()
+        return real3(cmd, *a, **k)
+
+    subprocess.run = fake_wording
+    try:
+        got = None
+        try:
+            got = lh.changed_tests("origin/main")
+        except SystemExit as e:
+            got = f"RAISED: {e}"
+    finally:
+        subprocess.run = real3
+    check(f"git's {label!r} wording widens (sentinel None), never raises",
+          got is None, f"got {str(got)[:180]!r}")
+
+# --- 6. END-TO-END through main(): the widen branch actually SCANS ------------
+# Everything above stops at `changed_tests()`. The branch that consumes the
+# sentinel — `if targets is None: targets = tracked_tests()` in main() — was
+# uncovered, which is both a coverage-gate failure and a real gap: a sentinel
+# nobody acts on is the original "0 scanned, exit 0" bug wearing a warning.
+#
+# This case uses REAL git in the REAL repo with a base ref that genuinely does
+# not exist, so nothing here is mocked: git fails for real, main() widens for
+# real, and the scanned count proves it read the whole tree rather than nothing.
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+saved_argv, saved_base = sys.argv[:], os.environ.get("BASE_REF")
+buf = io.StringIO()
+try:
+    sys.argv = ["lint-hermetic-bridge-tests.py", "--diff"]
+    os.environ["BASE_REF"] = "refs/heads/no-such-base-ref-for-this-test"
+    with contextlib.redirect_stdout(buf):
+        rc = lh.main()
+except SystemExit as e:
+    rc, = (f"RAISED: {e}",)
+finally:
+    sys.argv = saved_argv
+    if saved_base is None:
+        os.environ.pop("BASE_REF", None)
+    else:
+        os.environ["BASE_REF"] = saved_base
+out = buf.getvalue()
+
+check("main('--diff') with an unresolvable BASE_REF exits 0, not 128", rc == 0, repr(rc))
+check("...and SAYS it fell back, rather than falling back silently",
+      "Falling back to the full tracked-test scan" in out, out[:300])
+m = re.search(r"ok \((\d+) bridge-importing tests scanned", out)
+check("...and reports a scan, not 'no test files changed'",
+      m is not None and "no test files changed" not in out, out[-400:])
+if m:
+    # The number is the whole point: the pre-fix behaviour and a broken widen both
+    # print a verdict, and only the count tells them apart.
+    check("...and the count proves it scanned the FULL tree, not an empty diff",
+          int(m.group(1)) >= 10, f"scanned {m.group(1)} — too few to be the full tree")
 
 print()
 if failures:

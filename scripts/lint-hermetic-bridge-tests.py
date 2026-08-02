@@ -974,10 +974,19 @@ def scan(paths) -> dict[str, str]:
     return out
 
 
-#: git's wording when a ref simply is not present in this checkout (shallow clone,
-#: missing remote-tracking branch). Distinct from a genuine git failure.
+#: git's wordings for "this comparison cannot be made in this checkout" -- as
+#: distinct from a genuine git failure. Two different situations, both routine
+#: under `actions/checkout@v4` depth 1 and both requiring the same response:
+#:   * the ref is ABSENT           -> "bad revision" / "unknown revision" / ...
+#:   * the ref exists but shares NO HISTORY with HEAD in the grafted shallow
+#:     graph                       -> "no merge base"
+#: The first cut of this fallback listed only the absent-ref spellings, so the
+#: shallow case it was written for still hard-failed. Verified against real git:
+#: `git diff --name-only A...HEAD` across unrelated histories exits 128 with
+#: `fatal: A...HEAD: no merge base`.
 _UNRESOLVABLE_REF = re.compile(
-    r"bad revision|unknown revision|ambiguous argument|not a valid object name",
+    r"bad revision|unknown revision|ambiguous argument|not a valid object name"
+    r"|no merge base",
     re.I,
 )
 
