@@ -260,6 +260,22 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
             # _budget_allows() at 18/20 and both activated, taking committed to 22.
             # Reservation and activation are one step here too.
             with op.store_lock(store_dir):
+                # RE-READ THE RECORD INSIDE THE LOCK. `existing` was read BEFORE the
+                # lock, only to choose this branch, and a direct owner cancellation can
+                # land in between — transition() now correctly holds the lock, so the
+                # cancel completes FIRST and this branch proceeds on a stale `draft`.
+                #
+                # _entry_still_live() cannot catch it: that checks the pack ENTRY
+                # (enabled + generation), while this is a per-RECORD cancellation. The
+                # entry stays enabled, every existing guard passes, the blind save
+                # rewrites cancelled -> draft, and the activation then legally succeeds.
+                # Measured on 3572d094: transition_cancelled True, result 'resumed',
+                # stored_status ACTIVE — a terminal record resurrected and re-activated.
+                fresh = store.get(pid)
+                if fresh is None or fresh.get("status") != "draft":
+                    return {"status": "refused", "policy_id": pid,
+                            "reason": "the draft was cancelled or removed while this "
+                                      "resume was in flight"}
                 ok, why = _budget_allows(store, normalized)
                 if not ok:
                     return {"status": "refused", "policy_id": pid, "reason": why}

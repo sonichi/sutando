@@ -881,6 +881,64 @@ def test_resume_branch_holds_the_store_lock_for_its_budget_check():
           f"(got {seen.get('r')!r})")
 
 
+def test_owner_cancel_racing_a_resume_cannot_resurrect_the_record():
+    """Direct owner cancellation racing a crash-draft resume (review, 5th instance).
+
+    `existing = store.get(pid)` is read BEFORE the lock, only to choose this
+    branch. `transition()` now correctly holds the lock, so a cancel can complete
+    FIRST and the resume branch then proceeds on a stale `draft` view: the blind
+    save rewrites `cancelled` -> `draft` and the activation legally succeeds.
+
+    Why every existing guard misses it: `_entry_still_live()` checks the pack
+    ENTRY (enabled + generation); this is a per-RECORD cancellation, so the entry
+    stays enabled and the check passes. The record's own status is the only thing
+    that changed, and nothing inside the lock was re-reading it.
+
+    Measured at 3572d094: transition_cancelled True, result "resumed",
+    stored_status ACTIVE.
+    """
+    d = _store()
+    entry = dpp._entry("react_baseline")
+    dpp.seed_defaults(d, OWNER, ["!r0:ag2.space"])
+    store = op.SubscriptionStore(d)
+    gen = dpp._entry_state(dpp.load_pack_state(d), entry["key"])["generation"]
+    room = "!crash:ag2.space"
+    pid = dpp._policy_id_for(entry["key"], gen, room)
+
+    rec, errs = op.validate_draft(dpp._draft_for(entry, room, OWNER, gen))
+    check(not errs, "setup: crash draft validates")
+    rec["pack"] = {"entry": entry["key"], "generation": gen}
+    store.save(rec)
+    check(store.get(pid)["status"] == "draft", "precondition: record is a draft")
+
+    real_lock = op.store_lock
+    fired = []
+
+    def racing_lock(store_dir, **kw):
+        # the owner cancels AFTER the pre-lock read, BEFORE the lock is taken
+        if not fired:
+            fired.append(1)
+            op.SubscriptionStore(d).transition(pid, "cancelled", note="owner direct cancel")
+        return real_lock(store_dir, **kw)
+
+    op.store_lock = racing_lock
+    try:
+        r = dpp.seed_room(op.SubscriptionStore(d), d, entry, room,
+                          owner_mxid=OWNER, owner_rooms=["!r0:ag2.space", room])
+    finally:
+        op.store_lock = real_lock
+
+    check(bool(fired), "control: the cancel injection actually fired")
+    check(op.SubscriptionStore(d).get(pid)["status"] == "cancelled"
+          or r["status"] != "resumed",
+          "control: the record really was cancelled before the lock")
+    final = op.SubscriptionStore(d).get(pid)["status"]
+    check(final != "active",
+          f"a cancelled record is never resurrected by a resume (got {final!r})")
+    check(r["status"] != "resumed",
+          f"and the caller is not told 'resumed' (got {r['status']!r})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
