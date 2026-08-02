@@ -242,7 +242,10 @@ check("a watcher and the real core in one session -> the CORE's answer",
 # fresh records (local at N-1, peer at N) and the probe targeted the peer's socket;
 # that socket is absent locally so the tri-state degraded to None — correct behaviour,
 # wrong target, and it suppresses the warning this check exists to raise.
-import json as _json, tempfile as _tf, time as _t, pathlib as _pl
+import json as _json
+import pathlib as _pl
+import tempfile as _tf
+import time as _t
 
 _ws = _pl.Path(_tf.mkdtemp())
 _cores = _ws / "state" / "cores"
@@ -252,7 +255,6 @@ _local_label = sorted(hc._local_host_labels())[0]
 (_cores / "PeerHost.alive").write_text(_json.dumps({"socket": "/tmp/peer-core.sock"}))
 # make the PEER strictly newer, which is the case that used to win
 _now = _t.time()
-import os as _os
 _os.utime(_cores / f"{_local_label}.alive", (_now - 5, _now - 5))
 _os.utime(_cores / "PeerHost.alive", (_now, _now))
 
