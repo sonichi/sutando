@@ -195,16 +195,20 @@ ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 # tasks/ + results/ (the shared task bus — the core is one consumer),
 # last-owner-activity.json (owner presence is one signal regardless of which
 # door the message came through), and core-status.json (the core's, not ours).
+# THE instance-name contract — single source of truth. The import guard below
+# and _LOCAL_TID_RE both derive from this pattern, because every drift between
+# them has produced the same bug class (queue + ACK + silently-stranded
+# results): first a length mismatch (>32 chars, review P1 round 5), then a
+# charset mismatch (str.isalnum() accepts Unicode letters the ASCII regex
+# rejects — GATEWAY_INSTANCE=é imported fine and stranded results, round 6).
+# ASCII [A-Za-z0-9_-], 1-32 chars, and nothing else — if this ever needs to
+# change, it changes HERE and both consumers follow.
+_INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
 GATEWAY_INSTANCE = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
-if GATEWAY_INSTANCE and not GATEWAY_INSTANCE.replace("-", "").replace("_", "").isalnum():
-    sys.exit(f"FATAL: GATEWAY_INSTANCE must be alphanumeric/-/_ (got {GATEWAY_INSTANCE!r})")
-# Length bound MUST match _LOCAL_TID_RE's instance segment ({1,32}) — review
-# P1 2026-08-02: a 33-char instance passed this guard, queued + ACKed tasks,
-# then _valid_local_tid() rejected the encoding and results were silently
-# stranded. Import refusal keeps the two contracts from drifting apart at the
-# only point a mismatch can enter.
-if len(GATEWAY_INSTANCE) > 32:
-    sys.exit(f"FATAL: GATEWAY_INSTANCE must be ≤32 chars (got {len(GATEWAY_INSTANCE)}: {GATEWAY_INSTANCE!r})")
+if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
+    sys.exit("FATAL: GATEWAY_INSTANCE must match "
+             f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
 
 
@@ -241,7 +245,7 @@ def _broker_tid(local_tid: str) -> str:
     return local_tid
 
 
-_LOCAL_TID_RE = re.compile(r"task-[A-Za-z0-9_-]{1,32}~([A-Za-z0-9._-]{1,64})")
+_LOCAL_TID_RE = re.compile(rf"task-{_INSTANCE_RE.pattern}~([A-Za-z0-9._-]{{1,64}})")
 
 
 def _valid_local_tid(tid: str) -> bool:

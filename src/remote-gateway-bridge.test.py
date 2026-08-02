@@ -163,6 +163,18 @@ def main() -> int:
         check(False, "GATEWAY_INSTANCE longer than 32 chars refuses at import")
     except SystemExit:
         check(True, "GATEWAY_INSTANCE longer than 32 chars refuses at import")
+    # A Unicode-letter instance must refuse at import — str.isalnum() accepted
+    # é/中 while the ASCII local-id regex rejected them: same strand class as
+    # the length bug, closed by deriving BOTH checks from one _INSTANCE_RE
+    # (review P1, round 6).
+    os.environ["GATEWAY_INSTANCE"] = "é"
+    _uspec = importlib.util.spec_from_file_location("rtc_unicode", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _urtc = importlib.util.module_from_spec(_uspec)
+    try:
+        _uspec.loader.exec_module(_urtc)
+        check(False, "Unicode-letter GATEWAY_INSTANCE refuses at import")
+    except SystemExit:
+        check(True, "Unicode-letter GATEWAY_INSTANCE refuses at import")
     # A path-shaped instance name must refuse at import (it lands in filenames).
     os.environ["GATEWAY_INSTANCE"] = "../evil"
     _bspec = importlib.util.spec_from_file_location("rtc_badinst", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
