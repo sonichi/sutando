@@ -264,7 +264,26 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
     # cannot know it is the twelfth.
     ok, why = _budget_allows(store, normalized)
     if not ok:
-        return {"status": "refused", "policy_id": pid, "reason": why}
+        # PERSIST the over-budget policy as a DRAFT instead of returning nothing.
+        #
+        # The refusal copy says explicit approval is required, and that sentence
+        # has to be backed by a record or it is a promise the system cannot keep:
+        # returning before store.save() left the deterministic policy_id absent,
+        # so `transition(pid, "active")` had nothing to activate and the result
+        # carried none of the fields render_card() needs. Verified on 08cedd9c
+        # with an 11-room seed — 10 seeded, 1 refused, store.get(refused) is None.
+        # Rooms past the budget were then neither auto-subscribed NOR
+        # owner-actionable, which is the silent drop the budget exists to avoid.
+        #
+        # A draft is the right state: it is inspectable, it consumes no budget
+        # (committed_evals_per_day counts ACTIVE only), and the resume path above
+        # re-runs this same check — so it cannot self-activate while over budget,
+        # and it DOES activate on the next seed if budget frees up because a room
+        # was cancelled. Self-healing rather than requiring a re-seed dance.
+        normalized["pack"] = {"entry": entry["key"], "generation": gen}
+        store.save(normalized)
+        return {"status": "refused", "policy_id": pid, "reason": why,
+                "draft": normalized, "awaiting": "owner-approval"}
 
     # Tag with pack provenance AFTER validate_draft (which drops unknown keys);
     # the store persists extra fields and observe_policy ignores them.

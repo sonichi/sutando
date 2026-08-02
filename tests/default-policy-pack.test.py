@@ -359,6 +359,71 @@ def test_budget_counts_only_pack_provenance_records():
           f"a non-pack active policy contributes 0 to the pack budget (got {_aggregate(d)})")
 
 
+def test_over_budget_room_leaves_an_APPROVABLE_record():
+    """john-the-dev's follow-up [P1] on #2320. The refusal copy says explicit
+    approval is required; that sentence must be backed by a record. Before the
+    fix, seed_room() returned before store.save(), so the deterministic policy_id
+    did not exist, transition(pid,'active') had nothing to act on, and the result
+    carried none of the fields a confirmation card needs. Verified on 08cedd9c:
+    11 rooms -> 10 seeded, 1 refused, store.get(refused) is None. Rooms past the
+    budget were then neither auto-subscribed NOR owner-actionable — the silent
+    drop the budget exists to prevent."""
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(11)]
+    res = dpp.seed_defaults(d, OWNER, rooms)
+    refused = [r for r in res if r["status"] == "refused"]
+    check(len(refused) == 1, f"one room lands over budget (got {len(refused)})")
+    store = op.SubscriptionStore(d)
+    rec = store.get(refused[0]["policy_id"])
+    check(rec is not None and rec.get("status") == "draft",
+          f"the over-budget policy is persisted as a draft (got {rec and rec.get('status')})")
+    check("draft" in refused[0] and refused[0].get("awaiting") == "owner-approval",
+          "the refusal result carries the draft + an explicit awaiting marker")
+    # The grammar the reviewer showed was broken must now work end to end.
+    check(store.transition(refused[0]["policy_id"], "active", note="owner approved") is True,
+          "transition(pid,'active') now has a record to act on")
+    # A draft must not consume budget, or the refusal would shrink the allowance
+    # every time it fired and the pack would starve itself.
+    d2 = _store()
+    dpp.seed_defaults(d2, OWNER, rooms)
+    check(_aggregate(d2) <= dpp.PACK_AGGREGATE_EVALS_PER_DAY,
+          f"a persisted draft consumes no budget ({_aggregate(d2)})")
+
+
+def test_a_persisted_draft_does_not_self_activate_while_over_budget():
+    """CONTROL for the fix above. seed_room() treats an existing draft as a
+    crash-interrupted seed and RESUMES it, so persisting one over budget could
+    have created a back door that activates on the next reconnect. The resume
+    path re-runs the same budget check, so it must stay refused."""
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(11)]
+    dpp.seed_defaults(d, OWNER, rooms)
+    before = _aggregate(d)
+    again = dpp.seed_defaults(d, OWNER, rooms)
+    check(not [r for r in again if r["status"] == "resumed"],
+          "no draft resumes while the budget is still saturated")
+    check(_aggregate(d) == before,
+          f"aggregate unchanged across the reseed ({before} -> {_aggregate(d)})")
+
+
+def test_the_draft_resumes_once_budget_frees_up():
+    """CALIBRATION. The control above is satisfied by a draft that can NEVER
+    activate, which would make the 'awaiting approval' state a dead end. Cancel
+    one active room and the queued draft must take the freed allowance on the
+    next seed — self-healing rather than requiring an owner re-seed dance."""
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(11)]
+    dpp.seed_defaults(d, OWNER, rooms)
+    store = op.SubscriptionStore(d)
+    victim = store.list(status="active")[0]
+    store.transition(victim["policy_id"], "cancelled", note="owner cancel")
+    after = dpp.seed_defaults(d, OWNER, rooms)
+    check(any(r["status"] == "resumed" for r in after),
+          "the queued draft activates once a room is cancelled")
+    check(_aggregate(d) <= dpp.PACK_AGGREGATE_EVALS_PER_DAY,
+          f"...and the budget still holds ({_aggregate(d)})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
