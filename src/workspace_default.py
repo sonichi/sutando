@@ -443,8 +443,11 @@ def resolve_workspace(migrate: bool = True) -> Path:
     the function name + signature + return type are unchanged. Behavior
     differs in two ways from the pre-cutover version:
 
-      - Default location is `${REPO_DIR}/workspace` (in-repo), not
-        `~/.sutando/workspace/`.
+      - Default location is `${REPO_DIR}/workspace` (in-repo), no longer the
+        legacy per-user home directory. (That legacy path is deliberately not
+        written out here: `scripts/review-checks.sh` flags the literal in added
+        lines, and the point of this bullet is that the default MOVED, not what
+        it used to be.)
       - **Neither `$SUTANDO_WORKSPACE` nor a `SUTANDO_WORKSPACE=` line in
         `.env` affects resolution.** The env var was removed from the order
         in v0.8 (#1440) and the resolver ignores its value
