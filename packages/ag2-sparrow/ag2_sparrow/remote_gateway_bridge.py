@@ -202,28 +202,50 @@ _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
 
 
 def _local_tid(broker_tid: str) -> str:
-    """Instance-namespaced LOCAL task id (P1 fix, PR review 2026-08-02).
+    """Instance-namespaced LOCAL task id (P1 fixes, PR review 2026-08-02 ×2).
 
-    Broker ids are only unique WITHIN a gateway; two gateways can mint the same
-    id. The local task/result filenames are the shared bus between instances,
-    so a named instance prefixes its instance name into the local id —
-    `task-abc` → `task-<inst>.abc` — making the file namespace collision-free
-    while `_broker_tid` recovers the wire id for ack/result POSTs. Unset
-    instance → identity (legacy single-gateway installs unchanged)."""
+    Broker ids are only unique WITHIN a gateway, so named instances must not
+    share the primary's local id space. The encoding is `task-<inst>~<broker_id>`
+    (broker id embedded VERBATIM after `~`):
+    - INJECTIVE across every (instance, broker_id) pair including the
+      unsuffixed primary: `~` is outside the broker id alphabet
+      (`[A-Za-z0-9._-]`, `_TID_RE`) and outside the GATEWAY_INSTANCE charset
+      (import guard), so no primary pass-through id can equal a named-instance
+      encoding, and the first `~` splits unambiguously. The earlier
+      `task-<inst>.<rest>` scheme was NOT injective — a primary broker id
+      `task-dev.X` collided with dev's mapping of `task-X` (review P1 #2).
+    - Still matches every consumer's `task-*` glob (watcher, archiver).
+    - May exceed _TID_RE's 64-char wire bound (review P1 #1) — local
+      consumers therefore gate on `_valid_local_tid`, and the wire id is
+      re-derived and `_valid_tid`-checked at the ack/result egress points.
+    Unset instance → identity (legacy single-gateway installs unchanged)."""
     if not GATEWAY_INSTANCE:
         return broker_tid
-    rest = broker_tid[5:] if broker_tid.startswith("task-") else broker_tid
-    return f"task-{GATEWAY_INSTANCE}.{rest}"
+    return f"task-{GATEWAY_INSTANCE}~{broker_tid}"
 
 
 def _broker_tid(local_tid: str) -> str:
     """Reverse of `_local_tid` — the id the GATEWAY knows this task by."""
     if not GATEWAY_INSTANCE:
         return local_tid
-    prefix = f"task-{GATEWAY_INSTANCE}."
+    prefix = f"task-{GATEWAY_INSTANCE}~"
     if local_tid.startswith(prefix):
-        return f"task-{local_tid[len(prefix):]}"
+        return local_tid[len(prefix):]
     return local_tid
+
+
+_LOCAL_TID_RE = re.compile(r"task-[A-Za-z0-9_-]{1,32}~([A-Za-z0-9._-]{1,64})")
+
+
+def _valid_local_tid(tid: str) -> bool:
+    """A safe LOCAL id: either a plain wire-valid id (primary/legacy) or a
+    named-instance encoding whose embedded broker id is itself wire-valid.
+    Centralizes the widened bound so every local consumer accepts what
+    `_local_tid` can produce (max ≈ 5+32+1+64 chars — filename-safe)."""
+    if _valid_tid(tid):
+        return True
+    m = _LOCAL_TID_RE.fullmatch(tid)
+    return bool(m) and m.group(1) not in (".", "..")
 
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
@@ -686,7 +708,10 @@ def _http_error_body(e) -> str:
 def _post_task_ack(tid: str) -> bool:
     """Tell the gateway a task made it safely into the local queue."""
     global _ack_disabled_until
-    if not _valid_tid(tid):
+    # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
+    # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
+    # the local form stranded queued results while the gateway waited forever.
+    if not _valid_tid(_broker_tid(tid)):
         return False
     if _ack_disabled_until and time.time() < _ack_disabled_until:
         return False  # gateway recently 404'd /ack — retry after the cooldown
@@ -1366,7 +1391,7 @@ def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
     for tid in list(inflight):
-        if not _valid_tid(tid):  # defense-in-depth: never read an unsafe path
+        if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
@@ -1450,7 +1475,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     check and the discard is then picked up by the next `_post_ready_results`
     instead of being raced. Returns the new suspects set for the next pass."""
     gone = {tid for tid in inflight
-            if _valid_tid(tid)
+            if _valid_local_tid(tid)
             and not (TASKS_DIR / f"{tid}.txt").exists()
             and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
             and not (RESULTS_DIR / f"{tid}.txt").exists()}

@@ -176,27 +176,70 @@ def main() -> int:
     # and dev (named instance) both receive broker id task-COLLIDE against the
     # SAME workspace; the local bus must keep them distinct, and the dev
     # instance's result POST must carry the BROKER id back on the wire. ──────
-    check(_grtc._local_tid("task-COLLIDE") == "task-dev.COLLIDE"
-          and _grtc._broker_tid("task-dev.COLLIDE") == "task-COLLIDE"
+    check(_grtc._local_tid("task-COLLIDE") == "task-dev~task-COLLIDE"
+          and _grtc._broker_tid("task-dev~task-COLLIDE") == "task-COLLIDE"
           and _lrtc._local_tid("task-COLLIDE") == "task-COLLIDE",
           "local/broker id mapping round-trips (dev) and is identity (legacy)")
+    # P1 (review #2): the mapping must be INJECTIVE across instances INCLUDING
+    # the unsuffixed primary. The old dotted scheme collided: primary broker id
+    # task-dev.COLLIDE == dev's mapping of task-COLLIDE. Under ~-encoding the
+    # ranges are disjoint (broker ids cannot contain ~), so the ambiguous
+    # primary id maps to itself and differs from dev's encoding — and a wire id
+    # carrying ~ is refused outright.
+    check(_lrtc._local_tid("task-dev.COLLIDE") == "task-dev.COLLIDE"
+          and _grtc._local_tid("task-COLLIDE") != "task-dev.COLLIDE",
+          "prefix-overlap case is collision-free (primary task-dev.X vs dev task-X)")
+    check(not _lrtc._valid_tid("task-dev~task-X"),
+          "the ~ encoding is unreachable from the wire (broker id charset excludes it)")
+    # P1 (review #1): a MAX-LENGTH broker id (64 chars) must survive the whole
+    # named-instance path — queue, ack, result POST — even though the local
+    # encoding exceeds the 64-char wire bound. Previously the ack refused it and
+    # _post_ready_results dropped it from inflight with the result stranded.
+    _maxid = "task-" + "M" * 59
+    check(_lrtc._valid_tid(_maxid), "max-length broker id is wire-valid (precondition)")
+    _mt = _grtc._write_task({"id": _maxid, "timestamp": "2026-08-02T00:00:00Z",
+                             "task": "MAXLEN", "source": "remote-gateway",
+                             "channel_id": "!p:example.org", "user_id": "@q:example.org"})
+    check(_mt == f"task-dev~{_maxid}" and (_grtc.TASKS_DIR / f"{_mt}.txt").exists(),
+          "max-length broker id queues under the instance encoding")
+    check(_grtc._valid_local_tid(_mt) and not _lrtc._valid_tid(_mt),
+          "local validator accepts the over-64 encoding the wire validator refuses")
+    _ab = len(STATE["acks"])
+    check(_grtc._post_task_ack(_mt) is True
+          and STATE["acks"][-1]["body"]["id"] == _maxid,
+          "ack posts the WIRE id for the max-length task (no local-form refusal)")
+    (_grtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    (_grtc.RESULTS_DIR / f"{_mt}.txt").write_text("maxlen answer")
+    _rb2 = len(STATE["results"])
+    _mi = {_mt}
+    _grtc._post_ready_results(_mi)
+    check(len(STATE["results"]) == _rb2 + 1
+          and STATE["results"][-1]["id"] == _maxid
+          and STATE["results"][-1]["body"] == "maxlen answer",
+          "max-length result POSTs with the broker id — not silently dropped from inflight")
+    STATE["results"].pop(); STATE["acks"].pop()
+    for _f in (f"{_mt}.txt",):
+        try: (_grtc.TASKS_DIR / _f).unlink()
+        except FileNotFoundError: pass
+    try: (_grtc.ARCHIVE_RESULTS_DIR / f"{_mt}.txt").unlink()
+    except FileNotFoundError: pass
     _collide = {"id": "task-COLLIDE", "timestamp": "2026-08-02T00:00:00Z",
                 "task": "PROD TASK", "source": "remote-gateway",
                 "channel_id": "!p:example.org", "user_id": "@qingyun:example.org"}
     _pt = _lrtc._write_task(dict(_collide))
     _dt = _grtc._write_task({**_collide, "task": "DEV TASK"})
-    check(_pt == "task-COLLIDE" and _dt == "task-dev.COLLIDE",
+    check(_pt == "task-COLLIDE" and _dt == "task-dev~task-COLLIDE",
           "same broker id yields DISTINCT local ids per instance")
     check((_lrtc.TASKS_DIR / "task-COLLIDE.txt").exists()
-          and (_grtc.TASKS_DIR / "task-dev.COLLIDE.txt").exists(),
+          and (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").exists(),
           "both task files exist — no instance shadowed the other's queue write")
-    check("id: task-dev.COLLIDE" in (_grtc.TASKS_DIR / "task-dev.COLLIDE.txt").read_text()
-          and "DEV TASK" in (_grtc.TASKS_DIR / "task-dev.COLLIDE.txt").read_text(),
+    check("id: task-dev~task-COLLIDE" in (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").read_text()
+          and "DEV TASK" in (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").read_text(),
           "dev task file serializes the LOCAL id (result filename follows it)")
     (_grtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
-    (_grtc.RESULTS_DIR / "task-dev.COLLIDE.txt").write_text("dev answer")
+    (_grtc.RESULTS_DIR / "task-dev~task-COLLIDE.txt").write_text("dev answer")
     _rb = len(STATE["results"])
-    _grtc._post_ready_results({"task-dev.COLLIDE"})
+    _grtc._post_ready_results({"task-dev~task-COLLIDE"})
     check(len(STATE["results"]) == _rb + 1
           and STATE["results"][-1]["id"] == "task-COLLIDE"
           and STATE["results"][-1]["body"] == "dev answer",
@@ -208,10 +251,10 @@ def main() -> int:
     # remove its task files + archived result. (First CI run caught this; the
     # local "exit 0" that missed it was a piped-exit-code misread — lesson.)
     STATE["results"].pop()
-    for _f in ("task-COLLIDE.txt", "task-dev.COLLIDE.txt"):
+    for _f in ("task-COLLIDE.txt", "task-dev~task-COLLIDE.txt"):
         try: (_lrtc.TASKS_DIR / _f).unlink()
         except FileNotFoundError: pass
-    try: (_grtc.ARCHIVE_RESULTS_DIR / "task-dev.COLLIDE.txt").unlink()
+    try: (_grtc.ARCHIVE_RESULTS_DIR / "task-dev~task-COLLIDE.txt").unlink()
     except FileNotFoundError: pass
 
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
