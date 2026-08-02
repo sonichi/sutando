@@ -209,6 +209,56 @@ def main() -> int:
           and "proactive-unverifiable.txt" in {p.name for p in results.glob("archive-*/*.txt")},
           f"rc={rc_after} exists={unverifiable.exists()}")
 
+    # ---- paths_held_open() edge cases, exercised directly -------------------
+    # These are branches main() cannot reach on its own: it only calls the helper
+    # when there is at least one candidate and when lsof is resolvable. Testing
+    # them through main() would need contortions that prove less than calling the
+    # function does.
+
+    # Empty input must short-circuit. This is not defensive noise: `lsof -F pn --`
+    # with NO file arguments lists EVERY open file on the machine, so a missing
+    # guard here would turn "nothing to check" into "everything looks held" —
+    # the archiver would silently stop working. Assert the short-circuit rather
+    # than trusting the caller's `if candidates:` to stay there forever.
+    check("paths_held_open([]) short-circuits to empty (never a bare lsof)",
+          arch.paths_held_open([]) == set())
+
+    # An lsof that cannot be EXECUTED raises OSError out of subprocess.run — a
+    # different branch from the non-zero-exit case above, which runs a real stub.
+    # Emptying PATH is not enough: shutil.which() then returns None and the code
+    # falls back to the absolute /usr/sbin/lsof, which exists on macOS and not on
+    # Linux, so that approach would pass or fail depending on the runner. Patch
+    # the resolution seam instead, so the branch fires identically everywhere.
+    missing_bin = str(tmp / "definitely-not-lsof")
+    real_which = arch.shutil.which
+    arch.shutil.which = lambda *a, **k: missing_bin
+    try:
+        raised = False
+        try:
+            arch.paths_held_open([results / "anything.txt"])
+        except arch.OpenWriterCheckUnavailable:
+            raised = True
+        except Exception as e:  # any other exception type is a bug, not a pass
+            raised = f"wrong exception: {type(e).__name__}: {e}"
+    finally:
+        arch.shutil.which = real_which
+    check("unrunnable lsof raises OpenWriterCheckUnavailable, not a raw OSError",
+          raised is True, str(raised))
+    check("...and shutil.which was restored (no leak into later assertions)",
+          arch.shutil.which is real_which)
+
+    # A sweep with NO stale candidates must not consult lsof at all and must
+    # still report cleanly. Separate workspace so the files above don't leak in.
+    tmp2 = Path(tempfile.mkdtemp(prefix="archiver-nocand-"))
+    (tmp2 / ".notes-migrated").touch()
+    (tmp2 / ".build_log-migrated").touch()
+    arch2 = _load_archiver(tmp2)
+    arch2.RESULTS.mkdir(parents=True, exist_ok=True)
+    (arch2.RESULTS / "fresh.txt").write_text("recent, not stale\n")
+    check("a sweep with zero stale candidates returns 0", arch2.main() == 0)
+    check("...and leaves the fresh file alone",
+          (arch2.RESULTS / "fresh.txt").exists())
+
     print()
     if fails:
         print(f"FAIL — {len(fails)}: {fails}")

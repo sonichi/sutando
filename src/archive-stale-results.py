@@ -101,17 +101,20 @@ def paths_held_open(paths: "list[Path]") -> "set[Path]":
         raise OpenWriterCheckUnavailable(
             f"lsof exited {proc.returncode}: {proc.stderr.strip()[:200]}"
         )
-    wanted = {p.resolve(): p for p in paths}
+    # os.path.realpath, not Path.resolve(): lsof reports names we do not control
+    # (it can emit decorated or non-path strings), and realpath is total — it
+    # normalizes without raising, where Path.resolve() would need a try/except
+    # whose failure mode is hard to trigger and therefore hard to prove. Both
+    # sides go through the SAME function so the comparison is apples-to-apples;
+    # normalizing only one side would silently miss a symlinked results dir.
+    wanted = {os.path.realpath(p): p for p in paths}
     open_now = set()
     for line in proc.stdout.splitlines():
         if not line.startswith("n"):
             continue
-        try:
-            resolved = Path(line[1:]).resolve()
-        except OSError:
-            continue
-        if resolved in wanted:
-            open_now.add(wanted[resolved])
+        match = wanted.get(os.path.realpath(line[1:]))
+        if match is not None:
+            open_now.add(match)
     return open_now
 
 
