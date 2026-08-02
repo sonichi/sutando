@@ -129,6 +129,54 @@ ensure_core_monitor() {
     >/tmp/core-input-watch.log 2>&1 &
 }
 
+# Guarantee this host's core heartbeat writer. src/core_heartbeat.py is the SOLE
+# writer of state/cores/<host>.alive; the cron-runner (installed by
+# ensure_durable_schedules below) reads that file as its liveness signal —
+# local_core_alive() returns False on a missing/stale .alive and cron-runner
+# then skips every due launchd fire without advancing the boundary
+# (src/cron-runner.py). startup.sh starts the heartbeat, but the Codex launcher
+# does not go through startup.sh, so a clean direct start-cli.sh launch would
+# migrate schedules and then silently suppress every fire. Start it here (once).
+# Guard on the $REPO-anchored path so the check is per-checkout (won't cross-match
+# a heartbeat from a different checkout/bundle, and stays hermetic under test).
+ensure_core_heartbeat() {
+  pgrep -f "$REPO/src/core_heartbeat.py" >/dev/null 2>&1 && return 0
+  python3 "$REPO/src/core_heartbeat.py" >/tmp/core-heartbeat.log 2>&1 &
+}
+
+ensure_durable_schedules() {
+  # Codex has no session CronCreate surface. Reconcile ordinary scheduled
+  # prompts onto the existing OS runner before the core session is reused or
+  # created, otherwise a runtime switch/restart leaves crons.json populated
+  # while every custom schedule silently stops.
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  local preflight result service
+  preflight="$(python3 "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py" --check)" || {
+    echo "  ⚠ durable schedule preflight failed" >&2
+    return 0
+  }
+  case "$preflight" in
+    *"runner_needed=1"*)
+      service="gui/$(id -u)/com.sutando.cron-runner"
+      if ! launchctl print "$service" >/dev/null 2>&1; then
+        bash "$REPO/src/install-cron-runner-launchd.sh" >/dev/null 2>&1 || {
+          echo "  ⚠ durable schedule runner failed to install" >&2
+          return 0
+        }
+        if ! launchctl print "$service" >/dev/null 2>&1; then
+          echo "  ⚠ durable schedule runner failed post-install verification" >&2
+          return 0
+        fi
+      fi
+      result="$(python3 "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py")" || {
+        echo "  ⚠ durable schedule reconciliation failed" >&2
+        return 0
+      }
+      echo "  ✓ durable schedules ($result)"
+      ;;
+  esac
+}
+
 ensure_codex_scheduler() {
   local ws host scheduler
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
@@ -142,9 +190,14 @@ ensure_codex_scheduler() {
   fi
 }
 
-# Codex has no session CronCreate surface. Reconcile the OS-backed scheduler
-# on every launcher invocation so the canonical five-minute main loop is owned
-# before the core starts (or while attaching to an existing core).
+# Codex has no session CronCreate surface. Two complementary reconcilers run on
+# every launcher invocation, partitioned by reconcile_launchd.py's eligibility
+# rules so no entry is double-owned: ensure_durable_schedules moves ordinary
+# fixed crons.json entries onto the OS-backed cron-runner (skipping main-loop,
+# codex-task entries, and anything already launchd-owned), and
+# ensure_codex_scheduler owns execution:codex-task entries plus the canonical
+# five-minute main loop while this runtime is selected.
+ensure_durable_schedules
 ensure_codex_scheduler
 
 if [ "${1:-}" = "--restart" ]; then
@@ -162,6 +215,7 @@ if session_exists "$SESSION"; then
   apply_tmux_defaults
   ensure_task_notifier
   ensure_core_monitor
+  ensure_core_heartbeat
   if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
@@ -193,11 +247,13 @@ if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   ensure_task_notifier
   ensure_core_monitor
+  ensure_core_heartbeat
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   ensure_task_notifier
   ensure_core_monitor
+  ensure_core_heartbeat
   echo "Started $SESSION detached with Codex. Attach via:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"
 fi

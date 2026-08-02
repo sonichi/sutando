@@ -28,6 +28,11 @@ RESULTS_DIR = WORKSPACE / "results"
 LOGS_DIR = WORKSPACE / "logs"
 STATE_DIR = WORKSPACE / "state"
 
+# Agent-written cache of the owner's real (Google Workspace) calendar. This
+# standalone script cannot reach the Station connector, but the core agent can —
+# it writes today's events here during the morning cron. See get_calendar_events.
+CALENDAR_CACHE_FILE = STATE_DIR / "calendar-today.json"
+
 # Weather codes → one-word description
 WEATHER_CODES = {
     0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
@@ -96,17 +101,76 @@ def get_weather() -> str:
         return None
 
 
-def get_calendar_events() -> list[dict] | None:
-    """Get today's calendar events via AppleScript.
+def _read_calendar_cache() -> list[dict] | None:
+    """Read today's calendar from the agent-written Google cache.
 
-    Returns a list of events ([] means verified empty) or None when the
-    calendar could not be read — callers must not render None as "clear".
+    This script cannot reach the owner's Google Workspace calendar (the Station
+    connector is agent-only), but the core agent can — during the morning cron
+    it writes ``state/calendar-today.json``::
+
+        {"date": "YYYY-MM-DD", "events": [{"raw": "9:30am Standup"}, ...]}
+
+    Returns the events list when the cache is present and stamped for TODAY,
+    else None (absent / stale / corrupt — never show yesterday's schedule).
+    """
+    try:
+        data = json.loads(CALENDAR_CACHE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("date") != datetime.now().strftime("%Y-%m-%d"):
+        return None
+    raw_events = data.get("events")
+    if not isinstance(raw_events, list):
+        return None
+    events: list[dict] = []
+    for ev in raw_events:
+        if isinstance(ev, dict):
+            raw = (ev.get("raw") or "").strip()
+            cal = ev.get("calendar", "")
+        else:
+            raw, cal = str(ev).strip(), ""
+        if raw:
+            events.append({"raw": raw, "calendar": cal})
+    return events
+
+
+def get_calendar_events() -> list[dict] | None:
+    """Get today's calendar events, preferring the owner's real Google calendar.
+
+    Source preference:
+      1. The Google-calendar cache (``state/calendar-today.json``) written by the
+         core agent — the ONLY source that sees the owner's Google Workspace
+         calendar, which a local macOS Calendar.app may not have subscribed.
+      2. Local macOS Calendar.app via AppleScript (fallback).
+
+    Returns a list of events ([] means verified empty) or None when the calendar
+    could not be read — callers must not render None as "clear".
+
+    When ``MORNING_BRIEFING_CALENDAR_SOURCE=google`` is set, the cache is the only
+    TRUSTED source: if it's missing/stale, return None (→ "couldn't read your
+    calendar") rather than a misleading empty read from a local calendar that
+    doesn't include the work account. This is exactly the 2026-07-21 bug — the
+    briefing announced "calendar is clear" off an empty local read while the
+    owner had three Google meetings that day.
 
     Respects MORNING_BRIEFING_SKIP_CALENDARS (comma-separated list of
     calendar names to exclude, e.g. "Home,Wedding,Birthdays"). Useful for
     filtering out subscribed shared calendars that clutter the briefing
     (closes #964). Case-insensitive match on calendar name.
     """
+    import os as _os
+
+    cached = _read_calendar_cache()
+    if cached is not None:
+        return cached
+    if _os.environ.get("MORNING_BRIEFING_CALENDAR_SOURCE", "").strip().lower() == "google":
+        # Trusted source expected but unavailable — do NOT fall back to a local
+        # read that can't see the work calendar and would look falsely "clear".
+        print(
+            "  calendar: google source expected but cache missing/stale — reporting unread",
+            file=sys.stderr,
+        )
+        return None
     script = '''
 set theDate to (current date)
 set hours of theDate to 0
@@ -239,48 +303,75 @@ def get_overnight_discord() -> list[str]:
         return []
 
 
+def _load_notifier():
+    """Load check-pending-questions.py once, as a module.
+
+    Module level on purpose: loading it inside get_pending_questions() would make
+    the predicate unreachable to tests, which point the notifier at a fixture by
+    swapping `PQ_FILE` on the loaded module (the pattern
+    tests/check-pending-questions-open-status.test.py already uses). A per-call
+    load rebuilds a private copy every time, so a test can only ever exercise a
+    re-implementation of the delegation instead of the shipped function — which is
+    exactly how the first version of this change shipped a regression past its own
+    test. Its main() is __name__-guarded, so importing fires no notification.
+    """
+    import importlib.util
+
+    src = Path(__file__).parent / "check-pending-questions.py"
+    spec = importlib.util.spec_from_file_location("_cpq_predicate", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_CPQ = _load_notifier()
+
+
 def get_pending_questions() -> list[str]:
-    """Return unanswered questions from pending-questions.md."""
-    pq = personal_path("pending-questions.md", WORKSPACE)
-    if not pq.exists():
-        return []
-    content = pq.read_text()
-    # Only the active region counts. Resolved questions live below a
-    # top-level "# Resolved" divider (audit trail), not deleted — without
-    # this cut the briefing speaks every resolved entry as still-pending.
-    # No-op when there is no such divider.
-    content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
-    # Organizer/section-shell headers (e.g. "## FRESH — 2026-07-05 [wu-air]",
-    # "## ACTIVE — ...", "## SURFACED — ...") group questions but are not
-    # themselves questions — skip them so the briefing's "top item" is a real
-    # question, not a date-label. Also skip anything already marked resolved
-    # inline (the "# Resolved" divider above is a no-op for files that use
-    # per-item "[RESOLVED]" markers instead).
-    org_header = re.compile(
-        r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\b', re.IGNORECASE
-    )
-    questions = []
-    for section in re.split(r'^## ', content, flags=re.MULTILINE)[1:]:
-        title_line, _, body = section.partition('\n')
-        title = title_line.strip()
-        # Strip leading date prefix like "[2026-05-27] "
-        title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title)
+    """Return unanswered questions, delegating to check-pending-questions.py.
+
+    That module's `get_waiting_questions()` is the single source of truth for
+    "is this question still waiting". This function used to re-implement the
+    predicate, and the two copies drifted: on 2026-07-28 the notifier counted 33
+    and this counted 32. The missing entry was a live owner ask
+    ("/observe MVP: design fully resolved, build on your nod") dropped because
+    the local copy tested `'RESOLVED' in title.upper()` — a substring match that
+    fires on the word appearing anywhere in the prose, including in "NOT
+    self-resolved". An open question that goes uncounted goes unsurfaced.
+
+    Fixing only this copy would leave the duplicate in place to re-diverge —
+    #2351 had already fixed the notifier's side (`Status: open`) without this one
+    changing. So the predicate now lives in exactly one place.
+
+    That invariant was initially only half-true: this function still dropped
+    organizer shells and inline `[RESOLVED ...]` titles locally, so the two
+    consumers reported different counts (notifier 2 / briefing 1 on a corpus with
+    one active marker plus one open ask) — review finding on 919c35f2. Both
+    classifications now live in the shared parser, and nothing here judges
+    waiting-ness; this function only maps the result to display titles.
+
+    Deliberately no fallback parser: a second implementation is the bug. And a
+    failure here must not degrade to `[]`, which the briefing would render as the
+    confident "no pending questions" that this whole class of bug produces.
+    """
+    # The briefing resolves its OWN file and hands it to the predicate, rather
+    # than relying on the notifier's independent resolution. Two reasons: the two
+    # modules could otherwise read different files on a host where resolution
+    # differs, silently reintroducing the divergence this change removes; and it
+    # keeps `personal_path` as the single patch point the existing regression
+    # tests already use (tests/briefing-pending-status.test.py,
+    # tests/morning-briefing-pending-extract.test.py), so the seam does not move.
+    _CPQ.PQ_FILE = personal_path("pending-questions.md", WORKSPACE)
+
+    out: list[str] = []
+    for q in _CPQ.get_waiting_questions():
+        title = (q.get("title") or q.get("id") or "") if isinstance(q, dict) else str(q)
+        title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
         if not title:
             continue
-        if 'RESOLVED' in title.upper() or org_header.match(title):
-            continue
-        # Also respect an explicit **Status:** field in the body: a section
-        # marked resolved/done/answered is not pending even when its title still
-        # reads "[OPEN …]" (mirrors check-pending-questions.py). Without this the
-        # briefing miscounts entries kept above the divider whose title wasn't
-        # updated but whose body carries "**Status:** resolved". `open` counts as
-        # pending (the natural word writers reach for) — kept in lockstep with
-        # check-pending-questions.py so the documented mirror stays truthful.
-        status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
-        if status_m and not status_m.group(1).strip().lower().startswith(('unanswered', 'waiting', 'open')):
-            continue
-        questions.append(title[:60])
-    return questions
+        out.append(title[:60])
+    return out
+
 
 
 def get_health_issues() -> list[str]:

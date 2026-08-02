@@ -21,6 +21,12 @@ jobs:
       - name: UTC timestamp check
         run: python3 scripts/check-utc-z-strftime.py
 
+      # Keep the documentation hub, metadata catalog, and repository-local
+      # Markdown links complete. The release skill uses the same audit during
+      # its docs-impact pass, so local preparation and CI enforce one contract.
+      - name: Documentation audit
+        run: python3 skills/release/scripts/docs_audit.py
+
       # Fails if vault.sync.include carries a per-host-prone path without a
       # hostname qualifier (would collapse across hosts on pull-merge).
       # See docs/workspace-per-host-paths.md.
@@ -136,6 +142,7 @@ jobs:
       - name: Run Python standalone tests
         run: |
           failed=0
+          failed_files=()
           while IFS= read -r f; do
             echo "→ $f"
             # `if ! assignment=$(...)` exempts the command from `bash -e` (GitHub's
@@ -147,16 +154,46 @@ jobs:
             # already uses this idiom for exactly this reason; this step was
             # missed. (Observed on a real CI run: a failure printed no output at
             # all, making it undiagnosable from the log.)
-            if ! output=$(python3 "$f" 2>&1); then rc=1; else rc=0; fi
+            # `cmd && rc=0 || rc=$?` exempts the command from `bash -e` (GitHub's
+            # default for run: steps) while capturing BOTH output and the real exit
+            # status. A bare `output=$(python3 "$f")` aborts the whole step the
+            # instant a test fails — before the `echo "$output"` below ever runs —
+            # so the failing test's traceback is DISCARDED, every later test is
+            # skipped, and the log shows only the bare `→ <file>` line. The
+            # shell-test step below already uses this idiom for exactly this reason;
+            # this step was missed. (Observed on a real CI run: a failure printed no
+            # output at all, making it undiagnosable from the log.)
+            output=$(python3 "$f" 2>&1) && rc=0 || rc=$?
             # Always show FAIL lines and summary
             echo "$output" | grep -E 'FAIL|^Results:' || true
-            if [ $rc -ne 0 ]; then
-              # Test failed — emit full output (PASS + FAIL + traceback) so
-              # debugging info isn't dropped on ImportError / uncaught exception.
-              echo "$output"
+            if [ "$rc" -ne 0 ]; then
+              # NAME THE FILE. A test that exits non-zero with NO output — sys.exit(1),
+              # an uncaught SystemExit, a bare `raise` in a helper — was previously
+              # invisible: the log showed only its `→` line, byte-identical to a
+              # passing test, and the step exited 1 with nothing to point at. Measured
+              # 2026-07-30 on a red `tsc + tests`: the whole step held 24 non-arrow
+              # lines and every `Results:` line was a pass, so the failing file could
+              # not be identified from the log at all.
+              echo "::error::FAILED: $f (exit $rc)"
+              if [ -n "$output" ]; then
+                # Emit full output (PASS + FAIL + traceback) so debugging info isn't
+                # dropped on ImportError / uncaught exception.
+                echo "$output"
+              else
+                echo "  (this test produced NO output — exited $rc silently)"
+              fi
+              failed_files+=("$f")
               failed=1
             fi
           done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
+          if [ "$failed" -ne 0 ]; then
+            # `::notice::`, not `::error::` — the per-file lines above are the real
+            # annotations. Making the summary an error too would double every failure
+            # in GitHub's annotation count, so the badge would misreport how many
+            # tests actually failed. Review nit, and a correct one.
+            echo "::notice::${#failed_files[@]} python test file(s) failed:"
+            printf '  %s\n' "${failed_files[@]}"
+          fi
           exit "$failed"
 
       # Run standalone shell tests (*.test.sh). Fixes issue #1934: these suites
