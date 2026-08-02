@@ -2901,11 +2901,59 @@ def check_core_supervisor() -> dict:
         detail = f"{state} — {str(prompt).splitlines()[0][:60]}"
     needs_user = {"blocked-human", "logged-out"}
     degraded = {"crashed", "hung", "gateway-down"}
+    # `gateway-down` means "core up, relay gateway not running". On a host with no
+    # gateway configured that is the DESIGNED state — startup.sh never launches the
+    # bridge and says so ("deliberately silent when unconfigured"), and the dedicated
+    # probe below returns None for exactly this case. Treating it as degraded here
+    # made every Sutando-only install carry a permanent warn it could not clear,
+    # which is how a status tool teaches its reader to skip the warn line.
+    if state == "gateway-down" and not _gateway_configured():
+        return {"name": name, "status": "ok",
+                "detail": "core up; ag2.space gateway not configured on this host"}
     if state in needs_user:
         return {"name": name, "status": "warn", "detail": f"core needs you: {detail}"}
     if state in degraded:
         return {"name": name, "status": "warn", "detail": f"core degraded: {detail}"}
     return {"name": name, "status": "ok", "detail": detail}
+
+
+def _gateway_configured() -> bool:
+    """Is the ag2.space mobile gateway configured on this host?
+
+    `startup.sh` is deliberately silent when it is not — "a Sutando-only user
+    never sees it" — so absence of the bridge is the EXPECTED state, not a fault.
+    Shared by the two probes that must agree about that; they did not, which is
+    the bug this helper exists to close.
+    """
+    try:
+        if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
+            return True
+        gw_env = claude_home_path("channels", "ag2space", ".env")
+        if gw_env.exists():
+            return any(
+                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
+                # errors="replace" is load-bearing, not cosmetic: without it a
+                # single non-UTF-8 byte raises, the except below swallows it, and a
+                # CONFIGURED gateway reads as unconfigured — which now also silences
+                # the gateway-down warn. Fail-open on a decode error is exactly the
+                # class this PR closes. (Caught in review by Sutando-Pro.)
+                for ln in gw_env.read_text(errors="replace").splitlines()
+            )
+    except OSError:
+        # EXPECTED failures only: the env file is unreadable / the path is bad.
+        # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.
+        #
+        # Deliberately NOT `except Exception`. A resolver contract bug (e.g.
+        # claude_home_path raising ValueError) would be swallowed into False,
+        # check_core_supervisor would then report a real `gateway-down` as OK,
+        # and check_gateway_bridge would vanish -- a CONFIGURED gateway's outage
+        # goes silent. That is the same fail-open direction this PR exists to
+        # close, one layer up. An unexpected exception propagates instead, which
+        # is loud; a programming error in a health probe should not be absorbed
+        # by the probe that is supposed to be reporting faults.
+        # (Caught in review by john-the-dev.)
+        pass
+    return False
 
 
 def check_gateway_bridge() -> "dict | None":
@@ -2923,16 +2971,7 @@ def check_gateway_bridge() -> "dict | None":
     nothing reported it, so mobile messages stranded in the cloud invisibly. This
     check makes that state visible on the dashboard.
     """
-    try:
-        gw_env = claude_home_path("channels", "ag2space", ".env")
-        configured = bool(os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"))
-        if not configured and gw_env.exists():
-            configured = any(
-                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
-                for ln in gw_env.read_text(errors="replace").splitlines()
-            )
-    except OSError:
-        configured = False
+    configured = _gateway_configured()
     if not configured:
         return None
     try:
