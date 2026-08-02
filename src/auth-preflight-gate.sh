@@ -103,39 +103,63 @@ if [ -n "$_ws" ] && [ -n "$_host" ]; then
   # on stock macOS. Bounded spin, then break a lock older than 30s so a killed
   # gate cannot wedge every later boot (a stuck lock would be the same class of
   # silent loss one layer up).
+  # Serialise the read-modify-write with a `mkdir` lock, and FAIL CLOSED if we
+  # cannot get it. `mkdir` is the portable atomic test-and-set — `flock(1)` is
+  # not on stock macOS.
+  #
+  # The first cut proceeded WITHOUT the lock after a bounded wait, and cleaned up
+  # by unconditionally removing it. Review reproduced the result: 10 writers
+  # against a pre-existing lock, every one returning 0, 2 of 10 records surviving,
+  # and the foreign lock deleted. That is the same silent record-loss this whole
+  # change exists to close, re-entered through the escape hatch — availability
+  # bought with the durability that is the entire point. So:
+  #   * only the acquirer ever touches the file, and
+  #   * only the acquirer ever removes the lock.
+  # On timeout we leave the file and the foreign lock untouched and say so on
+  # stderr. Losing one duplicate record while a peer gate writes an equivalent
+  # one beats corrupting the file for everybody.
   _lock="$_pq.lock"
+  _have_lock=0
   _waited=0
-  while ! mkdir "$_lock" 2>/dev/null; do
-    if [ -d "$_lock" ]; then
-      _age=$(( $(date +%s) - $(stat -f %m "$_lock" 2>/dev/null || stat -c %Y "$_lock" 2>/dev/null || date +%s) ))
-      if [ "$_age" -ge 30 ]; then rmdir "$_lock" 2>/dev/null || true; continue; fi
-    fi
+  while [ "$_waited" -lt 100 ]; do
+    if mkdir "$_lock" 2>/dev/null; then _have_lock=1; break; fi
+    # Break a lock whose owner died, but only on a numerically-valid mtime:
+    # `stat -f %m` is BSD and `stat -c %Y` is GNU, and the wrong one can exit 0
+    # with non-numeric output, which would make the arithmetic below abort the
+    # whole gate under `set -e`.
+    _lock_mtime="$(stat -f %m "$_lock" 2>/dev/null || stat -c %Y "$_lock" 2>/dev/null || echo "")"
+    case "$_lock_mtime" in
+      ''|*[!0-9]*) : ;;
+      *) if [ "$(( $(date +%s) - _lock_mtime ))" -ge 30 ]; then rmdir "$_lock" 2>/dev/null || true; fi ;;
+    esac
     _waited=$((_waited + 1))
-    # NOT `[ ... ] && break`: as the last statement of a loop body that compound
-    # returns 1 when the test is false, and under `set -e` the shell exits.
-    if [ "$_waited" -ge 100 ]; then break; fi   # ~10s: proceed unlocked rather than drop the record
     sleep 0.1
   done
-  _new="$_pq.new.$$"
-  _tmp="$_pq.tmp.$$"
-  {
-    echo "## [$_ts] BOOT ABORTED — CLI login required ($_host)"
-    echo "auth-preflight-gate stopped startup before services launched."
-    echo "Remedy: $_remedy"
-    echo ""
-  } > "$_new"
-  if [ -f "$_pq" ]; then
-    if head -1 "$_pq" | grep -qE '^# [^ ]'; then
-      { head -1 "$_pq"; echo ""; cat "$_new"; tail -n +2 "$_pq"; } > "$_tmp"
-    else
-      { cat "$_new"; cat "$_pq"; } > "$_tmp"
-    fi
-    mv -f "$_tmp" "$_pq"
+
+  if [ "$_have_lock" != "1" ]; then
+    echo "  auth-preflight-gate: could not acquire $_lock after ~10s; leaving pending-questions.md untouched (a concurrent gate holds it and is recording an equivalent abort)." >&2
   else
-    mv -f "$_new" "$_pq"
+    _new="$_pq.new.$$"
+    _tmp="$_pq.tmp.$$"
+    {
+      echo "## [$_ts] BOOT ABORTED — CLI login required ($_host)"
+      echo "auth-preflight-gate stopped startup before services launched."
+      echo "Remedy: $_remedy"
+      echo ""
+    } > "$_new"
+    if [ -f "$_pq" ]; then
+      if head -1 "$_pq" | grep -qE '^# [^ ]'; then
+        { head -1 "$_pq"; echo ""; cat "$_new"; tail -n +2 "$_pq"; } > "$_tmp"
+      else
+        { cat "$_new"; cat "$_pq"; } > "$_tmp"
+      fi
+      mv -f "$_tmp" "$_pq"
+    else
+      mv -f "$_new" "$_pq"
+    fi
+    rm -f "$_new" "$_tmp"
+    rmdir "$_lock" 2>/dev/null || true
   fi
-  rm -f "$_new" "$_tmp"
-  rmdir "$_lock" 2>/dev/null || true
   # --- end pending-question write (unique sentinel; tests extract to here) ---
   printf '[dm-only]\nSutando boot on %s ABORTED: CLI login required.\n%s\n' \
     "$_host" "$_remedy" > "$_ws/results/proactive-$(date +%s).txt"

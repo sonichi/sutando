@@ -223,14 +223,55 @@ if block:
         check("...and the reader counts every one of them",
               waiting(pq2) == base + N,
               f"{base} -> {waiting(pq2)}, expected {base + N}")
+        # `.find()`, not `.index()`: a MISSING record must be reported by the
+        # check above, not raise here and abort the suite. The first CI run of
+        # this file crashed exactly that way — a lost record surfaced as a
+        # traceback rather than a FAIL line, which hides which assertion bit.
+        _div = re.search(r'^#[ \t]+Resolved\b', final, re.M)
+        _pos = [final.find(f"remedy-{n}") for n in range(N)]
         check("...and they all sit above the divider",
-              all(final.index(f"remedy-{n}") < re.search(r'^#[ \t]+Resolved\b', final, re.M).start()
-                  for n in range(N)) if re.search(r'^#[ \t]+Resolved\b', final, re.M) else True,
-              "a concurrent write landed below the divider")
+              _div is None or all(0 <= q < _div.start() for q in _pos),
+              f"positions {_pos}, divider at {_div.start() if _div else None} "
+              f"(-1 = that record is absent, see the check above)")
         strays = sorted(p.name for p in pq2.parent.iterdir()
                         if p.name.startswith("pending-questions.md.")
                         and p.name != "pending-questions.md")
         check("no per-invocation scratch or lock left behind", not strays, str(strays))
+
+        # --- 8. a HELD, FRESH foreign lock must FAIL CLOSED ------------------
+        # Review at 72833b61: the bounded wait used to `break` and proceed
+        # WITHOUT the lock, then unconditionally `rmdir` it. Reproduced there as
+        # 10 writers, all returning 0, 2 of 10 records surviving, and the
+        # foreign lock deleted. The escape hatch re-entered the exact silent
+        # record-loss this change closes. Fail closed instead: touch neither the
+        # file nor a lock we do not own.
+        pq2.write_text(FIXTURE)
+        held = Path(str(pq2) + ".lock")
+        held.mkdir()
+        before_bytes = pq2.read_text()
+        n_before2 = waiting(pq2)
+        e = dict(env); e["_ts"] = "2026-08-02T14:00:00Z"; e["_remedy"] = "remedy-locked"
+        r4 = subprocess.run(["bash", "-c", "set -e\n" + block],
+                            capture_output=True, text=True, env=e, timeout=180)
+        check("a held foreign lock does NOT crash the gate", r4.returncode == 0,
+              f"rc={r4.returncode} err={r4.stderr[-200:]}")
+        check("...and the file is left byte-identical", pq2.read_text() == before_bytes,
+              "the writer mutated the file without owning the lock")
+        check("...and the count is unchanged", waiting(pq2) == n_before2,
+              f"{n_before2} -> {waiting(pq2)}")
+        check("...and the FOREIGN lock still exists", held.is_dir(),
+              "the writer removed a lock it never acquired")
+        check("...and it says so on stderr rather than failing silently",
+              "could not acquire" in r4.stderr, repr(r4.stderr[-200:]))
+        held.rmdir()
+
+        # Control: with the lock released, the same invocation DOES write —
+        # so the four assertions above are about the lock, not about the fixture.
+        r5 = subprocess.run(["bash", "-c", "set -e\n" + block],
+                            capture_output=True, text=True, env=e, timeout=120)
+        check("control: with the lock free, the same call writes normally",
+              r5.returncode == 0 and waiting(pq2) == n_before2 + 1,
+              f"rc={r5.returncode}, {n_before2} -> {waiting(pq2)}")
 
 print()
 if failures:
