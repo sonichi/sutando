@@ -126,6 +126,26 @@ def _tmux(sock: str, *args: str) -> subprocess.CompletedProcess | None:
         return None
 
 
+def _argv_names_session(args: str, sess: str) -> bool:
+    """True only if argv names EXACTLY this session via --name.
+
+    Substring matching is wrong here and was a live false-healthy path
+    (review-caught, qingyun-wu on #2488): `"--name sutando-core" in args` is
+    also satisfied by `claude --name sutando-core-watcher`, so a prefixed
+    sibling session kept this host's `.alive` fresh over a dead core — the exact
+    class of bug this module exists to remove. Compare the whole token instead:
+    the next token after a bare `--name`, or the value after `--name=`.
+    """
+    toks = args.split()
+    for i, tok in enumerate(toks):
+        if tok == "--name":
+            if i + 1 < len(toks) and toks[i + 1] == sess:
+                return True
+        elif tok.startswith("--name=") and tok[len("--name="):] == sess:
+            return True
+    return False
+
+
 def core_pid(socket_path: str | None = None, session: str | None = None) -> int | None:
     """The pid of the CORE process, or None if the core is gone.
 
@@ -179,8 +199,7 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
                                     capture_output=True, text=True, timeout=5)
                 if ps.returncode != 0:
                     continue
-                args = ps.stdout.strip()
-                if f"--name {sess}" in args or f"--name={sess}" in args:
+                if _argv_names_session(ps.stdout.strip(), sess):
                     return int(pid_s)
     except Exception:
         pass

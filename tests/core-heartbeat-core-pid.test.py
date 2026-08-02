@@ -203,6 +203,32 @@ with tempfile.TemporaryDirectory() as td5:
     check("REAL: the `--name=<session>` spelling also matches",
           _REAL_CORE_PID("/tmp/s.sock") == 4243)
 
+    # --- NEGATIVE CONTROLS: a PREFIXED session name must NOT match -------------
+    # qingyun-wu, #2488 @8de9021e: the match was `f"--name {sess}" in args`, a
+    # substring test, so target `sutando-core` was also satisfied by
+    # `claude --name sutando-core-watcher`. They reproduced the resolver
+    # returning that pid with no exactly-named core alive — a prefixed sibling
+    # keeping .alive fresh over a dead core, i.e. the bug this PR removes.
+    # Each case below returns the WRONG pid on the pre-fix module.
+    for spelling, argv in (
+        ("--name <prefixed>",  "claude --name sutando-core-watcher --resume"),
+        ("--name=<prefixed>",  "claude --name=sutando-core-secondary"),
+        ("--name <suffixed>",  "claude --name x-sutando-core"),
+        ("--name absent",      "claude --resume sutando-core"),
+    ):
+        _stub(b, "pgrep", "#!/bin/sh\necho 4242\n")
+        _stub(b, "ps", f"#!/bin/sh\necho '{argv}'\n")
+        _stub(b, "tmux", _tmux_runtime("claude") if "_tmux_runtime" in dir() else "#!/bin/sh\nexit 0\n")
+        check(f"NEGATIVE: {spelling} must NOT be taken for the core",
+              _REAL_CORE_PID("/tmp/s.sock") is None)
+
+    # POSITIVE control in the same block: the exact name still resolves, so the
+    # negatives above cannot be passing merely because everything returns None.
+    _stub(b, "ps", "#!/bin/sh\necho 'claude --name sutando-core --resume'\n")
+    check("CONTROL: the EXACT session name still resolves (negatives aren't vacuous)",
+          _REAL_CORE_PID("/tmp/s.sock") == 4242)
+
+
     # --- the repaired contract: the SESSION RUNTIME decides what "no matching
     # claude process" means. Claude -> ABSENT (a preserved sibling window must
     # never resurrect a dead core, john-the-dev on #2488). Non-Claude -> the
