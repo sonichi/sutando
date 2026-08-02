@@ -434,6 +434,42 @@ def _ensure_tier_map_seeded() -> bool:
         return False
 
 
+def resolve_access_tier(user_id: str, tier_map: dict, seeded_ok: bool) -> str:
+    """Resolve a sender's access_tier from a loaded tierMap. Owner comes
+    STRICTLY from membership in a successfully-persisted map:
+      1. uid present in tierMap        → its recorded tier (owner/team/other)
+      2. tierMap present, uid missing  → "other" (a new allowlist addition;
+         prevents silent privilege escalation when the operator forgets a
+         tierMap line)
+      3. tierMap empty/unconfirmed     → "other" (fail CLOSED). A legit
+         pre-tierMap config is grandfathered into a NON-empty map by
+         _ensure_tier_map_seeded, so an empty map here means the seed could
+         not persist/read — never grant owner off that (#2161 CR: a transient
+         error must not escalate every allowlisted user to owner).
+      4. Unknown tier value in config  → degrade safely to "other" rather
+         than treating as owner.
+    See #893 for the split-default rationale; #2161 for the fail-closed fix.
+    Exercised directly by tests/slack-bridge-tier-map.test.py (#2512).
+    """
+    if user_id in tier_map:
+        access_tier = tier_map[user_id]
+    else:
+        access_tier = "other"
+        if tier_map:
+            print(
+                f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
+                flush=True,
+            )
+        elif not seeded_ok:
+            print(
+                f"  [tier-map] WARNING: grandfather seed unavailable; {user_id} resolved read-only (other), not owner",
+                flush=True,
+            )
+    if access_tier not in ("owner", "team", "other"):
+        access_tier = "other"
+    return access_tier
+
+
 def tofu_onboard(user_id: str, username: str | None) -> set:
     """First-time auto-onboard — same contract as telegram-bridge.py.
 
@@ -934,38 +970,12 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     else:
         thread_ts = None
 
-    # Resolve access_tier from `tierMap`. Owner comes STRICTLY from membership
-    # in a successfully-persisted map:
-    #   1. uid present in tierMap        → its recorded tier (owner/team/other)
-    #   2. tierMap present, uid missing  → "other" (a new allowlist addition;
-    #      prevents silent privilege escalation when the operator forgets a
-    #      tierMap line)
-    #   3. tierMap empty/unconfirmed     → "other" (fail CLOSED). A legit
-    #      pre-tierMap config is grandfathered into a NON-empty map by
-    #      _ensure_tier_map_seeded above, so an empty map here means the seed
-    #      could not persist/read — never grant owner off that (#2161 CR:
-    #      a transient error must not escalate every allowlisted user to owner).
-    # See #893 for the split-default rationale; #2161 for the fail-closed fix.
+    # Resolve access_tier from `tierMap`. The fail-closed rules live on
+    # resolve_access_tier's docstring, and tests/slack-bridge-tier-map.test.py
+    # exercises that same symbol (#2512 — coverage claim now matches reality).
     seeded_ok = _ensure_tier_map_seeded()
     tier_map = load_tier_map()
-    if user_id in tier_map:
-        access_tier = tier_map[user_id]
-    else:
-        access_tier = "other"
-        if tier_map:
-            print(
-                f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
-                flush=True,
-            )
-        elif not seeded_ok:  # pragma: no cover — rare seed-failure warning; the empty-map→other fail-closed resolution is unit-tested in tests/bridges-allowlist-default-readonly.test.py
-            print(
-                f"  [tier-map] WARNING: grandfather seed unavailable; {user_id} resolved read-only (other), not owner",
-                flush=True,
-            )
-    if access_tier not in ("owner", "team", "other"):
-        # Unknown tier value in config → degrade safely to "other" rather
-        # than treating as owner.
-        access_tier = "other"
+    access_tier = resolve_access_tier(user_id, tier_map, seeded_ok)
 
     # Intercept vault commands before any disk write — must happen AFTER
     # access_tier is resolved so untrusted senders cannot write to Keychain.
