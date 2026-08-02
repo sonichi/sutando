@@ -17,12 +17,25 @@ Guards:
   1. a CONTENTFUL stale .txt is archived (flood prevention still works)
   2. an EMPTY stale .txt is NOT archived — left in place for the drain
   3. a fresh (non-stale) .txt is untouched regardless of size
+  4. a PARTIAL-but-nonempty .txt held open by a writer is NOT archived, and the
+     producer's completed body is still readable from the LIVE queue afterwards
+     — content is not a completion signal, so the guard consults the
+     open-descriptor table rather than inspecting bytes
+  5. when that check cannot be run, NOTHING is archived and the reason is
+     printed — fail closed, loudly
+
+Several guards assert absence ("not archived"), which would also hold if the
+archiver had simply stopped working. Each is therefore paired with a positive
+calibration that the SAME file archives once its blocking condition is removed,
+so a preserved file is attributable to the guard and not to a no-op.
 
 Run: python3 tests/archive-stale-results.test.py   (exit 0/1)
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import os
 import sys
 import tempfile
@@ -149,6 +162,52 @@ def main() -> int:
     # so pin the positive case explicitly rather than inferring it.
     check("guard is not a blanket no-op — the closed contentful file DID move",
           "proactive-contentful.txt" in archived_names)
+
+    # ---- fail-closed: lsof cannot be consulted -----------------------------
+    # Runs IN-PROCESS (same reason as the rest of this file: a subprocess would
+    # execute the branch but coverage on the parent would never see it). A real
+    # stub on PATH rather than a monkeypatched shutil.which, so the actual
+    # resolve-and-run path executes; a stub that exits 4 is neither lsof's "some
+    # matched" (0) nor its "none matched" (1), i.e. a genuine non-answer.
+    stub_dir = tmp / "fakebin"
+    stub_dir.mkdir(exist_ok=True)
+    stub = stub_dir / "lsof"
+    stub.write_text("#!/bin/sh\necho 'simulated lsof failure' >&2\nexit 4\n")
+    stub.chmod(0o755)
+
+    unverifiable = results / "proactive-unverifiable.txt"
+    unverifiable.write_text("a complete body nothing holds open\n")
+    os.utime(unverifiable, (old, old))
+
+    prev_path = os.environ["PATH"]
+    os.environ["PATH"] = f"{stub_dir}:{prev_path}"
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            rc_unverif = arch.main()
+    finally:
+        os.environ["PATH"] = prev_path
+
+    check("fail-closed run still exits 0 (a non-answer is not an error)",
+          rc_unverif == 0, f"rc={rc_unverif}")
+    check("cannot-verify ⇒ the stale file is NOT archived",
+          unverifiable.exists()
+          and "proactive-unverifiable.txt" not in {p.name for p in results.glob("archive-*/*.txt")},
+          f"exists={unverifiable.exists()}")
+    check("cannot-verify is reported loudly on stderr, not degraded silently",
+          "cannot verify open writers" in err.getvalue(), err.getvalue().strip()[:120])
+
+    # CALIBRATION. Without this, the two assertions above would also pass if the
+    # archiver had simply stopped working — they only observe absence. Remove the
+    # stub and the SAME file must now move, which attributes its preservation to
+    # the unavailable check and nothing else. (My first draft of this control
+    # passed because the script crashed before reaching the guard.)
+    rc_after = arch.main()
+    check("calibration — with lsof restored the SAME file archives",
+          rc_after == 0
+          and not unverifiable.exists()
+          and "proactive-unverifiable.txt" in {p.name for p in results.glob("archive-*/*.txt")},
+          f"rc={rc_after} exists={unverifiable.exists()}")
 
     print()
     if fails:
