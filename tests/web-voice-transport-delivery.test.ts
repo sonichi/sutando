@@ -32,12 +32,27 @@ import {
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '..');
 
+/**
+ * The surface the artifact must expose to the page. Deliberately structural
+ * rather than importing the real types: this asserts what the *built browser
+ * bundle* hands the page, which is the thing that can silently regress — a
+ * type import would check the source and prove nothing about the artifact.
+ */
+interface TransportGlobal {
+	VoiceTransport: new (opts?: unknown) => unknown;
+	classifyMicError: (name?: string, message?: string) => string;
+	downsample: (input: Float32Array, fromRate: number, toRate: number) => Float32Array;
+	float32ToInt16: (f32: Float32Array) => Int16Array;
+	int16ToFloat32: (buf: ArrayBuffer) => Float32Array;
+	[key: string]: unknown;
+}
+
 /** Run the IIFE in a bare context and hand back the global it installed. */
-function evaluateArtifact(js: string): any {
+function evaluateArtifact(js: string): TransportGlobal | undefined {
 	const sandbox: Record<string, unknown> = {};
 	vm.createContext(sandbox);
 	vm.runInContext(js, sandbox);
-	return sandbox[BROWSER_TRANSPORT_GLOBAL];
+	return sandbox[BROWSER_TRANSPORT_GLOBAL] as TransportGlobal | undefined;
 }
 
 describe('browser transport delivery — source mode (on-demand compile)', () => {
