@@ -187,3 +187,51 @@ else
   esac
 fi
 clear_managed
+
+# --- $SUTANDO_PY / bundled-runtime precedence (review blocker, 2026-08-02) -----
+#     The stub test above falls back to a HOMEBREW python, which is exactly the
+#     tier the buggy gate already had — so it passed while the real defect was
+#     live. The untested case is a bundled install: a broken `python3` first on
+#     PATH and a perfectly good $SUTANDO_PY. There the gate answered "no usable
+#     python3" and left voice disabled with a valid managed credential on disk.
+#
+#     No host-dependent skip here: $SUTANDO_PY is pointed at whatever interpreter
+#     is running this suite, so the case is exercised on every machine. That is
+#     the point — a guard that only runs where Homebrew happens to exist is how
+#     this bug reached review.
+run_gate_sutando_py() {
+  env -i PATH="$STUBBIN:/usr/bin:/bin" REPO="$STUB" \
+    SUTANDO_PY="$REAL_PY" \
+    GEMINI_API_KEY="" GEMINI_VOICE_API_KEY="" \
+    bash -c 'cd "$1"; source "$2/src/startup-runtime.sh"; configure_startup_runtime; printf "SKIP_VOICE=%s\n" "${SKIP_VOICE:-0}"' \
+    _ "$TMP" "$REPO" 2>/dev/null
+}
+
+REAL_PY="$(command -v python3 2>/dev/null)"
+[ -x "$REAL_PY" ] || REAL_PY=/usr/bin/python3
+write_managed '{"capabilities":{"gemini-voice":{"key":"managed-voice-key"}}}'
+out="$(run_gate_sutando_py)"
+case "$out" in
+  *SKIP_VOICE=0*) echo "  ok  a stub python3 cannot disable voice when \$SUTANDO_PY is valid" ;;
+  *) fail "gate ignored \$SUTANDO_PY — managed credential read as absent (got: $out)" ;;
+esac
+
+# CALIBRATION. The assertion above is satisfied by a gate that never disables
+# voice at all, which would be a worse bug in the other direction. Same stub
+# PATH, same valid $SUTANDO_PY, but NO managed credential: voice must go off.
+clear_managed
+out="$(run_gate_sutando_py)"
+case "$out" in
+  *SKIP_VOICE=1*) echo "  ok  ...and with no credential it still disables (gate can say NO)" ;;
+  *) fail "gate enabled voice with no credential at all — the check is vacuous (got: $out)" ;;
+esac
+
+# The single source of truth itself: `sutando-config.sh python-bin` must PREFER
+# $SUTANDO_PY. If this drifts, the gate above silently falls back to a later
+# tier and the regression returns without either test failing.
+got="$(SUTANDO_PY="$REAL_PY" bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)"
+[ "$got" = "$REAL_PY" ] \
+  && echo "  ok  sutando-config.sh python-bin honours \$SUTANDO_PY" \
+  || fail "python-bin ignored \$SUTANDO_PY (wanted $REAL_PY, got ${got:-<empty>})"
+
+echo "PASS: interpreter precedence (SUTANDO_PY / bundled) is honoured by the gate"

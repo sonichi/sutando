@@ -33,19 +33,41 @@ _managed_voice_credential_present() {
   # credential sat on disk.
   #
   # PROBE, don't path-match. `command -v` finds the stub because the stub IS on
-  # PATH; only running it tells you whether it works. Homebrew's location is
-  # asked for (`brew --prefix`) rather than written down, so this works on both
-  # Apple Silicon and Intel and adds no hardcoded path (REVIEW.md hardcoded-paths).
+  # PATH; only running it tells you whether it works.
+  #
+  # ORDER comes from scripts/sutando-config.sh, asked for rather than restated.
+  # An earlier version of this gate probed `command -v python3` and then Homebrew
+  # and stopped there, skipping the two tiers that actually matter on a bundled
+  # install: $SUTANDO_PY and <engine>/runtime/python. A host with a broken
+  # `python3` first on PATH and a valid $SUTANDO_PY therefore concluded "no usable
+  # python3" and left voice disabled while a managed credential sat on disk —
+  # exactly the silent managed-user outage this function exists to prevent, and
+  # inconsistent with the workspace lookup ABOVE, which resolves fine because
+  # sutando-config.sh honours $SUTANDO_PY internally.
+  #
+  # `python-bin` is consulted FIRST so the precedence has one definition. The
+  # explicit tiers after it are a fallback for the case where that script cannot
+  # run at all; Homebrew stays last, beyond the canonical order, because it was
+  # added for a real host and dropping it would regress that case. brew's
+  # location is asked for, never written down (REVIEW.md hardcoded-paths).
   _usable_python() {
-    [ -n "${1:-}" ] && [ -x "$1" ] && "$1" -c 'import json' >/dev/null 2>&1
+    # No `-x` test: `python-bin` may return a bare command name, and a name that
+    # is not on PATH simply fails to execute. Running it IS the test.
+    [ -n "${1:-}" ] && "$1" -c 'import json' >/dev/null 2>&1
   }
-  local _py=""
-  if _usable_python "$(command -v python3 2>/dev/null)"; then
-    _py="$(command -v python3)"
-  elif command -v brew >/dev/null 2>&1 \
-       && _usable_python "$(brew --prefix 2>/dev/null)/bin/python3"; then
-    _py="$(brew --prefix)/bin/python3"
-  fi
+  local _py="" _cand _brew=""
+  command -v brew >/dev/null 2>&1 && _brew="$(brew --prefix 2>/dev/null)/bin/python3"
+  for _cand in \
+      "$(bash "$_repo/scripts/sutando-config.sh" python-bin 2>/dev/null)" \
+      "${SUTANDO_PY:-}" \
+      "$_repo/../runtime/python/bin/python3" \
+      "$(command -v python3 2>/dev/null)" \
+      "$_brew"; do
+    if _usable_python "$_cand"; then
+      _py="$_cand"
+      break
+    fi
+  done
   if [ -z "$_py" ]; then
     echo "  ~ managed-credential gate: no usable python3 —" \
          "cannot read $_file; treating as UNKNOWN, not as absent" >&2
