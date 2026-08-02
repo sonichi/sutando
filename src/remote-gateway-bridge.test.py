@@ -138,6 +138,39 @@ def main() -> int:
           "invalid REMOTE_TASK_TIER fails CLOSED to team (never silently owner)")
     os.environ.pop("REMOTE_TASK_TIER", None)
 
+    # ── GATEWAY_INSTANCE (multi-gateway): named instance suffixes the per-bridge
+    # state files + lock role; unset stays byte-identical to legacy ─────────────
+    os.environ["GATEWAY_INSTANCE"] = "dev"
+    _gspec = importlib.util.spec_from_file_location("rtc_inst", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _grtc = importlib.util.module_from_spec(_gspec)
+    _gspec.loader.exec_module(_grtc)
+    check(_grtc.INFLIGHT_FILE.name == "remote-task-inflight.dev.json",
+          "GATEWAY_INSTANCE=dev suffixes the inflight ledger")
+    check(_grtc.TASK_ROOMS_FILE.name == "remote-task-rooms.dev.json",
+          "GATEWAY_INSTANCE=dev suffixes the task-rooms sidecar")
+    check(_grtc.GATEWAY_STATUS_FILE.name == "gateway-status.dev.json",
+          "GATEWAY_INSTANCE=dev suffixes gateway-status")
+    check(_grtc._LOCK_ROLE == "gateway-bridge.dev",
+          "GATEWAY_INSTANCE=dev gets its OWN singleton lock role (per-gateway dual-poller guard)")
+    # A path-shaped instance name must refuse at import (it lands in filenames).
+    os.environ["GATEWAY_INSTANCE"] = "../evil"
+    _bspec = importlib.util.spec_from_file_location("rtc_badinst", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _brtc = importlib.util.module_from_spec(_bspec)
+    try:
+        _bspec.loader.exec_module(_brtc)
+        check(False, "GATEWAY_INSTANCE with path characters refuses at import")
+    except SystemExit:
+        check(True, "GATEWAY_INSTANCE with path characters refuses at import")
+    os.environ.pop("GATEWAY_INSTANCE", None)
+    _lspec = importlib.util.spec_from_file_location("rtc_legacy", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _lrtc = importlib.util.module_from_spec(_lspec)
+    _lspec.loader.exec_module(_lrtc)
+    check(_lrtc.INFLIGHT_FILE.name == "remote-task-inflight.json"
+          and _lrtc.TASK_ROOMS_FILE.name == "remote-task-rooms.json"
+          and _lrtc.GATEWAY_STATUS_FILE.name == "gateway-status.json"
+          and _lrtc._LOCK_ROLE == "gateway-bridge",
+          "GATEWAY_INSTANCE unset keeps every legacy filename + lock role byte-identical")
+
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),
     # and the access_tier-clamp + newline-forge assertions — which expect the

@@ -1090,6 +1090,23 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   else
     echo "  ✓ gateway bridge (already running)"
   fi
+
+  # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
+  # the environment launches one extra bridge for that gateway (e.g.
+  # AG2_REMOTE_TOKEN_DEV → instance "dev" against the dev homeserver). Each
+  # instance gets its own lock role + state files via GATEWAY_INSTANCE, and
+  # deliberately inherits NO REMOTE_PROACTIVE_ROOM — proactive nudges stay with
+  # the primary (owner-DM) gateway only.
+  # No pgrep dedupe here (env vars are invisible to pgrep -f): the bridge's own
+  # per-instance singleton lock (role gateway-bridge.<inst>) makes a duplicate
+  # launch self-defer and exit, so always-spawn is safe and simpler.
+  for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
+    _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
+    SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+      REMOTE_PROACTIVE_ROOM= \
+      python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+    echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
+  done
 fi
 
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)

@@ -185,23 +185,40 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# Named-instance support (multi-gateway): one core may run SEVERAL bridge
+# processes, each pointed at a different gateway (e.g. prod + dev homeservers)
+# via its own REMOTE_TASK_TOKEN env. GATEWAY_INSTANCE names this process's
+# instance; it suffixes the per-BRIDGE state files below and the singleton lock
+# role, so two instances never clobber each other's ledgers or contend one
+# lock. Unset (default) keeps every filename byte-identical to before — the
+# single-bridge install sees zero change. Deliberately NOT suffixed:
+# tasks/ + results/ (the shared task bus — the core is one consumer),
+# last-owner-activity.json (owner presence is one signal regardless of which
+# door the message came through), and core-status.json (the core's, not ours).
+GATEWAY_INSTANCE = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
+if GATEWAY_INSTANCE and not GATEWAY_INSTANCE.replace("-", "").replace("_", "").isalnum():
+    sys.exit(f"FATAL: GATEWAY_INSTANCE must be alphanumeric/-/_ (got {GATEWAY_INSTANCE!r})")
+_INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
 # gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
-# cross-send other channels' (Discord/Telegram) results to the gateway.
-INFLIGHT_FILE = _STATE / "remote-task-inflight.json"
+# cross-send other channels' (Discord/Telegram) results to the gateway. The
+# per-instance suffix is what keeps a second bridge from claiming results this
+# instance delegated (each instance only POSTs ids in ITS OWN ledger).
+INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # Sidecar map {task id → origin room id}, recorded at queue time. Outbound
 # file-attach needs the room because media uploads go to the room-scoped
 # endpoint (POST /v1/rooms/{room}/media) while text results go to /v1/results
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
-TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
+TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 # sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
 # guessing from tmux-window presence. Written on every poll outcome: connected
 # after a healthy round-trip, reconnecting in the backoff branches.
-GATEWAY_STATUS_FILE = _STATE / "gateway-status.json"
+GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
 
 # Launch provenance + in-bridge file log. A supervisor that persists stdout
 # (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
@@ -1425,7 +1442,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
 # lock-layer error → poll anyway (a lock bug must never silence task delivery;
 # the only risk of a dropped guard is the pre-existing dual-poller). Kill-switch:
 # SUTANDO_BRIDGE_LOCK=0 lets the owner disable it in prod without a redeploy.
-_LOCK_ROLE = "gateway-bridge"
+_LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"  # per-instance: dual-poller guard stays per-gateway
 _LOCK_WS = _STATE.parent  # _STATE = <workspace>/state (injected) or ~/.ag2-sparrow/state
 
 
