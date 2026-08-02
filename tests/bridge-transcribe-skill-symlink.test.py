@@ -27,6 +27,37 @@ import sys
 import tempfile
 from pathlib import Path
 
+# ── HERMETIC ISOLATION — must precede any bridge load ───────────────────────
+# The execution block at the bottom imports src/discord-bridge.py, whose
+# module-level `channel_access_path()` reads $CLAUDE_CONFIG_DIR and falls back
+# to the developer's REAL home. scripts/lint-hermetic-bridge-tests.py requires
+# the earliest MODULE-LEVEL `os.environ["CLAUDE_CONFIG_DIR"] = ...` assignment,
+# to a value that is not that real home — a patch, a setdefault, or an
+# assignment nested inside a function or `with` block is deliberately NOT
+# accepted, because those either no-op or execute too late.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-transcribe-skill-")
+
+# The bridge sys.exit()s at import when no bot token is present, so seed a fake
+# one INSIDE the isolated dir. It is never used to connect — the discord SDK is
+# stubbed below — but the module refuses to load without it.
+# Seed EVERY channel this file names, not just the one it imports, and seed them
+# with LITERAL path segments. The lint keys the requirement off the bridges the
+# test references (discord, slack and telegram all appear in BRIDGES below), and
+# it tracks path segments statically — a `for _ch in (...)` loop is invisible to
+# it, which is correct: a seed it cannot see is a seed a reader cannot verify.
+_ccd_root = Path(os.environ["CLAUDE_CONFIG_DIR"])
+(_ccd_root / "channels" / "discord").mkdir(parents=True, exist_ok=True)
+(_ccd_root / "channels" / "slack").mkdir(parents=True, exist_ok=True)
+(_ccd_root / "channels" / "telegram").mkdir(parents=True, exist_ok=True)
+(_ccd_root / "channels" / "discord" / "access.json").write_text('{"allowFrom": []}\n')
+(_ccd_root / "channels" / "slack" / "access.json").write_text('{"allowFrom": []}\n')
+(_ccd_root / "channels" / "telegram" / "access.json").write_text('{"allowFrom": []}\n')
+
+# The discord bridge additionally sys.exit()s at import without a bot token.
+# Never used to connect — the SDK is stubbed below.
+(_ccd_root / "channels" / "discord" / ".env").write_text(
+    "DISCORD_BOT_TOKEN=not-a-real-token-test-only\n")
+
 REPO = Path(__file__).resolve().parent.parent
 BRIDGES = ("discord-bridge.py", "slack-bridge.py", "telegram-bridge.py")
 SKILL_REL = ("skills", "audio-transcribe", "scripts", "transcribe.py")
@@ -90,8 +121,67 @@ for name in BRIDGES:
     check(f"{name}: the resolved script actually exists (would transcribe, not degrade)",
           Path(got).exists())
 
+
+
+# ── EXECUTION: run _transcribe_via_skill so the derivation line actually runs ─
+# Everything above evaluates the expression TEXT, which proves the semantics but
+# never executes src/discord-bridge.py:432 — so diff-cover reported that line at
+# 0%. A subprocess would not help: coverage.py does not trace a child
+# interpreter, so the load has to be IN-PROCESS.
+import importlib.util
+import types
+
+
+def _stub_discord() -> None:
+    """Minimal stand-in for the discord SDK so the module imports offline."""
+    stub = types.ModuleType("discord")
+
+    class _Intents:
+        @classmethod
+        def default(cls):
+            i = cls(); i.message_content = False; i.members = False; return i
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            self.user = None
+            self.loop = types.SimpleNamespace(create_task=lambda *a, **kw: None)
+
+        def event(self, fn):
+            return fn
+
+        def get_channel(self, _):
+            return None
+
+    stub.Intents, stub.Client = _Intents, _Client
+    stub.AllowedMentions = type("AllowedMentions", (), {"__init__": lambda self, *a, **kw: None})
+    for n in ("File", "Message", "DMChannel", "TextChannel", "Thread"):
+        setattr(stub, n, type(n, (), {}))
+    sys.modules.setdefault("discord", stub)
+    sys.modules.setdefault("discord.errors", types.ModuleType("discord.errors"))
+
+
+_stub_discord()
+_spec = importlib.util.spec_from_file_location("_db_exec", REPO / "src" / "discord-bridge.py")
+_db = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(_db)
+except Exception as exc:                                    # pragma: no cover - env-dependent
+    check("EXECUTION: discord-bridge imported for the real call", False, repr(exc))
+else:
+    seen: dict[str, object] = {}
+    _db._run_optional_script_shared = lambda script, args, **kw: seen.setdefault("script", script)
+    _db._transcribe_via_skill("/tmp/does-not-exist.ogg")
+    got = Path(str(seen.get("script", "")))
+    check("EXECUTION: the derivation line ran and produced a path", bool(seen))
+    check("EXECUTION: it resolved to the REAL checkout's skills/, not the symlink parent",
+          got.parts[-4:] == ("skills", "audio-transcribe", "scripts", "transcribe.py"),
+          f"got {got}")
+    # The property the fix exists for: os.path.realpath means the derived path
+    # does not depend on __file__ being reached through a symlinked src/.
+    check("EXECUTION: the resolved script exists on disk", got.exists(), f"got {got}")
+
 print()
 if failures:
     print(f"{len(failures)} check(s) FAILED: {failures}")
     sys.exit(1)
-print("all checks passed — every bridge finds the transcribe skill through a symlinked src/")
+print("all checks passed — the transcribe skill path survives a symlinked src/")
