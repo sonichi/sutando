@@ -206,6 +206,68 @@ _dead = hc.core_env_has_proxy_url(
 check("control: the default runner reaches a real `ps` (dead pid also -> None)",
       _dead is None)
 
+# --- the lookalike SESSION NAME (PR #2530 review, john-the-dev) -------------------
+# `f"--name {session}" in argv` is a SUBSTRING test, so `--name sutando-core-watcher`
+# satisfied it and a prefix-named sibling was accepted as the core. The reviewer
+# reproduced it on a sole pane: returned True where the contract answer is None.
+#
+# This is the SAME lookalike class as the `ANTHROPIC_BASE_URL_OLD` control already in
+# this file. I wrote the guard for the env-var axis and then opened the identical hole
+# on the session-name axis — which is why both axes now get an assertion.
+WATCHER_ARGV = "claude --name sutando-core-watcher --model opus"
+
+check("a PREFIX-named sibling is not the core (--name sutando-core-watcher)",
+      probe(R(0, "6648\n"), R(0, f"{WATCHER_ARGV} {ENV_WITH_PROXY}")) is None,
+      "substring matching on '--name sutando-core' accepts the watcher and returns True")
+
+check("a SUFFIX-named sibling is not the core either",
+      probe(R(0, "6648\n"), R(0, f"claude --name x-sutando-core {ENV_WITH_PROXY}")) is None)
+
+check("the =-joined spelling IS accepted (--name=sutando-core)",
+      probe(R(0, "6648\n"), R(0, f"claude --name=sutando-core {ENV_WITH_PROXY}")) is True)
+
+check("control: exact --name still matches (the fix did not over-tighten)",
+      probe(R(0, "6648\n"), R(0, f"{ARGV} {ENV_WITH_PROXY}")) is True)
+
+check("a watcher and the real core in one session -> the CORE's answer",
+      hc.core_env_has_proxy_url(
+          socket_path="/tmp/probe.sock",
+          tmux_runner=lambda sock, *a: R(0, "7777\n6648\n"),
+          ps_runner=lambda pid: R(0, f"{ARGV} {ENV_NO_PROXY}") if str(pid) == "6648"
+                                else R(0, f"{WATCHER_ARGV} {ENV_WITH_PROXY}")) is False)
+
+# --- the socket must come from THIS host (PR #2530 review, qingyun-wu) ------------
+# `_live_core_socket()` globs every synced state/cores/*.alive and takes the freshest,
+# which the workspace contract permits to be another MACHINE's. The reviewer built two
+# fresh records (local at N-1, peer at N) and the probe targeted the peer's socket;
+# that socket is absent locally so the tri-state degraded to None — correct behaviour,
+# wrong target, and it suppresses the warning this check exists to raise.
+import json as _json, tempfile as _tf, time as _t, pathlib as _pl
+
+_ws = _pl.Path(_tf.mkdtemp())
+_cores = _ws / "state" / "cores"
+_cores.mkdir(parents=True)
+_local_label = sorted(hc._local_host_labels())[0]
+(_cores / f"{_local_label}.alive").write_text(_json.dumps({"socket": "/tmp/local-core.sock"}))
+(_cores / "PeerHost.alive").write_text(_json.dumps({"socket": "/tmp/peer-core.sock"}))
+# make the PEER strictly newer, which is the case that used to win
+_now = _t.time()
+import os as _os
+_os.utime(_cores / f"{_local_label}.alive", (_now - 5, _now - 5))
+_os.utime(_cores / "PeerHost.alive", (_now, _now))
+
+check("a NEWER peer heartbeat does not win — the local socket is chosen",
+      hc._local_core_socket(workspace=_ws) == "/tmp/local-core.sock",
+      "the freshest *.alive belongs to PeerHost; resolving by mtime alone picks it")
+
+check("control: the OLD resolver does pick the peer (the bug is real, not theoretical)",
+      hc._live_core_socket(workspace=_ws) == "/tmp/peer-core.sock")
+
+_os.remove(_cores / f"{_local_label}.alive")
+check("no LOCAL heartbeat -> None, not a default socket",
+      hc._local_core_socket(workspace=_ws) is None,
+      "falling back to the default socket would probe a session this host may not run")
+
 print()
 if failures:
     print(f"{len(failures)} check(s) FAILED: {failures}")

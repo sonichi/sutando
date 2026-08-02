@@ -2562,6 +2562,49 @@ def _marker_predates_running_core(marker: dict) -> bool:
     return started < launched - margin
 
 
+def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
+    """This HOST's core tmux socket, or None if this host has no live heartbeat.
+
+    Deliberately NOT `_live_core_socket()`. That resolver globs every synced
+    `state/cores/*.alive` and takes the freshest, which the workspace contract
+    permits to be ANOTHER MACHINE's — the vault carries one heartbeat per host.
+    A reviewer reproduced it with two fresh records: the local one at mtime N-1
+    and a peer at N, and the probe targeted `/tmp/peer-core.sock`. That socket
+    does not exist locally, so the tri-state correctly degraded to None — which
+    silently suppresses the very warning this check exists to raise. Correct
+    behaviour, wrong target, false green.
+
+    Host matching uses `_local_host_labels()` rather than one label, because the
+    reader and the launchers do not share a host-label contract (see that
+    function). Returning None when this host has no fresh heartbeat is right:
+    "no local core is running" is not evidence that a core bypasses the proxy.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return None
+    labels = _local_host_labels()
+    now = time.time()
+    best_mtime, best_socket = None, None
+    for alive_file in cores_dir.glob("*.alive"):
+        if alive_file.stem not in labels:
+            continue                      # another machine's heartbeat
+        try:
+            mtime = alive_file.stat().st_mtime
+            if now - mtime >= 90.0:
+                continue                  # stale — not a live core
+            payload = json.loads(alive_file.read_text())
+            if not isinstance(payload, dict):
+                continue
+            sock = payload.get("socket")
+        except (OSError, ValueError):
+            continue
+        if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
+            best_mtime, best_socket = mtime, sock
+    return best_socket
+
+
 def core_env_has_proxy_url(
     socket_path: Optional[str] = None,
     session: str = "sutando-core",
@@ -2614,7 +2657,9 @@ def core_env_has_proxy_url(
                 ["ps", "eww", "-o", "command=", "-p", str(pid)],
                 capture_output=True, text=True, timeout=15,
             )
-    sock = socket_path or _live_core_socket()
+    sock = socket_path or _local_core_socket()
+    if not sock:
+        return None                       # no live LOCAL core -> unknown, not a bypass
     # `-s` = every pane in the SESSION, not just the current window's.
     panes = tmux_runner(sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
     if panes is None or getattr(panes, "returncode", 1) != 0:
@@ -2624,7 +2669,22 @@ def core_env_has_proxy_url(
         return None
     # Identify the core by argv, not by position: `--name <session>` is what
     # start-cli.sh passes and no sibling window carries it.
-    marker = f"--name {session}"
+    #
+    # TOKEN equality, never substring. `f"--name {session}" in argv` also matches
+    # `--name sutando-core-watcher`, so a prefix-named sibling in the same session
+    # was accepted as the core (john-the-dev, reproduced on a sole pane: returned
+    # True where the contract is None). This is the SAME lookalike class as the
+    # `ANTHROPIC_BASE_URL_OLD` control already in the suite — I guarded the env-var
+    # axis and then introduced the identical hole on the session-name axis.
+    def _names_this_session(argv: str) -> bool:
+        toks = argv.split()
+        for i, t in enumerate(toks):
+            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
+                return True
+            if t == f"--name={session}":  # the =-joined spelling
+                return True
+        return False
+
     matches = []
     for pid in pids:
         try:
@@ -2634,7 +2694,7 @@ def core_env_has_proxy_url(
         if proc is None or getattr(proc, "returncode", 1) != 0:
             continue                      # this pane vanished; keep looking
         out = proc.stdout or ""
-        if marker in out:
+        if _names_this_session(out):
             matches.append(out)
     # Zero matches: the core is not in this session (or ps could not read any pane).
     # More than one: ambiguous, and an ambiguous session is not evidence of a bypass.
