@@ -135,19 +135,23 @@ with tempfile.TemporaryDirectory() as _tmp:
         _mod.WORKSPACE = str(ws)
         _mod.NOTES_DIR = notes
 
-        # not a git work tree at all: git returns non-zero, no exception
-        ok("no git repo: _note_creation_dates returns {} rather than raising",
-           _mod._note_creation_dates(notes) == {}, "expected empty map")
+        # not a git work tree: git RAN and returned non-zero. That is an empty
+        # result, NOT an unavailable git — the flag must say so, because the
+        # caller uses it to decide whether per-file probes are safe.
+        ok("no git repo: returns ({}, ran=True) — empty result, not unavailable",
+           _mod._note_creation_dates(notes) == ({}, True),
+           f"got {_mod._note_creation_dates(notes)!r}")
 
         _mod.subprocess.run = _boom
-        ok("git unavailable: _note_creation_dates degrades to {}",
-           _mod._note_creation_dates(notes) == {}, "OSError must be swallowed")
+        ok("git unavailable: returns ({}, ran=False) — distinguishable from empty",
+           _mod._note_creation_dates(notes) == ({}, False),
+           f"got {_mod._note_creation_dates(notes)!r}")
         ok("git unavailable: _note_added_at degrades to ''",
            _mod._note_added_at(notes / "n.md") == "", "OSError must be swallowed")
         _mod.subprocess.run = _orig_run
 
         # a malformed stamp must fall through to mtime, not crash the briefing
-        _mod._note_creation_dates = lambda d: {"n.md": "not-a-timestamp"}
+        _mod._note_creation_dates = lambda d: ({"n.md": "not-a-timestamp"}, True)
         stats = _mod.analyze_note_activity()
         ok("malformed git stamp falls back to mtime instead of raising",
            stats["total"] == 1 and stats["recent_7d"] == 1,
@@ -163,6 +167,97 @@ with tempfile.TemporaryDirectory() as _tmp:
 ok("teardown restored the real _note_creation_dates",
    _mod._note_creation_dates is _orig_dates and "lambda" not in repr(_mod._note_creation_dates),
    f"still patched: {_mod._note_creation_dates!r}")
+
+
+# --- rename is not creation (review #2526 P1-1) ----------------------------
+# `--diff-filter=A` alone reports a rename as an add, so a note written in June
+# and renamed last week reads as new. Repro from the review, held directly.
+
+with tempfile.TemporaryDirectory() as _tmp:
+    ws = Path(_tmp)
+    notes = ws / "notes"
+    notes.mkdir()
+    _git(ws, "init", "-q")
+
+    old = notes / "old-name.md"
+    old.write_text("body\n")
+    _git(ws, "add", "notes/old-name.md")
+    _git(ws, "commit", "-qm", "add", when="2026-06-03T12:00:00 +0000")
+    _git(ws, "mv", "notes/old-name.md", "notes/new-name.md")
+    _git(ws, "commit", "-qm", "rename", when="2026-07-31T12:00:00 +0000")
+
+    renamed = notes / "new-name.md"
+    _now = time.time()
+    os.utime(renamed, (_now, _now))
+
+    _o_ws, _o_dir = _mod.WORKSPACE, _mod.NOTES_DIR
+    try:
+        _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+        created, ran = _mod._note_creation_dates(notes)
+        stats = _mod.analyze_note_activity()
+    finally:
+        _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
+
+    ok("rename carries the ORIGINAL add date, not the rename date",
+       created.get("new-name.md", "").startswith("2026-06-03"),
+       f"got {created.get('new-name.md')!r}")
+    ok("a note renamed last week but written in June is NOT recent",
+       stats["recent_7d"] == 0, f"recent_7d={stats['recent_7d']}, expected 0")
+
+
+# --- no per-note fan-out when git cannot run (review #2526 P1-2) -----------
+# Pre-fix, a failed bulk query yielded created={} and _is_recent() then spawned
+# one git per note — 356 on the real workspace, each with a 10s timeout.
+
+with tempfile.TemporaryDirectory() as _tmp:
+    ws = Path(_tmp)
+    notes = ws / "notes"
+    notes.mkdir()
+    for i in range(3):
+        (notes / f"n{i}.md").write_text("body\n")
+
+    _o_ws, _o_dir, _o_run = _mod.WORKSPACE, _mod.NOTES_DIR, _mod.subprocess.run
+    _calls = []
+
+    def _count_and_raise(*a, **k):
+        _calls.append(a[0] if a else None)
+        raise OSError("git not on PATH")
+
+    try:
+        _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+        _mod.subprocess.run = _count_and_raise
+        stats = _mod.analyze_note_activity()
+    finally:
+        _mod.subprocess.run = _o_run
+        _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
+
+    ok("git unavailable: exactly ONE git attempt for 3 notes (no per-note fan-out)",
+       len(_calls) == 1, f"{len(_calls)} subprocess attempts: expected 1 bulk, no per-note probes")
+    ok("git unavailable: still returns a usable count via mtime",
+       stats["total"] == 3 and stats["recent_7d"] == 3, f"got {stats}")
+
+    # and when the resolver itself says there is no git, zero spawns
+    _o_argv = _mod.git_argv
+    _calls2 = []
+
+    def _boom_argv(*a):
+        raise _mod_git_unavailable("no runnable git")
+
+    from git_binary import GitUnavailable as _mod_git_unavailable  # noqa: E402
+    try:
+        _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+        _mod.git_argv = _boom_argv
+        _mod.subprocess.run = lambda *a, **k: _calls2.append(1)
+        stats2 = _mod.analyze_note_activity()
+    finally:
+        _mod.git_argv = _o_argv
+        _mod.subprocess.run = _o_run
+        _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
+
+    ok("no runnable git: ZERO subprocess spawns",
+       len(_calls2) == 0, f"{len(_calls2)} spawns despite GitUnavailable")
+    ok("no runnable git: count still produced from mtime",
+       stats2["total"] == 3, f"got {stats2}")
 
 
 print(f"daily-insight-note-age: {_passed}/{_passed + _failed} passed"

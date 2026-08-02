@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from git_binary import git_argv  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 CALLS_FILE = WORKSPACE / "results" / "calls" / "calls.jsonl"
@@ -190,22 +191,79 @@ def _iso_z(stamp):
     return stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
 
 
+def _note_creation_dates(notes_dir):
+    """`(filename -> creation stamp, git_ran)` for every note, in ONE git call.
+
+    mtime cannot answer "when was this written" in this workspace. It is a
+    git-backed vault synced across hosts, and both `git checkout` and the rsync
+    path stamp every file with the time of the *sync*. On 2026-08-02 that made
+    673 of 725 notes share one mtime to the minute, so the seven-day filter
+    matched every note on disk and `recent_7d` was identically `total`
+    (356 == 356) — a filter that cannot discriminate. Same trap
+    `skills/task-orphan-check/SKILL.md` documents for task files.
+
+    **Renames are followed.** `--diff-filter=A` alone reports a rename as a
+    creation, so a note written in June and renamed last week reads as new. The
+    query therefore asks for adds AND renames (`-M --name-status`) oldest-first,
+    and a rename carries the original's date onto the new name. `--follow` is
+    not an option here: it accepts only a single path, and this is one query for
+    the whole directory.
+
+    The second element of the tuple distinguishes **"git could not run"** from
+    **"git ran and that path has no history"**. They are not the same: the
+    caller must not fall back to per-file git probes on a host where git is
+    unavailable, or one failed directory query becomes one failed probe per
+    note.
+    """
+    try:
+        argv = git_argv(
+            "-C", str(WORKSPACE), "log", "--reverse", "--diff-filter=AR", "-M",
+            "--name-status", "--format=@%aI", "--", str(notes_dir),
+        )
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        # GitUnavailable subclasses FileNotFoundError -> OSError, so a host with
+        # no runnable git lands here rather than needing its own branch.
+        return {}, False
+    if r.returncode != 0:
+        return {}, True
+    created, stamp = {}, None
+    for line in r.stdout.splitlines():
+        if line.startswith("@"):
+            stamp = line[1:]
+            continue
+        if not line.strip() or stamp is None:
+            continue
+        parts = line.split("\t")
+        status = parts[0]
+        if status.startswith("R") and len(parts) >= 3:
+            src, dst = Path(parts[1]).name, Path(parts[2]).name
+            # the renamed file keeps the date of whatever it was renamed FROM
+            created[dst] = created.get(src, stamp)
+        elif status.startswith("A") and len(parts) >= 2:
+            # oldest-first (--reverse), so the FIRST add seen is the earliest
+            created.setdefault(Path(parts[1]).name, stamp)
+    return created, True
+
+
 def _note_added_at(path):
-    """Creation stamp for ONE note, for files the directory-wide scan misses.
+    """Creation stamp for ONE note the directory-wide scan missed.
 
     `git log --diff-filter=A -- <dir>` applies history simplification and can
     omit a file that the same query scoped to that file alone reports fine
-    (observed on `notes/pro-parity-runbook.md`, added in 6c269998). Without this
-    second tier such a file falls through to mtime and — because the sync resets
-    mtime — is counted as new forever, inflating the number in exactly the
-    direction this fix exists to correct. Returns "" if git cannot answer.
+    (observed on `notes/pro-parity-runbook.md`, added in 6c269998). `--follow`
+    is usable here because this is a single path, so it also survives renames.
+
+    Only ever called for names absent from the bulk map, and only when that
+    query actually ran — see `_note_creation_dates`. Returns "" if git cannot
+    answer.
     """
     try:
-        r = subprocess.run(
-            ["git", "-C", str(WORKSPACE), "log", "--diff-filter=A", "-1",
-             "--format=%aI", "--", str(path)],
-            capture_output=True, text=True, timeout=10,
+        argv = git_argv(
+            "-C", str(WORKSPACE), "log", "--follow", "--diff-filter=A", "-1",
+            "--format=%aI", "--", str(path),
         )
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""
@@ -215,16 +273,27 @@ def analyze_note_activity():
     """Check note creation patterns."""
     notes = list(NOTES_DIR.glob("*.md"))
     cutoff = datetime.now().timestamp() - 7 * 86400
-    created = _note_creation_dates(NOTES_DIR)
+    created, git_ran = _note_creation_dates(NOTES_DIR)
+
+    def _stamp_is_recent(iso):
+        try:
+            return datetime.fromisoformat(_iso_z(iso)).timestamp() > cutoff
+        except ValueError:
+            return None
 
     def _is_recent(n):
-        iso = created.get(n.name) or _note_added_at(n)
-        if iso:
-            try:
-                return datetime.fromisoformat(_iso_z(iso)).timestamp() > cutoff
-            except ValueError:
-                pass
-        # genuinely untracked: mtime is all there is, unreliable as it is here
+        iso = created.get(n.name)
+        if iso is None and git_ran:
+            # absent from the bulk map (history simplification). Bounded: this
+            # runs only for the handful of names the one directory query missed,
+            # never per-note, and never at all when git could not run.
+            iso = _note_added_at(n) or None
+        if iso is not None:
+            verdict = _stamp_is_recent(iso)
+            if verdict is not None:
+                return verdict
+        # git unavailable, untracked, or an unparseable stamp: mtime is all
+        # there is, unreliable as it is here.
         return n.stat().st_mtime > cutoff
 
     recent = [n for n in notes if _is_recent(n)]
