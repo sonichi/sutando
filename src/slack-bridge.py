@@ -60,6 +60,7 @@ sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
+from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -667,20 +668,16 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     [File attached:] line unchanged. Any error from the subprocess is swallowed;
     transcription failure must never block task delivery.
     """
-    import subprocess
     skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
-    if not skill_script.exists():
-        return None
-    try:
-        result = subprocess.run(
-            [sys.executable, str(skill_script), local_path],
-            capture_output=True, text=True, timeout=25,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    except Exception as e:
-        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
-    return None
+    return _run_optional_script_shared(
+        skill_script,
+        [local_path],
+        timeout=25,
+        on_error=lambda exc: print(
+            f"  [stt] skill call failed for {os.path.basename(local_path)}: {exc}",
+            flush=True,
+        ),
+    )
 
 
 # When a sender ADDRESSES the bot (a DM, or an @mention — every _write_task call

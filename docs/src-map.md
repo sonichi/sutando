@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-181 modules indexed.
+182 modules indexed.
 
 ## `src/`
 
@@ -70,6 +70,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`morning-briefing.py`** — Morning briefing for Sutando.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
+- **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.

@@ -105,6 +105,14 @@ Disallowed:
 Shared behavior needed by multiple adapters belongs in core only when it is
 provider-neutral. Otherwise it belongs in an adapter library.
 
+### Optional adapter capabilities
+
+Optional capability discovery also remains at the adapter edge. A generic
+core helper may run an injected script path and standardize timeout/failure
+semantics, but it must not name, locate, or import a concrete skill. This keeps
+the dependency direction adapter → helper while preserving the rule that core
+does not depend on installed skills.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known
