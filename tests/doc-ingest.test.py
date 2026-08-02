@@ -230,14 +230,13 @@ with tempfile.TemporaryDirectory() as td:
         check("pdf-pypdf-fallback", "page one text" in ingest.extract_pdf(pdf))
 
     # 16b. pdftotext SUCCESS path (CI has no poppler) — mock which + subprocess.
-    ok_proc = types.SimpleNamespace(returncode=0, stdout="poppler extracted text", stderr="")
     with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/pdftotext"), \
-         mock.patch.object(ingest.subprocess, "run", return_value=ok_proc):
+         mock.patch.object(ingest, "_run_text_command_bounded",
+                           return_value=(0, "poppler extracted text", "")):
         check("pdf-pdftotext-success", "poppler extracted text" in ingest.extract_pdf(pdf))
 
     # 16c. pdftotext returns empty → fall through to a raising fake pypdf → next
     #      extractor absent → RuntimeError from the tried-non-empty branch.
-    empty_proc = types.SimpleNamespace(returncode=0, stdout="   ", stderr="")
     raising_pypdf = types.ModuleType("pypdf")
 
     def _boom(_p):
@@ -245,7 +244,7 @@ with tempfile.TemporaryDirectory() as td:
 
     raising_pypdf.PdfReader = _boom
     with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/pdftotext"), \
-         mock.patch.object(ingest.subprocess, "run", return_value=empty_proc), \
+         mock.patch.object(ingest, "_run_text_command_bounded", return_value=(0, "   ", "")), \
          mock.patch.dict(sys.modules, {"pypdf": raising_pypdf, "fitz": None}):
         try:
             ingest.extract_pdf(pdf)
@@ -297,10 +296,10 @@ with tempfile.TemporaryDirectory() as td:
         check("docx-fallback", "ParaFromXml" in ingest.extract_docx(fake_docx, 500))
 
     # 18b. DOCX fallback via textutil (docx absent, textutil present) — mocked.
-    tu_proc = types.SimpleNamespace(returncode=0, stdout="textutil docx text", stderr="")
     with mock.patch.dict(sys.modules, {"docx": None}), \
          mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/textutil"), \
-         mock.patch.object(ingest.subprocess, "run", return_value=tu_proc):
+         mock.patch.object(ingest, "_run_text_command_bounded",
+                           return_value=(0, "textutil docx text", "")):
         check("docx-textutil", "textutil docx text" in ingest.extract_docx(fake_docx, 500))
 
     # 19. RTF via textutil unavailable → clear RuntimeError.
@@ -379,35 +378,39 @@ with tempfile.TemporaryDirectory() as td:
     # 23. RTF/.doc dispatch → textutil success path (mock which + subprocess).
     rtf2 = tmp / "y.rtf"
     rtf2.write_text("{\\rtf1 body}")
-    fake_proc = types.SimpleNamespace(returncode=0, stdout="converted rtf text", stderr="")
     with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/textutil"), \
-         mock.patch.object(ingest.subprocess, "run", return_value=fake_proc):
+         mock.patch.object(ingest, "_run_text_command_bounded",
+                           return_value=(0, "converted rtf text", "")):
         kind, text = ingest.extract(rtf2, 500)
     check("rtf-textutil-success", kind == "textutil" and "converted rtf text" in text)
 
     # 24. textutil non-zero return → RuntimeError naming the failure.
-    fail_proc = types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
     with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/textutil"), \
-         mock.patch.object(ingest.subprocess, "run", return_value=fail_proc):
+         mock.patch.object(ingest, "_run_text_command_bounded", return_value=(1, "", "boom")):
         try:
             ingest.extract_textutil(rtf2)
             check("textutil-nonzero", False, "expected RuntimeError")
         except RuntimeError as exc:
             check("textutil-nonzero", "textutil failed" in str(exc))
 
-    # 24b. Converter stdout is file-backed and rejected at a hard byte budget;
-    # it must never be fully captured into process memory before truncation.
-    def _oversized_converter(*_args, stdout=None, **_kwargs):
-        stdout.write(b"x" * (1024 * 1024 + 1))
-        return types.SimpleNamespace(returncode=0, stdout=None, stderr=b"")
-
-    with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/textutil"), \
-         mock.patch.object(ingest.subprocess, "run", side_effect=_oversized_converter):
-        try:
-            ingest.extract_textutil(rtf2, 10)
-            check("textutil-byte-budget", False, "expected hard byte-budget failure")
-        except RuntimeError as exc:
-            check("textutil-byte-budget", "byte budget" in str(exc), str(exc))
+    # 24b. Converter stdout is streamed from a pipe and the child is terminated
+    # at the budget. The marker is after 2 MiB of output; with max_chars=10 the
+    # byte ceiling is 1 MiB, so post-output code must never run.
+    converter_finished = tmp / "converter-finished"
+    oversized_command = [
+        sys.executable,
+        "-c",
+        ("import os, pathlib; "
+         "[os.write(1, b'x' * 4096) for _ in range(512)]; "
+         f"pathlib.Path({str(converter_finished)!r}).write_text('finished')"),
+    ]
+    try:
+        ingest._run_text_command_bounded(oversized_command, 10, "test converter")
+        check("textutil-byte-budget", False, "expected hard byte-budget failure")
+    except RuntimeError as exc:
+        check("textutil-byte-budget", "byte budget" in str(exc), str(exc))
+    check("converter-stopped-at-budget", not converter_finished.exists(),
+          "child reached post-output marker instead of being terminated at the budget")
 
     # 24c. Page-based PDF fallbacks accumulate incrementally and stop once the
     # extracted-text ceiling is crossed instead of joining every page first.

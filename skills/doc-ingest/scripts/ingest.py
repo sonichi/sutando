@@ -9,11 +9,13 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
-import tempfile
+import time
 import zipfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -81,38 +83,70 @@ def _join_bounded(chunks, max_chars: int, label: str, separator: str = "\n") -> 
 
 
 def _run_text_command_bounded(command: list[str], max_chars: int, label: str) -> tuple[int, str, str]:
-    """Capture command output through a file so stdout is never buffered in RAM."""
+    """Stream converter output and stop the child as soon as its budget is crossed."""
     _, byte_budget = _document_budgets(max_chars)
-    with tempfile.TemporaryFile() as stdout_file:
-        proc = subprocess.run(
-            command,
-            stdout=stdout_file,
-            stderr=subprocess.PIPE,
-            timeout=120,
-        )
-        # Unit-test fakes may provide stdout directly; real subprocesses write to
-        # stdout_file, keeping the potentially large conversion outside memory.
-        mocked_stdout = getattr(proc, "stdout", None)
-        if isinstance(mocked_stdout, str):
-            payload = mocked_stdout.encode("utf-8")
-        elif isinstance(mocked_stdout, bytes):
-            payload = mocked_stdout
-        else:
-            size = stdout_file.tell()
-            if size > byte_budget:
-                raise _ResourceBudgetError(
-                    f"{label} exceeds extracted byte budget ({byte_budget} bytes); extraction stopped"
-                )
-            stdout_file.seek(0)
-            payload = stdout_file.read(byte_budget + 1)
-        if len(payload) > byte_budget:
-            raise _ResourceBudgetError(
-                f"{label} exceeds extracted byte budget ({byte_budget} bytes); extraction stopped"
-            )
-        stderr = getattr(proc, "stderr", b"") or b""
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
-        return proc.returncode, payload.decode("utf-8", errors="replace"), stderr
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None and proc.stderr is not None
+    streams = selectors.DefaultSelector()
+    streams.register(proc.stdout, selectors.EVENT_READ, "stdout")
+    streams.register(proc.stderr, selectors.EVENT_READ, "stderr")
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    stdout_size = 0
+    stderr_size = 0
+    deadline = time.monotonic() + 120
+
+    def stop_child() -> None:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    try:
+        while streams.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_child()
+                raise subprocess.TimeoutExpired(command, 120)
+            for key, _ in streams.select(timeout=min(remaining, 0.1)):
+                # Read at most one byte beyond the stdout budget. This makes the
+                # crossing observable without draining a child that keeps
+                # producing output; the child is terminated immediately below.
+                if key.data == "stdout":
+                    read_size = min(64 * 1024, byte_budget - stdout_size + 1)
+                else:
+                    read_size = 64 * 1024
+                chunk = os.read(key.fd, read_size)
+                if not chunk:
+                    streams.unregister(key.fileobj)
+                    continue
+                if key.data == "stdout":
+                    stdout_size += len(chunk)
+                    if stdout_size > byte_budget:
+                        stop_child()
+                        raise _ResourceBudgetError(
+                            f"{label} exceeds extracted byte budget "
+                            f"({byte_budget} bytes); extraction stopped"
+                        )
+                    stdout_chunks.append(chunk)
+                elif stderr_size < 64 * 1024:
+                    keep = chunk[:64 * 1024 - stderr_size]
+                    stderr_chunks.append(keep)
+                    stderr_size += len(keep)
+        returncode = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    finally:
+        streams.close()
+        stop_child()
+        proc.stdout.close()
+        proc.stderr.close()
+    return (
+        returncode,
+        b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+        b"".join(stderr_chunks).decode("utf-8", errors="replace"),
+    )
 
 
 def _read_ooxml_member_bounded(zf: zipfile.ZipFile, name: str, max_chars: int) -> bytes:
