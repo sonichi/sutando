@@ -7,7 +7,7 @@
 The 3-space model (`docs/workspace-design.md`) deliberately keeps State per-machine:
 
 - State is rebuildable.
-- `rm -rf "$(bash scripts/sutando-config.sh workspace)"` is meant to be survivable.
+- `rm -rf <workspace>` is meant to be survivable.
 - Logs and PIDs from one Mac have no value on another.
 
 Real use case that bends the rule: a user with multiple Macs wants a **cross-machine task queue** — start a Telegram task on the MacBook, finish it on the Mac Studio because that's the machine with the GPU / the right tool / the recording it needs. The relevant State subdirectories are:
@@ -21,7 +21,7 @@ The straightforward fix — sync the whole workspace — breaks the "rebuildable
 
 Add `<workspace>/state/.sync-allowlist` — a newline-delimited list of subpaths under `state/` that get synced across the fleet. Default (file missing) → nothing in State syncs. Existing single-machine installs are unaffected.
 
-> `<workspace>` resolves via `bash scripts/sutando-config.sh workspace` (M0 helper, PR #1395). Defaults to `<repo>/workspace/`. **`$SUTANDO_WORKSPACE` is not honored** — removed in v0.8; setting it only warns. The `rm -rf` examples below therefore resolve the workspace through the helper rather than through `$SUTANDO_WORKSPACE`: with the var unset (the normal case now) the old form expands to a bare `rm -rf`, and with a stale value still exported — the expected state for exactly the legacy installs this note addresses — it would delete the OLD path, demonstrating survivability against the wrong tree.
+> `<workspace>` resolves via `bash scripts/sutando-config.sh workspace` (M0 helper, PR #1395). Defaults to `<repo>/workspace/`. **`$SUTANDO_WORKSPACE` is not honored** — removed in v0.8; setting it only warns. The `rm -rf` examples below deliberately write `<workspace>` as a **placeholder, not a runnable command**. Spelling out the resolved path would make a destructive line copy-pasteable, and the prose around it calls the deletion *survivable* — which is a claim about the sync design, not an invitation to try it on a live tree. The old `$SUTANDO_WORKSPACE` form was inert when pasted (the var is unset); anything that resolves for real is not.
 
 Example file:
 
@@ -92,10 +92,10 @@ A Mac that wakes up post-sync and sees `state/fleet/done/task-<id>.<otherhost>.f
 
 ## Lifecycle invariants
 
-The 3-space model's invariant is `rm -rf "$(bash scripts/sutando-config.sh workspace)"` is survivable. With fleet sync added, the invariant becomes:
+The 3-space model's invariant is `rm -rf <workspace>` is survivable. With fleet sync added, the invariant becomes:
 
-- `rm -rf "$(bash scripts/sutando-config.sh workspace)"` on **one** Mac is survivable — the next sync pulls fleet state back.
-- `rm -rf "$(bash scripts/sutando-config.sh workspace)"` on **all** Macs simultaneously loses uncommitted claims + uncommitted results. This is a user-action consequence, not a bug; document it but don't engineer for it.
+- `rm -rf <workspace>` on **one** Mac is survivable — the next sync pulls fleet state back.
+- `rm -rf <workspace>` on **all** Macs simultaneously loses uncommitted claims + uncommitted results. This is a user-action consequence, not a bug; document it but don't engineer for it.
 - A Mac that loses network mid-claim retries the claim on next sync. If the same task is already done by another Mac (flag present post-sync), it noops.
 
 Tasks **not** on the allowlist behave exactly as today — no change to single-machine semantics.
