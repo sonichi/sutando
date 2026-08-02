@@ -25,22 +25,29 @@ _managed_voice_credential_present() {
   # Mirrors CAPABILITY_FALLBACKS['gemini-voice'] = ['gemini-voice','gemini-text'].
   # Malformed/unreadable files skip the tier rather than throwing, matching
   # readManaged()'s try/catch contract.
-  # Resolve a REAL interpreter before reading. A bare `python3` on a fresh Mac
-  # resolves to the Xcode Command Line Tools stub, which exits non-zero — and
-  # this function returns 1 on any failure, so a stub would be indistinguishable
-  # from "no managed credential configured". That is a silent wrong answer, not
-  # a crash: startup would quietly proceed as BYO-only while a managed
-  # credential sat on disk. Homebrew-first mirrors resolve_python() in
-  # src/install-{cron-runner,health-check}-launchd.sh.
+  # Resolve an interpreter that actually RUNS before reading. A bare `python3`
+  # on a fresh Mac resolves to the Xcode Command Line Tools stub, which exits
+  # non-zero — and this function returns 1 on any failure, so a stub would be
+  # indistinguishable from "no managed credential configured". That is a silent
+  # wrong answer, not a crash: startup would proceed BYO-only while a managed
+  # credential sat on disk.
+  #
+  # PROBE, don't path-match. `command -v` finds the stub because the stub IS on
+  # PATH; only running it tells you whether it works. Homebrew's location is
+  # asked for (`brew --prefix`) rather than written down, so this works on both
+  # Apple Silicon and Intel and adds no hardcoded path (REVIEW.md hardcoded-paths).
+  _usable_python() {
+    [ -n "${1:-}" ] && [ -x "$1" ] && "$1" -c 'import json' >/dev/null 2>&1
+  }
   local _py=""
-  if [ -x /opt/homebrew/bin/python3 ]; then _py=/opt/homebrew/bin/python3
-  elif [ -x /usr/local/bin/python3 ]; then _py=/usr/local/bin/python3
-  elif command -v python3 >/dev/null 2>&1; then _py="$(command -v python3)"
+  if _usable_python "$(command -v python3 2>/dev/null)"; then
+    _py="$(command -v python3)"
+  elif command -v brew >/dev/null 2>&1 \
+       && _usable_python "$(brew --prefix 2>/dev/null)/bin/python3"; then
+    _py="$(brew --prefix)/bin/python3"
   fi
-  # Probe rather than trust the path: the stub EXISTS on PATH, so `command -v`
-  # finds it. Only running it distinguishes a usable interpreter from a shim.
-  if [ -z "$_py" ] || ! "$_py" -c 'import json' >/dev/null 2>&1; then
-    echo "  ~ managed-credential gate: no usable python3 (tried '${_py:-none}') —" \
+  if [ -z "$_py" ]; then
+    echo "  ~ managed-credential gate: no usable python3 —" \
          "cannot read $_file; treating as UNKNOWN, not as absent" >&2
     return 1
   fi
