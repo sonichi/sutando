@@ -198,6 +198,13 @@ ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
 GATEWAY_INSTANCE = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
 if GATEWAY_INSTANCE and not GATEWAY_INSTANCE.replace("-", "").replace("_", "").isalnum():
     sys.exit(f"FATAL: GATEWAY_INSTANCE must be alphanumeric/-/_ (got {GATEWAY_INSTANCE!r})")
+# Length bound MUST match _LOCAL_TID_RE's instance segment ({1,32}) — review
+# P1 2026-08-02: a 33-char instance passed this guard, queued + ACKed tasks,
+# then _valid_local_tid() rejected the encoding and results were silently
+# stranded. Import refusal keeps the two contracts from drifting apart at the
+# only point a mismatch can enter.
+if len(GATEWAY_INSTANCE) > 32:
+    sys.exit(f"FATAL: GATEWAY_INSTANCE must be ≤32 chars (got {len(GATEWAY_INSTANCE)}: {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
 
 

@@ -152,6 +152,17 @@ def main() -> int:
           "GATEWAY_INSTANCE=dev suffixes gateway-status")
     check(_grtc._LOCK_ROLE == "gateway-bridge.dev",
           "GATEWAY_INSTANCE=dev gets its OWN singleton lock role (per-gateway dual-poller guard)")
+    # A >32-char instance must refuse at import — the bound must equal
+    # _LOCAL_TID_RE's instance segment or a legal-looking env config accepts
+    # tasks, ACKs them, and silently strands their results (review P1, round 5).
+    os.environ["GATEWAY_INSTANCE"] = "a" * 33
+    _ospec = importlib.util.spec_from_file_location("rtc_overlong", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _ortc = importlib.util.module_from_spec(_ospec)
+    try:
+        _ospec.loader.exec_module(_ortc)
+        check(False, "GATEWAY_INSTANCE longer than 32 chars refuses at import")
+    except SystemExit:
+        check(True, "GATEWAY_INSTANCE longer than 32 chars refuses at import")
     # A path-shaped instance name must refuse at import (it lands in filenames).
     os.environ["GATEWAY_INSTANCE"] = "../evil"
     _bspec = importlib.util.spec_from_file_location("rtc_badinst", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
