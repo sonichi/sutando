@@ -168,6 +168,49 @@ if thin:
     check("...and the message tells you how to lower it deliberately",
           "MIN_TRACKED_TESTS" in thin, thin)
 
+# --- 4. An UNRESOLVABLE base ref must WIDEN, not crash and not go quiet ------
+# CI caught this on the first version of the fix. `actions/checkout@v4` fetches
+# depth 1, so `origin/main` is often absent and `origin/main...HEAD` exits 128
+# with "bad revision". Three distinguishable behaviours, and only the third is
+# right:
+#
+#   before this PR   returned [] -> "no test files changed" -> 0 scanned, exit 0
+#   first fix        SystemExit  -> broke the repo's own --diff test in CI
+#   now              warns, falls back to the full tree -> 63 scanned, exit 0
+#
+# Crashing here is the "a guard becomes a thing people disable" outcome this
+# change's own rationale warns about, committed one layer up.
+class _BadRef:
+    returncode = 128
+    stdout = ""
+    stderr = "fatal: bad revision 'origin/main...HEAD'"
+
+real2 = subprocess.run
+
+
+def fake_bad_ref(cmd, *a, **k):
+    if isinstance(cmd, (list, tuple)) and cmd[:2] == ["git", "diff"]:
+        return _BadRef()
+    return real2(cmd, *a, **k)
+
+
+subprocess.run = fake_bad_ref
+try:
+    widened = None
+    try:
+        widened = lh.changed_tests("origin/main")
+    except SystemExit as e:
+        widened = f"RAISED: {e}"
+finally:
+    subprocess.run = real2
+
+check("an unresolvable base ref does NOT raise",
+      not isinstance(widened, str),
+      str(widened)[:200])
+check("...and returns the widen sentinel (None), not an empty list",
+      widened is None,
+      f"got {widened!r} — [] would silently scan nothing, which is the original bug")
+
 print()
 if failures:
     print(f"{len(failures)} check(s) FAILED: {failures}")

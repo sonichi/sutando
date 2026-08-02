@@ -974,6 +974,13 @@ def scan(paths) -> dict[str, str]:
     return out
 
 
+#: git's wording when a ref simply is not present in this checkout (shallow clone,
+#: missing remote-tracking branch). Distinct from a genuine git failure.
+_UNRESOLVABLE_REF = re.compile(
+    r"bad revision|unknown revision|ambiguous argument|not a valid object name",
+    re.I,
+)
+
 #: Floor for full-tree discovery. The tree held 310 tracked test files when this
 #: was added; 50 is far below any plausible legitimate shrink and far above the
 #: zero a broken `git ls-files` returns. A tripwire, not a census.
@@ -993,10 +1000,26 @@ def _git_lines(cmd: list[str], what: str) -> list[str]:
     """
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
     if r.returncode != 0:
+        err = (r.stderr or "").strip()
+        # An UNRESOLVABLE BASE REF is not a broken discovery -- it means this
+        # comparison is inapplicable here. `actions/checkout@v4` fetches depth 1,
+        # so `origin/main` is frequently absent and `origin/main...HEAD` exits 128
+        # with "bad revision". Hard-failing on that breaks every shallow checkout,
+        # including the repo's own test that exercises --diff -- which is exactly
+        # the "a guard becomes a thing people disable" outcome this PR's own body
+        # warns about, committed one layer up. Signal it and let the caller widen
+        # to the full tree: more coverage than the diff, never less, never silent.
+        if _UNRESOLVABLE_REF.search(err):
+            print(
+                f"lint-hermetic-bridge-tests: cannot resolve the base ref for {what} "
+                f"({err.splitlines()[0][:120] if err else 'no stderr'}).\n"
+                "  Falling back to the full tracked-test scan — wider, not quieter."
+            )
+            return None
         raise SystemExit(
             f"lint-hermetic-bridge-tests: FAILED to discover {what} -- "
             f"`{' '.join(cmd)}` exited {r.returncode}.\n"
-            f"  {(r.stderr or '').strip()[:300]}\n"
+            f"  {err[:300]}\n"
             "  Refusing to report a verdict on a discovery that did not run."
         )
     return [ln for ln in r.stdout.splitlines() if ln.strip()]
@@ -1032,7 +1055,9 @@ def main() -> int:
     if mode == "--diff":
         base = os.environ.get("BASE_REF", "origin/main")
         targets = changed_tests(base)
-        if not targets:
+        if targets is None:            # base ref unresolvable -> widen, don't skip
+            targets = tracked_tests()
+        elif not targets:
             print("lint-hermetic-bridge-tests: no test files changed — nothing to scan")
             return 0
     else:
