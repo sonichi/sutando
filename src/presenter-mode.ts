@@ -19,7 +19,10 @@ export function presenterModeActive(workspaceDir?: string, nowIso?: string): boo
   } catch {
     return false;
   }
-  if (!expireIso || expireIso[0] < '0' || expireIso[0] > '9') return false;
+  // Full UTC shape, not just a leading digit: '9999-not-a-date' starts with a
+  // digit and lexically compares as future, so anything less than the whole
+  // pattern lets a corrupted sentinel hold the gate open forever (#2516 review).
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(expireIso)) return false;
   const now = nowIso ?? new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   return now < expireIso;
 }

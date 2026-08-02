@@ -33,6 +33,13 @@ with tempfile.TemporaryDirectory(prefix="sutando-presenter-mode-") as tmp:
     sentinel.write_text("garbage")
     check("malformed sentinel is inactive", not presenter_mode.presenter_mode_active(workspace, now=0))
 
+    # Digit-prefixed malformed (#2516 review canary): starts with a digit and
+    # lexically compares as future, so a first-byte check + raw compare reads
+    # it ACTIVE — the documented fail-closed contract requires full-shape validation.
+    sentinel.write_text("9999-not-a-date")
+    check("digit-prefixed malformed sentinel is inactive (fail closed)",
+          not presenter_mode.presenter_mode_active(workspace, now=0))
+
     sentinel.write_text("1970-01-01T00:00:01Z\n")
     check("future expiry is active", presenter_mode.presenter_mode_active(workspace, now=0))
 

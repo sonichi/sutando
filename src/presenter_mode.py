@@ -7,6 +7,7 @@ this module owns the shared state path and expiry interpretation.
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,7 +27,11 @@ def presenter_mode_active(workspace: Optional[Path] = None, *, now: Optional[flo
         return False
     try:
         expire_iso = sentinel.read_text().strip()
-        if not expire_iso or not expire_iso[0].isdigit():
+        # Full UTC shape, not just a leading digit: '9999-not-a-date' starts
+        # with a digit and lexically compares as future, so anything less than
+        # the whole pattern lets a corrupted sentinel suppress notifications
+        # forever (#2516 review — shared canary with the TS twin).
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", expire_iso):
             return False
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
         return now_iso < expire_iso

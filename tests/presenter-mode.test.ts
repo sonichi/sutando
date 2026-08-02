@@ -31,6 +31,13 @@ test('malformed sentinel is inactive', () => {
   assert.equal(presenterModeActive(workspaceWithSentinel('garbage'), EPOCH), false);
 });
 
+test('digit-prefixed malformed sentinel is inactive — fail-closed (#2516 review canary)', () => {
+  // '9999-not-a-date' starts with a digit and lexically compares as future;
+  // a first-byte check plus raw compare reads it as ACTIVE. The documented
+  // contract says malformed fails closed, so the full UTC shape must validate.
+  assert.equal(presenterModeActive(workspaceWithSentinel('9999-not-a-date'), EPOCH), false);
+});
+
 test('future expiry is active', () => {
   assert.equal(presenterModeActive(workspaceWithSentinel('1970-01-01T00:00:01Z\n'), EPOCH), true);
 });
