@@ -321,14 +321,29 @@ class HealthCheckDegradesWithoutGit(unittest.TestCase):
         sites, so it passed while this activated caller stayed broken
         (@john-the-dev, reviewing #2469).
         """
+        spawned = []
+        real_run = subprocess.run
+
+        def spy(argv, *a, **k):
+            spawned.append(argv[0] if isinstance(argv, list) else argv)
+            return real_run(argv, *a, **k)
+
         git_binary.reset_cache_for_tests()
         try:
-            with patch.object(git_binary, "path_candidates", return_value=[]):
+            with patch.object(git_binary, "path_candidates", return_value=[]), \
+                 patch.object(subprocess, "run", spy):
                 result = health_check.check_live_checkout_branch()
         finally:
             git_binary.reset_cache_for_tests()
+        # Assert the BEHAVIOUR, not the wording. #2471 landed a second
+        # degradation path in this probe (resolver returns None -> return before
+        # the try:), so pinning one path's detail string made this test fail on a
+        # merge that had made the degradation strictly earlier and safer. What
+        # must hold is: the probe stays non-fatal AND spawns nothing — a spawn is
+        # what raises the CLT modal, and only counting execs can see that.
         self.assertEqual(result["status"], "ok")
-        self.assertIn("git not runnable", result["detail"])
+        self.assertEqual(spawned, [], "probe spawned a process with no runnable git")
+        self.assertRegex(result["detail"], r"(?i)git not runnable|no runnable git")
 
     def test_runs_against_a_real_git_without_raising(self):
         """Exercises both git invocations on a host that does have git.
