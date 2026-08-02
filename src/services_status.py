@@ -251,12 +251,20 @@ def service_registry() -> list[dict]:
          "probe": ("port", 7845)},
         {"id": "credential-proxy", "name": "Credential Proxy",
          "probe": ("port", 7846)},
+        # `$`-anchored, like the gateway row above. An UNANCHORED pattern also
+        # matches any process that merely MENTIONS the script — most concretely
+        # `python3 src/discord-bridge.py send <channel> <text>`, the one-off REST
+        # send used to post from outside the daemon. Measured: with such a send
+        # in flight, `pgrep -f 'discord-bridge\.py'` returned BOTH it and the
+        # daemon, so a dead daemon would have read `running` for the life of the
+        # send. Anchoring keeps the daemon (each launches with the script path
+        # LAST in argv) and drops the sub-command form, which has trailing args.
         {"id": "discord-bridge", "name": "Discord",
-         "probe": ("process", r"discord-bridge\.py")},
+         "probe": ("process", r"discord-bridge\.py$")},
         {"id": "slack-bridge", "name": "Slack",
-         "probe": ("process", r"slack-bridge\.py")},
+         "probe": ("process", r"slack-bridge\.py$")},
         {"id": "telegram-bridge", "name": "Telegram",
-         "probe": ("process", r"telegram-bridge\.py")},
+         "probe": ("process", r"telegram-bridge\.py$")},
     ]
 
 
