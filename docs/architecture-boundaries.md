@@ -122,6 +122,16 @@ mechanics. For example, `src/presenter_mode.py` owns the presenter sentinel path
 and expiry semantics; Discord, Slack, Telegram, and notification jobs decide
 what delivery to suppress when that policy reports active.
 
+### Shared result-file lifecycle
+
+The task/result filesystem protocol is core infrastructure, including its
+claim, crash-recovery, collision, and retry rules. A dependency-light core
+helper owns each shared state transition; adapters supply their resolved paths
+and retain only provider-specific delivery. For example,
+`src/proactive_recovery.py` restores proactive delivery claims stranded by a
+crash, while Discord, Slack, and Telegram decide how the recovered result is
+sent. Copying the filesystem state machine into each adapter is not permitted.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known
