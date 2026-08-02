@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-183 modules indexed.
+184 modules indexed.
 
 ## `src/`
 
@@ -75,6 +75,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
+- **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
