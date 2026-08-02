@@ -84,12 +84,11 @@ The workspace tree is the unit of sync. Every file under `<workspace>/` is poten
   "vault": {
     "remote_url": "https://github.com/your-org/your-workspace.git",
     "sync": {
-      "_comment": "include REPLACES the default set — restate every default path you still want",
+      "_comment": "include REPLACES the default set — copy the CURRENT list from sutando.config.json (that file is the source of truth; the paths below are what it ships as of this page's revision) and add yours after it",
       "include": [
         "notes/",
         "hosts/*/",
         ".claude-sutando/projects/*/memory/",
-        "state/current-track.md",
         "custom-research/",
         "drafts/"
       ],
@@ -125,7 +124,7 @@ First-cross-host pull is handled specially — [#1458](https://github.com/sonich
 | Key | Default | Notes |
 |---|---|---|
 | `vault.remote_url` | (required) | git URL of your private workspace repo |
-| `vault.sync.include` | shipped set in `sutando.config.json` (currently `notes/`, `hosts/*/`, `.claude-sutando/projects/*/memory/`, `state/current-track.md`) | **REPLACES** that list — not additive. An override must restate every default path it still wants carried. (`resolve_vault()`'s own fallback is `[]`, but the shipped config supplies the real default.) |
+| `vault.sync.include` | the list shipped in **`sutando.config.json`** — that file is the source of truth; read it rather than trusting any copy, including this page | **REPLACES** that list — not additive. An override must restate every default path it still wants carried. (`resolve_vault()`'s own fallback is `[]`, but the shipped config supplies the real default, so `[]` never describes what you actually get.) |
 | `vault.sync.exclude` | `[]` | subtractive — carves subpaths out of an included parent (emitted after the includes, so gitignore last-match wins) |
 | `--vault-url` (CLI flag) | (overrides config) | per-invocation override |
 
