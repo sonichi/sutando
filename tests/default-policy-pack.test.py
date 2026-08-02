@@ -424,6 +424,53 @@ def test_the_draft_resumes_once_budget_frees_up():
           f"...and the budget still holds ({_aggregate(d)})")
 
 
+def test_disable_revokes_pending_drafts_so_a_stale_card_cannot_activate():
+    """john-the-dev's follow-up [P1] on #2320, created BY the previous fix.
+
+    set_enabled(False) cancelled only ACTIVE records. The over-budget draft is
+    not active, so it survived the disable — and `draft -> active` is a legal
+    transition, so an approval card minted before the disable still activated a
+    room afterwards. Reproduced on adbd1b56: after_disable=draft,
+    activate_stale=True, final_status=active, while the entry read enabled=False.
+    The owner's disable was advisory, which is the one thing a disable must not be.
+    """
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(11)]
+    res = dpp.seed_defaults(d, OWNER, rooms)
+    refused = [r for r in res if r["status"] == "refused"]
+    check(len(refused) == 1, "precondition: one room is over budget and left as a draft")
+    pid = refused[0]["policy_id"]
+    store = op.SubscriptionStore(d)
+    check(store.get(pid)["status"] == "draft", "precondition: it really is a draft")
+
+    dpp.set_enabled(d, "react_baseline", False)
+    check(dpp.is_enabled(d, "react_baseline") is False, "entry reads disabled")
+    check(store.get(pid)["status"] == "cancelled",
+          f"disable REVOKES the pending draft (got {store.get(pid)['status']})")
+    # The real assertion is the consequence, not the status: a late click on a
+    # card minted before the disable must not resurrect the room. `cancelled` is
+    # terminal in the store, so the guard lives in the state machine rather than
+    # in a caller that could forget to ask.
+    check(store.transition(pid, "active", note="stale card clicked after disable") is False,
+          "a stale approval CANNOT activate a room after the owner disabled the entry")
+    check(store.get(pid)["status"] == "cancelled", "...and the record stays cancelled")
+
+
+def test_disable_then_reenable_still_seeds_a_fresh_generation():
+    """CALIBRATION. The guard above is satisfied by a disable that destroys the
+    entry permanently, which would be a worse bug. Re-enabling must still seed."""
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(11)]
+    dpp.seed_defaults(d, OWNER, rooms)
+    dpp.set_enabled(d, "react_baseline", False)
+    dpp.set_enabled(d, "react_baseline", True)
+    again = dpp.seed_defaults(d, OWNER, rooms)
+    check(any(r["status"] == "seeded" for r in again),
+          "re-enable seeds a fresh generation after a disable")
+    check(_aggregate(d) <= dpp.PACK_AGGREGATE_EVALS_PER_DAY,
+          f"...and the aggregate budget still holds ({_aggregate(d)})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -335,6 +335,18 @@ def on_room_join(store_dir: str, owner_mxid: str, room_id: str,
 
 
 # ── Owner controls: list + disable/enable ───────────────────────────────────
+def _pending_drafts_for(store: "op.SubscriptionStore", key: str) -> "list[dict]":
+    """Pack drafts awaiting owner approval — persisted by the over-budget path.
+
+    Separate from _active_records_for() because these are NOT active and must
+    not count toward the aggregate budget, but they DO carry a legal
+    draft->active transition, so every lifecycle that revokes authority has to
+    sweep them too.
+    """
+    return [r for r in store.list(status="draft")
+            if (r.get("pack") or {}).get("entry") == key]
+
+
 def _active_records_for(store: "op.SubscriptionStore", key: str) -> "list[dict]":
     return [r for r in store.list(status="active")
             if (r.get("pack") or {}).get("entry") == key]
@@ -371,7 +383,26 @@ def set_enabled(store_dir: str, key: str, enabled: bool) -> dict:
     was_disabled = es["disabled"]
     if not enabled:
         cancelled = 0
-        for rec in _active_records_for(store, key):
+        # ACTIVE records, then PENDING DRAFTS. Cancelling only the active ones
+        # left the over-budget drafts behind: not active, so not iterated — yet
+        # `draft -> active` is a legal transition, so an approval card minted
+        # before the disable still activated a room afterwards. Reproduced on
+        # adbd1b56: after_disable=draft, activate_stale=True, final_status=active
+        # while the entry read enabled=False. The owner's disable was advisory.
+        #
+        # Cancelling closes it completely rather than partially, because
+        # `cancelled` is TERMINAL in the store (transition() permits
+        # draft->{active,cancelled} and active->{cancelled,expired}, nothing out
+        # of cancelled) — so a late click on a stale card now returns False
+        # instead of resurrecting the room. That is why this is enough on its own
+        # and no separate check is needed in the activation path: the guard lives
+        # in the state machine, not in a caller that could forget to ask.
+        #
+        # This became reachable only when over-budget policies started being
+        # persisted — before that there were no pack drafts to strand. A fix that
+        # creates a new record type has to be walked through every lifecycle that
+        # enumerates records, not just the one it was written for.
+        for rec in _active_records_for(store, key) + _pending_drafts_for(store, key):
             if store.transition(rec["policy_id"], "cancelled",
                                  note="pack entry disabled by owner"):
                 cancelled += 1
