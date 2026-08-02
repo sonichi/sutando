@@ -11,7 +11,7 @@
 import { createServer, request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
@@ -37,6 +37,60 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TASK_DIR = join(WORKSPACE_DIR, 'tasks');
 const STATE_DIR = join(WORKSPACE_DIR, 'state');
 const SUBSCRIPTIONS_PATH = join(REPO_ROOT, 'skills/subscription-scanner/state/subscriptions.json');
+
+// ─── Browser voice-transport delivery ──────────────────────────────────────
+//
+// The page loads src/web-voice-transport.ts — the canonical transport — as a
+// plain <script>. Getting real TypeScript into the browser needs a build step,
+// and the two runtime modes need different ones:
+//
+//   BUNDLED (packaged desktop app): this file IS dist/web-client.js, running
+//     under the pinned node with no tsx and no devDependencies. It serves the
+//     prebuilt dist/web-voice-transport.browser.js that build:bundle produced.
+//     A missing artifact is a PACKAGING ERROR — 503, never a silent fallback.
+//
+//   SOURCE (tsx src/web-client.ts): devDependencies are present, so the
+//     transport is compiled on demand from the TypeScript and cached in memory
+//     for the process. Compiling rather than reading dist/ is deliberate — it
+//     is what guarantees source mode cannot serve a stale artifact left behind
+//     by an old build:bundle run.
+//
+// Distinguishing the modes by where this module is running from is exact:
+// esbuild writes the bundle to dist/, tsx runs it from src/.
+const RUNNING_BUNDLED = basename(dirname(fileURLToPath(import.meta.url))) === 'dist';
+const BROWSER_TRANSPORT_ARTIFACT = 'web-voice-transport.browser.js';
+const BROWSER_TRANSPORT_ROUTE = '/web-voice-transport.js';
+const BROWSER_TRANSPORT_DIST = join(REPO_ROOT, 'dist', BROWSER_TRANSPORT_ARTIFACT);
+let _browserTransportCache: string | null = null;
+
+/**
+ * Resolve the browser transport JS for the current mode. Throws with a
+ * diagnostic message rather than returning a fallback: there is no second
+ * implementation to fall back TO, so a silent empty response would surface as
+ * an unexplained dead Connect button.
+ */
+async function loadBrowserTransport(): Promise<string> {
+	if (_browserTransportCache) return _browserTransportCache;
+
+	if (RUNNING_BUNDLED) {
+		if (!existsSync(BROWSER_TRANSPORT_DIST)) {
+			throw new Error(
+				`bundled mode: ${BROWSER_TRANSPORT_ARTIFACT} missing from ${dirname(BROWSER_TRANSPORT_DIST)} — ` +
+					'desktop packaging error (npm run build:bundle did not run or did not ship this artifact)',
+			);
+		}
+		_browserTransportCache = readFileSync(BROWSER_TRANSPORT_DIST, 'utf8');
+		return _browserTransportCache;
+	}
+
+	// Source mode. The specifier is built at runtime so esbuild cannot follow it
+	// when bundling this file — that keeps the esbuild devDependency out of
+	// dist/web-client.js, which must run without a development node_modules.
+	const specifier = ['..', 'scripts', 'browser-transport-build.mjs'].join('/');
+	const mod = await import(new URL(specifier, import.meta.url).href);
+	_browserTransportCache = await mod.buildBrowserTransportSource();
+	return _browserTransportCache!;
+}
 
 const HTML = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -3598,6 +3652,32 @@ function escapeHtml(s: string): string {
 
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
+
+	if (url.pathname === BROWSER_TRANSPORT_ROUTE) {
+		loadBrowserTransport().then(
+			js => {
+				res.writeHead(200, {
+					'Content-Type': 'application/javascript; charset=utf-8',
+					// Source mode recompiles per process; bundled mode ships a new
+					// artifact per release. Neither wants a browser holding an old
+					// copy across a restart, and this file is 14KB.
+					'Cache-Control': 'no-store',
+				});
+				res.end(js);
+			},
+			(err: Error) => {
+				// Fail loudly and in two places: the HTTP status so the page's
+				// loader can show the user something, and the server log so the
+				// operator sees the packaging error even if nobody opened the UI.
+				console.error(`[web-client] ${BROWSER_TRANSPORT_ROUTE} unavailable: ${err.message}`);
+				res.writeHead(503, { 'Content-Type': 'application/javascript; charset=utf-8' });
+				res.end(
+					`console.error(${JSON.stringify('Sutando voice transport unavailable: ' + err.message)});\n`,
+				);
+			},
+		);
+		return;
+	}
 
 	if (url.pathname === '/sse') {
 		res.writeHead(200, {
