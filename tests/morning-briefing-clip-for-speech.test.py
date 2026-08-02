@@ -63,5 +63,62 @@ class TestClipForSpeech(unittest.TestCase):
         self.assertTrue(mb.clip_for_speech(REAL, 60).endswith("…"))
 
 
+# --- review finding, qingyun-wu on 38a6bf91 -----------------------------------
+# When the parenthetical opens at character 0, trimming it emptied `head` and the
+# old fallback hard-sliced the ORIGINAL text -- putting the "(" straight back and
+# recreating the exact fragment this function exists to remove.
+
+LEADING_PAREN = "(This parenthetical title keeps going for much longer than the speech limit allows)"
+
+BRACKET_SHAPES = [
+    LEADING_PAREN,
+    "(short) then a much longer tail that will certainly be clipped somewhere",
+    "Leading text (then a parenthetical that never closes because it is long",
+    "((doubly nested opener that keeps going well past any sane speech limit))",
+    "No brackets at all, just a long ordinary title that must clip on a word",
+    "(a)(b)(c) followed by a long tail of ordinary words to force the clipping",
+]
+
+
+class TestLeadingParenthetical(unittest.TestCase):
+    def test_the_reviewers_exact_repro(self):
+        out = mb.clip_for_speech(LEADING_PAREN, 30)
+        self.assertEqual(out.count("("), out.count(")"), out)
+        self.assertNotIn("(This parenthetical title kee", out)
+        self.assertLessEqual(len(out), 30)
+
+    def test_a_clip_is_never_left_with_an_unclosed_bracket(self):
+        """The axis, not just the one string the review happened to find.
+
+        A clipped result must be balanced, within the limit, and marked. Text
+        returned UNCHANGED is exempt on purpose -- see the next test.
+        """
+        checked = 0
+        for text in BRACKET_SHAPES:
+            for limit in (8, 10, 12, 15, 20, 25, 30, 40, 50, 60, 80, 120):
+                out = mb.clip_for_speech(text, limit)
+                if out == text:
+                    continue
+                checked += 1
+                self.assertEqual(out.count("("), out.count(")"), (limit, text, out))
+                self.assertLessEqual(len(out), limit, (limit, out))
+                self.assertTrue(out.endswith("\u2026"), (limit, out))
+        self.assertGreater(checked, 40, "axis should exercise many clipped cases")
+
+    def test_unbalanced_text_that_FITS_is_returned_unchanged(self):
+        """Deliberate: we do not edit a title we did not clip.
+
+        "Leading text (unclosed" is already unbalanced at the source. Silently
+        rewriting a title that fits would be a worse defect than passing it
+        through, so this is an exemption, not an oversight.
+        """
+        fits = "Leading text (unclosed"
+        self.assertEqual(mb.clip_for_speech(fits, 60), fits)
+
+    def test_a_title_that_is_only_an_open_bracket_still_terminates(self):
+        for limit in (2, 3, 5, 10):
+            out = mb.clip_for_speech("(" * 40, limit)
+            self.assertLessEqual(len(out), limit, (limit, out))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -352,7 +352,18 @@ def clip_for_speech(text: str, limit: int) -> str:
     if head.count("(") > head.count(")"):
         head = head[:head.rfind("(")]
     head = head.rstrip(" ,;:-\u2014/(")
-    return head + "\u2026" if head else text[:limit - 1] + "\u2026"
+    if head:
+        return head + "\u2026"
+    # Nothing survived: the whole clip window sat inside a parenthetical that
+    # opens at character 0. Falling back to a raw slice of `text` would put the
+    # "(" straight back and re-create the unclosed fragment this function exists
+    # to remove, so clip the text with the bracket dropped instead.
+    bare = text.lstrip("(").lstrip()
+    head = bare[:limit - 1]
+    cut = head.rfind(" ")
+    head = head[:cut] if cut > 0 else head
+    head = head.rstrip(" ,;:-\u2014/(")
+    return (head or bare[:limit - 1]) + "\u2026"
 
 
 def get_pending_questions() -> list[str]:
