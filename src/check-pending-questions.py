@@ -19,41 +19,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import personal_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from presenter_mode import presenter_mode_active  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
 LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
-PRESENTER_SENTINEL = WORKSPACE / "state" / "presenter-mode.sentinel"
 # How long an UNCHANGED question set stays quiet before it is raised again. This
 # is the floor that stops "notify only when the set changes" from turning an
 # unanswered queue permanently mute — see should_notify().
 UNCHANGED_REMINDER_SEC = 86400  # 24h
-
-
-def presenter_mode_active():
-    """True if scripts/presenter-mode.sh has been started and the expiry
-    timestamp in the sentinel is still in the future. Silences all
-    notifications for the ICLR talk window. Stale sentinels (past-expiry)
-    are ignored and return False — the next `status` / `stop` call will
-    remove the file."""
-    if not PRESENTER_SENTINEL.exists():
-        return False
-    try:
-        expire_iso = PRESENTER_SENTINEL.read_text().strip()
-        # Require an ISO-8601-ish prefix (starts with a digit). Without
-        # this guard, malformed sentinel content like "garbage" compares
-        # LESS than any real now_iso ("2" < "g" in ASCII) and the mode
-        # fails OPEN — appears active forever. The same guard is in
-        # src/discord-bridge.py and src/telegram-bridge.py.
-        if not expire_iso or not expire_iso[0].isdigit():
-            return False
-        # Compare as ISO-8601 with Z suffix — sorts correctly as strings.
-        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        return now_iso < expire_iso
-    except Exception:
-        return False
 
 
 def voice_client_connected():
@@ -372,7 +348,7 @@ def main():
     if not questions:
         return
 
-    if not force and presenter_mode_active():
+    if not force and presenter_mode_active(WORKSPACE):
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
         return
 

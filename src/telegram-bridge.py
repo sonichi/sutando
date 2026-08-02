@@ -59,6 +59,7 @@ from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
+from presenter_mode import presenter_mode_active  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
@@ -230,28 +231,6 @@ def archive_file(src: "Path", kind: str, task_id: str) -> None:
             src.unlink(missing_ok=True)
         except Exception:
             pass
-
-# Presenter mode: silence proactive DMs during ICLR/talk windows. Sentinel
-# is written by scripts/presenter-mode.sh with an ISO-8601 expiry. Matches
-# the check in src/check-pending-questions.py and src/discord-bridge.py.
-PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
-
-
-def presenter_mode_active():
-    if not PRESENTER_SENTINEL.exists():
-        return False
-    try:
-        expire_iso = PRESENTER_SENTINEL.read_text().strip()
-        # Require an ISO-8601-ish prefix (starts with a digit). Without
-        # this guard, malformed sentinel content like "garbage" compares
-        # LESS than any real now_iso ("2" < "g" in ASCII) and the mode
-        # fails OPEN — appears active forever.
-        if not expire_iso or not expire_iso[0].isdigit():
-            return False
-        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        return now_iso < expire_iso
-    except Exception:
-        return False
 
 # Load access config
 ACCESS_FILE = channel_access_path("telegram")
@@ -950,7 +929,7 @@ def main():  # pragma: no cover
         from proactive_routing import should_claim_proactive
         try:
             if (
-                not presenter_mode_active()
+                not presenter_mode_active(REPO)
                 and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
             ):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
