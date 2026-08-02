@@ -318,15 +318,24 @@ finally:
     hc.WORKSPACE_DIR = _saved
 
 # and the caller's guard: no local socket -> unknown, never a default-socket probe
+# `is None or True` was the first spelling here and it is ALWAYS TRUE — a test that
+# cannot fail, inside a PR whose whole subject is checks that cannot fail. Caught by
+# both reviewers. Capture the result, then assert the contract on it.
 _probed = []
-check("no local socket -> None WITHOUT probing tmux",
-      hc.core_env_has_proxy_url(
-          tmux_runner=lambda sock, *a: _probed.append(sock) or R(0, "6648\n"),
-          ps_runner=lambda pid: R(0, f"{ARGV} {ENV_WITH_PROXY}")) is None
-      or True)
+_no_sock = hc.core_env_has_proxy_url(
+    tmux_runner=lambda sock, *a: _probed.append(sock) or R(0, "6648\n"),
+    ps_runner=lambda pid: R(0, f"{ARGV} {ENV_WITH_PROXY}"))
+check("no local socket -> None (the tri-state contract, not merely 'did not crash')",
+      _no_sock is None,
+      f"returned {_no_sock!r}; a False here would be a bypass claim built on no evidence, "
+      f"and a True would be a routing claim built on none")
 check("control: and tmux was never called (no fallback to a default socket)",
       _probed == [],
       f"tmux was invoked with {_probed!r} — the guard let a default socket through")
+
+# Both halves are needed and neither implies the other: the first pins WHAT is
+# returned, the second pins that nothing was probed to get there. A helper that
+# probed a default socket and happened to return None would pass the first alone.
 
 print()
 if failures:
