@@ -113,6 +113,58 @@ with tempfile.TemporaryDirectory() as _tmp:
        f"recent_7d==total=={stats['total']} — filter still cannot discriminate")
 
 
+# --- degradation contracts -------------------------------------------------
+# Each of these is a path the fix falls back through when git cannot answer.
+# They are the difference between "the counter degrades" and "the briefing
+# crashes", so they are asserted rather than left to coverage.
+
+with tempfile.TemporaryDirectory() as _tmp:
+    ws = Path(_tmp)
+    notes = ws / "notes"
+    notes.mkdir()
+    (notes / "n.md").write_text("body\n")
+
+    _orig_ws, _orig_dir = _mod.WORKSPACE, _mod.NOTES_DIR
+    _orig_run = _mod.subprocess.run
+    _orig_dates = _mod._note_creation_dates
+
+    def _boom(*a, **k):
+        raise OSError("git not on PATH")
+
+    try:
+        _mod.WORKSPACE = str(ws)
+        _mod.NOTES_DIR = notes
+
+        # not a git work tree at all: git returns non-zero, no exception
+        ok("no git repo: _note_creation_dates returns {} rather than raising",
+           _mod._note_creation_dates(notes) == {}, "expected empty map")
+
+        _mod.subprocess.run = _boom
+        ok("git unavailable: _note_creation_dates degrades to {}",
+           _mod._note_creation_dates(notes) == {}, "OSError must be swallowed")
+        ok("git unavailable: _note_added_at degrades to ''",
+           _mod._note_added_at(notes / "n.md") == "", "OSError must be swallowed")
+        _mod.subprocess.run = _orig_run
+
+        # a malformed stamp must fall through to mtime, not crash the briefing
+        _mod._note_creation_dates = lambda d: {"n.md": "not-a-timestamp"}
+        stats = _mod.analyze_note_activity()
+        ok("malformed git stamp falls back to mtime instead of raising",
+           stats["total"] == 1 and stats["recent_7d"] == 1,
+           f"got {stats}")
+    finally:
+        _mod.subprocess.run = _orig_run
+        _mod._note_creation_dates = _orig_dates
+        _mod.WORKSPACE, _mod.NOTES_DIR = _orig_ws, _orig_dir
+
+# Teardown must actually restore, or a later case silently runs against the
+# monkeypatch. Asserted rather than trusted — the first version of this block
+# reassigned the lambda to itself and "passed".
+ok("teardown restored the real _note_creation_dates",
+   _mod._note_creation_dates is _orig_dates and "lambda" not in repr(_mod._note_creation_dates),
+   f"still patched: {_mod._note_creation_dates!r}")
+
+
 print(f"daily-insight-note-age: {_passed}/{_passed + _failed} passed"
       + (f" — {_failed} FAILED" if _failed else ""))
 raise SystemExit(1 if _failed else 0)
