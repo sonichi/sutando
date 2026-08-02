@@ -67,12 +67,47 @@ _host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)"
 if [ -n "$_ws" ] && [ -n "$_host" ]; then
   _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   mkdir -p "$_ws/hosts/$_host" "$_ws/results"
+  # Insert at the TOP of the active region, never `>>` at EOF.
+  #
+  # `check-pending-questions.py` (and morning-briefing, agent-api,
+  # friction-detector, dashboard) count only the text ABOVE the file's
+  # top-level `# Resolved` divider — everything after it is the audit trail.
+  # An EOF append therefore lands BELOW the divider and is permanently
+  # uncounted. Measured on this host's real file (2099 lines, divider at 1652):
+  #
+  #     baseline                            21 waiting
+  #     after this block appended with `>>`  21   <- INVISIBLE
+  #     same text placed above the divider   22   <- counted
+  #
+  # It reports success in every cheap way: bytes land, the path is right,
+  # nothing errors, `wc -c` grows. Only calling the reader shows the zero.
+  # And this is the worst case to lose: the gate writes precisely when a boot
+  # was ABORTED, so the record of why is dropped at the moment it matters.
+  #
+  # Top-of-file rather than "just above the divider" deliberately: it needs no
+  # divider regex at all, so it cannot be defeated by the divider-detection
+  # edge cases #2419 catalogues (a quoted `# Resolved` in a comment, a fenced
+  # block, an inline code span). A boot-abort question also belongs first.
+  _pq="$_ws/hosts/$_host/pending-questions.md"
   {
-    echo ""
     echo "## [$_ts] BOOT ABORTED — CLI login required ($_host)"
     echo "auth-preflight-gate stopped startup before services launched."
     echo "Remedy: $_remedy"
-  } >> "$_ws/hosts/$_host/pending-questions.md"
+    echo ""
+  } > "$_pq.new"
+  if [ -f "$_pq" ]; then
+    # Keep a leading `# ` H1 as the first line if the file has one, so the
+    # insert goes into the active region rather than above the title.
+    if head -1 "$_pq" | grep -qE '^# [^ ]'; then
+      { head -1 "$_pq"; echo ""; cat "$_pq.new"; tail -n +2 "$_pq"; } > "$_pq.tmp"
+    else
+      { cat "$_pq.new"; cat "$_pq"; } > "$_pq.tmp"
+    fi
+    mv "$_pq.tmp" "$_pq"
+  else
+    mv "$_pq.new" "$_pq"
+  fi
+  rm -f "$_pq.new"
   printf '[dm-only]\nSutando boot on %s ABORTED: CLI login required.\n%s\n' \
     "$_host" "$_remedy" > "$_ws/results/proactive-$(date +%s).txt"
 fi
