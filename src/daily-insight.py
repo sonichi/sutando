@@ -141,10 +141,93 @@ def _frontmatter_tags(content: str) -> list[str]:
     return []
 
 
+def _note_creation_dates(notes_dir):
+    """Map note filename -> creation timestamp, taken from the first commit that
+    ADDED each file.
+
+    mtime cannot answer "when was this written" in this workspace. The workspace
+    is a git-backed vault synced across hosts, and both `git checkout` and the
+    rsync path stamp every file with the time of the *sync*, not of the writing.
+    On 2026-08-02 that made 673 of 725 notes share one mtime to the minute, so
+    the seven-day filter below matched every note on disk and `recent_7d` was
+    identically `total` (356 == 356) — a filter that cannot discriminate, which
+    is the same trap `skills/task-orphan-check/SKILL.md` documents for task
+    files. Git commit dates are immune: they survive clone, checkout and sync.
+
+    Returns {} when git is unavailable or the workspace is not a work tree, in
+    which case the caller falls back to mtime rather than claiming nothing.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(WORKSPACE), "log", "--diff-filter=A",
+             "--name-only", "--format=@%aI", "--", str(notes_dir)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if r.returncode != 0:
+        return {}
+    created, stamp = {}, None
+    for line in r.stdout.splitlines():
+        if line.startswith("@"):
+            stamp = line[1:]
+        elif line.strip() and stamp:
+            # setdefault keeps the OLDEST add when a path was deleted and re-added
+            created.setdefault(Path(line.strip()).name, stamp)
+    return created
+
+
+def _iso_z(stamp):
+    """Normalise a trailing `Z` to `+00:00` for `datetime.fromisoformat`.
+
+    Python 3.9 (this repo's floor) rejects the `Z` suffix outright. git emits it
+    whenever a commit's author date is UTC — every commit on this host carries a
+    numeric `-07:00` offset, so an unnormalised parse looks correct here and
+    fails only for commits made by CI or by a peer host running UTC. Those would
+    silently fall through to mtime, i.e. straight back into the bug this
+    function exists to fix.
+    """
+    return stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
+
+
+def _note_added_at(path):
+    """Creation stamp for ONE note, for files the directory-wide scan misses.
+
+    `git log --diff-filter=A -- <dir>` applies history simplification and can
+    omit a file that the same query scoped to that file alone reports fine
+    (observed on `notes/pro-parity-runbook.md`, added in 6c269998). Without this
+    second tier such a file falls through to mtime and — because the sync resets
+    mtime — is counted as new forever, inflating the number in exactly the
+    direction this fix exists to correct. Returns "" if git cannot answer.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(WORKSPACE), "log", "--diff-filter=A", "-1",
+             "--format=%aI", "--", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def analyze_note_activity():
     """Check note creation patterns."""
     notes = list(NOTES_DIR.glob("*.md"))
-    recent = [n for n in notes if n.stat().st_mtime > (datetime.now().timestamp() - 7 * 86400)]
+    cutoff = datetime.now().timestamp() - 7 * 86400
+    created = _note_creation_dates(NOTES_DIR)
+
+    def _is_recent(n):
+        iso = created.get(n.name) or _note_added_at(n)
+        if iso:
+            try:
+                return datetime.fromisoformat(_iso_z(iso)).timestamp() > cutoff
+            except ValueError:
+                pass
+        # genuinely untracked: mtime is all there is, unreliable as it is here
+        return n.stat().st_mtime > cutoff
+
+    recent = [n for n in notes if _is_recent(n)]
     tags = Counter()
     for n in notes:
         for tag in _frontmatter_tags(n.read_text()):
