@@ -44,6 +44,7 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -55,7 +56,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from util_paths import channel_access_path, claude_home_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
@@ -337,8 +338,7 @@ def tofu_onboard(sender_id, username):
         "tofuOnboardedAt": int(time.time()),
         "tofuOnboardedUsername": username or None,
     }
-    ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
-    os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Telegram user ID
+    write_private_text(ACCESS_FILE, json.dumps(payload, indent=2) + "\n")  # don't inherit umask 644 — file holds owner's Telegram user ID
     print(f"  TOFU: auto-onboarded @{username} (id={sender_id}) as owner — wrote {ACCESS_FILE}")
     return {sender_id}
 
@@ -366,20 +366,16 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     Optional — if the skill is absent the caller falls back to [Voice note attached:].
     Errors are swallowed; transcription failure must never block task delivery.
     """
-    import subprocess
     skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
-    if not skill_script.exists():
-        return None
-    try:
-        result = subprocess.run(
-            [sys.executable, str(skill_script), local_path],
-            capture_output=True, text=True, timeout=25,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    except Exception as e:
-        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
-    return None
+    return _run_optional_script_shared(
+        skill_script,
+        [local_path],
+        timeout=25,
+        on_error=lambda exc: print(
+            f"  [stt] skill call failed for {os.path.basename(local_path)}: {exc}",
+            flush=True,
+        ),
+    )
 
 
 def download_file(file_id, name_hint="file"):

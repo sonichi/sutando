@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-180 modules indexed.
+182 modules indexed.
 
 ## `src/`
 
@@ -70,11 +70,13 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`morning-briefing.py`** — Morning briefing for Sutando.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
+- **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
+- **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
 - **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
 - **`read_discord_channel.py`** — Gated Discord channel reader — the ONLY sanctioned way for the agent to pull a Discord channel's content into its context.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)

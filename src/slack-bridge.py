@@ -60,6 +60,7 @@ sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
+from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -72,7 +73,7 @@ from result_markers import parse_markers  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from util_paths import channel_access_path, claude_home_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
@@ -299,8 +300,7 @@ def _backup_access_to_disk(data: dict) -> None:
         return
     try:
         ACCESS_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_BACKUP_FILE.write_text(json.dumps(data, indent=2) + "\n")
-        os.chmod(ACCESS_BACKUP_FILE, 0o600)
+        write_private_text(ACCESS_BACKUP_FILE, json.dumps(data, indent=2) + "\n")
     except OSError:
         pass  # best-effort; backup must never break the write path
 
@@ -317,8 +317,7 @@ def _restore_access_from_disk() -> bool:
         return False
     try:
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_FILE.write_text(json.dumps(backup, indent=2) + "\n")
-        os.chmod(ACCESS_FILE, 0o600)
+        write_private_text(ACCESS_FILE, json.dumps(backup, indent=2) + "\n")
         _update_access_cache(backup)
         print(
             "  [access] restored access.json from durable on-disk backup "
@@ -339,8 +338,7 @@ def _restore_access_from_cache() -> bool:
         return False
     try:
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_FILE.write_text(json.dumps(cached, indent=2) + "\n")
-        os.chmod(ACCESS_FILE, 0o600)
+        write_private_text(ACCESS_FILE, json.dumps(cached, indent=2) + "\n")
         print(
             "  [access] restored access.json from in-memory cache "
             "(external deletion detected — #899)",
@@ -432,13 +430,12 @@ def _ensure_tier_map_seeded() -> bool:
     # access-control file BEFORE writing, so a disk-full / interrupt / partial
     # write can destroy allowFrom — and with fail-closed tier resolution that
     # locks legitimate owners out against a corrupt file, at bridge startup.
-    # Write a sibling temp, chmod it, then os.replace() atomically. The pid+uuid
+    # Write a sibling temp BORN 0600 (write_private_text), then os.replace(). The pid+uuid
     # suffix avoids colliding with a concurrent .tmp; on any failure the original
     # access.json bytes are left intact and the orphan temp is removed.
     tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
-        os.chmod(tmp, 0o600)
+        write_private_text(tmp, json.dumps(data, indent=2) + "\n")
         os.replace(tmp, ACCESS_FILE)
         _update_access_cache(data)
         print(f"  [tier-map] grandfathered {len(allow)} existing allowFrom member(s) as owner; new additions now default to read-only", flush=True)
@@ -477,8 +474,7 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
         "tofuOnboardedAt": int(time.time()),
         "tofuOnboardedUsername": username or None,
     }
-    ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
-    os.chmod(ACCESS_FILE, 0o600)
+    write_private_text(ACCESS_FILE, json.dumps(payload, indent=2) + "\n")
     _update_access_cache(payload)
     print(
         f"  TOFU: auto-onboarded @{username} (id={user_id}) as owner — wrote {ACCESS_FILE}",
@@ -672,20 +668,16 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     [File attached:] line unchanged. Any error from the subprocess is swallowed;
     transcription failure must never block task delivery.
     """
-    import subprocess
     skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
-    if not skill_script.exists():
-        return None
-    try:
-        result = subprocess.run(
-            [sys.executable, str(skill_script), local_path],
-            capture_output=True, text=True, timeout=25,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    except Exception as e:
-        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
-    return None
+    return _run_optional_script_shared(
+        skill_script,
+        [local_path],
+        timeout=25,
+        on_error=lambda exc: print(
+            f"  [stt] skill call failed for {os.path.basename(local_path)}: {exc}",
+            flush=True,
+        ),
+    )
 
 
 # When a sender ADDRESSES the bot (a DM, or an @mention — every _write_task call

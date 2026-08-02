@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -111,20 +112,43 @@ def analyze_task_patterns():
     return sources
 
 
+def _frontmatter_tags(content: str) -> list[str]:
+    """Tags from a note's YAML frontmatter only.
+
+    Previously this did `if "tags:" in content` and then took the FIRST line
+    containing that substring — anywhere in the note, prose included. A note
+    quoting a GitHub Actions workflow
+
+        lives in `.github/workflows/ios-release.yaml`, whose trigger is
+        `push: tags: [ios-v*]` (+ workflow_dispatch)
+
+    therefore had its prose parsed as tag names, and the daily insight told the
+    owner: "Top tags: lives in `.github/workflows/ios-release.yaml`, whose trigger
+    is `push:  ios-v*` (+, code-review". Substring-matching a structured field
+    against free text is the bug; the field only means "tags" inside frontmatter.
+
+    Frontmatter is the leading `---` block. A `tags:` line elsewhere is prose.
+    """
+    if not content.startswith("---"):
+        return []
+    end = content.find("\n---", 3)
+    if end == -1:  # unterminated block — not frontmatter, don't guess
+        return []
+    for line in content[3:end].split("\n"):
+        if re.match(r"\s*tags\s*:", line):
+            raw = line.split(":", 1)[1]
+            return [t.strip() for t in raw.replace("[", "").replace("]", "").split(",") if t.strip()]
+    return []
+
+
 def analyze_note_activity():
     """Check note creation patterns."""
     notes = list(NOTES_DIR.glob("*.md"))
     recent = [n for n in notes if n.stat().st_mtime > (datetime.now().timestamp() - 7 * 86400)]
     tags = Counter()
     for n in notes:
-        content = n.read_text()
-        if "tags:" in content:
-            tag_line = [l for l in content.split("\n") if "tags:" in l]
-            if tag_line:
-                for tag in tag_line[0].replace("tags:", "").replace("[", "").replace("]", "").split(","):
-                    tag = tag.strip()
-                    if tag:
-                        tags[tag] += 1
+        for tag in _frontmatter_tags(n.read_text()):
+            tags[tag] += 1
     return {"total": len(notes), "recent_7d": len(recent), "top_tags": tags.most_common(5)}
 
 
@@ -145,6 +169,54 @@ def _git_author_identity(repo_root):
         if r.returncode == 0 and v:
             return v
     return ""
+
+
+def _own_stand_value(env=None, repo_root=None):
+    """This instance's `Stand:` trailer value, or "" when it cannot be determined.
+
+    Both Sutando instances commit under the owner's GH-mapped email (CLA requires
+    it), so `--author` cannot separate them — a local-branch scan on one host
+    returned 17 `Echo Act IV Mini` commits beside 16 `Echo Act IV Pro` ones, the
+    peer's present only because worktrees had been created at its PR heads.
+
+    Resolution order, all canonical — no host-name guessing:
+      1. ``SUTANDO_STAND`` (explicit override)
+      2. ``bash scripts/sutando-config.sh stand`` — the per-clone config key,
+         which resolves with NO environment and is therefore what the scheduled
+         cron actually sees (john-the-dev, #2484: the activated path exports
+         neither env var, so an env-only reader silently returns "").
+
+    An earlier revision mapped host labels containing ``mac-mini``/``macbook`` to
+    this owner's Stand names. That is installation-specific policy in shared
+    code: on another user's machine it would assign a foreign identity and filter
+    out all of their legitimate commits. Removed.
+
+    Returns "" when nothing resolves — and the CALLER must then decline to report,
+    not count everything (see analyze_dev_activity).
+    """
+    env = os.environ if env is None else env
+    explicit = (env.get("SUTANDO_STAND") or "").strip()
+    if explicit:
+        return explicit
+    inside_repo = Path(repo_root) if repo_root else SRC_DIR
+    try:
+        top = subprocess.run(
+            ["git", "-C", str(inside_repo), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if top.returncode != 0 or not top.stdout.strip():
+        return ""
+    script = Path(top.stdout.strip()) / "scripts" / "sutando-config.sh"
+    if not script.is_file():
+        return ""
+    try:
+        r = subprocess.run(["bash", str(script), "stand"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def analyze_dev_activity(repo_root=SRC_DIR, now=None):
@@ -171,24 +243,47 @@ def analyze_dev_activity(repo_root=SRC_DIR, now=None):
         return None
     try:
         out = subprocess.run(
-            ["git", "-C", str(repo_root), "log", "--since=24 hours ago",
-             f"--author={author}", "--pretty=format:C:%H", "--name-only"],
+            ["git", "-C", str(repo_root), "log", "--branches", "--since=24 hours ago",
+             f"--author={author}",
+             "--pretty=format:C:%H\x1f%(trailers:key=Stand,valueonly)", "--name-only"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
         return None
+    stand = _own_stand_value(repo_root=repo_root)
     commits = 0
     dirs = Counter()
+    counting = False
+    seen_stands = set()
     for line in out.stdout.splitlines():
         if line.startswith("C:"):
-            commits += 1
-        elif line.strip() and "/" in line:
+            # "C:<sha>\x1f<Stand trailer value>" — the trailer is the ONLY thing
+            # that separates this instance from its peer, because both commit
+            # under the owner's GH-mapped email (see _own_stand_value).
+            trailer = line.split("\x1f", 1)[1].strip() if "\x1f" in line else ""
+            if trailer:
+                seen_stands.add(trailer)
+            counting = (not stand) or (trailer == stand)
+            if counting:
+                commits += 1
+        elif counting and line.strip() and "/" in line:
             dirs[line.split("/", 1)[0]] += 1
+    if not stand and len(seen_stands) > 1:
+        # No resolvable instance AND the scan spans MORE THAN ONE — we cannot say
+        # which commits are ours, and counting them all would credit the peer's
+        # work as this instance's (john-the-dev, #2484). Decline.
+        #
+        # Deliberately narrower than "decline whenever identity is unknown": that
+        # also silences every single-instance install which has never set the
+        # config key, producing the other failure john named — "reports no work
+        # despite real commits". Ambiguity, not ignorance, is what makes a count
+        # unsafe.
+        return None
     if commits == 0:
         return None
-    return {"commits_24h": commits, "top_dirs": dirs.most_common(3)}
+    return {"commits_24h": commits, "top_dirs": dirs.most_common(3), "stand": stand}
 
 
 def dev_activity_insight(dev):
@@ -198,9 +293,11 @@ def dev_activity_insight(dev):
     n = dev["commits_24h"]
     where = ", ".join(f"{d}/" for d, _ in dev["top_dirs"]) or "the codebase"
     plural = "s" if n != 1 else ""
+    stand = (dev.get("stand") or "").strip()
+    subject = f"Sutando's {stand} instance" if stand else "Sutando"
     return (
-        f"You shipped {n} commit{plural} in the last 24h, mostly in {where}. "
-        f"That's the real headline of your day — steady build velocity."
+        f"{subject} shipped {n} commit{plural} in the last 24h, mostly in {where}. "
+        f"That's the real headline — steady build velocity."
     )
 
 
