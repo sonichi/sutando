@@ -342,6 +342,24 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
     # reservation that has not been written yet, so the check and the write have
     # to be one step rather than two correct steps.
     with op.store_lock(store_dir):
+        # IDEMPOTENCY IS PART OF THE CRITICAL SECTION, not a pre-check.
+        # `existing` was read before the lock only to choose this branch. Two
+        # writers racing the same room both see None and both arrive here; the
+        # first activates at the final budget slot, and the second — now over
+        # budget — blind-saves the SAME deterministic policy_id as an
+        # over_budget draft, silently DOWNGRADING a working subscription while
+        # the first writer has already reported "seeded".
+        #
+        # `_entry_still_live()` cannot see this: it validates pack authority and
+        # generation, never whether another writer created this policy_id.
+        # Measured at 3572d094: results ['seeded','refused'], record_status
+        # 'draft', over_budget True, aggregate back to 18 — the activation wiped
+        # AND the budget freed for another grant.
+        fresh = store.get(pid)
+        if fresh is not None:
+            return {"status": "skipped", "policy_id": pid,
+                    "reason": f"generation record exists ({fresh.get('status')}) "
+                              f"— created by a concurrent seed"}
         ok, why = _budget_allows(store, normalized)
         if not ok:
             # PERSIST the over-budget policy as a DRAFT instead of returning nothing.

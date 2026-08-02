@@ -939,6 +939,65 @@ def test_owner_cancel_racing_a_resume_cannot_resurrect_the_record():
           f"and the caller is not told 'resumed' (got {r['status']!r})")
 
 
+def test_concurrent_seed_of_the_same_room_is_idempotent_not_a_downgrade():
+    """Same-policy idempotency must be serialized WITH the write (review 12:06).
+
+    `existing = store.get(pid)` is read before the lock only to choose a branch.
+    Two writers racing the same room both see None and both reach the first-seed
+    section; the first activates at the final budget slot, and the second — now
+    over budget — blind-saves the SAME deterministic policy_id as an over_budget
+    draft. A working subscription is silently DOWNGRADED while the first writer
+    has already returned "seeded", and the freed aggregate can fund another grant.
+
+    `_entry_still_live()` cannot catch it: it validates pack authority and
+    generation, never whether another writer created this policy_id.
+
+    Measured at 3572d094: results ['seeded','refused'], record_status 'draft',
+    over_budget True, aggregate back to 18.
+    """
+    d = _store()
+    entry = dpp._entry("react_baseline")
+    n = (dpp.PACK_AGGREGATE_EVALS_PER_DAY // op.DEFAULT_EVALS_PER_DAY) - 1   # 18/20
+    rooms = [f"!r{i}:ag2.space" for i in range(n)]
+    dpp.seed_defaults(d, OWNER, rooms)
+    gen = dpp._entry_state(dpp.load_pack_state(d), entry["key"])["generation"]
+    room = "!final:ag2.space"
+    pid = dpp._policy_id_for(entry["key"], gen, room)
+    before = dpp.committed_evals_per_day(op.SubscriptionStore(d))
+    check(before == dpp.PACK_AGGREGATE_EVALS_PER_DAY - op.DEFAULT_EVALS_PER_DAY,
+          f"control: exactly one budget slot is left (got {before})")
+
+    real_lock = op.store_lock
+    fired, res = [], {}
+
+    def racing_lock(store_dir, **kw):
+        # writer B has already read existing=None; let writer A finish entirely
+        if not fired:
+            fired.append(1)
+            res["A"] = dpp.seed_room(op.SubscriptionStore(d), d, entry, room,
+                                     owner_mxid=OWNER, owner_rooms=rooms + [room])["status"]
+        return real_lock(store_dir, **kw)
+
+    op.store_lock = racing_lock
+    try:
+        res["B"] = dpp.seed_room(op.SubscriptionStore(d), d, entry, room,
+                                 owner_mxid=OWNER, owner_rooms=rooms + [room])["status"]
+    finally:
+        op.store_lock = real_lock
+
+    check(bool(fired), "control: the concurrent writer actually ran")
+    check(res.get("A") == "seeded", f"control: writer A did seed (got {res.get('A')!r})")
+
+    rec = op.SubscriptionStore(d).get(pid) or {}
+    check(rec.get("status") == "active",
+          f"the first writer's ACTIVE record survives the second writer "
+          f"(got {rec.get('status')!r})")
+    check(not (rec.get("pack") or {}).get("over_budget"),
+          "and it is not rewritten as an over_budget draft")
+    check(res.get("B") != "seeded",
+          f"the second writer does not also claim seeded (got {res.get('B')!r})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
