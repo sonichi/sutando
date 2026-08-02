@@ -75,6 +75,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
+- **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
