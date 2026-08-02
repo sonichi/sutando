@@ -203,10 +203,16 @@ def main() -> int:
           "dev result POST translates back to the BROKER id on the wire")
     check(not (_lrtc.RESULTS_DIR / "task-COLLIDE.txt").exists(),
           "prod's result slot untouched — no cross-instance claim")
-    # cleanup so later assertions on the queue see the harness's own state
+    # Restore the harness's world EXACTLY: later assertions use ABSOLUTE counts
+    # (`len(STATE["results"]) == 1`), so pop this block's posted result and
+    # remove its task files + archived result. (First CI run caught this; the
+    # local "exit 0" that missed it was a piped-exit-code misread — lesson.)
+    STATE["results"].pop()
     for _f in ("task-COLLIDE.txt", "task-dev.COLLIDE.txt"):
         try: (_lrtc.TASKS_DIR / _f).unlink()
         except FileNotFoundError: pass
+    try: (_grtc.ARCHIVE_RESULTS_DIR / "task-dev.COLLIDE.txt").unlink()
+    except FileNotFoundError: pass
 
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),
