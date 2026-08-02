@@ -178,6 +178,34 @@ check("control: tmux is invoked with -s (every pane in the session)",
       "-s" in _seen_args.get("a", ()),
       f"args were {_seen_args.get('a')!r} — without -s tmux returns only the current window")
 
+# --- the DEFAULT ps_runner, which every case above injects past ------------------
+# CI reported exactly two uncovered changed lines: the default `ps_runner` closure.
+# Every assertion above supplies its own, so the real one never ran — the shape of
+# "tested the seam, never the thing behind it" that this PR's review already caught
+# once. Exercised here against THIS test process's own pid: `ps eww -p <self>` is
+# available on both macOS and the Linux CI runner, always returns a live process, and
+# its argv cannot contain `--name sutando-core`, so the contract answer is None.
+# Deterministic and hermetic — no live core required.
+import os as _os
+
+_default_ps = hc.core_env_has_proxy_url(
+    socket_path="/tmp/probe.sock",
+    tmux_runner=lambda sock, *a: R(0, f"{_os.getpid()}\n"),
+)  # ps_runner deliberately omitted -> the production closure runs
+check("the DEFAULT ps_runner executes and yields the contract answer",
+      _default_ps is None,
+      "this process is not the core, so `--name sutando-core` is absent -> None")
+
+# control: the default path really did SHELL OUT rather than short-circuiting. A pid
+# that cannot exist makes `ps` exit non-zero; if that is indistinguishable from the
+# line above, the test proves nothing about the closure.
+_dead = hc.core_env_has_proxy_url(
+    socket_path="/tmp/probe.sock",
+    tmux_runner=lambda sock, *a: R(0, "2147483647\n"),
+)
+check("control: the default runner reaches a real `ps` (dead pid also -> None)",
+      _dead is None)
+
 print()
 if failures:
     print(f"{len(failures)} check(s) FAILED: {failures}")
