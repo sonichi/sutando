@@ -122,6 +122,14 @@ mechanics. For example, `src/presenter_mode.py` owns the presenter sentinel path
 and expiry semantics; Discord, Slack, Telegram, and notification jobs decide
 what delivery to suppress when that policy reports active.
 
+### HTTP transport handlers
+
+HTTP handlers are transport adapters, not the owner of feature policy. Repeated
+authentication gates, status/header emission, and JSON serialization belong in
+small handler helpers so every route uses one wire contract. Route branches retain
+endpoint-specific orchestration and payload construction. Refactors must preserve
+status codes, headers, and payload shapes with direct contract tests.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known

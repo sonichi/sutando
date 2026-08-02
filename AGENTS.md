@@ -20,6 +20,7 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 - **Inline tools** are only for tools that need instant response from Gemini. Prefer skill scripts for complex logic. Only promote to inline if the user says the skill approach is too slow.
 - **Skill config goes in the skill's `manifest.json` `config` block — not ad-hoc env vars.** See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the convention — declaration, the `CLI > env > manifest > config-file > state` read-precedence, and config-only manifests. Don't invent an undocumented env var (Chi 2026-06-16).
 - **Optional capability discovery stays at the adapter edge.** Shared runners may standardize provider-neutral execution behavior, but adapters must inject script or capability paths. Core helpers must not name, locate, or import a concrete skill. Add direct contract tests for the runner and wiring tests for every adapter that delegates to it.
+- **HTTP handlers centralize transport mechanics.** Put repeated authentication gates, status/header emission, and JSON encoding in handler helpers; route branches own endpoint behavior. Protect status codes, headers, and payload shapes with direct contract tests when refactoring handlers.
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 
 ### Where does new code belong? (decision guide — issue #222)
