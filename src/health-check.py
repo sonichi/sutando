@@ -41,6 +41,7 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+from git_binary import git_argv  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
@@ -1588,6 +1589,11 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
         return {"name": name, "status": "ok",
                 "detail": "no runnable git (resolver) — skipping"}
     try:
+        # `git_bin` came from the resolver above, so it is never a bare `git`
+        # resolving through PATH — which on a Mac without developer tools lands
+        # on the Xcode-CLT stub, whose modal install dialog fires BEFORE the
+        # return-code check below can degrade. This check is registered
+        # unconditionally, so it ran on every health pass.
         out = subprocess.run(
             [git_bin, "-C", str(repo), "branch", "--show-current"],
             capture_output=True, text=True, timeout=10,
@@ -2080,8 +2086,13 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
     deploys aren't hidden.
     """
     try:
+        # git_argv raises GitUnavailable (an OSError) when this host has no
+        # runnable git — caught below and treated as "can't tell", exactly like
+        # any other git error. Never invoke /usr/bin/git directly: on a Mac
+        # without developer tools that is the CLT shim and it raises a modal
+        # install dialog, which a health check must never be able to do.
         log = subprocess.run(
-            ["/usr/bin/git", "log", "-1", "--format=%ct", "HEAD", "--", str(src_file)],
+            git_argv("log", "-1", "--format=%ct", "HEAD", "--", str(src_file)),
             cwd=REPO_DIR, capture_output=True, text=True, timeout=5
         )
         if log.returncode != 0 or not log.stdout.strip():
@@ -2092,7 +2103,7 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
             return False
         # No commits since proc_start; check for uncommitted edits
         diff = subprocess.run(
-            ["/usr/bin/git", "diff", "--quiet", "HEAD", "--", str(src_file)],
+            git_argv("diff", "--quiet", "HEAD", "--", str(src_file)),
             cwd=REPO_DIR, capture_output=True, timeout=5
         )
         return diff.returncode == 0  # 0 = no diff
