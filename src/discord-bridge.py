@@ -76,6 +76,7 @@ import discord_config  # noqa: E402  — Sutando workspace-local discord config 
 from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
+from presenter_mode import presenter_mode_active  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -485,30 +486,6 @@ def _ref_from_attachment(att, local_path) -> "local_task_protocol.AttachmentRef"
         size=(getattr(att, "size", 0) or 0),
     )
 
-
-# Presenter mode: when scripts/presenter-mode.sh is active, the bridge
-# must not send proactive DMs to the owner. The sentinel contains an
-# ISO-8601 expiry; see scripts/presenter-mode.sh for the contract.
-# Matches the check in src/check-pending-questions.py — both scripts
-# share the same sentinel path + comparison logic.
-PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
-
-
-def presenter_mode_active():
-    if not PRESENTER_SENTINEL.exists():
-        return False
-    try:
-        expire_iso = PRESENTER_SENTINEL.read_text().strip()
-        # Require an ISO-8601-ish prefix (starts with a digit). Without
-        # this guard, malformed sentinel content like "garbage" compares
-        # LESS than any real now_iso ("2" < "g" in ASCII) and the mode
-        # fails OPEN — appears active forever.
-        if not expire_iso or not expire_iso[0].isdigit():
-            return False
-        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        return now_iso < expire_iso
-    except Exception:
-        return False
 
 # Optional: deterministic ownership for team/other-tier tasks across nodes.
 # When set, only the node whose stand-identity.json `machine` field matches
@@ -4753,7 +4730,7 @@ async def poll_proactive():
         try:
             # Skip sends while presenter-mode is active. Files remain on
             # disk and are sent on a later tick once the sentinel clears.
-            if presenter_mode_active():
+            if presenter_mode_active(REPO):
                 _presenter_log_throttle += 1
                 if _presenter_log_throttle % 20 == 1:  # ~once per 60s
                     pending = sum(
