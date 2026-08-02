@@ -120,5 +120,63 @@ class TestLeadingParenthetical(unittest.TestCase):
             out = mb.clip_for_speech("(" * 40, limit)
             self.assertLessEqual(len(out), limit, (limit, out))
 
+# --- review finding #2, john-the-dev + qingyun-wu on 987bcddc -----------------
+# The first fix stripped a leading "(" and re-sliced, which shifts the window one
+# char right and can pull the matching ")" in ALONE -- the mirror image of the
+# orphan it removed. The 11-case suite passed at that head because its shapes
+# never placed a closer on the shifted boundary. Hand-picked shapes are exactly
+# what missed it, so this axis is generated: brackets at EVERY position, every
+# limit. Measured 31 violations at 987bcddc, 0 after.
+
+def _bracket_corpus():
+    alpha = "abcdefghijklmnop"
+    out = set()
+    for n in (6, 9, 12):
+        base = alpha[:n]
+        for i in range(n + 1):
+            for j in range(i, n + 1):
+                out.add(base[:i] + "(" + base[i:j] + ")" + base[j:] + " trailing words here")
+    out |= {
+        "(abcdefghi) long trailing title",          # the reviewers' exact repro
+        "((nested opener that never closes at all in this string",
+        "(a(b)c) then more words to force the clip somewhere",
+        ")leading closer with no opener at all in the string",
+        "(((", ")))", "()", "( )", "a(b", "a)b",
+    }
+    return sorted(out)
+
+
+class TestBracketBalanceAxis(unittest.TestCase):
+    def test_the_reviewers_exact_repro_at_the_failing_limit(self):
+        out = mb.clip_for_speech("(abcdefghi) long trailing title", 11)
+        self.assertEqual(out.count("("), out.count(")"), out)
+        self.assertNotEqual(out, "abcdefghi\u2026)"[::-1])  # guard against the old 'abcdefghi)…'
+        self.assertNotIn(")\u2026", out)
+
+    def test_a_clip_is_never_unbalanced_in_EITHER_direction(self):
+        """Generated axis: brackets at every position x every limit."""
+        checked = 0
+        for text in _bracket_corpus():
+            for limit in range(2, 45):
+                out = mb.clip_for_speech(text, limit)
+                if out == text:
+                    continue          # unchanged text is exempt by contract
+                checked += 1
+                self.assertEqual(out.count("("), out.count(")"), (limit, text, out))
+                self.assertLessEqual(len(out), limit, (limit, text, out))
+        self.assertGreater(checked, 4000, "axis should exercise thousands of clipped cases")
+
+    def test_nested_leading_groups_at_the_boundary(self):
+        for text in ("((ab)) trailing words here", "(a(bc)d) trailing words here"):
+            for limit in range(2, 20):
+                out = mb.clip_for_speech(text, limit)
+                if out == text:
+                    continue
+                self.assertEqual(out.count("("), out.count(")"), (limit, text, out))
+
+    def test_an_unmatched_CLOSER_is_also_cut(self):
+        out = mb.clip_for_speech(")leading closer with no opener at all here", 12)
+        self.assertEqual(out.count("("), out.count(")"), out)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
