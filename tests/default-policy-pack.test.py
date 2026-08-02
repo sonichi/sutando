@@ -752,6 +752,66 @@ def test_over_budget_draft_racing_a_disable_is_not_left_live():
           f"no live draft is left on a disabled entry (got {status!r})")
 
 
+def test_resume_reports_refused_when_the_record_was_cancelled_mid_flight():
+    """The RESUME branch must honour transition()'s return value.
+
+    Found by review, and my own shape-grep missed it honestly: the sweep matched
+    check-then-FIRST-write, and here the check precedes an idempotent RE-save of a
+    record that already exists.
+
+    Reachability, asked explicitly before treating it as a defect: the primary
+    race is already closed on this path -- the draft PRE-EXISTS, so a concurrent
+    disable's sweep sees and cancels it. What survives is the TRUTHFULNESS half.
+    `cancelled` is terminal, so transition(pid, "active") returns False, and the
+    branch then reported "resumed" for a record that is actually cancelled. The
+    room is not subscribed (good) but every caller is told it is (bad) -- exactly
+    the sub-defect the main path's fix comment names.
+    """
+    d = _store()
+    entry = dpp._entry("react_baseline")
+    room = ROOMS[0]
+    gen = dpp._entry_state(dpp.load_pack_state(d), entry["key"])["generation"]
+    pid = dpp._policy_id_for(entry["key"], gen, room)
+    store = op.SubscriptionStore(d)
+
+    # Simulate the crash: validated record saved, never transitioned.
+    normalized, errors = op.validate_draft(dpp._draft_for(entry, room, OWNER, gen))
+    check(not errors, "setup: factory draft validates")
+    normalized["pack"] = {"entry": entry["key"], "generation": gen}
+    store.save(normalized)
+    check(store.get(pid)["status"] == "draft",
+          "precondition: a crash leaves a non-terminal draft record")
+
+    # The owner disables while the resume is in flight. Because the draft already
+    # exists, the sweep CANCELS it -- a real interleaving, not a stubbed return.
+    real = dpp._entry_still_live
+    fired = []
+
+    def racing(store_dir, key, g):
+        ok = real(store_dir, key, g)
+        if not fired:
+            fired.append(True)
+            dpp.set_enabled(store_dir, key, False)
+        return ok
+
+    dpp._entry_still_live = racing
+    try:
+        r = dpp.seed_room(store, d, entry, room, owner_mxid=OWNER, owner_rooms=ROOMS)
+    finally:
+        dpp._entry_still_live = real
+
+    check(bool(fired), "control: the disable injection fired on the resume path")
+    # NOT "the sweep cancelled it" -- that was true for a moment and then the
+    # re-save overwrote it. The invariant that actually matters is the end state:
+    # a disabled entry must never be left with a live record, however many writers
+    # touched it on the way.
+    check(store.get(pid)["status"] != "active",
+          f"a disabled entry is never left ACTIVE by the resume path "
+          f"(got {store.get(pid)['status']!r})")
+    check(r["status"] != "resumed",
+          f"a cancelled record is never reported as resumed (got {r['status']!r})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

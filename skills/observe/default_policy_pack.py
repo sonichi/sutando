@@ -262,9 +262,31 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
                         "reason": "entry was disabled or re-generated while this "
                                   "seed was in flight"}
             normalized["pack"] = {"entry": entry["key"], "generation": gen}
+            # PUBLISH, THEN VERIFY — and on THIS path the re-save is itself the
+            # hazard, which is why it needs more than honouring transition().
+            #
+            # set_enabled() argues that cancelling is sufficient on its own
+            # because `cancelled` is terminal, so "the guard lives in the state
+            # machine, not in a caller that could forget to ask". That holds for
+            # transition() — and NOT for save(), which is a blind whole-record
+            # overwrite (json.dump + os.replace) that consults no state machine.
+            #
+            # So the sequence here was: the sweep cancels this pre-existing
+            # draft, this save RESURRECTS it to `draft`, and the activation below
+            # then legally succeeds. A disabled entry goes ACTIVE, and the
+            # terminality the sweep relies on is silently undone by a writer that
+            # never asked. Re-reading after the save is what closes it.
             store.save(normalized)  # re-assert content (idempotent for this gen)
-            store.transition(pid, "active",
-                             note="factory default (resumed crash-interrupted draft)")
+            if not _entry_still_live(store_dir, entry["key"], gen):
+                store.transition(pid, "cancelled",
+                                 note="pack entry disabled while this resume was in flight")
+                return {"status": "refused", "policy_id": pid,
+                        "reason": "entry was disabled or re-generated while this "
+                                  "seed was in flight"}
+            if not store.transition(pid, "active",
+                                    note="factory default (resumed crash-interrupted draft)"):
+                return {"status": "refused", "policy_id": pid,
+                        "reason": "activation refused by the store — the record was already cancelled"}
             return {"status": "resumed", "policy_id": pid, "reason": reason}
         # A terminal/idempotent record already exists for this (entry, gen, room):
         #   - active    → already seeded (the intended re-seed skip).
