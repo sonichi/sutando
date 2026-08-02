@@ -167,6 +167,45 @@ ok("all-unavailable briefing still reports the calendar honestly",
    "couldn't read your calendar" in allgone, f"got {allgone!r}")
 
 
+# --- a CRASHED health check is not a clean system (review round 2) ---------
+# health-check.py ends in `sys.exit(1 if issues else 0)`, so a non-zero exit is
+# its normal way of saying "I found problems" — a blanket `returncode != 0 ->
+# None` would throw away real findings. The crash case is non-zero WITH nothing
+# parseable: import error, traceback on stderr, empty stdout. Both reviewers
+# reproduced the false all-clear on that path independently.
+
+
+def _health_with(rc, out, err=""):
+    real = _mod.subprocess.run
+    try:
+        _mod.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(
+            args=[], returncode=rc, stdout=out, stderr=err)
+        return _mod.get_health_issues()
+    finally:
+        _mod.subprocess.run = real
+
+
+_crash = _health_with(1, "", "Traceback (most recent call last): boom")
+ok("crashed health check (rc!=0, nothing parseable) returns None",
+   _crash is None, f"got {_crash!r}")
+ok("crashed health check withholds the all-clear",
+   CLEAN not in _mod.synthesize(None, [], [], [], [], _crash))
+
+# the discriminator: rc!=0 is AMBIGUOUS, so real findings must survive it
+_found = _health_with(1, "  \u2717 disk-space    fail    91% full on /\n")
+ok("rc!=0 WITH parseable issues still returns them (not None)",
+   _found == ["disk-space: 91% full on /"], f"got {_found!r}")
+_n = _mod.synthesize(None, [], [], [], [], _found)
+ok("real health issues still reach the briefing", "91% full" in _n, f"got {_n!r}")
+ok("a day with real health issues gets no all-clear", CLEAN not in _n)
+
+# and a clean run is still verified-empty, not unknown
+_ok0 = _health_with(0, "  \u2713 everything fine\n")
+ok("rc==0 with no failures is verified-empty []", _ok0 == [], f"got {_ok0!r}")
+ok("verified-clean health STILL yields the all-clear",
+   CLEAN in _mod.synthesize(None, [], [], [], [], _ok0))
+
+
 print(f"briefing-all-clear-verified: {_passed}/{_passed + _failed} passed"
       + (f" — {_failed} FAILED" if _failed else ""))
 raise SystemExit(1 if _failed else 0)

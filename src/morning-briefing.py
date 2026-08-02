@@ -410,6 +410,15 @@ def get_health_issues() -> "list[str] | None":
                     issues.append(f"{name}: {detail}")
                 elif parts:
                     issues.append(parts[0])
+        # A non-zero exit is AMBIGUOUS here and must not be read as failure
+        # alone: health-check.py ends in `sys.exit(1 if issues else 0)`, so
+        # non-zero is its normal way of saying "I found problems" — and those
+        # problems are exactly what this function is for. The crash case is
+        # non-zero WITH nothing parseable (import error, traceback on stderr,
+        # empty stdout): the run produced no verdict at all, so the answer is
+        # "unknown", not "clean".
+        if r.returncode != 0 and not issues:
+            return None
         return issues[:3]
     except (subprocess.TimeoutExpired, OSError):
         return None
