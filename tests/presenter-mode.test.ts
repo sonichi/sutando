@@ -38,6 +38,40 @@ test('digit-prefixed malformed sentinel is inactive — fail-closed (#2516 revie
   assert.equal(presenterModeActive(workspaceWithSentinel('9999-not-a-date'), EPOCH), false);
 });
 
+// Shape-valid but SEMANTICALLY impossible (#2516 second review round). The
+// full-shape regex pins field widths only, so each of these matched and then
+// lexically compared as future — holding the gate open forever on a corrupted
+// sentinel. Mirrored case-for-case in tests/presenter-mode-policy.test.py.
+//
+// The rollover cases are why a bare parse is not enough HERE specifically:
+// `new Date('2026-02-30T00:00:00Z')` does NOT throw, it means 2026-03-02. The
+// Python twin's strptime rejects it outright, so without the canonical
+// round-trip the two implementations would disagree on exactly these values.
+for (const [value, why] of [
+  ['9999-99-99T99:99:99Z', 'impossible in every field'],
+  ['2026-13-01T00:00:00Z', 'month 13'],
+  ['2026-00-01T00:00:00Z', 'month 00'],
+  ['2026-01-32T00:00:00Z', 'day 32'],
+  ['2027-01-01T24:00:00Z', 'hour 24'],
+  ['2027-02-30T00:00:00Z', 'Feb 30 — Date rolls it over rather than failing'],
+  ['2027-06-31T00:00:00Z', 'Jun 31 — Date rolls it over rather than failing'],
+  ['2027-02-29T00:00:00Z', 'Feb 29 in a non-leap year'],
+] as const) {
+  test(`shape-valid but impossible sentinel is inactive: ${value} (${why})`, () => {
+    assert.equal(presenterModeActive(workspaceWithSentinel(value), EPOCH), false);
+  });
+}
+
+// CONTROLS — without these the fix could pass by rejecting everything, which
+// would silently disable presenter mode instead of hardening it.
+test('CONTROL: a real leap day is still ACTIVE', () => {
+  assert.equal(presenterModeActive(workspaceWithSentinel('2028-02-29T00:00:00Z'), EPOCH), true);
+});
+
+test('CONTROL: a genuinely future expiry is still ACTIVE', () => {
+  assert.equal(presenterModeActive(workspaceWithSentinel('2099-12-31T23:59:59Z'), EPOCH), true);
+});
+
 test('future expiry is active', () => {
   assert.equal(presenterModeActive(workspaceWithSentinel('1970-01-01T00:00:01Z\n'), EPOCH), true);
 });
