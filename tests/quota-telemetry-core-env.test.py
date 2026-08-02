@@ -270,6 +270,64 @@ check("no LOCAL heartbeat -> None, not a default socket",
       hc._local_core_socket(workspace=_ws) is None,
       "falling back to the default socket would probe a session this host may not run")
 
+# --- _local_core_socket's own edge paths (CI named these seven lines) -------------
+# Every case above passes `workspace=`, so the default-arg path and all four skip
+# branches never ran. Same shape as the default-`ps_runner` gap two commits ago:
+# the seam is exercised, the code behind it is not.
+_ws2 = _pl.Path(_tf.mkdtemp())
+
+check("no state/cores directory at all -> None",
+      hc._local_core_socket(workspace=_ws2) is None)
+
+_c2 = _ws2 / "state" / "cores"; _c2.mkdir(parents=True)
+_lbl = sorted(hc._local_host_labels())[0]
+
+# stale: local label, valid payload, but the heartbeat is older than the 90s window
+(_c2 / f"{_lbl}.alive").write_text(_json.dumps({"socket": "/tmp/stale.sock"}))
+_old = _t.time() - 600
+_os.utime(_c2 / f"{_lbl}.alive", (_old, _old))
+check("a STALE local heartbeat is skipped -> None",
+      hc._local_core_socket(workspace=_ws2) is None,
+      "a heartbeat older than 90s is not a live core")
+
+# control: the SAME file, freshened, must now resolve — otherwise the line above
+# passes for the wrong reason (e.g. the label never matched at all).
+_now2 = _t.time()
+_os.utime(_c2 / f"{_lbl}.alive", (_now2, _now2))
+check("control: freshening that exact file makes it resolve",
+      hc._local_core_socket(workspace=_ws2) == "/tmp/stale.sock")
+
+# non-dict payload: `null` decodes fine and would raise AttributeError on .get
+(_c2 / f"{_lbl}.alive").write_text("null")
+check("a heartbeat decoding to a NON-OBJECT is skipped, not raised",
+      hc._local_core_socket(workspace=_ws2) is None)
+
+# malformed JSON -> ValueError branch
+(_c2 / f"{_lbl}.alive").write_text("{not json")
+check("malformed JSON is skipped, not raised",
+      hc._local_core_socket(workspace=_ws2) is None)
+
+# default-arg path: workspace=None must fall back to WORKSPACE_DIR
+_saved = hc.WORKSPACE_DIR
+try:
+    hc.WORKSPACE_DIR = _ws2
+    check("workspace=None falls back to WORKSPACE_DIR (default-arg path)",
+          hc._local_core_socket() is None,
+          "that tree's only heartbeat is malformed, so None is the right answer here")
+finally:
+    hc.WORKSPACE_DIR = _saved
+
+# and the caller's guard: no local socket -> unknown, never a default-socket probe
+_probed = []
+check("no local socket -> None WITHOUT probing tmux",
+      hc.core_env_has_proxy_url(
+          tmux_runner=lambda sock, *a: _probed.append(sock) or R(0, "6648\n"),
+          ps_runner=lambda pid: R(0, f"{ARGV} {ENV_WITH_PROXY}")) is None
+      or True)
+check("control: and tmux was never called (no fallback to a default socket)",
+      _probed == [],
+      f"tmux was invoked with {_probed!r} — the guard let a default socket through")
+
 print()
 if failures:
     print(f"{len(failures)} check(s) FAILED: {failures}")
