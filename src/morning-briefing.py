@@ -25,7 +25,6 @@ from util_paths import personal_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
-LOGS_DIR = WORKSPACE / "logs"
 STATE_DIR = WORKSPACE / "state"
 
 # Agent-written cache of the owner's real (Google Workspace) calendar. This
@@ -281,26 +280,66 @@ def get_reminders() -> list[str]:
         return []
 
 
-def get_overnight_discord() -> list[str]:
-    """Read last 8 hours of Discord DMs from the bridge log."""
-    log = LOGS_DIR / "discord-bridge.log"
-    if not log.exists():
-        return []
-    try:
-        cutoff = time.time() - 8 * 3600
-        messages = []
-        for line in log.read_text(errors="replace").splitlines()[-200:]:
-            # Look for DM lines: [msg] #DM @user: text
-            if "[msg] #DM" in line and "is_dm: True" in line:
-                # Extract sender and preview
-                m = re.search(r'\[msg\] #DM @(\S+): (.+?) \(mentions:', line)
-                if m:
-                    sender, text = m.group(1), m.group(2)[:80]
-                    if sender != "Sutando" and "Sutando-Pro" not in sender:
-                        messages.append(f"{sender}: {text}")
-        return messages[-5:] if messages else []
-    except OSError:
-        return []
+def get_overnight_discord(now: float | None = None) -> list[str]:
+    """Owner Discord DMs from the last 8 hours, newest last (max 5).
+
+    Reads the TASK FILES the bridge writes, not `logs/discord-bridge.log`.
+
+    The log cannot answer this question. Its docstring promised an 8-hour window
+    and the code computed `cutoff = time.time() - 8 * 3600` and then never used
+    it: the effective window was `splitlines()[-200:]`, a line count. That is not
+    an oversight that a one-line patch fixes — the `[msg] #DM` lines carry no
+    timestamp at all (measured 2026-08-02: 10 of 6,754 lines in the live log had
+    an ISO stamp, and none of them were message lines), so there is nothing for a
+    time cutoff to compare against. Meanwhile the line window silently shrinks as
+    the bridge gets chattier: on the same log, all 9 matching DM lines sat at
+    indices 596-6177 while the window began at 6,554, so the briefing reported
+    ZERO overnight messages on a day that had them. The failure direction is
+    false-clean, which is the worst one for a daily briefing.
+
+    The bridge already writes a properly timestamped record of every DM it
+    processes: `tasks/task-<id>.txt`, archived to `tasks/archive/` after
+    handling, each carrying an ISO `timestamp:`, `source:`, `channel_name:` and
+    `access_tier:`. Reading those makes the promised 8-hour filter actually
+    implementable, with no new instrumentation.
+
+    Owner DMs are `source: discord` + `channel_name: DM` + `access_tier: owner`.
+    The tier check is what replaces the old sender-name exclusion: peer bots post
+    to shared channels as `team`, so they cannot reach this list.
+    """
+    now = time.time() if now is None else now
+    cutoff = now - 8 * 3600
+    tasks_dir = WORKSPACE / "tasks"
+    found: list[tuple[float, str]] = []
+    for directory in (tasks_dir, tasks_dir / "archive"):
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("task-*.txt"):
+            try:
+                head = path.read_text(errors="replace")
+            except OSError:
+                continue
+            fields = dict(re.findall(r"^([a-z_]+):[ \t]*(.*)$", head, re.M))
+            if fields.get("source") != "discord":
+                continue
+            if fields.get("channel_name") != "DM":
+                continue
+            if fields.get("access_tier", "owner") != "owner":
+                continue
+            stamp = fields.get("timestamp", "")
+            try:
+                when = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if when < cutoff:
+                continue
+            body = ""
+            m = re.search(r"^task:[ \t]*(.*)$", head, re.M)
+            if m:
+                body = m.group(1).strip()[:80]
+            found.append((when, body))
+    found.sort()
+    return [body for _when, body in found[-5:]]
 
 
 def _load_notifier():
