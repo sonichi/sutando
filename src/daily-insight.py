@@ -273,7 +273,18 @@ def analyze_note_activity():
     for n in notes:
         for tag in _frontmatter_tags(n.read_text()):
             tags[tag] += 1
-    return {"total": len(notes), "recent_7d": len(recent), "top_tags": tags.most_common(5)}
+    # `age_known` is the honest half of this result. `recent_7d` is only a claim
+    # about note CREATION when git supplied the dates; when the bulk query
+    # returned no history the count is a restatement of mtime, and mtime in this
+    # workspace is the time of the last sync. Emitting it anyway is the original
+    # 2026-08-02 bug ("356 notes in the last 7 days", true figure 50) in a
+    # quieter form, so the caller is given the means to say nothing instead.
+    return {
+        "total": len(notes),
+        "recent_7d": len(recent),
+        "age_known": bool(created),
+        "top_tags": tags.most_common(5),
+    }
 
 
 def _git_author_identity(repo_root):
@@ -467,7 +478,13 @@ def generate_insight():
             )
 
     note_stats = analyze_note_activity()
-    if note_stats["recent_7d"] > 5:
+    # No git-derived creation dates -> no note-creation claim, in EITHER
+    # direction. A confident zero ("no new notes in 7 days") is as wrong as a
+    # confident 9 when both come from sync-reset mtimes. Tag counts and totals
+    # do not depend on dates and are unaffected.
+    if not note_stats.get("age_known"):
+        pass
+    elif note_stats["recent_7d"] > 5:
         insights.append(
             f"You've created {note_stats['recent_7d']} notes in the last 7 days "
             f"({note_stats['total']} total). Top tags: {', '.join(t[0] for t in note_stats['top_tags'][:3])}. "

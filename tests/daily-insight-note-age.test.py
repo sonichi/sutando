@@ -319,6 +319,78 @@ for _fn in (_mod._note_creation_dates, _mod._note_added_at):
        f"bare git argv in {_fn.__name__}")
 
 
+# --- a no-history host must make NO note-creation claim (review #2526 rd 4) ---
+# Bounding the subprocess count fixed the fan-out but not the falsehood: on a
+# workspace that is not its own git repo, `recent_7d` is a restatement of mtime,
+# and mtime here is the time of the last sync. Reported on the reviewer's host
+# as "recent_7d=9" with a direct mtime count of exactly 9 — no creation-date
+# evidence behind it. generate_insight() must be unable to say it, in EITHER
+# direction: a confident zero is as unevidenced as a confident nine.
+
+def _insight_text(ws, notes):
+    _o_ws, _o_dir = _mod.WORKSPACE, _mod.NOTES_DIR
+    try:
+        _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+        return _mod.generate_insight() or ""
+    finally:
+        _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
+
+
+for _n, _label in ((9, "positive claim"), (14, "reviewer's exact count")):
+    with tempfile.TemporaryDirectory() as _tmp:
+        ws = Path(_tmp)
+        notes = ws / "notes"
+        notes.mkdir()
+        for i in range(_n):
+            (notes / f"n{i}.md").write_text("---\ntags: [x]\n---\nbody\n")
+        # NOT a git work tree -> no note history available
+
+        _o_ws, _o_dir = _mod.WORKSPACE, _mod.NOTES_DIR
+        try:
+            _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+            st = _mod.analyze_note_activity()
+        finally:
+            _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
+
+        ok(f"no-history ({_n} notes): age_known is False",
+           st.get("age_known") is False, f"got {st.get('age_known')!r}")
+        ok(f"no-history ({_n} notes): total still reported (date-independent)",
+           st["total"] == _n, f"got {st['total']}")
+
+        txt = _insight_text(ws, notes)
+        ok(f"no-history ({_n} notes): insight makes NO note-creation claim ({_label})",
+           "notes in the last 7 days" not in txt,
+           f"emitted: {txt[:120]!r}")
+
+# control: WITH real git history the claim is still made, so the suppression
+# cannot pass by muting the feature outright
+with tempfile.TemporaryDirectory() as _tmp:
+    ws = Path(_tmp)
+    notes = ws / "notes"
+    notes.mkdir()
+    _git(ws, "init", "-q")
+    for i in range(7):
+        f = notes / f"r{i}.md"
+        f.write_text("---\ntags: [y]\n---\nbody\n")
+        _git(ws, "add", f"notes/r{i}.md")
+    _git(ws, "commit", "-qm", "add recent")
+
+    _o_ws, _o_dir = _mod.WORKSPACE, _mod.NOTES_DIR
+    try:
+        _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+        st = _mod.analyze_note_activity()
+    finally:
+        _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
+
+    ok("CONTROL: with git history, age_known is True",
+       st.get("age_known") is True, f"got {st.get('age_known')!r}")
+    ok("CONTROL: with git history, recent_7d is git-derived and non-zero",
+       st["recent_7d"] == 7, f"got {st['recent_7d']}")
+    txt = _insight_text(ws, notes)
+    ok("CONTROL: with git history the claim IS emitted (suppression is not blanket)",
+       "notes in the last 7 days" in txt, f"emitted: {txt[:120]!r}")
+
+
 print(f"daily-insight-note-age: {_passed}/{_passed + _failed} passed"
       + (f" — {_failed} FAILED" if _failed else ""))
 raise SystemExit(1 if _failed else 0)
