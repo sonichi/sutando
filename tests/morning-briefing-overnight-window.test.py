@@ -91,6 +91,39 @@ class OvernightWindowTest(unittest.TestCase):
         self.assertEqual(self.mod.get_overnight_discord(now=self.now),
                          ["buried by chatter"])
 
+    def test_month_partitioned_archive_is_scanned(self):
+        """PR #591 partitions the archive as tasks/archive/YYYY-MM/<id>.txt.
+
+        The flat form is LEGACY. Scanning only it reproduces the exact
+        false-clean this function exists to remove: on the live workspace at
+        review time, 280 flat vs 178 month-partitioned files, and in an 8-hour
+        window 1 owner DM found vs 2 missed.
+        """
+        write_task(self.ws / "tasks" / "archive" / "2026-08", "1",
+                   self.now - 3600, body="month-partitioned")
+        self.assertEqual(self.mod.get_overnight_discord(now=self.now),
+                         ["month-partitioned"])
+
+    def test_flat_and_month_archives_are_merged_in_time_order(self):
+        """Legacy flat entries must not be dropped when both shapes exist."""
+        write_task(self.ws / "tasks" / "archive", "1", self.now - 300,
+                   body="legacy-flat")
+        write_task(self.ws / "tasks" / "archive" / "2026-08", "2",
+                   self.now - 200, body="month-newer")
+        write_task(self.ws / "tasks", "3", self.now - 100, body="live")
+        self.assertEqual(self.mod.get_overnight_discord(now=self.now),
+                         ["legacy-flat", "month-newer", "live"])
+
+    def test_archive_scan_is_one_level_deep_only(self):
+        """Bounded like discord-bridge's own `archive.glob("*/<id>.txt")`.
+
+        rglob would walk unbounded depth; a stray nested tree must not be
+        pulled in.
+        """
+        write_task(self.ws / "tasks" / "archive" / "2026-08" / "extra", "1",
+                   self.now - 60, body="too deep")
+        self.assertEqual(self.mod.get_overnight_discord(now=self.now), [])
+
     def test_archive_and_live_dirs_are_both_scanned(self):
         write_task(self.ws / "tasks", "2", self.now - 60, body="newest")
         write_task(self.ws / "tasks" / "archive", "1", self.now - 120, body="older")

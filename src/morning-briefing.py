@@ -310,11 +310,22 @@ def get_overnight_discord(now: float | None = None) -> list[str]:
     now = time.time() if now is None else now
     cutoff = now - 8 * 3600
     tasks_dir = WORKSPACE / "tasks"
+    archive = tasks_dir / "archive"
     found: list[tuple[float, str]] = []
-    for directory in (tasks_dir, tasks_dir / "archive"):
+    # The archive is MONTH-PARTITIONED (`tasks/archive/YYYY-MM/<id>.txt`, PR
+    # #591); the flat form is legacy and only holds tasks archived before it.
+    # Scanning the flat form alone reproduces the very false-clean this function
+    # exists to fix: measured on the live workspace, 280 flat vs 178 month-
+    # partitioned, and in an 8-hour window 1 owner DM flat vs 2 missed. One
+    # level deep, matching discord-bridge.py's own `archive.glob(f"*/{id}.txt")`
+    # — not rglob, which would walk unbounded depth.
+    globs = ((tasks_dir, "task-*.txt"),
+             (archive, "task-*.txt"),
+             (archive, "*/task-*.txt"))
+    for directory, pattern in globs:
         if not directory.is_dir():
             continue
-        for path in directory.glob("task-*.txt"):
+        for path in directory.glob(pattern):
             try:
                 head = path.read_text(errors="replace")
             except OSError:
