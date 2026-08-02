@@ -974,21 +974,55 @@ def scan(paths) -> dict[str, str]:
     return out
 
 
-def tracked_tests() -> list[str]:
-    r = subprocess.run(
-        ["git", "ls-files", "--", "tests/*.py"], capture_output=True, text=True, cwd=REPO
-    )
+#: Floor for full-tree discovery. The tree held 310 tracked test files when this
+#: was added; 50 is far below any plausible legitimate shrink and far above the
+#: zero a broken `git ls-files` returns. A tripwire, not a census.
+MIN_TRACKED_TESTS = 50
+
+
+def _git_lines(cmd: list[str], what: str) -> list[str]:
+    """Run a git query whose EMPTY result would otherwise read as "nothing to do".
+
+    Both discovery paths fed `scan()` straight from `r.stdout` with no returncode
+    check, so a git failure returned `[]` and the lint printed
+    `ok (0 bridge-importing tests scanned)` and exited 0. Reproduced: with git
+    forced to exit 128, `tracked_tests()` went 310 -> 0 and `main()` still exited
+    0. A gate that reports clean because it could not look is worse than no gate
+    -- it occupies the slot where a real check would go and answers with the same
+    word. That is the shape this lint exists to catch, one level up.
+    """
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
+    if r.returncode != 0:
+        raise SystemExit(
+            f"lint-hermetic-bridge-tests: FAILED to discover {what} -- "
+            f"`{' '.join(cmd)}` exited {r.returncode}.\n"
+            f"  {(r.stderr or '').strip()[:300]}\n"
+            "  Refusing to report a verdict on a discovery that did not run."
+        )
     return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def tracked_tests() -> list[str]:
+    files = _git_lines(["git", "ls-files", "--", "tests/*.py"], "tracked tests")
+    if len(files) < MIN_TRACKED_TESTS:
+        raise SystemExit(
+            f"lint-hermetic-bridge-tests: discovered {len(files)} tracked test files, "
+            f"floor is {MIN_TRACKED_TESTS}.\n"
+            "  Discovery collapsed, or the suite genuinely shrank -- if the latter, lower\n"
+            "  MIN_TRACKED_TESTS deliberately in the same PR so the shrink is reviewable."
+        )
+    return files
 
 
 def changed_tests(base: str) -> list[str]:
-    r = subprocess.run(
+    # An empty result is LEGITIMATE here (a PR may touch no test files), so this
+    # path gets the returncode check but NO floor. "zero changed" is a real
+    # answer; "zero tracked" never is. A floor here would fail every PR that
+    # doesn't touch tests, which is how a guard becomes a thing people disable.
+    return _git_lines(
         ["git", "diff", "--name-only", "--diff-filter=AM", f"{base}...HEAD", "--", "tests/*.py"],
-        capture_output=True,
-        text=True,
-        cwd=REPO,
+        f"tests changed vs {base}",
     )
-    return [ln for ln in r.stdout.splitlines() if ln.strip()]
 
 
 def main() -> int:
