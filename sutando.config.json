@@ -39,5 +39,8 @@
   },
   "health_check": {
     "down_bridge_action": "restart"
+  },
+  "bridges": {
+    "progress_stream": false
   }
 }

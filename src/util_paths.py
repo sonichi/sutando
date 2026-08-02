@@ -154,7 +154,8 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     Returns the FIRST existing path. If none exist, returns the preferred
     private-dir path so the caller's `.exists()` check fails gracefully.
     """
-    ws = workspace if workspace is not None else _workspace_root()
+    explicit_ws = workspace is not None
+    ws = workspace if explicit_ws else _workspace_root()
 
     # New per-host canonical home (workspace-as-git-repo, #1717). Probed first
     # so relocated files are found; absent → falls through to legacy order.
@@ -179,8 +180,31 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     if p.exists():
         return p
 
-    # Nothing exists; return preferred (private if configured, else workspace)
+    # Nothing exists — this is the path the caller will CREATE. It must stay
+    # inside the workspace the caller named, or their isolation is a fiction.
+    #
+    # The read probes above may legitimately return a legacy machine-<host>/
+    # file: that is the migration fallback and it is load-bearing while those
+    # files still exist. But the WRITE destination is a different question, and
+    # answering it from $SUTANDO_MEMORY_DIR ignored the argument entirely — so
+    # `personal_path("x.md", <fresh tmp>)` handed back a path in the operator's
+    # real, vault-SYNCED memory tree. A test that passed a tmpdir believing it
+    # was isolated wrote into Chi's vault instead; ALPHA/BRAVO fixtures reached
+    # it that way (#2452). Passing a tmpdir is not isolation unless the resolved
+    # path is actually inside it.
+    #
+    # When no workspace was passed the caller has accepted ambient resolution,
+    # so the env-based private dir remains correct and behavior is unchanged.
+    # The escape exists ONLY when a private dir is configured: that is the branch
+    # that answered from the environment instead of from `ws`. When it is None the
+    # code already fell through to `ws / filename`, which is inside the workspace
+    # and needs no change — and `tests/util-paths-hosts-resolution.test.py` pins
+    # that as a deliberate #1717 decision ("the fix is read-side only; write
+    # target is untouched"). So keep the write target where #1717 put it, the
+    # workspace root, and change only WHOSE workspace answers.
     if private is not None:
+        if explicit_ws:
+            return ws / filename
         return private / filename
     if filename in {"stand-avatar.png"}:
         return ws / "assets" / filename

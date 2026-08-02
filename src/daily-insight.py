@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -111,20 +112,43 @@ def analyze_task_patterns():
     return sources
 
 
+def _frontmatter_tags(content: str) -> list[str]:
+    """Tags from a note's YAML frontmatter only.
+
+    Previously this did `if "tags:" in content` and then took the FIRST line
+    containing that substring — anywhere in the note, prose included. A note
+    quoting a GitHub Actions workflow
+
+        lives in `.github/workflows/ios-release.yaml`, whose trigger is
+        `push: tags: [ios-v*]` (+ workflow_dispatch)
+
+    therefore had its prose parsed as tag names, and the daily insight told the
+    owner: "Top tags: lives in `.github/workflows/ios-release.yaml`, whose trigger
+    is `push:  ios-v*` (+, code-review". Substring-matching a structured field
+    against free text is the bug; the field only means "tags" inside frontmatter.
+
+    Frontmatter is the leading `---` block. A `tags:` line elsewhere is prose.
+    """
+    if not content.startswith("---"):
+        return []
+    end = content.find("\n---", 3)
+    if end == -1:  # unterminated block — not frontmatter, don't guess
+        return []
+    for line in content[3:end].split("\n"):
+        if re.match(r"\s*tags\s*:", line):
+            raw = line.split(":", 1)[1]
+            return [t.strip() for t in raw.replace("[", "").replace("]", "").split(",") if t.strip()]
+    return []
+
+
 def analyze_note_activity():
     """Check note creation patterns."""
     notes = list(NOTES_DIR.glob("*.md"))
     recent = [n for n in notes if n.stat().st_mtime > (datetime.now().timestamp() - 7 * 86400)]
     tags = Counter()
     for n in notes:
-        content = n.read_text()
-        if "tags:" in content:
-            tag_line = [l for l in content.split("\n") if "tags:" in l]
-            if tag_line:
-                for tag in tag_line[0].replace("tags:", "").replace("[", "").replace("]", "").split(","):
-                    tag = tag.strip()
-                    if tag:
-                        tags[tag] += 1
+        for tag in _frontmatter_tags(n.read_text()):
+            tags[tag] += 1
     return {"total": len(notes), "recent_7d": len(recent), "top_tags": tags.most_common(5)}
 
 
