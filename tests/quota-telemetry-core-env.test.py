@@ -127,6 +127,57 @@ check("control: the pane pid is passed through to ps, not hardcoded",
                                 ps_runner=lambda pid: R(0, f"{ARGV} {ENV_WITH_PROXY}")
                                 if str(pid) == "424242" else R(0, ARGV)) is True)
 
+# --- the sibling-window case (PR #2530 review, john-the-dev P1) ---------------
+# `list-panes -t =<session>` resolves to the session's CURRENT WINDOW, and this repo
+# deliberately keeps sibling windows (gateway, monitor) in the core's session — it heals
+# window-scoped so they survive. With `gateway` active, the original code returned the
+# GATEWAY's pid and reported on its environment. The reviewer built that case on a real
+# tmux and it reproduced. Window NAME is no discriminator either: on this host the core's
+# window is auto-named after the claude version (`2.1.220`).
+GATEWAY_ARGV = "node /Users/x/sutando/src/remote-gateway-bridge.js"
+
+def multi_pane(order, core_env=ENV_NO_PROXY, gw_env=ENV_WITH_PROXY):
+    """order = list of 'core'/'gateway'; the FIRST is what the old code would have read."""
+    pids = {"core": "6648", "gateway": "7777"}
+    listing = R(0, "\n".join(pids[k] for k in order) + "\n")
+    def ps(pid):
+        if str(pid) == pids["core"]:
+            return R(0, f"{ARGV} {core_env}")
+        return R(0, f"{GATEWAY_ARGV} {gw_env}")
+    return hc.core_env_has_proxy_url(socket_path="/tmp/probe.sock",
+                                     tmux_runner=lambda sock, *a: listing,
+                                     ps_runner=ps)
+
+check("sibling window listed FIRST does not hijack the verdict",
+      multi_pane(["gateway", "core"]) is False,
+      "the gateway carries ANTHROPIC_BASE_URL and the core does not; answering True "
+      "would be reporting on a sibling's environment")
+
+check("same session, core listed first — still the core's answer",
+      multi_pane(["core", "gateway"]) is False)
+
+check("and it is the CORE's value that is returned, not merely 'not the gateway's'",
+      multi_pane(["gateway", "core"], core_env=ENV_WITH_PROXY, gw_env=ENV_NO_PROXY) is True)
+
+check("no pane carries the --name marker -> None (core not in this session)",
+      hc.core_env_has_proxy_url(socket_path="/tmp/probe.sock",
+                                tmux_runner=lambda sock, *a: R(0, "7777\n"),
+                                ps_runner=lambda pid: R(0, f"{GATEWAY_ARGV} {ENV_WITH_PROXY}")) is None)
+
+check("TWO panes both claiming the marker -> None (ambiguous is not evidence)",
+      hc.core_env_has_proxy_url(socket_path="/tmp/probe.sock",
+                                tmux_runner=lambda sock, *a: R(0, "6648\n6649\n"),
+                                ps_runner=lambda pid: R(0, f"{ARGV} {ENV_NO_PROXY}")) is None)
+
+# control: the tmux call must enumerate the whole SESSION, not the active window.
+_seen_args = {}
+hc.core_env_has_proxy_url(socket_path="/tmp/probe.sock",
+                          tmux_runner=lambda sock, *a: (_seen_args.setdefault("a", a), R(0, "6648\n"))[1],
+                          ps_runner=lambda pid: R(0, f"{ARGV} {ENV_NO_PROXY}"))
+check("control: tmux is invoked with -s (every pane in the session)",
+      "-s" in _seen_args.get("a", ()),
+      f"args were {_seen_args.get('a')!r} — without -s tmux returns only the current window")
+
 print()
 if failures:
     print(f"{len(failures)} check(s) FAILED: {failures}")

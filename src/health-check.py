@@ -2585,11 +2585,24 @@ def core_env_has_proxy_url(
     production core was exactly as unrouted as before. Freshness is a property of the
     artifact; routing is a property of the process.
 
-    The pid comes from ``tmux list-panes -F '#{pane_pid}'`` rather than ``pgrep``.
-    ``pgrep -f claude`` matches any argv containing the string — including the shell
-    running the check — and macOS ``pgrep -a`` lists ancestors, not argv. The pane pid
-    is the process tmux actually launched: verified on this host as pid 6648 ==
-    ``claude --name sutando-core``.
+    The pid comes from tmux rather than ``pgrep``: ``pgrep -f claude`` matches any argv
+    containing the string — including the shell running this check — and macOS
+    ``pgrep -a`` lists ancestors, not argv.
+
+    But a pane pid is only useful if it is the CORE's pane. The first version of this
+    helper targeted the session (``list-panes -t =sutando-core``), which tmux resolves
+    to that session's **current window** — and this repo deliberately keeps sibling
+    windows (gateway, monitor) in the same session, healing window-scoped precisely so
+    they survive (`src/agent/claude/cli/start-cli.sh`). A reviewer built the case and it
+    reproduced: with the ``gateway`` window active, the production command returned the
+    gateway's pid, so the helper would report on a sibling's environment — false green or
+    false warning, independent of the real core. Window NAME is no discriminator either;
+    on this host the core's window is auto-named ``2.1.220`` after the claude version.
+
+    So enumerate EVERY pane in the session (``list-panes -s``) and identify the core by
+    what it actually is: the process whose argv carries ``--name <session>``, which is
+    exactly how `start-cli.sh` launches it. Zero matches or more than one -> ``None``;
+    an ambiguous session is not evidence of a bypass.
 
     Both subprocess calls are injectable so the contract is testable without a live
     core; production passes neither.
@@ -2602,19 +2615,32 @@ def core_env_has_proxy_url(
                 capture_output=True, text=True, timeout=15,
             )
     sock = socket_path or _live_core_socket()
-    panes = tmux_runner(sock, "list-panes", "-t", f"={session}", "-F", "#{pane_pid}")
+    # `-s` = every pane in the SESSION, not just the current window's.
+    panes = tmux_runner(sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
     if panes is None or getattr(panes, "returncode", 1) != 0:
         return None                       # no such session / tmux unavailable
-    pid = (panes.stdout or "").split()
-    if not pid or not pid[0].isdigit():
+    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
+    if not pids:
         return None
-    try:
-        proc = ps_runner(pid[0])
-    except Exception:                     # noqa: BLE001 — a probe failure is "unknown"
+    # Identify the core by argv, not by position: `--name <session>` is what
+    # start-cli.sh passes and no sibling window carries it.
+    marker = f"--name {session}"
+    matches = []
+    for pid in pids:
+        try:
+            proc = ps_runner(pid)
+        except Exception:                 # noqa: BLE001 — a probe failure is "unknown"
+            return None
+        if proc is None or getattr(proc, "returncode", 1) != 0:
+            continue                      # this pane vanished; keep looking
+        out = proc.stdout or ""
+        if marker in out:
+            matches.append(out)
+    # Zero matches: the core is not in this session (or ps could not read any pane).
+    # More than one: ambiguous, and an ambiguous session is not evidence of a bypass.
+    if len(matches) != 1:
         return None
-    if proc is None or getattr(proc, "returncode", 1) != 0:
-        return None
-    tokens = (proc.stdout or "").split()
+    tokens = matches[0].split()
     # `ps eww` prints argv THEN the environment. On a process whose env we are not
     # permitted to read it prints argv alone, which contains no KEY=VALUE pairs — and
     # "no pairs" is indistinguishable from "an empty environment". Requiring at least
@@ -2646,7 +2672,7 @@ def _agent_activity_age() -> "float | None":
         return None
 
 
-def check_quota_telemetry(proxy_status: str) -> dict:
+def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
     quota-state.json is written by the proxy from the quota headers on
@@ -2688,6 +2714,13 @@ def check_quota_telemetry(proxy_status: str) -> dict:
     it stays silent, and a host that never wired at all still takes the
     absent-file branch below.
     """
+    # `core_env_prober` is an injectable seam, defaulting to the real probe. It exists
+    # because the first version of this branch called `core_env_has_proxy_url()`
+    # unconditionally: the existing 39-case suite overrides WORKSPACE_DIR but had no way
+    # to override THAT, so its fixtures escaped into the developer's live tmux, observed
+    # the real (unrouted) core, and 3 of 39 flipped to `warn`. A required suite whose
+    # result depends on ambient host state is worse than the bug it guards -- and CI,
+    # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
     if proxy_status != "ok":
         check["detail"] = "credential proxy not running — quota telemetry not expected"
@@ -2701,8 +2734,9 @@ def check_quota_telemetry(proxy_status: str) -> dict:
             # A FRESH file is not proof the CORE routed — the proxy writes this file
             # for whatever talks to it. Only a demonstrated absence downgrades; None
             # (env unreadable) leaves the fresh reading alone.
+            probe = core_env_prober or core_env_has_proxy_url
             if quota_age <= QUOTA_STATE_STALE_SEC and not _runtime_may_skip_proxy() \
-                    and core_env_has_proxy_url() is False:
+                    and probe() is False:
                 check["status"] = "warn"
                 check["detail"] = (
                     f"quota state is fresh ({age_min}m) but the RUNNING core has no "
