@@ -26,6 +26,8 @@ before services can see the backlog. Full post-mortem:
 """
 
 import os
+import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -51,6 +53,68 @@ RETENTION_HOURS = int(os.environ.get("RETENTION_HOURS", "24"))
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() not in ("", "0", "false", "no")
 
 
+class OpenWriterCheckUnavailable(Exception):
+    """`lsof` could not be consulted, so no file can be proven closed."""
+
+
+def paths_held_open(paths: "list[Path]") -> "set[Path]":
+    """Return the subset of `paths` that some process currently holds open.
+
+    Raises OpenWriterCheckUnavailable if the question cannot be answered.
+
+    Why this exists: CONTENT IS NOT A COMPLETION SIGNAL. The strip()-empty guard
+    below catches a producer that has written nothing, but a producer that wrote
+    a header and paused leaves a file that is non-empty, readable, well-formed
+    and still mid-write. Archiving it renames the inode out from under the open
+    descriptor, so the producer's remaining flush lands in the archived copy and
+    the completed owner-facing message is absent from the live queue — silent
+    loss (reproduced on 780f7b6: before='header\\n', archived after the flush =
+    'header\\nlater body\\n', original_exists=False).
+
+    No amount of looking at bytes distinguishes "complete" from "truncated",
+    because the producer's own intent is not in the file. The only signal that
+    actually answers "is anyone still writing this?" is the open-descriptor
+    table, so ask the kernel instead of guessing from content.
+
+    Batched into ONE lsof call: the flood this script exists to prevent was 142
+    files (post-mortem 2026-04-15), and one subprocess per candidate would turn
+    a startup-path sweep into 142 spawns.
+    """
+    if not paths:
+        return set()
+    lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+    try:
+        # -F pn = machine-readable field output: `p<pid>` lines then `n<name>`
+        # lines. Plain `-t` prints PIDs only, which cannot be mapped back to
+        # WHICH file is open — the distinction we need.
+        proc = subprocess.run(
+            [lsof, "-F", "pn", "--"] + [str(p) for p in paths],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OpenWriterCheckUnavailable(str(e)) from e
+    # lsof exits 1 when simply nothing matched, which is a valid "none open"
+    # answer, not an error. Anything else means we did not get a real answer.
+    if proc.returncode not in (0, 1):
+        raise OpenWriterCheckUnavailable(
+            f"lsof exited {proc.returncode}: {proc.stderr.strip()[:200]}"
+        )
+    wanted = {p.resolve(): p for p in paths}
+    open_now = set()
+    for line in proc.stdout.splitlines():
+        if not line.startswith("n"):
+            continue
+        try:
+            resolved = Path(line[1:]).resolve()
+        except OSError:
+            continue
+        if resolved in wanted:
+            open_now.add(wanted[resolved])
+    return open_now
+
+
 def main() -> int:
     if not RESULTS.is_dir():
         print("  [retention] results/ missing — nothing to do")
@@ -62,6 +126,8 @@ def main() -> int:
 
     moved = 0
     errors = 0
+    skipped_open = 0
+    candidates: "list[Path]" = []
     for f in RESULTS.iterdir():
         if not f.is_file():
             continue
@@ -101,6 +167,49 @@ def main() -> int:
                 continue
         except (OSError, UnicodeDecodeError):
             continue
+        candidates.append(f)
+
+    # Prove the producer is done before moving anything. FAIL CLOSED: if the
+    # open-descriptor table cannot be consulted, nothing is archived this run.
+    # The asymmetry is deliberate and is the whole point of the guard —
+    #   * not archiving is self-healing and bounded: the file stays in the live
+    #     queue and the next startup sweep retries it, so the worst case is one
+    #     delayed cycle of flood-prevention;
+    #   * archiving a file that is still being written is unbounded and SILENT:
+    #     the completed message exists only in an archive nobody reads.
+    # A recoverable, visible flood beats an invisible permanent loss of an
+    # owner-facing message. The warning below is loud for the same reason —
+    # degrading to the old behaviour quietly would reintroduce exactly the
+    # silent-drop class this guard removes.
+    check_failed = False
+    if candidates:
+        try:
+            held = paths_held_open(candidates)
+        except OpenWriterCheckUnavailable as e:
+            check_failed = True
+            print(
+                f"  [retention] cannot verify open writers ({e}) — archiving"
+                f" nothing this run; {len(candidates)} candidate(s) stay in the"
+                " live queue and are retried next sweep",
+                file=sys.stderr,
+            )
+            held = set(candidates)
+    else:
+        held = set()
+
+    for f in candidates:
+        if f in held:
+            # Say which of the two it is. "Still open by a writer" is a positive
+            # observation; "could not check" is the absence of one. Reporting the
+            # second as the first would be claiming evidence we do not have.
+            reason = (
+                "open-writer check unavailable"
+                if check_failed
+                else "still open by a writer"
+            )
+            print(f"  [retention] skipping {f.name} — {reason}")
+            skipped_open += 1
+            continue
         if DRY_RUN:
             print(f"  [retention] would archive {f.name}")
             moved += 1
@@ -118,14 +227,23 @@ def main() -> int:
         label = "would archive"
     else:
         label = "archived"
+    # `skipped_open` is reported even when nothing moved: a run that archived 0
+    # because every candidate was still being written is a DIFFERENT outcome
+    # from a run that found nothing stale, and collapsing the two would hide the
+    # guard doing its job.
+    held_note = f", {skipped_open} still-open file(s) left in place" if skipped_open else ""
     if moved or errors:
         print(
             f"  [retention] {label} {moved} stale file(s) (>{RETENTION_HOURS}h)"
             + (f", {errors} error(s)" if errors else "")
             + (f" to {archive_dir.name}/" if moved and not DRY_RUN else "")
+            + held_note
         )
     else:
-        print(f"  [retention] no stale files to archive (>{RETENTION_HOURS}h cutoff)")
+        print(
+            f"  [retention] no stale files to archive (>{RETENTION_HOURS}h cutoff)"
+            + held_note
+        )
     return 1 if errors else 0
 
 

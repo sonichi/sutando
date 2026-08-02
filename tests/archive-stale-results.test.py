@@ -94,6 +94,20 @@ def main() -> int:
     fresh_empty = results / "proactive-fresh.txt"
     fresh_empty.write_text("")  # 0 bytes but recent — also must stay
 
+    # John's #2360 P1 blocker: nonempty readable content is NOT a completion
+    # signal. A producer that wrote a header and paused leaves a file that is
+    # non-zero, decodable and strip()-nonempty — every content check above says
+    # "archive it" — while the descriptor is still open. Renaming it strands the
+    # producer's later flush in the archived inode. Reproduced on 780f7b6:
+    # before='header\n', archived-after-flush='header\nlater body\n',
+    # original_exists=False. The fd stays open across main() ON PURPOSE.
+    partial = results / "proactive-partial.txt"
+    partial_fh = open(partial, "w")
+    partial_fh.write("header\n")
+    partial_fh.flush()
+    os.fsync(partial_fh.fileno())
+    os.utime(partial, (old, old))
+
     rc = arch.main()  # in-process → coverage sees the strip-empty exclusion branch
     check("archiver main() returns 0", rc == 0, f"rc={rc}")
 
@@ -113,6 +127,28 @@ def main() -> int:
           f"undecodable exists={undecodable.exists()} archived={sorted(archived_names)}")
     check("fresh empty .txt is untouched",
           fresh_empty.exists() and "proactive-fresh.txt" not in archived_names)
+
+    # The blocker guard. Finish the producer's write AFTER the sweep and assert
+    # the completed body is readable from the LIVE queue — not merely that the
+    # file was skipped. Asserting only "not archived" would pass even if the
+    # bytes had gone somewhere useless; the consumer-visible fact is what the
+    # owner actually depends on.
+    partial_fh.write("later body\n")
+    partial_fh.flush()
+    os.fsync(partial_fh.fileno())
+    partial_fh.close()
+    check("partial-but-nonempty .txt held open by a writer is NOT archived",
+          partial.exists() and "proactive-partial.txt" not in archived_names,
+          f"partial exists={partial.exists()} archived={sorted(archived_names)}")
+    check("the producer's completed body is intact in the LIVE queue",
+          partial.exists() and partial.read_text() == "header\nlater body\n",
+          f"live content={partial.read_text()!r}" if partial.exists() else "file gone")
+
+    # Calibration: the guard must still be able to say YES. A suite where every
+    # assertion is "not archived" would also pass if the archiver were a no-op,
+    # so pin the positive case explicitly rather than inferring it.
+    check("guard is not a blanket no-op — the closed contentful file DID move",
+          "proactive-contentful.txt" in archived_names)
 
     print()
     if fails:
