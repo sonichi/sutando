@@ -25,6 +25,7 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 
 - **HTTP handlers centralize transport mechanics.** Put repeated authentication gates, status/header emission, and JSON encoding in handler helpers. Dispatch methods route only; named endpoint methods own behavior. Protect delegation, status codes, headers, and payload shapes with direct contract tests when refactoring handlers.
 - **HTTP route methods are dispatch layers.** Move filesystem reconciliation and response assembly into named module functions; route methods should parse the request, call one unit, and emit its result. Test the extracted behavior directly plus one route-wiring path.
+- **Archive through `task_archive.archive_file`.** Monthly destination selection and failed-move cleanup are one task/result protocol policy. Bridge wrappers may supply provider log formatting, but must not rebuild archive paths or move/unlink fallback behavior.
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 - **Code comments: at most 2 lines, and only what the code cannot state itself.** Give the constraint or the non-obvious reason. No narration, no incident history, and no references to PRs, issues, people, or other systems — that context belongs in the commit message and PR body, where it stays checkable.
 

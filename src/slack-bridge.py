@@ -81,7 +81,7 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
-from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _archive_file_shared, find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
@@ -183,24 +183,17 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
 
 
 def archive_file(src: Path, kind: str, task_id: str) -> None:
-    """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
-    Matches the behavior of telegram-bridge.py / discord-bridge.py."""
-    try:
-        if not src.exists():
-            return
-        from datetime import datetime
-        import shutil
-        ym = datetime.now().strftime("%Y-%m")
-        base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
-        dest_dir = base / ym
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
-    except Exception as e:
-        print(f"[Slack] archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+    """Archive through the shared task/result filesystem policy."""
+    _archive_file_shared(
+        src,
+        kind,
+        task_id,
+        ARCHIVE_TASKS_DIR,
+        ARCHIVE_RESULTS_DIR,
+        on_error=lambda exc: print(
+            f"[Slack] archive_file({kind}, {task_id}) failed: {exc}", flush=True
+        ),
+    )
 
 
 ACCESS_FILE = channel_access_path("slack")
