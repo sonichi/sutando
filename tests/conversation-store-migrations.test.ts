@@ -57,8 +57,11 @@ const tables = (d: DatabaseSync): string[] =>
 		.map(r => r.name);
 const cols = (d: DatabaseSync, t: string): string[] =>
 	(d.prepare(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).map(c => c.name);
-const rows = (d: DatabaseSync, t: string): any[] =>
-	d.prepare(`SELECT * FROM ${t} ORDER BY id`).all() as any[];
+// SQLite rows are open-shaped; `unknown` values force an explicit read at each
+// use-site rather than silently trusting a column's type.
+type Row = Record<string, unknown>;
+const rows = (d: DatabaseSync, t: string): Row[] =>
+	d.prepare(`SELECT * FROM ${t} ORDER BY id`).all() as Row[];
 const count = (d: DatabaseSync, t: string): number =>
 	(d.prepare(`SELECT count(*) AS c FROM ${t}`).get() as { c: number }).c;
 
@@ -225,7 +228,7 @@ test('old sessions with BOTH obsolete columns: both dropped, other columns and r
 		assert.ok(c.includes(keep), `${keep} survived`);
 	}
 	assert.equal(count(d, 'sessions'), 1, 'row survived');
-	assert.equal((rows(d, 'sessions')[0] as any).session_id, 's1');
+	assert.equal(rows(d, 'sessions')[0].session_id, 's1');
 });
 
 test('old sessions with only ONE obsolete column: only that one is dropped', () => {
