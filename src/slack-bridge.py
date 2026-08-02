@@ -61,6 +61,7 @@ sys.stderr.reconfigure(line_buffering=True)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
+from presenter_mode import presenter_mode_active  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -224,22 +225,6 @@ def archive_file(src: Path, kind: str, task_id: str) -> None:
             src.unlink(missing_ok=True)
         except Exception:
             pass
-
-
-PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
-
-
-def presenter_mode_active() -> bool:
-    if not PRESENTER_SENTINEL.exists():
-        return False
-    try:
-        expire_iso = PRESENTER_SENTINEL.read_text().strip()
-        if not expire_iso or not expire_iso[0].isdigit():
-            return False
-        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        return now_iso < expire_iso
-    except Exception:
-        return False
 
 
 ACCESS_FILE = channel_access_path("slack")
@@ -1468,7 +1453,7 @@ def result_watcher():
                 archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
 
             # Proactive messages (sent to owner DM)
-            if not presenter_mode_active():
+            if not presenter_mode_active(REPO):
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
                         continue
