@@ -86,9 +86,63 @@ gh_rc = _with_run(_mod.check_github_issues, lambda *a, **k: _Result(1, ""))
 ok("github probe: non-zero exit reports COULD NOT CHECK",
    len(gh_rc) == 1 and gh_rc[0].startswith(U), f"got {gh_rc!r}")
 
-rem_to = _with_run(_mod.check_overdue_reminders, _raise(subprocess.TimeoutExpired("osa", 10)))
+# The reminders probe returns early when reminders.py is absent, which is the
+# case on a clean-install CI runner (macos-tools is not installed there). That
+# early return used to skip the exception handler entirely, so asserting on the
+# timeout alone passed locally and FAILED in CI — the test was measuring the
+# developer's machine. Pin the script as present, then exercise each path.
+_real_home = _mod.claude_home_path
+
+
+class _Present(type(Path())):
+    def exists(self):  # noqa: D102
+        return True
+
+
+def _with_script_present(fn, impl):
+    real_run = _mod.subprocess.run
+    try:
+        _mod.claude_home_path = lambda *a: _Present(Path("/nonexistent/reminders.py"))
+        _mod.subprocess.run = impl
+        return fn()
+    finally:
+        _mod.subprocess.run = real_run
+        _mod.claude_home_path = _real_home
+
+
+rem_to = _with_script_present(_mod.check_overdue_reminders,
+                              _raise(subprocess.TimeoutExpired("osa", 10)))
 ok("reminders probe: timeout reports COULD NOT CHECK",
    len(rem_to) == 1 and rem_to[0].startswith(U), f"got {rem_to!r}")
+
+rem_rc = _with_script_present(_mod.check_overdue_reminders, lambda *a, **k: _Result(1, ""))
+ok("reminders probe: non-zero exit reports COULD NOT CHECK",
+   len(rem_rc) == 1 and rem_rc[0].startswith(U), f"got {rem_rc!r}")
+
+rem_absent = _mod.check_overdue_reminders.__wrapped__() if hasattr(
+    _mod.check_overdue_reminders, "__wrapped__") else None
+_real_run2 = _mod.subprocess.run
+try:
+    _mod.claude_home_path = lambda *a: Path("/nonexistent/definitely-not-here.py")
+    rem_absent = _mod.check_overdue_reminders()
+finally:
+    _mod.claude_home_path = _real_home
+    _mod.subprocess.run = _real_run2
+ok("reminders probe: missing reminders.py reports COULD NOT CHECK (the CI case)",
+   len(rem_absent) == 1 and rem_absent[0].startswith(U), f"got {rem_absent!r}")
+
+# NB: the fixture must not contain "overdue"/"past due" — the detector matches
+# those substrings, so "no overdue items" is parsed AS an overdue reminder. My
+# first fixture said exactly that and the control failed for the right reason.
+rem_clean = _with_script_present(_mod.check_overdue_reminders,
+                                 lambda *a, **k: _Result(0, "Reminders: 0 due\n"))
+ok("CONTROL: reminders probe that RAN and found nothing returns []",
+   rem_clean == [], f"got {rem_clean!r}")
+
+rem_hit = _with_script_present(_mod.check_overdue_reminders,
+                               lambda *a, **k: _Result(0, "Overdue: call the dentist\n"))
+ok("CONTROL: a genuinely overdue reminder is still reported unmarked",
+   len(rem_hit) == 1 and not rem_hit[0].startswith(U), f"got {rem_hit!r}")
 
 # --- the CONTROL: a probe that ran and found nothing stays empty -------------
 # Without this the fix could pass by marking everything unchecked, which would

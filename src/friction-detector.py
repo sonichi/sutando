@@ -150,7 +150,10 @@ def check_overdue_reminders():
     try:
         script = claude_home_path("skills", "macos-tools", "scripts", "reminders.py")
         if not script.exists():
-            return []
+            # Absent probe, not an absent problem. This is also why the suite
+            # fails on a clean-install runner where macos-tools is not present:
+            # the early return skipped the exception handler entirely.
+            return [UNCHECKED + "overdue reminders (reminders.py not installed)"]
         # Use sys.executable: friction-detector runs via cron (launchd-managed);
         # bare `python3` can resolve to a different interpreter on minimal PATH.
         # See feedback_subprocess_sys_executable.md.
@@ -158,10 +161,12 @@ def check_overdue_reminders():
             [sys.executable, str(script), "list"],
             capture_output=True, text=True, timeout=10
         )
-        if result.returncode == 0:
-            for line in result.stdout.split("\n"):
-                if "overdue" in line.lower() or "past due" in line.lower():
-                    issues.append(f"Overdue reminder: {line.strip()[:80]}")
+        if result.returncode != 0:
+            return [UNCHECKED + f"overdue reminders (reminders.py exited "
+                    f"{result.returncode})"]
+        for line in result.stdout.split("\n"):
+            if "overdue" in line.lower() or "past due" in line.lower():
+                issues.append(f"Overdue reminder: {line.strip()[:80]}")
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         return [UNCHECKED + f"overdue reminders ({type(e).__name__})"]
     return issues
