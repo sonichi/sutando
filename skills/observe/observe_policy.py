@@ -165,6 +165,25 @@ def store_lock(store_dir: str, *, timeout: float = 10.0):
     while the core runs). It does not make a nested same-thread call atomic —
     re-entrancy lets that through by design — so callers must still re-verify
     authority INSIDE the critical section rather than relying on the lock alone.
+
+    **The re-entrant fast path is process-wide but NOT thread-aware, and that is
+    safe only because nothing here is threaded.** `_STORE_LOCKS` is keyed on the
+    directory alone, so if two threads in one process used the same store, the
+    second would see the first's entry and take the fast path — sharing the lock
+    without ever being serialized against it. Verified dormant at the time of
+    writing: `skills/observe` contains no `threading` / `asyncio` /
+    `concurrent.futures` reference, and `set_enabled()` has exactly one production
+    caller (the CLI dispatcher in `default_policy_pack.main`), which is a separate
+    process by construction.
+
+    If threads are ever introduced here, this is the change, and it is small: key
+    re-entrancy on `(realpath, threading.get_ident())` and guard the whole block
+    with a per-directory `threading.Lock` acquired before the flock — the flock
+    alone cannot help, because two threads in one process contend on separate fds
+    and would take the LOCK_NB timeout instead of serializing. Left unbuilt on
+    purpose rather than added speculatively; the invariant that makes it
+    unnecessary is stated above so the next reader can check whether it still
+    holds instead of rediscovering the hazard.
     """
     key = os.path.realpath(store_dir)
     held = _STORE_LOCKS.get(key)
