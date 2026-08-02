@@ -99,10 +99,6 @@ if [ -n "$_ws" ] && [ -n "$_host" ]; then
   # that is meant to explain why startup aborted. Visibility is not worth losing
   # an entry for.
   #
-  # `mkdir` is the portable atomic test-and-set here — `flock(1)` is not present
-  # on stock macOS. Bounded spin, then break a lock older than 30s so a killed
-  # gate cannot wedge every later boot (a stuck lock would be the same class of
-  # silent loss one layer up).
   # Serialise the read-modify-write with a `mkdir` lock, and FAIL CLOSED if we
   # cannot get it. `mkdir` is the portable atomic test-and-set — `flock(1)` is
   # not on stock macOS.
@@ -118,26 +114,29 @@ if [ -n "$_ws" ] && [ -n "$_host" ]; then
   # On timeout we leave the file and the foreign lock untouched and say so on
   # stderr. Losing one duplicate record while a peer gate writes an equivalent
   # one beats corrupting the file for everybody.
+  #
+  # There is deliberately NO stale-lock reclamation, and that is the second half
+  # of the same rule. This loop used to stat the lock and `rmdir` it once its
+  # mtime passed 30s, to stop a killed gate wedging later boots. `rmdir` names a
+  # PATH, not the directory you observed: if the owner releases and a new gate
+  # acquires between the `stat` and the `rmdir`, the reclaimer deletes the
+  # REPLACEMENT's lock and two writers enter the read-modify-write together —
+  # the classic ABA, and it loses exactly the boot-abort record this block
+  # exists to preserve. There is no identity to check either, since `mkdir`
+  # gives the acquirer no token the observer can compare against. A wedged lock
+  # costs one skipped record per boot and says so on stderr; the race costs a
+  # silently truncated file. Prefer the loud, bounded failure.
   _lock="$_pq.lock"
   _have_lock=0
   _waited=0
   while [ "$_waited" -lt 100 ]; do
     if mkdir "$_lock" 2>/dev/null; then _have_lock=1; break; fi
-    # Break a lock whose owner died, but only on a numerically-valid mtime:
-    # `stat -f %m` is BSD and `stat -c %Y` is GNU, and the wrong one can exit 0
-    # with non-numeric output, which would make the arithmetic below abort the
-    # whole gate under `set -e`.
-    _lock_mtime="$(stat -f %m "$_lock" 2>/dev/null || stat -c %Y "$_lock" 2>/dev/null || echo "")"
-    case "$_lock_mtime" in
-      ''|*[!0-9]*) : ;;
-      *) if [ "$(( $(date +%s) - _lock_mtime ))" -ge 30 ]; then rmdir "$_lock" 2>/dev/null || true; fi ;;
-    esac
     _waited=$((_waited + 1))
     sleep 0.1
   done
 
   if [ "$_have_lock" != "1" ]; then
-    echo "  auth-preflight-gate: could not acquire $_lock after ~10s; leaving pending-questions.md untouched (a concurrent gate holds it and is recording an equivalent abort)." >&2
+    echo "  auth-preflight-gate: could not acquire $_lock after ~10s; leaving pending-questions.md untouched (a concurrent gate holds it and is recording an equivalent abort). If no gate is running, this lock is stale — remove it by hand: rmdir '$_lock'" >&2
   else
     _new="$_pq.new.$$"
     _tmp="$_pq.tmp.$$"

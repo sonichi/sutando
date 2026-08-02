@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -94,10 +95,14 @@ def extract_writer() -> str:
     """
     src = GATE.read_text()
     start = src.index('_pq="$_ws/hosts/$_host/pending-questions.md"')
-    # Anchor on a sentinel that occurs ONCE. `rmdir "$_lock"` also appears in
-    # the stale-lock breaker inside the spin loop, so anchoring there truncated
-    # the block mid-loop and produced a bash syntax error that looked like a
-    # gate bug.
+    # Anchor on a sentinel that occurs ONCE, never on a line of the block's own
+    # logic. This used to anchor on `rmdir "$_lock"`, which also appeared in the
+    # stale-lock breaker inside the spin loop; the extraction truncated mid-loop
+    # and produced a bash syntax error that read as a gate bug. That breaker is
+    # gone now (see the ABA note in the gate), so `rmdir` is once again unique —
+    # which is exactly why the anchor must NOT move back to it. An anchor whose
+    # uniqueness depends on the current shape of the code re-breaks the next
+    # time the code changes.
     end = src.index("# --- end pending-question write", start)
     return src[start:end]
 
@@ -282,6 +287,65 @@ if block:
         check("control: with the lock free, the same call writes normally",
               r5.returncode == 0 and waiting(pq2) == n_before2 + 1,
               f"rc={r5.returncode}, {n_before2} -> {waiting(pq2)}")
+
+        # --- 9. ABA: a lock the gate did not acquire must SURVIVE, however old --
+        # The prior head reclaimed a lock whose mtime passed 30s by calling
+        # `rmdir "$_lock"`. `rmdir` names a PATH, not the directory that was
+        # stat-ed: if the original owner releases and a fresh gate acquires in
+        # the window between the two syscalls, the reclaimer deletes the
+        # REPLACEMENT's lock, a third writer then acquires, and two writers sit
+        # in the read-modify-write together — losing the boot-abort record.
+        #
+        # This asserts the property that makes the race impossible rather than
+        # trying to hit the window: the gate removes NO lock it did not create.
+        # Backdating well past the old 30s threshold is what makes it
+        # discriminating — on the prior head the gate reclaims this lock, writes,
+        # and `stale.is_dir()` is False. Verified by reverting the production
+        # hunk: this check FAILS there and passes here.
+        pq2.write_text(FIXTURE)
+        stale = Path(str(pq2) + ".lock")
+        stale.mkdir()
+        old = time.time() - 3600            # 60 min: 120x the retired threshold
+        os.utime(stale, (old, old))
+        n_before3 = waiting(pq2)
+        bytes_before3 = pq2.read_text()
+        e2 = dict(env)
+        e2["_ts"] = "2026-08-02T19:00:00Z"
+        e2["_remedy"] = "remedy-aba"
+        r6 = subprocess.run(["bash", "-c", "set -e\n" + block],
+                            capture_output=True, text=True, env=e2, timeout=180)
+        check("an HOUR-old foreign lock is still not reclaimed", stale.is_dir(),
+              "the gate removed a lock it never acquired — a replacement "
+              "acquired in the stat->rmdir window would have been destroyed")
+        check("...and the gate still fails closed rather than writing",
+              waiting(pq2) == n_before3 and pq2.read_text() == bytes_before3,
+              f"{n_before3} -> {waiting(pq2)}; the file must be byte-identical")
+        check("...and it exits 0 and says why", r6.returncode == 0
+              and "could not acquire" in r6.stderr,
+              f"rc={r6.returncode} err={r6.stderr[-200:]}")
+        check("...and the stderr names the manual remedy, so a genuinely wedged "
+              "lock is recoverable without reintroducing the race",
+              "rmdir" in r6.stderr, repr(r6.stderr[-240:]))
+        # Control: the age is what the previous head keyed on, so prove the age
+        # was really applied — otherwise a no-op `utime` would make the four
+        # checks above pass for the wrong reason.
+        #
+        # `os.stat` is guarded rather than called directly. On the pre-fix gate
+        # this lock is GONE by now, and a bare stat raises FileNotFoundError,
+        # which aborts the suite mid-run and hides which assertion bit — the
+        # same failure mode section 7 above already had to fix. A control must
+        # report FAIL, never crash; when the directory is missing the four
+        # checks above have already said so.
+        try:
+            _age = time.time() - os.stat(stale).st_mtime
+        except FileNotFoundError:
+            _age = None
+        check("control: the lock really is older than the retired 30s threshold",
+              _age is not None and _age > 30,
+              "the lock was removed before the control could read it (see the "
+              "reclamation checks above)" if _age is None
+              else f"mtime age {_age:.0f}s")
+        shutil.rmtree(stale, ignore_errors=True)
 
 print()
 if failures:
