@@ -164,7 +164,18 @@ DIFF_MD="$OUT/diff.md"
         echo "  **⚠ DRIFT** — heads differ. Commits the remote may be missing (last 20):"
         echo ""
         echo "  \`\`\`"
-        git -C "$LOCAL_REPO" log --oneline "$REMOTE_HEAD..$LOCAL_HEAD" 2>/dev/null | head -20 | sed 's/^/  /' || echo "  (could not compute; remote HEAD may not exist locally)"
+        # Same unreachable-|| shape: it bound to `sed`, which exits 0 whatever
+        # `git log` did. This one costs the most of the three -- the fallback is
+        # the honest message for the case that legitimately happens (the remote
+        # HEAD is not an object in the local clone), so a failed range render as
+        # an empty DRIFT block that reads "no commits are missing".
+        _drift=$(git -C "$LOCAL_REPO" log --oneline "$REMOTE_HEAD..$LOCAL_HEAD" 2>/dev/null | head -20)
+        if [ -n "$_drift" ]; then
+            printf '%s\n' "$_drift" | sed 's/^/  /'
+        else
+            echo "  (could not compute; remote HEAD may not exist locally)"
+        fi
+        unset _drift
         echo "  \`\`\`"
     fi
     echo ""
@@ -239,7 +250,17 @@ DIFF_MD="$OUT/diff.md"
 
     echo "## Files present in only one gather"
     echo ""
-    diff -rq "$OUT/local" "$OUT/remote" 2>/dev/null | grep -E "^Only in " | head -40 || echo "_(no diff)_"
+    # `|| echo` was unreachable: `||` binds to the LAST command of a pipeline,
+    # and `head` exits 0 on empty input however `grep` fared. So "_(no diff)_"
+    # never printed and "the gathers are identical" rendered as an empty section
+    # -- indistinguishable from "the diff did not run".
+    _only=$(diff -rq "$OUT/local" "$OUT/remote" 2>/dev/null | grep -E "^Only in " | head -40)
+    if [ -n "$_only" ]; then
+        printf '%s\n' "$_only"
+    else
+        echo "_(no diff)_"
+    fi
+    unset _only
     echo ""
 
     echo "---"

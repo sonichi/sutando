@@ -1581,8 +1581,20 @@ commit_main() {
         echo "  If you want to commit + delete in one step on a fresh state, run --commit first (no-delete)," >&2
         echo "  observe ~7d for straggler writers, then re-run with --commit --delete-source --backup-id <id-from-step-1>." >&2
         echo "  Available backups:" >&2
-        ls -1 "$DEST_REAL/state/migration-backup-"*.tar "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null \
-            | sed -E 's@.*migration-backup-(.+)\.tar(\.gz)?$@    \1@' >&2 || echo "    (none)" >&2
+        # `|| echo` was unreachable: `||` binds to the LAST command of a pipeline,
+        # and `sed` exits 0 whatever `ls` did. So "(none)" never printed and an
+        # operator who has no backups sees the "Available backups:" header with
+        # nothing under it -- exactly when they most need to be told the list is
+        # empty rather than left to guess the command failed.
+        _backups=$(ls -1 "$DEST_REAL/state/migration-backup-"*.tar \
+                          "$DEST_REAL/state/migration-backup-"*.tar.gz 2>/dev/null \
+                   | sed -E 's@.*migration-backup-(.+)\.tar(\.gz)?$@    \1@')
+        if [ -n "$_backups" ]; then
+            printf '%s\n' "$_backups" >&2
+        else
+            echo "    (none)" >&2
+        fi
+        unset _backups
         exit 2
     fi
 
