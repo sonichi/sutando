@@ -26,6 +26,10 @@ RESULTS_DIR = WORKSPACE / "results"
 LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
 PRESENTER_SENTINEL = WORKSPACE / "state" / "presenter-mode.sentinel"
+# How long an UNCHANGED question set stays quiet before it is raised again. This
+# is the floor that stops "notify only when the set changes" from turning an
+# unanswered queue permanently mute — see should_notify().
+UNCHANGED_REMINDER_SEC = 86400  # 24h
 
 
 def presenter_mode_active():
@@ -182,12 +186,55 @@ def get_waiting_questions():
     return questions
 
 
-def should_notify():
-    """Only notify once per hour to avoid spam."""
+def _last_notify_state():
+    """(mtime, key) of the last notification. `key` is None for the pre-2026-08-01
+    format, which stored a bare timestamp — so the first run after upgrading is
+    treated as "set unknown" and notifies once rather than silently suppressing."""
     if not LAST_NOTIFY_FILE.exists():
-        return True
-    last = LAST_NOTIFY_FILE.stat().st_mtime
-    return (time.time() - last) > 3600  # 1 hour
+        return None, None
+    mtime = LAST_NOTIFY_FILE.stat().st_mtime
+    parts = LAST_NOTIFY_FILE.read_text().split()
+    return mtime, (parts[1] if len(parts) > 1 else None)
+
+
+def should_notify(key=None):
+    """Notify when the SET changed, when it is genuinely new, or when an unchanged
+    set has gone unmentioned for longer than UNCHANGED_REMINDER_SEC.
+
+    The old rule was purely time-based — 3600s since the marker's mtime, with no
+    awareness of whether anything had changed — so an unchanged queue re-notified
+    every hour, forever. Observed 2026-08-01: the identical 17 items reached the
+    owner three times inside 60 minutes (05:43 cron, 06:17 briefing, 06:4x cron),
+    content hash unchanged across all three.
+
+    The script already computed the discriminator: `questions_key()` hashes the
+    sorted titles and was used to name the proactive file. The cooldown simply
+    never consulted it.
+
+    A FLOOR, NOT A CLIFF (2026-08-01, Mini's cold review). The first version of
+    this fix ended at `key != last_key`, which discarded mtime on that path — so
+    an unchanged set was announced exactly once, EVER. That is wrong in the case
+    the file exists for: questions are unchanged precisely BECAUSE nobody has
+    answered them, and one host already carries 54 such items. They would have
+    gone permanently silent, with no error — a queue that stops asking. Keeping
+    the daily floor bounds the spam (the bug above was 3 sends in 60 min) while
+    the queue stays audible.
+
+    `key=None` preserves the old time-only rule. No production caller passes it —
+    the only live call site hashes the set — so treat it as a compatibility
+    default for an embedder, not as a path this repo exercises."""
+    mtime, last_key = _last_notify_state()
+    if mtime is None:
+        return True                      # never notified
+    if key is None:
+        return (time.time() - mtime) > 3600
+    if last_key is None:
+        return True                      # legacy marker: key unknown, notify once
+    if key != last_key:
+        return True                      # the set changed
+    # Unchanged set: quiet, but not forever — re-raise once a day so an
+    # unanswered queue keeps asking instead of going mute.
+    return (time.time() - mtime) > UNCHANGED_REMINDER_SEC
 
 
 def notify_macos(count, titles):
@@ -329,7 +376,7 @@ def main():
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
         return
 
-    if not force and not should_notify():
+    if not force and not should_notify(questions_key(questions)):
         print(f"(cooldown) {len(questions)} pending questions — skipping notification")
         return
 
@@ -341,7 +388,7 @@ def main():
     # exact "claimed an outcome it never achieved" failure this script exists to
     # remove, reproduced in its own control flow.
     summary = deliver(questions, count, titles)
-    LAST_NOTIFY_FILE.write_text(str(int(time.time())))
+    LAST_NOTIFY_FILE.write_text(f"{int(time.time())} {questions_key(questions)}")
     print(summary)
 
 
