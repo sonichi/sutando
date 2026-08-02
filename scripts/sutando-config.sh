@@ -244,6 +244,26 @@ for entry in resolve_core_config_dirs():
 "
     ;;
 
+  stand)
+    # This instance's `Stand:` commit-trailer value, from the per-clone config
+    # key `stand` (sutando.config.local.json). Empty when unset.
+    #
+    # Both fleet instances commit under the owner's GH-mapped email (CLA), so no
+    # git field distinguishes them; the trailer is the only discriminator, and
+    # consumers need it WITHOUT an environment (the scheduled cron exports
+    # nothing — john-the-dev, sutando#2484). Deliberately has NO fallback guess:
+    # an unset key must read as "unknown" so callers decline rather than
+    # attribute a foreign identity. Never infer it from the host name — that is
+    # installation-specific policy and would assign this owner's Stand values on
+    # someone else's machine.
+    "$PY" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import load_config
+print(str(load_config().get('stand', '') or '').strip(), end='')
+"
+    ;;
+
   host-label)
     # Per-host directory label for hosts/<host>/ paths, mirroring
     # src/util_paths.py:_host_label() for shell callers. Use this instead of the
