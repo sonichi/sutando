@@ -812,6 +812,75 @@ def test_resume_reports_refused_when_the_record_was_cancelled_mid_flight():
           f"a cancelled record is never reported as resumed (got {r['status']!r})")
 
 
+def test_resume_branch_holds_the_store_lock_for_its_budget_check():
+    """The RESUME branch has its OWN budget check; it must be inside the lock too.
+
+    Wrapping only the first-seed reservation fixed a call site, not the class:
+    `seed_room()` calls `_budget_allows()` twice, and the `status == "draft"`
+    resume path had its own unlocked copy. Two crash-interrupted drafts both
+    passed at 18/20 and both activated -> committed 22.
+
+    Asserted CROSS-PROCESS, for the same reason as the fork test in
+    tests/observe-policy.test.py: an in-process synchronous injection is a nested
+    same-thread call, which the re-entrant lock lets through by design. The
+    reachable race is core-vs-CLI, so the property is "another PROCESS cannot
+    enter while this branch is between its budget check and its activation".
+    """
+    import json as _json
+    import subprocess
+    import textwrap
+
+    d = _store()
+    entry = dpp._entry("react_baseline")
+    dpp.seed_defaults(d, OWNER, ["!r0:ag2.space"])
+    store = op.SubscriptionStore(d)
+    gen = dpp._entry_state(dpp.load_pack_state(d), entry["key"])["generation"]
+    rec, errs = op.validate_draft(dpp._draft_for(entry, "!cc:ag2.space", OWNER, gen))
+    check(not errs, "setup: resume draft validates")
+    rec["pack"] = {"entry": entry["key"], "generation": gen}
+    store.save(rec)
+
+    child_src = textwrap.dedent(f"""
+        import sys, json
+        sys.path.insert(0, {os.path.dirname(op.__file__)!r})
+        import observe_policy as op
+        try:
+            with op.store_lock({d!r}, timeout=1.0):
+                print(json.dumps({{"r": "ACQUIRED"}}))
+        except op.StoreLockUnavailable:
+            print(json.dumps({{"r": "REFUSED"}}))
+    """)
+
+    def probe():
+        r = subprocess.run([sys.executable, "-c", child_src],
+                           capture_output=True, text=True, timeout=30)
+        try:
+            return _json.loads(r.stdout.strip())["r"]
+        except Exception:
+            return f"ERR:{r.stderr.strip()[:80]}"
+
+    check(probe() == "ACQUIRED",
+          "control: with the lock free, another process ACQUIRES (the probe can say yes)")
+
+    seen = {}
+    orig = dpp._budget_allows
+
+    def probing(store_, draft):
+        seen.setdefault("r", probe())      # fires INSIDE the resume critical section
+        return orig(store_, draft)
+
+    dpp._budget_allows = probing
+    try:
+        dpp.seed_room(op.SubscriptionStore(d), d, entry, "!cc:ag2.space",
+                      owner_mxid=OWNER, owner_rooms=["!r0:ag2.space", "!cc:ag2.space"])
+    finally:
+        dpp._budget_allows = orig
+
+    check(seen.get("r") == "REFUSED",
+          f"the resume branch's budget check runs under the store lock "
+          f"(got {seen.get('r')!r})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
