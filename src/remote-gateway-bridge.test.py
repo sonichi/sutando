@@ -171,6 +171,43 @@ def main() -> int:
           and _lrtc._LOCK_ROLE == "gateway-bridge",
           "GATEWAY_INSTANCE unset keeps every legacy filename + lock role byte-identical")
 
+    # ── P1 regression (john, PR #2503 review): two gateways minting the SAME
+    # broker id must not share a local task/result file. Prod (legacy module)
+    # and dev (named instance) both receive broker id task-COLLIDE against the
+    # SAME workspace; the local bus must keep them distinct, and the dev
+    # instance's result POST must carry the BROKER id back on the wire. ──────
+    check(_grtc._local_tid("task-COLLIDE") == "task-dev.COLLIDE"
+          and _grtc._broker_tid("task-dev.COLLIDE") == "task-COLLIDE"
+          and _lrtc._local_tid("task-COLLIDE") == "task-COLLIDE",
+          "local/broker id mapping round-trips (dev) and is identity (legacy)")
+    _collide = {"id": "task-COLLIDE", "timestamp": "2026-08-02T00:00:00Z",
+                "task": "PROD TASK", "source": "remote-gateway",
+                "channel_id": "!p:example.org", "user_id": "@qingyun:example.org"}
+    _pt = _lrtc._write_task(dict(_collide))
+    _dt = _grtc._write_task({**_collide, "task": "DEV TASK"})
+    check(_pt == "task-COLLIDE" and _dt == "task-dev.COLLIDE",
+          "same broker id yields DISTINCT local ids per instance")
+    check((_lrtc.TASKS_DIR / "task-COLLIDE.txt").exists()
+          and (_grtc.TASKS_DIR / "task-dev.COLLIDE.txt").exists(),
+          "both task files exist — no instance shadowed the other's queue write")
+    check("id: task-dev.COLLIDE" in (_grtc.TASKS_DIR / "task-dev.COLLIDE.txt").read_text()
+          and "DEV TASK" in (_grtc.TASKS_DIR / "task-dev.COLLIDE.txt").read_text(),
+          "dev task file serializes the LOCAL id (result filename follows it)")
+    (_grtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    (_grtc.RESULTS_DIR / "task-dev.COLLIDE.txt").write_text("dev answer")
+    _rb = len(STATE["results"])
+    _grtc._post_ready_results({"task-dev.COLLIDE"})
+    check(len(STATE["results"]) == _rb + 1
+          and STATE["results"][-1]["id"] == "task-COLLIDE"
+          and STATE["results"][-1]["body"] == "dev answer",
+          "dev result POST translates back to the BROKER id on the wire")
+    check(not (_lrtc.RESULTS_DIR / "task-COLLIDE.txt").exists(),
+          "prod's result slot untouched — no cross-instance claim")
+    # cleanup so later assertions on the queue see the harness's own state
+    for _f in ("task-COLLIDE.txt", "task-dev.COLLIDE.txt"):
+        try: (_lrtc.TASKS_DIR / _f).unlink()
+        except FileNotFoundError: pass
+
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),
     # and the access_tier-clamp + newline-forge assertions — which expect the

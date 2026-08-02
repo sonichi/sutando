@@ -200,6 +200,31 @@ if GATEWAY_INSTANCE and not GATEWAY_INSTANCE.replace("-", "").replace("_", "").i
     sys.exit(f"FATAL: GATEWAY_INSTANCE must be alphanumeric/-/_ (got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
 
+
+def _local_tid(broker_tid: str) -> str:
+    """Instance-namespaced LOCAL task id (P1 fix, PR review 2026-08-02).
+
+    Broker ids are only unique WITHIN a gateway; two gateways can mint the same
+    id. The local task/result filenames are the shared bus between instances,
+    so a named instance prefixes its instance name into the local id —
+    `task-abc` → `task-<inst>.abc` — making the file namespace collision-free
+    while `_broker_tid` recovers the wire id for ack/result POSTs. Unset
+    instance → identity (legacy single-gateway installs unchanged)."""
+    if not GATEWAY_INSTANCE:
+        return broker_tid
+    rest = broker_tid[5:] if broker_tid.startswith("task-") else broker_tid
+    return f"task-{GATEWAY_INSTANCE}.{rest}"
+
+
+def _broker_tid(local_tid: str) -> str:
+    """Reverse of `_local_tid` — the id the GATEWAY knows this task by."""
+    if not GATEWAY_INSTANCE:
+        return local_tid
+    prefix = f"task-{GATEWAY_INSTANCE}."
+    if local_tid.startswith(prefix):
+        return f"task-{local_tid[len(prefix):]}"
+    return local_tid
+
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
 # gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
@@ -666,8 +691,9 @@ def _post_task_ack(tid: str) -> bool:
     if _ack_disabled_until and time.time() < _ack_disabled_until:
         return False  # gateway recently 404'd /ack — retry after the cooldown
     try:
-        safe_tid = urllib.parse.quote(tid, safe="")
-        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": tid}, timeout=10)
+        wire_tid = _broker_tid(tid)
+        safe_tid = urllib.parse.quote(wire_tid, safe="")
+        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": wire_tid}, timeout=10)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         return True
     except urllib.error.HTTPError as e:
@@ -1083,13 +1109,18 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
 def _write_task(task: dict) -> str | None:
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns the task id, or None if it has no id / already present."""
-    tid = str(task.get("id") or "").strip()
-    if not tid:
+    broker_tid = str(task.get("id") or "").strip()
+    if not broker_tid:
         _log("dropping task with no id")
         return None
-    if not _valid_tid(tid):
-        _log(f"dropping task with unsafe id {tid!r}")
+    if not _valid_tid(broker_tid):
+        _log(f"dropping task with unsafe id {broker_tid!r}")
         return None
+    # Everything from here down — filenames, ledgers, archives, the serialized
+    # id: header the core echoes back as the result filename — uses the LOCAL
+    # id; `_broker_tid` restores the wire id at the ack/result POST boundary.
+    tid = _local_tid(broker_tid)
+    task = {**task, "id": tid}
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived.
     if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
@@ -1387,7 +1418,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
         try:
-            _req("POST", "/v1/results", {"id": tid, "body": out_body})
+            _req("POST", "/v1/results", {"id": _broker_tid(tid), "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
