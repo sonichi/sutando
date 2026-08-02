@@ -40,6 +40,27 @@ clear_managed() { rm -f "$WS/state/auth/managed-credentials.json"; }
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
+# A fake `python3` that exits non-zero, exactly like the Xcode Command Line
+# Tools stub on a Mac with no real Python. Placed FIRST on PATH.
+STUBBIN="$TMP/stubbin"; mkdir -p "$STUBBIN"
+printf '#!/bin/sh\nexit 1\n' > "$STUBBIN/python3"; chmod +x "$STUBBIN/python3"
+
+# Same as run_gate but with the stub shadowing python3 on PATH.
+run_gate_stubbed() {
+  env -i PATH="$STUBBIN:/usr/bin:/bin" REPO="$STUB" \
+    GEMINI_API_KEY="" GEMINI_VOICE_API_KEY="" \
+    bash -c 'cd "$1"; source "$2/src/startup-runtime.sh"; configure_startup_runtime; printf "SKIP_VOICE=%s\n" "${SKIP_VOICE:-0}"' \
+    _ "$TMP" "$REPO" 2>/dev/null
+}
+
+# Same, but capturing stderr — the loud-vs-silent assertion needs the warning.
+run_gate_stubbed_err() {
+  env -i PATH="$STUBBIN:/usr/bin:/bin" REPO="$STUB" \
+    GEMINI_API_KEY="" GEMINI_VOICE_API_KEY="" \
+    bash -c 'cd "$1"; source "$2/src/startup-runtime.sh"; configure_startup_runtime' \
+    _ "$TMP" "$REPO" 2>&1 >/dev/null
+}
+
 # 1. Managed-only install (no env keys at all) MUST start voice. This is the
 #    assertion that fails on the unpatched gate.
 write_managed '{"capabilities":{"gemini-voice":{"key":"managed-voice-key"}}}'
@@ -136,3 +157,33 @@ grep -q 'SKIP_VOICE=1' <<<"$startup_none" || fail "control: credential-free laun
 grep -q '^disabled' <<<"$health_none"     || fail "control: credential-free health should disable: $health_none"
 
 echo "PASS: startup voice gate recognizes the managed tier"
+
+# --- stub-shadowing: a broken `python3` on PATH must not be mistaken for -------
+#     "no managed credential". The gate returns 1 on ANY failure, so a stub and
+#     an absent credential are the same signal to the caller — a silent wrong
+#     answer, not a crash: startup proceeds BYO-only while a managed credential
+#     sits on disk. The fix resolves an absolute interpreter first and PROBES it,
+#     so the stub cannot shadow a real Python.
+#
+#     Skipped where no absolute interpreter exists, rather than passing for the
+#     wrong reason: with nothing to fall back to, returning 1 IS correct and the
+#     assertion would prove nothing.
+write_managed '{"capabilities":{"gemini-voice":{"key":"managed-voice-key"}}}'
+if [ -x /opt/homebrew/bin/python3 ] || [ -x /usr/local/bin/python3 ]; then
+  out="$(run_gate_stubbed)"
+  case "$out" in
+    *SKIP_VOICE=0*) echo "  ok  a stub python3 on PATH does not shadow the real interpreter" ;;
+    *) fail "stub python3 shadowed the real one — gate read a managed credential as absent (got: $out)" ;;
+  esac
+else
+  # No absolute interpreter to fall back to, so returning 1 is correct — but it
+  # must be LOUD. Silent is the whole defect: the caller cannot distinguish
+  # "no usable python" from "no managed credential", and picks the wrong one.
+  # This branch is not a skip; it asserts the other half of the same fix.
+  err="$(run_gate_stubbed_err)"
+  case "$err" in
+    *"no usable python3"*) echo "  ok  unusable python3 is reported, not silently read as 'absent'" ;;
+    *) fail "stub python3 produced NO warning — indistinguishable from an absent credential (stderr: ${err:-<empty>})" ;;
+  esac
+fi
+clear_managed
