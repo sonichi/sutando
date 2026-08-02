@@ -412,7 +412,37 @@ with tempfile.TemporaryDirectory() as td:
     check("converter-stopped-at-budget", not converter_finished.exists(),
           "child reached post-output marker instead of being terminated at the budget")
 
-    # 24c. Page-based PDF fallbacks accumulate incrementally and stop once the
+    # 24c. Both pipes are drained concurrently, stderr retention is capped,
+    # and a converter that stays within the stdout budget completes normally.
+    bounded_command = [
+        sys.executable,
+        "-c",
+        "import os; os.write(2, b'e' * (128 * 1024)); os.write(1, b'ok')",
+    ]
+    returncode, stdout, stderr = ingest._run_text_command_bounded(
+        bounded_command, 10, "test converter")
+    check("converter-bounded-success", returncode == 0 and stdout == "ok")
+    check("converter-stderr-cap", len(stderr.encode()) == 64 * 1024)
+
+    # 24d. A stalled converter is terminated at the deadline, before its
+    # post-sleep marker can be written.
+    timeout_finished = tmp / "converter-timeout-finished"
+    timeout_command = [
+        sys.executable,
+        "-c",
+        ("import pathlib, time; time.sleep(1); "
+         f"pathlib.Path({str(timeout_finished)!r}).write_text('finished')"),
+    ]
+    with mock.patch.object(ingest, "TEXT_COMMAND_TIMEOUT_SECONDS", 0.05):
+        try:
+            ingest._run_text_command_bounded(timeout_command, 10, "test converter")
+            check("converter-timeout", False, "expected TimeoutExpired")
+        except ingest.subprocess.TimeoutExpired:
+            check("converter-timeout", True)
+    check("converter-stopped-at-timeout", not timeout_finished.exists(),
+          "child reached post-timeout marker instead of being terminated")
+
+    # 24e. Page-based PDF fallbacks accumulate incrementally and stop once the
     # extracted-text ceiling is crossed instead of joining every page first.
     oversized_pypdf = types.ModuleType("pypdf")
     oversized_pypdf.PdfReader = lambda _p: types.SimpleNamespace(

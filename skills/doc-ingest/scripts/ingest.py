@@ -32,6 +32,7 @@ MAX_XLSX_COLUMNS = 16_384
 TEXT_READ_CHUNK_CHARS = 64 * 1024
 MAX_DOCUMENT_TEXT_CHARS = 16 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
+TEXT_COMMAND_TIMEOUT_SECONDS = 120
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".heic"}
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus"}
@@ -94,7 +95,7 @@ def _run_text_command_bounded(command: list[str], max_chars: int, label: str) ->
     stderr_chunks: list[bytes] = []
     stdout_size = 0
     stderr_size = 0
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + TEXT_COMMAND_TIMEOUT_SECONDS
 
     def stop_child() -> None:
         if proc.poll() is None:
@@ -110,7 +111,7 @@ def _run_text_command_bounded(command: list[str], max_chars: int, label: str) ->
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 stop_child()
-                raise subprocess.TimeoutExpired(command, 120)
+                raise subprocess.TimeoutExpired(command, TEXT_COMMAND_TIMEOUT_SECONDS)
             for key, _ in streams.select(timeout=min(remaining, 0.1)):
                 # Read at most one byte beyond the stdout budget. This makes the
                 # crossing observable without draining a child that keeps
