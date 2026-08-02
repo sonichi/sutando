@@ -225,6 +225,12 @@ class TestCheckStaleTasks(unittest.TestCase):
                 archive = results / "archive" / "2026-08"
                 archive.mkdir(parents=True)
                 (archive / name).write_text("[no-send]\n")
+            elif result_location == "flat-archive":
+                archive = results / "archive"
+                archive.mkdir()
+                (archive / name).write_text("[no-send]\n")
+            elif result_location == "non-file":
+                (results / name).mkdir()
             elif result_location == "retention-archive":
                 archive = results / "archive-2026-08-02"
                 archive.mkdir()
@@ -248,6 +254,12 @@ class TestCheckStaleTasks(unittest.TestCase):
 
     def test_bridge_archived_result_marks_task_complete(self):
         self.assertEqual(self._call("bridge-archive"), [])
+
+    def test_flat_archived_result_marks_task_complete(self):
+        self.assertEqual(self._call("flat-archive"), [])
+
+    def test_result_named_directory_does_not_mark_task_complete(self):
+        self.assertEqual(len(self._call("non-file")), 1)
 
     def test_retention_archived_result_marks_task_complete(self):
         self.assertEqual(self._call("retention-archive"), [])
