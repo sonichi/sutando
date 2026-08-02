@@ -2840,7 +2840,19 @@ def _gateway_configured() -> bool:
                 # class this PR closes. (Caught in review by Sutando-Pro.)
                 for ln in gw_env.read_text(errors="replace").splitlines()
             )
-    except Exception:
+    except OSError:
+        # EXPECTED failures only: the env file is unreadable / the path is bad.
+        # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.
+        #
+        # Deliberately NOT `except Exception`. A resolver contract bug (e.g.
+        # claude_home_path raising ValueError) would be swallowed into False,
+        # check_core_supervisor would then report a real `gateway-down` as OK,
+        # and check_gateway_bridge would vanish -- a CONFIGURED gateway's outage
+        # goes silent. That is the same fail-open direction this PR exists to
+        # close, one layer up. An unexpected exception propagates instead, which
+        # is loud; a programming error in a health probe should not be absorbed
+        # by the probe that is supposed to be reporting faults.
+        # (Caught in review by john-the-dev.)
         pass
     return False
 

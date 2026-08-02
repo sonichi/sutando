@@ -208,6 +208,40 @@ def main() -> int:
         check("_gateway_configured: token + invalid UTF-8 byte → still True",
               _configured(gw_env_path=_gw) is True)
 
+    # --- failure CLASSIFICATION (john-the-dev, review of 2328fbe9) ---------
+    # The catch was `except Exception`, so ANY error became False = "no gateway
+    # configured here". check_core_supervisor then reports a real `gateway-down`
+    # as OK and check_gateway_bridge returns None — a CONFIGURED gateway's outage
+    # goes silent. Fail-open in the one direction this probe must not fail.
+    #
+    # These pin the classification itself, so narrowing cannot be undone quietly.
+    base = {k: v for k, v in hc.os.environ.items()
+            if k not in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+
+    # 1) UNEXPECTED exception must NOT be classified as unconfigured. The
+    #    reviewer's exact repro: a resolver contract bug.
+    raised = None
+    with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
+         unittest.mock.patch.object(hc, "claude_home_path",
+                                    side_effect=ValueError("resolver contract bug")):
+        try:
+            got = hc._gateway_configured()
+        except ValueError:
+            raised = True
+        else:
+            raised = False
+    check("_gateway_configured: unexpected exception propagates, is NOT False",
+          raised is True,
+          "a resolver bug was swallowed into 'unconfigured' — that silences a real gateway-down")
+
+    # 2) EXPECTED I/O failure still means unconfigured (the narrowing must not
+    #    break the case the catch legitimately exists for).
+    with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
+         unittest.mock.patch.object(hc, "claude_home_path",
+                                    side_effect=OSError("unreadable")):
+        check("_gateway_configured: OSError → False (expected I/O failure)",
+              hc._gateway_configured() is False)
+
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1
