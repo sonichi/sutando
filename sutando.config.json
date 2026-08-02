@@ -29,7 +29,7 @@
         "notes/",
         "hosts/*/",
         ".claude-sutando/projects/*/memory/",
-      "state/current-track.md"
+        "state/current-track.md"
       ],
       "exclude": [
         "tasks/",
