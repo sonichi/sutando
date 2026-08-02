@@ -250,6 +250,115 @@ def test_default_store_dir_resolves():
           "_default_store_dir resolves to <workspace>/state/observe")
 
 
+def _aggregate(d):
+    """Sum the evals/day of every ACTIVE pack record, computed from the store on
+    disk rather than by calling dpp.committed_evals_per_day().
+
+    Deliberate: using the module's own accounting to verify the module's own
+    budget would be self-referential — if that helper miscounted, the assertion
+    would agree with it and the suite would go green on a broken budget. This
+    reads the persisted records directly, so the test and the code can disagree.
+    """
+    total = 0
+    for rec in op.SubscriptionStore(d).list(status="active"):
+        if not (rec.get("pack") or {}).get("entry"):
+            continue
+        cap = (rec.get("cost_cap") or {}).get("evals_per_day")
+        if isinstance(cap, int):
+            total += cap
+    return total
+
+
+def test_multi_room_fanout_stays_inside_the_aggregate_budget():
+    """john-the-dev's #2320 blocker. evaluate_standing_approval() checks ONE
+    draft's cap, so N rooms each at the default cap all pass individually while
+    the total the owner authorized grows to N x default. Reproduced on 144ea820:
+    three rooms -> caps [2,2,2], aggregate 6, advertised default 2."""
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(15)]
+    res = dpp.seed_defaults(d, OWNER, rooms)
+    seeded = [r for r in res if r["status"] == "seeded"]
+    refused = [r for r in res if r["status"] == "refused"]
+
+    budget = getattr(dpp, "PACK_AGGREGATE_EVALS_PER_DAY", None)
+    check(budget is not None, "pack declares an aggregate budget")
+    check(budget is not None and _aggregate(d) <= budget,
+          f"15-room fan-out stays within the aggregate budget "
+          f"({_aggregate(d)} <= {budget})")
+    check(len(seeded) * op.DEFAULT_EVALS_PER_DAY == _aggregate(d),
+          "aggregate equals the sum of what was actually activated")
+    check(len(refused) > 0,
+          "rooms beyond the budget are REFUSED, not silently activated")
+    # The refusal must be legible. A bare "refused" would leave the owner unable
+    # to tell a budget stop from a scope or mode rejection, which are different
+    # problems with different fixes.
+    check(refused and "aggregate budget" in refused[0]["reason"],
+          f"refusal names the budget as the cause: {refused[0]['reason'] if refused else 'n/a'}")
+
+
+def test_a_later_join_cannot_widen_a_pre_blessed_aggregate():
+    """The second half of the blocker: on_room_join() runs long after connect,
+    so an unbounded per-room grant means the authorized total keeps growing with
+    no policy edit and no renewed approval."""
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(15)]
+    dpp.seed_defaults(d, OWNER, rooms)
+    before = _aggregate(d)
+    res = dpp.on_room_join(d, OWNER, "!late:ag2.space",
+                           member_rooms=rooms + ["!late:ag2.space"])
+    check(res and res[0]["status"] == "refused",
+          f"a join at the budget is refused (got {res[0]['status'] if res else 'no result'})")
+    check(_aggregate(d) == before,
+          f"aggregate is unchanged by the refused join ({before} -> {_aggregate(d)})")
+
+
+def test_a_join_under_budget_still_seeds():
+    """CALIBRATION. Both assertions above are satisfied by a blanket refusal, so
+    they would still pass if the budget check rejected everything and broke the
+    feature outright. Pin the positive case: under budget, a join still works."""
+    d = _store()
+    dpp.seed_defaults(d, OWNER, ["!x:ag2.space"])
+    before = _aggregate(d)
+    res = dpp.on_room_join(d, OWNER, "!y:ag2.space",
+                           member_rooms=["!x:ag2.space", "!y:ag2.space"])
+    check(res and res[0]["status"] == "seeded",
+          f"an under-budget join still seeds (got {res[0]['status'] if res else 'no result'})")
+    check(_aggregate(d) == before + op.DEFAULT_EVALS_PER_DAY,
+          "...and the aggregate grows by exactly one room's cap")
+
+
+def test_reseeding_does_not_double_count_the_budget():
+    """The budget sums ACTIVE records, and re-seed is idempotent, so a reconnect
+    must not consume budget a second time — otherwise repeated reconnects would
+    starve the pack out of its own allowance."""
+    d = _store()
+    rooms = [f"!r{i}:ag2.space" for i in range(5)]
+    dpp.seed_defaults(d, OWNER, rooms)
+    first = _aggregate(d)
+    dpp.seed_defaults(d, OWNER, rooms)
+    dpp.seed_defaults(d, OWNER, rooms)
+    check(_aggregate(d) == first,
+          f"aggregate unchanged across repeated reseeds ({first} -> {_aggregate(d)})")
+
+
+def test_budget_counts_only_pack_provenance_records():
+    """An explicitly owner-approved policy must not shrink the pack's automatic
+    allowance — approving something should never make the next automatic grant
+    harder. Only records carrying pack provenance count."""
+    d = _store()
+    store = op.SubscriptionStore(d)
+    draft, errs = op.validate_draft({
+        "room_id": "!manual:ag2.space", "created_by": OWNER,
+        "event_types": ["message.created"], "mode": "observe",
+        "cost_cap": {"evals_per_day": op.DEFAULT_EVALS_PER_DAY},
+    })
+    check(not errs, f"fixture draft validates ({errs})")
+    store.save(draft)
+    store.transition(draft["policy_id"], "active", note="owner-approved, not pack")
+    check(_aggregate(d) == 0,
+          f"a non-pack active policy contributes 0 to the pack budget (got {_aggregate(d)})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

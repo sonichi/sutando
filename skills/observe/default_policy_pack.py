@@ -66,6 +66,29 @@ PACK_ENTRIES: "list[dict]" = [
     },
 ]
 
+# The standing approval blesses a PER-DRAFT cap (DEFAULT_EVALS_PER_DAY). It says
+# nothing about how many drafts there may be, and fanning one entry across every
+# member room multiplies it. Reproduced on 144ea820 with three rooms:
+#
+#   advertised default = 2       per-room caps = [2, 2, 2]      aggregate = 6
+#   ...then on_room_join('!d')                                  aggregate = 8
+#
+# Each draft passes the boundary individually while the total the owner has
+# actually authorized grows without a policy edit or a renewed approval, and
+# every later join widens it again. A per-draft ceiling cannot express "how much
+# in total", so the pack carries its own aggregate budget.
+#
+# Beyond the budget a room is NOT silently dropped and NOT silently activated —
+# it is refused, so it surfaces as an explicit card the owner can approve. That
+# is the whole design: the boundary degrades to CONSENT rather than to a silent
+# yes or a silent no. Getting "needs a click" wrong costs a click; getting
+# "auto-activated" wrong spends the owner's budget without asking.
+#
+# The number itself is a policy choice, not a derived constant — 20 = ten rooms
+# at the default cap. Raising it is an owner decision, which is exactly why it is
+# a single named constant here instead of being implied by the fan-out.
+PACK_AGGREGATE_EVALS_PER_DAY = 20
+
 _PACK_STATE_FILE = "_pack_state.json"  # not obs_*.json → never listed as a policy
 
 
@@ -135,6 +158,39 @@ def _draft_for(entry: dict, room_id: str, owner_mxid: str, generation: int) -> d
 
 
 # ── Seeding (connect-time + join-time), authz via the reused boundary ────────
+def committed_evals_per_day(store: "op.SubscriptionStore") -> int:
+    """Total evals/day already auto-activated by the pack across ALL rooms.
+
+    Counts only pack-provenance ACTIVE records: the budget governs what the pack
+    grants itself under standing approval, not what the owner has explicitly
+    approved elsewhere. Counting owner-approved policies too would let an
+    explicit approval shrink the automatic allowance, which is backwards —
+    approving something should never make the next automatic grant harder.
+    """
+    total = 0
+    for rec in store.list(status="active"):
+        if not (rec.get("pack") or {}).get("entry"):
+            continue
+        cap = (rec.get("cost_cap") or {}).get("evals_per_day")
+        if isinstance(cap, int):
+            total += cap
+    return total
+
+
+def _budget_allows(store: "op.SubscriptionStore", draft: dict) -> "tuple[bool, str]":
+    """Would activating `draft` keep the pack inside its aggregate budget?"""
+    cap = (draft.get("cost_cap") or {}).get("evals_per_day")
+    cap = cap if isinstance(cap, int) else 0
+    committed = committed_evals_per_day(store)
+    if committed + cap > PACK_AGGREGATE_EVALS_PER_DAY:
+        return False, (
+            f"pack aggregate budget reached "
+            f"({committed} + {cap} > {PACK_AGGREGATE_EVALS_PER_DAY} evals/day) — "
+            "explicit approval required for this room"
+        )
+    return True, ""
+
+
 def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
               room_id: str, owner_mxid: str, owner_rooms: "list[str]") -> dict:
     """Seed one per-room policy for `entry` in `room_id`. Idempotent: skips if a
@@ -170,6 +226,12 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
                 normalized, owner_mxid=owner_mxid, owner_rooms=owner_rooms)
             if not auto:
                 return {"status": "refused", "policy_id": pid, "reason": reason}
+            # The aggregate applies on RESUME too. A crash-interrupted draft is
+            # not yet active, so it is not already counted; letting it through
+            # unchecked would make crashing a way to exceed the budget.
+            ok, why = _budget_allows(store, normalized)
+            if not ok:
+                return {"status": "refused", "policy_id": pid, "reason": why}
             normalized["pack"] = {"entry": entry["key"], "generation": gen}
             store.save(normalized)  # re-assert content (idempotent for this gen)
             store.transition(pid, "active",
@@ -196,6 +258,13 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
         # that is a misconfigured pack entry or an out-of-scope room — refuse,
         # do NOT silently activate (respects the never-widen-the-boundary rule).
         return {"status": "refused", "policy_id": pid, "reason": reason}
+
+    # Per-draft approval passed; now the aggregate. This is the gate the
+    # per-draft boundary structurally cannot express — it sees one draft and
+    # cannot know it is the twelfth.
+    ok, why = _budget_allows(store, normalized)
+    if not ok:
+        return {"status": "refused", "policy_id": pid, "reason": why}
 
     # Tag with pack provenance AFTER validate_draft (which drops unknown keys);
     # the store persists extra fields and observe_policy ignores them.
