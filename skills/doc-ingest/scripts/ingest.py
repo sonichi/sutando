@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -27,6 +28,8 @@ MAX_TABLE_CELLS = 1_000_000
 MAX_TABLE_TEXT_CHARS = 16 * 1024 * 1024
 MAX_XLSX_COLUMNS = 16_384
 TEXT_READ_CHUNK_CHARS = 64 * 1024
+MAX_DOCUMENT_TEXT_CHARS = 16 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".heic"}
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus"}
@@ -47,6 +50,92 @@ def _truncate(text: str, max_chars: int) -> str:
 
 class _PreTruncatedText(str):
     """A bounded stream result that already carries the exact truncation notice."""
+
+
+class _ResourceBudgetError(RuntimeError):
+    """Extraction stopped before untrusted input could exceed a hard bound."""
+
+
+def _document_budgets(max_chars: int) -> tuple[int, int]:
+    """Return hard character/byte ceilings for untrusted document extraction."""
+    char_budget = MAX_DOCUMENT_TEXT_CHARS if not max_chars else min(
+        MAX_DOCUMENT_TEXT_CHARS, max(max_chars * 4, TEXT_READ_CHUNK_CHARS)
+    )
+    return char_budget, min(MAX_DOCUMENT_BYTES, max(char_budget * 4, 1024 * 1024))
+
+
+def _join_bounded(chunks, max_chars: int, label: str, separator: str = "\n") -> str:
+    """Join incrementally while refusing materialization past the hard ceiling."""
+    char_budget, _ = _document_budgets(max_chars)
+    parts: list[str] = []
+    total = 0
+    for chunk in chunks:
+        chunk = str(chunk)
+        total += len(chunk)
+        if total > char_budget:
+            raise _ResourceBudgetError(
+                f"{label} exceeds extracted text budget ({char_budget} chars); extraction stopped"
+            )
+        parts.append(chunk)
+    return separator.join(parts)
+
+
+def _run_text_command_bounded(command: list[str], max_chars: int, label: str) -> tuple[int, str, str]:
+    """Capture command output through a file so stdout is never buffered in RAM."""
+    _, byte_budget = _document_budgets(max_chars)
+    with tempfile.TemporaryFile() as stdout_file:
+        proc = subprocess.run(
+            command,
+            stdout=stdout_file,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        # Unit-test fakes may provide stdout directly; real subprocesses write to
+        # stdout_file, keeping the potentially large conversion outside memory.
+        mocked_stdout = getattr(proc, "stdout", None)
+        if isinstance(mocked_stdout, str):
+            payload = mocked_stdout.encode("utf-8")
+        elif isinstance(mocked_stdout, bytes):
+            payload = mocked_stdout
+        else:
+            size = stdout_file.tell()
+            if size > byte_budget:
+                raise _ResourceBudgetError(
+                    f"{label} exceeds extracted byte budget ({byte_budget} bytes); extraction stopped"
+                )
+            stdout_file.seek(0)
+            payload = stdout_file.read(byte_budget + 1)
+        if len(payload) > byte_budget:
+            raise _ResourceBudgetError(
+                f"{label} exceeds extracted byte budget ({byte_budget} bytes); extraction stopped"
+            )
+        stderr = getattr(proc, "stderr", b"") or b""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return proc.returncode, payload.decode("utf-8", errors="replace"), stderr
+
+
+def _read_ooxml_member_bounded(zf: zipfile.ZipFile, name: str, max_chars: int) -> bytes:
+    """Reject oversized OOXML members before zipfile allocates their payload."""
+    _, byte_budget = _document_budgets(max_chars)
+    info = zf.getinfo(name)
+    if info.file_size > byte_budget:
+        raise _ResourceBudgetError(
+            f"OOXML member exceeds uncompressed byte budget ({byte_budget} bytes); extraction stopped"
+        )
+    return zf.read(info)
+
+
+def _validate_ooxml_archive_bounded(zf: zipfile.ZipFile, max_chars: int) -> None:
+    """Reject archive inflation before a third-party OOXML parser opens it."""
+    _, byte_budget = _document_budgets(max_chars)
+    total = 0
+    for info in zf.infolist():
+        total += info.file_size
+        if total > byte_budget:
+            raise _ResourceBudgetError(
+                f"OOXML archive exceeds uncompressed byte budget ({byte_budget} bytes); extraction stopped"
+            )
 
 
 def _read_text_bounded(path: Path, max_chars: int) -> str:
@@ -248,16 +337,23 @@ def _xml_text(payload: bytes) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def extract_pdf(path: Path) -> str:
+def extract_pdf(path: Path, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     tried = []
     if shutil.which("pdftotext"):
         tried.append("pdftotext")
-        proc = subprocess.run(["pdftotext", "-layout", str(path), "-"],
-                              capture_output=True, text=True, timeout=120)
-        if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout
-    for mod, call in (("pypdf", lambda m: "\n".join((p.extract_text() or "") for p in m.PdfReader(str(path)).pages)),
-                      ("fitz", lambda m: "\n".join(p.get_text() for p in m.open(str(path))))):
+        returncode, stdout, _ = _run_text_command_bounded(
+            ["pdftotext", "-layout", str(path), "-"], max_chars, "PDF"
+        )
+        if returncode == 0 and stdout.strip():
+            return stdout
+    for mod, call in (
+        ("pypdf", lambda m: _join_bounded(
+            ((p.extract_text() or "") for p in m.PdfReader(str(path)).pages), max_chars, "PDF"
+        )),
+        ("fitz", lambda m: _join_bounded(
+            (p.get_text() for p in m.open(str(path))), max_chars, "PDF"
+        )),
+    ):
         try:
             extractor = __import__(mod)
         except ImportError:
@@ -265,6 +361,8 @@ def extract_pdf(path: Path) -> str:
         tried.append(mod)
         try:
             text = call(extractor)
+        except _ResourceBudgetError:
+            raise
         except Exception:  # noqa: BLE001 — fall through to the next extractor
             continue
         if text.strip():
@@ -423,31 +521,50 @@ def extract_csv(path: Path, max_rows: int) -> str:
         return _collect_table(csv.reader(fh, delimiter=delimiter), max_rows, summary=True)
 
 
-def extract_docx(path: Path, max_rows: int) -> str:
+def extract_docx(path: Path, max_rows: int, max_chars: int = DEFAULT_MAX_CHARS) -> str:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            _validate_ooxml_archive_bounded(zf, max_chars)
+            _read_ooxml_member_bounded(zf, "word/document.xml", max_chars)
+    except zipfile.BadZipFile:
+        # Let python-docx or textutil report malformed legacy/test inputs.
+        pass
     try:
         import docx  # noqa: PLC0415
 
         d = docx.Document(str(path))
-        parts = [p.text for p in d.paragraphs if p.text.strip()]
-        for table in d.tables:
-            rows = [[c.text for c in row.cells] for row in table.rows]
-            parts.append(_rows_to_markdown(rows, max_rows))
-        return "\n\n".join(parts)
+
+        def chunks():
+            for paragraph in d.paragraphs:
+                if paragraph.text.strip():
+                    yield paragraph.text
+            for table in d.tables:
+                rows = ([c.text for c in row.cells] for row in table.rows)
+                yield _collect_table(rows, max_rows)
+
+        return _join_bounded(chunks(), max_chars, "DOCX", "\n\n")
     except ImportError:
         pass
     if shutil.which("textutil"):
-        proc = subprocess.run(["textutil", "-convert", "txt", "-stdout", str(path)],
-                              capture_output=True, text=True, timeout=120)
-        if proc.returncode == 0:
-            return proc.stdout
+        returncode, stdout, _ = _run_text_command_bounded(
+            ["textutil", "-convert", "txt", "-stdout", str(path)], max_chars, "DOCX"
+        )
+        if returncode == 0:
+            return stdout
     with zipfile.ZipFile(path) as zf:
-        return _xml_text(zf.read("word/document.xml"))
+        return _xml_text(_read_ooxml_member_bounded(zf, "word/document.xml", max_chars))
 
 
-def extract_pptx(path: Path) -> str:
+def extract_pptx(path: Path, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     with zipfile.ZipFile(path) as zf:
         slides = sorted(n for n in zf.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n))
-        return "\n\n".join(f"## Slide {i + 1}\n\n{_xml_text(zf.read(n))}" for i, n in enumerate(slides))
+        return _join_bounded(
+            (f"## Slide {i + 1}\n\n{_xml_text(_read_ooxml_member_bounded(zf, n, max_chars))}"
+             for i, n in enumerate(slides)),
+            max_chars,
+            "PPTX",
+            "\n\n",
+        )
 
 
 def extract_zip(path: Path, max_rows: int, member_cap: int = 20,
@@ -514,14 +631,15 @@ def extract_zip(path: Path, max_rows: int, member_cap: int = 20,
     return "\n\n".join(parts)
 
 
-def extract_textutil(path: Path) -> str:
+def extract_textutil(path: Path, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     if not shutil.which("textutil"):
         raise RuntimeError(f"no extractor for {path.suffix} (textutil unavailable on this host)")
-    proc = subprocess.run(["textutil", "-convert", "txt", "-stdout", str(path)],
-                          capture_output=True, text=True, timeout=120)
-    if proc.returncode != 0:
-        raise RuntimeError(f"textutil failed on {path.name}: {proc.stderr.strip()[:200]}")
-    return proc.stdout
+    returncode, stdout, stderr = _run_text_command_bounded(
+        ["textutil", "-convert", "txt", "-stdout", str(path)], max_chars, "textutil"
+    )
+    if returncode != 0:
+        raise RuntimeError(f"textutil failed on {path.name}: {stderr.strip()[:200]}")
+    return stdout
 
 
 def extract(path: Path, max_rows: int, max_chars: int = DEFAULT_MAX_CHARS,
@@ -534,15 +652,15 @@ def extract(path: Path, max_rows: int, max_chars: int = DEFAULT_MAX_CHARS,
     if suffix in AUDIO_SUFFIXES:
         return "audio", "doc-ingest: use skills/audio-transcribe for audio files."
     if suffix == ".pdf":
-        return "pdf", extract_pdf(path)
+        return "pdf", extract_pdf(path, max_chars)
     if suffix in {".xlsx", ".xlsm"}:
         return "xlsx", extract_xlsx(path, max_rows)
     if suffix in {".csv", ".tsv"}:
         return "table", extract_csv(path, max_rows)
     if suffix == ".docx":
-        return "docx", extract_docx(path, max_rows)
+        return "docx", extract_docx(path, max_rows, max_chars)
     if suffix == ".pptx":
-        return "pptx", extract_pptx(path)
+        return "pptx", extract_pptx(path, max_chars)
     if suffix == ".zip":
         return "zip", extract_zip(
             path, max_rows,
@@ -551,7 +669,7 @@ def extract(path: Path, max_rows: int, max_chars: int = DEFAULT_MAX_CHARS,
             max_chars=max_chars,
         )
     if suffix in {".rtf", ".doc"}:
-        return "textutil", extract_textutil(path)
+        return "textutil", extract_textutil(path, max_chars)
     if suffix in TEXT_SUFFIXES or not suffix:
         return "text", _read_text_bounded(path, max_chars)
     # Unknown suffix: try text read — better a replaced-chars dump than a refusal.

@@ -395,6 +395,55 @@ with tempfile.TemporaryDirectory() as td:
         except RuntimeError as exc:
             check("textutil-nonzero", "textutil failed" in str(exc))
 
+    # 24b. Converter stdout is file-backed and rejected at a hard byte budget;
+    # it must never be fully captured into process memory before truncation.
+    def _oversized_converter(*_args, stdout=None, **_kwargs):
+        stdout.write(b"x" * (1024 * 1024 + 1))
+        return types.SimpleNamespace(returncode=0, stdout=None, stderr=b"")
+
+    with mock.patch.object(ingest.shutil, "which", return_value="/usr/bin/textutil"), \
+         mock.patch.object(ingest.subprocess, "run", side_effect=_oversized_converter):
+        try:
+            ingest.extract_textutil(rtf2, 10)
+            check("textutil-byte-budget", False, "expected hard byte-budget failure")
+        except RuntimeError as exc:
+            check("textutil-byte-budget", "byte budget" in str(exc), str(exc))
+
+    # 24c. Page-based PDF fallbacks accumulate incrementally and stop once the
+    # extracted-text ceiling is crossed instead of joining every page first.
+    oversized_pypdf = types.ModuleType("pypdf")
+    oversized_pypdf.PdfReader = lambda _p: types.SimpleNamespace(
+        pages=[types.SimpleNamespace(extract_text=lambda: "x" * 40_000) for _ in range(2)])
+    with mock.patch.object(ingest.shutil, "which", return_value=None), \
+         mock.patch.dict(sys.modules, {"pypdf": oversized_pypdf, "fitz": None}):
+        try:
+            ingest.extract_pdf(pdf, 10)
+            check("pdf-text-budget", False, "expected hard text-budget failure")
+        except RuntimeError as exc:
+            check("pdf-text-budget", "text budget" in str(exc), str(exc))
+
+    # 24d. Direct OOXML fallbacks inspect declared uncompressed member size
+    # before zf.read(), preventing a compressed member from inflating in RAM.
+    oversized_docx = tmp / "oversized.docx"
+    with zipfile.ZipFile(oversized_docx, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", b"x" * (1024 * 1024 + 1))
+    with mock.patch.dict(sys.modules, {"docx": None}), \
+         mock.patch.object(ingest.shutil, "which", return_value=None):
+        try:
+            ingest.extract_docx(oversized_docx, 500, 10)
+            check("docx-member-byte-budget", False, "expected OOXML budget failure")
+        except RuntimeError as exc:
+            check("docx-member-byte-budget", "byte budget" in str(exc), str(exc))
+
+    oversized_pptx = tmp / "oversized.pptx"
+    with zipfile.ZipFile(oversized_pptx, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("ppt/slides/slide1.xml", b"x" * (1024 * 1024 + 1))
+    try:
+        ingest.extract_pptx(oversized_pptx, 10)
+        check("pptx-member-byte-budget", False, "expected OOXML budget failure")
+    except RuntimeError as exc:
+        check("pptx-member-byte-budget", "byte budget" in str(exc), str(exc))
+
     # 25. _table_summary unit — numeric column reports aggregates; text column does not.
     digest = ingest._table_summary([["id", "name", "qty"],
                                     ["1", "widget", "3"],
