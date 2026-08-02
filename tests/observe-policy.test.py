@@ -220,7 +220,9 @@ def test_store_lock_serializes_a_SEPARATE_PROCESS():
       C. parent inside a real transition()  -> child REFUSED (proves the SHIPPED
          path takes it, not just a hand-rolled `with` in the test)
     """
-    import subprocess, textwrap, json as _json
+    import json as _json
+    import subprocess
+    import textwrap
     d = tempfile.mkdtemp()
     child_src = textwrap.dedent(f"""
         import sys, json, time
