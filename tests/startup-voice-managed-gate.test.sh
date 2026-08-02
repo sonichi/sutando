@@ -234,4 +234,52 @@ got="$(SUTANDO_PY="$REAL_PY" bash "$REPO/scripts/sutando-config.sh" python-bin 2
   && echo "  ok  sutando-config.sh python-bin honours \$SUTANDO_PY" \
   || fail "python-bin ignored \$SUTANDO_PY (wanted $REAL_PY, got ${got:-<empty>})"
 
+
+# --- tier 2: the BUNDLE-VENDORED runtime, with $SUTANDO_PY unset --------------
+#     The guard above covers tier 1 ($SUTANDO_PY), which is the case the review
+#     reproduced. It does NOT cover tier 2, and tier 2 is the one that matters on
+#     a real bundled install: measured on this host, $SUTANDO_PY is UNSET while
+#     <engine>/runtime/python/bin/python3 exists. If the system python3 there were
+#     the CLT stub, tier 2 is the only thing standing between a managed user and a
+#     silent voice outage — so leaving it untested would leave the actual
+#     production shape unguarded while the suite looked thorough.
+#
+#     Builds the real layout (<engine>/sutando/scripts + <engine>/runtime/python)
+#     and symlinks a WORKING interpreter into it, so this runs anywhere including
+#     CI, where no bundle exists.
+BUNDLE="$TMP/engine"
+mkdir -p "$BUNDLE/sutando/scripts" "$BUNDLE/runtime/python/bin"
+cp "$REPO/scripts/sutando-config.sh" "$BUNDLE/sutando/scripts/sutando-config.sh"
+ln -sf "$REAL_PY" "$BUNDLE/runtime/python/bin/python3"
+
+got="$(env -i PATH="$STUBBIN:/usr/bin:/bin" \
+       bash "$BUNDLE/sutando/scripts/sutando-config.sh" python-bin 2>/dev/null)"
+case "$got" in
+  */runtime/python/bin/python3)
+    echo "  ok  python-bin picks the bundled runtime when \$SUTANDO_PY is unset" ;;
+  *)
+    fail "python-bin skipped the bundled runtime (got: ${got:-<empty>})" ;;
+esac
+
+# It must also RUN — resolving a path proves precedence, not usability, and the
+# whole defect class here is an interpreter that exists but does not execute.
+"$got" -c 'import json' 2>/dev/null \
+  && echo "  ok  ...and the bundled interpreter actually executes" \
+  || fail "python-bin returned a bundled path that does not run: $got"
+
+# CONTROL: remove the bundled runtime, change nothing else. Resolution must fall
+# through to tier 3 — otherwise the assertion above could be matching a path that
+# gets returned regardless of whether the runtime is really there.
+rm -f "$BUNDLE/runtime/python/bin/python3"
+got_none="$(env -i PATH="$STUBBIN:/usr/bin:/bin" \
+            bash "$BUNDLE/sutando/scripts/sutando-config.sh" python-bin 2>/dev/null)"
+case "$got_none" in
+  */runtime/python/bin/python3)
+    fail "python-bin still claims the bundled runtime after it was removed (got: $got_none)" ;;
+  *)
+    echo "  ok  control: with no bundled runtime it falls through to a later tier" ;;
+esac
+
+# Summary last: printing PASS before the tier-2 assertions below would have
+# announced success for checks that had not run yet.
 echo "PASS: interpreter precedence (SUTANDO_PY / bundled) is honoured by the gate"
