@@ -829,8 +829,17 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// destination already is the owner's DM). It has no meaning for the
 				// voice/task path, so strip it on read: this keeps voice from ever
 				// speaking "dm only" and keeps it out of logs. Parity with Python
-				// parse_markers(), which strips it before delivery.
-				const result = readFileSync(path, 'utf-8').replace(/\[dm-only\]\s*/gi, '').trim();
+				// parse_markers(), which strips ONLY a STANDALONE marker — one alone
+				// on its line. An inline mention is prose (a result DISCUSSING the
+				// marker) and rewriting it silently corrupts owner-facing text:
+				//   in  "- #2170 [dm-only]: closes the leak vector"
+				//   out "- #2170 : closes the leak vector"
+				// The old expression here was /\[dm-only\]\s*/gi, which stripped
+				// every occurrence and made this consumer disagree with every
+				// text bridge after the Python side was narrowed.
+				const result = readFileSync(path, 'utf-8')
+					.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '')
+					.trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
 

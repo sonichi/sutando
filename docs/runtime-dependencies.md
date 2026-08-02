@@ -96,12 +96,16 @@ Two consequences when packaging, or when adding a call to any of these:
 its stated limit: the gate matches explicit `/usr/bin/…` tokens only, so a bare
 `git` or `python3` resolved through PATH is invisible to it.
 
-> **Not yet on `main`.** Shared resolvers that prefer a real install and degrade
-> instead of prompting are still under review: `src/git_binary.py` (#2469),
-> `src/python-binary.ts` (#2475), `SutandoConfig.resolvePython` (#2473), and the
-> runtime-descriptor guard in `scripts/sutando-config.sh` (#2478). Until those
-> land, several call sites still invoke the stub directly on a host without
-> developer tools.
+> **Resolver rollout, partially landed.** Shared resolvers prefer a real install
+> and degrade instead of prompting, rather than invoking the stub directly.
+>
+> On `main`: `src/python-binary.ts` (#2475) — used by `skills/zoom/tools.ts` and
+> `src/meeting-tools.ts`.
+>
+> Still under review: `src/git_binary.py` (#2469), `SutandoConfig.resolvePython`
+> (#2473), and the runtime-descriptor guard in `scripts/sutando-config.sh`
+> (#2478). Until those land, the call sites they cover still invoke the stub
+> directly on a host without developer tools.
 
 ## Embedding Sutando in another application
 
