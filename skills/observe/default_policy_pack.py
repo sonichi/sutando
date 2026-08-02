@@ -313,99 +313,106 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
     # Per-draft approval passed; now the aggregate. This is the gate the
     # per-draft boundary structurally cannot express — it sees one draft and
     # cannot know it is the twelfth.
-    ok, why = _budget_allows(store, normalized)
-    if not ok:
-        # PERSIST the over-budget policy as a DRAFT instead of returning nothing.
-        #
-        # The refusal copy says explicit approval is required, and that sentence
-        # has to be backed by a record or it is a promise the system cannot keep:
-        # returning before store.save() left the deterministic policy_id absent,
-        # so `transition(pid, "active")` had nothing to activate and the result
-        # carried none of the fields render_card() needs. Verified on 08cedd9c
-        # with an 11-room seed — 10 seeded, 1 refused, store.get(refused) is None.
-        # Rooms past the budget were then neither auto-subscribed NOR
-        # owner-actionable, which is the silent drop the budget exists to avoid.
-        #
-        # A draft is the right state: it is inspectable, it consumes no budget
-        # (committed_evals_per_day counts ACTIVE only), and the resume path above
-        # re-runs this same check — so it cannot self-activate while over budget,
-        # and it DOES activate on the next seed if budget frees up because a room
-        # was cancelled. Self-healing rather than requiring a re-seed dance.
+    # ONE CRITICAL SECTION: budget reservation must be atomic with activation.
+    # Without this, two seeds each passed _budget_allows() before either committed
+    # an active record and both activated — measured at 18/20: committed went to
+    # 22 with both writers reporting "seeded". A per-draft check cannot see a
+    # reservation that has not been written yet, so the check and the write have
+    # to be one step rather than two correct steps.
+    with op.store_lock(store_dir):
+        ok, why = _budget_allows(store, normalized)
+        if not ok:
+            # PERSIST the over-budget policy as a DRAFT instead of returning nothing.
+            #
+            # The refusal copy says explicit approval is required, and that sentence
+            # has to be backed by a record or it is a promise the system cannot keep:
+            # returning before store.save() left the deterministic policy_id absent,
+            # so `transition(pid, "active")` had nothing to activate and the result
+            # carried none of the fields render_card() needs. Verified on 08cedd9c
+            # with an 11-room seed — 10 seeded, 1 refused, store.get(refused) is None.
+            # Rooms past the budget were then neither auto-subscribed NOR
+            # owner-actionable, which is the silent drop the budget exists to avoid.
+            #
+            # A draft is the right state: it is inspectable, it consumes no budget
+            # (committed_evals_per_day counts ACTIVE only), and the resume path above
+            # re-runs this same check — so it cannot self-activate while over budget,
+            # and it DOES activate on the next seed if budget frees up because a room
+            # was cancelled. Self-healing rather than requiring a re-seed dance.
+            if not _entry_still_live(store_dir, entry["key"], gen):
+                return {"status": "refused", "policy_id": pid,
+                        "reason": "entry was disabled or re-generated while this seed was in flight"}
+            # `over_budget` marks this record as one the OWNER must approve, not one
+            # the pack granted itself. committed_evals_per_day() skips it forever
+            # after — including once approved — because this module's own rule is
+            # that "approving something should never make the next automatic grant
+            # harder". Without the marker an approved draft keeps plain pack
+            # provenance and consumes the automatic allowance: measured on
+            # df4b7b3b, approving 3 queued rooms took the aggregate to 26/20 and
+            # then refused EVERY subsequent auto-seed, permanently, even after a
+            # room was cancelled. The budget bounds what the pack grants ITSELF;
+            # an explicit owner decision is deliberately outside it.
+            normalized["pack"] = {"entry": entry["key"], "generation": gen,
+                                  "over_budget": True}
+            # PUBLISH, THEN VERIFY — the same compare-and-commit as the activate path
+            # below, and it belongs here for the same reason. The check above is a
+            # READ and this save is a WRITE; a disable landing between them is missed
+            # by the sweep (no record yet) and strands a draft on a disabled entry.
+            #
+            # A stranded DRAFT is not benign, which is the easy mistake here: it does
+            # not observe anything by itself, but `draft -> active` is a legal
+            # transition, so an approval card minted before the disable can still
+            # activate the room afterwards — reproduced on adbd1b56 and the reason
+            # set_enabled() sweeps pending drafts as well as active records.
+            store.save(normalized)
+            if not _entry_still_live(store_dir, entry["key"], gen):
+                store.transition(pid, "cancelled",
+                                 note="pack entry disabled while this over-budget draft was in flight")
+                return {"status": "refused", "policy_id": pid,
+                        "reason": "entry was disabled or re-generated while this seed was in flight"}
+            return {"status": "refused", "policy_id": pid, "reason": why,
+                    "draft": normalized, "awaiting": "owner-approval"}
+
+        # Tag with pack provenance AFTER validate_draft (which drops unknown keys);
+        # the store persists extra fields and observe_policy ignores them.
+        # Cheap path: refuse before writing anything at all. This is what keeps a
+        # seed racing the sweep from persisting a record (see the racing-seed tests).
         if not _entry_still_live(store_dir, entry["key"], gen):
             return {"status": "refused", "policy_id": pid,
-                    "reason": "entry was disabled or re-generated while this seed was in flight"}
-        # `over_budget` marks this record as one the OWNER must approve, not one
-        # the pack granted itself. committed_evals_per_day() skips it forever
-        # after — including once approved — because this module's own rule is
-        # that "approving something should never make the next automatic grant
-        # harder". Without the marker an approved draft keeps plain pack
-        # provenance and consumes the automatic allowance: measured on
-        # df4b7b3b, approving 3 queued rooms took the aggregate to 26/20 and
-        # then refused EVERY subsequent auto-seed, permanently, even after a
-        # room was cancelled. The budget bounds what the pack grants ITSELF;
-        # an explicit owner decision is deliberately outside it.
-        normalized["pack"] = {"entry": entry["key"], "generation": gen,
-                              "over_budget": True}
-        # PUBLISH, THEN VERIFY — the same compare-and-commit as the activate path
-        # below, and it belongs here for the same reason. The check above is a
-        # READ and this save is a WRITE; a disable landing between them is missed
-        # by the sweep (no record yet) and strands a draft on a disabled entry.
+                "reason": "entry was disabled or re-generated while this seed was in flight"}
+        normalized["pack"] = {"entry": entry["key"], "generation": gen}
+
+        # PUBLISH, THEN VERIFY — a compare-and-commit, not a check-then-write.
         #
-        # A stranded DRAFT is not benign, which is the easy mistake here: it does
-        # not observe anything by itself, but `draft -> active` is a legal
-        # transition, so an approval card minted before the disable can still
-        # activate the room afterwards — reproduced on adbd1b56 and the reason
-        # set_enabled() sweeps pending drafts as well as active records.
+        # The check above is a READ, and the save/activate below are SEPARATE writes.
+        # A disable landing in that window was missed by BOTH sides: its sweep found
+        # no record to cancel (we had not saved yet), and we had already passed our
+        # only check — so an entry the owner had just revoked came back ACTIVE.
+        #
+        # This is reachable across PROCESSES, which is why an in-process ordering
+        # argument is not enough: this module ships a CLI (`disable`) that runs
+        # against the same store dir while the core handles a room join, so
+        # observe_policy's "single-writer (the core), so no lock protocol needed"
+        # does not hold on this path.
+        #
+        # Writing the record BEFORE the deciding check closes it from both ends:
+        #   * if the disable's sweep runs after our save, it SEES this record and
+        #     cancels it — and `cancelled` is terminal, so the activation below
+        #     fails safely rather than resurrecting it;
+        #   * if the sweep already passed us, our re-read sees `disabled` and we
+        #     cancel the record ourselves.
+        # Either interleaving ends non-active. Honour transition()'s return value —
+        # ignoring it is what let a cancelled record be reported as seeded.
         store.save(normalized)
         if not _entry_still_live(store_dir, entry["key"], gen):
             store.transition(pid, "cancelled",
-                             note="pack entry disabled while this over-budget draft was in flight")
+                             note="pack entry disabled while this seed was in flight")
             return {"status": "refused", "policy_id": pid,
                     "reason": "entry was disabled or re-generated while this seed was in flight"}
-        return {"status": "refused", "policy_id": pid, "reason": why,
-                "draft": normalized, "awaiting": "owner-approval"}
-
-    # Tag with pack provenance AFTER validate_draft (which drops unknown keys);
-    # the store persists extra fields and observe_policy ignores them.
-    # Cheap path: refuse before writing anything at all. This is what keeps a
-    # seed racing the sweep from persisting a record (see the racing-seed tests).
-    if not _entry_still_live(store_dir, entry["key"], gen):
-        return {"status": "refused", "policy_id": pid,
-            "reason": "entry was disabled or re-generated while this seed was in flight"}
-    normalized["pack"] = {"entry": entry["key"], "generation": gen}
-
-    # PUBLISH, THEN VERIFY — a compare-and-commit, not a check-then-write.
-    #
-    # The check above is a READ, and the save/activate below are SEPARATE writes.
-    # A disable landing in that window was missed by BOTH sides: its sweep found
-    # no record to cancel (we had not saved yet), and we had already passed our
-    # only check — so an entry the owner had just revoked came back ACTIVE.
-    #
-    # This is reachable across PROCESSES, which is why an in-process ordering
-    # argument is not enough: this module ships a CLI (`disable`) that runs
-    # against the same store dir while the core handles a room join, so
-    # observe_policy's "single-writer (the core), so no lock protocol needed"
-    # does not hold on this path.
-    #
-    # Writing the record BEFORE the deciding check closes it from both ends:
-    #   * if the disable's sweep runs after our save, it SEES this record and
-    #     cancels it — and `cancelled` is terminal, so the activation below
-    #     fails safely rather than resurrecting it;
-    #   * if the sweep already passed us, our re-read sees `disabled` and we
-    #     cancel the record ourselves.
-    # Either interleaving ends non-active. Honour transition()'s return value —
-    # ignoring it is what let a cancelled record be reported as seeded.
-    store.save(normalized)
-    if not _entry_still_live(store_dir, entry["key"], gen):
-        store.transition(pid, "cancelled",
-                         note="pack entry disabled while this seed was in flight")
-        return {"status": "refused", "policy_id": pid,
-                "reason": "entry was disabled or re-generated while this seed was in flight"}
-    if not store.transition(pid, "active",
-                            note="factory default (standing approval)"):
-        return {"status": "refused", "policy_id": pid,
-                "reason": "activation refused by the store — the record was already cancelled"}
-    return {"status": "seeded", "policy_id": pid, "reason": reason}
+        if not store.transition(pid, "active",
+                                note="factory default (standing approval)"):
+            return {"status": "refused", "policy_id": pid,
+                    "reason": "activation refused by the store — the record was already cancelled"}
+        return {"status": "seeded", "policy_id": pid, "reason": reason}
 
 
 def seed_defaults(store_dir: str, owner_mxid: str,
@@ -502,6 +509,16 @@ def set_enabled(store_dir: str, key: str, enabled: bool) -> dict:
     if not entry:
         return {"ok": False, "reason": f"unknown pack entry: {key}"}
     store = op.SubscriptionStore(store_dir)
+    # The disable is COMMIT + SWEEP, and both halves must be one critical section
+    # against a concurrent seed. The commit-first ordering already closed the
+    # window where a seed reads the flag before it lands; the lock closes the one
+    # where a seed WRITES between the commit and the sweep.
+    with op.store_lock(store_dir):
+        return _set_enabled_locked(store, store_dir, key, enabled)
+
+
+def _set_enabled_locked(store, store_dir: str, key: str, enabled: bool) -> dict:
+    entry = _entry(key)
     st = load_pack_state(store_dir)
     es = _entry_state(st, key)
     was_disabled = es["disabled"]

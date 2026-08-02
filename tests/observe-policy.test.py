@@ -204,6 +204,73 @@ def test_render_card_a2ui_real_contract():
           "choices carry the agreed custom-event convention (space.ag2.ha.answer)")
 
 
+def test_store_lock_serializes_a_SEPARATE_PROCESS():
+    """The lock must exclude another PROCESS, because that is the reachable race.
+
+    `default_policy_pack` ships a CLI (enable/disable/seed) that writes this store
+    while the core is running, so core-vs-CLI is a genuine concurrent-writer pair.
+    An in-process synchronous "injection" is NOT that: it is a nested same-thread
+    call, which the re-entrant lock lets through by design. So this asserts the
+    property that actually closes the P1 races, and does it across a real fork.
+
+    Three controls, because two of them can pass on a lock that is simply always
+    refusing or always granting:
+      A. parent NOT holding  -> child must ACQUIRE   (proves it can say yes)
+      B. parent holding      -> child must be REFUSED
+      C. parent inside a real transition()  -> child REFUSED (proves the SHIPPED
+         path takes it, not just a hand-rolled `with` in the test)
+    """
+    import subprocess, textwrap, json as _json
+    d = tempfile.mkdtemp()
+    child_src = textwrap.dedent(f"""
+        import sys, json, time
+        sys.path.insert(0, {os.path.dirname(op.__file__)!r})
+        import observe_policy as op
+        t0 = time.monotonic()
+        try:
+            with op.store_lock({d!r}, timeout=1.0):
+                print(json.dumps({{"r": "ACQUIRED"}}))
+        except op.StoreLockUnavailable:
+            print(json.dumps({{"r": "REFUSED"}}))
+    """)
+
+    def probe():
+        r = subprocess.run([sys.executable, "-c", child_src],
+                           capture_output=True, text=True, timeout=30)
+        try:
+            return _json.loads(r.stdout.strip())["r"]
+        except Exception:
+            return f"ERR:{r.stderr.strip()[:80]}"
+
+    check(probe() == "ACQUIRED",
+          "A: with the lock free, another process ACQUIRES it (control — the probe can say yes)")
+
+    with op.store_lock(d):
+        check(probe() == "REFUSED",
+              "B: while this process holds the lock, another process is REFUSED")
+
+    # C: the shipped mutating path must hold it, not just an explicit `with`.
+    store = op.SubscriptionStore(d)
+    rec = {"policy_id": "obs_" + "a" * 16, "status": "draft",
+           "room_id": "!r:ag2.space", "mode": sorted(op.STANDING_MODES)[0],
+           "cost_cap": {"evals_per_day": 1}}
+    store.save(rec)
+    seen = {}
+    orig_save = op.SubscriptionStore.save
+
+    def probing_save(self, r):
+        seen.setdefault("r", probe())
+        return orig_save(self, r)
+
+    op.SubscriptionStore.save = probing_save
+    try:
+        store.transition(rec["policy_id"], "cancelled", note="probe")
+    finally:
+        op.SubscriptionStore.save = orig_save
+    check(seen.get("r") == "REFUSED",
+          f"C: transition() itself holds the lock against another process (got {seen.get('r')!r})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

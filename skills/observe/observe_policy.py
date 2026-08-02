@@ -30,6 +30,8 @@ is a later slice (needs metering).
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -126,9 +128,88 @@ def evaluate_standing_approval(draft: dict, *, owner_mxid: str,
     return True, "within standing approval (self + scoped room + notify-only + default cap)"
 
 
+class StoreLockUnavailable(RuntimeError):
+    """The store lock could not be taken within its timeout.
+
+    Deliberately an ERROR rather than a silent proceed: a caller that cannot
+    serialize must not fall through into a critical section, because the whole
+    point of the lock is that the authority check and the write are one step.
+    """
+
+
+_STORE_LOCKS: "dict[str, list]" = {}
+
+
+@contextlib.contextmanager
+def store_lock(store_dir: str, *, timeout: float = 10.0):
+    """Process-wide RE-ENTRANT exclusive lock for one store directory.
+
+    Two properties, both load-bearing, both measured rather than assumed:
+
+    1. **Re-entrancy is keyed on the store DIRECTORY, process-wide** — not on the
+       SubscriptionStore instance and not on the fd. `flock` attaches to the open
+       file *description*, so a second `open()` + `LOCK_EX` from the SAME process
+       blocks forever (verified: fd1 holds, fd2 blocks; LOCK_NB returns
+       EWOULDBLOCK). That is not hypothetical here — `set_enabled()` constructs
+       its own SubscriptionStore while a seed path holds a different instance, so
+       per-instance re-entrancy would deadlock on exactly the nesting the
+       racing-seed regressions exercise.
+
+    2. **LOCK_NB + bounded retry, never a bare blocking LOCK_EX.** A lock that
+       cannot be taken raises `StoreLockUnavailable`; it does not hang. Same
+       reasoning as `codex-scheduler.py`: a hung seed on a room-join path is worse
+       than a refused one, because it takes the core down with it.
+
+    Note what this does and does not buy. It serializes CONCURRENT writers, which
+    is the reachable failure (the module ships a CLI that writes the same store
+    while the core runs). It does not make a nested same-thread call atomic —
+    re-entrancy lets that through by design — so callers must still re-verify
+    authority INSIDE the critical section rather than relying on the lock alone.
+    """
+    key = os.path.realpath(store_dir)
+    held = _STORE_LOCKS.get(key)
+    if held is not None and held[1] > 0:
+        held[1] += 1
+        try:
+            yield
+        finally:
+            held[1] -= 1
+        return
+
+    os.makedirs(store_dir, exist_ok=True)
+    fd = os.open(os.path.join(key, ".store.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise StoreLockUnavailable(
+                    f"store lock busy for >{timeout}s: {key}")
+            time.sleep(0.02)
+
+    _STORE_LOCKS[key] = [fd, 1]
+    try:
+        yield
+    finally:
+        _STORE_LOCKS.pop(key, None)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 class SubscriptionStore:
     """File-per-policy store — same inspectable pattern as the human-action
-    store. Single-writer (the core), so no lock protocol needed."""
+    store.
+
+    NOT single-writer. An earlier version of this docstring said "Single-writer
+    (the core), so no lock protocol needed", and both P1 races found on #2320
+    trace back to code trusting that sentence: `default_policy_pack` ships a CLI
+    (`enable`/`disable`/`seed`) that writes this store while the core is running.
+    Mutating sequences must run under `store_lock(self.dir)`."""
 
     def __init__(self, store_dir: str):
         self.dir = store_dir
@@ -179,19 +260,28 @@ class SubscriptionStore:
 
     def transition(self, policy_id: str, to: str, note: str = "") -> bool:
         """draft->active|cancelled, active->cancelled|expired. Terminal states
-        immutable (same discipline as human-actions)."""
-        rec = self.get(policy_id)
-        if not rec:
-            return False
-        allowed = {"draft": {"active", "cancelled"},
-                   "active": {"cancelled", "expired"}}
-        if to not in allowed.get(rec.get("status", ""), set()):
-            return False
-        rec["status"] = to
-        rec.setdefault("audit", []).append(
-            {"at": time.time(), "to": to, **({"note": note} if note else {})})
-        self.save(rec)
-        return True
+        immutable (same discipline as human-actions).
+
+        The read and the write are ONE critical section. Without the lock this
+        was a non-atomic read/modify/write: a disable that cancelled a record
+        after this method's `get()` and before its `save()` was silently
+        overwritten. Measured on e741643a — `transition()` returned True with
+        `entry_enabled=False` and the stored status back at `active`, i.e. a
+        revoked policy re-activated by a stale in-flight write.
+        """
+        with store_lock(self.dir):
+            rec = self.get(policy_id)
+            if not rec:
+                return False
+            allowed = {"draft": {"active", "cancelled"},
+                       "active": {"cancelled", "expired"}}
+            if to not in allowed.get(rec.get("status", ""), set()):
+                return False
+            rec["status"] = to
+            rec.setdefault("audit", []).append(
+                {"at": time.time(), "to": to, **({"note": note} if note else {})})
+            self.save(rec)
+            return True
 
 
 def render_card(rec: dict, *, auto_activated: bool = False,
