@@ -35,16 +35,35 @@ Commit time, not mtime: mtime moves for reasons unrelated to the peer — a sync
 a checkout, a merge — so it measures this host's git activity, not the peer's.
 
 Every threshold is read from the file itself (`valid_for_minutes`,
-`expected_back_by`), so the peer declares its own tolerances and this reader
-invents none. Snapshot age is REPORTED but never escalated on: without knowing
-the sync interval, any staleness cutoff here would be self-invented, which is
-the class of guess that produced the original false alarm.
+`valid_until`, `expected_back_by`), so the peer declares its own tolerances and
+this reader invents none.
+
+**Snapshot age is not merely informational (corrected 2026-08-02, review on
+#2515).** The first version reported it and never acted on it, reasoning that any
+staleness cutoff would be self-invented. That was an over-correction, and it
+created the mirror of the bug this module fixes: a peer that dies immediately
+after publishing a healthy snapshot can never publish again, so the reader
+returned ALIVE_AS_OF / exit 0 **forever**. Canary from the review — a heartbeat
+committed 2026-01-01, read 2026-08-02:
+
+    {"verdict": "ALIVE_AS_OF", "exit": 0, "beat_lag_min": 1.0, "snapshot_age_min": 306719.0}
+
+The cutoff was never self-invented: the peer publishes `valid_until`, a wall-clock
+deadline by which it PROMISES to have refreshed. Past it, the honest answer is
+"I cannot tell" — which is what the original protocol said and what the first
+version wrongly conflated with "the peer is down". They are different verdicts:
+UNKNOWN is not an escalation, BEAT_STOPPED is.
 
 Verdicts:
   COMEBACK_FAILED  state=down, past expected_back_by, no came_back_at (exit 2)
   BEAT_STOPPED     peer stopped beating as of its own snapshot        (exit 2)
-  ALIVE_AS_OF      beating normally as of the snapshot                (exit 0)
+  VIEW_STALE       my copy is past the peer's OWN valid_until         (exit 1)
+  ALIVE_AS_OF      beating normally, snapshot within the peer window  (exit 0)
   NOT_ARMED        no signal file / never armed                       (exit 1)
+
+VIEW_STALE exits 1, not 2: a stale view is an absence of information, not
+evidence of failure. Escalating it is what produced the original false alarm;
+reporting it as success is what the review caught.
 
 Lives in `src/`, not `scripts/`, on purpose. It needs `workspace_default` as a
 sibling import; reaching `src/` from `scripts/` means walking the repo root, and
@@ -129,12 +148,30 @@ def evaluate(doc: dict, committed: "dt.datetime | None", now: dt.datetime) -> di
                           f"snapshot (its own window is {window_min} min) — the peer stopped, "
                           f"this is not transport lag"}
 
+    # 3. The peer published `valid_until` — a wall-clock deadline by which it
+    #    promised to have refreshed. Past it we hold a snapshot the peer itself
+    #    no longer vouches for, and a peer that died right after publishing can
+    #    never refresh it. Reporting that as healthy makes the reader permanently
+    #    blind; escalating it re-creates the false alarm. So: UNKNOWN, exit 1.
+    valid_until = _iso(doc.get("valid_until", ""))
+    if valid_until is None and window_min is not None:
+        valid_until = beat + dt.timedelta(minutes=window_min)
+    if valid_until is not None and now > valid_until:
+        return {"verdict": "VIEW_STALE", "exit": 1,
+                "beat_lag_min": round(beat_lag_min, 1),
+                "snapshot_age_min": round(snapshot_age_min, 1),
+                "detail": f"the peer was beating normally when it published (lag "
+                          f"{beat_lag_min:.0f} min), but my copy is {snapshot_age_min:.0f} min old "
+                          f"and past the peer's own valid_until ({doc.get('valid_until') or 'derived'}). "
+                          f"I cannot tell whether it is still alive — this is UNKNOWN, not a "
+                          f"failure: a peer that died right after publishing would look identical."}
+
     return {"verdict": "ALIVE_AS_OF", "exit": 0,
             "beat_lag_min": round(beat_lag_min, 1),
             "snapshot_age_min": round(snapshot_age_min, 1),
             "detail": f"beating normally as of its snapshot (lag {beat_lag_min:.0f} min, window "
-                      f"{window_min} min). My copy is {snapshot_age_min:.0f} min old — reported, "
-                      f"not escalated: a staleness cutoff here would be self-invented."}
+                      f"{window_min} min), and my copy is {snapshot_age_min:.0f} min old — inside "
+                      f"the peer's own valid_until, so the view is still vouched for."}
 
 
 def main(argv=None) -> int:

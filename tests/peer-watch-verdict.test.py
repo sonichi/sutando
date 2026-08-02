@@ -103,9 +103,14 @@ check("no commit time -> NOT_ARMED, never a healthy verdict",
       v["verdict"] == "NOT_ARMED", str(v))
 
 # --- 5. Exit codes are the escalation contract -------------------------------
+# `now` must sit INSIDE the peer's declared window: this case asserts the exit
+# code of a HEALTHY verdict, and 12:00 against a 10:35 beat is 40 min past the
+# peer's own valid_until — correctly VIEW_STALE once staleness became a verdict.
+# The fixture predates that rule; its `now` was arbitrary because age did not
+# matter yet. Making it explicit rather than loosening the rule to fit it.
 check("ALIVE_AS_OF exits 0",
       pw.evaluate(doc(heartbeat_at="2026-08-02T10:35:00Z"),
-                  T("2026-08-02T10:40:00Z"), T("2026-08-02T12:00:00Z"))["exit"] == 0)
+                  T("2026-08-02T10:40:00Z"), T("2026-08-02T11:00:00Z"))["exit"] == 0)
 check("BEAT_STOPPED exits 2",
       pw.evaluate(doc(heartbeat_at="2026-08-02T09:00:00Z"),
                   T("2026-08-02T10:40:00Z"), T("2026-08-02T10:41:00Z"))["exit"] == 2)
@@ -203,6 +208,44 @@ v = pw.evaluate({"state": "back", "heartbeat_at": "garbage", "valid_for_minutes"
                 committed=T("2026-08-02T10:40:21Z"), now=T("2026-08-02T10:41:00Z"))
 check("an UNPARSEABLE heartbeat_at is NOT_ARMED, never healthy",
       v["verdict"] == "NOT_ARMED" and v["exit"] == 1, str(v))
+
+# --- 10. A stale VIEW must not read as healthy forever ----------------------
+# Review canary on #2515: a peer that dies immediately after publishing a healthy
+# snapshot can never publish again, so an age-blind reader returns ALIVE_AS_OF /
+# exit 0 indefinitely. Measured before the fix: beat_lag 1.0 min, snapshot_age
+# 306719 min (7 months), verdict ALIVE_AS_OF. The mirror of the bug this module
+# fixes — I over-corrected against wall-clock and made the reader permanently blind.
+STALE = doc(heartbeat_at="2026-01-01T00:00:00Z", valid_until="2026-01-01T00:45:00Z")
+v = pw.evaluate(STALE, committed=T("2026-01-01T00:01:00Z"), now=T("2026-08-02T00:00:00Z"))
+check("a 7-month-old healthy snapshot is VIEW_STALE, not ALIVE_AS_OF",
+      v["verdict"] == "VIEW_STALE", str(v))
+check("...and it is UNKNOWN (exit 1), not an escalation (exit 2)",
+      v["exit"] == 1, str(v))
+check("...and the beat lag is still reported as healthy — the PEER was fine",
+      v.get("beat_lag_min") == 1.0, str(v))
+check("...and the detail says 'cannot tell', not that the peer failed",
+      "cannot tell" in v["detail"], v["detail"])
+
+# The bound is the PEER's, not ours: derive it from valid_for_minutes when the
+# explicit field is absent, so an older signal file still gets a freshness check.
+v = pw.evaluate({"state": "back", "heartbeat_at": "2026-01-01T00:00:00Z",
+                 "valid_for_minutes": 45},
+                committed=T("2026-01-01T00:01:00Z"), now=T("2026-08-02T00:00:00Z"))
+check("a signal file with no valid_until falls back to beat + valid_for_minutes",
+      v["verdict"] == "VIEW_STALE", str(v))
+
+# And the boundary must not fire early — inside the peer's window stays healthy.
+v = pw.evaluate(doc(heartbeat_at="2026-08-02T10:00:00Z",
+                    valid_until="2026-08-02T10:45:00Z"),
+                committed=T("2026-08-02T10:05:00Z"), now=T("2026-08-02T10:40:00Z"))
+check("inside the peer's own valid_until the view is still ALIVE_AS_OF",
+      v["verdict"] == "ALIVE_AS_OF" and v["exit"] == 0, str(v))
+
+# A genuinely stopped beat still outranks staleness — it is the stronger claim.
+v = pw.evaluate(doc(heartbeat_at="2026-01-01T00:00:00Z", valid_until="2026-01-01T00:45:00Z"),
+                committed=T("2026-01-01T09:00:00Z"), now=T("2026-08-02T00:00:00Z"))
+check("BEAT_STOPPED still wins over VIEW_STALE when the peer had gone quiet",
+      v["verdict"] == "BEAT_STOPPED" and v["exit"] == 2, str(v))
 
 print()
 if failures:
