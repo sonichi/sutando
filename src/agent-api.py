@@ -101,6 +101,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 #               stay aligned with these writes.
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 import local_task_protocol  # noqa: E402
 
@@ -769,8 +770,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Recent activity: git commits + processed tasks
             activity = []
             try:
+                # git_argv raises GitUnavailable (an OSError) on a host with no
+                # runnable git — absorbed by the `except Exception` below, which
+                # already degrades this endpoint to "no commit activity". Never
+                # hardcode /usr/bin/git: on a Mac without developer tools it is
+                # the CLT shim and raises a modal install dialog.
                 git_log = subprocess.run(
-                    ["/usr/bin/git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
+                    git_argv("-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"),
                     capture_output=True, text=True, timeout=5
                 ).stdout.strip()
                 for line in git_log.split("\n"):
