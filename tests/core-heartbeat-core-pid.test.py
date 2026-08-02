@@ -203,6 +203,16 @@ with tempfile.TemporaryDirectory() as td5:
     check("REAL: the `--name=<session>` spelling also matches",
           _REAL_CORE_PID("/tmp/s.sock") == 4243)
 
+    def _tmux_runtime(rt: str) -> str:
+        return ("#!/bin/sh\n"
+                "for a in \"$@\"; do\n"
+                "  case \"$a\" in\n"
+                f"    show-environment) echo 'SUTANDO_CORE_RUNTIME={rt}'; exit 0 ;;\n"
+                "    list-panes) echo 777; exit 0 ;;\n"
+                "  esac\n"
+                "done\n"
+                "exit 0\n")
+
     # --- NEGATIVE CONTROLS: a PREFIXED session name must NOT match -------------
     # qingyun-wu, #2488 @8de9021e: the match was `f"--name {sess}" in args`, a
     # substring test, so target `sutando-core` was also satisfied by
@@ -218,7 +228,7 @@ with tempfile.TemporaryDirectory() as td5:
     ):
         _stub(b, "pgrep", "#!/bin/sh\necho 4242\n")
         _stub(b, "ps", f"#!/bin/sh\necho '{argv}'\n")
-        _stub(b, "tmux", _tmux_runtime("claude") if "_tmux_runtime" in dir() else "#!/bin/sh\nexit 0\n")
+        _stub(b, "tmux", _tmux_runtime("claude"))
         check(f"NEGATIVE: {spelling} must NOT be taken for the core",
               _REAL_CORE_PID("/tmp/s.sock") is None)
 
@@ -235,16 +245,6 @@ with tempfile.TemporaryDirectory() as td5:
     # scoped-pane fallback still applies. Each Claude arm below is paired with
     # the identical state on a non-Claude session, so the assertion proves the
     # DISCRIMINATION and not merely that something returned None.
-    def _tmux_runtime(rt: str) -> str:
-        return ("#!/bin/sh\n"
-                "for a in \"$@\"; do\n"
-                "  case \"$a\" in\n"
-                f"    show-environment) echo 'SUTANDO_CORE_RUNTIME={rt}'; exit 0 ;;\n"
-                "    list-panes) echo 777; exit 0 ;;\n"
-                "  esac\n"
-                "done\n"
-                "exit 0\n")
-
     # a NON-core claude must not match (someone else's claude on the box)
     _stub(b, "pgrep", "#!/bin/sh\necho 999\n")
     _stub(b, "ps", "#!/bin/sh\necho 'claude --name something-else'\n")
