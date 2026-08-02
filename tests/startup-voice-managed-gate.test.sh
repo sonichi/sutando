@@ -165,27 +165,45 @@ echo "PASS: startup voice gate recognizes the managed tier"
 #     sits on disk. The fix resolves an absolute interpreter first and PROBES it,
 #     so the stub cannot shadow a real Python.
 #
-#     Skipped where no absolute interpreter exists, rather than passing for the
-#     wrong reason: with nothing to fall back to, returning 1 IS correct and the
-#     assertion would prove nothing.
+#     This used to branch on a HOST-level probe:
+#
+#         if [ -x /opt/homebrew/bin/python3 ] || [ -x /usr/local/bin/python3 ]
+#
+#     evaluated in the OUTER shell, while the assertion runs inside
+#     `env -i PATH="$STUBBIN:/usr/bin:/bin"`. Those are different worlds, and on a
+#     Homebrew Mac they disagree: the outer test sees /opt/homebrew/bin/python3 and
+#     takes the "a real interpreter is reachable" branch, but the inner env has no
+#     brew on PATH at all (`command -v brew` -> nothing, measured), so the gate's
+#     Homebrew tier cannot fire and the assertion fails. It failed identically on
+#     the parent commit — the guard never held on that platform, and CI (Linux, no
+#     Homebrew) structurally could not see it. Reported by sonichi on #2197.
+#
+#     The branch is gone rather than repaired. Inside this hermetic env NO tier is
+#     reachable by construction — $SUTANDO_PY is cleared by `env -i`, the bundled
+#     runtime does not exist under the fixture repo, PATH's python3 IS the stub,
+#     and brew is not on PATH — so "a real interpreter is found despite the stub"
+#     was unassertable here on ANY platform, not just where it happened to fail.
+#     That case is covered properly below, by injecting a reachable interpreter
+#     into the same inner env instead of asking the host about one.
+#
+#     What remains is the invariant this env CAN express: with nothing usable to
+#     fall back to, returning 1 is correct — but it must be LOUD. Silence is the
+#     whole defect, because the caller cannot then distinguish "no usable python"
+#     from "no managed credential" and picks the wrong one.
 write_managed '{"capabilities":{"gemini-voice":{"key":"managed-voice-key"}}}'
-if [ -x /opt/homebrew/bin/python3 ] || [ -x /usr/local/bin/python3 ]; then
-  out="$(run_gate_stubbed)"
-  case "$out" in
-    *SKIP_VOICE=0*) echo "  ok  a stub python3 on PATH does not shadow the real interpreter" ;;
-    *) fail "stub python3 shadowed the real one — gate read a managed credential as absent (got: $out)" ;;
-  esac
-else
-  # No absolute interpreter to fall back to, so returning 1 is correct — but it
-  # must be LOUD. Silent is the whole defect: the caller cannot distinguish
-  # "no usable python" from "no managed credential", and picks the wrong one.
-  # This branch is not a skip; it asserts the other half of the same fix.
-  err="$(run_gate_stubbed_err)"
-  case "$err" in
-    *"no usable python3"*) echo "  ok  unusable python3 is reported, not silently read as 'absent'" ;;
-    *) fail "stub python3 produced NO warning — indistinguishable from an absent credential (stderr: ${err:-<empty>})" ;;
-  esac
-fi
+err="$(run_gate_stubbed_err)"
+case "$err" in
+  *"no usable python3"*) echo "  ok  unusable python3 is reported, not silently read as 'absent'" ;;
+  *) fail "stub python3 produced NO warning — indistinguishable from an absent credential (stderr: ${err:-<empty>})" ;;
+esac
+
+# And it must still DISABLE voice in that state rather than proceeding as if a
+# credential had been read — the warning and the outcome are separate claims.
+out="$(run_gate_stubbed)"
+case "$out" in
+  *SKIP_VOICE=1*) echo "  ok  ...and voice is disabled, not left enabled on an unread credential" ;;
+  *) fail "no usable python yet voice stayed enabled (got: $out)" ;;
+esac
 clear_managed
 
 # --- $SUTANDO_PY / bundled-runtime precedence (review blocker, 2026-08-02) -----
