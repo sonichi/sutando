@@ -37,6 +37,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -263,7 +264,16 @@ if block:
               "the writer removed a lock it never acquired")
         check("...and it says so on stderr rather than failing silently",
               "could not acquire" in r4.stderr, repr(r4.stderr[-200:]))
-        held.rmdir()
+        # Teardown, not an assertion — every claim about the foreign lock is
+        # made above and is unchanged. Guarded because a bare `rmdir` here
+        # raised FileNotFoundError once in a clean run at this head, after all
+        # five checks had PASSED. Three subsequent runs could not reproduce it,
+        # so this is hardening, NOT a diagnosis — I am not claiming to know why
+        # the directory was gone. A teardown that asserts state it never
+        # re-reads is the wrong place to learn that, and an intermittent red
+        # here would look like the fail-closed behaviour regressing when it did
+        # not.
+        shutil.rmtree(held, ignore_errors=True)
 
         # Control: with the lock released, the same invocation DOES write —
         # so the four assertions above are about the lock, not about the fixture.
