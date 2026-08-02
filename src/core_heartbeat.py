@@ -157,14 +157,29 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
         return None
 
     # The core process itself — identity, not location.
+    #
+    # `pgrep -a` is NOT portable: on Linux it prints "PID argv", but on
+    # macOS/BSD `-a` means "include ancestors" and the output is bare PIDs.
+    # Parsing argv out of it therefore matched nothing on macOS and this whole
+    # identity branch silently fell through to the pane path (review-caught,
+    # qingyun-wu on #2488; reproduced on this host: `pgrep -ax claude` printed
+    # two bare PIDs, one of them an ancestor of pgrep itself).
+    #
+    # So: `pgrep -x` for the exact process NAME (no ancestors, no argv), then
+    # ask `ps` for each pid's argv. `pgrep -f` is deliberately avoided — it
+    # matches the invoking shell's own argv and self-matches.
     try:
-        pg = subprocess.run(["pgrep", "-ax", "claude"],
+        pg = subprocess.run(["pgrep", "-x", "claude"],
                             capture_output=True, text=True, timeout=5)
         if pg.returncode == 0:
-            for line in pg.stdout.splitlines():
-                pid_s, _, args = line.partition(" ")
-                if not pid_s.strip().isdigit():
+            for pid_s in pg.stdout.split():
+                if not pid_s.isdigit():
                     continue
+                ps = subprocess.run(["ps", "-o", "args=", "-p", pid_s],
+                                    capture_output=True, text=True, timeout=5)
+                if ps.returncode != 0:
+                    continue
+                args = ps.stdout.strip()
                 if f"--name {sess}" in args or f"--name={sess}" in args:
                     return int(pid_s)
     except Exception:
@@ -231,6 +246,8 @@ def _handle_signal(signum: int, frame) -> None:
         pass
 
 
+# One `core_pid() is None` can mean "cannot tell", not "dead" — see run_forever().
+ABSENT_BEATS_BEFORE_DEATH = 3
 def run_forever(interval: float = 30.0, status: str = "running") -> int:
     """Heartbeat loop. Returns the exit code (0 on graceful shutdown)."""
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -243,10 +260,17 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     # reproduced with core_pid=None at start: three beats, .alive still present).
     # Fail-open is preserved: never having seen a core means never stopping.
     saw_core = False
+    absent_streak = 0
     while not _SHUTDOWN_REQUESTED:
         present = core_pid() is not None
         saw_core = saw_core or present
-        if saw_core and not present:
+        # `core_pid()` returns None for BOTH "the core is gone" and "I could not
+        # tell" (tmux timeout, transient exec failure) — the values are
+        # indistinguishable. Acting on a single None turns one flaky read into a
+        # removed `.alive`, i.e. a false death reported to every peer. Require
+        # CONSECUTIVE absences; any single present read resets the streak.
+        absent_streak = 0 if present else absent_streak + 1
+        if saw_core and absent_streak >= ABSENT_BEATS_BEFORE_DEATH:
             print("core_heartbeat: core pane is gone — stopping beat and "
                   "removing .alive so readers see it leave", file=sys.stderr, flush=True)
             try:

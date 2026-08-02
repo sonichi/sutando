@@ -172,18 +172,25 @@ with tempfile.TemporaryDirectory() as td5:
     b = pathlib.Path(td5) / "bin"
     # session EXISTS (exit 0 for =sutando-core), pgrep finds the core claude
     _stub(b, "tmux", "#!/bin/sh\nexit 0\n")
-    _stub(b, "pgrep", "#!/bin/sh\necho '4242 claude --name sutando-core --foo'\n")
+    # Portable toolchain (2026-08-02, #2488 review): `pgrep -x` yields bare pids
+    # on BOTH Linux and macOS; argv comes from `ps`. The old fake emitted the
+    # Linux-only `pgrep -a` shape ("PID argv"), which is exactly the assumption
+    # that made this branch dead on macOS — the fixture encoded the bug.
+    _stub(b, "pgrep", "#!/bin/sh\necho 4242\n")
+    _stub(b, "ps", "#!/bin/sh\necho 'claude --name sutando-core --foo'\n")
     os.environ["PATH"] = f"{b}:{_ORIG_PATH}"
     check("REAL: pgrep match on `--name <session>` returns the core pid",
           _REAL_CORE_PID("/tmp/s.sock") == 4242)
 
     # same, the `--name=<session>` spelling
-    _stub(b, "pgrep", "#!/bin/sh\necho '4243 claude --name=sutando-core'\n")
+    _stub(b, "pgrep", "#!/bin/sh\necho 4243\n")
+    _stub(b, "ps", "#!/bin/sh\necho 'claude --name=sutando-core'\n")
     check("REAL: the `--name=<session>` spelling also matches",
           _REAL_CORE_PID("/tmp/s.sock") == 4243)
 
     # a NON-core claude must not match (someone else's claude on the box)
-    _stub(b, "pgrep", "#!/bin/sh\necho '999 claude --name something-else'\n")
+    _stub(b, "pgrep", "#!/bin/sh\necho 999\n")
+    _stub(b, "ps", "#!/bin/sh\necho 'claude --name something-else'\n")
     _stub(b, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) echo 777; exit 0;; esac; done\nexit 0\n")
     check("REAL: a claude for a DIFFERENT session falls through to the pane path",
           _REAL_CORE_PID("/tmp/s.sock") == 777)
@@ -216,7 +223,10 @@ with tempfile.TemporaryDirectory() as td7:
     _stub(b7, "tmux", "#!/bin/sh\nfor a in \"$@\"; do case $a in list-panes) echo 555; exit 0;; esac; done\nexit 0\n")
     # pgrep prints a NON-NUMERIC first token before the real row. Without the
     # `continue` this would crash on int(); with it, the real row still matches.
-    _stub(b7, "pgrep", "#!/bin/sh\necho 'PID COMMAND'\necho '4321 claude --name sutando-core'\n")
+    # `pgrep -x` should print only pids, but a hostile/odd binary could emit a
+    # header row; the `isdigit()` guard must skip it and still match the real pid.
+    _stub(b7, "pgrep", "#!/bin/sh\necho 'PID'\necho 4321\n")
+    _stub(b7, "ps", "#!/bin/sh\necho 'claude --name sutando-core'\n")
     os.environ["PATH"] = f"{b7}:{_ORIG_PATH}"
     check("a non-numeric pgrep line is skipped, the real row still matches",
           _REAL_CORE_PID("/tmp/s.sock") == 4321)
