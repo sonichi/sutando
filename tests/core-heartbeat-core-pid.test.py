@@ -325,6 +325,16 @@ with tempfile.TemporaryDirectory() as td7:
           _REAL_CORE_PID("/tmp/s.sock") == 4321)
 os.environ["PATH"] = _ORIG_PATH
 
+with tempfile.TemporaryDirectory() as td_ps_fail:
+    b_ps_fail = pathlib.Path(td_ps_fail) / "bin"; b_ps_fail.mkdir(parents=True)
+    _stub(b_ps_fail, "tmux", "#!/bin/sh\nexit 0\n")
+    _stub(b_ps_fail, "pgrep", "#!/bin/sh\necho 111\necho 222\n")
+    _stub(b_ps_fail, "ps", "#!/bin/sh\n[ \"$4\" = 111 ] && exit 1\necho 'claude --name sutando-core'\n")
+    os.environ["PATH"] = f"{b_ps_fail}:{_ORIG_PATH}"
+    check("a failed ps lookup is skipped and the next matching pid resolves",
+          _REAL_CORE_PID("/tmp/s.sock") == 222)
+os.environ["PATH"] = _ORIG_PATH
+
 with tempfile.TemporaryDirectory() as td8:
     b8 = pathlib.Path(td8) / "bin"; b8.mkdir(parents=True)
     # tmux PRESENT but pgrep ABSENT -> the subprocess call raises, the except
@@ -338,6 +348,35 @@ with tempfile.TemporaryDirectory() as td8:
     check("pgrep missing entirely -> swallowed, falls through to the pane path",
           _REAL_CORE_PID("/tmp/s.sock") == 556)
 os.environ["PATH"] = _ORIG_PATH
+
+# When tmux cannot report a session-owned runtime, the repo config remains the
+# bounded fallback. A multiline value is defensive input: only its first line
+# may become the runtime identifier.
+_REAL_TMUX = ch._tmux
+sc = importlib.import_module("sutando_config")
+_REAL_RESOLVE_CORE_RUNTIME = sc.resolve_core_runtime
+ch._tmux = lambda *args, **kwargs: None
+sc.resolve_core_runtime = lambda: "codex\nignored"
+check("session runtime falls back to the first non-empty config line",
+      ch._session_runtime("/tmp/s.sock", "sutando-core") == "codex")
+sc.resolve_core_runtime = _REAL_RESOLVE_CORE_RUNTIME
+ch._tmux = _REAL_TMUX
+
+# A transient heartbeat write failure must be logged and retried rather than
+# killing the daemon. Bound the loop through the normal shutdown flag.
+_write_fail_calls = {"n": 0}
+def _present_then_stop(socket_path=None, session=None):
+    _write_fail_calls["n"] += 1
+    if _write_fail_calls["n"] >= 2:
+        ch._SHUTDOWN_REQUESTED = True
+    return 4242
+def _write_fails(status="running"):
+    raise OSError("transient write failure")
+ch.core_pid = _present_then_stop
+ch.write_beat = _write_fails
+ch._SHUTDOWN_REQUESTED = False
+check("transient write failure does not terminate the heartbeat loop",
+      ch.run_forever(interval=0.01) == 0)
 
 # .alive unlink raising must not crash the vanish path — the beat is stopping
 # either way, and an unremovable file is not worth a traceback in a daemon.
