@@ -42,14 +42,14 @@
     "claude_sutando_config_dir": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Where the Sutando-scoped Claude Code config lives — set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
+      "description": "Where the Sutando-scoped Claude Code config lives \u2014 set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
       "properties": {
         "subdir": {
           "type": "string",
           "minLength": 1,
           "default": ".claude-sutando",
           "pattern": "^(?!.*\\.\\.)(?!/)[^/].*$",
-          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace — absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
+          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace \u2014 absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
         }
       }
     },
@@ -110,7 +110,7 @@
         "sync": {
           "type": "object",
           "additionalProperties": false,
-          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) — overriding in .local.json wipes the defaults for that array.",
+          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) \u2014 overriding in .local.json wipes the defaults for that array.",
           "properties": {
             "include": {
               "type": "array",
@@ -145,7 +145,7 @@
       "properties": {
         "progress_stream": {
           "type": "boolean",
-          "description": "Emit in-channel '⏳ working… (Ns)' progress placeholders while a task runs."
+          "description": "Emit in-channel '\u23f3 working\u2026 (Ns)' progress placeholders while a task runs."
         }
       }
     },
