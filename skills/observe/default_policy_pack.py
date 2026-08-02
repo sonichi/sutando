@@ -177,6 +177,25 @@ def committed_evals_per_day(store: "op.SubscriptionStore") -> int:
     return total
 
 
+def _entry_still_live(store_dir: str, key: str, generation: int) -> bool:
+    """Re-read pack state: is `key` still enabled AND still on `generation`?
+
+    Called immediately before any persist/activate in seed_room, because the
+    decision to seed was taken earlier and the owner may have disabled the entry
+    in between. Committing the disable first (see set_enabled) closes the other
+    half of that window; this closes the half where a seed is still in flight.
+
+    Re-READS from disk rather than trusting the state loaded at the top of
+    seed_room — the whole point is that it may have changed since.
+    """
+    st = load_pack_state(store_dir)
+    es = st["entries"].get(key)
+    if es is None:
+        entry = _entry(key)
+        return bool(entry and entry.get("default_enabled", True)) and generation == 1
+    return (not es.get("disabled", False)) and es.get("generation") == generation
+
+
 def _budget_allows(store: "op.SubscriptionStore", draft: dict) -> "tuple[bool, str]":
     """Would activating `draft` keep the pack inside its aggregate budget?"""
     cap = (draft.get("cost_cap") or {}).get("evals_per_day")
@@ -232,6 +251,10 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
             ok, why = _budget_allows(store, normalized)
             if not ok:
                 return {"status": "refused", "policy_id": pid, "reason": why}
+            if not _entry_still_live(store_dir, entry["key"], gen):
+                return {"status": "refused", "policy_id": pid,
+                        "reason": "entry was disabled or re-generated while this "
+                                  "seed was in flight"}
             normalized["pack"] = {"entry": entry["key"], "generation": gen}
             store.save(normalized)  # re-assert content (idempotent for this gen)
             store.transition(pid, "active",
@@ -280,6 +303,9 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
         # re-runs this same check — so it cannot self-activate while over budget,
         # and it DOES activate on the next seed if budget frees up because a room
         # was cancelled. Self-healing rather than requiring a re-seed dance.
+        if not _entry_still_live(store_dir, entry["key"], gen):
+            return {"status": "refused", "policy_id": pid,
+                    "reason": "entry was disabled or re-generated while this seed was in flight"}
         normalized["pack"] = {"entry": entry["key"], "generation": gen}
         store.save(normalized)
         return {"status": "refused", "policy_id": pid, "reason": why,
@@ -287,6 +313,9 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
 
     # Tag with pack provenance AFTER validate_draft (which drops unknown keys);
     # the store persists extra fields and observe_policy ignores them.
+    if not _entry_still_live(store_dir, entry["key"], gen):
+        return {"status": "refused", "policy_id": pid,
+            "reason": "entry was disabled or re-generated while this seed was in flight"}
     normalized["pack"] = {"entry": entry["key"], "generation": gen}
     store.save(normalized)
     store.transition(pid, "active", note="factory default (standing approval)")
@@ -402,14 +431,32 @@ def set_enabled(store_dir: str, key: str, enabled: bool) -> dict:
         # persisted — before that there were no pack drafts to strand. A fix that
         # creates a new record type has to be walked through every lifecycle that
         # enumerates records, not just the one it was written for.
-        for rec in _active_records_for(store, key) + _pending_drafts_for(store, key):
-            if store.transition(rec["policy_id"], "cancelled",
-                                 note="pack entry disabled by owner"):
-                cancelled += 1
+        # COMMIT THE DISABLE FIRST, THEN SWEEP. The reverse order made the sweep a
+        # snapshot with an open window behind it: a seed already in flight could
+        # persist a record AFTER _pending_drafts_for() returned but BEFORE
+        # disabled=True was written, so it was in neither the sweep nor the gate.
+        # Reproduced on 4d50448b, two variants of one race —
+        #   over budget  -> persisted as `draft`, survived, then activated on a
+        #                   late approval click (activate_late True)
+        #   under budget -> the sweep had already freed allowance, so the racing
+        #                   seed went straight to `active` and needed no click at
+        #                   all: a live subscription on an entry reading disabled.
+        # The second is worse and is the one the ordering alone cannot catch.
+        #
+        # With the flag committed first, the window inverts and both halves are
+        # covered: anything persisted BEFORE the commit is caught by the sweep
+        # that now runs after it, and anything still in flight AFTER the commit
+        # sees the disable at its own re-check (see _entry_still_live) and
+        # refuses. Cheap, and it needs no lock the store does not have.
         if not was_disabled:
             es["generation"] += 1  # next enable seeds a fresh generation
         es["disabled"] = True
         save_pack_state(store_dir, st)
+
+        for rec in _active_records_for(store, key) + _pending_drafts_for(store, key):
+            if store.transition(rec["policy_id"], "cancelled",
+                                 note="pack entry disabled by owner"):
+                cancelled += 1
         return {"ok": True, "key": key, "enabled": False,
                 "cancelled_rooms": cancelled}
     es["disabled"] = False

@@ -471,6 +471,93 @@ def test_disable_then_reenable_still_seeds_a_fresh_generation():
           f"...and the aggregate budget still holds ({_aggregate(d)})")
 
 
+def test_a_seed_racing_the_disable_cannot_survive_it():
+    """john-the-dev's TOCTOU follow-up on #2320, in BOTH variants.
+
+    The sweep added by the previous fix read the draft list, then cancelled, then
+    committed disabled=True. A seed already in flight could persist a record into
+    that gap: absent from the sweep, and not yet gated by the flag.
+
+    Reproduced on 4d50448b two ways from one root cause:
+      over budget  -> persisted as `draft`, survived, and a late approval click
+                      ACTIVATED it (activate_late True) on a disabled entry;
+      under budget -> the sweep had already freed allowance, so the racing seed
+                      went straight to `active` and needed no click at all.
+    The second is worse and ordering alone cannot catch it, which is why the fix
+    is ordering (commit the flag first) PLUS revalidation at every persist point.
+    """
+    entry = dpp._entry("react_baseline")
+    rooms = [f"!r{i}:ag2.space" for i in range(11)]
+
+    # --- variant A: inject at the exact window (right after the draft snapshot)
+    d = _store()
+    dpp.seed_defaults(d, OWNER, rooms)
+    store = op.SubscriptionStore(d)
+    caught = {}
+    orig_drafts = dpp._pending_drafts_for
+    def hooked(s, k):
+        out = orig_drafts(s, k)
+        if not caught:
+            r = dpp.seed_room(op.SubscriptionStore(d), d, entry, "!late:ag2.space",
+                              owner_mxid=OWNER, owner_rooms=rooms + ["!late:ag2.space"])
+            caught["pid"] = r["policy_id"]; caught["status"] = r["status"]
+        return out
+    dpp._pending_drafts_for = hooked
+    try:
+        dpp.set_enabled(d, "react_baseline", False)
+    finally:
+        dpp._pending_drafts_for = orig_drafts
+    check(caught.get("status") == "refused",
+          f"A: a seed racing the sweep is REFUSED (got {caught.get('status')})")
+    check(store.get(caught["pid"]) is None,
+          "A: ...and nothing is persisted for it at all")
+
+    # --- variant B: inject mid-sweep, once budget has been freed by cancellations
+    d2 = _store()
+    dpp.seed_defaults(d2, OWNER, rooms)
+    store2 = op.SubscriptionStore(d2)
+    caught2 = {}
+    orig_tr = op.SubscriptionStore.transition
+    def racing(self, pid, to, note=""):
+        r = orig_tr(self, pid, to, note)
+        if not caught2 and to == "cancelled":
+            x = dpp.seed_room(op.SubscriptionStore(d2), d2, entry, "!late:ag2.space",
+                              owner_mxid=OWNER, owner_rooms=rooms + ["!late:ag2.space"])
+            caught2["pid"] = x["policy_id"]; caught2["status"] = x["status"]
+        return r
+    op.SubscriptionStore.transition = racing
+    try:
+        dpp.set_enabled(d2, "react_baseline", False)
+    finally:
+        op.SubscriptionStore.transition = orig_tr
+    check(caught2.get("status") == "refused",
+          f"B: an under-budget racing seed is REFUSED, not auto-ACTIVATED (got {caught2.get('status')})")
+    check(store2.get(caught2["pid"]) is None,
+          "B: ...and no live subscription is left on a disabled entry")
+
+
+def test_disable_commits_its_flag_before_sweeping():
+    """The ordering half, asserted directly rather than inferred from the race.
+
+    If the flag were still written last, a reader observing mid-sweep would see
+    the entry as ENABLED while its records were already being cancelled.
+    """
+    d = _store()
+    dpp.seed_defaults(d, OWNER, [f"!r{i}:ag2.space" for i in range(3)])
+    seen = []
+    orig_tr = op.SubscriptionStore.transition
+    def observe(self, pid, to, note=""):
+        seen.append(dpp.is_enabled(d, "react_baseline"))
+        return orig_tr(self, pid, to, note)
+    op.SubscriptionStore.transition = observe
+    try:
+        dpp.set_enabled(d, "react_baseline", False)
+    finally:
+        op.SubscriptionStore.transition = orig_tr
+    check(seen and not any(seen),
+          f"the entry already reads DISABLED during every cancellation (saw {seen})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
