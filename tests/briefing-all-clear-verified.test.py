@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+""""Everything looks clean" must mean every query ran, not that every query was falsy.
+
+`get_reminders()` and `get_health_issues()` both returned `[]` on
+TimeoutExpired/OSError — the same value they return when the query ran and found
+nothing. `synthesize()` closed on `not reminders and not health_issues`, so a
+timed-out reminders fetch plus a timed-out health check produced a confident
+"Everything looks clean. Good day for deep work." over two questions nobody had
+answered. Spoken to the owner every morning.
+
+`get_calendar_events()` already drew this line (None vs []) after the 2026-07-21
+falsely-clear bug, #2256; the other two gathers never did.
+
+Test 1 is the discriminator: the SAME synthesize() inputs except failure-vs-empty
+must produce different closings. Tests 4-5 are the regression for a crash this
+fix could have introduced — main() calls len() on both values unguarded.
+
+Run: python3 tests/briefing-all-clear-verified.test.py
+"""
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location("mb", REPO / "src" / "morning-briefing.py")
+_mod = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(_mod)
+except SystemExit:
+    pass
+
+_passed = 0
+_failed = 0
+
+
+def ok(name: str, cond: bool, detail: str = "") -> None:
+    global _passed, _failed
+    if cond:
+        _passed += 1
+        print(f"  ok   {name}")
+    else:
+        _failed += 1
+        print(f"  FAIL {name}" + (f" — {detail}" if detail else ""))
+
+
+def _with_failing_subprocess(fn, exc):
+    real = _mod.subprocess.run
+    try:
+        _mod.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(exc)
+        return fn()
+    finally:
+        _mod.subprocess.run = real
+
+
+CLEAN = "Everything looks clean"
+
+# --- the gathers must report unavailability, not emptiness -------------------
+rem = _with_failing_subprocess(_mod.get_reminders, subprocess.TimeoutExpired("osascript", 5))
+ok("get_reminders() returns None on timeout, not []", rem is None, f"got {rem!r}")
+
+hl = _with_failing_subprocess(_mod.get_health_issues, subprocess.TimeoutExpired("health", 5))
+ok("get_health_issues() returns None on timeout, not []", hl is None, f"got {hl!r}")
+
+rem_os = _with_failing_subprocess(_mod.get_reminders, OSError("no such binary"))
+ok("get_reminders() returns None on OSError too", rem_os is None, f"got {rem_os!r}")
+
+# --- the closing distinguishes verified-empty from unanswered ---------------
+verified = _mod.synthesize(None, [], [], [], [], [])
+ok("a genuinely clean day STILL gets the all-clear",
+   CLEAN in verified, f"got {verified!r}")
+
+degraded = _mod.synthesize(None, [], None, [], [], None)
+ok("failed reminders + failed health check get NO all-clear",
+   CLEAN not in degraded, f"got {degraded!r}")
+
+ok("the two are distinguishable (the whole point)",
+   (CLEAN in verified) != (CLEAN in degraded))
+
+# each alone is sufficient to withhold it
+ok("failed reminders alone withholds the all-clear",
+   CLEAN not in _mod.synthesize(None, [], None, [], [], []))
+ok("failed health check alone withholds the all-clear",
+   CLEAN not in _mod.synthesize(None, [], [], [], [], None))
+
+# and the pre-existing calendar guard is untouched
+ok("unreadable calendar still withholds the all-clear (#2256, unchanged)",
+   CLEAN not in _mod.synthesize(None, None, [], [], [], []))
+
+# --- None must not crash the reporting lines --------------------------------
+# main() calls len() on both values. Returning None without fixing those would
+# raise TypeError and take the whole briefing down — worse than the bug.
+try:
+    _ = f"  reminders: {'unavailable' if rem is None else f'{len(rem)} due'}"
+    _ = f"  health issues: {'unavailable' if hl is None else len(hl)}"
+    ok("main()'s progress lines survive None (no len(None))", True)
+except TypeError as e:
+    ok("main()'s progress lines survive None (no len(None))", False, str(e))
+
+# Substring-matching `len(reminders)` was too crude: the CORRECT guarded form
+# contains it too (`'unavailable' if reminders is None else f'{len(reminders)}'`).
+# Assert the guard is present on the same line instead.
+src = (REPO / "src" / "morning-briefing.py").read_text()
+_len_lines = [ln for ln in src.splitlines()
+              if "len(reminders)" in ln or "len(health_issues)" in ln]
+ok("every len() on a possibly-None gather is guarded by an `is None` check",
+   all("is None" in ln for ln in _len_lines),
+   f"unguarded: {[ln.strip() for ln in _len_lines if 'is None' not in ln]}")
+
+# --- content lines still render when data IS present ------------------------
+withdata = _mod.synthesize(None, [], ["Call the dentist"], [], [], ["disk: 91% full"])
+ok("reminders still render when present", "Call the dentist" in withdata)
+ok("health issues still render when present", "disk: 91% full" in withdata)
+ok("a day with real items gets no all-clear", CLEAN not in withdata)
+
+
+print(f"briefing-all-clear-verified: {_passed}/{_passed + _failed} passed"
+      + (f" — {_failed} FAILED" if _failed else ""))
+raise SystemExit(1 if _failed else 0)

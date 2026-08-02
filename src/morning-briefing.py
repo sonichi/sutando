@@ -254,18 +254,25 @@ return output
     return events
 
 
-def get_reminders() -> list[str]:
-    """Get today's and overdue reminders via the existing script."""
+def get_reminders() -> "list[str] | None":
+    """Today's and overdue reminders, or None when the query could not run.
+
+    None and [] are different facts and the caller relies on the difference:
+    [] is a verified-empty list, None is "I do not know". Returning [] for a
+    timeout let `synthesize()` fold an unanswered query into "Everything looks
+    clean" — the same shape as the 2026-07-21 falsely-clear calendar bug
+    (#2256), which is why `get_calendar_events()` already draws this line.
+    """
     script_path = Path(__file__).parent.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
     if not script_path.exists():
-        return []
+        return None
     try:
         r = subprocess.run(
             [sys.executable, str(script_path), "list", "--due-today"],
             capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0:
-            return []
+            return None
         items = []
         # reminders.py prints the human-readable sentinel "No reminders."
         # (exit 0) when the due-today list is empty — skip it so the empty
@@ -278,7 +285,7 @@ def get_reminders() -> list[str]:
                 items.append(line)
         return items[:5]
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        return None
 
 
 def get_overnight_discord() -> list[str]:
@@ -374,11 +381,16 @@ def get_pending_questions() -> list[str]:
 
 
 
-def get_health_issues() -> list[str]:
-    """Run health check and return only the failed/warn items, concisely."""
+def get_health_issues() -> "list[str] | None":
+    """Failed health items, or None when the check could not run.
+
+    Same contract as `get_reminders`: [] means the check ran and found nothing,
+    None means it did not run. A timed-out health check returning [] made the
+    briefing assert a clean system it had never inspected.
+    """
     hc = Path(__file__).parent / "health-check.py"
     if not hc.exists():
-        return []
+        return None
     try:
         r = subprocess.run(
             [sys.executable, str(hc)],
@@ -400,7 +412,7 @@ def get_health_issues() -> list[str]:
                     issues.append(parts[0])
         return issues[:3]
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        return None
 
 
 def get_daily_insight() -> str | None:
@@ -483,8 +495,14 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         if not has_raw_data and len(first_sentence) > 20:
             parts.append(f"Insight: {first_sentence}.")
 
-    # Closing — an unreadable calendar (None) is not a verified-clean day.
-    if events == [] and not reminders and not pending_qs and not health_issues:
+    # Closing — every input must be VERIFIED empty, not merely falsy. `None`
+    # from any gather means that query did not run, and an unanswered query is
+    # not evidence of a clean day. Previously only the calendar was checked this
+    # way, so a timed-out reminders fetch and a timed-out health check (both
+    # returning [] at the time) produced a confident "Everything looks clean"
+    # over two questions nobody had answered.
+    if (events == [] and reminders == [] and health_issues == []
+            and not pending_qs):
         parts.append("Everything looks clean. Good day for deep work.")
 
     return " ".join(parts)
@@ -525,7 +543,7 @@ def main():
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
 
     reminders = get_reminders()
-    print(f"  reminders: {len(reminders)} due")
+    print(f"  reminders: {'unavailable' if reminders is None else f'{len(reminders)} due'}")
 
     discord_msgs = get_overnight_discord()
     print(f"  discord overnight: {len(discord_msgs)} messages")
@@ -537,7 +555,7 @@ def main():
     print(f"  pending questions: {len(pending_qs)}")
 
     health_issues = get_health_issues()
-    print(f"  health issues: {len(health_issues)}")
+    print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")
 
     # Synthesize
     narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight)
