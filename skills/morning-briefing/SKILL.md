@@ -14,21 +14,23 @@ ARGUMENTS: $ARGUMENTS
 
 ## What to gather
 
-**Step 0 — Base data (canonical, always run first):**
+**Step 0 — Calendar cache. CONDITIONAL: Google-calendar hosts only.**
 
-**Step 0 — produce the calendar cache FIRST (Google-calendar hosts).** `src/morning-briefing.py`
-cannot reach the owner's Google Workspace calendar; it reads a cache the *agent* writes. Skipping
-this step is silent: the briefing reports "couldn't read your calendar", or falls back to a local
-macOS Calendar read that stalls and can miss the work account entirely. Pull today's local-day
-events from the Google connector, then:
+`src/morning-briefing.py` cannot reach the owner's Google Workspace calendar; it reads a cache the
+*agent* writes. Omitting this is silent: the briefing reports "couldn't read your calendar", or
+falls back to a local macOS Calendar read that stalls and can miss the work account entirely. Pull
+today's local-day events from the Google connector, then:
 
 ```bash
 echo '[{"raw":"9:00-9:30am 1:1 w/ Sam","calendar":"work"}]' | python3 src/write_calendar_cache.py
 python3 src/write_calendar_cache.py --empty   # ONLY for a genuinely empty day
 ```
 
-Skip step 0 on hosts with no Google connector — the reader falls back to local macOS Calendar.
-See "Calendar source (Google Workspace) — activation" below for the full contract.
+**Hosts with no Google connector skip STEP 0 ONLY** — the reader falls back to local macOS
+Calendar. Step 1 below still runs on every host. See "Calendar source (Google Workspace) —
+activation" for the full contract.
+
+**Step 1 — Base data (canonical; runs on EVERY host, including hosts that skipped Step 0):**
 
 ```bash
 WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
