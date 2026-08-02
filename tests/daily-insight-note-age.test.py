@@ -260,6 +260,65 @@ with tempfile.TemporaryDirectory() as _tmp:
        stats2["total"] == 3, f"got {stats2}")
 
 
+# --- no-history workspace must not fan out either (review #2526 round 3) ---
+# git RUNS and succeeds, but the notes path has no history: not a worktree, or
+# the workspace is ignored by the parent checkout. Measured at the review head:
+# 15 subprocess calls for 14 notes. An empty bulk map means the repo has nothing
+# to say about notes/, so asking it once per note gets the same nothing N times.
+# The call count must be independent of N.
+
+for _n_notes in (3, 9):
+    with tempfile.TemporaryDirectory() as _tmp:
+        ws = Path(_tmp)
+        notes = ws / "notes"
+        notes.mkdir()
+        for i in range(_n_notes):
+            (notes / f"n{i}.md").write_text("body\n")
+        # deliberately NOT a git work tree
+
+        _o_ws, _o_dir, _o_run = _mod.WORKSPACE, _mod.NOTES_DIR, _mod.subprocess.run
+        _seen = []
+
+        def _tally(*a, **k):
+            _seen.append(a[0] if a else None)
+            return _o_run(*a, **k)
+
+        try:
+            _mod.WORKSPACE, _mod.NOTES_DIR = str(ws), notes
+            _mod.subprocess.run = _tally
+            created, ran = _mod._note_creation_dates(notes)
+            _seen.clear()
+            stats = _mod.analyze_note_activity()
+        finally:
+            _mod.subprocess.run = _o_run
+            _mod.WORKSPACE, _mod.NOTES_DIR = _o_ws, _o_dir
+
+        ok(f"no-history workspace ({_n_notes} notes): bulk map is empty",
+           created == {}, f"got {created!r}")
+        ok(f"no-history workspace ({_n_notes} notes): exactly 1 git call, independent of N",
+           len(_seen) == 1,
+           f"{len(_seen)} calls for {_n_notes} notes — fan-out scales with N")
+        ok(f"no-history workspace ({_n_notes} notes): still returns a count",
+           stats["total"] == _n_notes, f"got {stats}")
+
+# and the single definition, since a shadowed duplicate silently kept a
+# bare-`git` body alive through one whole review round
+import inspect  # noqa: E402
+_src = inspect.getsource(_mod)
+ok("exactly one _note_creation_dates definition (no shadowed duplicate)",
+   _src.count("def _note_creation_dates(") == 1,
+   f"{_src.count('def _note_creation_dates(')} definitions")
+# Scoped to the two helpers this PR introduces. daily-insight.py has three
+# OTHER bare-`git` call sites (author identity, repo-root, dev-activity log)
+# that predate this change and are not in its diff — asserting on them would
+# fail this PR for code it does not touch. Flagged in the PR body instead.
+for _fn in (_mod._note_creation_dates, _mod._note_added_at):
+    _fsrc = inspect.getsource(_fn)
+    ok(f"{_fn.__name__} builds argv via git_argv, not bare git",
+       "git_argv(" in _fsrc and '["git"' not in _fsrc,
+       f"bare git argv in {_fn.__name__}")
+
+
 print(f"daily-insight-note-age: {_passed}/{_passed + _failed} passed"
       + (f" — {_failed} FAILED" if _failed else ""))
 raise SystemExit(1 if _failed else 0)

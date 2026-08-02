@@ -142,42 +142,6 @@ def _frontmatter_tags(content: str) -> list[str]:
     return []
 
 
-def _note_creation_dates(notes_dir):
-    """Map note filename -> creation timestamp, taken from the first commit that
-    ADDED each file.
-
-    mtime cannot answer "when was this written" in this workspace. The workspace
-    is a git-backed vault synced across hosts, and both `git checkout` and the
-    rsync path stamp every file with the time of the *sync*, not of the writing.
-    On 2026-08-02 that made 673 of 725 notes share one mtime to the minute, so
-    the seven-day filter below matched every note on disk and `recent_7d` was
-    identically `total` (356 == 356) — a filter that cannot discriminate, which
-    is the same trap `skills/task-orphan-check/SKILL.md` documents for task
-    files. Git commit dates are immune: they survive clone, checkout and sync.
-
-    Returns {} when git is unavailable or the workspace is not a work tree, in
-    which case the caller falls back to mtime rather than claiming nothing.
-    """
-    try:
-        r = subprocess.run(
-            ["git", "-C", str(WORKSPACE), "log", "--diff-filter=A",
-             "--name-only", "--format=@%aI", "--", str(notes_dir)],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if r.returncode != 0:
-        return {}
-    created, stamp = {}, None
-    for line in r.stdout.splitlines():
-        if line.startswith("@"):
-            stamp = line[1:]
-        elif line.strip() and stamp:
-            # setdefault keeps the OLDEST add when a path was deleted and re-added
-            created.setdefault(Path(line.strip()).name, stamp)
-    return created
-
-
 def _iso_z(stamp):
     """Normalise a trailing `Z` to `+00:00` for `datetime.fromisoformat`.
 
@@ -283,10 +247,18 @@ def analyze_note_activity():
 
     def _is_recent(n):
         iso = created.get(n.name)
-        if iso is None and git_ran:
-            # absent from the bulk map (history simplification). Bounded: this
-            # runs only for the handful of names the one directory query missed,
-            # never per-note, and never at all when git could not run.
+        if iso is None and git_ran and created:
+            # Absent from a bulk map that DID return history — the
+            # history-simplification case, so a single-path query can still
+            # answer. Bounded by the number of names that query missed.
+            #
+            # `and created` is load-bearing: an EMPTY bulk map means this repo
+            # has no history for notes/ at all (not a worktree, or the path is
+            # ignored). Per-file probes then ask the same repo the same
+            # question once per note and get the same nothing — measured at 15
+            # subprocess calls for 14 notes on a non-worktree workspace. The
+            # count must not scale with N when the bulk query already proved
+            # there is nothing to find.
             iso = _note_added_at(n) or None
         if iso is not None:
             verdict = _stamp_is_recent(iso)
