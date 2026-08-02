@@ -190,5 +190,66 @@ class OvernightWindowTest(unittest.TestCase):
         self.assertEqual(len(only), 80)
 
 
+    # ---- upper edge of the window (john-the-dev, PR #2508 @ e42cc19d) ----
+    # Only the LOWER bound was enforced, so one future-dated stamp counted as
+    # "overnight" in every briefing until the wall clock caught up. Testing the
+    # whole boundary AXIS, not just the reported case: a fixture set containing
+    # only the bug a reviewer named cannot catch the next one.
+
+    def _month_archive(self):
+        """The ACTIVE archive layout — where a processed DM really lands."""
+        return self.ws / "tasks" / "archive" / "2026-08"
+
+    def test_future_dated_task_is_excluded(self):
+        write_task(self._month_archive(), "future", self.now + 365 * 86400,
+                   body="future-dated")
+        self.assertEqual(self.mod.get_overnight_discord(now=self.now), [])
+
+    def test_future_dated_task_in_flat_archive_is_excluded(self):
+        write_task(self.ws / "tasks" / "archive", "flatfuture", self.now + 3600,
+                   body="flat future")
+        self.assertEqual(self.mod.get_overnight_discord(now=self.now), [])
+
+    def test_future_dated_task_in_live_tasks_dir_is_excluded(self):
+        write_task(self.ws / "tasks", "livefuture", self.now + 60, body="live future")
+        self.assertEqual(self.mod.get_overnight_discord(now=self.now), [])
+
+    def test_task_written_exactly_now_is_included(self):
+        """Upper bound is INCLUSIVE — a DM arriving this instant still counts."""
+        write_task(self._month_archive(), "rightnow", self.now, body="right now")
+        self.assertEqual(self.mod.get_overnight_discord(now=self.now), ["right now"])
+
+    def test_task_exactly_at_cutoff_is_included(self):
+        """Lower bound is INCLUSIVE — unchanged by the upper-bound fix.
+
+        Pinned to a whole second on purpose. `write_task` serialises with `%S`,
+        so a fractional `now` truncates the stamp BELOW a fractional cutoff and
+        the case silently becomes "one second early" instead of "exactly at the
+        edge" — the fixture format cannot express the boundary being asserted.
+        """
+        now = float(int(self.now))
+        write_task(self._month_archive(), "atcutoff", now - 8 * 3600,
+                   body="at cutoff")
+        self.assertEqual(self.mod.get_overnight_discord(now=now), ["at cutoff"])
+
+    def test_task_one_second_before_cutoff_is_excluded(self):
+        """The other side of that edge, so "inclusive" is a measured claim."""
+        now = float(int(self.now))
+        write_task(self._month_archive(), "tooold", now - 8 * 3600 - 1,
+                   body="too old")
+        self.assertEqual(self.mod.get_overnight_discord(now=now), [])
+
+    def test_future_task_does_not_displace_real_ones(self):
+        """The newest-five slice is taken AFTER sorting, so an unbounded future
+        stamp sorts last and evicts a genuine overnight DM from the list."""
+        for i in range(5):
+            write_task(self._month_archive(), "real%d" % i, self.now - (i + 1) * 600,
+                       body="real%d" % i)
+        write_task(self._month_archive(), "future", self.now + 999999, body="future")
+        got = self.mod.get_overnight_discord(now=self.now)
+        self.assertNotIn("future", got)
+        self.assertEqual(len(got), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

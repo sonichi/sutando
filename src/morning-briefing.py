@@ -342,7 +342,15 @@ def get_overnight_discord(now: float | None = None) -> list[str]:
                 when = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
             except ValueError:
                 continue
-            if when < cutoff:
+            # BOTH edges. Only the lower one was enforced, so a single
+            # future-dated timestamp counted as "overnight" in every briefing
+            # until the wall clock caught up — unbounded, and the mirror image
+            # of the false-clean this function exists to fix. The risk is not
+            # theoretical now that briefing truth rests on mutable on-disk
+            # stamps: clock skew, a hand-edited file, or imported state all
+            # produce one. Both bounds inclusive: `cutoff` is 8h ago exactly,
+            # and a task written this instant must still count.
+            if not cutoff <= when <= now:
                 continue
             body = ""
             m = re.search(r"^task:[ \t]*(.*)$", head, re.M)
