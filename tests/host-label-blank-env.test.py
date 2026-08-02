@@ -14,10 +14,17 @@ branch `host/   /<id>`: exactly the per-host path split that `_host_label()`'s
 own docstring documents from the 2026-06-22 DHCP-drift incident, except
 self-inflicted and much harder to see in a directory listing.
 
-The third implementation, `SutandoConfig.hostLabel()` in Swift, already trims
-and falls through — the divergence was found by bassilkhilo-ag2 reviewing #2416
-and filed there as a doc nit. It is not a doc nit: the doc comments in both
-files claim lockstep with each other, and they were not in lockstep.
+SIX resolvers read that env var, and four were wrong: `util_paths.py`,
+`sync-workspace.sh`, `util_paths.ts`, `main.swift`'s `perHostLabel()`, plus the
+fallback branches in `sync-memory.sh` and `codex/cli/start-cli.sh`. Their doc
+comments claim lockstep with each other and were not in lockstep.
+
+A correction worth keeping, since the first version of this file asserted the
+opposite: `SutandoConfig.hostLabel()` — cited in a #2416 review as the one
+implementation that already trimmed — **does not exist**. `SutandoConfig.swift`
+is 299 lines, the cited 266-284 is `detectEnvWorkspaceInDotenv`, and `hostLabel`
+appears nowhere in it. That citation was taken as fact and a "two of three are
+wrong" story built on it. Count the sites yourself before writing the number.
 
 Blank means "not set" -> fall through to scutil/hostname.
 
