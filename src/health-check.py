@@ -322,6 +322,55 @@ def resolve_voice_health_config(
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
 
 
+def resolve_web_client_port(
+    env: Optional[dict] = None,
+    env_path: Optional[Path] = None,
+) -> dict:
+    """Resolve CLIENT_PORT with the same sourced-dotenv precedence as startup."""
+    env = os.environ if env is None else env
+    env_path = _resolve_dotenv() if env_path is None else env_path
+    file_value: Optional[str] = None
+    file_has_value = False
+
+    if env_path.exists():
+        try:
+            lines = env_path.read_text().splitlines()
+        except OSError as exc:
+            return {"error": f"{env_path.name} unreadable ({exc})"}
+        for line_no, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            assignment = line
+            if assignment.startswith("export "):
+                assignment = assignment[len("export "):].lstrip()
+            if not assignment.startswith("CLIENT_PORT"):
+                continue
+            if "=" not in assignment:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT assignment"}
+            key, value = assignment.split("=", 1)
+            if key.strip() != "CLIENT_PORT":
+                continue
+            try:
+                parsed = shlex.split(value, comments=True, posix=True)
+            except ValueError as exc:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT value ({exc})"}
+            if len(parsed) > 1:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT value"}
+            file_value = parsed[0] if parsed else ""
+            file_has_value = True
+
+    configured = file_value if file_has_value else env.get("CLIENT_PORT")
+    value = str(configured or "8080").strip()
+    try:
+        port = int(value)
+    except ValueError:
+        return {"error": f"invalid CLIENT_PORT={value!r}"}
+    if not 1 <= port <= 65535:
+        return {"error": f"invalid CLIENT_PORT={value!r}"}
+    return {"port": port}
+
+
 def check_voice_stack(
     env: Optional[dict] = None,
     env_path: Optional[Path] = None,
@@ -669,6 +718,94 @@ def check_cron_runner(
     }
 
 
+_MONTH_MAX_DAYS = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
+                   7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
+
+
+def _cron_field_values(field: str, lo: int, hi: int) -> "set[int] | None":
+    """Expand one numeric cron field to its value set, or None if not understood.
+
+    None means "do not reason about this expression" — every caller below treats
+    an unparseable field as schedulable, so a parser gap can never invent a
+    never-fires verdict.
+    """
+    out: "set[int]" = set()
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            return None
+        step = 1
+        if "/" in part:
+            part, _, raw_step = part.partition("/")
+            if not raw_step.isdigit() or int(raw_step) < 1:
+                return None
+            step = int(raw_step)
+        if part in ("*", "?"):
+            start, end = lo, hi
+        elif "-" in part.lstrip("-"):
+            start_s, _, end_s = part.partition("-")
+            if not (start_s.isdigit() and end_s.isdigit()):
+                return None
+            start, end = int(start_s), int(end_s)
+        elif part.isdigit():
+            start = end = int(part)
+        else:
+            return None  # names (JAN/MON), L, W, # — not our business
+        if start > end or start < lo or end > hi:
+            return None
+        out.update(range(start, end + 1, step))
+    return out or None
+
+
+def _cron_can_never_fire(expr: str) -> bool:
+    """True only when a 5-field cron's day-of-month/month pair is impossible.
+
+    A deliberately-parked entry is the real case: this host carries
+    `wire-newsroom-nightly-DISABLED-...` at `0 0 31 2 *` — February 31st, which
+    is syntactically valid and can never occur. /schedule-crons cannot register
+    it, so it was counted as expected-but-missing and the session-crons guard
+    warned on every run, permanently. A guard that always warns is a guard
+    nobody reads, and this one exists to catch a SILENT failure (a peer
+    instance registered 2/18 with no error) — so a standing false positive
+    disables exactly the signal it was built to raise.
+
+    Deliberately conservative: day-of-week must be unrestricted, because cron
+    ORs day-of-month with day-of-week — `0 0 31 2 MON` still fires on Mondays.
+    Anything unparseable returns False (schedulable).
+    """
+    parts = expr.split()
+    if len(parts) != 5:
+        return False
+    _, _, dom_f, month_f, dow_f = parts
+    if dow_f.strip() not in ("*", "?"):
+        return False  # OR-semantics with day-of-week — it can still fire
+    doms = _cron_field_values(dom_f, 1, 31)
+    months = _cron_field_values(month_f, 1, 12)
+    if doms is None or months is None:
+        return False
+    return not any(d <= _MONTH_MAX_DAYS[m] for m in months for d in doms)
+
+
+def _entry_marked_parked(entry: dict) -> bool:
+    """True when the entry carries an explicit "deliberately disabled" signal.
+
+    An impossible date alone must NOT qualify. `0 0 31 2 *` is equally the
+    signature of a parked job and of an active typo — someone meaning "the 31st,
+    monthly" and writing February. Excluding on the date alone would let a
+    mistyped ACTIVE schedule vanish from `expected`, so CronCreate silently
+    omits it and this guard reports green forever: the precise silent-miss class
+    the check exists to surface.
+
+    Two accepted signals: an explicit `disabled: true` field, and the
+    established convention of DISABLED in the entry name (used by this host's
+    `wire-newsroom-nightly-DISABLED-2026-06-09-...`, which also records why).
+    """
+    if entry.get("disabled") is True:
+        return True
+    name = entry.get("name")
+    return isinstance(name, str) and "DISABLED" in name
+
+
 def check_session_cron_registration(
     workspace_dir: Optional[Path] = None,
     host_label: Optional[str] = None,
@@ -706,7 +843,18 @@ def check_session_cron_registration(
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
             return False
-        if entry.get("loop") == "dynamic" or not entry.get("cron"):
+        cron_expr = entry.get("cron")
+        if entry.get("loop") == "dynamic" or not cron_expr:
+            return False
+        if (
+            _entry_marked_parked(entry)
+            and isinstance(cron_expr, str)
+            and _cron_can_never_fire(cron_expr)
+        ):
+            # BOTH signals required. Marked-disabled AND unregistrable (e.g.
+            # `0 0 31 2 *`): /schedule-crons cannot register it, so counting it
+            # as expected warns forever. An impossible date WITHOUT a disabled
+            # marker is an active typo and must still warn.
             return False
         return True
 
@@ -917,6 +1065,12 @@ def check_memory_index_integrity() -> "dict | None":
     suffix, not the file, so this is measured by asking whether each memory is
     named in the prefix that actually loads.
 
+    Not every absence from MEMORY.md is a loss, though: overflow entries live in
+    sibling HUB indexes (``MEMORY-reference.md``, ``MEMORY-wire.md``, …) which
+    MEMORY.md links to. Those are grep-reachable by design and are counted
+    separately — lumping them in produced a 1010-file warn on this host whose
+    real content was 906, and a warn nobody can read is a warn nobody reads.
+
     Fails only when a memory is demonstrably lost that way; warns for orphaned/
     stranded files and for an index merely approaching the limit. Returns None
     on a clean index or when the memory dir does not exist yet.
@@ -935,20 +1089,55 @@ def check_memory_index_integrity() -> "dict | None":
     def _referenced_in(hay: str, name: str) -> bool:
         return name in hay or name[:-3] in hay
 
+    # MEMORY.md is not the only index. Once a corpus outgrows the load budget the
+    # overflow moves to sibling HUB indexes (MEMORY-reference.md, MEMORY-wire.md,
+    # …). A hub entry deliberately does not auto-load — it only has to be findable
+    # — so it is not a loss.
+    #
+    # But a hub is only findable if the LOADED prefix of MEMORY.md links to it.
+    # Trusting every MEMORY*.md glob match instead lets an unlinked file (a stale
+    # copy, a backup, an ordinary memory that happens to match the glob) launder
+    # itself AND every filename it mentions into a false green — inside the one
+    # probe that exists to prevent silent loss. A hub linked only PAST the cut is
+    # equally unreachable, so `loaded_text` is the correct gate, not `index_text`.
+    # (john-the-dev, #2483: an earlier revision of this change trusted the glob
+    # and its test suite explicitly blessed the unlinked case.)
+    #
+    # An untrusted MEMORY*.md is therefore not an index at all: it falls through
+    # to the classification below and is reported like any other unindexed file.
+    index_names = {"MEMORY.md"}
+    hub_text = ""
+    for hub in sorted(MEMORY_DIR.glob("MEMORY*.md")):
+        if hub.name == "MEMORY.md" or not _referenced_in(loaded_text, hub.name):
+            continue
+        index_names.add(hub.name)
+        hub_text += "\n" + hub.read_text(errors="ignore")
+
     # (a) live memory files not referenced anywhere in MEMORY.md → won't load.
     # (c) referenced, but ONLY beyond the load cut → equally won't load. Same
     #     consequence, different cause, so they are found the same way: ask the
     #     prefix that actually loads, not the whole file. Testing the whole file
     #     reported an index entry parked on line 201 as healthy (john-the-dev,
     #     #2449) because the bytes were on disk — just never read.
+    # (d) reachable only from a sibling hub index → by design, NOT a loss. Kept
+    #     separate so the genuinely-lost names stay readable: on this host 104
+    #     by-design entries were mixed into a single 1010-file warn, which is
+    #     unreadable and therefore unread — 8 truly dark memories sat inside it
+    #     for months while the probe "warned" about them on every run.
     unindexed: list[str] = []
     beyond_cut: list[str] = []
+    hub_only: list[str] = []
     for p in sorted(MEMORY_DIR.glob("*.md")):
-        if p.name == "MEMORY.md":
+        if p.name in index_names:  # an index is not a memory it indexes
             continue
         if _referenced_in(loaded_text, p.name):
             continue
-        (beyond_cut if _referenced_in(effective_text, p.name) else unindexed).append(p.name)
+        if _referenced_in(effective_text, p.name):
+            beyond_cut.append(p.name)
+        elif _referenced_in(hub_text, p.name):
+            hub_only.append(p.name)
+        else:
+            unindexed.append(p.name)
 
     # (b) memories stranded in a sibling *-BACKUP tree, absent from the live dir.
     stranded: list[str] = []
@@ -981,9 +1170,15 @@ def check_memory_index_integrity() -> "dict | None":
                 f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1024:.0f}KB / "
                 f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
 
+    def _hub_note() -> str:
+        return (f"; {len(hub_only)} reachable via a sibling hub index "
+                f"({', '.join(sorted(index_names - {'MEMORY.md'}))}) — by design, not loaded"
+                if hub_only else "")
+
     if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
-                "detail": f"all memory files present in the loaded MEMORY.md index ({_size_note()})"}
+                "detail": (f"all memory files reachable from the loaded MEMORY.md index"
+                           f"{_hub_note()} ({_size_note()})")}
     parts = []
     if beyond_cut:
         parts.append(
@@ -1002,8 +1197,10 @@ def check_memory_index_integrity() -> "dict | None":
         )
     if unindexed:
         parts.append(
-            f"{len(unindexed)} memory file(s) not in MEMORY.md (won't load): "
+            f"{len(unindexed)} memory file(s) in NO index — neither MEMORY.md nor any "
+            f"sibling hub — so they never load and cannot be found: "
             + ", ".join(unindexed[:6]) + ("…" if len(unindexed) > 6 else "")
+            + _hub_note()
         )
     if stranded:
         parts.append(
@@ -1273,6 +1470,67 @@ def check_per_host_config_backup() -> dict:
     return {"name": name, "status": "ok", "detail": f"{checked} channel access.json backup(s) current"}
 
 
+# How far behind the expected branch before the checkout is worth nagging about.
+# Deliberately not 1: `main` on this repo moves several times a day, so warning on
+# any non-zero delta would fire constantly and train the reader to ignore it —
+# the failure mode that makes a health check worthless.
+_BEHIND_WARN_DEFAULT = 10
+
+
+def _behind_warn_threshold(repo: "Path") -> int:
+    """Positive commits-behind threshold from the durable core config.
+
+    Read through the SAME `core` config path as `expected_branch` below — no
+    ad-hoc env var (repo rule: config belongs in the declared config block, not
+    in an invented environment variable).
+
+    Read LAZILY and validated, because the first cut of this did neither: it
+    ran `int(os.environ[...])` at import time, so
+    `SUTANDO_CHECKOUT_BEHIND_WARN=not-a-number` raised ValueError before the
+    module finished loading and took down the ENTIRE health check — a probe
+    meant to reveal stale guards instead reporting no health at all. A zero
+    was equally bad: it warned on an exactly-current checkout. So every
+    invalid class — unreadable config, non-integer, zero, negative — falls
+    back to the default rather than crashing or crying wolf.
+    """
+    try:
+        from sutando_config import load_config  # noqa: PLC0415
+        raw = (load_config(repo_root=repo).get("core") or {}).get("checkout_behind_warn")
+    except Exception:
+        return _BEHIND_WARN_DEFAULT          # config unreadable/malformed
+    # `bool` is a subclass of `int`, so `int(True)` is 1 and a plausible config
+    # typo — `"checkout_behind_warn": true` — would silently warn on every
+    # one-commit drift. That is precisely the alert fatigue the default of 10
+    # exists to prevent, and the probe would train users to ignore it. Accept a
+    # REAL integer only; the schema declares this key as an integer, so every
+    # other type (bool, float, numeric string) is invalid config and falls back.
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return _BEHIND_WARN_DEFAULT          # absent, bool, or non-integer
+    return raw if raw > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
+
+
+def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
+    """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
+
+    Uses the LAST-FETCHED remote ref — deliberately does not fetch. A health
+    probe must stay fast and work offline, and a network call here would make
+    the whole run hang on a flaky link. The consequence is honest and stated in
+    the warning text: if the local ref is itself stale the count UNDERSTATES the
+    drift, so this can only under-report, never cry wolf.
+    """
+    try:
+        out = subprocess.run(
+            [git_bin, "-C", str(repo), "rev-list", "--count", f"HEAD..origin/{branch}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None          # no such remote ref (fresh clone, renamed remote)
+    raw = out.stdout.strip()
+    return int(raw) if raw.isdigit() else None
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -1306,9 +1564,32 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
         except Exception:
             expected = None  # config unreadable — fall through to the default
     expected = expected or "main"
+    # Resolve the git binary ONCE for both subprocesses in this probe.
+    #
+    # This used to be `git_bin = "git"` with a comment promising that #2469's
+    # resolver "replaces this line when it lands". That was a TODO wearing a
+    # design rationale: at the merged tree of both heads, `resolve_git` was
+    # imported at module scope and used elsewhere while this probe still shelled
+    # the literal — so the cumulative state kept the Xcode-CLT shim modal that
+    # #2469 exists to remove. A swap point nobody swaps is not a fix.
+    #
+    # Imported lazily and defensively so this composes in EITHER merge order:
+    # before #2469 lands the module is absent and we behave exactly as today;
+    # after it lands both calls go through the resolver with no further edit.
+    try:
+        from git_binary import resolve_git  # noqa: PLC0415
+        git_bin = resolve_git()
+    except Exception:
+        git_bin = "git"
+    if git_bin is None:
+        # Resolver says there is no runnable git (CLT absent, only the stub).
+        # Degrade like the OSError path below rather than shelling the shim —
+        # that modal is the whole point of #2469.
+        return {"name": name, "status": "ok",
+                "detail": "no runnable git (resolver) — skipping"}
     try:
         out = subprocess.run(
-            ["git", "-C", str(repo), "branch", "--show-current"],
+            [git_bin, "-C", str(repo), "branch", "--show-current"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1329,7 +1610,27 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           "PR-branch checkout ships stale/unreviewed code (2026-07-29 "
                           "incident: 4 days on a Jul-25 PR branch). Author PRs in "
                           f"worktrees; switch back (git -C {repo} switch {expected})"}
-    return {"name": name, "status": "ok", "detail": f"live checkout on {expected!r}"}
+    # On the expected branch — but that is only half of "is this checkout current".
+    # A checkout can be on `main` and still be executing weeks-old code, and the
+    # branch-name comparison above returns ok for it. Observed 2026-08-01 on the
+    # 24/7 node: on `main`, 0 ahead, **15 commits behind**, and four merged guards
+    # were consequently not running — including the MEMORY.md load-limit warning
+    # (#2449), so the memory index silently truncated with nothing to report it.
+    # A peer node reproduced the same shape at 31 behind. Nothing anywhere
+    # surfaced either, because wrong-branch and stale-branch are different
+    # failure modes and only the first had a probe.
+    behind = _commits_behind(repo, expected, git_bin)
+    if behind is not None and behind >= _behind_warn_threshold(repo):
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on {expected!r} but {behind} commits behind "
+                          f"origin/{expected} — merged fixes are not running here, and a "
+                          "guard that never shipped to this machine reports nothing (so "
+                          "silence reads as health). Refresh with "
+                          f"`git -C {repo} pull --ff-only` + restart. Count is against the "
+                          "last-fetched ref; this probe does not fetch."}
+    return {"name": name, "status": "ok",
+            "detail": f"live checkout on {expected!r}"
+                      + (f", {behind} commits behind" if behind else "")}
 
 
 def check_migrate_reader_contract() -> dict:
@@ -2704,11 +3005,59 @@ def check_core_supervisor() -> dict:
         detail = f"{state} — {str(prompt).splitlines()[0][:60]}"
     needs_user = {"blocked-human", "logged-out"}
     degraded = {"crashed", "hung", "gateway-down"}
+    # `gateway-down` means "core up, relay gateway not running". On a host with no
+    # gateway configured that is the DESIGNED state — startup.sh never launches the
+    # bridge and says so ("deliberately silent when unconfigured"), and the dedicated
+    # probe below returns None for exactly this case. Treating it as degraded here
+    # made every Sutando-only install carry a permanent warn it could not clear,
+    # which is how a status tool teaches its reader to skip the warn line.
+    if state == "gateway-down" and not _gateway_configured():
+        return {"name": name, "status": "ok",
+                "detail": "core up; ag2.space gateway not configured on this host"}
     if state in needs_user:
         return {"name": name, "status": "warn", "detail": f"core needs you: {detail}"}
     if state in degraded:
         return {"name": name, "status": "warn", "detail": f"core degraded: {detail}"}
     return {"name": name, "status": "ok", "detail": detail}
+
+
+def _gateway_configured() -> bool:
+    """Is the ag2.space mobile gateway configured on this host?
+
+    `startup.sh` is deliberately silent when it is not — "a Sutando-only user
+    never sees it" — so absence of the bridge is the EXPECTED state, not a fault.
+    Shared by the two probes that must agree about that; they did not, which is
+    the bug this helper exists to close.
+    """
+    try:
+        if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
+            return True
+        gw_env = claude_home_path("channels", "ag2space", ".env")
+        if gw_env.exists():
+            return any(
+                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
+                # errors="replace" is load-bearing, not cosmetic: without it a
+                # single non-UTF-8 byte raises, the except below swallows it, and a
+                # CONFIGURED gateway reads as unconfigured — which now also silences
+                # the gateway-down warn. Fail-open on a decode error is exactly the
+                # class this PR closes. (Caught in review by Sutando-Pro.)
+                for ln in gw_env.read_text(errors="replace").splitlines()
+            )
+    except OSError:
+        # EXPECTED failures only: the env file is unreadable / the path is bad.
+        # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.
+        #
+        # Deliberately NOT `except Exception`. A resolver contract bug (e.g.
+        # claude_home_path raising ValueError) would be swallowed into False,
+        # check_core_supervisor would then report a real `gateway-down` as OK,
+        # and check_gateway_bridge would vanish -- a CONFIGURED gateway's outage
+        # goes silent. That is the same fail-open direction this PR exists to
+        # close, one layer up. An unexpected exception propagates instead, which
+        # is loud; a programming error in a health probe should not be absorbed
+        # by the probe that is supposed to be reporting faults.
+        # (Caught in review by john-the-dev.)
+        pass
+    return False
 
 
 def check_gateway_bridge() -> "dict | None":
@@ -2726,16 +3075,7 @@ def check_gateway_bridge() -> "dict | None":
     nothing reported it, so mobile messages stranded in the cloud invisibly. This
     check makes that state visible on the dashboard.
     """
-    try:
-        gw_env = claude_home_path("channels", "ag2space", ".env")
-        configured = bool(os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"))
-        if not configured and gw_env.exists():
-            configured = any(
-                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
-                for ln in gw_env.read_text(errors="replace").splitlines()
-            )
-    except OSError:
-        configured = False
+    configured = _gateway_configured()
     if not configured:
         return None
     try:
@@ -3775,7 +4115,15 @@ def run_all_checks() -> list[dict]:
     # Core services (required)
     checks.extend(check_voice_stack())
 
-    web_check = check_port(8080, "web-client", probe=True)
+    web_config = resolve_web_client_port()
+    if web_config.get("error"):
+        web_check = {
+            "name": "web-client",
+            "status": "down",
+            "detail": web_config["error"],
+        }
+    else:
+        web_check = check_port(web_config["port"], "web-client", probe=True)
     if web_check["status"] == "ok":
         mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
     checks.append(web_check)
