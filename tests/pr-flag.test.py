@@ -195,6 +195,42 @@ def main() -> int:
     assert rebased != base_h, "a base change must refire"
     print("  ok  dedup hash flips on approvals_standing and on base")
 
+    # ---- a malformed review node must be IGNORED, not counted, not fatal ----
+    # GitHub can return a review whose `author` is null -- a deleted account, or a
+    # review left by an app/integration that no longer resolves. There is no login
+    # to key a latest-per-author map on, so the row is skipped. Both counts pass
+    # through the same skip, so a malformed node cannot inflate one and not the
+    # other, and it must not abort state collection for the whole repo either.
+    malformed = _pr(40, "peer", approvers=["a"], extra_reviews=[
+        {"author": None, "state": "APPROVED",
+         "submittedAt": "2026-08-02T03:00:00Z", "commit": {"oid": "head-40"}},
+        {"author": {}, "state": "APPROVED",
+         "submittedAt": "2026-08-02T03:00:00Z", "commit": {"oid": "old-head"}},
+        {"author": {"login": ""}, "state": "CHANGES_REQUESTED",
+         "submittedAt": "2026-08-02T04:00:00Z", "commit": {"oid": "head-40"}},
+    ])
+    got_bad = pf.raw_state([malformed], OWNER)[0]
+    assert got_bad["approvals"] == 1, (
+        f"an authorless APPROVED must not inflate the head-anchored count: {got_bad}")
+    assert got_bad["approvals_standing"] == 1, (
+        f"...nor the standing count, which admits older commits: {got_bad}")
+    # The empty-login CHANGES_REQUESTED is the discriminating half: if the skip were
+    # keyed on `author is None` rather than on a falsy login, it would land in the
+    # map under "" and silently revoke a real approval.
+    # ...and the record is still COMPLETE: a malformed node must not abort or
+    # truncate state collection, which is the "not fatal" half of the claim.
+    assert set(got_bad) == {"number", "title", "author", "is_mine", "base", "head", "ci",
+                            "mergeable", "review", "approvals", "approvals_standing"}, got_bad
+    # Control: the same fixture with a REAL login does move the counts, so the
+    # assertions above are about the missing login and not about the fixture.
+    named = _pr(41, "peer", approvers=["a"], extra_reviews=[
+        {"author": {"login": "b"}, "state": "APPROVED",
+         "submittedAt": "2026-08-02T03:00:00Z", "commit": {"oid": "head-41"}},
+    ])
+    got_named = pf.raw_state([named], OWNER)[0]
+    assert got_named["approvals"] == 2 and got_named["approvals_standing"] == 2, got_named
+    print("  ok  a review with no author.login is skipped by BOTH counts, and is not fatal")
+
     # empty repo → empty state, stable hash
     assert pf.raw_state([], OWNER) == []
     assert pf.state_hash([]) == pf.state_hash([])
