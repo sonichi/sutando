@@ -2,8 +2,10 @@
 
 *Status: draft for review — G8 of the desktop-parity plan
 (`design-desktop-onboarding-parity.md` in the roadmap vault). Companion to the
-first refactor slice, #2197 (`src/credential-resolver.ts` + the TS `GEMINI_*`
-reader sweep). Owner call outstanding: confirm **managed pilot = Gemini voice**.*
+first refactor slice, **#2197 (open, in review)**, which introduces
+`src/credential-resolver.ts` + the TS `GEMINI_*` reader sweep — file paths
+below describe that PR's head, not current `main`. Owner call outstanding:
+confirm **managed pilot = Gemini voice**.*
 
 ## Problem
 
@@ -23,7 +25,7 @@ resolver decides which credential satisfies it:
 resolveCredential('gemini-voice')  →  { key, source: 'managed' | 'env' | 'none' }
 ```
 
-Three rules, all load-bearing (implemented in `src/credential-resolver.ts`):
+Three rules, all load-bearing (implemented by #2197's `src/credential-resolver.ts`):
 
 1. **Tier order: managed → env.** The managed tier reads
    `<workspace>/state/auth/managed-credentials.json` — per-host durable
@@ -71,7 +73,7 @@ the tier list grows.
 
 ## Migration plan (reader sweep)
 
-- **Phase 1 — TS surfaces (#2197, done):** `voice-agent.ts`, `voice-key.ts`,
+- **Phase 1 — TS surfaces (#2197, open — the implementing PR):** `voice-agent.ts`, `voice-key.ts`,
   `browser-tools.ts`, `recording-tools.ts` + `startup-runtime.sh` gate +
   health-check surface. Tests: `tests/credential-resolver.test.ts` (tier
   order, fallback, malformed-file, byte-identical-legacy).
@@ -98,5 +100,5 @@ the tier list grows.
 
 1. **Owner:** confirm managed pilot = Gemini voice (G8 call, stands).
 2. **Owner:** G7 vault-vs-`.env` (shapes the tier list, blocks nothing here).
-3. Phase-2 Python twin (mine, after #2197 lands).
+3. Phase-2 Python twin (mine, after #2197 merges).
 4. Desktop consumers of `source` (G5 banner, G6 Settings — air's lane).
