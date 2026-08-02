@@ -330,12 +330,44 @@ def seed_room(store: "op.SubscriptionStore", store_dir: str, entry: dict,
 
     # Tag with pack provenance AFTER validate_draft (which drops unknown keys);
     # the store persists extra fields and observe_policy ignores them.
+    # Cheap path: refuse before writing anything at all. This is what keeps a
+    # seed racing the sweep from persisting a record (see the racing-seed tests).
     if not _entry_still_live(store_dir, entry["key"], gen):
         return {"status": "refused", "policy_id": pid,
             "reason": "entry was disabled or re-generated while this seed was in flight"}
     normalized["pack"] = {"entry": entry["key"], "generation": gen}
+
+    # PUBLISH, THEN VERIFY — a compare-and-commit, not a check-then-write.
+    #
+    # The check above is a READ, and the save/activate below are SEPARATE writes.
+    # A disable landing in that window was missed by BOTH sides: its sweep found
+    # no record to cancel (we had not saved yet), and we had already passed our
+    # only check — so an entry the owner had just revoked came back ACTIVE.
+    #
+    # This is reachable across PROCESSES, which is why an in-process ordering
+    # argument is not enough: this module ships a CLI (`disable`) that runs
+    # against the same store dir while the core handles a room join, so
+    # observe_policy's "single-writer (the core), so no lock protocol needed"
+    # does not hold on this path.
+    #
+    # Writing the record BEFORE the deciding check closes it from both ends:
+    #   * if the disable's sweep runs after our save, it SEES this record and
+    #     cancels it — and `cancelled` is terminal, so the activation below
+    #     fails safely rather than resurrecting it;
+    #   * if the sweep already passed us, our re-read sees `disabled` and we
+    #     cancel the record ourselves.
+    # Either interleaving ends non-active. Honour transition()'s return value —
+    # ignoring it is what let a cancelled record be reported as seeded.
     store.save(normalized)
-    store.transition(pid, "active", note="factory default (standing approval)")
+    if not _entry_still_live(store_dir, entry["key"], gen):
+        store.transition(pid, "cancelled",
+                         note="pack entry disabled while this seed was in flight")
+        return {"status": "refused", "policy_id": pid,
+                "reason": "entry was disabled or re-generated while this seed was in flight"}
+    if not store.transition(pid, "active",
+                            note="factory default (standing approval)"):
+        return {"status": "refused", "policy_id": pid,
+                "reason": "activation refused by the store — the record was already cancelled"}
     return {"status": "seeded", "policy_id": pid, "reason": reason}
 
 

@@ -646,6 +646,58 @@ def test_list_pack_shows_rooms_awaiting_the_owners_approval():
           f"a disabled entry shows nothing pending — drafts were revoked (got {v3['awaiting_approval']})")
 
 
+def test_seed_racing_a_disable_after_its_live_check_never_activates():
+    """The after-check/before-save window (peer re-review of head 9539d430).
+
+    `_entry_still_live()` is a READ; the persist and activate that follow it are
+    SEPARATE writes. An owner disable landing in between is missed by the sweep
+    (there is no record yet to cancel) and then the in-flight seed writes and
+    activates one AFTER the revocation.
+
+    Reachable across PROCESSES, which is what makes it a real defect rather than
+    a synthetic interleaving: this module ships a CLI (`disable`) that runs
+    against the same store dir while the core handles a room join, so
+    observe_policy's "single-writer (the core), so no lock protocol needed" does
+    not hold for this path.
+
+    Worst case prevented: a factory policy the owner has disabled keeps
+    observing a newly joined room.
+    """
+    d = _store()
+    entry = dpp._entry("react_baseline")
+    rooms = [f"!r{i}:ag2.space" for i in range(2)]
+    dpp.seed_defaults(d, OWNER, rooms)
+
+    real = dpp._entry_still_live
+    fired = []
+
+    def racing(store_dir, key, gen):
+        ok = real(store_dir, key, gen)
+        if not fired:                      # only the FIRST (pre-persist) check
+            fired.append(True)
+            dpp.set_enabled(store_dir, key, False)   # the owner disables RIGHT HERE
+        return ok
+
+    dpp._entry_still_live = racing
+    try:
+        r = dpp.seed_room(op.SubscriptionStore(d), d, entry, "!late:ag2.space",
+                          owner_mxid=OWNER, owner_rooms=rooms + ["!late:ag2.space"])
+    finally:
+        dpp._entry_still_live = real
+
+    # CONTROL FIRST: without this, every assertion below passes vacuously on a
+    # run where the injection never fired.
+    check(bool(fired), "control: the disable injection actually fired")
+    check(not dpp.is_enabled(d, "react_baseline"),
+          "control: the entry really is disabled by the end of the race")
+
+    pid = r.get("policy_id")
+    rec = op.SubscriptionStore(d).get(pid) if pid else None
+    status = (rec or {}).get("status")
+    check(status != "active",
+          f"a seed that lost the race to a disable is never left ACTIVE (got {status!r})")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
