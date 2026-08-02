@@ -119,6 +119,23 @@ class TestCaptureVideoRouting(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 400)
         ctx.exception.close()
 
+    def test_dispatch_delegates_capture_routes(self):
+        # Keep do_GET as routing only; endpoint behavior belongs to the named
+        # handlers where each path can evolve without growing one shared block.
+        handler = object.__new__(self.mod.Handler)
+        with mock.patch.object(self.mod.Handler, "_handle_capture") as still, \
+             mock.patch.object(self.mod.Handler, "_handle_capture_video") as video:
+            handler.path = "/capture?silent=true"
+            handler.do_GET()
+            still.assert_called_once_with()
+            video.assert_not_called()
+
+            still.reset_mock()
+            handler.path = "/capture-video?action=start&silent=true"
+            handler.do_GET()
+            video.assert_called_once_with()
+            still.assert_not_called()
+
     def test_capture_still_returns_png(self):
         # The screenshot branch still works for the plain /capture path.
         status, body = self._get("/capture?silent=true", token=self.token)
