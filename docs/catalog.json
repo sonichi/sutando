@@ -6,7 +6,7 @@
       "audience": ["users", "operators", "contributors", "maintainers"],
       "status": "canonical",
       "canonical_for": "external tool and package requirements, and what to vendor when embedding Sutando",
-      "last_verified": "2026-08-01"
+      "last_verified": "2026-08-02"
     },
     "docs/README.md": {
       "title": "Sutando documentation",
@@ -20,7 +20,7 @@
       "audience": ["contributors", "maintainers"],
       "status": "draft",
       "canonical_for": "proposed core, enterprise, and extension architecture boundaries",
-      "last_verified": "2026-07-27"
+      "last_verified": "2026-08-02"
     },
     "docs/adr/0001-pointer-teacher-brain.md": {
       "title": "Pointer Teacher brain: accessibility-first, Gemini-vision fallback",
