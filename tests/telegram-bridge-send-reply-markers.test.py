@@ -27,6 +27,7 @@ Exit: 0 = all pass, 1 = failure
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -37,27 +38,29 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 
-def _load_bridge():
-    """Import telegram-bridge.py by path (hyphenated name is not importable).
+# ---- Isolation MUST be module level, and MUST precede exec_module ----------
+# Not inside a helper: scripts/lint-hermetic-bridge-tests.py requires the
+# assignment at module level because a function body is not guaranteed to run,
+# and it is right — my first draft hid this in _load_bridge() and the lint named
+# the file (CR #2551, @qingyun-wu).
+#
+# An EMPTY temp dir is not neutral either. The bridge resolves channel config at
+# import; channel_access_path() reads a missing canonical file as a migration gap
+# and falls back to the developer's real ~/.claude/channels/telegram/access.json.
+# So seed it, then import (#2357).
+_CCD = tempfile.mkdtemp(prefix="ccd-tg-sendreply-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CCD
+_CH = Path(_CCD) / "channels" / "telegram"
+_CH.mkdir(parents=True, exist_ok=True)          # parents=True: channels/ does not exist yet
+(_CH / "access.json").write_text(json.dumps({"allowFrom": []}))
+os.environ["SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER"] = "1"
+# Import-time guard only; `api` is stubbed before any call so it is never used.
+os.environ["TELEGRAM_BOT_TOKEN"] = "test-token-not-a-real-credential"
 
-    The module reads config at import time; point it at a throwaway config dir
-    so this test never touches the host's real Telegram state.
-    """
-    # In-process env only — never write a token into the caller's config dir
-    # (#2357: a test seeding a stub Discord token into the real config dir).
-    os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="tg-sendreply-cfg-")
-    os.environ["SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER"] = "1"
-    # The module exits at import without a token; it is never used because
-    # `api` is stubbed before any call, but import must get past the guard.
-    os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-a-real-credential")
-    spec = importlib.util.spec_from_file_location(
-        "telegram_bridge_under_test", REPO / "src" / "telegram-bridge.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-TB = _load_bridge()
+_spec = importlib.util.spec_from_file_location(
+    "telegram_bridge_under_test", REPO / "src" / "telegram-bridge.py")
+TB = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(TB)
 
 
 def _allowlisted_file() -> str:
