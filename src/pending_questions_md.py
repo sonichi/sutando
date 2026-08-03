@@ -165,7 +165,7 @@ def _opens_span(text: str, start: int, length: int) -> bool:
     return "`" in info        # invalid fence info -> inline
 
 
-def _mask_nonfence_spans(text: str) -> str:
+def _mask_nonfence_spans(text: str, report_ranges: bool = False):
     """Blank inline spans whose OPENER cannot be a fence marker.
 
     Such an opener is unambiguously a span delimiter, so it may close on the next
@@ -180,6 +180,7 @@ def _mask_nonfence_spans(text: str) -> str:
     runs = _backtick_runs(text)
     opens = [_opens_span(text, s, n) for s, n in runs]
     out = list(text)
+    ranges: "list[tuple[int, int]]" = []
     k = 0
     while k < len(runs):
         if not opens[k]:
@@ -194,10 +195,16 @@ def _mask_nonfence_spans(text: str) -> str:
             for q in range(start, end):
                 if out[q] != "\n":
                     out[q] = " "
+            ranges.append((start, end))
             k = m + 1
         else:
             k += 1
-    return "".join(out)
+    masked = "".join(out)
+    # `report_ranges` exists because "was a question swallowed" has to be asked
+    # about the SPECIFIC span that hid a given divider. Newlines are preserved
+    # above, so a masked region is not a contiguous run of changed characters and
+    # cannot be recovered by diffing the two strings.
+    return (masked, ranges) if report_ranges else masked
 
 
 def mask_markup(text: str) -> str:
@@ -227,6 +234,27 @@ def mask_markup(text: str) -> str:
 def _question_entry_masked(text: str, masked: str) -> bool:
     """True when masking swallowed something a READER counts as a question."""
     for raw_line, masked_line in zip(text.split("\n"), masked.split("\n")):
+        if raw_line == masked_line:
+            continue
+        if raw_line.startswith("## ") or re.match(r'^\s*-\s+\*\*\[(.+?)\]', raw_line):
+            return True
+    return False
+
+
+def _question_entry_masked_in(text: str, masked: str, lo: int, hi: int) -> bool:
+    """True when the span covering [lo, hi) swallowed a reader-recognised question.
+
+    Scoped deliberately. Asking the question document-globally meant a question
+    swallowed by ONE deliberate span counted as damage for a divider hidden by a
+    DIFFERENT, unrelated span — two independent balanced quotes in the same file
+    warned even though each was intentional and nothing live was lost.
+    """
+    pos = 0
+    for raw_line, masked_line in zip(text.split("\n"), masked.split("\n")):
+        start, end = pos, pos + len(raw_line)
+        pos = end + 1                                  # +1 for the newline
+        if end <= lo or start >= hi:
+            continue                                   # outside THIS span
         if raw_line == masked_line:
             continue
         if raw_line.startswith("## ") or re.match(r'^\s*-\s+\*\*\[(.+?)\]', raw_line):
@@ -266,7 +294,7 @@ def _dividers_hidden_by_damage(text: str, divider: re.Pattern) -> list[tuple[int
     # What the SPAN pass alone swallowed. `mask_markup` runs comments -> spans ->
     # fences, so diffing these two isolates the span step: fences are applied to
     # NEITHER side, and comments are applied to BOTH.
-    spanned = _mask_nonfence_spans(comments_only)
+    spanned, span_ranges = _mask_nonfence_spans(comments_only, report_ranges=True)
     masked = mask_markup(text)
     hidden = []
     for m in divider.finditer(comments_only):
@@ -281,7 +309,15 @@ def _dividers_hidden_by_damage(text: str, divider: re.Pattern) -> list[tuple[int
             # separate, balanced span quoting the divider warned on healthy
             # markup — reproduced by three reviewers at 06f3dfc4. The fence pass
             # has its own branch above; it must not leak into this one.
-            damaged = _question_entry_masked(comments_only, spanned)
+            # Only the span that actually hid THIS divider can implicate it.
+            # Scoping to the pass was not enough: the test still ran across the
+            # whole document, so an unrelated deliberate span elsewhere supplied
+            # the "swallowed question" for a divider it never touched.
+            damaged = any(
+                _question_entry_masked_in(comments_only, spanned, lo, hi)
+                for lo, hi in span_ranges
+                if lo <= m.start() and m.end() <= hi
+            )
         if damaged:
             hidden.append((text.count("\n", 0, m.start()) + 1, text[m.start():m.end()]))
     return hidden

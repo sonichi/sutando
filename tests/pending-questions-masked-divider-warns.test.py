@@ -137,9 +137,37 @@ class TestMaskedDividerWarns(unittest.TestCase):
             "- **[RETIRED]** archived\n"
             f"end {TICK}\n"
         )
+        # UPDATED 2026-08-03: this fixture does NOT satisfy its own premise. Measured
+        # span ranges on it: [43,56) covers lines 1-2 (the banner) and [88,133) covers
+        # lines 3-8 (the real divider AND the swallowed `- **[RETIRED]**` bullet). They
+        # are TWO different spans, so the banner's span swallows no question and is a
+        # deliberate, balanced quote — exactly the false alarm qingyun-wu flagged at
+        # 446de6c7. The anti-under-reporting guarantee this test was added for is
+        # preserved below in the same-span fixture, where the premise actually holds.
         out, err = _run(text)
-        self.assertIn("line 2", err, "the quoted banner is a candidate and must be listed")
         self.assertIn("line 5", err, "the REAL divider must not be dropped in favour of the banner")
+        self.assertNotIn("line 2", err,
+                         "a balanced quote hidden by a DIFFERENT span swallows nothing "
+                         "and must not be listed")
+        self.assertEqual(out, text, "still warn-only")
+
+    def test_ONE_span_hiding_TWO_dividers_lists_BOTH(self):
+        # The original intent of the test above, under a fixture that actually meets
+        # its premise: a single runaway span swallows a banner, a live question AND
+        # the real divider. Nothing can single out "the real one" here, so listing
+        # every candidate is honest and still actionable — one unbalanced backtick
+        # explains all of them.
+        text = (
+            f"intro: never append below the {TICK}\n"
+            "# Resolved\n"
+            "## a live question this span swallowed\n"
+            "# Resolved\n"
+            "archived body\n"
+            f"end {TICK}\n"
+        )
+        out, err = _run(text)
+        self.assertIn("line 2", err, "first candidate in the SAME span must be listed")
+        self.assertIn("line 4", err, "second candidate in the SAME span must be listed")
         self.assertEqual(out, text, "still warn-only")
 
     def test_label_comes_from_the_MATCH_not_a_hardcoded_string(self):
@@ -286,6 +314,47 @@ class TestMaskedDividerWarns(unittest.TestCase):
         out, err = _run(text)
         self.assertIn("MASKED by markup", err,
                       "scoping the damage test must not silence real span damage")
+
+    def test_TWO_INDEPENDENT_balanced_spans_do_not_implicate_each_other(self):
+        # qingyun-wu at 446de6c7. Scoping the damage test to the span PASS was not
+        # enough — it still ran across the whole document, so a question swallowed
+        # by ONE deliberate span counted as damage for a divider hidden by a
+        # DIFFERENT, unrelated span. Both quotes here are intentional and balanced;
+        # nothing live is lost, so nothing may warn.
+        #
+        # This is the control that pins the relation as LOCAL: the swallowed
+        # question must belong to the same span that hid the divider.
+        text = (
+            "## live one\n"
+            f"prose opens {TICK}\n"
+            "## an example heading inside a deliberate quote\n"
+            f"{TICK} closes the first span\n"
+            "\n"
+            f"prose opens {TICK}\n"
+            "# Resolved\n"
+            f"{TICK} closes the second span\n"
+            "## still live\n"
+        )
+        out, err = _run(text)
+        self.assertEqual(err, "",
+                         "a question swallowed by an UNRELATED span must not implicate "
+                         "a divider hidden by a different one")
+        self.assertEqual(out, text)
+
+    def test_the_swallowing_span_still_warns_when_it_is_the_SAME_span(self):
+        # Over-trigger control for the scoping. Narrowing to the hiding span must
+        # not blind the detector when that very span takes a live question with it.
+        text = (
+            "## live one\n"
+            f"prose opens {TICK}\n"
+            "## a live question this same span swallowed\n"
+            "# Resolved\n"
+            "archived body\n"
+            f"{TICK} closes\n"
+        )
+        out, err = _run(text)
+        self.assertIn("MASKED by markup", err,
+                      "same-span damage must still warn after the scoping")
 
     def test_no_divider_at_all_is_silent(self):
         text = "## only live questions\nbody\n"
