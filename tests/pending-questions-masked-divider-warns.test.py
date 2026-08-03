@@ -78,6 +78,44 @@ class TestMaskedDividerWarns(unittest.TestCase):
         self.assertEqual(err, "", "a bounded fenced example must not warn")
         self.assertEqual(out, text, "no real divider exists, so nothing is cut")
 
+    def test_bullet_only_archive_also_warns(self):
+        # REVIEW FIX (qingyun-wu + john-the-dev, #2558). The first version of the
+        # discriminator tested `## ` headings ONLY, so a bullet-only archive under a
+        # masked divider returned the whole file with an EMPTY stderr — retired
+        # bullets served as live while the guard implied all-clear.
+        #
+        # This is the shape the module header itself calls out: "real
+        # pending-questions.md carries 0 `## ` headings, only bullets". A guard that
+        # covers one of two reader-recognized populations is worse than no guard,
+        # because it reads as comprehensive.
+        text = (
+            f"intro stray {TICK}\n"
+            "# Resolved\n"
+            "\n"
+            "- **[RETIRED, 2026-08-03]** archived bullet should not be live\n"
+            f"closing {TICK}\n"
+        )
+        out, err = _run(text)
+        self.assertIn("MASKED", err, "a bullet-only archive must warn too")
+        self.assertEqual(out, text, "still warn-only — never cut")
+
+    def test_bounded_fence_containing_a_BULLET_stays_quiet(self):
+        # The control that keeps the widened predicate honest: widening to bullets
+        # must not start crying wolf on a fenced example that happens to contain one.
+        fence = TICK * 3
+        text = (
+            "## live question\n"
+            f"{fence}\n"
+            "# Resolved\n"
+            "- **[EXAMPLE]** this is documentation, not an archive\n"
+            f"{fence}\n"
+            "\n"
+            "## another live question\n"
+        )
+        out, err = _run(text)
+        self.assertEqual(err, "", "a bounded fenced example must stay quiet")
+        self.assertEqual(out, text)
+
     def test_no_divider_at_all_is_silent(self):
         text = "## only live questions\nbody\n"
         out, err = _run(text)

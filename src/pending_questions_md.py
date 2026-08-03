@@ -219,25 +219,45 @@ def mask_markup(text: str) -> str:
     return mask_fenced_code(_mask_nonfence_spans(mask_html_comments(text)))
 
 
-def _masks_real_sections(text: str, masked: str) -> bool:
-    """True when masking has swallowed at least one real `## ` question heading.
+def _divider_hidden_by_inline_span(text: str, divider: re.Pattern) -> bool:
+    """True when the divider survives comment+fence masking but an inline span hides it.
 
-    This is the discriminator between DAMAGE and a legitimate quoted example, and it
-    is deliberately not a threshold. A `# Resolved` shown inside a bounded fence
-    masks only the example itself — zero question headings — and must stay quiet,
-    because a warning that cries wolf on healthy files is a warning nobody reads. An
-    unclosed span, by contrast, swallows live sections: measured 66 on the host where
-    this was found, versus 0 for a fenced example.
+    This is the discriminator between DAMAGE and a legitimately quoted divider, and it
+    asks the only question that actually separates them: **which masker hid it?**
 
-    Chosen by measurement after a cleverer-looking condition ("everything after the
-    divider is masked too") was tested against the real damaged file and turned out
-    FALSE there — 4,542 unmasked characters remained in the tail — so that guard
-    would not have fired on the very defect it was written for.
+      * hidden by a COMMENT or a BOUNDED FENCE -> the author quoted the divider on
+        purpose (a banner, a documentation example). Masking did its job. Stay quiet.
+      * survives those, then vanishes under `_mask_nonfence_spans` -> an unbalanced
+        backtick opened a span that ran past it. Nothing intended that. Warn.
+
+    **This replaces a population count, on review of #2558.** The first version asked
+    "did masking swallow a real `## ` heading?", which qingyun-wu and john-the-dev both
+    caught: the readers ALSO count free-form `- **[label]**` bullets, and this file's
+    own module header notes that "real pending-questions.md carries 0 `## ` headings,
+    only bullets" — so a bullet-only archive warned nothing while serving retired
+    bullets as live. A guard covering one of two populations is worse than none,
+    because it reads as comprehensive.
+
+    Widening it to bullets was the obvious repair and it is the WRONG axis: a fenced
+    example containing a bullet then trips the warning (verified — it broke the
+    bounded-fence control). Keying on the masker instead needs no knowledge of what
+    counts as a question, so it covers both populations, any future third shape, and
+    an archive of plain prose, without a list that can drift from the readers.
+
+    Measured on all five known shapes:
+
+        REAL damaged (unbalanced backtick)   fences=visible spans=hidden  -> WARN
+        REAL healthy                         divider found normally       -> quiet
+        bullet-only archive, stray backtick  fences=visible spans=hidden  -> WARN
+        bounded fence w/ divider + bullet    fences=hidden                -> quiet
+        banner quoting divider in a comment  divider found normally       -> quiet
+
+    Also rejected by measurement: "everything after the divider is masked too", which
+    is FALSE on the real damaged file (4,542 unmasked tail chars), so it would not
+    have fired on the defect it was written for.
     """
-    return any(
-        raw_line.startswith("## ") and raw_line != masked_line
-        for raw_line, masked_line in zip(text.split("\n"), masked.split("\n"))
-    )
+    fenced_and_comments_only = mask_fenced_code(mask_html_comments(text))
+    return bool(divider.search(fenced_and_comments_only))
 
 
 def active_region(text: str, divider: re.Pattern = DIVIDER_RE) -> str:
@@ -266,7 +286,7 @@ def active_region(text: str, divider: re.Pattern = DIVIDER_RE) -> str:
     if m:
         return text[:m.start()]
     raw = divider.search(text)
-    if raw is not None and _masks_real_sections(text, masked):
+    if raw is not None and _divider_hidden_by_inline_span(text, divider):
         line = text.count("\n", 0, raw.start()) + 1
         print(
             f"pending-questions: '# Resolved' divider at line {line} is MASKED by "
