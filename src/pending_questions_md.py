@@ -220,7 +220,7 @@ def mask_markup(text: str) -> str:
 
 
 def _divider_hidden_by_inline_span(text: str, divider: re.Pattern) -> bool:
-    """Every divider that survives comment+fence masking but is then hidden by an inline span.
+    """Every divider hidden by DAMAGE (an unclosed inline span or an unclosed fence).
 
     Returns a list of (line, matched_text); empty when nothing is span-hidden.
 
@@ -258,12 +258,21 @@ def _divider_hidden_by_inline_span(text: str, divider: re.Pattern) -> bool:
     is FALSE on the real damaged file (4,542 unmasked tail chars), so it would not
     have fired on the defect it was written for.
     """
-    fenced_and_comments_only = mask_fenced_code(mask_html_comments(text))
+    comments_only = mask_html_comments(text)
+    fenced = mask_fenced_code(comments_only)
     masked = mask_markup(text)
     hidden = []
-    for m in divider.finditer(fenced_and_comments_only):
-        # Hidden by the inline-span pass specifically: present here, gone after it.
-        if masked[m.start():m.end()].strip() == "":
+    for m in divider.finditer(comments_only):
+        if masked[m.start():m.end()].strip() != "":
+            continue                      # still visible after all masking -> not hidden at all
+        if fenced[m.start():m.end()].strip() != "":
+            damaged = True                # survived the fence pass -> an unclosed SPAN hid it
+        else:
+            # The fence pass hid it. That is deliberate quoting IF the fence closes;
+            # an UNCLOSED fence runs to end of document, so everything from here on is
+            # masked. That signature separates a documentation example from damage.
+            damaged = fenced[m.start():].strip() == ""
+        if damaged:
             hidden.append((text.count("\n", 0, m.start()) + 1, text[m.start():m.end()]))
     return hidden
 

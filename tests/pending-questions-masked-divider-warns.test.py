@@ -161,6 +161,39 @@ class TestMaskedDividerWarns(unittest.TestCase):
         self.assertNotIn("Resolved", err.getvalue(), "must not name a divider absent from the file")
         self.assertEqual(out, text)
 
+    def test_an_UNCLOSED_FENCE_also_warns(self):
+        # SELF-REVIEW, not a reviewer finding. Three review rounds had all been
+        # "an input the guard did not enumerate", so I enumerated the rest myself —
+        # and the warning's own text ("an unclosed backtick span or code fence")
+        # was over-claiming: an unclosed FENCE produced identical damage (whole file
+        # served as live, retired entry visible) and the guard said NOTHING, because
+        # the helper masked fences before looking.
+        fence = TICK * 3
+        text = (
+            "## live question\n"
+            "body\n"
+            f"{fence}\n"
+            "example content that never closes\n"
+            "\n"
+            "# Resolved\n"
+            "\n"
+            "- **[RETIRED]** archived question served as LIVE\n"
+        )
+        out, err = _run(text)
+        self.assertIn("MASKED", err, "an unclosed fence is damage too")
+        self.assertEqual(out, text, "still warn-only")
+
+    def test_a_BOUNDED_fence_example_stays_quiet_after_the_widening(self):
+        # The control that keeps the widening honest. An unclosed fence masks to END
+        # OF DOCUMENT; a closed one stops at its closer. That signature is what
+        # separates damage from a documentation example, so a quoted divider inside
+        # a properly closed fence must remain silent.
+        fence = TICK * 3
+        text = f"## live question\n{fence}\n# Resolved\n{fence}\n\n## another live question\n"
+        out, err = _run(text)
+        self.assertEqual(err, "", "a closed fence is deliberate quoting, not damage")
+        self.assertEqual(out, text)
+
     def test_no_divider_at_all_is_silent(self):
         text = "## only live questions\nbody\n"
         out, err = _run(text)
