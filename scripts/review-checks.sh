@@ -52,9 +52,12 @@ parse_list() {  # $1 = flag|allow ; reads $GUIDE
         /^```yaml/ {y=1; next}
         /^```/     {y=0}
         !y {next}
-        /^[[:space:]]*flag:[[:space:]]*$/  {s="flag";  next}
-        /^[[:space:]]*allow:[[:space:]]*$/ {s="allow"; next}
-        /^[[:space:]]*[A-Za-z_-]+:[[:space:]]*$/ {s=""}
+        # Section keys are matched generically so a new list (e.g. allow_paired)
+        # needs no parser change — previously only flag:/allow: were recognized
+        # and every other key reset the state, silently dropping new sections.
+        /^[[:space:]]*[A-Za-z_-]+:[[:space:]]*$/ {
+            s=$0; sub(/^[[:space:]]*/,"",s); sub(/:[[:space:]]*$/,"",s); next
+        }
         s==want && /^[[:space:]]*-[[:space:]]/ {
             v=$0; sub(/^[[:space:]]*-[[:space:]]*/,"",v)
             sub(/[[:space:]]+#.*$/,"",v)
@@ -64,11 +67,17 @@ parse_list() {  # $1 = flag|allow ; reads $GUIDE
     ' "$GUIDE"
 }
 FLAGS="$(parse_list flag)"
+# flag_exact: patterns that must match the WHOLE path token, not a substring.
+# Needed for full executable paths — '/usr/bin/swift' as a substring also
+# rejects the real, separate '/usr/bin/swift-inspect' binary (#2474 review).
+FLAGS_EXACT="$(parse_list flag_exact)"
 ALLOWS="$(parse_list allow)"
+ALLOW_PAIRED="$(parse_list allow_paired)"
 NOTE=""
 if [[ -z "${FLAGS//[$' \t\r\n']/}" ]]; then
     FLAGS=$'/Users/\n/home/'
     ALLOWS=$'/nonexistent\n/usr/fake\n/tmp/\nexample.com'
+    ALLOW_PAIRED=''
     NOTE="no repo review guide (or no checks: block) at ${GUIDE#$REPO/}; used generic defaults"
 fi
 
@@ -79,7 +88,7 @@ fi
 # — so a large PR diff (~8MB) can't hit 'Argument list too long' and make the
 # scanner fail to launch while we blindly print PASS (#2281). `printf` is a bash
 # builtin, so piping the whole diff carries no exec-size limit.
-HITS="$(printf '%s' "$DIFF" | RC_FLAGS="$FLAGS" RC_ALLOWS="$ALLOWS" python3 "$HERE/review-checks.py")"
+HITS="$(printf '%s' "$DIFF" | RC_FLAGS="$FLAGS" RC_FLAGS_EXACT="$FLAGS_EXACT" RC_ALLOWS="$ALLOWS" RC_ALLOW_PAIRED="$ALLOW_PAIRED" python3 "$HERE/review-checks.py")"
 SCAN_RC=$?
 # Fail closed: if the scanner didn't run to completion (exec failure, crash),
 # its exit is non-zero. Do NOT interpret an empty stdout as "clean" — error out.
