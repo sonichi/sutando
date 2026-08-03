@@ -284,8 +284,14 @@ class CarrierSetProbe(unittest.TestCase):
         # qingyun-wu, P1 on e73e2597. The remedy said "add them to the local list"
         # for EVERY missing shipped entry — including `state/current-track.md`,
         # which #2534 ships at a flat, SHARED vault path. Following that advice
-        # re-tracks per-host state at a path a peer also writes, which is exactly
-        # the incident that destroyed a peer's 1056-line anchor on 2026-08-03.
+        # re-tracks per-host state at a path a peer also writes, so a peer's copy
+        # lands in yours and each sync keeps its own side.
+        #
+        # This comment previously called that "the incident that destroyed a
+        # peer's 1056-line anchor". Nothing was destroyed — the vault uses
+        # per-host branches and a host never writes to a peer's. Corrected here
+        # as well as in the source, because a retraction that fixes only the
+        # passage in front of you leaves the wrong version alive somewhere else.
         #
         # It must still be REPORTED — silently filtering it would hide a real
         # divergence, which is the failure this whole probe exists to prevent.
@@ -308,7 +314,19 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIn("must NOT be re-added", r["detail"])
         self.assertIn("#2567", r["detail"], "must name why")
         self.assertNotIn("add them to the local list", r["detail"],
-                         "the data-loss instruction must not accompany this entry")
+                         "the re-add instruction must not accompany this entry")
+        # The warning must not claim data loss. It shipped saying re-adding
+        # "destroyed a peer's anchor"; nothing was destroyed, and an operator who
+        # later discovers that discounts the whole warning — including the part
+        # that is true. Asserting the absence of the claim is the point here:
+        # the reason may be reworded, the false severity must not come back.
+        for overclaim in ("destroyed", "destroy", "data loss"):
+            self.assertNotIn(overclaim, r["detail"].lower(),
+                             f"the warning must not claim {overclaim!r} — the hazard is a "
+                             "peer's copy landing in yours on a shared path, not loss")
+        # …and it must still say enough to act on, so the correction cannot be
+        # satisfied by simply deleting the reason.
+        self.assertIn("SHARED", r["detail"], "must still name why the path is unsafe")
 
     def test_a_BROADER_local_entry_is_coverage_not_a_dropped_entry(self):
         # #2571, reported by Sutando-Pro against #2566 within minutes of merge.
