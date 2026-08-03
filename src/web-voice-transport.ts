@@ -81,8 +81,14 @@ export function int16ToFloat32(buf: ArrayBuffer): Float32Array {
  * Human-friendly microphone-error classification. Not every failure is a
  * permission denial — name the real cause so the user isn't sent to "browser
  * settings" when the mic is merely busy or absent. (Verbatim from web-client.)
+ *
+ * `message` is the underlying `DOMException.message`. The default branch echoes
+ * it because an unclassified failure is exactly the case where the raw browser
+ * text is the only diagnostic the user can report — dropping it (as this module
+ * did before the web UI switched over) made the shipped guidance strictly less
+ * useful than web-client's own copy.
  */
-export function classifyMicError(name: string | undefined): string {
+export function classifyMicError(name: string | undefined, message?: string): string {
   switch (name) {
     case 'NotAllowedError':
     case 'SecurityError':
@@ -94,7 +100,13 @@ export function classifyMicError(name: string | undefined): string {
     case 'OverconstrainedError':
       return 'No microphone found. Connect an input device and select it as the default in your OS sound settings, then Connect.';
     default:
-      return 'Microphone error (' + (name || 'unknown') + '). Click Connect to retry.';
+      return (
+        'Microphone error (' +
+        (name || 'unknown') +
+        '): ' +
+        (message || 'could not start capture') +
+        '. Click Connect to retry.'
+      );
   }
 }
 
@@ -102,9 +114,33 @@ export function classifyMicError(name: string | undefined): string {
 
 export type VoiceStatus = 'idle' | 'connecting' | 'live' | 'error' | 'closed';
 
+/**
+ * Why the close event carries the raw code/reason: the surface — not the
+ * transport — owns reconnect policy (attempt caps, retry delay, and the
+ * troubleshooting copy that names GEMINI_API_KEY and the Discord link). It
+ * cannot make that decision without distinguishing a clean server goodbye
+ * (code 4000) or a user-initiated disconnect from an unexpected drop, so the
+ * code and reason are handed through verbatim rather than flattened into
+ * `detail`.
+ */
+export interface VoiceCloseInfo {
+  code: number;
+  reason: string;
+}
+
 export interface VoiceTransportEvents {
-  /** Connection lifecycle. `detail` is a human string for the status line. */
-  onStatus?(status: VoiceStatus, detail?: string): void;
+  /**
+   * Connection lifecycle. `detail` is a human string for the status line.
+   * `close` is present only for `status === 'closed'`, carrying the WS close
+   * code and reason so the surface can apply its own reconnect policy.
+   */
+  onStatus?(status: VoiceStatus, detail?: string, close?: VoiceCloseInfo): void;
+  /**
+   * Optional trace sink for the surface's debug panel and its downloadable
+   * debug dump. `kind` mirrors web-client's dbg() channels ('audio' | 'event' |
+   * 'err' | 'warn' | undefined). Off unless the surface supplies it.
+   */
+  onDebug?(msg: string, kind?: string): void;
   /** Server transcript frame. `partial=false` means finalized. */
   onTranscript?(role: string, text: string, partial: boolean): void;
   /** Assistant turn ended normally. Playback is NOT flushed — the final audio
@@ -161,6 +197,12 @@ export class VoiceTransport {
   private bytesRecv = 0;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Debug-panel counters. They exist to bound the trace output (first N only),
+  // not as protocol state — the surface reads byte totals from onStats.
+  private audioChunksRecv = 0;
+  private micSendCount = 0;
+  private playChunkCount = 0;
+
   constructor(opts: VoiceTransportOptions = {}) {
     this.ev = opts;
     this.captureBuf = opts.captureBuf ?? 2048;
@@ -210,7 +252,8 @@ export class VoiceTransport {
         }, 500);
       } catch (err: any) {
         const name = err?.name ?? 'unknown';
-        const friendly = classifyMicError(err?.name);
+        const friendly = classifyMicError(err?.name, err?.message);
+        this.debug('Mic error: ' + (err?.name ? err.name + ': ' : '') + err?.message, 'err');
         this.status('error', 'Mic error');
         this.ev.onMicError?.(name, err?.message ?? '', friendly);
         // Prevent an auto-reconnect loop on a hard mic failure.
@@ -224,14 +267,20 @@ export class VoiceTransport {
 
     ws.onmessage = (event: MessageEvent) => this.onMessage(event);
 
-    ws.onerror = () => this.status('error', 'Connection error');
+    ws.onerror = () => {
+      this.debug('WS error', 'err');
+      this.status('error', 'Connection failed');
+    };
 
-    ws.onclose = () => {
+    ws.onclose = (event: CloseEvent) => {
       // A server-initiated close must tear down the whole audio graph, not just
       // the stats timer — otherwise mic capture keeps running and stale audio
       // state lingers. Mirrors web-client's doCleanup() on ws.onclose.
+      const code = event?.code ?? 0;
+      const reason = event?.reason ?? '';
+      this.debug('WS closed: code=' + code + ' reason=' + reason);
       this.teardownAudio();
-      this.status('closed', 'Disconnected');
+      this.status('closed', 'Disconnected', { code, reason });
     };
   }
 
@@ -278,12 +327,25 @@ export class VoiceTransport {
 
   private async startMic(): Promise<void> {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      const secure = typeof window !== 'undefined' && (window as any).isSecureContext;
-      throw new Error(
-        secure
-          ? 'Microphone access is not available in this browser. Please use a modern browser that supports getUserMedia.'
-          : 'Microphone access requires HTTPS. Please access this page via HTTPS or localhost.',
-      );
+      // Condition and copy are verbatim from web-client. Deliberately keyed on
+      // location rather than isSecureContext: the two agree on every surface we
+      // ship today, but this is the string a user reads when the mic will not
+      // start, and the shipped wording is the one to preserve.
+      const isLocalhost =
+        window.location.hostname === 'localhost' ||
+        window.location.hostname === '127.0.0.1' ||
+        window.location.hostname === '[::1]';
+      const isHttps = window.location.protocol === 'https:';
+
+      if (!isLocalhost && !isHttps) {
+        throw new Error(
+          'Microphone access requires HTTPS. Please access this page via HTTPS (https://your-domain.com) or use localhost. Modern browsers block getUserMedia on HTTP for security.',
+        );
+      } else {
+        throw new Error(
+          'Microphone access is not available in this browser. Please use a modern browser that supports getUserMedia.',
+        );
+      }
     }
 
     this.micStream = await navigator.mediaDevices.getUserMedia({
@@ -315,6 +377,14 @@ export class VoiceTransport {
       // `new Int16Array(len)`), so the ArrayBufferLike→ArrayBuffer cast is safe.
       this.ws.send(pcm.buffer as ArrayBuffer);
       this.bytesSent += pcm.buffer.byteLength;
+      this.micSendCount++;
+      if (this.micSendCount <= 3) {
+        this.debug(
+          'Sent mic #' + this.micSendCount + ': ' + pcm.buffer.byteLength + 'B (' +
+            down.length + ' samples @ ' + this.inputRate + 'Hz)',
+          'audio',
+        );
+      }
     };
 
     source.connect(processor);
@@ -347,6 +417,12 @@ export class VoiceTransport {
   private onMessage(event: MessageEvent): void {
     if (event.data instanceof ArrayBuffer) {
       this.bytesRecv += event.data.byteLength;
+      this.audioChunksRecv++;
+      // First few only: the debug panel wants proof audio is arriving, not a
+      // line per 20ms chunk. Matches web-client's cap.
+      if (this.audioChunksRecv <= 5) {
+        this.debug('Recv audio #' + this.audioChunksRecv + ': ' + event.data.byteLength + 'B', 'audio');
+      }
       this.playChunk(event.data);
       return;
     }
@@ -354,8 +430,10 @@ export class VoiceTransport {
     try {
       msg = JSON.parse(event.data);
     } catch {
+      this.debug('Bad JSON text frame', 'warn');
       return; // non-JSON text frame — ignore
     }
+    this.debug('Recv: ' + JSON.stringify(msg), 'event');
 
     if (msg?.type === 'session.config' && msg.audioFormat) {
       this.inputRate = msg.audioFormat.inputSampleRate ?? this.inputRate;
@@ -422,8 +500,18 @@ export class VoiceTransport {
         const idx = this.activeSources.indexOf(src);
         if (idx >= 0) this.activeSources.splice(idx, 1);
       };
-    } catch {
+      this.playChunkCount++;
+      if (this.playChunkCount <= 5) {
+        this.debug(
+          'Played chunk #' + this.playChunkCount + ': ' + f32.length +
+            ' samples, scheduled at ' + this.nextPlayTime.toFixed(3) +
+            's (ctx.state=' + ctx.state + ')',
+          'audio',
+        );
+      }
+    } catch (err: any) {
       /* transient scheduling error — drop this chunk */
+      this.debug('playChunk error: ' + (err?.message ?? err), 'err');
     }
   }
 
@@ -442,8 +530,12 @@ export class VoiceTransport {
 
   // ─── helpers ────────────────────────────────────────────────
 
-  private status(s: VoiceStatus, detail?: string): void {
-    this.ev.onStatus?.(s, detail);
+  private status(s: VoiceStatus, detail?: string, close?: VoiceCloseInfo): void {
+    this.ev.onStatus?.(s, detail, close);
+  }
+
+  private debug(msg: string, kind?: string): void {
+    this.ev.onDebug?.(msg, kind);
   }
 
   private stopStats(): void {
