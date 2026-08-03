@@ -616,7 +616,19 @@ def _tier_for(user_id):
     local file can, and only for a sender they named explicitly.
 
     Everyone else (unlisted / no user_id) gets LOCAL_TIER, unchanged: no existing
-    install is silently demoted, and an unknown sender never gains privilege."""
+    install is silently demoted, and an unknown sender never gains privilege.
+
+    ⚠ CONTRACT — `user_id` MUST stay broker-attested (cold-review note, #2584).
+    The removed clamp used to be a backstop: even if `user_id` had become
+    body-influenced, a mapped tier was still bounded by LOCAL_TIER. With the
+    clamp gone, "`user_id` is the broker-written Matrix sender, never a
+    task-body self-claim" is SOLELY load-bearing for the no-wire-escalation
+    property. It holds today because `user_id` is a broker-writer-side entry in
+    _TASK_FIELDS, serialized beside room_name/sender_name. Any future change
+    that lets a task body influence `user_id` reintroduces wire-controlled
+    escalation — re-add a bound here if that contract is ever weakened.
+    (Deliberately a contract note, not an assert: provenance cannot be checked
+    at runtime — the value is an ordinary string whichever path produced it.)"""
     uid = (user_id or "").strip()
     if uid:
         mapped = _load_tier_map().get(uid)
@@ -1293,6 +1305,7 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     as discord-bridge.write_owner_activity so the proactive-loop reader is
     transport-agnostic. Best-effort — never blocks task intake."""
     if sender_tier is None:
+        # user_id is broker-attested here — see the CONTRACT note in _tier_for.
         sender_tier = _tier_for(task.get("user_id"))
     if sender_tier != "owner":
         return
@@ -1456,6 +1469,7 @@ def _write_task(task: dict) -> str | None:
     # Resolve ONCE and reuse for both the task tier AND the owner-activity gate
     # below, so the two decisions can never diverge (a single source of truth,
     # no double read of the tierMap).
+    # user_id is broker-attested here — see the CONTRACT note in _tier_for.
     sender_tier = _tier_for(task.get("user_id"))
     lines.append(f"access_tier: {sender_tier}")
     # #2267 parity, second half: the other bridges append the in-band security
