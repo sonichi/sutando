@@ -366,6 +366,37 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIsNotNone(r)
         self.assertEqual(r["status"], "ok", r.get("detail"))
 
+    def test_the_directory_probe_is_actually_BOUNDED(self):
+        # The cap is the whole reason this walk is safe to run from a background
+        # health check, and an unenforced cap is just a slow unbounded walk. Pin
+        # the bound itself rather than trusting the constant to be wired up.
+        d = self.tmp / "many"
+        d.mkdir()
+        for i in range(self.hc._PROBE_FILES_PER_DIR + 12):
+            (d / f"f{i:03d}.md").write_text("x\n")
+        got = self.hc._carrier_probe_files(d)
+        self.assertEqual(len(got), self.hc._PROBE_FILES_PER_DIR)
+        # Sorted, so the verdict cannot depend on filesystem walk order — an
+        # unsorted sample would make the probe answer differently run to run.
+        self.assertEqual(got, sorted(got))
+
+    def test_an_EMPTY_carrier_directory_does_not_manufacture_a_failure(self):
+        # `hosts/<label>/` exists but nothing has been written under it yet.
+        # There is no outcome to measure, and inventing one would fail a host
+        # that has done nothing wrong. The genuinely-absent case (no
+        # representative at all) is reported by the callers instead.
+        empty = self.tmp / "empty-dir"
+        empty.mkdir()
+        self.assertEqual(self.hc._carrier_probe_files(empty), [])
+        self.assertEqual(self.hc._carrier_target_verdict(self.tmp, empty), "carried")
+
+    def test_a_representative_that_is_neither_file_nor_directory_yields_nothing(self):
+        # A dangling symlink resolves to a path that exists() says nothing useful
+        # about; probing it would ask git about something that is not there.
+        link = self.tmp / "dangling"
+        link.symlink_to(self.tmp / "does-not-exist")
+        self.assertEqual(self.hc._carrier_probe_files(link), [])
+
     def test_a_NARROWER_local_rule_covering_one_child_is_not_coverage(self):
         # qingyun-wu P1 on #2572. `_carrier_representative` returned the FIRST
         # glob match, so a shipped wildcard matching several paths was judged on
