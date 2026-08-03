@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-192 modules indexed.
+193 modules indexed.
 
 ## `src/`
 
@@ -121,6 +121,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
 - **`task_priority.py`** — Task priority taxonomy + readers.
+- **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
