@@ -1286,8 +1286,19 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     stale: "list[str]" = []
     unmeasured: "list[str]" = []
     for entry in resolved:
-        rep = _carrier_representative(workspace, entry)
-        if rep is None:
+        # EVERY materialized match, not one. `_carrier_representative()` (singular)
+        # collapses `hosts/*/` to its first match, so a two-host workspace whose
+        # exclude carries host A but not host B reported `ok` while B's subtree
+        # was ignored and unbacked — the same false green the dropped branch was
+        # fixed for, on the OTHER axis.
+        #
+        # The previous round shared the directory-vs-file instrument across both
+        # branches and stopped there. Coverage has two independent axes — WHICH
+        # paths you probe, and WHAT you ask about each — and generalizing one of
+        # them left the other singular here. Both branches now enumerate.
+        # (john-the-dev and qingyun-wu, independently, on cf059ca8.)
+        reps = _carrier_representatives(workspace, entry)
+        if not reps:
             continue
         # `git_argv` rather than a bare "git": on macOS the stock /usr/bin/git is
         # an Xcode-CLT shim that pops an install dialog when the tools are absent,
@@ -1301,7 +1312,12 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         # Caught by restoring this host's real pre-fix exclude and watching the
         # probe still say OK. Both that and the directory/contents distinction now
         # live in `_carrier_target_verdict` so the two branches cannot drift.
-        verdict = _carrier_target_verdict(workspace, rep)
+        verdict = "carried"
+        for rep in reps:
+            got = _carrier_target_verdict(workspace, rep)
+            if got != "carried":
+                verdict = got
+                break
         if verdict == "dropped":
             stale.append(entry)
         elif verdict == "unmeasured":

@@ -366,6 +366,64 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIsNotNone(r)
         self.assertEqual(r["status"], "ok", r.get("detail"))
 
+    def test_SAME_config_two_hosts_partially_carried_is_not_ok(self):
+        # john-the-dev and qingyun-wu, independently, on cf059ca8. The STALE
+        # branch still collapsed `hosts/*/` to `_carrier_representative()`
+        # (singular), so a workspace whose exclude carries host A but not host B
+        # reported `ok` while B's subtree was ignored and unbacked.
+        #
+        # Note resolved == shipped here: this is NOT the dropped/override branch.
+        # The previous round shared the directory-vs-file instrument across both
+        # branches and stopped, but coverage has TWO independent axes — which
+        # paths you probe, and what you ask about each — so generalizing one left
+        # the other singular. This pins the axis that was missed.
+        ws = _mkworkspace(self.tmp,
+                          ["hosts/", "hosts/a/", "hosts/a/**", "hosts/b/"],   # b's files not carried
+                          ["hosts/a/current-track.md", "hosts/b/current-track.md"])
+        self._patch_resolved(["hosts/*/"])
+        self._patch_shipped(["hosts/*/"])          # same config — stale branch
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertNotEqual(r["status"], "ok",
+                            "host b's subtree is ignored; judging only host a hides it")
+        self.assertIn("hosts/*/", r["detail"])
+
+    def test_SAME_config_two_hosts_FULLY_carried_reads_ok(self):
+        # The control that keeps the fix from simply failing every wildcard:
+        # identical except host b's contents are carried too.
+        ws = _mkworkspace(self.tmp,
+                          ["hosts/", "hosts/a/", "hosts/a/**", "hosts/b/", "hosts/b/**"],
+                          ["hosts/a/current-track.md", "hosts/b/current-track.md"])
+        self._patch_resolved(["hosts/*/"])
+        self._patch_shipped(["hosts/*/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", r.get("detail"))
+
+    def test_an_unmeasurable_second_host_stays_fail_closed(self):
+        # Enumerating must not weaken the unmeasured contract: if host a answers
+        # cleanly and host b's probe fails, the entry is UNKNOWN, never carried.
+        ws = _mkworkspace(self.tmp,
+                          ["hosts/", "hosts/a/", "hosts/a/**", "hosts/b/", "hosts/b/**"],
+                          ["hosts/a/current-track.md", "hosts/b/current-track.md"])
+        self._patch_resolved(["hosts/*/"])
+        self._patch_shipped(["hosts/*/"])
+        real = self.hc.subprocess.run
+
+        def flaky(argv, *a, **kw):
+            if any("hosts/b" in str(x) for x in argv):
+                raise self.hc.subprocess.SubprocessError("probe failed on host b")
+            return real(argv, *a, **kw)
+
+        self.hc.subprocess.run = flaky
+        try:
+            r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        finally:
+            self.hc.subprocess.run = real
+        self.assertIsNotNone(r)
+        self.assertNotEqual(r["status"], "ok",
+                            "a host we could not measure is UNKNOWN, not carried")
+
     def test_the_directory_probe_is_actually_BOUNDED(self):
         # The cap is the whole reason this walk is safe to run from a background
         # health check, and an unenforced cap is just a slow unbounded walk. Pin
