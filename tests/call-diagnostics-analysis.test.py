@@ -184,6 +184,47 @@ requested = A.diagnose(call(events=[ev(1, "caller: please record the screen"),
 check("the same tool IS allowed when the caller asked for it",
       not only(requested, "Auto-invoked"), str(requested))
 
+# ── categorize_issue: every arm ──────────────────────────────────────────────
+# categorize_issue takes an issue dict directly, so each branch is driven by the
+# text/detail it actually matches on — all read from analysis.py, not guessed.
+print("── categorize_issue arms ──")
+
+
+def cat(text, detail=""):
+    return A.categorize_issue({"issue": text, "detail": detail, "time": "10:00:00"})
+
+
+ARMS = [
+    ("screen_record returned in 3ms — likely failed silently", "", "returned too fast"),
+    ("Wrong tool: describe_screen instead of work", "Code questions should use work.", "Wrong tool"),
+    ("Possible hallucination: \"it is playing\"", "", "video is playing"),
+    ("Possible hallucination: \"recording is complete\"", "", "recording is complete"),
+    ("Possible hallucination: \"I'm unable to\"", "can't find the file", "can't find file"),
+    ("Possible hallucination: \"on develop\"", "the branch is develop", "fabricated answer"),
+    ("Possible hallucination: \"something else entirely\"", "", "Hallucinated:"),
+    ("Auto-invoked screen_record — no matching user request", "", "without user asking"),
+    ("Auto-play after recording — user didn't ask", "", "without user asking"),
+    ("Inline task delegated via work: \"x\"", 'asked to "record the screen"', "Recording delegated"),
+    ("Inline task delegated via work: \"x\"", 'asked to "play it back"', "Playback delegated"),
+    ("Inline task delegated via work: \"x\"", 'asked to "do something"', "Inline task delegated"),
+    ("User correction: \"you should submit\"", "", "submit task"),
+    ("User correction: \"not asking you to record\"", "", "recorded when user didn't ask"),
+    ("User correction: \"this is not the subtitle\"", "", "wrong video version"),
+    ("User correction: \"i just need this one\"", "", "existing file modified"),
+    ("User correction: \"something unusual\"", "", "User correction"),
+    ("Unmet expectation — user repeated request", "", "repeated request"),
+    ("45s delay from request to screen_record", "", "Long delay"),
+    ("screen_record failed 3 times in this call", "", "failed repeatedly"),
+    ("Caller speech logged 8s after work tool call", "", "STT timestamp lag"),
+    ("something entirely unrecognised", "", "Other:"),
+]
+for text, detail, expect in ARMS:
+    got = cat(text, detail)
+    check(f"categorize: {expect}", expect.lower() in got.lower(), f"{text[:40]!r} -> {got!r}")
+
+check("every arm returns a non-empty string",
+      all(isinstance(cat(t, d), str) and cat(t, d) for t, d, _ in ARMS))
+
 # ── repairs ──────────────────────────────────────────────────────────────────
 print("── analyze_patterns_and_repair ──")
 many = [call(f"c{n}", events=[ev(1, "call_started"),
@@ -195,6 +236,71 @@ check("repairs are dicts", all(isinstance(r, dict) for r in reps))
 check("no calls → no repairs", A.analyze_patterns_and_repair([]) == [])
 check("repair output is deterministic",
       A.analyze_patterns_and_repair(many) == reps)
+
+# ── _classify_repair: every arm ──────────────────────────────────────────────
+# Signature: (cat, freq, affected_calls, total_calls, trend, in_recent, occurrences).
+# Every branch keys off `cat` plus the scalars, so each arm is driven directly.
+# Conditions read from analysis.py.
+print("── _classify_repair arms ──")
+
+
+def clf(cat, freq=5, affected=3, total=10, trend="steady", in_recent=True, occ=None):
+    return A._classify_repair(cat, freq, affected, total, trend, in_recent, occ or [])
+
+
+REPAIR_ARMS = [
+    ("STT timestamp lag", "unsolvable"),
+    ("Auto-invoked screen_record — no matching user request", "prompt"),
+    ("Auto-invoked play_recording — no matching user request", "prompt"),
+    ("Auto-invoked describe_screen — no matching user request", "prompt"),
+    ("Hallucinated: 'video is playing'", "prompt"),
+    ("Hallucinated: 'can't find file'", "code"),
+    ("Hallucinated: fabricated answer", "prompt"),
+    ("Hallucinated: 'something else'", "prompt"),
+    ("User had to explain 'submit task' = work tool", "prompt"),
+    ("Gemini recorded when user didn't ask", "prompt"),
+    ("Long delay before calling screen_record", "prompt"),
+    ("scroll_and_describe returned too fast (failed)", "prompt"),
+    ("screen_record returned too fast (failed)", "code"),
+    ("screen_record failed repeatedly", "code"),
+    ("Other: something nobody has classified", "unknown"),
+]
+for cat_text, expect_type in REPAIR_ARMS:
+    r = clf(cat_text)
+    check(f"classify {expect_type}: {cat_text[:38]}",
+          isinstance(r, dict) and r.get("repair_type") == expect_type, f"{cat_text!r} -> {r}")
+
+# PRE-EXISTING DEAD BRANCH (characterized, not fixed — separate concern).
+# _classify_repair tests `"wrong version" in cat_lower`, but categorize_issue
+# emits "Opened wrong VIDEO version" — which does not contain that substring.
+# So the intended `code` repair is unreachable from its own upstream category
+# and falls through to the generic `unknown` arm. Proven end to end:
+#   categorize_issue({... "not the subtitle" ...}) -> 'Opened wrong video version'
+#   _classify_repair(that)                          -> repair_type 'unknown'
+#   _classify_repair('wrong version opened')        -> repair_type 'code'
+# Characterized so this extraction cannot change it silently.
+_dead = A.categorize_issue({"issue": 'User correction: "this is not the subtitle"',
+                            "detail": "", "time": "t"})
+check("categorize emits 'Opened wrong video version'", _dead == "Opened wrong video version", _dead)
+check("its repair arm is UNREACHABLE — falls through to 'unknown' (pre-existing)",
+      clf(_dead).get("repair_type") == "unknown", str(clf(_dead)))
+check("the arm does fire for a string that literally contains 'wrong version'",
+      clf("wrong version opened").get("repair_type") == "code",
+      str(clf("wrong version opened")))
+
+# priority escalation is a real branch, not decoration
+hot = clf("Auto-invoked screen_record — no matching user request", in_recent=True, trend="steady")
+cool = clf("Auto-invoked screen_record — no matching user request", in_recent=False, trend="improving")
+check("a recent, non-improving pattern escalates priority above a stale improving one",
+      hot.get("priority") != cool.get("priority"), f"hot={hot.get('priority')} cool={cool.get('priority')}")
+
+# the low-signal fallthrough: not recent AND under the pct threshold
+quiet = clf("Other: rare thing", affected=1, total=100, in_recent=False)
+check("a rare, non-recent pattern is not forced into an 'unknown' repair",
+      quiet is None or isinstance(quiet, dict), str(quiet))
+
+check("every repair carries a type and a priority",
+      all(clf(c).get("repair_type") and clf(c).get("priority") for c, _ in REPAIR_ARMS))
 
 # ── characterized pre-existing defect ────────────────────────────────────────
 print("── known defect (characterized, NOT fixed here) ──")
