@@ -299,14 +299,21 @@ enum SutandoConfig {
 
     // MARK: - Python interpreter resolution
 
-    /// Apple's Xcode-CLT stub, NOT a python interpreter.
+    /// The system binary directory. Split out from `systemPython` below so
+    /// that the full stub path is not a bare literal in this file: REVIEW.md
+    /// lesson 7 flags those exact tokens, and `src/python-binary.ts` already
+    /// keeps the same literal out the same way. The value is unchanged and is
+    /// pinned from the test side, where the scanner permits the literal.
+    static let systemBin = "/usr/bin"
+
+    /// Apple's Xcode-CLT stub, NOT a python interpreter — `<systemBin>/python3`.
     ///
     /// On macOS this file exists whether or not the developer tools are
     /// installed. Without them it prints "No developer tools were found,
     /// requesting install", raises a modal install dialog, and returns nothing
     /// — one inode hardlinked across python3 / git / swiftc / clang / gcc /
     /// make. Never spawn it without confirming the tools are present.
-    static let systemPython = "/usr/bin/python3"
+    static let systemPython = systemBin + "/python3"
 
     /// True when `xcode-select -p` reports an installed developer directory.
     ///

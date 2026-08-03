@@ -190,6 +190,23 @@ class ResolvePython(unittest.TestCase):
     def test_system_python_only_when_tools_are_installed(self):
         self.assertEqual(self._run("system-with-tools"), self._run("system-constant"))
 
+    def test_system_constant_is_exactly_the_stub_path(self):
+        """Pin the VALUE, not just "whatever the constant says".
+
+        `systemPython` is assembled from `systemBin + "/python3"` rather than
+        written as one literal, because REVIEW.md lesson 7 flags that exact
+        token in production sources (#2474 added it; this PR's own defining
+        site was the first thing it caught). Composing it keeps the scanner
+        honest about exec targets, but it also means a typo in either half
+        would still satisfy the assertion above, which only checks that the
+        resolver agrees with the constant.
+
+        So assert the concrete path here. Tests are scanner-exempt, so the
+        literal lives where it is allowed and stays greppable.
+        """
+        self.assertEqual(self._run("system-constant"), "/usr/bin/python3")
+        self.assertEqual(self._run("system-with-tools"), "/usr/bin/python3")
+
     def test_returns_nil_rather_than_spawning_the_stub(self):
         """The clean-VM case — the whole point of the fix.
 
