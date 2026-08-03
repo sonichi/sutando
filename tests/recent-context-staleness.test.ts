@@ -51,6 +51,33 @@ describe('recent_context freshness annotation', () => {
 		assert.equal(annotateContextFreshness({ updated_at: iso(VOICE_CONTEXT_STALE_HOURS - 0.1) }, NOW).stale, undefined);
 	});
 
+	it('a materially FUTURE updated_at is unknown, never fresh', () => {
+		// qingyun-wu + john-the-dev, review of #2560. age = now - updated goes NEGATIVE
+		// for a future stamp, so it fails BOTH branches: not >= the stale threshold, and
+		// Number.isFinite() is true so it never reaches 'unknown'. A skewed or corrupt
+		// clock therefore bypassed the guard entirely and voice could assert an old
+		// pending_action as current until wall time caught up — the exact defect this
+		// PR exists to close, arriving through the one input I had not considered.
+		const out = annotateContextFreshness(
+			{ updated_at: iso(-24), pending_action: { kind: 'paste' } },
+			NOW,
+		);
+		assert.equal(out.freshness, 'unknown', 'future stamp must not read as fresh');
+		assert.equal(out.stale, undefined);
+		assert.match(String(out.note), /future/i, 'say WHY it is untrusted');
+		assert.ok(out.pending_action, 'payload still returned');
+	});
+
+	it('tolerates small clock skew rather than crying wolf on it', () => {
+		// Control for the above: machine clocks routinely disagree by seconds. If any
+		// future stamp were 'unknown', ordinary skew would flag every healthy context
+		// and the marker would stop meaning anything.
+		const out = annotateContextFreshness({ updated_at: iso(-0.02) }, NOW); // ~72s ahead
+		assert.equal(out.freshness, undefined, 'small skew must stay healthy');
+		assert.equal(out.stale, undefined);
+		assert.equal(out.age_hours, 0, 'clamped to 0, never negative');
+	});
+
 	it('survives a null/empty payload without throwing', () => {
 		assert.equal(annotateContextFreshness(null, NOW).freshness, 'unknown');
 		assert.equal(annotateContextFreshness({}, NOW).freshness, 'unknown');

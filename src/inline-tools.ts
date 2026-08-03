@@ -945,6 +945,11 @@ const VOICE_SESSION_CONTEXT_PATH = join(WORKSPACE_DIR, 'state', 'voice-session-c
 // session, so a multi-hour gap means the session that wrote it is long gone.
 export const VOICE_CONTEXT_STALE_HOURS = 6;
 
+// Clocks between the writing process and the reading one disagree by seconds in
+// practice. Inside this window a future timestamp is ordinary skew and the age is
+// clamped to 0; beyond it the stamp is untrustworthy and degrades to 'unknown'.
+export const VOICE_CONTEXT_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+
 /**
  * Stamp the context payload with its own age.
  *
@@ -974,7 +979,31 @@ export function annotateContextFreshness(
 			'context has no parseable updated_at — age unknown, so treat pending_action and active_drafts as historical unless the user confirms them.';
 		return base;
 	}
-	const ageHours = (nowMs - updatedMs) / 3_600_000;
+	// A FUTURE timestamp fails both branches below unless it is caught here: the age
+	// goes negative, so it is never >= the stale threshold, and Number.isFinite() is
+	// true so it never reaches 'unknown'. A skewed or corrupt clock would therefore
+	// bypass the guard completely and let voice assert an old pending_action as
+	// current until wall time caught up — the very defect this function exists to
+	// close, through the one input I had not considered (qingyun-wu + john-the-dev,
+	// review of #2560).
+	//
+	// The tolerance matters as much as the check: machine clocks routinely disagree
+	// by seconds, so treating ANY future stamp as untrusted would flag healthy
+	// contexts and train the reader to ignore the marker. Inside the window the age
+	// is clamped to 0 (healthy, never negative); beyond it the stamp cannot be
+	// trusted at all, so it degrades to unknown rather than to fresh.
+	const ageMs = nowMs - updatedMs;
+	if (ageMs < -VOICE_CONTEXT_SKEW_TOLERANCE_MS) {
+		const aheadHours = Math.round((-ageMs / 3_600_000) * 10) / 10;
+		base.age_hours = Math.round((ageMs / 3_600_000) * 10) / 10;
+		base.freshness = 'unknown';
+		base.note =
+			`this context is timestamped ${aheadHours}h in the FUTURE — a skewed or corrupt clock, ` +
+			'so its age cannot be trusted. Treat pending_action and active_drafts as historical ' +
+			'unless the user confirms them.';
+		return base;
+	}
+	const ageHours = Math.max(0, ageMs) / 3_600_000;
 	base.age_hours = Math.round(ageHours * 10) / 10;
 	if (ageHours >= VOICE_CONTEXT_STALE_HOURS) {
 		base.stale = true;
