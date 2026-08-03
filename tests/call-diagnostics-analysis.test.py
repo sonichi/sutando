@@ -113,6 +113,77 @@ check("every detected issue categorizes to a string",
 check("categorize_issue is deterministic",
       [A.categorize_issue(i) for i in halluc] == [A.categorize_issue(i) for i in halluc])
 
+# ── remaining detection rules ────────────────────────────────────────────────
+# Every trigger below was read from analysis.py rather than guessed — two of my
+# earlier fixtures were wrong from assuming (the fast-fail rule is a SUB-10ms
+# return, and agent lines are prefixed "sutando:" not "agent:").
+print("── detection rules ──")
+
+
+def only(issues, needle):
+    return [i for i in issues if needle in i["issue"]]
+
+
+# 3. inline task delegated via work (keyword in the action text, not a /tmp/ path)
+inline = A.diagnose(call(events=[ev(1, "call_started"),
+                                 ev(3, "task_delegated:please screen record the demo")]))
+check("inline recording task delegated via work is flagged",
+      only(inline, "Inline task delegated"), str(inline))
+path_only = A.diagnose(call(events=[ev(1, "call_started"),
+                                    ev(3, "task_delegated:tidy up /tmp/recording.mov")]))
+check("a keyword only in a /tmp/ path does not trigger it",
+      not only(path_only, "Inline task delegated"), str(path_only))
+
+# 4. auto-play after recording, with no caller speech in between
+autoplay = A.diagnose(call(events=[ev(1, "call_started"), ev(3, "recording auto-stop"),
+                                   ev(5, "tool_call:play_recording")]))
+check("auto-play right after a recording stop is flagged",
+      only(autoplay, "Auto-play after recording"), str(autoplay))
+asked = A.diagnose(call(events=[ev(1, "call_started"), ev(3, "recording auto-stop"),
+                                ev(4, "caller: play it back please"),
+                                ev(5, "tool_call:play_recording")]))
+check("caller speech in between suppresses the auto-play warning",
+      not only(asked, "Auto-play after recording"), str(asked))
+
+# 5. >30s delay between a caller request and the tool call
+delay = A.diagnose(call(events=[ev(1, "caller: can you record this"),
+                                ev(45, "tool_call:screen_record")]))
+check("a >30s request-to-execution delay is flagged", only(delay, "delay from request"), str(delay))
+prompt_ = A.diagnose(call(events=[ev(1, "caller: can you record this"),
+                                  ev(5, "tool_call:screen_record")]))
+check("a prompt execution is not flagged as delayed",
+      not only(prompt_, "delay from request"), str(prompt_))
+
+# 6. caller speech logged >5s AFTER the tool call (STT lag)
+lag = A.diagnose(call(events=[ev(1, "tool_call:describe_screen"),
+                              ev(20, "caller: what is on screen")]))
+check("caller speech logged after a tool call is flagged as STT lag",
+      only(lag, "Caller speech logged"), str(lag))
+
+# 7. wrong tool for the request
+wrong = A.diagnose(call(events=[ev(1, "caller: what branch am i on"),
+                                ev(5, "tool_call:describe_screen")]))
+check("a repo question answered with describe_screen is flagged as the wrong tool",
+      only(wrong, "Wrong tool"), str(wrong))
+right = A.diagnose(call(events=[ev(1, "caller: what branch am i on"),
+                                ev(5, "tool_call:work")]))
+check("the correct tool for the same request is not flagged",
+      not only(right, "Wrong tool"), str(right))
+
+# 8. explicit user correction
+corr = A.diagnose(call(events=[ev(1, "call_started"),
+                               ev(3, "caller: i am not asking you to record")]))
+check("an explicit user correction is flagged", only(corr, "User correction"), str(corr))
+
+# 10. auto-invoked tool with no matching request in the preceding 20s
+auto = A.diagnose(call(events=[ev(1, "call_started"), ev(3, "tool_call:screen_record")]))
+check("a tool invoked with no matching request is flagged",
+      only(auto, "Auto-invoked"), str(auto))
+requested = A.diagnose(call(events=[ev(1, "caller: please record the screen"),
+                                    ev(3, "tool_call:screen_record")]))
+check("the same tool IS allowed when the caller asked for it",
+      not only(requested, "Auto-invoked"), str(requested))
+
 # ── repairs ──────────────────────────────────────────────────────────────────
 print("── analyze_patterns_and_repair ──")
 many = [call(f"c{n}", events=[ev(1, "call_started"),
