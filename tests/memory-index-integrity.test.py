@@ -76,8 +76,18 @@ with tempfile.TemporaryDirectory() as t:
 # and could not detect a wrong cutoff at all (qingyun-wu, #2449).
 check("shipped line limit matches the documented 200", hc.MEMORY_INDEX_LOAD_LINES == 200,
       f"got {hc.MEMORY_INDEX_LOAD_LINES}")
-check("shipped byte limit matches the documented 25KB", hc.MEMORY_INDEX_LOAD_BYTES == 25 * 1024,
+# 25 KB DECIMAL. The docs say "the first 25KB"; 25 * 1024 made this 600 B looser
+# than the runtime. The runtime prints its own limit as "24.4KB", and
+# 25_000 / 1024 = 24.41 — 25_600 would print "25.0KB". Assert the units, and
+# assert the band that used to read healthy while being truncated.
+check("shipped byte limit is 25 KB DECIMAL, not KiB", hc.MEMORY_INDEX_LOAD_BYTES == 25_000,
       f"got {hc.MEMORY_INDEX_LOAD_BYTES}")
+check("the limit renders as the runtime prints it (24.4KB)",
+      f"{hc.MEMORY_INDEX_LOAD_BYTES / 1024:.1f}" == "24.4",
+      f"renders {hc.MEMORY_INDEX_LOAD_BYTES / 1024:.1f}KB")
+check("a file in the 25_000..25_600 band is NOT treated as under the limit",
+      25_200 > 25_000 and hc.MEMORY_INDEX_LOAD_BYTES <= 25_000,
+      "the KiB reading would have called 25,200 B healthy while its tail was dropped")
 
 def _mem_with(index_body: str, extra=()):
     """A memory tree whose MEMORY.md is exactly `index_body`."""
@@ -257,12 +267,12 @@ for _label, _body, _want in (
 
 # qingyun-wu: the byte limit cuts THROUGH a line; the filename before the cut is
 # still read, so the memory loads and must not be reported lost.
-_mem_with(("x" * (25 * 1024 - 100)) + "\n- [Good](good-memory.md) " + ("d" * 4000) + "\n")
+_mem_with(("x" * (25_000 - 100)) + "\n- [Good](good-memory.md) " + ("d" * 4000) + "\n")
 r = hc.check_memory_index_integrity()
 check("entry starting just BEFORE the 25KB cut is read → not a failure",
       r and r["status"] != "fail", str(r))
 # Discriminating control: an entry starting AFTER the cut is genuinely lost.
-_mem_with(("x" * (25 * 1024 + 50)) + "\n" + _ENTRY)
+_mem_with(("x" * (25_000 + 50)) + "\n" + _ENTRY)
 r = hc.check_memory_index_integrity()
 check("entry starting AFTER the cut is still a failure", r and r["status"] == "fail", str(r))
 
