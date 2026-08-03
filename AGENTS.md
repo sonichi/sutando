@@ -393,12 +393,14 @@ Tasks arrive from multiple channels via the same file bridge:
 MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`), and derive
 attachments from actions whose `kind == "attach"`. **Do not add a new private parser.**
 
-*Migration status (be precise — the rule is the target, not yet universal):*
-`discord-bridge.py` and `dm-result.py` are migrated and guarded by
-`tests/bridge-marker-no-leak.test.py`. **`telegram-bridge.py` is NOT yet migrated** —
-`send_reply()` still compiles its own `file|send|attach` regex, so it remains a live
-instance of the drift class described below. Migrating it is follow-up work, deliberately
-out of scope here. A consumer may apply
+*Migration status: all four Python consumers conform, and the guard enforces it.*
+`discord-bridge.py`, `dm-result.py`, `telegram-bridge.py`, and `slack-bridge.py` all
+obtain marker grammar from `parse_markers()`, and `tests/bridge-marker-no-leak.test.py`
+fails if any of them declares the grammar itself — matching the grammar in any regex
+literal, so a renamed private parser cannot slip past. Telegram's `send_reply()` used to
+compile its own `file|send|attach` regex and Slack declared the same regex dead at module
+scope; both are gone. Add any new consumer to that guard when it starts handling markers.
+A consumer may apply
 only the actions its transport supports, but must NOT recognise, strip, or prioritise
 markers with local regexes or `startswith` checks. Attachment-path authorization is a
 separate concern owned by `src/send_allowlist.py`, applied immediately before the
