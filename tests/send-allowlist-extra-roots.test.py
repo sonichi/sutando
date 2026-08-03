@@ -5,7 +5,10 @@ Covers the shared-allowlist tidy: slack-bridge and telegram-bridge now delegate
 to send_allowlist.is_path_sendable instead of keeping hand-written copies that
 had drifted apart. Slack passes its inbound dir via extra_roots.
 """
-import os, sys, tempfile, unittest
+import os
+import sys
+import tempfile
+import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from send_allowlist import is_path_sendable, SEND_ALLOWED_ROOTS
