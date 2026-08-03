@@ -389,9 +389,16 @@ Tasks arrive from multiple channels via the same file bridge:
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body (regardless of marker order), so a body carrying private data can never be *redirected* out to a shared channel. It marks dm-only intent but does not by itself force a DM — that stays the consumer's job. In practice the private producer (the morning briefing's calendar + email) is emitted as a proactive result (`results/proactive-*.txt`), which every bridge already delivers to the owner's DM; `[dm-only]` reinforces that by guaranteeing no stray `[channel:]` redirect overrides it. **Detected anywhere in the body** — that is what makes the guard undefeatable by marker order, and over-triggering it fails safe. **Stripped only when the marker stands alone on its line**, before delivery and before voice speaks it; a marker mentioned inline in prose is detected but the text is delivered verbatim. Parsed by `result_markers.parse_markers`.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
 
-**Marker parsing is centralised — do not re-implement it.** Every Python result
-consumer MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`),
-and derive attachments from actions whose `kind == "attach"`. A consumer may apply
+**Marker parsing is centralised — do not re-implement it.** A Python result consumer
+MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`), and derive
+attachments from actions whose `kind == "attach"`. **Do not add a new private parser.**
+
+*Migration status (be precise — the rule is the target, not yet universal):*
+`discord-bridge.py` and `dm-result.py` are migrated and guarded by
+`tests/bridge-marker-no-leak.test.py`. **`telegram-bridge.py` is NOT yet migrated** —
+`send_reply()` still compiles its own `file|send|attach` regex, so it remains a live
+instance of the drift class described below. Migrating it is follow-up work, deliberately
+out of scope here. A consumer may apply
 only the actions its transport supports, but must NOT recognise, strip, or prioritise
 markers with local regexes or `startswith` checks. Attachment-path authorization is a
 separate concern owned by `src/send_allowlist.py`, applied immediately before the

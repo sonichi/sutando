@@ -139,9 +139,16 @@ def main() -> int:
         return fail("parse_markers did not emit an attach action")
 
     # ---- Adoption guards: no consumer may re-define the marker grammar ----
-    # Scoped deliberately to the two delivery consumers that once carried a
-    # private copy. A repo-wide ban would reject docs, tests, and unrelated
-    # protocols, so keep this file-specific.
+    # Scoped deliberately to the two delivery consumers this change migrates.
+    # A repo-wide ban would reject docs, tests, and unrelated protocols, so keep
+    # this file-specific.
+    #
+    # KNOWN GAP, stated so the guard is not mistaken for full coverage:
+    # src/telegram-bridge.py still compiles its own file|send|attach regex in
+    # send_reply(). It is NOT in `consumers` below because it would fail — that
+    # is a real outstanding migration, not an oversight. Adding Telegram here is
+    # the follow-up; until then this guard proves only that Discord and the REST
+    # fallback stay clean.
     consumers = ("src/discord-bridge.py", "src/dm-result.py")
     for rel in consumers:
         src = (REPO / rel).read_text()

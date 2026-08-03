@@ -163,6 +163,15 @@ consumers (Discord, Slack, Telegram, gateway, and the `dm-result.py` REST
 fallback) own transport routing and upload calls only — they must not define
 marker regexes or path-policy copies.
 
+**Current conformance is partial, and the gap is named deliberately.**
+`discord-bridge.py` and `dm-result.py` obtain marker grammar solely from
+`parse_markers()`. `telegram-bridge.py` does not: `send_reply()` still compiles a
+local `file|send|attach` regex, and proactive delivery passes raw result text into
+that helper. It is therefore a live instance of the drift this boundary exists to
+prevent, and migrating it is tracked follow-up work. The rule above states the
+target and forbids *new* private parsers; it is not a claim that every consumer
+already conforms.
+
 Parsing never authorizes and authorization never parses: `parse_markers()`
 extracts any marker value and leaves the decision about whether a path may be
 opened to the allowlist. A consumer that filters values during parsing
