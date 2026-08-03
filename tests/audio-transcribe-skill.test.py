@@ -19,6 +19,8 @@ from unittest.mock import MagicMock, patch
 
 REPO = Path(__file__).parent.parent
 SKILL_SCRIPT = REPO / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+sys.path.insert(0, str(REPO / "src"))
+from optional_script import run_optional_script  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,7 +46,13 @@ def _load_bridge_helper(bridge_name: str) -> types.ModuleType:
         end += 1
     func_src = "\n".join(lines[start:end])
     # Inject __file__ so Path(__file__).parent.parent resolves correctly.
-    ns: dict = {"Path": Path, "os": os, "sys": sys, "__file__": str(bridge_path)}
+    ns: dict = {
+        "Path": Path,
+        "os": os,
+        "sys": sys,
+        "__file__": str(bridge_path),
+        "_run_optional_script_shared": run_optional_script,
+    }
     exec(func_src, ns)  # noqa: S102
     mod = types.SimpleNamespace(_transcribe_via_skill=ns["_transcribe_via_skill"])
     return mod
@@ -136,6 +144,60 @@ class TestSkillCLI(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Bridge helper tests
 # ---------------------------------------------------------------------------
+
+class TestOptionalScriptRunner(unittest.TestCase):
+    def test_success_preserves_interpreter_args_and_timeout(self):
+        script = Path("/tmp/optional-script.py")
+        result = MagicMock(returncode=0, stdout="  transcript text\n")
+        with patch.object(Path, "exists", return_value=True), \
+             patch("optional_script.subprocess.run", return_value=result) as run:
+            output = run_optional_script(
+                script, ["/tmp/voice.m4a"], timeout=25
+            )
+        self.assertEqual(output, "transcript text")
+        run.assert_called_once_with(
+            [sys.executable, str(script), "/tmp/voice.m4a"],
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+
+    def test_exception_is_fail_open_and_reported(self):
+        errors = []
+        with patch.object(Path, "exists", return_value=True), \
+             patch("optional_script.subprocess.run", side_effect=TimeoutError("slow")):
+            output = run_optional_script(
+                Path("/tmp/optional-script.py"),
+                ["input"],
+                timeout=25,
+                on_error=errors.append,
+            )
+        self.assertIsNone(output)
+        self.assertEqual(str(errors[0]), "slow")
+
+    def test_bridges_delegate_but_keep_capability_discovery_at_the_edge(self):
+        shared_source = (REPO / "src" / "optional_script.py").read_text()
+        self.assertNotIn("audio-transcribe", shared_source)
+        self.assertNotIn(' / "skills"', shared_source)
+
+        for bridge_name in ("discord", "slack", "telegram"):
+            bridge_source = (
+                REPO / "src" / f"{bridge_name}-bridge.py"
+            ).read_text()
+            lines = bridge_source.splitlines()
+            start = next(
+                i
+                for i, line in enumerate(lines)
+                if "def _transcribe_via_skill" in line
+            )
+            end = start + 1
+            while end < len(lines) and (
+                lines[end].startswith("    ") or lines[end] == ""
+            ):
+                end += 1
+            helper_source = "\n".join(lines[start:end])
+            self.assertIn("_run_optional_script_shared(", helper_source)
+            self.assertNotIn("subprocess.run", helper_source)
 
 class TestBridgeHelperSlack(unittest.TestCase):
     def test_skill_absent_returns_none(self):
@@ -230,7 +292,13 @@ class TestBridgeHelperSymlinkResolve(unittest.TestCase):
         while end < len(lines) and (lines[end].startswith("    ") or lines[end] == ""):
             end += 1
         func_src = "\n".join(lines[start:end])
-        ns: dict = {"Path": Path, "os": os, "sys": sys, "__file__": symlink_path}
+        ns: dict = {
+            "Path": Path,
+            "os": os,
+            "sys": sys,
+            "__file__": symlink_path,
+            "_run_optional_script_shared": run_optional_script,
+        }
         exec(func_src, ns)  # noqa: S102
         return ns
 
@@ -270,16 +338,21 @@ class TestRealModuleResolveLineCoverage(unittest.TestCase):
         """telegram-bridge.py has no hard import-time dependency on a live
         token (see tests/telegram-writeside-attachments.test.py), so it can
         be imported directly."""
-        os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
-        spec = importlib.util.spec_from_file_location(
-            "telegrambridge_realcov", REPO / "src" / "telegram-bridge.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp_ws, patch.dict(os.environ, {
+            "CLAUDE_CONFIG_DIR": str(Path(tmp_ws) / "claude"),
+            "SUTANDO_WORKSPACE": tmp_ws,
+            "SUTANDO_TEST_MODE": "1",
+            "TELEGRAM_BOT_TOKEN": "test-token-not-real",
+        }):
+            spec = importlib.util.spec_from_file_location(
+                "telegrambridge_realcov", REPO / "src" / "telegram-bridge.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
 
-        mock_result = MagicMock(returncode=0, stdout="resolved via real module\n")
-        with patch("subprocess.run", return_value=mock_result):
-            result = mod._transcribe_via_skill("/tmp/voice.ogg")
-        self.assertEqual(result, "resolved via real module")
+            mock_result = MagicMock(returncode=0, stdout="resolved via real module\n")
+            with patch("subprocess.run", return_value=mock_result):
+                result = mod._transcribe_via_skill("/tmp/voice.ogg")
+            self.assertEqual(result, "resolved via real module")
 
     def test_slack_bridge_real_module(self):
         """slack-bridge.py's module-level `App(token=BOT_TOKEN)` hits the
@@ -309,25 +382,31 @@ class TestRealModuleResolveLineCoverage(unittest.TestCase):
         _socket = types.ModuleType("slack_bolt.adapter.socket_mode")
         _socket.SocketModeHandler = type(
             "SocketModeHandler", (), {"__init__": lambda self, *a, **k: None})
-        with patch.dict(sys.modules, {
-            "slack_bolt": _bolt,
-            "slack_bolt.adapter": _adapter,
-            "slack_bolt.adapter.socket_mode": _socket,
-        }), tempfile.TemporaryDirectory() as tmp_ws, patch.dict(os.environ, {
-            "SUTANDO_WORKSPACE": tmp_ws,
-            "SUTANDO_TEST_MODE": "1",
-            "SLACK_BOT_TOKEN": "xoxb-test-not-real",
-            "SLACK_APP_TOKEN": "xapp-test-not-real",
-        }):
-            spec = importlib.util.spec_from_file_location(
-                "slackbridge_realcov", REPO / "src" / "slack-bridge.py")
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp_ws:
+            claude_dir = Path(tmp_ws) / "claude"
+            access_file = claude_dir / "channels" / "slack" / "access.json"
+            access_file.parent.mkdir(parents=True)
+            access_file.write_text('{"allowFrom": []}')
+            with patch.dict(sys.modules, {
+                "slack_bolt": _bolt,
+                "slack_bolt.adapter": _adapter,
+                "slack_bolt.adapter.socket_mode": _socket,
+            }), patch.dict(os.environ, {
+                "CLAUDE_CONFIG_DIR": str(claude_dir),
+                "SUTANDO_WORKSPACE": tmp_ws,
+                "SUTANDO_TEST_MODE": "1",
+                "SLACK_BOT_TOKEN": "xoxb-test-not-real",
+                "SLACK_APP_TOKEN": "xapp-test-not-real",
+            }):
+                spec = importlib.util.spec_from_file_location(
+                    "slackbridge_realcov", REPO / "src" / "slack-bridge.py")
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
 
-            mock_result = MagicMock(returncode=0, stdout="resolved via real module\n")
-            with patch("subprocess.run", return_value=mock_result):
-                result = mod._transcribe_via_skill("/tmp/voice.m4a")
-            self.assertEqual(result, "resolved via real module")
+                mock_result = MagicMock(returncode=0, stdout="resolved via real module\n")
+                with patch("subprocess.run", return_value=mock_result):
+                    result = mod._transcribe_via_skill("/tmp/voice.m4a")
+                self.assertEqual(result, "resolved via real module")
 
 
 if __name__ == "__main__":
