@@ -541,11 +541,20 @@ class CarrierSetProbe(unittest.TestCase):
         self._patch_shipped(["notes/", "data/"])
         real = self.hc.subprocess.run
 
+        fired = []
+
         def flaky(argv, *a, **kw):
             # Succeed for the resolved entry's stale-branch probe, fail only on
             # the shipped entry's coverage probe — the exact mixed case where the
             # old code discarded the finding it already had.
-            if any("data" in str(x) for x in argv):
+            #
+            # Keyed on STDIN, not argv: paths travel through `check-ignore
+            # --stdin` now. The argv form stopped matching when the instrument
+            # changed and this test kept passing, because `data/` is dropped for
+            # an ordinary reason anyway — vacuous, and silently so. `fired` is
+            # asserted below so it can never go vacuous quietly again.
+            if "data" in (kw.get("input") or ""):
+                fired.append(1)
                 raise self.hc.subprocess.SubprocessError("timed out")
             return real(argv, *a, **kw)
 
@@ -555,9 +564,12 @@ class CarrierSetProbe(unittest.TestCase):
         finally:
             self.hc.subprocess.run = real
         self.assertIsNotNone(r)
+        self.assertTrue(fired, "the stub never fired — this test proves nothing")
         self.assertNotEqual(r["status"], "ok",
                             "a measurement that failed is UNKNOWN, never a pass")
         self.assertIn("data/", r["detail"], "the entry we could not measure must be named")
+        self.assertIn("could NOT measure", r["detail"],
+                      "must land in unmeasured, not be mistaken for an ordinary drop")
 
     def test_an_ODD_EXIT_CODE_is_also_unmeasured_not_covered(self):
         # The other half of "the measurement failed", and a separate line: the
@@ -577,11 +589,14 @@ class CarrierSetProbe(unittest.TestCase):
 
         class _Odd:
             returncode = 128
-            stdout = b""
-            stderr = b"fatal: not a git repository"
+            stdout = ""
+            stderr = "fatal: not a git repository"
+
+        fired = []
 
         def odd_exit(argv, *a, **kw):
-            if any("data" in str(x) for x in argv):
+            if "data" in (kw.get("input") or ""):
+                fired.append(1)
                 return _Odd()
             return real(argv, *a, **kw)
 
@@ -591,9 +606,12 @@ class CarrierSetProbe(unittest.TestCase):
         finally:
             self.hc.subprocess.run = real
         self.assertIsNotNone(r)
+        self.assertTrue(fired, "the stub never fired — this test proves nothing")
         self.assertNotEqual(r["status"], "ok",
                             "exit 128 is a git that could not answer, not a pass")
         self.assertIn("data/", r["detail"])
+        self.assertIn("could NOT measure", r["detail"],
+                      "must land in unmeasured, not be mistaken for an ordinary drop")
 
     def test_a_shipped_entry_with_nothing_on_disk_is_still_reported(self):
         # The coverage test can only speak when something is materialized. An entry
