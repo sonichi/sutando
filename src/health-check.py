@@ -42,7 +42,13 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+# Kept as two lines on purpose: tests/git-binary-resolution.test.py:109 asserts
+# the literal `from git_binary import git_argv` to prove each call site imports
+# the resolver instead of hardcoding a git path. Merging these into one import
+# breaks that substring check — which guards 27 other call sites, so the import
+# bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
+from git_binary import GitUnavailable  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
@@ -1108,6 +1114,168 @@ def check_memory_dir_siblings() -> "dict | None":
             "only; which slug is canonical is an open decision."
         ),
     }
+
+
+def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
+    """Resolve one existing concrete path for a carrier-set entry, or None.
+
+    Entries are gitignore-style and may be globs (`hosts/*/`), directories
+    (`notes/`) or plain files (`state/current-track.md`). We only need ONE
+    materialized path per entry to ask git whether the entry is being carried;
+    an entry with nothing on disk yet is not evidence of anything, so it is
+    skipped rather than reported.
+    """
+    rel = entry.strip().lstrip("/").rstrip("/")
+    if not rel:
+        return None
+    if any(ch in rel for ch in "*?["):
+        for hit in sorted(workspace.glob(rel)):
+            return hit
+        return None
+    candidate = workspace / rel
+    return candidate if candidate.exists() else None
+
+
+def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
+    """A configured carrier-set entry that git still ignores is not being backed up.
+
+    `sync-workspace.sh:generate_exclude` REFUSES to rewrite an existing
+    `.git/info/exclude` that differs from the generated content (the #1445 guard
+    against clobbering operator-authored rules), and `_enforce_carrier_set_pre`
+    (`:613`) swallows that refusal so the tick continues. The sync then pushes and
+    reports success while the carrier set is silently stale — observed on two
+    hosts independently (65 refusals / 63 followed by `pushed to` on one, 4/4 on
+    the other; see #2565). Every existing check reads healthy: the config IS
+    correct, the checkout IS current, and only the generated artifact is stale.
+
+    Two distinct causes produce the identical symptom and need different remedies,
+    so they are reported separately rather than collapsed:
+
+      1. STALE EXCLUDE — the resolved config lists an entry that git still
+         ignores. Remedy: `bash scripts/sync-workspace.sh --force-gitignore`.
+      2. DROPPED BY OVERRIDE — a local `vault.sync.include` REPLACES the shipped
+         default rather than merging into it (#2531), so shipped entries added
+         later never reach this host. Remedy: add them to the local list. Here
+         the on-disk exclude legitimately MATCHES the resolved config, so cause 1
+         is dormant and a resolved-vs-disk comparison alone reads healthy.
+
+    Asking git directly (`check-ignore`) rather than regenerating the exclude and
+    diffing is deliberate: it tests the OUTCOME, cannot drift as the generator's
+    formatting changes, and is immune to the two legitimate no-diff branches
+    (`:562` no-op when already matching, `:570` safe legacy `hosts/<label>/` ->
+    `hosts/*/` widening) — after either, the paths ARE un-ignored, so there is
+    nothing to false-positive on.
+
+    Returns None when the workspace is not a git repo (vault never initialized),
+    which is a valid unconfigured state and not a defect.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    name = "carrier-set"
+    if not (workspace / ".git").exists():
+        return None
+
+    vault = _resolved_vault()
+    resolved = [e for e in (vault.get("sync") or {}).get("include") or [] if isinstance(e, str)]
+    if not resolved:
+        return None
+
+    stale: "list[str]" = []
+    unmeasured: "list[str]" = []
+    for entry in resolved:
+        rep = _carrier_representative(workspace, entry)
+        if rep is None:
+            continue
+        try:
+            proc = subprocess.run(
+                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
+                         str(rep.relative_to(workspace))),
+                capture_output=True, timeout=10,
+            )
+        except (GitUnavailable, OSError, subprocess.SubprocessError):
+            # Could not run the measurement at all. NOT the same as "carried".
+            unmeasured.append(entry)
+            continue
+        # `git_argv` rather than a bare "git": on macOS the stock /usr/bin/git is
+        # an Xcode-CLT shim that pops an install dialog when the tools are absent,
+        # and this probe runs from a BACKGROUND health check where nobody is there
+        # to dismiss it. The resolver refuses that shim instead of spawning it.
+        #
+        # `--no-index` is LOAD-BEARING (sync-workspace.sh says so at its own
+        # check-ignore call): without it, git reports an ALREADY-TRACKED file as
+        # not-ignored regardless of the rules, so a host whose file was carried
+        # once and whose exclude later went stale reads healthy forever. Caught
+        # by restoring this host's real pre-fix exclude and watching the probe
+        # still say OK.
+        #
+        # check-ignore's contract is 0 = ignored, 1 = NOT ignored, anything else
+        # = it failed. Treating "not 0" as healthy folded exit 128 in with exit 1,
+        # so a git that could not run reported the carrier set as fine — the exact
+        # unmeasured-reads-as-healthy failure this probe exists to catch, in the
+        # probe itself.
+        if proc.returncode == 0:
+            stale.append(entry)
+        elif proc.returncode != 1:
+            unmeasured.append(entry)
+
+    # Read the SHIPPED file directly rather than through load_config(), which
+    # deep-merges the local override and would therefore return `resolved` —
+    # the very list we are testing against. There is no shipped-only public
+    # loader, and inventing one behind a broad `except` would make this branch a
+    # silent no-op the day the name was wrong.
+    dropped: "list[str]" = []
+    try:
+        shipped_cfg = json.loads((Path(REPO_DIR) / "sutando.config.json").read_text())
+        shipped = ((shipped_cfg.get("vault") or {}).get("sync") or {}).get("include")
+        if isinstance(shipped, list):
+            dropped = [e for e in shipped if isinstance(e, str) and e not in resolved]
+    except (OSError, json.JSONDecodeError, AttributeError):
+        dropped = []
+
+    # A shipped entry can be one this host must NOT carry. `state/current-track.md`
+    # is per-host state that #2534 added at a flat, SHARED vault path: two cores write
+    # the same path, and on 2026-08-03 that overwrote a peer's 1056-line anchor.
+    # Telling an operator to re-add it walks them back into that incident, so the
+    # REMEDY is split rather than the entry hidden — silently filtering it would
+    # suppress a real divergence. Delete this list once the host-qualified migration
+    # (#2567/#2568) lands: the flat path stops being shipped and stops appearing here.
+    UNSAFE_TO_READD = ("state/current-track.md",)
+    unsafe = [e for e in dropped if e in UNSAFE_TO_READD]
+    safe = [e for e in dropped if e not in UNSAFE_TO_READD]
+
+    if not stale and not dropped and not unmeasured:
+        return {"name": name, "status": "ok",
+                "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault"}
+
+    parts = []
+    if unmeasured:
+        parts.append(
+            f"could NOT measure {len(unmeasured)} carrier path(s) "
+            f"({', '.join(unmeasured[:4])}{'…' if len(unmeasured) > 4 else ''}) — git was "
+            f"unavailable or check-ignore failed, so whether the vault is backing them up is "
+            f"UNKNOWN, not fine"
+        )
+    if stale:
+        parts.append(
+            f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
+            f"backing them up ({', '.join(stale[:4])}{'…' if len(stale) > 4 else ''}) — the exclude "
+            f"file is stale and sync refused to regenerate it; fix with "
+            f"`bash scripts/sync-workspace.sh --force-gitignore` (diff it first)"
+        )
+    if safe:
+        parts.append(
+            f"{len(safe)} shipped carrier path(s) are missing from this host's resolved include "
+            f"({', '.join(safe[:4])}{'…' if len(safe) > 4 else ''}) — a local "
+            f"`vault.sync.include` REPLACES the shipped default (#2531), so upstream additions never "
+            f"arrive; add them to the local list"
+        )
+    if unsafe:
+        parts.append(
+            f"{len(unsafe)} shipped carrier path(s) are missing here and must NOT be re-added "
+            f"({', '.join(unsafe)}) — per-host state carried at a flat, SHARED vault path, so "
+            f"re-adding re-creates the cross-host overwrite that destroyed a peer's anchor "
+            f"(#2567). Leave them out until the host-qualified migration lands"
+        )
+    return {"name": name, "status": "fail", "detail": "; ".join(parts)}
 
 
 def check_memory_index_integrity() -> "dict | None":
@@ -4657,6 +4825,10 @@ def run_all_checks() -> list[dict]:
     if _mem_index:
         checks.append(_mem_index)
 
+    # Carrier-set enforcement — a stale exclude means the vault is silently not
+    # backing up paths the config says it carries (#2565).
+    checks.extend(c for c in (check_carrier_set_enforced(),) if c)
+
     # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
     # <workspace>/notes rather than <repo>/notes — the notes/.gitkeep was
@@ -6007,6 +6179,39 @@ def community_support_line() -> str:
     return "  Stuck? Community support (real humans + community agents): https://discord.gg/uZHWXXmrCS"
 
 
+#: Statuses that are NOT problems. Everything else is, by the same rule the
+#: issue list uses: `issues = [c for c in checks if c["status"] not in ("ok", "warn")]`.
+#: `stale` is an issue but gets its own glyph because it names a specific remedy.
+_BENIGN_STATUSES = ("ok", "warn")
+
+
+def status_icon(status: str) -> str:
+    """Glyph for a probe status — unrecognized reads as a PROBLEM, not a shrug.
+
+    The human-readable listing used to enumerate `down`/`missing`/`not_loaded` as
+    severe and fall back to `~` for anything else. That put **`fail`** — the most
+    severe status any probe emits, and the one nine probes use — on the least
+    alarming glyph, sharing it with "status I don't recognize". `error` (5 probes)
+    and `wedged` landed there too.
+
+    It is a real miss, not a cosmetic one: a peer host filtered health-check output
+    with `grep -E "⚠|✗"` and the single `fail` line was the one the filter hid, so a
+    run with a genuine failure read as three routine warnings.
+
+    `--quiet` never had this bug — it renders every non-stale issue as `✗`. The two
+    output modes disagreed about the same status. This makes them agree by deriving
+    both from one predicate, and inverts the default so a status added later shows
+    up as a problem until someone deliberately classifies it as benign.
+    """
+    if status == "ok":
+        return "✓"
+    if status == "warn":
+        return "⚠"
+    if status == "stale":
+        return "♻"
+    return "✗"
+
+
 def summary_line(checks) -> str:
     """The no-failures summary. Warnings are deliberately NOT issues — they must
     not fail the exit code or wake the launchd notifier, and that is unchanged.
@@ -6104,7 +6309,7 @@ def main():
     if quiet:
         if issues:
             for c in issues:
-                icon = "♻" if c["status"] == "stale" else "✗"
+                icon = status_icon(c["status"])
                 print(f"{icon} {c['name']}: {c['status']} ({c['detail']})")
             if do_fix:
                 # Fall through to existing fix path below
@@ -6120,7 +6325,7 @@ def main():
         print("=" * 40)
 
         for c in checks:
-            icon = "✓" if c["status"] == "ok" else "⚠" if c["status"] == "warn" else "✗" if c["status"] in ("down", "missing", "not_loaded") else "♻" if c["status"] == "stale" else "~"
+            icon = status_icon(c["status"])
             print(f"  {icon} {c['name']:30s} {c['status']:12s} {c['detail']}")
 
         print()
