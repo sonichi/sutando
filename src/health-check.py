@@ -42,7 +42,13 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+# Kept as two lines on purpose: tests/git-binary-resolution.test.py:109 asserts
+# the literal `from git_binary import git_argv` to prove each call site imports
+# the resolver instead of hardcoding a git path. Merging these into one import
+# breaks that substring check — which guards 27 other call sites, so the import
+# bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
+from git_binary import GitUnavailable  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
@@ -270,6 +276,37 @@ def _resolve_dotenv() -> Path:
 _VOICE_ENV_KEYS = ("SKIP_VOICE", "GEMINI_VOICE_API_KEY", "GEMINI_API_KEY")
 
 
+def managed_voice_credential_present(path: Optional[Path] = None) -> bool:
+    """True when the managed-credentials file carries a usable voice key.
+
+    Mirrors `_managed_voice_credential_present` in startup-runtime.sh, including
+    its fallback order (`CAPABILITY_FALLBACKS['gemini-voice']`) and its
+    malformed-file contract: an unreadable or malformed file SKIPS the tier
+    rather than raising, matching readManaged()'s try/catch.
+
+    Deliberately NOT fail-closed, unlike the dotenv parsing above. The two cases
+    differ: a malformed SKIP_VOICE means someone configured voice and we cannot
+    tell how, so hiding it would mask an outage. A malformed managed file means
+    the managed tier is unusable, so startup will not boot voice either — and
+    reporting "enabled" there would invent an outage that cannot exist. Match
+    the launcher, because the whole bug was the two disagreeing.
+    """
+    if path is None:
+        path = WORKSPACE_DIR / "state" / "auth" / "managed-credentials.json"
+    try:
+        caps = (json.loads(Path(path).read_text()) or {}).get("capabilities") or {}
+        if not isinstance(caps, dict):
+            return False
+    except Exception:
+        return False
+    for slot in ("gemini-voice", "gemini-text"):
+        entry = caps.get(slot)
+        key = entry.get("key") if isinstance(entry, dict) else None
+        if isinstance(key, str) and key:
+            return True
+    return False
+
+
 def resolve_voice_health_config(
     env: Optional[dict] = None,
     env_path: Optional[Path] = None,
@@ -331,6 +368,22 @@ def resolve_voice_health_config(
         return {"enabled": True, "detail": "Gemini voice credential configured"}
     if skip_voice not in ("", "0", "1"):
         return {"enabled": True, "error": f"invalid SKIP_VOICE={skip_voice!r}"}
+    # The MANAGED tier, checked in the same order startup-runtime.sh uses: BYO env
+    # first, then managed, and only then SKIP_VOICE. Without this the two disagree —
+    # startup-runtime.sh:52-58 boots voice on a managed credential while this
+    # returned "disabled", so all four voice checks reported `ok — disabled` over a
+    # running-and-broken voice agent. A health check that reports "disabled" about a
+    # service that is actually running is worse than no check: it converts an outage
+    # into a green light. (#2197 review blocker, john-the-dev 2026-07-30T01:53.)
+    #
+    # This check MUST sit above the SKIP_VOICE=1 return, not below it. Placing it
+    # below narrowed the bug without resolving it: the launcher *unsets* an inherited
+    # SKIP_VOICE when a managed credential exists, so the composition "managed key +
+    # inherited SKIP_VOICE=1" still had startup booting voice while health reported
+    # disabled. The managed-only test could not catch it because it omits SKIP_VOICE.
+    # (#2197 review blocker, john-the-dev 2026-07-31T05:37.)
+    if managed_voice_credential_present():
+        return {"enabled": True, "detail": "managed voice credential configured"}
     if skip_voice == "1":
         return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
@@ -1063,6 +1116,392 @@ def check_memory_dir_siblings() -> "dict | None":
     }
 
 
+def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
+    """EVERY existing concrete path a carrier-set entry matches.
+
+    Entries are gitignore-style and may be globs (`hosts/*/`), directories
+    (`notes/`) or plain files (`state/current-track.md`).
+
+    Deliberately ALL matches, not the first. Sampling one is sound for the stale
+    branch (which asks "is the entry this host configured actually in effect" —
+    one witness settles it), but not for judging whether a *local* rule covers a
+    *shipped* one: a narrower local rule can cover one child of a shipped
+    wildcard while leaving its siblings ignored, and a first-hit check that
+    happened to land on the covered child would report the vault healthy while a
+    whole host subtree went unbacked (qingyun-wu P1 on #2572).
+
+    Enumeration is bounded by construction: glob matches are the entry's own
+    direct matches (`hosts/*/` -> one path per host), never a recursive walk of
+    their contents.
+    """
+    rel = entry.strip().lstrip("/").rstrip("/")
+    if not rel:
+        return []
+    if any(ch in rel for ch in "*?["):
+        return sorted(workspace.glob(rel))
+    candidate = workspace / rel
+    return [candidate] if candidate.exists() else []
+
+
+def _carrier_probe_files(rep: "Path") -> "list[Path]":
+    """Every concrete file a materialized representative stands for.
+
+    A file represents itself; a DIRECTORY is represented by every file beneath
+    it, sorted for determinism.
+
+    Deliberately EXHAUSTIVE. The first cut sampled the first 25 and said so in a
+    comment — "past the cap the probe can UNDER-report" — which treated a stated
+    caveat as an acceptable conclusion rather than a defect. john-the-dev built
+    the obvious counterexample on that head: 26 files with only the 26th ignored
+    read `ok`, so a stale exclude left a real carrier file unbacked while health
+    certified the subtree. In a probe whose entire purpose is catching silent
+    non-backup, a sample is not proof of coverage.
+
+    Cost is bounded by asking git ONCE for the whole list (`check-ignore
+    --stdin`) rather than once per file, so exhaustiveness costs a filesystem
+    walk plus a single process — not N processes. See `_carrier_target_verdict`.
+    """
+    if rep.is_file():
+        return [rep]
+    if not rep.is_dir():
+        return []
+    return sorted(f for f in rep.rglob("*") if f.is_file())
+
+
+def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
+    """`"carried"` | `"dropped"` | `"unmeasured"` for ONE materialized path.
+
+    A DIRECTORY and the files inside it are different questions for git, and the
+    first cut asked the wrong one. `*` + `!hosts/` + `!hosts/*/` un-ignores the
+    directories while every file beneath stays ignored — `!hosts/**` is what
+    carries the contents. So `check-ignore` on `hosts/a` answered "not ignored"
+    while `hosts/a/current-track.md` was ignored and unbacked, and the probe
+    reported the vault healthy with the very file it exists to protect not being
+    backed up. Reproduced independently by john-the-dev and qingyun-wu on
+    a958d06f, and confirmed here before changing anything.
+
+    So a directory is probed through EVERY file beneath it, and any ignored one
+    condemns the entry. Exhaustive rather than sampled: a 26-file directory whose
+    26th file alone was ignored read `ok` under the old 25-file cap
+    (john-the-dev, #2572), which is the exact silent non-backup this exists for.
+
+    `--no-index` stays load-bearing and the instrument stays `check-ignore` for
+    a reason worth recording: the obvious alternative,
+    `ls-files --others --ignored`, is index-AWARE, so it calls a tracked file
+    carried. That silently reverses a documented behavior —
+    `test_a_TRACKED_file_with_a_stale_exclude_is_still_reported` exists because a
+    host that carried a file once and then let its exclude go stale read healthy
+    forever while nothing NEW under that entry was being carried. I wrote the
+    ls-files version first and that test failed; it was right and I was wrong.
+
+    Used by BOTH the stale and dropped branches. The stale branch probes a
+    directory representative too and had the same blindness; fixing only the
+    branch that was reported would have left the identical defect one step to
+    the left, which is how this class of bug has survived three rounds here.
+    """
+    targets = _carrier_probe_files(rep)
+    if not targets:
+        # A materialized directory with no files under it yet. Nothing to
+        # measure — treated as carried so an empty `hosts/<label>/` cannot
+        # manufacture a failure; the "nothing on disk" case is handled by the
+        # callers, which report an entry with no representatives at all.
+        return "carried"
+
+    # NUL-delimited, not newline. A filename may CONTAIN a newline, and
+    # `"\n".join(...)` then splits one real path into two bogus ones — both of
+    # which are typically un-ignored, so the genuinely ignored carrier file reads
+    # as carried. Reproduced on a real tree (john-the-dev, #2572):
+    #
+    #     notes/z\nx.md  check-ignore -q  -> 0  (IGNORED, not backed up)
+    #     split halves   notes/z, x.md    -> 1, 1 (both un-ignored)
+    #     newline-joined batch            -> 1  -> reads CARRIED, false green
+    #     NUL-joined with -z              -> 0  -> dropped, correct
+    #
+    # `-z` makes git read NUL-separated input, which is the only delimiter a
+    # POSIX filename cannot contain.
+    rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
+    try:
+        proc = subprocess.run(
+            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-z", "--stdin"),
+            input=rels, capture_output=True, text=True, timeout=60,
+        )
+    except (GitUnavailable, OSError, subprocess.SubprocessError):
+        return "unmeasured"
+    # check-ignore's contract, unchanged by --stdin: 0 = at least one path is
+    # ignored, 1 = none are, anything else = it failed. Folding "not 0" into
+    # healthy would count exit 128 as carried.
+    if proc.returncode == 0:
+        return "dropped"
+    if proc.returncode == 1:
+        return "carried"
+    return "unmeasured"
+
+
+def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
+    """One existing concrete path for a carrier-set entry, or None.
+
+    The single-witness form, kept for the stale branch: that branch asks whether
+    the entry THIS host configured is in effect, and one materialized path
+    answers it. An entry with nothing on disk yet is not evidence of anything,
+    so it is skipped rather than reported. Use `_carrier_representatives` when
+    the question is coverage of a *different* (shipped) entry — see its
+    docstring for why one witness is not enough there.
+    """
+    reps = _carrier_representatives(workspace, entry)
+    return reps[0] if reps else None
+
+
+def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
+    """A configured carrier-set entry that git still ignores is not being backed up.
+
+    `sync-workspace.sh:generate_exclude` REFUSES to rewrite an existing
+    `.git/info/exclude` that differs from the generated content (the #1445 guard
+    against clobbering operator-authored rules), and `_enforce_carrier_set_pre`
+    (`:613`) swallows that refusal so the tick continues. The sync then pushes and
+    reports success while the carrier set is silently stale — observed on two
+    hosts independently (65 refusals / 63 followed by `pushed to` on one, 4/4 on
+    the other; see #2565). Every existing check reads healthy: the config IS
+    correct, the checkout IS current, and only the generated artifact is stale.
+
+    Two distinct causes produce the identical symptom and need different remedies,
+    so they are reported separately rather than collapsed:
+
+      1. STALE EXCLUDE — the resolved config lists an entry that git still
+         ignores. Remedy: `bash scripts/sync-workspace.sh --force-gitignore`.
+      2. DROPPED BY OVERRIDE — a local `vault.sync.include` REPLACES the shipped
+         default rather than merging into it (#2531), so shipped entries added
+         later never reach this host. Remedy: add them to the local list. Here
+         the on-disk exclude legitimately MATCHES the resolved config, so cause 1
+         is dormant and a resolved-vs-disk comparison alone reads healthy.
+
+    Asking git directly (`check-ignore`) rather than regenerating the exclude and
+    diffing is deliberate: it tests the OUTCOME, cannot drift as the generator's
+    formatting changes, and is immune to the two legitimate no-diff branches
+    (`:562` no-op when already matching, `:570` safe legacy `hosts/<label>/` ->
+    `hosts/*/` widening) — after either, the paths ARE un-ignored, so there is
+    nothing to false-positive on.
+
+    Returns None when the workspace is not a git repo (vault never initialized),
+    which is a valid unconfigured state and not a defect.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    name = "carrier-set"
+    if not (workspace / ".git").exists():
+        return None
+
+    vault = _resolved_vault()
+    resolved = [e for e in (vault.get("sync") or {}).get("include") or [] if isinstance(e, str)]
+    if not resolved:
+        return None
+
+    stale: "list[str]" = []
+    unmeasured: "list[str]" = []
+    for entry in resolved:
+        # EVERY materialized match, not one. `_carrier_representative()` (singular)
+        # collapses `hosts/*/` to its first match, so a two-host workspace whose
+        # exclude carries host A but not host B reported `ok` while B's subtree
+        # was ignored and unbacked — the same false green the dropped branch was
+        # fixed for, on the OTHER axis.
+        #
+        # The previous round shared the directory-vs-file instrument across both
+        # branches and stopped there. Coverage has two independent axes — WHICH
+        # paths you probe, and WHAT you ask about each — and generalizing one of
+        # them left the other singular here. Both branches now enumerate.
+        # (john-the-dev and qingyun-wu, independently, on cf059ca8.)
+        reps = _carrier_representatives(workspace, entry)
+        if not reps:
+            continue
+        # `git_argv` rather than a bare "git": on macOS the stock /usr/bin/git is
+        # an Xcode-CLT shim that pops an install dialog when the tools are absent,
+        # and this probe runs from a BACKGROUND health check where nobody is there
+        # to dismiss it. The resolver refuses that shim instead of spawning it.
+        #
+        # `--no-index` is LOAD-BEARING on the file path (sync-workspace.sh says so
+        # at its own check-ignore call): without it, git reports an ALREADY-TRACKED
+        # file as not-ignored regardless of the rules, so a host whose file was
+        # carried once and whose exclude later went stale reads healthy forever.
+        # Caught by restoring this host's real pre-fix exclude and watching the
+        # probe still say OK. Both that and the directory/contents distinction now
+        # live in `_carrier_target_verdict` so the two branches cannot drift.
+        verdict = "carried"
+        for rep in reps:
+            got = _carrier_target_verdict(workspace, rep)
+            if got != "carried":
+                verdict = got
+                break
+        if verdict == "dropped":
+            stale.append(entry)
+        elif verdict == "unmeasured":
+            # Could not run the measurement at all. NOT the same as "carried".
+            unmeasured.append(entry)
+
+    # Read the SHIPPED file directly rather than through load_config(), which
+    # deep-merges the local override and would therefore return `resolved` —
+    # the very list we are testing against. There is no shipped-only public
+    # loader, and inventing one behind a broad `except` would make this branch a
+    # silent no-op the day the name was wrong.
+    dropped: "list[str]" = []
+    try:
+        shipped_cfg = json.loads((Path(REPO_DIR) / "sutando.config.json").read_text())
+        shipped = ((shipped_cfg.get("vault") or {}).get("sync") or {}).get("include")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        # The shipped config itself is unreadable, so there is no comparison to
+        # make. This except must stay narrow and must NOT wrap the measurement
+        # loop below: the first cut did, so one entry's git timeout jumped here
+        # and reset `dropped = []`, erasing findings already collected — a
+        # fail-OPEN that turned a failed measurement into a green report, three
+        # lines under a comment promising the opposite (qingyun-wu P1 on #2572).
+        shipped = None
+
+    if isinstance(shipped, list):
+        missing = [e for e in shipped if isinstance(e, str) and e not in resolved]
+        # String inequality is not absence of coverage. A local entry can be
+        # strictly BROADER than the shipped one it replaces — `hosts/` covers
+        # everything `hosts/*/` does — and the whole point of this probe is to
+        # judge by outcome, not by config text. The `stale` branch above already
+        # asks git; this branch used to revert to string equality, so it reported
+        # a fully-carried subtree as missing and advised "add them to the local
+        # list", i.e. told the operator to NARROW a config that was already
+        # correct (#2571, reported against #2566 by Sutando-Pro).
+        #
+        # EVERY materialized match must be covered, not one sampled witness. A
+        # narrower local rule (`hosts/a/`) covers one child of a shipped wildcard
+        # (`hosts/*/`) while its siblings stay ignored, and first-hit sampling
+        # that landed on the covered child reported the vault healthy with a host
+        # subtree silently unbacked.
+        #
+        # An entry with nothing materialized yet stays reported: there is no
+        # outcome to measure, but the divergence is real and becomes silent data
+        # loss the moment the first file lands under it.
+        for entry in missing:
+            reps = _carrier_representatives(workspace, entry)
+            if not reps:
+                dropped.append(entry)
+                continue
+            verdict = "covered"
+            for rep in reps:
+                # Same instrument as the stale branch, deliberately shared: a
+                # DIRECTORY representative and the files under it are different
+                # questions for git, and asking about the directory reported a
+                # subtree healthy while its carrier file was ignored.
+                got = _carrier_target_verdict(workspace, rep)
+                if got != "carried":
+                    verdict = got
+                    break
+            if verdict == "dropped":
+                dropped.append(entry)
+            elif verdict == "unmeasured":
+                unmeasured.append(entry)
+
+    # A shipped entry can be one this host must NOT carry. `state/current-track.md`
+    # is per-host state that #2534 added at a flat, SHARED vault path, so two cores
+    # write the same file and each host's sync resolves the resulting conflict in its
+    # own favour — a peer's anchor lands in your working copy, and neither side's
+    # merge keeps the other's.
+    #
+    # This comment previously said that "overwrote a peer's 1056-line anchor". It did
+    # not, and the correction matters because I wrote the original from a misread of
+    # the sync code rather than from the vault. The vault uses PER-HOST branches
+    # (`host/<host>/<wsid>`); a host only ever merges a peer INTO its own branch and
+    # never writes to the peer's. Checked afterwards: both branches were byte-identical
+    # and this host's index referenced 263 memory files against the discarded copy's
+    # 262 — a strict superset, nothing missing. Chi corrected the claim; Sutando-Pro
+    # independently confirmed it from `state/current-track.md`'s own two-commit history.
+    #
+    # The guidance is unchanged — do not re-add it — but the reason is cross-host
+    # CONTENT DELIVERY on a shared path, not data loss. Telling an operator to re-add
+    # walks them back into that, so the REMEDY is split rather than the entry hidden;
+    # silently filtering it would suppress a real divergence. Delete this list once the
+    # host-qualified migration (#2567/#2568) lands: the flat path stops being shipped
+    # and stops appearing here.
+    UNSAFE_TO_READD = ("state/current-track.md",)
+    unsafe = [e for e in dropped if e in UNSAFE_TO_READD]
+    safe = [e for e in dropped if e not in UNSAFE_TO_READD]
+
+    # The same carve-out has to reach the STALE branch, and there it inverts the
+    # verdict rather than just softening the wording. A path that must not be
+    # carried and is NOT being carried is in its CORRECT state — reporting that as
+    # a failure whose remedy is `--force-gitignore` would walk the operator into
+    # re-carrying it, which is the cross-host overwrite this carve-out exists to
+    # prevent. Found by running the merged probe on a live host that had
+    # deliberately un-carried the path: it said `fail` and named the exact command
+    # that resumes the incident.
+    stale_expected = [e for e in stale if e in UNSAFE_TO_READD]
+    stale = [e for e in stale if e not in UNSAFE_TO_READD]
+
+    if not stale and not dropped and not unmeasured:
+        if not stale_expected:
+            return {
+                "name": name,
+                "status": "ok",
+                "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault",
+            }
+        # NOT `ok`: this host is in the correct state, but it got there by DIVERGING
+        # from the shipped default, which still ships the flat path in
+        # `vault.sync.include` and still re-carries it on `--force-gitignore` or in a
+        # fresh workspace. Reporting `ok` would claim the default is safe when only
+        # this host is (qingyun-wu on #2570).
+        #
+        # `warn` + an EXPLICIT `alerting: False`. The first cut set `warn` alone and
+        # claimed in this comment that it "never alerts" because `main()` excludes
+        # warn from `issues` — which was simply false. `issues` is a local list used
+        # to print a summary; `--emit-task`, `--notify-on-fail` and `--notify-slack`
+        # each consume the FULL checks list and treat a plain warn as a failure, so
+        # this state still fired a task and a notification on first transition
+        # (qingyun-wu again, with a one-check witness). The claim was tested against
+        # the list I happened to have named rather than the surfaces that enforce.
+        #
+        # Suppression is right HERE specifically: the owner cannot act on it. Phase 2
+        # of #2567 is gated on migration evidence, so paging about it would repeat a
+        # non-actionable message until that lands, and this branch stops being
+        # reachable once the flat path leaves the shipped default.
+        return {
+            "name": name,
+            "status": "warn",
+            "alerting": False,
+            "detail": (
+                f"{len(resolved) - len(stale_expected)} configured carrier path(s) un-ignored; "
+                f"{', '.join(stale_expected)} correctly NOT carried on this host — but the shipped "
+                f"default still lists it in `vault.sync.include`, so a fresh workspace or "
+                f"`--force-gitignore` re-carries it at the flat, SHARED path and can resume the "
+                f"cross-host overwrite. This host is right and the default is not; do not "
+                f"`--force-gitignore` it back. Clears when phase 2 of #2567 drops the entry"
+            ),
+        }
+
+    parts = []
+    if unmeasured:
+        parts.append(
+            f"could NOT measure {len(unmeasured)} carrier path(s) "
+            f"({', '.join(unmeasured[:4])}{'…' if len(unmeasured) > 4 else ''}) — git was "
+            f"unavailable or check-ignore failed, so whether the vault is backing them up is "
+            f"UNKNOWN, not fine"
+        )
+    if stale:
+        parts.append(
+            f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
+            f"backing them up ({', '.join(stale[:4])}{'…' if len(stale) > 4 else ''}) — the exclude "
+            f"file is stale and sync refused to regenerate it; fix with "
+            f"`bash scripts/sync-workspace.sh --force-gitignore` (diff it first)"
+        )
+    if safe:
+        parts.append(
+            f"{len(safe)} shipped carrier path(s) are missing from this host's resolved include "
+            f"({', '.join(safe[:4])}{'…' if len(safe) > 4 else ''}) — a local "
+            f"`vault.sync.include` REPLACES the shipped default (#2531), so upstream additions never "
+            f"arrive; add them to the local list"
+        )
+    if unsafe:
+        parts.append(
+            f"{len(unsafe)} shipped carrier path(s) are missing here and must NOT be re-added "
+            f"({', '.join(unsafe)}) — per-host state carried at a flat, SHARED vault path, so "
+            f"re-adding puts two hosts on one file: a peer's copy lands in yours and each "
+            f"sync keeps its own side (#2567). Leave them out until the host-qualified "
+            f"migration lands"
+        )
+    return {"name": name, "status": "fail", "detail": "; ".join(parts)}
+
+
 def check_memory_index_integrity() -> "dict | None":
     """Catch memories that exist on disk but will never load into a session.
 
@@ -1524,6 +1963,55 @@ def _behind_warn_threshold(repo: "Path") -> int:
     return raw if raw > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
 
 
+def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
+                             git_bin: str = "git") -> "list[str]":
+    """Subjects of not-yet-pulled commits that EFFECTIVELY change ``prefix``.
+
+    Two different questions, and the first cut answered the wrong one. "Did a
+    not-yet-pulled commit TOUCH this path" is commit-path history; "would
+    pulling change any bytes here" is a tree diff. They diverge whenever history
+    is reversible: upstream adds `skills/demo/SKILL.md` and removes it in the
+    next commit, a clone sits two commits behind, and
+    `git log HEAD..origin/main -- skills/` lists both commits while
+    `git diff --name-only HEAD..origin/main -- skills/` is EMPTY. Pulling would
+    change no skill bytes, yet the probe warned — a false behavioral-staleness
+    alarm, which is precisely the alert fatigue this check argues against.
+    Reproduced independently by qingyun-wu and john-the-dev on #2573.
+
+    So the TREE DIFF is the gate and history is only the message: if nothing
+    under ``prefix`` differs, return nothing; only when it does differ, name the
+    commits so the warning is actionable.
+
+    Same last-fetched-ref, no-network contract as `_commits_behind`, and the
+    same honest consequence: a stale local ref makes this UNDER-report, never
+    cry wolf. Returns `[]` on any failure for the same reason — this is an
+    additional signal layered on a probe that must not become the thing that
+    breaks the health run.
+    """
+    try:
+        changed = subprocess.run(
+            [git_bin, "-C", str(repo), "diff", "--name-only",
+             f"HEAD..origin/{branch}", "--", prefix],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if changed.returncode != 0 or not changed.stdout.strip():
+        return []
+
+    try:
+        out = subprocess.run(
+            [git_bin, "-C", str(repo), "log", "--no-merges", "--format=%s",
+             f"HEAD..origin/{branch}", "--", prefix],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
 def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
     """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
 
@@ -1648,6 +2136,36 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           "silence reads as health). Refresh with "
                           f"`git -C {repo} pull --ff-only` + restart. Count is against the "
                           "last-fetched ref; this probe does not fetch."}
+    # Count is the wrong instrument for BEHAVIORAL staleness, and the threshold
+    # above is deliberately 10 to avoid alert fatigue — correctly, since `main`
+    # moves several times a day. But one commit that rewrites a skill outranks
+    # nine that touch docs, and a count cannot tell them apart.
+    #
+    # Skills are the case with no other detector. `src/` needs a restart to take
+    # effect, so the `*-stale` probes catch it by comparing a running process
+    # against its source. A skill has no process: the agent reads the markdown
+    # from THIS checkout on every invocation, so a merged skill fix that has not
+    # been pulled is simply not in effect, with nothing anywhere to compare.
+    #
+    # Observed 2026-08-03 on this node: exactly ONE commit behind — far under the
+    # threshold, so this probe reported ok — while the live `context-reconstruct`
+    # still instructed writing `state/current-track.md`, the shared flat path
+    # whose two-writer collision had destroyed a peer's anchor hours earlier
+    # (#2567/#2568). The running skill and the merged skill disagreed, and both
+    # looked correct from where anyone was standing.
+    stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
+    if stale_skills:
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on {expected!r} and only {behind} commit(s) behind "
+                          f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
+                          f"nag threshold — but {len(stale_skills)} of them change `skills/`, "
+                          "which the agent re-reads from this checkout on EVERY invocation. "
+                          "Those merged skill fixes are not in effect here, and no "
+                          "restart-staleness probe can see it: a skill has no running process "
+                          f"to compare against. ({'; '.join(stale_skills[:3])}"
+                          f"{'; …' if len(stale_skills) > 3 else ''}) Refresh with "
+                          f"`git -C {repo} pull --ff-only`. Measured against the last-fetched "
+                          "ref; this probe does not fetch, so it can only under-report."}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
                       + (f", {behind} commits behind" if behind else "")}
@@ -1745,14 +2263,45 @@ LAUNCHD_BACKED_CHECKS = {
 
 
 def fix_launchd(label: str) -> str:
-    """Try to reload a launchd job."""
+    """Try to reload a launchd job.
+
+    A missing plist is NOT an edge case for these two services, and saying
+    "no plist found" reads like a launchd failure when it is not one. The
+    voice-agent / web-client plists are generated by **Sutando.app's
+    installer** (see `_voice_log_path`); this repo ships installers only for
+    credential-proxy, cron-runner, health-check and the app itself. On a plain
+    checkout `src/startup.sh` launches both services directly instead —
+    `run_node_service voice-agent src/voice-agent.ts ... &` — precisely because
+    it checks `launchctl print` first and falls through when there is no job.
+
+    So on any host without Sutando.app installed, --fix reaches this function
+    for a stale voice-agent, prints one internal-sounding line, and can never
+    restart it. Observed on the 24/7 node 2026-08-03: `voice-agent: stale
+    (code is 2159 min newer than process)` survived repeated `--fix` runs,
+    each reporting `no plist found for com.sutando.voice-agent`.
+
+    Two distinct misses share one message, and only one of them is a bug:
+      * label absent from plist_map  -> a real "we don't know this job"
+      * label known, plist missing   -> the service is simply not launchd-
+        managed here, and the operator needs the command that DOES work
+    """
     plist_map = {
         "com.sutando.voice-agent": Path.home() / "Library/LaunchAgents/com.sutando.voice-agent.plist",
         "com.sutando.web-client": Path.home() / "Library/LaunchAgents/com.sutando.web-client.plist",
     }
     plist = plist_map.get(label)
-    if not plist or not plist.exists():
+    if not plist:
         return f"no plist found for {label}"
+    if not plist.exists():
+        # Deliberately names a runnable command. A --fix line that reports a
+        # miss without naming the remedy is indistinguishable, to whoever
+        # reads the log, from a fix that was attempted and failed.
+        return (
+            f"{label} is not launchd-managed on this host (no {plist.name} in "
+            f"~/Library/LaunchAgents — that plist comes from Sutando.app's installer). "
+            f"startup.sh launches this service directly instead, so --fix cannot "
+            f"restart it. Remedy: bash src/restart.sh"
+        )
 
     uid = subprocess.run(["/usr/bin/id", "-u"], capture_output=True, text=True).stdout.strip()
     # Try kickstart
@@ -4896,6 +5445,10 @@ def run_all_checks() -> list[dict]:
     if _mem_index:
         checks.append(_mem_index)
 
+    # Carrier-set enforcement — a stale exclude means the vault is silently not
+    # backing up paths the config says it carries (#2565).
+    checks.extend(c for c in (check_carrier_set_enforced(),) if c)
+
     # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
     # <workspace>/notes rather than <repo>/notes — the notes/.gitkeep was
@@ -5251,6 +5804,29 @@ def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -
     return False
 
 
+def _alerts_suppressed(check: dict) -> bool:
+    """True when a check must NOT wake anyone, whatever its status says.
+
+    `main()` computes a local `issues` list, and it is tempting to treat that as
+    "what alerts". It is not. `--emit-task`, `--notify-on-fail` and
+    `--notify-slack` each consume the FULL `checks` list through their own
+    filters, and all three count a plain `warn` as a failure. A carve-out tested
+    only against `issues` therefore still fires a task and a macOS notification
+    on the first transition (qingyun-wu, #2570 — verified on the exact head with
+    a one-check witness: notification written, 1 Slack message, 1 task file).
+
+    So suppression has to be an explicit property of the CHECK, honored at every
+    surface that can wake someone, rather than a status the reader hopes is
+    benign. A probe sets `"alerting": False` when its result is genuinely
+    informational — visible on the dashboard, never a page.
+
+    Deliberately narrow: only an explicit `False` suppresses. A missing key
+    alerts, so no existing check changes behavior by omission, and a typo cannot
+    silence a real failure.
+    """
+    return check.get("alerting") is False
+
+
 def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
     """Emit a task file describing health-check failures so the proactive
     loop's CLI session sees them via the watcher and can decide what to do
@@ -5282,7 +5858,9 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     # watchdog catches the bug class that motivated this PR. Excluding
     # would have missed Mini's discord-bridge issue this morning. Per
     # her PR review note 2026-05-05.
-    failures = [c for c in checks if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")]
+    failures = [c for c in checks
+                if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")
+                and not _alerts_suppressed(c)]
     if not failures:
         return
 
@@ -5367,7 +5945,9 @@ def notify_for_failures(
     defaults to `osascript` driving `display notification`. Tests inject a
     fake to avoid spamming the developer's own notification center.
     """
-    failures = [c for c in checks if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")]
+    failures = [c for c in checks
+                if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")
+                and not _alerts_suppressed(c)]
     if not failures:
         return
 
@@ -5432,9 +6012,12 @@ def _slack_failures(checks: list[dict]) -> list[dict]:
     out = []
     for c in checks:
         st = c["status"]
+        if _alerts_suppressed(c):
+            continue
         if st in ("down", "missing", "not_loaded", "fail", "stale"):
             out.append(c)
-        elif st == "warn" and "on-demand" not in (c.get("detail") or ""):
+        elif st == "warn" and "on-demand" not in (c.get("detail") or "") \
+                and not _alerts_suppressed(c):
             out.append(c)
     return out
 
@@ -6246,6 +6829,39 @@ def community_support_line() -> str:
     return "  Stuck? Community support (real humans + community agents): https://discord.gg/uZHWXXmrCS"
 
 
+#: Statuses that are NOT problems. Everything else is, by the same rule the
+#: issue list uses: `issues = [c for c in checks if c["status"] not in ("ok", "warn")]`.
+#: `stale` is an issue but gets its own glyph because it names a specific remedy.
+_BENIGN_STATUSES = ("ok", "warn")
+
+
+def status_icon(status: str) -> str:
+    """Glyph for a probe status — unrecognized reads as a PROBLEM, not a shrug.
+
+    The human-readable listing used to enumerate `down`/`missing`/`not_loaded` as
+    severe and fall back to `~` for anything else. That put **`fail`** — the most
+    severe status any probe emits, and the one nine probes use — on the least
+    alarming glyph, sharing it with "status I don't recognize". `error` (5 probes)
+    and `wedged` landed there too.
+
+    It is a real miss, not a cosmetic one: a peer host filtered health-check output
+    with `grep -E "⚠|✗"` and the single `fail` line was the one the filter hid, so a
+    run with a genuine failure read as three routine warnings.
+
+    `--quiet` never had this bug — it renders every non-stale issue as `✗`. The two
+    output modes disagreed about the same status. This makes them agree by deriving
+    both from one predicate, and inverts the default so a status added later shows
+    up as a problem until someone deliberately classifies it as benign.
+    """
+    if status == "ok":
+        return "✓"
+    if status == "warn":
+        return "⚠"
+    if status == "stale":
+        return "♻"
+    return "✗"
+
+
 def summary_line(checks) -> str:
     """The no-failures summary. Warnings are deliberately NOT issues — they must
     not fail the exit code or wake the launchd notifier, and that is unchanged.
@@ -6343,7 +6959,7 @@ def main():
     if quiet:
         if issues:
             for c in issues:
-                icon = "♻" if c["status"] == "stale" else "✗"
+                icon = status_icon(c["status"])
                 print(f"{icon} {c['name']}: {c['status']} ({c['detail']})")
             if do_fix:
                 # Fall through to existing fix path below
@@ -6359,7 +6975,7 @@ def main():
         print("=" * 40)
 
         for c in checks:
-            icon = "✓" if c["status"] == "ok" else "⚠" if c["status"] == "warn" else "✗" if c["status"] in ("down", "missing", "not_loaded") else "♻" if c["status"] == "stale" else "~"
+            icon = status_icon(c["status"])
             print(f"  {icon} {c['name']:30s} {c['status']:12s} {c['detail']}")
 
         print()
