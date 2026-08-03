@@ -165,6 +165,31 @@ Both should move toward dependency inversion:
 Moving files without first removing these dependencies would make the boundary
 look cleaner without making it real.
 
+## Schema migration vs live writer
+
+A module that owns live write APIs must not also own destructive one-time schema
+transformations. Migration code is high-consequence, runs once at startup, and is
+almost impossible to test through the live surface — embedded in a writer it ends
+up exercised only by driving a real session.
+
+Worked example, `src/conversation-store.ts` → `src/conversation-store-migrations.ts`:
+
+> `conversation-store.ts` owns current schema initialization and live write APIs.
+> Destructive or legacy SQLite transformations belong in
+> `conversation-store-migrations.ts`, are idempotent, transaction-tested and
+> invoked before views/statements are prepared. Do not place migration SQL in a
+> live record function.
+
+The ordering is part of the contract: current-table DDL → migrations → view
+rebuild → prepared statements. The migration module never creates current-schema
+DDL (that stays the caller's job) and never propagates failure — the store must
+still initialize after a handled, rolled-back migration.
+
+Enforced by `tests/conversation-store-migration-delegation.test.ts`, which checks
+the delegation and the ordering, and scans the store for the legacy table names
+and transaction verbs while deliberately still permitting current-schema
+`CREATE TABLE`.
+
 ## Presentation adapters vs domain/storage
 
 A presentation module (an HTTP server, a renderer, a CLI front end) adapts and
