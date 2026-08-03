@@ -42,7 +42,13 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from git_binary import GitUnavailable, git_argv  # noqa: E402
+# Kept as two lines on purpose: tests/git-binary-resolution.test.py:109 asserts
+# the literal `from git_binary import git_argv` to prove each call site imports
+# the resolver instead of hardcoding a git path. Merging these into one import
+# breaks that substring check — which guards 27 other call sites, so the import
+# bends here rather than the guard.
+from git_binary import git_argv  # noqa: E402
+from git_binary import GitUnavailable  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
