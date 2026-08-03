@@ -741,6 +741,181 @@ def main() -> int:
     except urllib.error.HTTPError as e:
         check(e.code == 401, "401 raises HTTPError")
 
+    # 5b. auth-rejection recovery: token-file re-read + live rotation
+    tok_dir = Path(tempfile.mkdtemp(prefix="rtc-tokfile-"))
+    tok_file = tok_dir / "relay.env"
+    # _read_token_file: dotenv form (export prefix + quotes stripped)
+    tok_file.write_text('# comment\nexport REMOTE_TASK_TOKEN="dotenv-secret"\nOTHER=x\n')
+    check(rtc._read_token_file(str(tok_file)) == "dotenv-secret",
+          "_read_token_file parses dotenv form (export + quotes)")
+    # raw onboarding-string form (no KEY=)
+    tok_file.write_text("# note\nhttp://u.example|raw-secret\n")
+    check(rtc._read_token_file(str(tok_file)) == "http://u.example|raw-secret",
+          "_read_token_file falls back to raw onboarding string")
+    check(rtc._read_token_file(str(tok_dir / "missing.env")) == "",
+          "_read_token_file missing file → empty (no-rotation)")
+    # mixed-alias precedence: a stale legacy AG2_REMOTE_TOKEN line ABOVE the
+    # canonical REMOTE_TASK_TOKEN must NOT win (file order is irrelevant;
+    # REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN, matching startup.sh).
+    tok_file.write_text("AG2_REMOTE_TOKEN=legacy-stale\nREMOTE_TASK_TOKEN=current-secret\n")
+    check(rtc._read_token_file(str(tok_file)) == "current-secret",
+          "canonical key wins over an EARLIER legacy line (mixed-alias env)")
+    tok_file.write_text("REMOTE_TASK_TOKEN=current-secret\nAG2_REMOTE_TOKEN=legacy-stale\n")
+    check(rtc._read_token_file(str(tok_file)) == "current-secret",
+          "canonical key wins over a LATER legacy line too")
+    tok_file.write_text("AG2_REMOTE_TOKEN=legacy-only\n")
+    check(rtc._read_token_file(str(tok_file)) == "legacy-only",
+          "legacy alias still honored when canonical absent")
+    # _reload_rotated_token: no TOKEN_FILE configured → False (FATAL path kept)
+    rtc.TOKEN_FILE = ""
+    check(rtc._reload_rotated_token() is False, "no TOKEN_FILE → no rotation")
+    check(rtc._recover_auth(401) is False,
+          "_recover_auth without TOKEN_FILE → False (caller keeps FATAL exit)")
+    # same secret as the running one → no rotation
+    rtc.TOKEN_FILE = str(tok_file)
+    tok_file.write_text(f"REMOTE_TASK_TOKEN={rtc.TOKEN}\n")
+    check(rtc._reload_rotated_token() is False, "unchanged token → no rotation")
+    # a rotated combined url|secret form (SAME gateway) swaps the secret;
+    # URL is never moved by rotation.
+    old_url = rtc.URL
+    tok_file.write_text(f"REMOTE_TASK_TOKEN={old_url}|rotated-secret\n")
+    check(rtc._reload_rotated_token() is True
+          and rtc.TOKEN == "rotated-secret"
+          and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer rotated-secret",
+          "rotated token swapped into TOKEN + shared _AUTH_HEADERS")
+    # a combined form naming a DIFFERENT gateway is REFUSED outright — honoring
+    # it would split the process across bases (poller on new, SSE/cards on old,
+    # carrying the fresh bearer to the old endpoint). Nothing changes.
+    tok_file.write_text("REMOTE_TASK_TOKEN=https://other.example/relay|other-secret\n")
+    check(rtc._reload_rotated_token() is False
+          and rtc.TOKEN == "rotated-secret"
+          and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer rotated-secret",
+          "URL-changing rotation refused — no partial gateway move")
+    # a rotation written in the URL-ENCODED form (https://url%7Csecret — the
+    # desktop connect flow writes this) must parse identically to the literal
+    # "|" form: extract just the secret, never set the bearer to the whole URL
+    # string. Regression guard for #2323: _reload_rotated_token used a literal
+    # "|" split, so an encoded rotation was mis-read as a bare secret and the
+    # bearer became "Bearer https://...%7C<secret>", failing auth after a valid
+    # rotation. Now it routes through _parse_onboarding_token (handles %7C).
+    tok_file.write_text(f"REMOTE_TASK_TOKEN={old_url}%7Cencoded-secret\n")
+    check(rtc._reload_rotated_token() is True
+          and rtc.TOKEN == "encoded-secret"
+          and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer encoded-secret",
+          "%7C-encoded rotation swaps just the secret (not the whole URL string)")
+    # SPLIT-layout rotation (bare REMOTE_TASK_TOKEN + a separate REMOTE_TASK_URL
+    # line — the documented persistent form) must get the SAME cross-gateway
+    # guard as the combined url|secret form. #2323 credential-boundary follow-up:
+    # _read_token_file drops the file URL, so before the fix a split file
+    # re-pointed by connect to a NEW gateway was mis-read as a same-gateway
+    # rotation → the new bearer went to the OLD running URL (bearer leak).
+    tok_file.write_text(f"REMOTE_TASK_TOKEN=split-same\nREMOTE_TASK_URL={old_url}\n")
+    check(rtc._reload_rotated_token() is True
+          and rtc.TOKEN == "split-same" and rtc.URL == old_url,
+          "split-layout rotation (same gateway URL) still hot-swaps the secret")
+    tok_file.write_text("REMOTE_TASK_TOKEN=split-other\n"
+                        "REMOTE_TASK_URL=https://other.example/relay\n")
+    check(rtc._reload_rotated_token() is False
+          and rtc.TOKEN == "split-same" and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer split-same",
+          "split-layout rotation to a DIFFERENT gateway refused (no cross-gateway bearer move)")
+    # _recover_auth immediate path: file already rotated again → True, no wait
+    tok_file.write_text("REMOTE_TASK_TOKEN=rotated-secret-2\n")
+    check(rtc._recover_auth(401) is True and rtc.TOKEN == "rotated-secret-2",
+          "_recover_auth resumes immediately when file already rotated")
+    # _recover_auth wait-loop path: rotation lands during the re-check sleep
+    slept = []
+
+    def _sleep_and_rotate(secs):
+        slept.append(secs)
+        tok_file.write_text("REMOTE_TASK_TOKEN=rotated-secret-3\n")
+    real_sleep, real_emit = rtc.time.sleep, rtc._emit_gateway_status
+    real_hb = rtc._heartbeat_singleton
+    rtc.time.sleep, rtc._emit_gateway_status = _sleep_and_rotate, lambda *a, **k: None
+    # The suite never ran main()'s _acquire_singleton, so a real heartbeat here
+    # would read as "lost ownership"; stub it — held-lock behavior is what the
+    # production loop has.
+    rtc._heartbeat_singleton = lambda: True
+    try:
+        check(rtc._recover_auth(403) is True and rtc.TOKEN == "rotated-secret-3"
+              and slept == [rtc.AUTH_RECHECK_INTERVAL],
+              "_recover_auth wait-loop picks up rotation after one re-check")
+    finally:
+        rtc.time.sleep, rtc._emit_gateway_status = real_sleep, real_emit
+        rtc._heartbeat_singleton = real_hb
+    # restore the suite's token so later sections keep authenticating
+    rtc.TOKEN = "testtoken"
+    rtc._AUTH_HEADERS["Authorization"] = "Bearer testtoken"
+    rtc.TOKEN_FILE = ""
+
+    # 5a-bis. Consumer-boundary BY-REFERENCE contract (#2323 review suggestion).
+    # Rotation reaches the long-lived consumers ONLY because they hold
+    # _AUTH_HEADERS by reference. Every producer-side assert above would still
+    # pass if a consumer __init__ copied the dict (the module dict is still
+    # mutated) while rotation silently stopped reaching that consumer — a
+    # bridge that keeps 401ing after rotation, the exact symptom this PR
+    # removes. Identity is the contract; assert it with `is`, constructed the
+    # way the bridge wires them (remote_gateway_bridge.py EventChannel/
+    # CardPoster call sites pass _AUTH_HEADERS itself).
+    from ag2_sparrow.event_channel import EventChannel as _ECBoundary
+    from ag2_sparrow.human_action import CardPoster as _CPBoundary
+
+    class _StubInbox:  # EventChannel.__init__ reads the durable cursor
+        def durable_cursor(self):
+            return ""
+    _bch = _ECBoundary(_StubInbox(), "https://gw", rtc._AUTH_HEADERS)
+    check(_bch._headers is rtc._AUTH_HEADERS,
+          "EventChannel holds _AUTH_HEADERS BY REFERENCE (is, not copy)")
+    _bcp = _CPBoundary(None, "https://gw", rtc._AUTH_HEADERS, "!room:x")
+    check(_bcp._headers is rtc._AUTH_HEADERS,
+          "CardPoster holds _AUTH_HEADERS BY REFERENCE (is, not copy)")
+    rtc._AUTH_HEADERS["Authorization"] = "Bearer boundary-rotated"
+    check(dict(_bch._headers)["Authorization"] == "Bearer boundary-rotated"
+          and {**_bcp._headers}["Authorization"] == "Bearer boundary-rotated",
+          "rotation reaches both consumers' per-request copies")
+    rtc._AUTH_HEADERS["Authorization"] = "Bearer testtoken"
+
+    # 5b. DESKTOP recovery-arming regression (#2323): in the desktop-spawned case
+    # startup.sh is skipped and ONLY AG2_DEVICE_ENV reaches the bridge — no
+    # REMOTE_TASK_TOKEN and no REMOTE_TASK_TOKEN_FILE. A fresh import must not only
+    # resolve TOKEN/URL from that file but also set TOKEN_FILE to it, or the whole
+    # auth-recovery path stays DISABLED exactly on the desktop (auth_retry=bool(
+    # TOKEN_FILE), _reload_rotated_token/_recover_auth return False on ""). Before
+    # the fix TOKEN_FILE came only from REMOTE_TASK_TOKEN_FILE → "" here.
+    _dev_env = Path(tmp) / "device.env"
+    _dev_env.write_text("REMOTE_TASK_TOKEN=desktoptoken\n"
+                        "REMOTE_TASK_URL=https://gw.example/relay\n")
+    _saved = {k: os.environ.get(k) for k in
+              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN_FILE",
+               "REMOTE_TASK_URL", "AG2_REMOTE_URL", "AG2_DEVICE_ENV")}
+    for _k in _saved:
+        os.environ.pop(_k, None)
+    os.environ["AG2_DEVICE_ENV"] = str(_dev_env)      # the ONLY thing the desktop passes
+    try:
+        _spec = importlib.util.spec_from_file_location(
+            "rtc_desktop", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _desk = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_desk)
+        check(_desk.TOKEN == "desktoptoken" and _desk.URL == "https://gw.example/relay",
+              "desktop AG2_DEVICE_ENV import resolves TOKEN + URL")
+        check(_desk.TOKEN_FILE == str(_dev_env),
+              "desktop import ARMS TOKEN_FILE from AG2_DEVICE_ENV (not left empty)")
+        check(bool(_desk.TOKEN_FILE) is True,
+              "→ SSE event-channel auth_retry=bool(TOKEN_FILE) is armed on desktop")
+        # and the recovery path actually fires on that file: a rotation swaps in live.
+        _dev_env.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay|desktop-rotated\n")
+        check(_desk._reload_rotated_token() is True and _desk.TOKEN == "desktop-rotated",
+              "desktop _reload_rotated_token re-reads AG2_DEVICE_ENV → live rotation")
+    finally:
+        for _k, _v in _saved.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
     # 6. inbound media marker → local file rewrite (network mocked)
     fetched = []
     real_download = rtc._download_bytes
@@ -1018,10 +1193,10 @@ def main() -> int:
     # imports.
     _saved = {k: os.environ.get(k) for k in
               ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
-               "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV")}
+               "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV", "REMOTE_MEDIA_MARKER")}
     try:
         for _k in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
-                   "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV"):
+                   "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV", "REMOTE_MEDIA_MARKER"):
             os.environ.pop(_k, None)
         _cfg = tempfile.mkdtemp()
         _chan = Path(_cfg) / "channels" / "ag2space"
@@ -1103,6 +1278,39 @@ def main() -> int:
         _sspec.loader.exec_module(_srtc)
         check(_srtc.TOKEN == "splitsecret" and _srtc.URL == "https://split.example/relay",
               "env-fallback: split-layout file (bare token + REMOTE_TASK_URL) resolves BOTH token and URL")
+
+        # REMOTE_MEDIA_MARKER carried from the channel .env on a bare/desktop launch.
+        # The bridge derives MEDIA_MARKER_TAG from os.environ at import; a desktop
+        # launch reaches config ONLY through this file (never startup.sh's env
+        # exports, the one place the AG2 marker default is otherwise set), so
+        # without carrying it the tag falls back to the provider-neutral default and
+        # never matches the gateway's `[ag2space-media: …]` — inbound media URLs stay
+        # unresolved (owner-reported 2026-08-03). Provider-neutral: the value lives
+        # in the .env, not this package.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ.pop("REMOTE_MEDIA_MARKER", None)
+        _mm_chan = Path(tempfile.mkdtemp()) / "channels" / "ag2space"
+        _mm_chan.mkdir(parents=True)
+        (_mm_chan / ".env").write_text(
+            "AG2_REMOTE_TOKEN='https://gw.example/relay|mmsecret'\nREMOTE_MEDIA_MARKER=ag2space-media\n")
+        os.environ["AG2_DEVICE_ENV"] = str(_mm_chan / ".env")
+        _mmspec = importlib.util.spec_from_file_location(
+            "rtc_marker", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _mmrtc = importlib.util.module_from_spec(_mmspec)
+        _mmspec.loader.exec_module(_mmrtc)
+        check(_mmrtc.MEDIA_MARKER_TAG == "ag2space-media",
+              "env-fallback: REMOTE_MEDIA_MARKER carried from the channel .env sets the marker tag (bare/desktop launch)")
+
+        # env still wins: an explicit REMOTE_MEDIA_MARKER is not overridden by the file.
+        os.environ["REMOTE_MEDIA_MARKER"] = "env-marker"
+        os.environ["AG2_DEVICE_ENV"] = str(_mm_chan / ".env")
+        _mmwspec = importlib.util.spec_from_file_location(
+            "rtc_marker_envwins", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _mmwrtc = importlib.util.module_from_spec(_mmwspec)
+        _mmwspec.loader.exec_module(_mmwrtc)
+        check(_mmwrtc.MEDIA_MARKER_TAG == "env-marker",
+              "env-fallback: explicit REMOTE_MEDIA_MARKER in env wins over the channel .env value")
     finally:
         for _k, _v in _saved.items():
             if _v is None:
