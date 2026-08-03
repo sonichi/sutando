@@ -38,6 +38,8 @@ If two layers seem to fit, prefer the more specific one (skill > core). If you'r
 
 **Transport does not own authorization or durable state.** `src/runtime-api/server.py` owns Unix-socket transport and daemon composition; JSON-RPC method dispatch, approval/elicitation policy, governed-capability authorization, idempotency and durable request transitions belong in `src/runtime-api/dispatcher.py`. Actor identity is resolved daemon-side and passed to the dispatcher explicitly — a client parameter must never override it. Do not reimplement approval or capability behavior in a transport.
 
+**Complex skill diagnostics separate analysis from IO and presentation.** Pure analysis policy must not live in a loader, CLI or renderer. Call-diagnostics detection, categorization and repair policy lives in `skills/call-diagnostics/scripts/analysis.py`; loaders and renderers consume it and must not carry copied detection rules. The policy stays inside the skill — do not promote it into `src/`. Enforced by `tests/call-diagnostics-analysis.test.py`.
+
 **Presentation modules don't own domain/storage policy.** Dashboard HTTP handlers and rendering code must delegate schedule parsing, validation and atomic `crons.json` mutation to `src/dashboard_schedules.py`. Schedule mutations must remain locked read-modify-write operations; do not rebuild cron validation or persistence inside a route. The adapter resolves the path (`_crons_path()` — workspace + host label); the domain module receives it. Enforced by `tests/dashboard-schedule-delegation.test.py`. See [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md) "Presentation adapters vs domain/storage".
 
 ## Repo rules
