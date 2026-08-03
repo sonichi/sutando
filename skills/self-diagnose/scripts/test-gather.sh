@@ -8,6 +8,15 @@ cd "$(dirname "$0")/../../.."
 
 PASS=0
 FAIL=0
+# Resolve REPO/WS exactly as gather.sh does, including its SUTANDO_ROOT-first
+# precedence (gather.sh:19-20). Defined once and shared by every assertion that
+# needs to know where gather will look — resolving differently in two places is
+# how the results fixture and the collector silently disagreed.
+_TG_REPO="${SUTANDO_ROOT:-$PWD}"
+[ -f "$_TG_REPO/CLAUDE.md" ] || _TG_REPO="$PWD"
+_TG_WS="$(bash "$_TG_REPO/scripts/sutando-config.sh" workspace)"
+_TG_HOST="$(bash "$_TG_REPO/scripts/sutando-config.sh" host-label 2>/dev/null || echo unknown)"
+
 pass() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 fail() { echo "  ❌ $1"; FAIL=$((FAIL + 1)); }
 
@@ -23,9 +32,31 @@ fi
 
 # Test 2: expected files present
 if [ -n "$OUT" ]; then
-	for f in meta.txt git-log.txt git-status.txt build_log-tail.md pending-questions.md health.txt quota.txt; do
+	for f in meta.txt git-log.txt git-status.txt build_log-tail.md health.txt quota.txt; do
 		[ -f "$OUT/$f" ] && pass "expected file exists: $f" || fail "missing file: $f"
 	done
+	# pending-questions.md is OPTIONAL: gather.sh:140-143 probes hosts/<host>/,
+	# then the workspace root, then the repo root, and `cp … || true` produces
+	# nothing when all three are absent. Requiring it unconditionally made this
+	# suite non-hermetic — green only on a host that happens to have the file,
+	# red in a clean worktree for behaviour the collector got right. The header
+	# already states the contract: "non-empty when source exists". Asserted BOTH
+	# ways so a genuinely missed copy still fails.
+	_pq_src=""
+	for _c in "$_TG_WS/hosts/$_TG_HOST/pending-questions.md" \
+	          "$_TG_WS/pending-questions.md" \
+	          "$_TG_REPO/pending-questions.md"; do
+		[ -f "$_c" ] && { _pq_src="$_c"; break; }
+	done
+	if [ -n "$_pq_src" ]; then
+		[ -f "$OUT/pending-questions.md" ] \
+			&& pass "pending-questions.md copied (source: ${_pq_src#"$_TG_WS/"})" \
+			|| fail "pending-questions.md MISSING despite a source at $_pq_src"
+	else
+		[ -f "$OUT/pending-questions.md" ] \
+			&& fail "pending-questions.md present but NO source exists — where did it come from?" \
+			|| pass "pending-questions.md absent, correctly: no source in any of the 3 probed locations"
+	fi
 fi
 
 # Test 3: meta.txt contains window + repo
@@ -75,9 +106,7 @@ fi
 # instead silently points the fixture at a different checkout's workspace than
 # the one gather reads — which is exactly what happens when this test runs from
 # a git worktree while SUTANDO_ROOT names the primary checkout.
-_FIX_REPO="${SUTANDO_ROOT:-$PWD}"
-[ -f "$_FIX_REPO/CLAUDE.md" ] || _FIX_REPO="$PWD"
-_WS_FOR_FIXTURE="$(bash "$_FIX_REPO/scripts/sutando-config.sh" workspace)"
+_WS_FOR_FIXTURE="$_TG_WS"
 mkdir -p "$_WS_FOR_FIXTURE/results" 2>/dev/null
 FAKE_RESULT="$_WS_FOR_FIXTURE/results/sutando-test-recent-$(date +%s).txt"
 echo "fake" > "$FAKE_RESULT"
