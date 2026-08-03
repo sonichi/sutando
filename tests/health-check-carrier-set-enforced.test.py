@@ -130,14 +130,19 @@ class CarrierSetProbe(unittest.TestCase):
         # this probe has a second branch. The host's local include replaced the
         # shipped default, so the exclude legitimately matches its own resolved
         # config — nothing is stale — yet the shipped entry never arrives.
+        # Uses `hosts/*/` rather than `state/current-track.md`: this test is about
+        # the MECHANISM (a local include replacing the shipped default), not that
+        # particular path, and the flat anchor now routes to the must-NOT-re-add
+        # branch. Pinning the mechanism to an entry that is safe to re-add keeps
+        # the two concerns from colliding again.
         ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
-                          ["notes/a.md", "state/current-track.md"])
+                          ["notes/a.md", "hosts/somehost/pending-questions.md"])
         self._patch_resolved(["notes/"])                                  # local override
-        self._patch_shipped(["notes/", "state/current-track.md"])          # shipped adds one
+        self._patch_shipped(["notes/", "hosts/*/"])                        # shipped adds one
         r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
         self.assertIsNotNone(r)
         self.assertEqual(r["status"], "fail")
-        self.assertIn("state/current-track.md", r["detail"])
+        self.assertIn("hosts/*/", r["detail"])
         self.assertIn("#2531", r["detail"], "must name the override cause, not just the symptom")
         self.assertNotIn("--force-gitignore", r["detail"],
                          "forcing regenerates from the still-wrong config and looks like it worked")
@@ -270,6 +275,41 @@ class CarrierSetProbe(unittest.TestCase):
         r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
         self.assertIsNotNone(r)
         self.assertEqual(r["status"], "ok", r.get("detail"))
+
+    def test_the_KNOWN_UNSAFE_entry_is_reported_but_never_recommended(self):
+        # qingyun-wu, P1 on e73e2597. The remedy said "add them to the local list"
+        # for EVERY missing shipped entry — including `state/current-track.md`,
+        # which #2534 ships at a flat, SHARED vault path. Following that advice
+        # re-tracks per-host state at a path a peer also writes, which is exactly
+        # the incident that destroyed a peer's 1056-line anchor on 2026-08-03.
+        #
+        # It must still be REPORTED — silently filtering it would hide a real
+        # divergence, which is the failure this whole probe exists to prevent.
+        # What had to go is the instruction, not the information.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**", "state/", "state/current-track.md"],
+                          ["notes/a.md", "state/current-track.md"])
+        self._patch_resolved(["notes/"])                                   # host dropped it
+        self._patch_shipped(["notes/", "state/current-track.md"])          # shipped still has it
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "fail")
+        self.assertIn("state/current-track.md", r["detail"], "must still be reported")
+        self.assertIn("must NOT be re-added", r["detail"])
+        self.assertIn("#2567", r["detail"], "must name why")
+        self.assertNotIn("add them to the local list", r["detail"],
+                         "the data-loss instruction must not accompany this entry")
+
+    def test_a_SAFE_dropped_entry_still_gets_the_add_it_remedy(self):
+        # Over-trigger control: the unsafe carve-out must not swallow the ordinary
+        # #2531 case, which is the reason the dropped branch exists at all.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"], ["notes/a.md", "hosts/h/x.md"])
+        self._patch_resolved(["notes/"])
+        self._patch_shipped(["notes/", "hosts/*/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertIn("hosts/*/", r["detail"])
+        self.assertIn("add them to the local list", r["detail"])
+        self.assertNotIn("must NOT be re-added", r["detail"])
 
     def test_the_probe_is_registered_in_the_run_list(self):
         # A probe nobody calls cannot report anything. This is the assertion

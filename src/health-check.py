@@ -1184,6 +1184,17 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     except (OSError, json.JSONDecodeError, AttributeError):
         dropped = []
 
+    # A shipped entry can be one this host must NOT carry. `state/current-track.md`
+    # is per-host state that #2534 added at a flat, SHARED vault path: two cores write
+    # the same path, and on 2026-08-03 that overwrote a peer's 1056-line anchor.
+    # Telling an operator to re-add it walks them back into that incident, so the
+    # REMEDY is split rather than the entry hidden — silently filtering it would
+    # suppress a real divergence. Delete this list once the host-qualified migration
+    # (#2567/#2568) lands: the flat path stops being shipped and stops appearing here.
+    UNSAFE_TO_READD = ("state/current-track.md",)
+    unsafe = [e for e in dropped if e in UNSAFE_TO_READD]
+    safe = [e for e in dropped if e not in UNSAFE_TO_READD]
+
     if not stale and not dropped and not unmeasured:
         return {"name": name, "status": "ok",
                 "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault"}
@@ -1203,12 +1214,19 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
             f"file is stale and sync refused to regenerate it; fix with "
             f"`bash scripts/sync-workspace.sh --force-gitignore` (diff it first)"
         )
-    if dropped:
+    if safe:
         parts.append(
-            f"{len(dropped)} shipped carrier path(s) are missing from this host's resolved include "
-            f"({', '.join(dropped[:4])}{'…' if len(dropped) > 4 else ''}) — a local "
+            f"{len(safe)} shipped carrier path(s) are missing from this host's resolved include "
+            f"({', '.join(safe[:4])}{'…' if len(safe) > 4 else ''}) — a local "
             f"`vault.sync.include` REPLACES the shipped default (#2531), so upstream additions never "
             f"arrive; add them to the local list"
+        )
+    if unsafe:
+        parts.append(
+            f"{len(unsafe)} shipped carrier path(s) are missing here and must NOT be re-added "
+            f"({', '.join(unsafe)}) — per-host state carried at a flat, SHARED vault path, so "
+            f"re-adding re-creates the cross-host overwrite that destroyed a peer's anchor "
+            f"(#2567). Leave them out until the host-qualified migration lands"
         )
     return {"name": name, "status": "fail", "detail": "; ".join(parts)}
 
