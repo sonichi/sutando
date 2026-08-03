@@ -187,14 +187,18 @@ echo
 
 # --- GNU-style `stat -f` must not break alive_age() (qingyun review, 2026-08-02) --------
 # On GNU/Linux `stat -f` means --file-system: it prints a multi-line dump AND
-# EXITS 0, so a `stat -f ... || stat -c ...` fallback never fires and the dump
-# reaches `$(( ))`. The lock path already guarded this; alive_age() did not.
-# The failure is silent in the dangerous direction: a dead core whose .alive is
-# unreadable could stay in the busy wait instead of taking the dead path.
-echo "8. GNU-style stat -f output → alive_age() reports STALE, does not die"
-WS7="$TMP/ws7"; mkws "$WS7"
-# a dead core: heartbeat present but ancient, status claims running-but-stale
-printf '{"status":"running","step":"gone","ts":%s}\n' "$(( $(date +%s) - 100 ))" > "$WS7/state/core-status.json"
+# EXITS 0. Selecting the fallback on EXIT STATUS therefore never reaches
+# `stat -c` on Linux, and a digit guard alone turns that into a CONFIDENT WRONG
+# answer: every mtime reads unreadable, so alive_age() returns 999999 and EVERY
+# core is classified DEAD.
+#
+# The first version of this case asserted only "does not crash / does not hang".
+# A dead-reporting alive_age() satisfies all of that, so the case passed on macOS
+# while CI went red. The assertion that matters is that a FRESH heartbeat is
+# still read as FRESH under GNU-shaped stat — correctness, not absence of noise.
+echo "8. GNU-style stat -f: a FRESH .alive must still read fresh (not DEAD)"
+WS7="$TMP/ws7"; mkws "$WS7"                       # mkws touches a live .alive
+printf '{"status":"running","step":"busy","ts":%s}\n' "$(date +%s)" > "$WS7/state/core-status.json"
 FAKEBIN="$TMP/fakebin7"; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/stat" <<'STATEOF'
 #!/bin/bash
@@ -207,15 +211,18 @@ if [ "${1:-}" = "-c" ]; then exec /usr/bin/stat -f %m "${3:-}"; fi
 exec /usr/bin/stat "$@"
 STATEOF
 chmod +x "$FAKEBIN/stat"
-start=$(date +%s)
-out="$(PATH="$FAKEBIN:$PATH" GR_WS="$WS7" GR_SYNC_CMD="true" GR_POLL_S=1 GR_STATUS_TTL_S=5 bash "$GR" --dry-run 2>&1)"; rc=$?
-took=$(( $(date +%s) - start ))
-[ "$rc" = 0 ] && say ok "exit 0 under GNU-style stat" || say FAIL "exit 0 under GNU-style stat (got $rc): $out"
+out="$(PATH="$FAKEBIN:$PATH" GR_WS="$WS7" GR_SYNC_CMD="true" GR_POLL_S=1 GR_STATUS_TTL_S=30 \
+       GR_BUSY_MAX_S=3 bash "$GR" --dry-run 2>&1)"; rc=$?
+# THE load-bearing assertion: the heartbeat is seconds old, so the run must not
+# declare the core dead. Pre-fix (BSD-only) and mid-fix (digit-guard-only) both
+# fail here; only output-shape selection passes.
+echo "$out" | grep -q "core is DEAD" \
+  && say FAIL "fresh .alive must NOT read as DEAD under GNU-shaped stat: $out" \
+  || say ok "fresh .alive still reads fresh under GNU-shaped stat"
 echo "$out" | grep -qiE 'integer expression|unbound variable|File:' \
   && say FAIL "no arithmetic/unbound diagnostic leaked: $out" \
   || say ok "no arithmetic/unbound diagnostic"
-[ "$took" -le 10 ] && say ok "did not hang in the busy wait (${took}s)" || say FAIL "did not hang (took ${took}s)"
-echo "$out" | grep -q "DRY-RUN — would exec" && say ok "still reached the restart decision" || say FAIL "still reached the restart decision: $out"
+[ "$rc" = 0 ] && say ok "exit 0 under GNU-style stat" || say FAIL "exit 0 under GNU-style stat (got $rc): $out"
 
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"

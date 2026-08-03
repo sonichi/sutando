@@ -73,21 +73,25 @@ mkdir -p "$WS/state/locks"
 # A holder that died before its trap ran would wedge restarts forever, so an
 # old lock is reapable — same liveness reasoning as workspace_lock.py, which
 # keys on freshness rather than pid (pids recycle; a hung holder should lose it).
-mtime_of() {  # epoch mtime, or EMPTY if unreadable/nonnumeric
-  # `stat -f %m` is BSD/macOS; on GNU/Linux `-f` means --file-system and prints
-  # a multi-line dump with exit 0, so the `||` fallback never fires and the dump
-  # reaches `$(( ))`. The digit guard is the load-bearing part: ANY unexpected
-  # output becomes empty so every caller takes its own explicit failure branch
-  # instead of dying in arithmetic under `set -euo pipefail`.
+mtime_of() {  # epoch mtime, or EMPTY if no variant yields a numeric answer
+  # `stat -f %m` is BSD/macOS; `stat -c %Y` is GNU. The trap is that GNU's `-f`
+  # means --file-system: it prints a multi-line dump and EXITS 0, so a
+  # `stat -f ... || stat -c ...` chain never reaches the fallback on Linux.
+  # Selecting on EXIT STATUS is therefore wrong; select on the OUTPUT being
+  # all-digits and try the next variant otherwise.
   # Callers choose their OWN fail-safe direction — they are opposite here:
-  #   lock age  -> unreadable means assume LIVE and defer (never kill blind)
-  #   .alive age -> unreadable means assume STALE (never let a dead core hide)
+  #   lock age   unreadable -> assume LIVE and defer (never kill blind)
+  #   .alive age unreadable -> assume STALE (never let a dead core hide)
   local _ts
-  _ts="$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true)"
-  case "$_ts" in
-    ''|*[!0-9]*) _ts="" ;;
-  esac
-  printf '%s' "$_ts"
+  for _fmt in "-f %m" "-c %Y"; do
+    # shellcheck disable=SC2086 -- _fmt is two intentional argv words
+    _ts="$(stat $_fmt "$1" 2>/dev/null || true)"
+    case "$_ts" in
+      ''|*[!0-9]*) ;;                       # not a bare epoch — try the next variant
+      *) printf '%s' "$_ts"; return 0 ;;
+    esac
+  done
+  printf ''
 }
 
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
