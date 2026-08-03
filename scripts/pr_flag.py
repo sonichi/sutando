@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -50,10 +51,35 @@ def _ci_state(rollup) -> str:
     return "green"
 
 
-def raw_state(prs: list, owner_login: str) -> list:
+STAND_RE = re.compile(r"^\s*Stand:\s*(.+?)\s*$", re.M)
+
+
+def _stands(pr: dict) -> list:
+    """Distinct `Stand:` trailer values across a PR's commits, sorted.
+
+    This is the ONLY signal that separates the agents. Several agents commit
+    through the SAME GitHub account, so `author.login` cannot tell them apart --
+    it collapses every one of them (and the human whose account it is) into one
+    identity.
+    """
+    seen = set()
+    for c in pr.get("commits") or []:
+        seen.update(m.strip() for m in STAND_RE.findall(c.get("messageBody") or "") if m.strip())
+    return sorted(seen)
+
+
+def _principal(stands: list) -> str:
+    """One label for who authored the PR: the stand, "joint", or "unattributed"."""
+    if not stands:
+        return "unattributed"
+    return stands[0] if len(stands) == 1 else "joint"
+
+
+def raw_state(prs: list, owner_login: str, stand: str = None) -> list:
     """Objective per-PR state — NO judgement. Sorted by number.
 
-    Each record: number, title, author, is_mine, base, head, ci, mergeable,
+    Each record: number, title, author, stands, principal, is_mine, base, head,
+    ci, mergeable,
     review, approvals, approvals_standing. These are facts the agent then judges
     (is it ready? does the owner need it? caveats?).
 
@@ -99,6 +125,7 @@ def raw_state(prs: list, owner_login: str) -> list:
         if pr.get("isDraft"):
             continue
         author = (pr.get("author") or {}).get("login", "")
+        stands = _stands(pr)
         head = pr.get("headRefOid") or ""
         # Two passes over the same reviews, differing ONLY in whether a review at
         # an older commit is admitted. Kept as one loop with a flag so the two
@@ -127,7 +154,15 @@ def raw_state(prs: list, owner_login: str) -> list:
             "number": pr.get("number"),
             "title": pr.get("title", ""),
             "author": author,
-            "is_mine": author == owner_login,
+            "stands": stands,
+            "principal": _principal(stands),
+            # `is_mine` is trailer-derived, NOT `author == owner_login`. The old
+            # form was true for EVERY agent sharing the account, so a field named
+            # "mine" actually answered "is this the shared login?" -- which read
+            # as "the owner's PR" to one consumer and "my PR" to another, and was
+            # wrong for both. None when no --stand is supplied: unknown beats a
+            # confident guess.
+            "is_mine": (stand in stands) if stand else None,
             "base": pr.get("baseRefName") or "",
             "head": head,
             "ci": _ci_state(pr.get("statusCheckRollup")),
@@ -150,7 +185,7 @@ def state_hash(state: list) -> str:
     OLDER commit moves the enforced gate without moving `approvals`, so before
     this it did not refire and the agent was never woken for a PR that had just
     become mergeable."""
-    key = [[s["number"], s["is_mine"], s["base"], s["head"], s["ci"], s["mergeable"],
+    key = [[s["number"], s["principal"], s["base"], s["head"], s["ci"], s["mergeable"],
             s["review"], s["approvals"], s["approvals_standing"]]
            for s in state]
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
@@ -178,16 +213,56 @@ def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — sub
         return []
 
 
+
+_STANDS_Q = """query($owner:String!,$name:String!,$n:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$n){ commits(first:100){ nodes{ commit{ messageBody } } } }
+  }
+}"""
+
+
+def _attach_commits(repo: str, prs: list) -> list:  # pragma: no cover - gh glue
+    """Populate each PR's `commits` with message bodies only.
+
+    Deliberately NOT folded into the `gh pr list --json` call: asking that query
+    for `commits` also pulls each commit's `authors` connection, and at
+    --limit 1000 GitHub rejects the whole request ("requesting up to 1,000,000
+    possible nodes which exceeds the maximum limit of 500,000") -- which returns
+    ZERO PRs, not a partial answer. One narrow query per PR is the cheap,
+    total-failure-free shape.
+    """
+    owner, _, name = repo.partition("/")
+    for pr in prs:
+        num = pr.get("number")
+        if num is None:
+            continue
+        res = subprocess.run(
+            ["gh", "api", "graphql", "-f", "query=" + _STANDS_Q,
+             "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"n={num}"],
+            capture_output=True, text=True, timeout=60)
+        if res.returncode != 0:
+            print(f"pr-flag: stand fetch failed for #{num}: {res.stderr[:120]}", file=sys.stderr)
+            pr["commits"] = []
+            continue
+        try:
+            nodes = json.loads(res.stdout)["data"]["repository"]["pullRequest"]["commits"]["nodes"]
+            pr["commits"] = [{"messageBody": n["commit"].get("messageBody") or ""} for n in nodes]
+        except (KeyError, TypeError, json.JSONDecodeError):
+            pr["commits"] = []
+    return prs
+
 def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic covered in tests
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="sonichi/sutando")
-    ap.add_argument("--owner", default="sonichi", help="GH login whose authored PRs are 'mine'")
+    ap.add_argument("--owner", default="sonichi", help="GH login whose PRs to fetch (shared by several agents)")
+    ap.add_argument("--stand", default=None, help="this agent's Stand trailer; sets is_mine (null if omitted)")
     ap.add_argument("--emit", action="store_true", help="print raw state JSON when it changed, else NO_CHANGE")
     ap.add_argument("--force", action="store_true", help="always emit (ignore dedup)")
     ap.add_argument("--state-file", default=None)
     args = ap.parse_args()
 
-    state = raw_state(_fetch_prs(args.repo, args.owner), args.owner)
+    state = raw_state(_attach_commits(args.repo, _fetch_prs(args.repo, args.owner)),
+                      args.owner, args.stand)
     h = state_hash(state)
 
     # dedup: resolve the stored-hash file the same way every reader does

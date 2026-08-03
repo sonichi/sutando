@@ -25,7 +25,7 @@ spec.loader.exec_module(pf)
 
 def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=False,
         title="t", head=None, approvers=(), stale_approvers=(), base="main",
-        extra_reviews=()):
+        extra_reviews=(), commit_bodies=None):
     head = head or f"head-{number}"
     rollup = []
     if ci == "green":
@@ -36,6 +36,7 @@ def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=Fals
         rollup = [{"status": "COMPLETED", "conclusion": "FAILURE", "name": "x"}]
     return {
         "number": number, "title": title, "author": {"login": author},
+        "commits": [{"messageBody": b} for b in (commit_bodies or [])],
         "reviewDecision": review, "statusCheckRollup": rollup,
         "headRefOid": head, "mergeable": mergeable, "isDraft": draft,
         "baseRefName": base,
@@ -82,17 +83,19 @@ def main() -> int:
     # objective fields, NO judgement fields (no court/why/ready/held)
     assert set(got) == {10, 11, 12, 13}, "draft excluded, rest present"
     for s in st:
-        assert set(s) == {"number", "title", "author", "is_mine", "base", "head", "ci",
-                          "mergeable", "review", "approvals", "approvals_standing"}, s
+        assert set(s) == {"number", "title", "author", "stands", "principal", "is_mine",
+                          "base", "head", "ci", "mergeable", "review", "approvals",
+                          "approvals_standing"}, s
         assert "court" not in s and "why" not in s and "ready" not in s, "script must emit NO judgement: " + str(s)
     print("  ok  raw_state emits objective fields only — no judgement")
 
-    assert got[10]["is_mine"] and got[10]["ci"] == "green" and got[10]["review"] == "none"
-    assert got[11]["is_mine"] and got[11]["ci"] == "pending"
-    assert not got[12]["is_mine"] and got[12]["approvals"] == 2 and got[12]["review"] == "REVIEW_REQUIRED"
+    # No --stand supplied -> is_mine is None everywhere (unknown, not a guess).
+    assert got[10]["is_mine"] is None and got[10]["ci"] == "green" and got[10]["review"] == "none"
+    assert got[11]["is_mine"] is None and got[11]["ci"] == "pending"
+    assert got[12]["is_mine"] is None and got[12]["approvals"] == 2 and got[12]["review"] == "REVIEW_REQUIRED"
     # distinct approvers only: qingyun approving twice counts once
     assert got[13]["approvals"] == 1 and got[13]["ci"] == "failing"
-    print("  ok  is_mine / ci / review / distinct-approvals are correct")
+    print("  ok  is_mine is None without --stand; ci / review / distinct-approvals correct")
 
     # sorted by number
     assert [s["number"] for s in st] == sorted(s["number"] for s in st)
@@ -219,8 +222,9 @@ def main() -> int:
     # map under "" and silently revoke a real approval.
     # ...and the record is still COMPLETE: a malformed node must not abort or
     # truncate state collection, which is the "not fatal" half of the claim.
-    assert set(got_bad) == {"number", "title", "author", "is_mine", "base", "head", "ci",
-                            "mergeable", "review", "approvals", "approvals_standing"}, got_bad
+    assert set(got_bad) == {"number", "title", "author", "stands", "principal", "is_mine",
+                            "base", "head", "ci", "mergeable", "review", "approvals",
+                            "approvals_standing"}, got_bad
     # Control: the same fixture with a REAL login does move the counts, so the
     # assertions above are about the missing login and not about the fixture.
     named = _pr(41, "peer", approvers=["a"], extra_reviews=[
@@ -235,6 +239,46 @@ def main() -> int:
     assert pf.raw_state([], OWNER) == []
     assert pf.state_hash([]) == pf.state_hash([])
     print("  ok  empty repo → empty state")
+
+
+    # ---- Stand-trailer principal ------------------------------------------
+    # THE REGRESSION: several agents commit through ONE GitHub account, so
+    # `author.login` cannot separate them. Before this, `is_mine` was
+    # `author == owner_login` -> True for every one of these three PRs, which is
+    # what made a digest call another agent's work "yours".
+    PRO, MINI = "Echo Act IV Pro", "Echo Act IV Mini"
+    shared = [
+        _pr(20, OWNER, commit_bodies=["body\n\nStand: " + PRO]),
+        _pr(21, OWNER, commit_bodies=["body\n\nStand: " + MINI]),
+        _pr(22, OWNER, commit_bodies=["a\n\nStand: " + PRO, "b\n\nStand: " + MINI]),
+        _pr(23, OWNER, commit_bodies=["no trailer here"]),
+    ]
+    g = {x["number"]: x for x in pf.raw_state(shared, OWNER, stand=PRO)}
+    assert g[20]["principal"] == PRO and g[20]["is_mine"] is True, g[20]
+    assert g[21]["principal"] == MINI and g[21]["is_mine"] is False, g[21]
+    assert g[22]["principal"] == "joint" and g[22]["stands"] == [MINI, PRO], g[22]
+    assert g[22]["is_mine"] is True, "a joint PR IS partly mine"
+    assert g[23]["principal"] == "unattributed" and g[23]["is_mine"] is False, g[23]
+    # every one of them shares the SAME author login -- that is the whole point
+    assert {x["author"] for x in g.values()} == {OWNER}
+    print("  ok  same login, different Stand trailers -> distinct principals")
+
+    # viewed as Mini, ownership flips -- proving is_mine tracks the trailer,
+    # not the account
+    m = {x["number"]: x for x in pf.raw_state(shared, OWNER, stand=MINI)}
+    assert m[20]["is_mine"] is False and m[21]["is_mine"] is True
+    print("  ok  is_mine follows the stand, not the shared account")
+
+    # trailers dedup across commits and sort
+    dup = _pr(24, OWNER, commit_bodies=["x\n\nStand: " + PRO, "y\n\nStand: " + PRO])
+    assert pf.raw_state([dup], OWNER)[0]["stands"] == [PRO]
+    print("  ok  repeated trailers dedup to one stand")
+
+    # identity moves the dedup hash: same objective state, different author
+    a = _pr(30, OWNER, commit_bodies=["m\n\nStand: " + PRO])
+    b = _pr(30, OWNER, commit_bodies=["m\n\nStand: " + MINI])
+    assert pf.state_hash(pf.raw_state([a], OWNER)) != pf.state_hash(pf.raw_state([b], OWNER))
+    print("  ok  a change of principal refires the digest")
 
     print("\nAll pr-flag core cases pass.")
     return 0
