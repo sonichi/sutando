@@ -1072,11 +1072,40 @@ _resolve_conflicts_keep_ours() {
     fi
 }
 
+# Pre-pull anchor migration (#2567). `state/current-track.md` is per-host state
+# that used to be carried at a shared flat path; that path is removed from the
+# carrier set in this change. On any vault where the file is still TRACKED,
+# `_enforce_carrier_set_pre` will untrack it and COMMIT that deletion — and a
+# peer pulls the deletion before its own enforcement ever runs (the pull half of
+# `cmd_default_bidirectional` precedes the push half). Without this helper that
+# peer loses its anchor.
+#
+# Same-commit migration on the PUSHING host does not fix it: that host can only
+# add ITS OWN `hosts/<label>/current-track.md`, which is not the puller's anchor.
+# The guarantee therefore has to be local and to run BEFORE the fetch/merge —
+# each host rescues its own copy. Same placement and contract as
+# `_migrate_flat_branch` above. Idempotent: a no-op once the per-host file
+# exists, so it costs one `[ -e ]` per tick thereafter.
+_migrate_flat_anchor() {
+    local _flat _dest
+    _flat="$WORKSPACE_DIR/state/current-track.md"
+    _dest="$WORKSPACE_DIR/hosts/$(_host)/current-track.md"
+    [ -f "$_flat" ] || return 0
+    [ -e "$_dest" ] && return 0
+    mkdir -p "$(dirname "$_dest")" || return 0
+    cp "$_flat" "$_dest" || return 0
+    log "_migrate_flat_anchor: copied state/current-track.md -> hosts/$(_host)/current-track.md before pull (#2567)"
+    echo "sync-workspace: migrated the per-host anchor to hosts/$(_host)/current-track.md (was at the shared flat path; #2567)" >&2
+}
+
 _pull_only_impl() {
     cd "$WORKSPACE_DIR" || die "pull-only: cannot cd to $WORKSPACE_DIR"
     [ -d ".git" ] || die "pull-only: $WORKSPACE_DIR is not a git repo; run --init first"
 
     _assert_sync_initialized "pull-only"
+
+    # Rescue this host's anchor BEFORE any peer deletion can merge in (#2567).
+    _migrate_flat_anchor
 
     if [ "$DRY_RUN" = "1" ]; then
         echo "DRY-RUN: would fetch + merge peer branches" >&2
