@@ -61,11 +61,23 @@ resolver, not part of #2197.
 
 ## Capability vocabulary
 
-Capabilities name *functions*, not providers-and-keys: `gemini-voice`,
-`gemini-text` today; `phone-tts`, `browser-llm`, … as consumers migrate. A
-capability may be satisfied by different providers over time without touching
-consumers — that is the point of the seam. New capabilities are added to the
-resolver's fallback table, not scattered as new env reads.
+A capability names a *function* — a role a consumer needs — decoupling the
+consumer from the credential and, ultimately, the provider. The **shipped**
+decoupling is from the *key*: a consumer asks for `gemini-voice` and never reads
+an env var or names a file. Today's canonical IDs are still **provider-branded
+for continuity** with the existing env chain (`gemini-voice` / `gemini-text`
+mirror `GEMINI_VOICE_API_KEY` / `GEMINI_API_KEY`), so a provider swap today would
+still change the ID — provider *neutrality* is a follow-up, not a current
+property of the vocabulary.
+
+The migration contract that makes a provider swap consumer-invisible: introduce
+role IDs (`voice-llm`, `text-llm`) and register the current provider-branded IDs
+as **aliases** to the same role in the resolver's fallback table, so both resolve
+identically and consumers migrate at their own pace. Until those aliases land,
+the portability claim is scoped to "same provider, different tier/key"
+(managed↔BYO) — which the `source` field already makes observable. New
+capabilities are added to the resolver's fallback table, not scattered as new
+env reads.
 
 ## Interaction with G7 (vault)
 
