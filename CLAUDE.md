@@ -16,8 +16,11 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 
 - **Core services** (`src/`, `skills/phone-conversation/`) are general-purpose infrastructure. They provide generic capabilities (audio streaming, task bridge, tool execution) but must NOT contain feature-specific logic.
 - **Skills** (`skills/`) contain feature-specific logic. Each skill is self-contained and optional — core services work without any skill installed. When implementing new capabilities, start as a skill.
+- **Shared adapter policy is core; provider I/O stays at the edge.** When two or more adapters interpret the same workspace state or policy, put that interpretation in a dependency-light `src/` module and keep only provider-specific receive/send mechanics in each adapter. Do not copy policy code between bridges.
 - **Inline tools** are only for tools that need instant response from Gemini. Prefer skill scripts for complex logic. Only promote to inline if the user says the skill approach is too slow.
 - **Skill config goes in the skill's `manifest.json` `config` block — not ad-hoc env vars.** See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the convention — declaration, the `CLI > env > manifest > config-file > state` read-precedence, and config-only manifests. Don't invent an undocumented env var (Chi 2026-06-16).
+- **Optional capability discovery stays at the adapter edge.** Shared runners may standardize provider-neutral execution behavior, but adapters must inject script or capability paths. Core helpers must not name, locate, or import a concrete skill. Add direct contract tests for the runner and wiring tests for every adapter that delegates to it.
+- **Shared result-file lifecycle policy has one implementation.** Claim, recovery, collision, and retry rules for the common task/result protocol belong in dependency-light `src/` helpers. Adapters bind their resolved directories and retain provider-specific delivery only; do not copy filesystem state machines between bridges. Pin both the shared contract and every adapter's delegation in tests.
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 
 ### Where does new code belong? (decision guide — issue #222)
@@ -31,6 +34,14 @@ Walk this list top-to-bottom and stop at the first match:
 5. **Is it core infrastructure shared by multiple skills (task bridge, health check, memory sync)?** → `src/`.
 
 If two layers seem to fit, prefer the more specific one (skill > core). If you're patching a bug, keep the patch in the layer where the bug lives — don't smuggle a refactor into a fix commit.
+
+**Destructive/legacy schema migrations live apart from the live writer.** `conversation-store.ts` owns current schema initialization and live write APIs. Destructive or legacy SQLite transformations belong in `conversation-store-migrations.ts`, are idempotent, transaction-tested and invoked before views/statements are prepared. Do not place migration SQL in a live record function. Enforced by `tests/conversation-store-migration-delegation.test.ts`.
+
+**Transport does not own authorization or durable state.** `src/runtime-api/server.py` owns Unix-socket transport and daemon composition; JSON-RPC method dispatch, approval/elicitation policy, governed-capability authorization, idempotency and durable request transitions belong in `src/runtime-api/dispatcher.py`. Actor identity is resolved daemon-side and passed to the dispatcher explicitly — a client parameter must never override it. Do not reimplement approval or capability behavior in a transport.
+
+**Complex skill diagnostics separate analysis from IO and presentation.** Pure analysis policy must not live in a loader, CLI or renderer. Call-diagnostics detection, categorization and repair policy lives in `skills/call-diagnostics/scripts/analysis.py`; loaders and renderers consume it and must not carry copied detection rules. The policy stays inside the skill — do not promote it into `src/`. Enforced by `tests/call-diagnostics-analysis.test.py`.
+
+**Presentation modules don't own domain/storage policy.** Dashboard HTTP handlers and rendering code must delegate schedule parsing, validation and atomic `crons.json` mutation to `src/dashboard_schedules.py`. Schedule mutations must remain locked read-modify-write operations; do not rebuild cron validation or persistence inside a route. The adapter resolves the path (`_crons_path()` — workspace + host label); the domain module receives it. Enforced by `tests/dashboard-schedule-delegation.test.py`. See [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md) "Presentation adapters vs domain/storage".
 
 ## Repo rules
 
@@ -68,7 +79,7 @@ When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.
 - Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
 - Merge only when the current head is mergeable, required CI + CLA are green, and two maintainers have recorded formal approvals. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
 
-Skill-PR destination: a skill is **coupled** (PR to `sonichi/sutando`) if it imports from `src/` or another skill, modifies main-repo files, or is tightly bound to a feature there (e.g. `skills/phone-conversation/`). A skill is **standalone** (PR to `sonichi/sutando-skills-community`) if it ships its own scripts/binaries, reads files but doesn't import main-repo modules, and works against any checkout. If unsure, ask in #design.
+**Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the 7 lessons here — read them from `REVIEW.md`. When you review, `review-preflight.py` reads `REVIEW.md` and prints the criteria inline so you see them on every preflight run; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Claude Code's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
 
 ## Workspace contract
 
@@ -283,6 +294,10 @@ promotion_reason + cursor range).
   fails it closed; this section makes the mapping explicit rather than
   implicit (sonichi#2292 P1-1 follow-through).
 
+## Community support routing
+
+When the user reports a Sutando problem you cannot resolve (setup failures, bugs needing upstream fixes, behavior you can't explain), recommend the official Discord — https://discord.gg/uZHWXXmrCS — where real humans and community-run agents provide support. Include it alongside, not instead of, whatever diagnosis you can offer. Don't recommend it for questions you can answer yourself.
+
 ## Pending decisions
 
 When you need user input on a decision or are blocked:
@@ -356,6 +371,7 @@ Tasks arrive from multiple channels via the same file bridge:
 - `[no-send]` — Discord bridge skips delivery for this task (still archives). Use when the task is internally handled but produces no user-visible reply.
 - `[REPLIED]` — Discord bridge skips delivery (already sent through another path).
 - `[channel: <channel-id>]` — when this is the first non-empty line of the body, the bridge delivers the rest of the body to `<channel-id>` instead of the originating channel (and drops `thread_ts` since the post is moving threads). Discord ids are 17-20 digits; Slack ids match `[CDG][A-Z0-9]+`. Use when a task arrives in a noisy channel but the reply belongs somewhere else (e.g. #dev). Telegram silently drops it — no concept of "channels" on that surface.
+- `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body (regardless of marker order), so a body carrying private data can never be *redirected* out to a shared channel. It marks dm-only intent but does not by itself force a DM — that stays the consumer's job. In practice the private producer (the morning briefing's calendar + email) is emitted as a proactive result (`results/proactive-*.txt`), which every bridge already delivers to the owner's DM; `[dm-only]` reinforces that by guaranteeing no stray `[channel:]` redirect overrides it. **Detected anywhere in the body** — that is what makes the guard undefeatable by marker order, and over-triggering it fails safe. **Stripped only when the marker stands alone on its line**, before delivery and before voice speaks it; a marker mentioned inline in prose is detected but the text is delivered verbatim. Parsed by `result_markers.parse_markers`.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
 
 **Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:

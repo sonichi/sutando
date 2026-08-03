@@ -41,12 +41,85 @@ export SUTANDO_ROOT="$REPO"
 # such hosts (web-client outage 2026-07-17).
 _APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
 [ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
-_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin)"
+# `|| true`: tsx-bin prints nothing AND returns nonzero on a bare bundled
+# runtime (no tsx anywhere) — under set -e that exited startup at this line
+# before the bundled-mode gate could run (Codex blocking finding #2).
+_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin || true)"
 run_tsx() {
   if [ -n "$_TSX_BIN" ]; then
     "$_TSX_BIN" "$@"
   else
     npx tsx "$@"
+  fi
+}
+
+# G1.5 node-bundle (owner-adopted design + owner review 2026-07-19).
+# Bundled and dev are MUTUALLY EXCLUSIVE modes, not a preference (P1-2):
+#   BUNDLED = the desktop-managed runtime is present — SUTANDO_NODE exported
+#   (fail-closed if invalid, see node-bin) OR the bundled runtime discovered
+#   at its canonical home (app-node-dir; covers launchd jobs without the env
+#   var) — AND dist artifacts are shipped. Services run dist/<name>.js under
+#   the pinned node; a missing artifact is an explicit PACKAGING ERROR, never
+#   a tsx fallback (tsx/npm/node_modules deliberately don't exist here).
+#   DEV = everything else; tsx-over-src exactly as before, so a stale dist/
+#   can never shadow live src edits.
+_NODE_BIN="$(bash "$REPO/scripts/sutando-config.sh" node-bin)" || {
+  echo "✗ SUTANDO_NODE is set but invalid — desktop packaging error; refusing PATH fallback (G1.5 fail-closed)"
+  exit 1
+}
+# At-rest discovery is scoped to the PACKAGED ENGINE COPY ONLY: the checkout
+# must itself live inside the engine root that owns the runtime
+# (<engine-root>/runtime/node/bin + <engine-root>/.../this repo). A dev
+# checkout on a machine that merely HAS the app installed must stay dev even
+# after `npm run build:bundle` — stale dist can never shadow live src
+# (Codex finding #3).
+_APP_ENGINE_ROOT="${_APP_NODE_DIR%/node/bin}"
+_APP_ENGINE_ROOT="${_APP_ENGINE_ROOT%/runtime}"
+# Mode comes from the MANAGED-RUNTIME SIGNAL ALONE (Codex re-review F2):
+# explicit SUTANDO_NODE, or the at-rest runtime discovered while running AS
+# the packaged engine copy. Artifact presence is then VALIDATED separately —
+# a managed runtime with missing dist is a packaging error that fails closed,
+# never a silent slide into dev/npm/tsx.
+BUNDLED_MODE=0
+if [ -n "${SUTANDO_NODE:-}" ]; then
+  BUNDLED_MODE=1
+elif [ -x "$_APP_NODE_DIR/node" ] && [ "${REPO#"$_APP_ENGINE_ROOT"/}" != "$REPO" ]; then
+  BUNDLED_MODE=1
+fi
+if [ "$BUNDLED_MODE" = "1" ]; then
+  # Validate EVERY artifact of the build:bundle contract, not a representative
+  # one (external review on #2182): a missing voice/proxy/etc artifact would
+  # otherwise fail inside a background job while boot still prints ✓.
+  _MISSING_DIST=""
+  # web-voice-transport.browser is the browser-side artifact the web UI loads
+  # for voice; it is built by the same build:bundle contract but is NOT a node
+  # service, so it has no run_node_service entry to catch its absence later.
+  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers web-voice-transport.browser; do
+    [ -f "$REPO/dist/$_artifact.js" ] || _MISSING_DIST="$_MISSING_DIST $_artifact.js"
+  done
+  if [ -n "$_MISSING_DIST" ]; then
+    echo "✗ bundled mode: required dist artifacts missing ($REPO/dist:$_MISSING_DIST) — desktop packaging error; refusing dev fallback (G1.5 fail-closed)"
+    exit 1
+  fi
+fi
+if [ -n "${SUTANDO_NODE:-}" ]; then
+  _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
+  case ":$PATH:" in *":$_SUTANDO_NODE_DIR:"*) ;; *) PATH="$_SUTANDO_NODE_DIR:$PATH"; export PATH ;; esac
+fi
+run_node_service() {
+  # $1 = dist basename (build-bundle artifact), $2 = ts entry (as run_tsx
+  # expects it today — relative or absolute), rest = service args.
+  _rns_dist="$REPO/dist/$1.js"
+  _rns_entry="$2"
+  shift 2
+  if [ "$BUNDLED_MODE" = "1" ]; then
+    if [ ! -f "$_rns_dist" ]; then
+      echo "  ✗ bundled mode: dist artifact missing: $_rns_dist (packaging error — refusing tsx fallback)"
+      return 1
+    fi
+    "$_NODE_BIN" "$_rns_dist" "$@"
+  else
+    run_tsx "$_rns_entry" "$@"
   fi
 }
 
@@ -167,6 +240,16 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
     exit 1
   fi
   rm -f "$_ccd_err"
+fi
+
+# Boot gate (#2396): verify the resolved CLAUDE_CONFIG_DIR can boot the CLI
+# authenticated BEFORE any service launches. A logged-out CLI (locked keychain
+# on SSH boots, fresh config dir) otherwise yields a half-up core — tmux +
+# bridges alive, CLI parked at /login, processing nothing (2026-07-30 outage).
+# The gate fails loud (stderr + notification + pending-questions + proactive
+# DM file) and aborts; SUTANDO_SKIP_AUTH_PREFLIGHT=1 is the escape hatch.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  bash "$REPO/src/auth-preflight-gate.sh" "$CLAUDE_CONFIG_DIR" || exit $?
 fi
 
 # Git committer attribution: REMOVED (2026-05-21). This block used to set
@@ -363,8 +446,18 @@ echo ""
 # things piece by piece.
 bash "$REPO/src/init.sh" --preflight | tail -1
 
-# Install dependencies if needed
-if [ ! -d node_modules ]; then
+# Bundled mode (G1.5): BUNDLED_MODE is computed ONCE next to
+# run_node_service (single source of truth — owner review P1-2: app-node-dir
+# discovery counts as bundled too, not just the env var). The npm bootstrap
+# + node/npx prereq blocks below are gated on it because a bundled runtime
+# deliberately has NO npm/npx/node_modules (Codex finding #1).
+if [ "$BUNDLED_MODE" = "1" ]; then
+  echo "  ✓ bundled mode (pinned runtime + dist artifacts) — skipping dependency bootstrap"
+fi
+
+# Install dependencies if needed (dev/source mode only — bundled installs
+# run dist artifacts under the pinned node and need no node_modules).
+if [ "$BUNDLED_MODE" != "1" ] && [ ! -d node_modules ]; then
   if command -v npm > /dev/null 2>&1 && npm install 2>/dev/null; then
     echo "  ✓ Dependencies installed (npm)"
   elif command -v pnpm > /dev/null 2>&1 && pnpm install 2>/dev/null; then
@@ -381,9 +474,13 @@ fi
 
 # Check CLI prerequisites. node/npx/python3, the selected core runtime, and
 # fswatch are checked here because they are not needed for init.sh bootstrap.
+# Bundled mode: node is $SUTANDO_NODE (its dir already heads PATH) and npx is
+# intentionally absent (bare-node runtime, dist-first services) — skip both.
 missing=0
-if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
-if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
+if [ "$BUNDLED_MODE" != "1" ]; then
+  if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
+  if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
+fi
 if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; missing=1; fi
 core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)"
 if ! command -v "$core_runtime" > /dev/null 2>&1; then
@@ -564,10 +661,18 @@ fi
 _PROXY_LABEL="com.sutando.credential-proxy"
 _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
 if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
-  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1; then
-    echo "  ✓ credential proxy (launchd-supervised, already loaded)"
+  # Upgrade path (Codex re-review F1): an already-loaded job may carry a plist
+  # generated BEFORE SUTANDO_NODE existed (or with a different runtime) — a
+  # KeepAlive restart would then lose the pinned runtime. Compare the loaded
+  # plist's managed runtime to the current one and reinstall on drift (the
+  # installer bootout_if_loaded+bootstraps, so re-running over a live job is
+  # safe).
+  _PROXY_PLIST_DEST="$HOME/Library/LaunchAgents/$_PROXY_LABEL.plist"
+  _PROXY_PLIST_NODE="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:SUTANDO_NODE" "$_PROXY_PLIST_DEST" 2>/dev/null || true)"
+  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1 && [ "$_PROXY_PLIST_NODE" = "${SUTANDO_NODE:-}" ]; then
+    echo "  ✓ credential proxy (launchd-supervised, already loaded, runtime current)"
   else
-    echo "  Installing launchd-supervised credential proxy..."
+    echo "  Installing launchd-supervised credential proxy (fresh or runtime drift)..."
     if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
       # Wait for the supervised proxy to bind before the legacy-launch guard.
       for _ in $(seq 1 10); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
@@ -579,8 +684,16 @@ if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ];
 fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
-  _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
-  run_tsx "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
+  # Same dist-only contract as the wrapper and the installer: a bundled host
+  # ships dist/ and has no quota-tracker skill dir, so resolving the TS source
+  # here would hand run_node_service a path that does not exist and leave the
+  # host with no proxy at all ("Claude will connect directly").
+  if [ "$BUNDLED_MODE" = "1" ]; then
+    _PROXY_SCRIPT="$REPO/dist/credential-proxy.js"
+  else
+    _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+  fi
+  run_node_service credential-proxy "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"
@@ -593,32 +706,42 @@ else
   export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
 
-# 0b. Obs collector (OPTIONAL — opt-in via SUTANDO_OBS_COLLECTOR=1).
-# The single, source-agnostic local collector: it receives Claude Code hooks
-# (and, later, voice / filewatcher / bridge events) on /ingest/<source>,
-# normalizes them into the one event schema, and writes the durable JSONL floor
-# at <workspace>/logs/events-*.jsonl (the visualizer tails that). Off by default
-# — it's an observability/dev tool, not required for the agent to run.
-#
-# When enabled we also point the core's hooks at it (SUTANDO_OBS_ENDPOINT) UNLESS
-# an endpoint is already set — e.g. a remote upstream collector — so the "always
-# set hooks, only export when told where" contract still holds.
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+# 0b. Local usage collector. Token/cost metrics are on by default so dashboard
+# usage panels work out of the box; plaintext prompt/tool hooks retain their
+# previous explicit SUTANDO_OBS_COLLECTOR=1 opt-in. Set the flag to 0 to disable
+# the local collector entirely. Cloud forwarding remains separately opt-in.
+# shellcheck source=src/observability/startup-policy.sh
+source "$REPO/src/observability/startup-policy.sh"
+OBS_COLLECTOR_READY=0
+if obs_collector_enabled; then
   OBS_PORT="${SUTANDO_OBS_PORT:-4000}"
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
-      run_tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
-    echo "  ✓ obs collector"
-  else
-    echo "  ✓ obs collector (already running on $OBS_PORT)"
+      run_node_service boot "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
+    for _obs_wait in 1 2 3 4 5 6 7 8 9 10; do
+      obs_collector_healthy "$OBS_PORT" && break
+      sleep 0.2
+    done
   fi
-  # Wire the core's hooks to the local collector unless an endpoint is already set.
-  if [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
-    export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+  if obs_collector_healthy "$OBS_PORT"; then
+    OBS_COLLECTOR_READY=1
+    echo "  ✓ obs collector (verified on $OBS_PORT)"
+  else
+    echo "  ⚠ obs collector unavailable or foreign listener on $OBS_PORT — metrics/hook capture disabled" >&2
+  fi
+  if [ "$OBS_COLLECTOR_READY" = "1" ]; then
+    # Default-on path is metrics-only. Preserve the old explicit =1 behavior
+    # for operators who intentionally opted into prompt/tool hook capture.
+    if [ -z "${SUTANDO_OBS_METRICS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_METRICS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
+    if obs_hooks_enabled && [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
   fi
 else
-  echo "  ~ obs collector (disabled — set SUTANDO_OBS_COLLECTOR=1 to enable)"
+  echo "  ~ obs collector (disabled via SUTANDO_OBS_COLLECTOR=0)"
 fi
 # A port can LISTEN while the service never responds (single-threaded server
 # blocked on a silent connection, hung event loop). The lsof guards below only
@@ -673,7 +796,7 @@ else
     fi
   elif ! lsof -i :9900 > /dev/null 2>&1; then
     echo "  Starting voice agent (port 9900)..."
-    run_tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
+    run_node_service voice-agent src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
     echo "  ✓ voice agent"
   else
     echo "  ✓ voice agent (already running)"
@@ -688,7 +811,7 @@ fi
 # back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
 # advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
 # post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
-run_tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+run_node_service emit-call-tiers src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
 echo "  ✓ call-tiers advertisement (re-emit 60s)"
 
 # 2. Web client (port 8080 by default; CLIENT_PORT may avoid a local conflict)
@@ -713,7 +836,7 @@ if [ "$WEB_CLIENT_PORT" = "8080" ] && launchctl print "gui/$(id -u)/com.sutando.
   fi
 elif ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
   echo "  Starting web client (port $WEB_CLIENT_PORT)..."
-  run_tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
+  run_node_service web-client src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running on $WEB_CLIENT_PORT)"
@@ -962,13 +1085,44 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # would export a value and the bridge's default never fires. A shared /
   # multi-user gateway sets REMOTE_TASK_TIER=team explicitly.
   REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
-  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
-  if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
-    python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
-    echo "  ✓ gateway bridge"
-  else
-    echo "  ✓ gateway bridge (already running)"
-  fi
+  # AG2 Space's gateway tags inbound image/file markers `ag2space-media` (its
+  # media-proxy at {gateway}/v1/media/...). The provider-neutral bridge defaults
+  # its marker tag to `remote-media`, so without this the marker never matches and
+  # the media URL lands in the task body unresolved — the core can't see the image
+  # (owner-reported 2026-07-25). Default it to the AG2 tag here, in the AG2-specific
+  # launch block, so the generic package carries no provider string. Explicit
+  # REMOTE_MEDIA_MARKER (e.g. from the channel .env) still wins.
+  REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
+  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
+  # Always spawn; the bridge's own unsuffixed singleton lock self-defers a
+  # duplicate. The previous `pgrep -f remote-gateway-bridge` guard was a P1
+  # (john, PR review 2026-08-02): every named-instance bridge shares the SAME
+  # argv, so a live secondary satisfied the pgrep and suppressed restart of a
+  # DEAD primary indefinitely. Instance identity lives only in env, which
+  # pgrep cannot see — the lock (role `gateway-bridge`, per-instance suffixed)
+  # is the only process-identity source that can arbitrate this.
+  # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
+  # the redirect below); the bridge stamps launched_via into gateway-status
+  # and skips its own bare-launch file log. See remote_gateway_bridge._log.
+  SUTANDO_SUPERVISED=1 python3 "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+  echo "  ✓ gateway bridge (self-defers if already running)"
+
+  # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
+  # the environment launches one extra bridge for that gateway (e.g.
+  # AG2_REMOTE_TOKEN_DEV → instance "dev" against the dev homeserver). Each
+  # instance gets its own lock role + state files via GATEWAY_INSTANCE, and
+  # deliberately inherits NO REMOTE_PROACTIVE_ROOM — proactive nudges stay with
+  # the primary (owner-DM) gateway only.
+  # No pgrep dedupe here (env vars are invisible to pgrep -f): the bridge's own
+  # per-instance singleton lock (role gateway-bridge.<inst>) makes a duplicate
+  # launch self-defer and exit, so always-spawn is safe and simpler.
+  for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
+    _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
+    SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+      REMOTE_PROACTIVE_ROOM= \
+      python3 "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+    echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
+  done
 fi
 
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
@@ -1056,7 +1210,7 @@ elif ! phone_stack_enabled; then
 elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
-    run_tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
+    run_node_service conversation-server skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
     echo "  ✓ conversation server (port 3100)"
   else
     echo "  ✓ conversation server (already running)"
@@ -1113,7 +1267,7 @@ fi
 if phone_stack_enabled && grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
 for port_name in $VERIFY_PORTS; do

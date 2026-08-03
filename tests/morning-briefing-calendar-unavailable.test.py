@@ -56,6 +56,10 @@ def _open_ok() -> subprocess.CompletedProcess:
 class TestCalendarRetry(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
+        # Force the AppleScript path deterministically: point the Google-calendar
+        # cache at a nonexistent file so get_calendar_events() never short-circuits
+        # on a real workspace state/calendar-today.json left by the agent.
+        self.mod.CALENDAR_CACHE_FILE = Path("/nonexistent/calendar-today.json")
 
     def test_error_then_retry_succeeds(self):
         """First osascript fails (-600) → Calendar launched → retry returns events."""
@@ -199,4 +203,15 @@ if __name__ == "__main__":
     # interpreter shutdown (not the test logic - subprocess calls are mocked).
     import os
     _r = unittest.main(exit=False)
+    # os._exit() skips atexit, which is where coverage.py writes its data file —
+    # so without an explicit save the lines this suite exercises (incl. main()'s
+    # briefing write) record as UNCOVERED under the coverage gate even though the
+    # tests ran and passed (#1832 class). Flush the active session first.
+    try:
+        import coverage
+        _c = coverage.Coverage.current()
+        if _c is not None:
+            _c.save()
+    except Exception:
+        pass
     os._exit(0 if _r.result.wasSuccessful() else 1)
