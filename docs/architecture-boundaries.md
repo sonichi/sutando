@@ -165,6 +165,32 @@ Both should move toward dependency inversion:
 Moving files without first removing these dependencies would make the boundary
 look cleaner without making it real.
 
+## Skill-internal boundaries
+
+The core/adapter/skill split is not the only boundary that matters. A large skill
+can carry the same layering problem internally: analysis policy welded to data
+loading, CLI parsing and presentation, so the rules can only be exercised by
+running the whole tool.
+
+Worked example, `skills/call-diagnostics/scripts/diagnose.py` →
+`scripts/analysis.py`:
+
+> Complex skill diagnostics must separate pure analysis policy from data
+> loading, CLI and presentation. Call-diagnostics detection, categorization and
+> repair policy lives in its analysis module; loaders and renderers consume it
+> and must not carry copied detection rules.
+
+The analysis module is import-safe by contract — it resolves no workspace, reads
+no `sys.argv`, opens no database or file, prints nothing and generates no HTML.
+That contract is asserted directly, by scanning the module source (docstring
+excluded, since it legitimately names what it avoids) and by importing it under a
+polluted `sys.argv` and asserting silence.
+
+This boundary is skill-internal: the policy stays inside `skills/call-diagnostics/`
+and is not promoted into `src/`. The delegation check is narrow — it forbids the
+renderer redefining moved symbols while leaving presentation labels and styles
+alone.
+
 ## Decision guide for new code
 
 This section explains the architectural categories. The repository-specific
