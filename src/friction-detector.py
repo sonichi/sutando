@@ -22,10 +22,19 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path, personal_path, shared_personal_path  # noqa: E402
+from pending_questions_md import DIVIDER_OR_DONE_RE, active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
+
+
+# Prefix for "this probe did not run". A friction report that cannot distinguish
+# "checked, found nothing" from "could not check" will happily tell the owner
+# "Everything is clean" over probes that never executed — the same class of bug
+# as the morning briefing's all-clear (#2528). Marked items are real report
+# lines, so `all_issues` is non-empty and the all-clear is withheld.
+UNCHECKED = "COULD NOT CHECK: "
 
 
 def check_pending_questions():
@@ -44,7 +53,7 @@ def check_pending_questions():
         return []
 
     # Discard resolved section (below a `# Resolved` / `# Done` divider).
-    content = re.split(r'^#\s+(?:Resolved|Done)\b', content, maxsplit=1, flags=re.MULTILINE)[0]
+    content = active_region(content, DIVIDER_OR_DONE_RE)
 
     _RESOLVED_STATUS = re.compile(
         r'\*\*Status:\*\*\s*(?:resolved|answered|done|complete)',
@@ -149,16 +158,21 @@ def check_github_issues():
             ["gh", "issue", "list", "--state", "open", "--json", "number,title,updatedAt"],
             capture_output=True, text=True, timeout=10
         )
-        if result.returncode == 0:
-            items = json.loads(result.stdout)
-            now = datetime.now(timezone.utc)
-            for item in items:
-                updated = datetime.fromisoformat(item["updatedAt"].replace("Z", "+00:00"))
-                age_days = (now - updated).days
-                if age_days > 7:
-                    issues.append(f"GitHub issue #{item['number']} stale ({age_days}d): {item['title'][:60]}")
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
-        pass
+        if result.returncode != 0:
+            # A failed probe is not an absence of stale issues. Saying nothing
+            # here lets `all_issues == []` render as "Everything is clean" over
+            # a question that was never answered.
+            return [UNCHECKED + "GitHub issues (gh exited "
+                    f"{result.returncode})"]
+        items = json.loads(result.stdout)
+        now = datetime.now(timezone.utc)
+        for item in items:
+            updated = datetime.fromisoformat(item["updatedAt"].replace("Z", "+00:00"))
+            age_days = (now - updated).days
+            if age_days > 7:
+                issues.append(f"GitHub issue #{item['number']} stale ({age_days}d): {item['title'][:60]}")
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
+        return [UNCHECKED + f"GitHub issues ({type(e).__name__})"]
     return issues
 
 
@@ -168,7 +182,10 @@ def check_overdue_reminders():
     try:
         script = claude_home_path("skills", "macos-tools", "scripts", "reminders.py")
         if not script.exists():
-            return []
+            # Absent probe, not an absent problem. This is also why the suite
+            # fails on a clean-install runner where macos-tools is not present:
+            # the early return skipped the exception handler entirely.
+            return [UNCHECKED + "overdue reminders (reminders.py not installed)"]
         # Use sys.executable: friction-detector runs via cron (launchd-managed);
         # bare `python3` can resolve to a different interpreter on minimal PATH.
         # See feedback_subprocess_sys_executable.md.
@@ -176,12 +193,14 @@ def check_overdue_reminders():
             [sys.executable, str(script), "list"],
             capture_output=True, text=True, timeout=10
         )
-        if result.returncode == 0:
-            for line in result.stdout.split("\n"):
-                if "overdue" in line.lower() or "past due" in line.lower():
-                    issues.append(f"Overdue reminder: {line.strip()[:80]}")
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+        if result.returncode != 0:
+            return [UNCHECKED + f"overdue reminders (reminders.py exited "
+                    f"{result.returncode})"]
+        for line in result.stdout.split("\n"):
+            if "overdue" in line.lower() or "past due" in line.lower():
+                issues.append(f"Overdue reminder: {line.strip()[:80]}")
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return [UNCHECKED + f"overdue reminders ({type(e).__name__})"]
     return issues
 
 

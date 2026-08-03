@@ -108,6 +108,39 @@ class TestCheckPendingQuestionsFreForm(unittest.TestCase):
             f"Section below # Resolved should be excluded. Got: {result}",
         )
 
+    def test_divider_documented_in_a_comment_is_not_the_divider(self):
+        """A `# Resolved` line inside an HTML comment must not end the active region.
+
+        The live outage: the file's own banner warns writers not to append at EOF
+        and quotes the rule it documents, putting `` # Resolved` heading `` at the
+        start of a line inside the comment. The old anchor matched that, so the
+        active region collapsed to the banner and every real section read as
+        archived.
+        """
+        content = f"""<!-- =====
+     WRITERS READ THIS FIRST — the parser truncates at the first `
+# Resolved` heading
+     and only counts sections ABOVE it.
+     ===== -->
+
+## Open question
+- **Asked:** {_OLD}
+
+# Resolved
+
+## Already done
+- **Asked:** {_OLD}
+"""
+        result = _make_module_with_pq(content)
+        self.assertTrue(
+            any("Open question" in r for r in result),
+            f"Decoy inside the banner must not truncate the file. Got: {result}",
+        )
+        self.assertFalse(
+            any("Already done" in r for r in result),
+            f"The real divider must still be honored. Got: {result}",
+        )
+
     def test_none_open_placeholder_returns_empty(self):
         """Standard '(none open)' content returns empty."""
         content = "# Pending Questions\n\n_(none open)_\n"
@@ -278,10 +311,24 @@ class TestFreFormParserStructural(unittest.TestCase):
             "Parser must not require **Status: unanswered** — free-form files never write this.",
         )
 
-    def test_resolved_divider_honored(self):
-        """Parser must split on `# Resolved` divider."""
-        self.assertIn("Resolved", self.SRC)
-        self.assertIn("re.split", self.SRC)
+    def test_divider_logic_is_not_reimplemented_locally(self):
+        """The divider cut must come from the shared helper, not a local regex.
+
+        This replaces an `assertIn("re.split", SRC)` text-grep. That assertion
+        tracked one spelling of the implementation rather than the property it
+        cared about, so the 2026-07-30 refactor — which preserved the behavior and
+        is covered behaviorally by test_below_resolved_divider_excluded and
+        test_divider_documented_in_a_comment_is_not_the_divider — reported a
+        failure with nothing behaviorally wrong.
+
+        The property actually worth guarding is the opposite one: four readers
+        each owning a private copy of this regex is what let a single defect go
+        dark in four places at once, so a LOCAL redefinition is the regression.
+        """
+        self.assertIn("active_region", self.SRC,
+                      "friction-detector must delegate the divider cut to pending_questions_md")
+        self.assertNotIn("re.split(r'^#", self.SRC,
+                         "divider regex must not be reimplemented locally")
 
     def test_explicit_resolved_regex_present(self):
         """Parser must recognize explicit resolved/answered/done status."""
