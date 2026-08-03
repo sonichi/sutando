@@ -23,10 +23,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // fallback). The Swift loader twin lives at
     // src/Sutando/SutandoConfig.swift and matches src/sutando_config.{py,ts}
     // byte-for-byte. Resolution order:
-    //   1. $SUTANDO_WORKSPACE env var (legacy escape hatch; warn once)
-    //   2. sutando.config.local.json -> workspace.path (per-clone override)
-    //   3. sutando.config.json -> workspace.path (tracked defaults)
-    //   4. ${REPO_DIR}/workspace baked-in default
+    //   1. sutando.config.local.json -> workspace.path (per-clone override)
+    //   2. sutando.config.json -> workspace.path (tracked defaults)
+    //   3. ${REPO_DIR}/workspace baked-in default
+    // $SUTANDO_WORKSPACE is NOT in the order — removed in v0.8; a set env var
+    // only warns. This comment claims to match sutando_config.{py,ts}
+    // byte-for-byte, so it has to track that removal too.
     //
     // Pre-#762 main.swift wrote tasks/logs/state under the repo checkout via
     // CLAUDE.md walk-up. Post-#762 that dir no longer exists, so writeTask
@@ -627,7 +629,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// per-host paths from the scutil-named Chis-MacBook-Pro subtree; #1745).
     func perHostLabel() -> String {
         let env = ProcessInfo.processInfo.environment
-        if let v = env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"], !v.isEmpty {
+        // `!v.isEmpty` is false for "   ", so a blank-but-set override became the
+        // label and produced `hosts/   /`. Trim first; blank means unset, same as
+        // the scutil branch below already does. Lockstep with util_paths.py/.ts.
+        if let v = (env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
             return v
         }
         if let lhn = runShell("/usr/sbin/scutil", ["--get", "LocalHostName"])?

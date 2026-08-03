@@ -53,10 +53,46 @@ def _ci_state(rollup) -> str:
 def raw_state(prs: list, owner_login: str) -> list:
     """Objective per-PR state — NO judgement. Sorted by number.
 
-    Each record: number, title, author, is_mine, head, ci, mergeable, review,
-    approvals. `approvals` = count of distinct logins whose latest effective
-    formal review state is APPROVED on the current head. These are facts the
-    agent then judges (is it ready? does the owner need it? caveats?).
+    Each record: number, title, author, is_mine, base, head, ci, mergeable,
+    review, approvals, approvals_standing. These are facts the agent then judges
+    (is it ready? does the owner need it? caveats?).
+
+    TWO approval counts, because they answer different questions and only one of
+    them matches what this repo actually enforces:
+
+      approvals           distinct logins whose latest formal review is APPROVED
+                          ON THE CURRENT HEAD. Strictly the newer signal.
+      approvals_standing  distinct logins whose latest formal review is APPROVED
+                          at ANY commit. This is what the branch rules count.
+
+    Both protection surfaces were read live on 2026-08-02:
+
+        classic protection : required_approving_review_count = 0,
+                             dismiss_stale_reviews = false
+        ruleset "main"     : approvals = 2,
+                             dismiss_stale_reviews_on_push = false,
+                             require_last_push_approval = false
+
+    `dismiss_stale = false` on both, so a stale approval still counts and
+    head-anchoring is STRICTER THAN WHAT ENFORCES. Emitting only the strict count
+    is not a conservative choice -- it fails in exactly one direction (false
+    not-ready), which is self-consistent and therefore never contradicts itself.
+    On 2026-08-02 the same head-anchoring criterion, applied by hand, produced a
+    merge-ready count of 8 against a true 15; it was caught only because a peer
+    published a different number. That count was not this script's output -- see
+    the scope note on `_fetch_prs` -- but it was this field's rule, and an agent
+    judging the emitted state has nothing else to judge from.
+
+    `base` (baseRefName) is emitted for the same reason: a STACKED PR targets
+    another PR's branch, so every other field can look ready while none of it is
+    a statement about main. #2420 reads mergeable + approved against
+    `fix/resolved-divider-anchor`, which is #2419's branch.
+
+    Deliberately NOT emitted: `mergeStateStatus`. It looks like the ideal field
+    -- GitHub computes it with the ruleset applied -- but it is a cached verdict.
+    #2420 reads CLEAN with one approval under a two-approval ruleset because the
+    cache was computed against its own base. A field that is right until it
+    silently isn't is worse here than the raw inputs the agent can check.
     """
     out = []
     for pr in prs:
@@ -64,34 +100,41 @@ def raw_state(prs: list, owner_login: str) -> list:
             continue
         author = (pr.get("author") or {}).get("login", "")
         head = pr.get("headRefOid") or ""
-        latest_formal_review = {}
-        for index, review in enumerate(pr.get("reviews") or []):
-            if (review.get("commit") or {}).get("oid") != head:
-                continue
-            state = review.get("state")
-            if state not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
-                continue
-            login = (review.get("author") or {}).get("login")
-            if not login:
-                continue
-            order = (review.get("submittedAt") or "", index)
-            if login not in latest_formal_review or order >= latest_formal_review[login][0]:
-                latest_formal_review[login] = (order, state)
-        approvers = {
-            login
-            for login, (_, state) in latest_formal_review.items()
-            if state == "APPROVED"
-        }
+        # Two passes over the same reviews, differing ONLY in whether a review at
+        # an older commit is admitted. Kept as one loop with a flag so the two
+        # counts can never drift apart in their tie-breaking or state handling.
+        def _approvers(head_only: bool) -> set:
+            latest_formal_review = {}
+            for index, review in enumerate(pr.get("reviews") or []):
+                if head_only and (review.get("commit") or {}).get("oid") != head:
+                    continue
+                state = review.get("state")
+                if state not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+                    continue
+                login = (review.get("author") or {}).get("login")
+                if not login:
+                    continue
+                order = (review.get("submittedAt") or "", index)
+                if login not in latest_formal_review or order >= latest_formal_review[login][0]:
+                    latest_formal_review[login] = (order, state)
+            return {
+                login
+                for login, (_, state) in latest_formal_review.items()
+                if state == "APPROVED"
+            }
+
         out.append({
             "number": pr.get("number"),
             "title": pr.get("title", ""),
             "author": author,
             "is_mine": author == owner_login,
+            "base": pr.get("baseRefName") or "",
             "head": head,
             "ci": _ci_state(pr.get("statusCheckRollup")),
             "mergeable": pr.get("mergeable") or "UNKNOWN",
             "review": pr.get("reviewDecision") or "none",
-            "approvals": len(approvers),
+            "approvals": len(_approvers(head_only=True)),
+            "approvals_standing": len(_approvers(head_only=False)),
         })
     out.sort(key=lambda x: x["number"])
     return out
@@ -99,18 +142,31 @@ def raw_state(prs: list, owner_login: str) -> list:
 
 def state_hash(state: list) -> str:
     """Stable hash of the objective set. Changes when a PR appears/disappears or
-    any actionable field (head/ci/mergeable/review/approvals) flips; a title
-    edit does not refire."""
-    key = [[s["number"], s["is_mine"], s["head"], s["ci"], s["mergeable"], s["review"], s["approvals"]]
+    any actionable field (base/head/ci/mergeable/review/approvals/
+    approvals_standing) flips; a title edit does not refire.
+
+    `approvals_standing` is in the key for a reason the head-anchored count
+    cannot cover: a reviewer converting CHANGES_REQUESTED to APPROVED at an
+    OLDER commit moves the enforced gate without moving `approvals`, so before
+    this it did not refire and the agent was never woken for a PR that had just
+    become mergeable."""
+    key = [[s["number"], s["is_mine"], s["base"], s["head"], s["ci"], s["mergeable"],
+            s["review"], s["approvals"], s["approvals_standing"]]
            for s in state]
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
 
 
 def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
+    # SCOPE NOTE: `--author owner_login` means this only ever sees the owner's OWN
+    # PRs (24 of 116 open on 2026-08-02). Peer PRs where the owner's approval is
+    # the thing unblocking a merge are not fetched at all, so they cannot appear
+    # in any digest built from this state. Left alone deliberately -- widening the
+    # fetch is a scope decision, not a field-completeness fix, and belongs in its
+    # own change.
     cmd = [
         "gh", "pr", "list", "--repo", repo, "--state", "open",
         "--author", owner_login, "--limit", "1000",
-        "--json", "number,title,author,headRefOid,mergeable,reviewDecision,statusCheckRollup,isDraft,reviews",
+        "--json", "number,title,author,baseRefName,headRefOid,mergeable,reviewDecision,statusCheckRollup,isDraft,reviews",
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:

@@ -36,7 +36,7 @@
     "workspace": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Workspace location config. Resolution order: $SUTANDO_WORKSPACE env (legacy escape hatch, warn) > sutando.config.local.json > sutando.config.json > baked-in default ${REPO_DIR}/workspace.",
+      "description": "Workspace location config. Resolution order: sutando.config.local.json > sutando.config.json > baked-in default ${REPO_DIR}/workspace. $SUTANDO_WORKSPACE is NOT honored (removed in v0.8); setting it only warns.",
       "properties": {
         "path": {
           "type": "string",
