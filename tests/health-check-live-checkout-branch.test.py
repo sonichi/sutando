@@ -327,6 +327,38 @@ def main() -> int:
         check("3 commit(s) behind" in r["detail"],
               f"v4) must still report the TOTAL behind count, got {r['detail'][:130]}")
 
+    # v5) git unrunnable -> no skill warning, and no exception either. This is the
+    #     branch that decides what happens when the MEASUREMENT fails, and an
+    #     uncaught raise here would take down the whole health run from inside the
+    #     probe that exists to report on it. Degrade closed: say nothing extra
+    #     rather than invent a warning from a failed read.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        real_run = hc.subprocess.run
+
+        def _boom_on_log(argv, *a, **kw):
+            if "log" in argv:
+                raise OSError("git vanished mid-run")
+            return real_run(argv, *a, **kw)
+
+        hc.subprocess.run = _boom_on_log
+        try:
+            got = hc._behind_commits_touching(work, "main", "skills/")
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc.subprocess.run = real_run
+        check(got == [], f"v5) a failed measurement yields no commits, got {got}")
+        check(r["status"] == "ok",
+              f"v5) and must not invent a warning from it, got {r['status']}")
+
+    # v6) git present but the log call FAILS (bad ref, renamed remote) -> same
+    #     degrade. Distinct from v5: there the call raised, here it returns
+    #     non-zero, and the two are different lines in the function.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        got = hc._behind_commits_touching(work, "no-such-branch-xyz", "skills/")
+        check(got == [], f"v6) non-zero rc yields no commits, got {got}")
+
     # m) No remote ref at all (fresh init, renamed remote) -> degrade to ok.
     #    A probe that cannot answer must not invent an alarm.
     with tempfile.TemporaryDirectory() as td:
