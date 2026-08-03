@@ -38,6 +38,14 @@ _MAGNITUDE_RE = re.compile(
 _PURE_NUMBER_COMMAS = re.compile(r"^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
 _CURRENCY_PREFIX = re.compile(r"^(?:[$€£¥]|USD|EUR|GBP|JPY)\s*", re.IGNORECASE)
 _LEADING_ARTICLE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
+# List elements are comma-separated, but a thousands-grouping comma inside a
+# numeric element ("1,000,000") is NOT an element boundary. A grouping comma is
+# preceded by a digit AND followed by exactly three digits then a non-digit/end;
+# split on every OTHER comma. (bassil CR 2026-08-03: naive text.split(",")
+# shredded "1,000,000, 500,000" into seven fragments, and _infer_kind routes any
+# multi-number comma answer — the GAIA multi-value shape this skill targets —
+# straight into the list path.)
+_LIST_SEP = re.compile(r"(?<!\d),|,(?!\d{3}(?:\D|$))")
 
 
 def _expand_magnitude(text: str) -> str | None:
@@ -122,7 +130,7 @@ def normalize_list(text: str, sort: bool = False, number_items: bool = False) ->
     """Comma-separated, single space after each comma. Per-element trimming; each
     element optionally normalized as a number. Sorting is opt-in (graders rarely
     want it) and case-insensitive."""
-    parts = [p.strip() for p in text.split(",")]
+    parts = [p.strip() for p in _LIST_SEP.split(text)]
     parts = [p for p in parts if p]
     if number_items:
         parts = [normalize_number(p) for p in parts]

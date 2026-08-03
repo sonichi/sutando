@@ -57,6 +57,33 @@ check("list-sort-opt", nz.normalize_list("mice, humans, cats", sort=True), "cats
 check("list-no-sort-default", nz.normalize_list("mice, humans"), "mice, humans")
 check("list-number-items", nz.normalize_list("$5, 10%, 2 million", number_items=True), "5, 10, 2000000")
 
+# A list whose elements are themselves thousands-grouped numbers must split on
+# the element separators only, NOT on every grouping comma (bassil CR 2026-08-03:
+# naive split(",") shredded "1,000,000, 500,000, 250,000" into 7 fragments). The
+# grouping commas are preserved in the elements; auto mode leaves them as-is,
+# --number-items strips them. This is the GAIA multi-number answer shape.
+check("list-grouped-numbers-preserved",
+      nz.normalize_list("1,000,000, 500,000, 250,000"),
+      "1,000,000, 500,000, 250,000")
+check("list-grouped-numbers-number-items",
+      nz.normalize_list("1,000,000, 500,000, 250,000", number_items=True),
+      "1000000, 500000, 250000")
+check("list-grouped-mixed-width",
+      nz.normalize_list("1,234, 5,678"), "1,234, 5,678")
+check("list-grouped-then-word",
+      nz.normalize_list("$1,000, Paris"), "$1,000, Paris")
+check("list-grouped-decimals",
+      nz.normalize_list("1,234.5, 6,789.0"), "1,234.5, 6,789.0")
+# No-space numeric list still splits correctly — the comma after "1000" is
+# followed by "2000" (4 digits, not a valid 3-digit grouping) → a separator.
+check("list-nospace-plain-numbers",
+      nz.normalize_list("1000,2000"), "1000, 2000")
+# Auto mode routes a multi-grouped-number answer to list and keeps 3 elements
+# (previously 7 garbage fragments).
+check("auto-list-grouped-numbers",
+      nz.normalize_answer("1,000,000, 500,000, 250,000"),
+      "1,000,000, 500,000, 250,000")
+
 # --- auto inference ---
 check("auto-number", nz.normalize_answer("100 million"), "100000000")
 check("auto-string", nz.normalize_answer("  Claude Shannon "), "Claude Shannon")
