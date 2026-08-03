@@ -940,6 +940,52 @@ export const deleteNoteTool: ToolDefinition = {
 
 const VOICE_SESSION_CONTEXT_PATH = join(WORKSPACE_DIR, 'state', 'voice-session-context.json');
 
+// Anything older than this is almost certainly a PREVIOUS session's context.
+// The file exists to bridge voice's ~10-minute Gemini window inside one live
+// session, so a multi-hour gap means the session that wrote it is long gone.
+export const VOICE_CONTEXT_STALE_HOURS = 6;
+
+/**
+ * Stamp the context payload with its own age.
+ *
+ * WHY: the writer is a PROSE INSTRUCTION, not code — CLAUDE.md tells core to
+ * update this file "whenever a durable decision lands". That is a discipline,
+ * and disciplines lapse silently. Measured 2026-08-03: the canonical file was
+ * **97 hours old and still carried `pending_action`**, and the legacy copy was
+ * 878 hours old. `recent_context` returned both verbatim, so voice would answer
+ * "what's pending?" with a four-day-old action stated as current — while the
+ * tool's own description promises "the CURRENT voice-session context".
+ *
+ * The payload is deliberately NOT withheld when stale: dropping it would hide
+ * context that is often still correct, and the failure this guards against is
+ * voice asserting currency it cannot verify. So it returns everything and adds
+ * the one fact the caller could not otherwise know.
+ */
+export function annotateContextFreshness(
+	parsed: Record<string, unknown> | null | undefined,
+	nowMs: number = Date.now(),
+): Record<string, unknown> {
+	const base: Record<string, unknown> = { ...(parsed ?? {}) };
+	const rawTs = base.updated_at;
+	const updatedMs = typeof rawTs === 'string' ? Date.parse(rawTs) : Number.NaN;
+	if (!Number.isFinite(updatedMs)) {
+		base.freshness = 'unknown';
+		base.note =
+			'context has no parseable updated_at — age unknown, so treat pending_action and active_drafts as historical unless the user confirms them.';
+		return base;
+	}
+	const ageHours = (nowMs - updatedMs) / 3_600_000;
+	base.age_hours = Math.round(ageHours * 10) / 10;
+	if (ageHours >= VOICE_CONTEXT_STALE_HOURS) {
+		base.stale = true;
+		base.note =
+			`this context is ${base.age_hours}h old — almost certainly written by an EARLIER session, ` +
+			'not the one you are in. Do not present pending_action or active_drafts as current; ' +
+			'say how old it is, or confirm with the user before acting on it.';
+	}
+	return base;
+}
+
 export const recentContextTool: ToolDefinition = {
 	name: 'recent_context',
 	description:
@@ -956,8 +1002,8 @@ export const recentContextTool: ToolDefinition = {
 				return { note: 'no context recorded yet — core hasn\'t written voice-session-context.json' };
 			}
 			const raw = readFileSync(VOICE_SESSION_CONTEXT_PATH, 'utf-8');
-			const parsed = JSON.parse(raw);
-			console.log(`${ts()} [RecentContext] returned (updated_at=${parsed.updated_at || 'unknown'}, ${(parsed.active_drafts || []).length} drafts, ${(parsed.last_results || []).length} results)`);
+			const parsed = annotateContextFreshness(JSON.parse(raw));
+			console.log(`${ts()} [RecentContext] returned (updated_at=${parsed.updated_at || 'unknown'}, age=${parsed.age_hours ?? '?'}h${parsed.stale ? ' STALE' : ''}, ${((parsed.active_drafts as unknown[]) || []).length} drafts, ${((parsed.last_results as unknown[]) || []).length} results)`);
 			return parsed;
 		} catch (err) {
 			return { error: `recent_context read failed: ${err instanceof Error ? err.message : err}` };
