@@ -438,6 +438,42 @@ class CarrierSetProbe(unittest.TestCase):
         self._patch_shipped(["notes/"])
         return ws
 
+    def test_a_filename_containing_a_NEWLINE_is_still_measured(self):
+        # john-the-dev on 73a91671. The batch joined paths with "\n", but a
+        # filename may CONTAIN a newline — so one real path became two bogus
+        # ones, and because both halves are typically un-ignored, the genuinely
+        # ignored carrier file read as carried.
+        #
+        # Reproduced before fixing, on a tree built to separate the two answers:
+        #     notes/z\nx.md          -> rc 0  (IGNORED, not backed up)
+        #     halves notes/z, x.md   -> rc 1, rc 1  (both un-ignored)
+        #     newline-joined batch   -> rc 1  -> ok, FALSE GREEN
+        #     NUL-joined with -z     -> rc 0  -> dropped, correct
+        #
+        # NUL is the only delimiter a POSIX filename cannot contain, which is
+        # why the fix is the delimiter rather than an escaping scheme.
+        weird = "notes/z\nx.md"
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/z", "x.md"], [weird])
+        self._patch_resolved(["notes/"])
+        self._patch_shipped(["notes/"])
+
+        # The fixture only proves something if the two answers genuinely differ:
+        # the real file ignored, both split halves not. Assert that first, or a
+        # future gitignore nuance could make this pass without discriminating.
+        def rc(path):
+            return subprocess.run(["git", "-C", str(ws), "check-ignore",
+                                   "--no-index", "-q", path],
+                                  capture_output=True).returncode
+        self.assertEqual(rc(weird), 0, "fixture: the real file must be IGNORED")
+        self.assertEqual(rc("notes/z"), 1, "fixture: split half must be un-ignored")
+        self.assertEqual(rc("x.md"), 1, "fixture: split half must be un-ignored")
+
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertNotEqual(r["status"], "ok",
+                            "a newline in a filename must not split one ignored path "
+                            "into two un-ignored ones")
+
     def test_the_26th_file_being_ignored_is_NOT_ok(self):
         # john-the-dev on e146c2b3. The probe sampled the first 25 files and a
         # comment admitted it could "UNDER-report past the cap" — a stated caveat

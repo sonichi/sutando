@@ -1207,10 +1207,22 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
         # callers, which report an entry with no representatives at all.
         return "carried"
 
-    rels = "\n".join(str(t.relative_to(workspace)) for t in targets)
+    # NUL-delimited, not newline. A filename may CONTAIN a newline, and
+    # `"\n".join(...)` then splits one real path into two bogus ones — both of
+    # which are typically un-ignored, so the genuinely ignored carrier file reads
+    # as carried. Reproduced on a real tree (john-the-dev, #2572):
+    #
+    #     notes/z\nx.md  check-ignore -q  -> 0  (IGNORED, not backed up)
+    #     split halves   notes/z, x.md    -> 1, 1 (both un-ignored)
+    #     newline-joined batch            -> 1  -> reads CARRIED, false green
+    #     NUL-joined with -z              -> 0  -> dropped, correct
+    #
+    # `-z` makes git read NUL-separated input, which is the only delimiter a
+    # POSIX filename cannot contain.
+    rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
     try:
         proc = subprocess.run(
-            git_argv("-C", str(workspace), "check-ignore", "--no-index", "--stdin"),
+            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-z", "--stdin"),
             input=rels, capture_output=True, text=True, timeout=60,
         )
     except (GitUnavailable, OSError, subprocess.SubprocessError):
