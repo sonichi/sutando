@@ -535,7 +535,30 @@ def _ag2space_access_path():
     return os.path.join(base, "channels", "ag2space", "access.json")
 
 
+# Known tier vocabulary. Also an ordering (higher == more privileged); kept for
+# validating a mapped value. It no longer CLAMPS — see _tier_for.
+_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
+
 _TIER_MAP_CACHE = {"mtime": None, "map": {}}
+
+
+def _stale_safe(cached):
+    """Project a STALE cached map onto the fail-closed side in BOTH directions.
+
+    The cache is deliberately preserved across a read error so a transient
+    mid-write cannot fail-OPEN a down-tiered sender back to LOCAL_TIER. That
+    reasoning holds only for entries at or below LOCAL_TIER. Once the map can
+    also grant a tier ABOVE LOCAL_TIER, replaying the cache verbatim keeps an
+    ESCALATION alive on a file the owner may have just deleted to revoke it —
+    so deleting access.json would not actually revoke anything.
+
+    Drop the above-LOCAL_TIER entries (those senders fall back to LOCAL_TIER)
+    and keep the rest. A legitimately-granted sender is briefly demoted while
+    the file is unreadable and is restored on the next successful read; an
+    unrevoked escalation is not left standing. Transient demotion is the safe
+    direction — the module already fails closed to "team" on a bad LOCAL_TIER."""
+    local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
+    return {k: v for k, v in cached.items() if _TIER_RANK.get(v, 0) <= local_rank}
 
 
 def _load_tier_map():
@@ -555,8 +578,10 @@ def _load_tier_map():
         mt = os.path.getmtime(path)
     except OSError:
         # Absent/unstattable → keep last-known-good (initially {} before any load).
-        return _TIER_MAP_CACHE["map"]
+        return _stale_safe(_TIER_MAP_CACHE["map"])
     if mt == _TIER_MAP_CACHE["mtime"]:
+        # File present and UNCHANGED — this cache is current, not stale. Return it
+        # verbatim: projecting here would drop a legitimate up-tier on every call.
         return _TIER_MAP_CACHE["map"]
     try:
         with open(path) as f:
@@ -569,14 +594,9 @@ def _load_tier_map():
     except Exception:
         # Malformed / mid-write → keep last-known-good; don't advance mtime so a
         # later successful read of the fixed file is still picked up.
-        return _TIER_MAP_CACHE["map"]
+        return _stale_safe(_TIER_MAP_CACHE["map"])
     _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = mt, tm
     return tm
-
-
-# Known tier vocabulary. Also an ordering (higher == more privileged); kept for
-# validating a mapped value. It no longer CLAMPS — see _tier_for.
-_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
 
 
 def _tier_for(user_id):

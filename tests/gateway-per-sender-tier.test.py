@@ -143,6 +143,45 @@ rgb._TIER_MAP_CACHE["mtime"] = -1                    # force a re-read attempt (
 check("malformed re-read keeps the down-tier (fail-safe, not fail-open to owner)",
       rgb._tier_for("@rick:ag2.space") == "team")
 
-_total = 17
+# --- stale cache must fail CLOSED in BOTH directions (revocation safety) ---
+# Once the map can grant a tier ABOVE LOCAL_TIER, replaying a STALE cache verbatim
+# would keep an escalation alive on a file the owner just deleted to revoke it.
+# Pre-change this could not happen (the clamp made an above-LOCAL_TIER entry
+# unreachable), so the hazard is introduced by the up-tier and fixed here.
+_prev_local = rgb.LOCAL_TIER
+rgb.LOCAL_TIER = "team"
+
+# 18. revocation-by-deletion actually revokes an ESCALATED sender
+_write_map({"@dana:ag2.space": "owner"})
+assert rgb._tier_for("@dana:ag2.space") == "owner"   # prime cache with the grant
+ACCESS.unlink()
+rgb._TIER_MAP_CACHE["mtime"] = -1                     # force re-read → OSError path
+check("deleting access.json REVOKES an escalated sender (no stale owner)",
+      rgb._tier_for("@dana:ag2.space") == "team")
+
+# 19. ...while a DOWN-tier still survives the same stale read (original fail-safe intact)
+_write_map({"@rick:ag2.space": "other"})
+assert rgb._tier_for("@rick:ag2.space") == "other"
+ACCESS.unlink()
+rgb._TIER_MAP_CACHE["mtime"] = -1
+check("stale cache still preserves a DOWN-tier (fail-safe not broken)",
+      rgb._tier_for("@rick:ag2.space") == "other")
+
+# 20. malformed (not deleted) also drops the escalation but keeps the down-tier
+_write_map({"@dana:ag2.space": "owner", "@rick:ag2.space": "other"})
+assert rgb._tier_for("@dana:ag2.space") == "owner"
+ACCESS.write_text("{ corrupt ]")
+rgb._TIER_MAP_CACHE["mtime"] = -1
+check("malformed read drops the escalation", rgb._tier_for("@dana:ag2.space") == "team")
+check("malformed read keeps the down-tier", rgb._tier_for("@rick:ag2.space") == "other")
+
+# 21. HOT PATH REGRESSION GUARD: a present, unchanged file is a VALID cache, not a
+# stale one — a legitimate up-tier must survive repeated reads untouched.
+_write_map({"@dana:ag2.space": "owner"})
+check("valid unchanged cache keeps the up-tier (hot path not projected)",
+      rgb._tier_for("@dana:ag2.space") == "owner" and rgb._tier_for("@dana:ag2.space") == "owner")
+rgb.LOCAL_TIER = _prev_local
+
+_total = 22
 print(f"\nResults: {_total - len(failures)}/{_total} passed" if not failures else f"\nResults: FAILED {failures}")
 sys.exit(1 if failures else 0)
