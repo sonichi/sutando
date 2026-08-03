@@ -1116,24 +1116,45 @@ def check_memory_dir_siblings() -> "dict | None":
     }
 
 
-def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
-    """Resolve one existing concrete path for a carrier-set entry, or None.
+def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
+    """EVERY existing concrete path a carrier-set entry matches.
 
     Entries are gitignore-style and may be globs (`hosts/*/`), directories
-    (`notes/`) or plain files (`state/current-track.md`). We only need ONE
-    materialized path per entry to ask git whether the entry is being carried;
-    an entry with nothing on disk yet is not evidence of anything, so it is
-    skipped rather than reported.
+    (`notes/`) or plain files (`state/current-track.md`).
+
+    Deliberately ALL matches, not the first. Sampling one is sound for the stale
+    branch (which asks "is the entry this host configured actually in effect" —
+    one witness settles it), but not for judging whether a *local* rule covers a
+    *shipped* one: a narrower local rule can cover one child of a shipped
+    wildcard while leaving its siblings ignored, and a first-hit check that
+    happened to land on the covered child would report the vault healthy while a
+    whole host subtree went unbacked (qingyun-wu P1 on #2572).
+
+    Enumeration is bounded by construction: glob matches are the entry's own
+    direct matches (`hosts/*/` -> one path per host), never a recursive walk of
+    their contents.
     """
     rel = entry.strip().lstrip("/").rstrip("/")
     if not rel:
-        return None
+        return []
     if any(ch in rel for ch in "*?["):
-        for hit in sorted(workspace.glob(rel)):
-            return hit
-        return None
+        return sorted(workspace.glob(rel))
     candidate = workspace / rel
-    return candidate if candidate.exists() else None
+    return [candidate] if candidate.exists() else []
+
+
+def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
+    """One existing concrete path for a carrier-set entry, or None.
+
+    The single-witness form, kept for the stale branch: that branch asks whether
+    the entry THIS host configured is in effect, and one materialized path
+    answers it. An entry with nothing on disk yet is not evidence of anything,
+    so it is skipped rather than reported. Use `_carrier_representatives` when
+    the question is coverage of a *different* (shipped) entry — see its
+    docstring for why one witness is not enough there.
+    """
+    reps = _carrier_representatives(workspace, entry)
+    return reps[0] if reps else None
 
 
 def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
@@ -1226,39 +1247,65 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     try:
         shipped_cfg = json.loads((Path(REPO_DIR) / "sutando.config.json").read_text())
         shipped = ((shipped_cfg.get("vault") or {}).get("sync") or {}).get("include")
-        if isinstance(shipped, list):
-            missing = [e for e in shipped if isinstance(e, str) and e not in resolved]
-            # String inequality is not absence of coverage. A local entry can be
-            # strictly BROADER than the shipped one it replaces — `hosts/` covers
-            # everything `hosts/*/` does — and the whole point of this probe is to
-            # judge by outcome, not by config text. The `stale` branch above already
-            # asks git; this branch used to revert to string equality, so it reported
-            # a fully-carried subtree as missing and advised "add them to the local
-            # list", i.e. told the operator to NARROW a config that was already
-            # correct (#2571, reported against #2566 by Sutando-Pro).
-            #
-            # So an entry only counts as dropped once git agrees nothing under it is
-            # carried. An entry with nothing materialized yet stays reported: there is
-            # no outcome to measure, but the divergence is real and becomes silent
-            # data loss the moment the first file lands under it.
-            for entry in missing:
-                rep = _carrier_representative(workspace, entry)
-                if rep is None:
-                    dropped.append(entry)
-                    continue
-                proc = subprocess.run(
-                    git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
-                             str(rep.relative_to(workspace))),
-                    capture_output=True, timeout=10,
-                )
-                # Same contract as the stale branch: 0 = ignored (so genuinely not
-                # carried), 1 = not ignored (covered by some broader local rule).
-                # Anything else is a failed measurement — keep reporting it rather
-                # than let an unmeasured read count as covered.
+    except (OSError, json.JSONDecodeError, AttributeError):
+        # The shipped config itself is unreadable, so there is no comparison to
+        # make. This except must stay narrow and must NOT wrap the measurement
+        # loop below: the first cut did, so one entry's git timeout jumped here
+        # and reset `dropped = []`, erasing findings already collected — a
+        # fail-OPEN that turned a failed measurement into a green report, three
+        # lines under a comment promising the opposite (qingyun-wu P1 on #2572).
+        shipped = None
+
+    if isinstance(shipped, list):
+        missing = [e for e in shipped if isinstance(e, str) and e not in resolved]
+        # String inequality is not absence of coverage. A local entry can be
+        # strictly BROADER than the shipped one it replaces — `hosts/` covers
+        # everything `hosts/*/` does — and the whole point of this probe is to
+        # judge by outcome, not by config text. The `stale` branch above already
+        # asks git; this branch used to revert to string equality, so it reported
+        # a fully-carried subtree as missing and advised "add them to the local
+        # list", i.e. told the operator to NARROW a config that was already
+        # correct (#2571, reported against #2566 by Sutando-Pro).
+        #
+        # EVERY materialized match must be covered, not one sampled witness. A
+        # narrower local rule (`hosts/a/`) covers one child of a shipped wildcard
+        # (`hosts/*/`) while its siblings stay ignored, and first-hit sampling
+        # that landed on the covered child reported the vault healthy with a host
+        # subtree silently unbacked.
+        #
+        # An entry with nothing materialized yet stays reported: there is no
+        # outcome to measure, but the divergence is real and becomes silent data
+        # loss the moment the first file lands under it.
+        for entry in missing:
+            reps = _carrier_representatives(workspace, entry)
+            if not reps:
+                dropped.append(entry)
+                continue
+            verdict = "covered"
+            for rep in reps:
+                try:
+                    proc = subprocess.run(
+                        git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
+                                 str(rep.relative_to(workspace))),
+                        capture_output=True, timeout=10,
+                    )
+                except (GitUnavailable, OSError, subprocess.SubprocessError):
+                    verdict = "unmeasured"
+                    break
+                # Same contract as the stale branch: 0 = ignored (so this match is
+                # genuinely not carried), 1 = not ignored (covered by a broader
+                # local rule). Anything else is a failed measurement, which is
+                # UNKNOWN — never "covered".
+                if proc.returncode == 0:
+                    verdict = "dropped"
+                    break
                 if proc.returncode != 1:
-                    dropped.append(entry)
-    except (OSError, json.JSONDecodeError, AttributeError, GitUnavailable, subprocess.SubprocessError):
-        dropped = []
+                    verdict = "unmeasured"
+                    break
+            if verdict == "dropped":
+                dropped.append(entry)
+            elif verdict == "unmeasured":
+                unmeasured.append(entry)
 
     # A shipped entry can be one this host must NOT carry. `state/current-track.md`
     # is per-host state that #2534 added at a flat, SHARED vault path: two cores write

@@ -332,6 +332,68 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertNotIn("hosts/*/", r["detail"])
         self.assertNotIn("add them to the local list", r["detail"])
 
+    def test_a_NARROWER_local_rule_covering_one_child_is_not_coverage(self):
+        # qingyun-wu P1 on #2572. `_carrier_representative` returned the FIRST
+        # glob match, so a shipped wildcard matching several paths was judged on
+        # one sampled witness. A narrower local rule covers one child while its
+        # siblings stay ignored — and if the sample landed on the covered child,
+        # the probe reported the vault healthy with a whole host subtree unbacked.
+        #
+        # This is the exact inverse of the case the previous test pins, and one
+        # host cannot tell them apart: with a single match, first-hit coverage and
+        # full coverage are indistinguishable. Two hosts is the minimum fixture
+        # that can fail.
+        #
+        # The `!hosts/` line is load-bearing. gitignore cannot re-include a path
+        # whose PARENT directory is excluded, so `!hosts/a/` under a leading `*`
+        # leaves hosts/a ignored too — and the first cut of this fixture did
+        # exactly that, making BOTH hosts ignored. The assertion still passed,
+        # because first-hit sampling then landed on an ignored path and reported
+        # it dropped for the right verdict via the wrong mechanism. A fixture that
+        # passes at the broken head is not a witness.
+        ws = _mkworkspace(self.tmp,
+                          ["notes/", "notes/**",
+                           "hosts/", "hosts/a/", "hosts/a/**"],   # carries a, NOT b
+                          ["notes/x.md", "hosts/a/current-track.md", "hosts/b/current-track.md"])
+        self._patch_resolved(["notes/", "hosts/a/"])     # narrower than shipped
+        self._patch_shipped(["notes/", "hosts/*/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertNotEqual(r["status"], "ok",
+                            "hosts/b is ignored and unbacked — sampling hosts/a must not pass it")
+        self.assertIn("hosts/*/", r["detail"])
+
+    def test_a_measurement_failure_never_erases_findings(self):
+        # qingyun-wu P1 on #2572, and the sharper half: the code said one thing
+        # and did the other. A comment promised a failed measurement "keeps being
+        # reported", while the enclosing `except` reset `dropped = []` — so one
+        # entry's git timeout erased findings already collected and returned ok.
+        # Fail-OPEN in the probe whose entire purpose is catching silent
+        # non-backup.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/x.md", "data/f.md"])
+        self._patch_resolved(["notes/"])
+        self._patch_shipped(["notes/", "data/"])
+        real = self.hc.subprocess.run
+
+        def flaky(argv, *a, **kw):
+            # Succeed for the resolved entry's stale-branch probe, fail only on
+            # the shipped entry's coverage probe — the exact mixed case where the
+            # old code discarded the finding it already had.
+            if any("data" in str(x) for x in argv):
+                raise self.hc.subprocess.SubprocessError("timed out")
+            return real(argv, *a, **kw)
+
+        self.hc.subprocess.run = flaky
+        try:
+            r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        finally:
+            self.hc.subprocess.run = real
+        self.assertIsNotNone(r)
+        self.assertNotEqual(r["status"], "ok",
+                            "a measurement that failed is UNKNOWN, never a pass")
+        self.assertIn("data/", r["detail"], "the entry we could not measure must be named")
+
     def test_a_shipped_entry_with_nothing_on_disk_is_still_reported(self):
         # The coverage test can only speak when something is materialized. An entry
         # the local config omits and that has NOTHING under it yet has no outcome to
