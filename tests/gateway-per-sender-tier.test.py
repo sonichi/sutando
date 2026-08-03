@@ -40,7 +40,7 @@ rgb.LOCAL_TIER = "owner"
 
 def _write_map(m):
     ACCESS.write_text(json.dumps({"allowFrom": ["@qingyun:ag2.space"], "tierMap": m}))
-    rgb._TIER_MAP_CACHE["mtime"] = None  # force re-read (mtime granularity is coarse)
+    rgb._TIER_MAP_CACHE["ident"] = None  # force re-read (mtime granularity is coarse)
 
 
 # 1. named teammate is down-tiered by user_id
@@ -64,12 +64,12 @@ check("'other' tier honored", rgb._tier_for("@stranger:ag2.space") == "other")
 
 # 6. missing file → LOCAL_TIER (fail-soft, no crash)
 ACCESS.unlink()
-rgb._TIER_MAP_CACHE["mtime"] = None
+rgb._TIER_MAP_CACHE["ident"] = None
 check("missing access.json → LOCAL_TIER", rgb._tier_for("@rick:ag2.space") == "owner")
 
 # 7. malformed JSON → LOCAL_TIER (fail-soft)
 ACCESS.write_text("{ not json ]")
-rgb._TIER_MAP_CACHE["mtime"] = None
+rgb._TIER_MAP_CACHE["ident"] = None
 check("malformed access.json → LOCAL_TIER", rgb._tier_for("@rick:ag2.space") == "owner")
 
 # 8. live update: adding a teammate is picked up without reload (mtime cache)
@@ -139,7 +139,7 @@ check("owner-default node: unlisted sender still owner (no regression)",
 _write_map({"@rick:ag2.space": "team"})
 assert rgb._tier_for("@rick:ag2.space") == "team"  # prime the cache with a good read
 ACCESS.write_text("{ corrupt not json ]")           # file now unparseable
-rgb._TIER_MAP_CACHE["mtime"] = -1                    # force a re-read attempt (hits except)
+rgb._TIER_MAP_CACHE["ident"] = None                    # force a re-read attempt (hits except)
 check("malformed re-read keeps the down-tier (fail-safe, not fail-open to owner)",
       rgb._tier_for("@rick:ag2.space") == "team")
 
@@ -155,7 +155,7 @@ rgb.LOCAL_TIER = "team"
 _write_map({"@dana:ag2.space": "owner"})
 assert rgb._tier_for("@dana:ag2.space") == "owner"   # prime cache with the grant
 ACCESS.unlink()
-rgb._TIER_MAP_CACHE["mtime"] = -1                     # force re-read → OSError path
+rgb._TIER_MAP_CACHE["ident"] = None                     # force re-read → OSError path
 check("deleting access.json REVOKES an escalated sender (no stale owner)",
       rgb._tier_for("@dana:ag2.space") == "team")
 
@@ -163,7 +163,7 @@ check("deleting access.json REVOKES an escalated sender (no stale owner)",
 _write_map({"@rick:ag2.space": "other"})
 assert rgb._tier_for("@rick:ag2.space") == "other"
 ACCESS.unlink()
-rgb._TIER_MAP_CACHE["mtime"] = -1
+rgb._TIER_MAP_CACHE["ident"] = None
 check("stale cache still preserves a DOWN-tier (fail-safe not broken)",
       rgb._tier_for("@rick:ag2.space") == "other")
 
@@ -171,7 +171,7 @@ check("stale cache still preserves a DOWN-tier (fail-safe not broken)",
 _write_map({"@dana:ag2.space": "owner", "@rick:ag2.space": "other"})
 assert rgb._tier_for("@dana:ag2.space") == "owner"
 ACCESS.write_text("{ corrupt ]")
-rgb._TIER_MAP_CACHE["mtime"] = -1
+rgb._TIER_MAP_CACHE["ident"] = None
 check("malformed read drops the escalation", rgb._tier_for("@dana:ag2.space") == "team")
 check("malformed read keeps the down-tier", rgb._tier_for("@rick:ag2.space") == "other")
 
@@ -207,6 +207,49 @@ check("unlisted sender does NOT register owner-presence on a team node",
       not OWNER_ACT.exists())
 rgb.LOCAL_TIER = _prev_local
 
-_total = 24
+# --- same-mtime revocation (john-the-dev [P1] on #2584, reproduced then fixed) ---
+# The cache used to key on float os.path.getmtime(). A rewrite landing in the same
+# second — or one whose mtime is restored via os.utime — compared EQUAL, so the
+# cached map was served verbatim. Harmless while the map could only down-tier; once
+# it can grant ABOVE LOCAL_TIER a REVOKED owner grant survives.
+#
+# NOTE: these rewrites reuse the SAME envelope as _write_map (allowFrom + tierMap).
+# An earlier draft dropped allowFrom, which changed st_size — so the size component
+# caught the staleness and the tests passed even with the above-local guard removed,
+# i.e. they did not exercise the path they claimed. Keep the envelope identical.
+import os as _os
+
+def _rewrite_same_identity(tier_map):
+    """Rewrite access.json preserving the envelope, then restore mtime exactly."""
+    st = _os.stat(ACCESS)
+    ACCESS.write_text(json.dumps({"allowFrom": ["@qingyun:ag2.space"], "tierMap": tier_map}))
+    _os.utime(ACCESS, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+_prev_local = rgb.LOCAL_TIER
+rgb.LOCAL_TIER = "team"
+
+# 25. SAME size, SAME mtime_ns, SAME inode -> identity collides exactly; only the
+# above-local re-read can catch the revocation. owner->other keeps byte length.
+_write_map({"@dana:ag2.space": "owner"})
+assert rgb._tier_for("@dana:ag2.space") == "owner"           # prime the grant
+_rewrite_same_identity({"@dana:ag2.space": "other"})
+check("identity-colliding rewrite does NOT serve a revoked owner grant",
+      rgb._tier_for("@dana:ag2.space") == "other")
+
+# 26. full revocation to an empty map under a restored mtime
+_write_map({"@dana:ag2.space": "owner"})
+assert rgb._tier_for("@dana:ag2.space") == "owner"
+_rewrite_same_identity({})
+check("same-mtime revocation to an empty map drops the grant",
+      rgb._tier_for("@dana:ag2.space") == "team")
+
+# 27. a NON-escalating cache still uses the identity shortcut (no perf regression)
+_write_map({"@rick:ag2.space": "team"})
+assert rgb._tier_for("@rick:ag2.space") == "team"
+check("cache identity shortcut still serves a non-escalating map",
+      rgb._tier_for("@rick:ag2.space") == "team")
+rgb.LOCAL_TIER = _prev_local
+
+_total = 27
 print(f"\nResults: {_total - len(failures)}/{_total} passed" if not failures else f"\nResults: FAILED {failures}")
 sys.exit(1 if failures else 0)

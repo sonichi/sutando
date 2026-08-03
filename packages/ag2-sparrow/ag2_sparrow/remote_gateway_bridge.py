@@ -539,7 +539,13 @@ def _ag2space_access_path():
 # validating a mapped value. It no longer CLAMPS — see _tier_for.
 _TIER_RANK = {"other": 0, "team": 1, "owner": 2}
 
-_TIER_MAP_CACHE = {"mtime": None, "map": {}}
+_TIER_MAP_CACHE = {"ident": None, "map": {}}
+
+
+def _has_above_local(cached) -> bool:
+    """True if the cached map grants anyone a tier ABOVE this node's LOCAL_TIER."""
+    local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
+    return any(_TIER_RANK.get(v, 0) > local_rank for v in cached.values())
 
 
 def _stale_safe(cached):
@@ -575,11 +581,20 @@ def _load_tier_map():
     tradeoff — the map floor never drops on a transient fault)."""
     path = _ag2space_access_path()
     try:
-        mt = os.path.getmtime(path)
+        st = os.stat(path)
     except OSError:
         # Absent/unstattable → keep last-known-good (initially {} before any load).
         return _stale_safe(_TIER_MAP_CACHE["map"])
-    if mt == _TIER_MAP_CACHE["mtime"]:
+    # Cache identity is (mtime_ns, size, inode), NOT float mtime. A float mtime
+    # collides under a same-second rewrite and can be restored outright with
+    # os.utime, which would serve a REVOKED grant from cache — reproduced on
+    # #2584 (rewrite to {"tierMap":{}}, restore st_mtime_ns, still resolved owner).
+    ident = (st.st_mtime_ns, st.st_size, st.st_ino)
+    # Belt-and-braces: never serve an ABOVE-LOCAL grant from cache without a fresh
+    # read. Identity can still be forged deliberately; a revoked escalation must not
+    # survive that. Costs one small read per call only while an escalation is
+    # cached — discord's loader has no cache at all and re-reads every message.
+    if ident == _TIER_MAP_CACHE["ident"] and not _has_above_local(_TIER_MAP_CACHE["map"]):
         # File present and UNCHANGED — this cache is current, not stale. Return it
         # verbatim: projecting here would drop a legitimate up-tier on every call.
         return _TIER_MAP_CACHE["map"]
@@ -595,7 +610,7 @@ def _load_tier_map():
         # Malformed / mid-write → keep last-known-good; don't advance mtime so a
         # later successful read of the fixed file is still picked up.
         return _stale_safe(_TIER_MAP_CACHE["map"])
-    _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = mt, tm
+    _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = ident, tm
     return tm
 
 
