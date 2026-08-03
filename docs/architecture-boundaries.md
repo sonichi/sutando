@@ -105,6 +105,23 @@ Disallowed:
 Shared behavior needed by multiple adapters belongs in core only when it is
 provider-neutral. Otherwise it belongs in an adapter library.
 
+### Optional adapter capabilities
+
+Optional capability discovery also remains at the adapter edge. A generic
+core helper may run an injected script path and standardize timeout/failure
+semantics, but it must not name, locate, or import a concrete skill. This keeps
+the dependency direction adapter → helper while preserving the rule that core
+does not depend on installed skills.
+
+### Shared adapter policy
+
+Provider-neutral workspace-state policy must have one dependency-light core
+implementation. Adapters pass the resolved workspace into that implementation
+and retain only provider-specific receive, send, threading, and formatting
+mechanics. For example, `src/presenter_mode.py` owns the presenter sentinel path
+and expiry semantics; Discord, Slack, Telegram, and notification jobs decide
+what delivery to suppress when that policy reports active.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known

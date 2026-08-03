@@ -73,8 +73,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
+from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
+from presenter_mode import presenter_mode_active  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -428,20 +430,16 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     Optional — if the skill is absent the caller falls back to [File attached:].
     Errors are swallowed; transcription failure must never block task delivery.
     """
-    import subprocess
-    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
-    if not skill_script.exists():
-        return None
-    try:
-        result = subprocess.run(
-            [sys.executable, str(skill_script), local_path],
-            capture_output=True, text=True, timeout=25,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    except Exception as e:
-        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
-    return None
+    skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    return _run_optional_script_shared(
+        skill_script,
+        [local_path],
+        timeout=25,
+        on_error=lambda exc: print(
+            f"  [stt] skill call failed for {os.path.basename(local_path)}: {exc}",
+            flush=True,
+        ),
+    )
 
 
 def _safe_attachment_basename(filename: str) -> str:
@@ -488,30 +486,6 @@ def _ref_from_attachment(att, local_path) -> "local_task_protocol.AttachmentRef"
         size=(getattr(att, "size", 0) or 0),
     )
 
-
-# Presenter mode: when scripts/presenter-mode.sh is active, the bridge
-# must not send proactive DMs to the owner. The sentinel contains an
-# ISO-8601 expiry; see scripts/presenter-mode.sh for the contract.
-# Matches the check in src/check-pending-questions.py — both scripts
-# share the same sentinel path + comparison logic.
-PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
-
-
-def presenter_mode_active():
-    if not PRESENTER_SENTINEL.exists():
-        return False
-    try:
-        expire_iso = PRESENTER_SENTINEL.read_text().strip()
-        # Require an ISO-8601-ish prefix (starts with a digit). Without
-        # this guard, malformed sentinel content like "garbage" compares
-        # LESS than any real now_iso ("2" < "g" in ASCII) and the mode
-        # fails OPEN — appears active forever.
-        if not expire_iso or not expire_iso[0].isdigit():
-            return False
-        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        return now_iso < expire_iso
-    except Exception:
-        return False
 
 # Optional: deterministic ownership for team/other-tier tasks across nodes.
 # When set, only the node whose stand-identity.json `machine` field matches
@@ -761,14 +735,13 @@ def ensure_tier_map_seeded() -> bool:
     # access-control file BEFORE writing, so a disk-full / interrupt / partial
     # write can destroy allowFrom — and with fail-closed tier resolution that
     # locks legitimate owners out against a corrupt file, at bridge startup.
-    # Write a sibling temp, chmod it, then os.replace() atomically (mirrors the
+    # Write a sibling temp BORN 0600 (write_private_text), then os.replace() (mirrors the
     # pairing path + the #2222 owner-activity fix). The pid+uuid suffix avoids
     # colliding with a concurrent pairing-path .tmp; on any failure the original
     # access.json bytes are left intact and the orphan temp is removed.
     tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
-        os.chmod(tmp, 0o600)
+        write_private_text(tmp, json.dumps(data, indent=2) + "\n")
         os.replace(tmp, ACCESS_FILE)
         _backup_access_to_disk(data)  # durable backup on every valid access write
         print(f"  [tier-map] grandfathered {len(allow)} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
@@ -2964,7 +2937,7 @@ async def _handle_discord_message(message, force=False):
                     # change also closes the lost-update race with the
                     # `/discord:access` skill's read-modify-write.
                     tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
-                    tmp_path.write_text(json.dumps(access_data, indent=2))
+                    write_private_text(tmp_path, json.dumps(access_data, indent=2))
                     os.replace(tmp_path, ACCESS_FILE)
                     _backup_access_to_disk(access_data)  # pragma: no cover — thread-engage seed write glue; the backup fn is unit-tested. Durable backup on every valid access write
                     # Refresh the gate for THIS message. require_mention was
@@ -3163,8 +3136,7 @@ async def _handle_discord_message(message, force=False):
         # Same pattern the thread-engage seed already uses. chmod the tmp before
         # replace so the final file is never briefly 0644 (it holds owner IDs).
         tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')  # pragma: no cover — async pairing branch; atomicity asserted structurally
-        tmp_path.write_text(json.dumps(access, indent=2))  # pragma: no cover
-        os.chmod(tmp_path, 0o600)  # pragma: no cover
+        write_private_text(tmp_path, json.dumps(access, indent=2))  # pragma: no cover
         os.replace(tmp_path, ACCESS_FILE)  # pragma: no cover
         _backup_access_to_disk(access)  # pragma: no cover — durable backup on every valid access write
         await message.channel.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {code}`")
@@ -4758,7 +4730,7 @@ async def poll_proactive():
         try:
             # Skip sends while presenter-mode is active. Files remain on
             # disk and are sent on a later tick once the sentinel clears.
-            if presenter_mode_active():
+            if presenter_mode_active(REPO):
                 _presenter_log_throttle += 1
                 if _presenter_log_throttle % 20 == 1:  # ~once per 60s
                     pending = sum(
