@@ -132,9 +132,27 @@ cleanup_lock() {
   # The lock is not permanent: the stale-reap above frees it, and the relaunched
   # core is expected to be serving long before LOCK_STALE_S elapses.
   [ "$RESTART_DECIDED" = 1 ] && return 0
-  [ "$(cat "$LOCKDIR/rid" 2>/dev/null || echo '')" = "$RID" ] && rm -rf "$LOCKDIR"
+  own_lock && rm -rf "$LOCKDIR"
 }
-trap cleanup_lock EXIT INT TERM
+
+# Do we still hold the lease we took? The lock directory can be reaped out from
+# under a live holder (a scheduler stall past LOCK_STALE_S is enough), after
+# which $LOCKDIR belongs to the REAPER. Renewing or acting on it then is worse
+# than not renewing at all: we would keep the peer's lock fresh and proceed to
+# restart alongside it — the double restart this lock exists to prevent
+# (qingyun-wu reproduced it on #2334 by SIGSTOPping the holder past the
+# threshold, letting a peer reap, then resuming: both runs restarted).
+own_lock() {
+  [ "$(cat "$LOCKDIR/rid" 2>/dev/null || echo '')" = "$RID" ]
+}
+
+# EXIT alone is not enough on a signal: `cleanup_lock` returns, and bash then
+# RESUMES the interrupted command — the quiet-gate loop keeps running with the
+# lock already released. Signal handlers must terminate explicitly. 128+signo
+# preserves the conventional exit codes.
+trap cleanup_lock EXIT
+trap 'cleanup_lock; exit 130' INT
+trap 'cleanup_lock; exit 143' TERM
 
 # Clear any sentinels from a PRIOR restart so a stale file can't be mistaken for ours.
 # Safe under the lock above: no peer can be mid-decision while we do this.
@@ -199,9 +217,23 @@ else
     # reads the directory's mtime, so the renewal must move the same clock the
     # reaper reads. Writing a sibling `ts` file is what an earlier revision did,
     # and it reintroduced the race documented at the top of this file.
+    # ...but ONLY while we still own it. Renewing a lock we no longer hold keeps
+    # the REAPER's lock fresh and then walks us into a concurrent restart.
+    if ! own_lock; then
+      log "lost the restart lease while waiting (holder is now $(cat "$LOCKDIR/rid" 2>/dev/null || echo 'gone')) — deferring, NOT restarting"
+      exit 4
+    fi
     touch "$LOCKDIR" 2>/dev/null || true
     sleep "$POLL_S"
   done
+fi
+
+# Re-check ownership after the gate and before anything destructive. The wait
+# may have ended by the core going idle rather than by a renewal tick, so the
+# loop's check is not sufficient on its own.
+if ! own_lock; then
+  log "lost the restart lease before prep (holder is now $(cat "$LOCKDIR/rid" 2>/dev/null || echo 'gone')) — deferring, NOT restarting"
+  exit 4
 fi
 
 # ---- Phase 2: prep, direct invocation ------------------------------------

@@ -264,6 +264,42 @@ else
   say FAIL "peer REAPED a live holder's lock (rc=$b_rc) — concurrent destructive restart: $(printf '%s' "$b_out" | grep -i 'reap\|deferr' | tail -1)"
 fi
 
+echo "10. A holder that LOSES its lease must defer, not restart alongside the reaper (qingyun #2334)"
+# His repro: A waits in the healthy gate; A stalls past LOCK_STALE_S (SIGSTOP models
+# a scheduler stall); B legitimately reaps the now-stale lock and acquires it; A
+# resumes. Before the ownership check, A touched B's lock and walked on to prep —
+# both A and B exited 0 and both logged "would exec". Exactly one may decide.
+WS10="$TMP/ws10"; mkws "$WS10"
+printf '{"status":"running","ts":%s}\n' "$(date +%s)" > "$WS10/state/core-status.json"
+( for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+    touch "$WS10/state/cores/$HOST.alive"
+    [ -f "$TMP/ws10_goidle" ] \
+      && printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS10/state/core-status.json" \
+      || printf '{"status":"running","ts":%s}\n' "$(date +%s)" > "$WS10/state/core-status.json"
+    sleep 1
+  done ) >/dev/null 2>&1 &
+keeper10=$!
+( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
+    >"$TMP/ws10_A.out" 2>&1 ) &
+A=$!
+sleep 2                      # let A acquire the lock and enter the gate
+kill -STOP "$A" 2>/dev/null  # stall A past the stale threshold
+sleep 4
+( GR_WS="$WS10" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
+    >"$TMP/ws10_B.out" 2>&1 ) &
+B=$!
+sleep 3                      # B reaps the stale lock and takes it
+kill -CONT "$A" 2>/dev/null  # A resumes holding a lease it no longer owns
+touch "$TMP/ws10_goidle"     # release both from the busy gate
+wait "$A" 2>/dev/null; wait "$B" 2>/dev/null
+kill "$keeper10" 2>/dev/null || true; wait "$keeper10" 2>/dev/null || true
+decisions=$(cat "$TMP/ws10_A.out" "$TMP/ws10_B.out" 2>/dev/null | grep -c "would exec" || true)
+if [ "$decisions" = 1 ]; then
+  say ok "exactly ONE restart decision after a lease loss (the resumed holder deferred)"
+else
+  say FAIL "$decisions restart decisions after a lease loss — concurrent destructive restart: $(grep -h 'would exec\|lost the restart lease' "$TMP/ws10_A.out" "$TMP/ws10_B.out" 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
+fi
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else
