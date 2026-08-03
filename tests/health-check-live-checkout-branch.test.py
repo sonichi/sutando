@@ -257,6 +257,76 @@ def main() -> int:
         check(r["status"] == "ok" and "behind" not in r["detail"],
               f"l) up-to-date -> clean ok, got {r}")
 
+    # Behavioral staleness (added 2026-08-03). The count threshold above is
+    # deliberately 10 and case k) pins that 1 behind stays ok — both correct for
+    # alert fatigue. But a count cannot distinguish one commit that rewrites a
+    # skill from nine that touch docs, and skills are the one case with no other
+    # detector: `src/` needs a restart, so the `*-stale` probes catch it by
+    # comparing a running process to its source; a skill has no process, since
+    # the agent re-reads the markdown from this checkout on every invocation.
+    #
+    # Observed on this node: exactly ONE commit behind, this probe reporting ok,
+    # while the live `context-reconstruct` still instructed writing the shared
+    # flat `state/current-track.md` whose two-writer collision had destroyed a
+    # peer's anchor hours earlier (#2567/#2568).
+    def _mk_clone_behind_paths(td: Path, paths: "list[str]") -> Path:
+        """A clone on `main`, one commit behind per entry in `paths`."""
+        up = _mk_repo(td, "main")
+        work = td / "work"
+        subprocess.run(["git", "clone", "-q", str(up), str(work)],
+                       check=True, capture_output=True)
+        for i, rel in enumerate(paths):
+            f = up / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(f"{i}\n")
+            _git(up, "add", rel)
+            _git(up, "commit", "-q", "-m", f"touch {rel}")
+        _git(work, "fetch", "-q", "origin")
+        return work
+
+    # v1) THE GAP: one commit behind — under the nag threshold, so case k) says
+    #     ok — but it changes a skill the agent reads every invocation.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/context-reconstruct/SKILL.md"])
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "warn",
+              f"v1) 1 behind but it changes skills/ -> warn, got {r['status']}")
+        check("skills/" in r["detail"],
+              f"v1) must name skills/ as the reason, got {r['detail'][:110]}")
+        check("touch skills/context-reconstruct/SKILL.md" in r["detail"],
+              f"v1) must name the actual commit so it is actionable, got {r['detail'][:150]}")
+
+    # v2) Over-trigger control: the same one-commit drift in a path the agent
+    #     does NOT read live must stay ok, or this re-creates the alert fatigue
+    #     the threshold exists to prevent.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["docs/whatever.md"])
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "ok",
+              f"v2) 1 behind touching docs only -> still ok, got {r['status']} / {r['detail'][:90]}")
+
+    # v3) Only NOT-YET-PULLED commits count. A checkout that already contains
+    #     the skill change is current — history is not drift.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        _git(work, "pull", "-q", "--ff-only")
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "ok",
+              f"v3) skill change already pulled -> ok, got {r['status']} / {r['detail'][:90]}")
+
+    # v4) A mixed drift still names only the skill commits, and the count in the
+    #     message is the TOTAL — conflating the two would misstate how far behind
+    #     the checkout actually is.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(
+            Path(td), ["docs/a.md", "skills/one/SKILL.md", "docs/b.md"])
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "warn", f"v4) mixed drift with a skill -> warn, got {r['status']}")
+        check("1 of them change" in r["detail"],
+              f"v4) must count only the skill commits, got {r['detail'][:130]}")
+        check("3 commit(s) behind" in r["detail"],
+              f"v4) must still report the TOTAL behind count, got {r['detail'][:130]}")
+
     # m) No remote ref at all (fresh init, renamed remote) -> degrade to ok.
     #    A probe that cannot answer must not invent an alarm.
     with tempfile.TemporaryDirectory() as td:

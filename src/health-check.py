@@ -1801,6 +1801,29 @@ def _behind_warn_threshold(repo: "Path") -> int:
     return raw if raw > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
 
 
+def _behind_commits_touching(repo: "Path", branch: str, prefix: str,
+                             git_bin: str = "git") -> "list[str]":
+    """Subjects of not-yet-pulled commits that change files under ``prefix``.
+
+    Same last-fetched-ref, no-network contract as `_commits_behind` — and the
+    same honest consequence: a stale local ref makes this UNDER-report, never
+    cry wolf. Returns `[]` on any failure for the same reason: this is an
+    additional signal layered on a probe that must not become the thing that
+    breaks the health run.
+    """
+    try:
+        out = subprocess.run(
+            [git_bin, "-C", str(repo), "log", "--no-merges", "--format=%s",
+             f"HEAD..origin/{branch}", "--", prefix],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
 def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
     """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
 
@@ -1925,6 +1948,36 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           "silence reads as health). Refresh with "
                           f"`git -C {repo} pull --ff-only` + restart. Count is against the "
                           "last-fetched ref; this probe does not fetch."}
+    # Count is the wrong instrument for BEHAVIORAL staleness, and the threshold
+    # above is deliberately 10 to avoid alert fatigue — correctly, since `main`
+    # moves several times a day. But one commit that rewrites a skill outranks
+    # nine that touch docs, and a count cannot tell them apart.
+    #
+    # Skills are the case with no other detector. `src/` needs a restart to take
+    # effect, so the `*-stale` probes catch it by comparing a running process
+    # against its source. A skill has no process: the agent reads the markdown
+    # from THIS checkout on every invocation, so a merged skill fix that has not
+    # been pulled is simply not in effect, with nothing anywhere to compare.
+    #
+    # Observed 2026-08-03 on this node: exactly ONE commit behind — far under the
+    # threshold, so this probe reported ok — while the live `context-reconstruct`
+    # still instructed writing `state/current-track.md`, the shared flat path
+    # whose two-writer collision had destroyed a peer's anchor hours earlier
+    # (#2567/#2568). The running skill and the merged skill disagreed, and both
+    # looked correct from where anyone was standing.
+    stale_skills = _behind_commits_touching(repo, expected, "skills/", git_bin)
+    if stale_skills:
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on {expected!r} and only {behind} commit(s) behind "
+                          f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
+                          f"nag threshold — but {len(stale_skills)} of them change `skills/`, "
+                          "which the agent re-reads from this checkout on EVERY invocation. "
+                          "Those merged skill fixes are not in effect here, and no "
+                          "restart-staleness probe can see it: a skill has no running process "
+                          f"to compare against. ({'; '.join(stale_skills[:3])}"
+                          f"{'; …' if len(stale_skills) > 3 else ''}) Refresh with "
+                          f"`git -C {repo} pull --ff-only`. Measured against the last-fetched "
+                          "ref; this probe does not fetch, so it can only under-report."}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
                       + (f", {behind} commits behind" if behind else "")}
