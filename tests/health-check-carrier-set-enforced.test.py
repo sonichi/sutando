@@ -351,20 +351,72 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertNotIn("fix with `bash scripts/sync-workspace.sh --force-gitignore`", r["detail"],
                          "must never hand back the command that resumes the overwrite")
 
-    def test_the_UNSAFE_carve_out_never_reaches_the_alerting_issue_list(self):
-        # The carve-out's whole safety property is that it does not alert and does
-        # not reach the --fix loop, because that loop's remedy is the command that
-        # resumes the overwrite. `main()` computes `issues` as everything whose
-        # status is not ok/warn, so this pins the classification rather than the
-        # string — if a later change moves the verdict to any other status, this
-        # fails even though the wording still looks right.
+    def _carve_out_result(self):
         ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
                           ["notes/a.md", "state/current-track.md"])
         self._patch_resolved(["notes/", "state/current-track.md"])
         self._patch_shipped(["notes/", "state/current-track.md"])
-        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
-        self.assertIn(r["status"], ("ok", "warn"),
-                      "must stay out of main()'s issues list, which drives alerts and --fix")
+        return self.hc.check_carrier_set_enforced(workspace_dir=ws)
+
+    def test_the_UNSAFE_carve_out_stays_out_of_the_issues_list(self):
+        # Necessary but NOWHERE NEAR sufficient — see the three tests below. This
+        # only pins that the summary/--fix path treats it as a non-issue.
+        r = self._carve_out_result()
+        self.assertIn(r["status"], ("ok", "warn"))
+
+    def test_the_carve_out_does_not_EMIT_A_TASK(self):
+        # The first version of this carve-out asserted "never alerts" and tested
+        # main()'s local `issues` list — which is not what alerts. `--emit-task`
+        # consumes the FULL checks list and counted a plain warn as a failure, so
+        # the state still queued a task for the agent (qingyun-wu, #2570).
+        # Exercise the helper itself.
+        r = self._carve_out_result()
+        tasks = self.tmp / "emit-tasks"
+        tasks.mkdir(exist_ok=True)
+        self.hc.emit_task_for_failures(
+            [r], state_file=self.tmp / "emit-state.json", tasks_dir=tasks)
+        self.assertEqual(sorted(p.name for p in tasks.glob("*.txt")), [],
+                         "a non-actionable transitional state must not queue owner work")
+
+    def test_the_carve_out_does_not_NOTIFY_or_reach_the_owner_DM(self):
+        # notify_for_failures shells out to osascript; record the invocation
+        # instead of firing a real notification at whoever runs the suite. It
+        # also writes its dedup state file only when it actually alerts, so the
+        # absence of that file is a second, independent witness.
+        r = self._carve_out_result()
+        calls = []
+        real_run = self.hc.subprocess.run
+        self.hc.subprocess.run = lambda *a, **kw: calls.append(a) or real_run(
+            ["/usr/bin/true"], capture_output=True)
+        state = self.tmp / "notify-state.json"
+        try:
+            self.hc.notify_for_failures([r], state_file=state)
+        finally:
+            self.hc.subprocess.run = real_run
+        self.assertEqual(calls, [], "a suppressed check must not fire a notification")
+        self.assertFalse(state.exists(), "and must not record an alert transition")
+        self.assertNotIn(r, self.hc._slack_failures([r]),
+                         "nor reach the remote owner DM")
+
+    def test_an_ORDINARY_warn_still_alerts(self):
+        # Over-trigger control. The suppression must be narrow: if it muted every
+        # warn, this fix would trade a false page for a silent failure, which is
+        # strictly worse in a probe whose job is catching silent non-backup.
+        ordinary = {"name": "something-else", "status": "warn", "detail": "a real problem"}
+        tasks = self.tmp / "ordinary-tasks"
+        tasks.mkdir(exist_ok=True)
+        self.hc.emit_task_for_failures(
+            [ordinary], state_file=self.tmp / "ordinary-state.json", tasks_dir=tasks)
+        self.assertEqual(len(list(tasks.glob("*.txt"))), 1,
+                         "an ordinary warn must still reach the owner")
+        self.assertIn(ordinary, self.hc._slack_failures([ordinary]))
+
+    def test_suppression_requires_an_explicit_False(self):
+        # A missing key must alert, so no existing check changes behavior by
+        # omission and a typo cannot silence a real failure.
+        self.assertFalse(self.hc._alerts_suppressed({"status": "warn"}))
+        self.assertFalse(self.hc._alerts_suppressed({"status": "warn", "alerting": True}))
+        self.assertTrue(self.hc._alerts_suppressed({"status": "warn", "alerting": False}))
 
     def test_a_genuinely_stale_SAFE_path_still_fails_with_its_remedy(self):
         # Over-trigger control. The carve-out must not blind the stale branch to
