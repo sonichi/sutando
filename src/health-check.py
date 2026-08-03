@@ -1195,9 +1195,26 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     unsafe = [e for e in dropped if e in UNSAFE_TO_READD]
     safe = [e for e in dropped if e not in UNSAFE_TO_READD]
 
+    # The same carve-out has to reach the STALE branch, and there it inverts the
+    # verdict rather than just softening the wording. A path that must not be
+    # carried and is NOT being carried is in its CORRECT state — reporting that as
+    # a failure whose remedy is `--force-gitignore` would walk the operator into
+    # re-carrying it, which is the cross-host overwrite this carve-out exists to
+    # prevent. Found by running the merged probe on a live host that had
+    # deliberately un-carried the path: it said `fail` and named the exact command
+    # that resumes the incident.
+    stale_expected = [e for e in stale if e in UNSAFE_TO_READD]
+    stale = [e for e in stale if e not in UNSAFE_TO_READD]
+
     if not stale and not dropped and not unmeasured:
-        return {"name": name, "status": "ok",
-                "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault"}
+        detail = f"all {len(resolved)} configured carrier path(s) un-ignored in the vault"
+        if stale_expected:
+            detail = (
+                f"{len(resolved) - len(stale_expected)} configured carrier path(s) un-ignored; "
+                f"{', '.join(stale_expected)} correctly NOT carried (shipped at a flat, shared path — "
+                f"do not `--force-gitignore` it back until #2567 lands)"
+            )
+        return {"name": name, "status": "ok", "detail": detail}
 
     parts = []
     if unmeasured:

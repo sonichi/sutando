@@ -84,14 +84,16 @@ class CarrierSetProbe(unittest.TestCase):
         # THE REGRESSION. Config lists state/current-track.md; the on-disk
         # exclude predates it, so git still ignores the file and the vault is
         # not backing it up. This must fail loudly, not read healthy.
+        # Uses `hosts/*/`, not `state/current-track.md`: this test is about STALE
+        # DETECTION, and that path now routes to the must-not-be-carried carve-out.
         ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
-                          ["notes/a.md", "state/current-track.md"])
-        self._patch_resolved(["notes/", "state/current-track.md"])
-        self._patch_shipped(["notes/", "state/current-track.md"])
+                          ["notes/a.md", "hosts/h/pending-questions.md"])
+        self._patch_resolved(["notes/", "hosts/*/"])
+        self._patch_shipped(["notes/", "hosts/*/"])
         r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
         self.assertIsNotNone(r, "probe returned None on a genuinely stale carrier set")
         self.assertEqual(r["status"], "fail")
-        self.assertIn("state/current-track.md", r["detail"])
+        self.assertIn("hosts/*/", r["detail"])
         self.assertIn("--force-gitignore", r["detail"], "must name the remedy")
 
     def test_a_TRACKED_file_with_a_stale_exclude_is_still_reported(self):
@@ -101,18 +103,20 @@ class CarrierSetProbe(unittest.TestCase):
         # host that carried the file once, then had its exclude go stale, read
         # healthy forever — the probe was blind to precisely the population it
         # was written for. `--no-index` is what makes the answer about the RULES.
+        # Safe path for the same reason as above — the assertion is about
+        # --no-index, not about which file is involved.
         ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
-                          ["notes/a.md", "state/current-track.md"])
-        subprocess.run(["git", "-C", str(ws), "add", "-f", "state/current-track.md"],
+                          ["notes/a.md", "hosts/h/pending-questions.md"])
+        subprocess.run(["git", "-C", str(ws), "add", "-f", "hosts/h/pending-questions.md"],
                        check=True, capture_output=True)
-        self._patch_resolved(["notes/", "state/current-track.md"])
-        self._patch_shipped(["notes/", "state/current-track.md"])
+        self._patch_resolved(["notes/", "hosts/*/"])
+        self._patch_shipped(["notes/", "hosts/*/"])
         r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
         self.assertIsNotNone(r)
         self.assertEqual(r["status"], "fail",
                          "a tracked file with a stale exclude must still report — "
                          "check-ignore without --no-index answers about the index, not the rules")
-        self.assertIn("state/current-track.md", r["detail"])
+        self.assertIn("hosts/*/", r["detail"])
 
     def test_an_enforced_carrier_set_reads_ok(self):
         # Over-trigger control. If this ever fails, the probe cries wolf on every
@@ -310,6 +314,46 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIn("hosts/*/", r["detail"])
         self.assertIn("add them to the local list", r["detail"])
         self.assertNotIn("must NOT be re-added", r["detail"])
+
+    def test_an_UNSAFE_path_that_is_NOT_carried_is_correct_not_a_failure(self):
+        # Found by running the merged probe on a live host. That host had
+        # deliberately un-carried `state/current-track.md` to stop overwriting a
+        # peer's anchor — the RIGHT state — and the probe reported `fail` with the
+        # remedy `--force-gitignore`, i.e. the exact command that re-carries it and
+        # resumes the cross-host overwrite.
+        #
+        # #2566 gave the dropped branch this carve-out; the stale branch never got
+        # it. Here it must INVERT the verdict, not just soften the wording: not
+        # carrying a path that must not be carried is success.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "state/current-track.md"])
+        self._patch_resolved(["notes/", "state/current-track.md"])
+        self._patch_shipped(["notes/", "state/current-track.md"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok",
+                         "an unsafe-to-carry path that is not carried is the correct state")
+        self.assertIn("correctly NOT carried", r["detail"])
+        # The command name legitimately appears as a PROHIBITION ("do not
+        # `--force-gitignore` it back"). Asserting its mere absence would forbid
+        # the warning as well as the instruction — what must never appear is the
+        # INSTRUCTIONAL form the stale branch hands out.
+        self.assertIn("do not `--force-gitignore`", r["detail"])
+        self.assertNotIn("fix with `bash scripts/sync-workspace.sh --force-gitignore`", r["detail"],
+                         "must never hand back the command that resumes the overwrite")
+
+    def test_a_genuinely_stale_SAFE_path_still_fails_with_its_remedy(self):
+        # Over-trigger control. The carve-out must not blind the stale branch to
+        # the case the whole probe exists for.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "hosts/h/pending-questions.md"])
+        self._patch_resolved(["notes/", "hosts/*/"])
+        self._patch_shipped(["notes/", "hosts/*/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "fail")
+        self.assertIn("hosts/*/", r["detail"])
+        self.assertIn("--force-gitignore", r["detail"], "the real remedy must survive")
 
     def test_the_probe_is_registered_in_the_run_list(self):
         # A probe nobody calls cannot report anything. This is the assertion
