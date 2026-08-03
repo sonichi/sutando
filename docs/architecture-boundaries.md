@@ -190,6 +190,27 @@ the delegation and the ordering, and scans the store for the legacy table names
 and transaction verbs while deliberately still permitting current-schema
 `CREATE TABLE`.
 
+## Transport vs request domain
+
+A transport (socket server, HTTP handler, message consumer) owns framing, connection
+lifecycle and daemon composition. It must not own authorization, policy or durable
+state transitions — when it does, the security rules can only be exercised by
+driving the transport, and any second transport is free to reimplement them
+differently.
+
+Worked example, `src/runtime-api/server.py` → `src/runtime-api/dispatcher.py`:
+
+> `server.py` owns Unix-socket transport and daemon composition. JSON-RPC method
+> dispatch, approval/elicitation validation, governed-capability authorization,
+> idempotency and durable request transitions belong in `dispatcher.py`. Actor
+> identity is resolved daemon-side and passed in explicitly; a client parameter
+> must never override it.
+
+The dependencies are ordinary constructor arguments (store, human-action adapter,
+actor, executor map) — no injection framework. Note the executor map must be *read*
+from the instance, not from the module global, or the argument is decorative and a
+caller injecting fakes silently gets the real executors.
+
 ## Skill-internal boundaries
 
 The core/adapter/skill split is not the only boundary that matters. A large skill
