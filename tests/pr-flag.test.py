@@ -24,7 +24,8 @@ spec.loader.exec_module(pf)
 
 
 def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=False,
-        title="t", head=None, approvers=(), stale_approvers=()):
+        title="t", head=None, approvers=(), stale_approvers=(), base="main",
+        extra_reviews=()):
     head = head or f"head-{number}"
     rollup = []
     if ci == "green":
@@ -37,11 +38,13 @@ def _pr(number, author, review="", ci="green", mergeable="MERGEABLE", draft=Fals
         "number": number, "title": title, "author": {"login": author},
         "reviewDecision": review, "statusCheckRollup": rollup,
         "headRefOid": head, "mergeable": mergeable, "isDraft": draft,
+        "baseRefName": base,
         "reviews": [
             *[{"author": {"login": a}, "state": "APPROVED", "commit": {"oid": head}}
               for a in approvers],
             *[{"author": {"login": a}, "state": "APPROVED", "commit": {"oid": "old-head"}}
               for a in stale_approvers],
+            *extra_reviews,
         ],
     }
 
@@ -79,7 +82,8 @@ def main() -> int:
     # objective fields, NO judgement fields (no court/why/ready/held)
     assert set(got) == {10, 11, 12, 13}, "draft excluded, rest present"
     for s in st:
-        assert set(s) == {"number", "title", "author", "is_mine", "head", "ci", "mergeable", "review", "approvals"}, s
+        assert set(s) == {"number", "title", "author", "is_mine", "base", "head", "ci",
+                          "mergeable", "review", "approvals", "approvals_standing"}, s
         assert "court" not in s and "why" not in s and "ready" not in s, "script must emit NO judgement: " + str(s)
     print("  ok  raw_state emits objective fields only — no judgement")
 
@@ -133,6 +137,99 @@ def main() -> int:
         "only each reviewer's latest effective current-head formal state counts"
     )
     print("  ok  dedup hash flips on ci / approvals / head; effective current-head approvals counted")
+
+    # ---- the enforced gate needs a SECOND approval count -------------------
+    # `approvals` is head-anchored. This repo's rules are not: both surfaces read
+    # `dismiss_stale_reviews = false` on 2026-08-02, so a stale approval still
+    # counts toward the two required. Emitting only the strict number fails in
+    # exactly ONE direction -- false not-ready -- which never contradicts itself,
+    # so nothing downstream can notice. It produced a published merge-ready count
+    # of 8 against a true 15 that day.
+    two_stale = pf.raw_state([_pr(20, "peer", stale_approvers=["a", "b"])], OWNER)[0]
+    assert two_stale["approvals"] == 0, "head-anchored count must still ignore stale approvals"
+    assert two_stale["approvals_standing"] == 2, (
+        "the enforced gate counts stale approvals; without this the PR reads not-ready")
+    # Control: the two numbers are NOT merely aliases of each other.
+    two_fresh = pf.raw_state([_pr(21, "peer", approvers=["a", "b"])], OWNER)[0]
+    assert two_fresh["approvals"] == two_fresh["approvals_standing"] == 2, two_fresh
+    none_at_all = pf.raw_state([_pr(22, "peer")], OWNER)[0]
+    assert none_at_all["approvals"] == none_at_all["approvals_standing"] == 0, none_at_all
+    print("  ok  approvals_standing counts stale approvals; approvals still does not")
+
+    # A CHANGES_REQUESTED that was later converted AT AN OLDER COMMIT must stop
+    # counting against the PR -- latest-per-author, not any-CR-ever.
+    converted = _pr(23, "peer", stale_approvers=["b"], extra_reviews=[
+        {"author": {"login": "a"}, "state": "CHANGES_REQUESTED",
+         "submittedAt": "2026-08-02T01:00:00Z", "commit": {"oid": "old-head"}},
+        {"author": {"login": "a"}, "state": "APPROVED",
+         "submittedAt": "2026-08-02T02:00:00Z", "commit": {"oid": "old-head"}},
+    ])
+    assert pf.raw_state([converted], OWNER)[0]["approvals_standing"] == 2, (
+        "a converted CHANGES_REQUESTED must count as that reviewer's approval")
+    still_blocked = _pr(24, "peer", stale_approvers=["b"], extra_reviews=[
+        {"author": {"login": "a"}, "state": "APPROVED",
+         "submittedAt": "2026-08-02T01:00:00Z", "commit": {"oid": "old-head"}},
+        {"author": {"login": "a"}, "state": "CHANGES_REQUESTED",
+         "submittedAt": "2026-08-02T02:00:00Z", "commit": {"oid": "old-head"}},
+    ])
+    assert pf.raw_state([still_blocked], OWNER)[0]["approvals_standing"] == 1, (
+        "a LATER changes-request must revoke that reviewer's earlier approval")
+    print("  ok  latest-per-author applies to the standing count in both directions")
+
+    # ---- base is emitted, and a stacked PR is distinguishable ---------------
+    # #2420 targets #2419's branch, so mergeable + approved says nothing about
+    # main. Without `base` in the payload the agent cannot see that at all.
+    stacked = pf.raw_state([_pr(25, "peer", approvers=["a", "b"],
+                                base="fix/resolved-divider-anchor")], OWNER)[0]
+    assert stacked["base"] == "fix/resolved-divider-anchor", stacked
+    assert pf.raw_state([_pr(26, "peer")], OWNER)[0]["base"] == "main"
+    print("  ok  base (baseRefName) is emitted; a stacked PR is distinguishable from a main one")
+
+    # ---- dedup: the two new fields are actionable, so they must refire ------
+    base_h = pf.state_hash(pf.raw_state([_pr(30, "peer", stale_approvers=["a"])], OWNER))
+    gained = pf.state_hash(pf.raw_state([_pr(30, "peer", stale_approvers=["a", "b"])], OWNER))
+    assert gained != base_h, (
+        "a second STANDING approval makes a PR mergeable and must wake the agent; "
+        "head-anchored `approvals` does not move here, which is why it was missed")
+    rebased = pf.state_hash(pf.raw_state([_pr(30, "peer", stale_approvers=["a"], base="other")], OWNER))
+    assert rebased != base_h, "a base change must refire"
+    print("  ok  dedup hash flips on approvals_standing and on base")
+
+    # ---- a malformed review node must be IGNORED, not counted, not fatal ----
+    # GitHub can return a review whose `author` is null -- a deleted account, or a
+    # review left by an app/integration that no longer resolves. There is no login
+    # to key a latest-per-author map on, so the row is skipped. Both counts pass
+    # through the same skip, so a malformed node cannot inflate one and not the
+    # other, and it must not abort state collection for the whole repo either.
+    malformed = _pr(40, "peer", approvers=["a"], extra_reviews=[
+        {"author": None, "state": "APPROVED",
+         "submittedAt": "2026-08-02T03:00:00Z", "commit": {"oid": "head-40"}},
+        {"author": {}, "state": "APPROVED",
+         "submittedAt": "2026-08-02T03:00:00Z", "commit": {"oid": "old-head"}},
+        {"author": {"login": ""}, "state": "CHANGES_REQUESTED",
+         "submittedAt": "2026-08-02T04:00:00Z", "commit": {"oid": "head-40"}},
+    ])
+    got_bad = pf.raw_state([malformed], OWNER)[0]
+    assert got_bad["approvals"] == 1, (
+        f"an authorless APPROVED must not inflate the head-anchored count: {got_bad}")
+    assert got_bad["approvals_standing"] == 1, (
+        f"...nor the standing count, which admits older commits: {got_bad}")
+    # The empty-login CHANGES_REQUESTED is the discriminating half: if the skip were
+    # keyed on `author is None` rather than on a falsy login, it would land in the
+    # map under "" and silently revoke a real approval.
+    # ...and the record is still COMPLETE: a malformed node must not abort or
+    # truncate state collection, which is the "not fatal" half of the claim.
+    assert set(got_bad) == {"number", "title", "author", "is_mine", "base", "head", "ci",
+                            "mergeable", "review", "approvals", "approvals_standing"}, got_bad
+    # Control: the same fixture with a REAL login does move the counts, so the
+    # assertions above are about the missing login and not about the fixture.
+    named = _pr(41, "peer", approvers=["a"], extra_reviews=[
+        {"author": {"login": "b"}, "state": "APPROVED",
+         "submittedAt": "2026-08-02T03:00:00Z", "commit": {"oid": "head-41"}},
+    ])
+    got_named = pf.raw_state([named], OWNER)[0]
+    assert got_named["approvals"] == 2 and got_named["approvals_standing"] == 2, got_named
+    print("  ok  a review with no author.login is skipped by BOTH counts, and is not fatal")
 
     # empty repo → empty state, stable hash
     assert pf.raw_state([], OWNER) == []

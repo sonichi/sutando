@@ -34,6 +34,8 @@ Walk this list top-to-bottom and stop at the first match:
 
 If two layers seem to fit, prefer the more specific one (skill > core). If you're patching a bug, keep the patch in the layer where the bug lives — don't smuggle a refactor into a fix commit.
 
+**Presentation modules don't own domain/storage policy.** Dashboard HTTP handlers and rendering code must delegate schedule parsing, validation and atomic `crons.json` mutation to `src/dashboard_schedules.py`. Schedule mutations must remain locked read-modify-write operations; do not rebuild cron validation or persistence inside a route. The adapter resolves the path (`_crons_path()` — workspace + host label); the domain module receives it. Enforced by `tests/dashboard-schedule-delegation.test.py`. See [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md) "Presentation adapters vs domain/storage".
+
 ## Repo rules
 
 Before creating a PR, check `gh pr list --state open` for an existing PR on the same topic. If one exists, push to its branch instead of creating a new PR.
