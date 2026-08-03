@@ -2,16 +2,19 @@
 # The health-check launchd installer must pick an interpreter that can actually
 # RUN health-check.py, not merely one that exists.
 #
-# 2026-08-03, measured on a live host: `resolve_python` preferred
+# 2026-08-03, measured on a live host: `resolve_python` returned
 # /opt/homebrew/bin/python3, which was 3.14.5 with a pyexpat/libexpat symbol
 # mismatch — `import plistlib` died, so health-check could not start at all.
-# /usr/bin/python3 (3.9.6) ran it fine. The preference order was exactly
-# inverted from what worked, and the job this installs is the OS-level net that
-# catches a wedged or dead session: the one component whose failure nothing else
-# watches. It would have failed every 300s into a log nobody reads while
-# `--status` still reported it loaded.
+# resolve_python only asks whether an interpreter EXISTS, and the job it
+# installs is the OS-level net that catches a wedged or dead session: the one
+# component whose failure nothing else watches. It would have failed every 300s
+# into a log nobody reads while `--status` still reported it loaded.
 #
-# These cases drive the REAL resolve_python with stub interpreters injected via
+# `resolve_python_verified` wraps it with a probe. Note the fallback list is
+# deliberately NOT extended with /usr/bin/python3: per REVIEW.md lesson 7 that
+# is the Xcode-CLT stub, which exists whether or not the tools do.
+#
+# These cases drive the REAL resolve_python_verified with stub interpreters injected via
 # $SUTANDO_PYTHON_CANDIDATES, so they assert the selection logic rather than
 # whatever happens to be installed on the machine running the suite.
 #
@@ -45,13 +48,18 @@ mk_bad  "$box/broken2"
 mk_good "$box/good1"
 mk_good "$box/good2"
 
-# Extract resolve_python and drive it directly. The script dispatches on "$1" at
+# Extract probe_python AND resolve_python_verified and drive them directly.
+# Both are needed: the resolver calls the probe, and an undefined probe would
+# fail every candidate (127) — which looks exactly like 'every interpreter is
+# broken' and would make these cases pass for the wrong reason. The script dispatches on "$1" at
 # the bottom (no main-guard), so it cannot simply be sourced.
 run_resolve() {
     SUTANDO_PYTHON_CANDIDATES="$1" REPO="$REPO" bash -c "
         REPO='$REPO'
-        $(sed -n '/^resolve_python()/,/^}$/p' "$SCRIPT")
-        resolve_python
+        $(sed -n '/^probe_python()/,/^}$/p' "$SCRIPT")
+        $(sed -n '/^probe_python()/,/^}$/p' "$SCRIPT")
+    $(sed -n '/^resolve_python_verified()/,/^}$/p' "$SCRIPT")
+        resolve_python_verified
     " 2>/dev/null
 }
 
@@ -69,7 +77,7 @@ check "skips a broken candidate and takes the next working one" \
 check "skips SEVERAL broken candidates" \
       "$(run_resolve "$box/broken1 $box/broken2 $box/good2")" "$box/good2"
 
-# The real host shape: broken Homebrew first, working system python later.
+# The real host shape: a broken preferred interpreter, a working one after it.
 check "a broken preferred interpreter does not win over a working later one" \
       "$(run_resolve "$box/broken1 $box/good1 $box/good2")" "$box/good1"
 
@@ -81,8 +89,9 @@ check "all candidates broken -> falls back to the first, does not refuse" \
 
 warned=$(SUTANDO_PYTHON_CANDIDATES="$box/broken1 $box/broken2" bash -c "
     REPO='$REPO'
-    $(sed -n '/^resolve_python()/,/^}$/p' "$SCRIPT")
-    resolve_python
+    $(sed -n '/^probe_python()/,/^}$/p' "$SCRIPT")
+    $(sed -n '/^resolve_python_verified()/,/^}$/p' "$SCRIPT")
+    resolve_python_verified
 " 2>&1 >/dev/null | grep -c "WARNING")
 check "all-broken fallback WARNS (a silent broken install is the bug)" \
       "$([ "$warned" -ge 1 ] && echo yes || echo no)" "yes"
@@ -95,16 +104,18 @@ check "a non-existent path is skipped, not treated as broken" \
 
 noise=$(SUTANDO_PYTHON_CANDIDATES="$box/does-not-exist $box/good1" bash -c "
     REPO='$REPO'
-    $(sed -n '/^resolve_python()/,/^}$/p' "$SCRIPT")
-    resolve_python
+    $(sed -n '/^probe_python()/,/^}$/p' "$SCRIPT")
+    $(sed -n '/^resolve_python_verified()/,/^}$/p' "$SCRIPT")
+    resolve_python_verified
 " 2>&1 >/dev/null | grep -c "does-not-exist")
 check "a non-existent path produces no note" "$noise" "0"
 
 # The same interpreter listed twice must be probed once.
 dupes=$(SUTANDO_PYTHON_CANDIDATES="$box/broken1 $box/broken1 $box/good1" bash -c "
     REPO='$REPO'
-    $(sed -n '/^resolve_python()/,/^}$/p' "$SCRIPT")
-    resolve_python
+    $(sed -n '/^probe_python()/,/^}$/p' "$SCRIPT")
+    $(sed -n '/^resolve_python_verified()/,/^}$/p' "$SCRIPT")
+    resolve_python_verified
 " 2>&1 >/dev/null | grep -c "broken1")
 check "a duplicate candidate is probed once, not twice" "$dupes" "1"
 

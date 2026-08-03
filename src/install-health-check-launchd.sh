@@ -89,89 +89,91 @@ bootout_if_loaded() {
 }
 
 resolve_python() {
-    # Pick an interpreter that can ACTUALLY RUN health-check.py, by running it.
-    #
-    # This used to pick the first interpreter that EXISTS, preferring Homebrew
-    # because "/usr/bin/python3 is 3.9 on older Macs and health-check.py uses
-    # 3.10+ syntax". Existing is not the same as working, and the job this
-    # installs is the OS-level net that catches a wedged or dead session — the
-    # one component whose failure nothing else is watching. Pointing it at a
-    # broken interpreter installs a job that fails every 300s into a log file
-    # nobody reads, while `--status` still reports it loaded.
-    #
-    # Measured on a live host 2026-08-03:
-    #     /opt/homebrew/bin/python3  3.14.5  -> ImportError: pyexpat (dlopen,
-    #                                           libexpat symbol mismatch), so
-    #                                           `import plistlib` dies and
-    #                                           health-check cannot start
-    #     /usr/bin/python3           3.9.6   -> runs health-check fine
-    # The preference order was exactly inverted from what worked, and the 3.10+
-    # rationale no longer holds: health-check.py compiles and runs on 3.9.6.
-    #
-    # Keep the preference order — Homebrew first is still right when it works —
-    # but require each candidate to pass a probe before accepting it.
-    #
-    # The probe IMPORTS health-check.py without executing it. `main()` is behind
-    # `if __name__ == "__main__"`, so loading the module exercises the whole
-    # import chain — which is where the failure is — and runs no checks.
-    #
-    # Two probes that look right and are not:
-    #   - `py_compile`: the file compiles fine under the broken interpreter.
-    #     The failure is dlopen of a C extension at IMPORT time, not syntax.
-    #   - `health-check.py --help`: there is no --help. The script ignores it
-    #     and runs the FULL check, which is slow, touches the workspace, and
-    #     exits non-zero on any unhealthy host — so a healthy interpreter on an
-    #     unhealthy host would be rejected. (Found by running it: it reported
-    #     missing .env / build_log for the probe's own working tree.)
-    __probe_python() {
-        [ -n "${1:-}" ] && [ -x "$1" ] || return 1
-        "$1" - "$REPO/src/health-check.py" >/dev/null 2>&1 <<'PROBE'
+    # Prefer Homebrew python3 — system /usr/bin/python3 is 3.9 on older
+    # Macs and health-check.py uses 3.10+ syntax (per agent-api.py:115
+    # comment).
+    if [ -x /opt/homebrew/bin/python3 ]; then
+        echo /opt/homebrew/bin/python3
+    elif [ -x /usr/local/bin/python3 ]; then
+        echo /usr/local/bin/python3
+    elif command -v python3 >/dev/null 2>&1; then
+        command -v python3
+    else
+        echo "ERROR: no python3 found" >&2
+        exit 1
+    fi
+}
+
+# Can this interpreter actually RUN health-check.py? Imports it WITHOUT executing
+# it: `main()` is behind `if __name__ == "__main__"`, so the whole import chain
+# runs and no checks do.
+#
+# Two probes that look right and are not, both rejected after trying them:
+#   - `py_compile`: the file compiles fine under a broken interpreter. The
+#     failure is dlopen of a C extension at IMPORT time, not syntax.
+#   - `health-check.py --help`: there is no --help. The script ignores it and
+#     runs the FULL check — slow, touches the workspace, and exits non-zero on
+#     any unhealthy host, so a healthy interpreter on an unhealthy host would be
+#     rejected. (Observed: it reported missing .env / build_log for the probe's
+#     own working tree.)
+probe_python() {
+    [ -n "${1:-}" ] && [ -x "$1" ] || return 1
+    "$1" - "$REPO/src/health-check.py" >/dev/null 2>&1 <<'PROBE'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("hc_probe", sys.argv[1])
 mod = importlib.util.module_from_spec(spec)
 sys.modules["hc_probe"] = mod
 spec.loader.exec_module(mod)
 PROBE
-    }
+}
 
-    # Candidates in preference order. `$SUTANDO_PYTHON_CANDIDATES` (space-
-    # separated) overrides it — an operator can pin the interpreter on a host
-    # where the default order is wrong, and the test suite can inject stubs to
-    # verify the selection logic without depending on what is installed.
-    # A pinned candidate is still PROBED: pinning says which to prefer, not
-    # "skip the check", so a pin that stops working is reported rather than
-    # silently installing a broken job.
-    __candidates="${SUTANDO_PYTHON_CANDIDATES:-}"
-    if [ -z "$__candidates" ]; then
-        __candidates="/opt/homebrew/bin/python3 /usr/local/bin/python3 $(command -v python3 2>/dev/null || true) /usr/bin/python3"
-    fi
+# resolve_python() picks the first interpreter that EXISTS. Existing is not
+# working, and this installs the OS-level net that catches a wedged or dead
+# session — the one component whose failure nothing else watches. Measured
+# 2026-08-03: the preferred Homebrew python3 (3.14.5) could not `import
+# plistlib` at all (pyexpat/libexpat symbol mismatch), so the installed job
+# would have failed every 300s into a log nobody reads while `--status` still
+# reported it loaded.
+#
+# So: keep resolve_python's preference order as the first candidate, but VERIFY
+# it, and fall back to the PATH interpreter if it cannot run the script.
+# $SUTANDO_PYTHON_CANDIDATES (space-separated) overrides the whole list, so an
+# operator can pin the interpreter on a host where the default order is wrong,
+# and the tests can inject stubs. A pinned candidate is still probed — pinning
+# says which to prefer, not "skip the check".
+#
+# Deliberately does NOT add /usr/bin/python3 as a fallback: per REVIEW.md
+# lesson 7 that path is the Xcode-CLT stub, which exists whether or not the
+# tools do and pops a GUI dialog when invoked without them. An operator who
+# knows CLT is installed can still select it explicitly via the env var.
+resolve_python_verified() {
+    __cands="${SUTANDO_PYTHON_CANDIDATES:-}"
+    [ -n "$__cands" ] || __cands="$(resolve_python) $(command -v python3 2>/dev/null || true)"
 
-    __first_existing=""
+    __first=""
     __seen=""
-    # shellcheck disable=SC2086 # deliberate word-splitting: space-separated list
-    for __c in $__candidates; do
+    # shellcheck disable=SC2086 # deliberate word-splitting of a space-separated list
+    for __c in $__cands; do
         [ -n "$__c" ] && [ -x "$__c" ] || continue
-        # `command -v python3` usually resolves to one of the literals above;
-        # without this the same interpreter is probed twice and reported twice.
         case " $__seen " in *" $__c "*) continue ;; esac
         __seen="$__seen $__c"
-        [ -n "$__first_existing" ] || __first_existing="$__c"
-        if __probe_python "$__c"; then
+        [ -n "$__first" ] || __first="$__c"
+        if probe_python "$__c"; then
             echo "$__c"
             return 0
         fi
         echo "note: $__c cannot import health-check.py — trying the next candidate" >&2
     done
 
-    if [ -n "$__first_existing" ]; then
-        # Every candidate failed the probe. Refusing outright would block an
-        # install over a probe that might itself be wrong (an unreadable repo, a
-        # --help regression), so fall back to the old behaviour — but say so,
-        # loudly, instead of installing a silently-broken job while looking fine.
-        echo "WARNING: no python3 could run health-check.py. Installing with" >&2
-        echo "         $__first_existing anyway; the job will likely fail every" >&2
-        echo "         run. Fix the interpreter, then re-run this installer." >&2
-        echo "$__first_existing"
+    if [ -n "$__first" ]; then
+        # Every candidate failed. Refusing would block an install over a probe
+        # that might itself be wrong; installing silently is the bug being
+        # fixed. So proceed with the preferred one and say so, loudly.
+        echo "WARNING: no python3 could import health-check.py. Installing with" >&2
+        echo "         $__first anyway; the job will likely fail every run." >&2
+        echo "         Fix the interpreter, or set SUTANDO_PYTHON_CANDIDATES," >&2
+        echo "         then re-run this installer." >&2
+        echo "$__first"
         return 0
     fi
 
@@ -196,7 +198,7 @@ case "$cmd" in
             echo "ERROR: template not found: $TEMPLATE" >&2
             exit 1
         fi
-        PYTHON_BIN="$(resolve_python)"
+        PYTHON_BIN="$(resolve_python_verified)"
         BREW_BIN="$(resolve_homebrew_bin)"
         echo "Installing $LABEL"
         echo "  repo:    $REPO"
