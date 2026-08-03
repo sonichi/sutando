@@ -27,7 +27,8 @@ from pathlib import Path
 # Pure analysis policy lives in analysis.py; this module keeps loading, CLI,
 # terminal output and HTML rendering. Do not duplicate categorization or repair
 # logic in the renderer.
-import sys as _sys, os as _os
+import os as _os
+import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from analysis import (INLINE_KEYWORDS, HALLUCINATION_PHRASES, merge_timeline,  # noqa: E402
                       parse_ts, _ts_short, diagnose, categorize_issue,
