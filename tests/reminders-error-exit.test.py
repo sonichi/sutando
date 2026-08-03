@@ -107,8 +107,17 @@ else:
         self.assertEqual(stdout_capture.getvalue(), "", "error must not appear on stdout")
         self.assertIn(error_msg, stderr_capture.getvalue())
 
-    def test_morning_briefing_get_reminders_returns_empty_on_script_error(self):
-        """morning-briefing's get_reminders() returns [] when reminders.py exits 1."""
+    def test_morning_briefing_get_reminders_reports_unavailable_on_script_error(self):
+        """get_reminders() returns None — not [] — when reminders.py exits 1.
+
+        This assertion used to pin `[]`. The guarantee it was written for is
+        that a non-zero exit must not leak the raw "Error: ..." string into the
+        spoken briefing, and `[]` was simply how that was expressed at the time.
+        `None` keeps that guarantee AND adds one: a failed query is no longer
+        indistinguishable from "nothing due", so `synthesize()` cannot fold it
+        into "Everything looks clean" (see tests/briefing-all-clear-verified).
+        Both properties are asserted below.
+        """
         import importlib.util as ilu
 
         mb_path = REPO / "src" / "morning-briefing.py"
@@ -128,7 +137,27 @@ else:
         with patch.object(sp, "run", return_value=fake_result):
             result = mb.get_reminders()
 
-        self.assertEqual(result, [], "get_reminders() must return [] when script exits non-zero")
+        self.assertIsNone(
+            result,
+            "get_reminders() must report unavailable (None) on a non-zero exit, "
+            "not [] — [] is indistinguishable from a verified-empty list",
+        )
+
+        # The original guarantee: the raw error text never reaches the owner.
+        narrative = mb.synthesize(None, [], result, [], [], [])
+        self.assertNotIn("Error:", narrative)
+        self.assertNotIn("-1743", narrative)
+
+        # And the new one: an unanswered query cannot produce an all-clear.
+        self.assertNotIn(
+            "Everything looks clean", narrative,
+            "a failed reminders query must withhold the all-clear",
+        )
+
+        # Control — with a verified-empty result the all-clear is still given,
+        # so this is pinning the distinction, not blanket suppression.
+        clean = mb.synthesize(None, [], [], [], [], [])
+        self.assertIn("Everything looks clean", clean)
 
 
 if __name__ == "__main__":
