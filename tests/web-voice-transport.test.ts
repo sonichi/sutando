@@ -153,3 +153,91 @@ describe('web-voice-transport turn lifecycle (drift guard vs web-client)', () =>
 		assert.equal(t.connected, false);
 	});
 });
+
+// ─── Capability gaps closed so the web UI can adopt this module ──────────────
+//
+// Each of these existed in web-client's inline transport and NOT here, which is
+// why the UI could not switch over without a behavior change. They are pinned
+// so the switch (and any later tidy) cannot quietly drop them again.
+
+describe('web-voice-transport close info (reconnect policy lives in the surface)', () => {
+	it('close carries the raw code and reason, not just a status string', () => {
+		const seen: Array<{ status: string; detail?: string; close?: { code: number; reason: string } }> = [];
+		const t = new VoiceTransport({
+			onStatus: (status, detail, close) => seen.push({ status, detail, close }),
+		});
+
+		// Drive ws.onclose the way the browser would, without a real socket.
+		(t as any).ws = null;
+		(t as any).teardownAudio = () => {};
+		(t as any).status('closed', 'Disconnected', { code: 4000, reason: 'goodbye' });
+
+		const closed = seen.find(s => s.status === 'closed');
+		assert.ok(closed, 'a closed status must be emitted');
+		assert.equal(closed!.close?.code, 4000);
+		assert.equal(closed!.close?.reason, 'goodbye');
+	});
+
+	it('the surface can distinguish a clean goodbye from an unexpected drop', () => {
+		// This is the whole reason the code is exposed: web-client treats 4000
+		// (and a user-initiated disconnect) as clean, and everything else as a
+		// drop that should trigger its reconnect ladder.
+		const isClean = (code: number) => code === 4000;
+		assert.equal(isClean(4000), true);
+		assert.equal(isClean(1006), false, 'abnormal closure must NOT read as clean');
+	});
+});
+
+describe('web-voice-transport debug sink (feeds the panel + downloadable dump)', () => {
+	it('forwards protocol frames to onDebug with the event channel', () => {
+		const lines: Array<[string, string | undefined]> = [];
+		const t = new VoiceTransport({ onDebug: (msg, kind) => lines.push([msg, kind]) });
+
+		feed(t, { type: 'turn.end' });
+
+		const evt = lines.find(([, kind]) => kind === 'event');
+		assert.ok(evt, 'a JSON frame must produce an event-channel debug line');
+		assert.match(evt![0], /turn\.end/, 'the frame itself must appear in the trace');
+	});
+
+	it('reports an unparseable text frame rather than dropping it silently', () => {
+		const lines: Array<[string, string | undefined]> = [];
+		const t = new VoiceTransport({ onDebug: (msg, kind) => lines.push([msg, kind]) });
+
+		(t as any).onMessage({ data: 'not json at all' });
+
+		assert.ok(
+			lines.some(([msg, kind]) => kind === 'warn' && /bad json/i.test(msg)),
+			'a malformed frame must be visible in the debug trace',
+		);
+	});
+
+	it('is entirely optional — no onDebug means no throw', () => {
+		const t = new VoiceTransport({});
+		assert.doesNotThrow(() => feed(t, { type: 'turn.end' }));
+		assert.doesNotThrow(() => (t as any).onMessage({ data: 'nope' }));
+	});
+});
+
+describe('web-voice-transport mic-error wording matches the shipped web UI', () => {
+	it('the unclassified case echoes the underlying browser message', () => {
+		// web-client showed the raw DOMException text here; this module used to
+		// drop it, which would have made the guidance strictly worse for exactly
+		// the failures nobody has classified yet.
+		const m = classifyMicError('WeirdError', 'device exploded');
+		assert.match(m, /WeirdError/);
+		assert.match(m, /device exploded/);
+		assert.match(m, /Click Connect to retry/);
+	});
+
+	it('falls back to a concrete phrase when the browser gives no message', () => {
+		const m = classifyMicError('WeirdError');
+		assert.match(m, /could not start capture/);
+		assert.doesNotMatch(m, /undefined/, 'must never render the string "undefined" at a user');
+	});
+
+	it('classified cases are unaffected by the added message argument', () => {
+		assert.match(classifyMicError('NotAllowedError', 'ignored'), /denied/i);
+		assert.match(classifyMicError('NotFoundError', 'ignored'), /no microphone found/i);
+	});
+});

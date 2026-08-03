@@ -165,6 +165,56 @@ Both should move toward dependency inversion:
 Moving files without first removing these dependencies would make the boundary
 look cleaner without making it real.
 
+## Schema migration vs live writer
+
+A module that owns live write APIs must not also own destructive one-time schema
+transformations. Migration code is high-consequence, runs once at startup, and is
+almost impossible to test through the live surface — embedded in a writer it ends
+up exercised only by driving a real session.
+
+Worked example, `src/conversation-store.ts` → `src/conversation-store-migrations.ts`:
+
+> `conversation-store.ts` owns current schema initialization and live write APIs.
+> Destructive or legacy SQLite transformations belong in
+> `conversation-store-migrations.ts`, are idempotent, transaction-tested and
+> invoked before views/statements are prepared. Do not place migration SQL in a
+> live record function.
+
+The ordering is part of the contract: current-table DDL → migrations → view
+rebuild → prepared statements. The migration module never creates current-schema
+DDL (that stays the caller's job) and never propagates failure — the store must
+still initialize after a handled, rolled-back migration.
+
+Enforced by `tests/conversation-store-migration-delegation.test.ts`, which checks
+the delegation and the ordering, and scans the store for the legacy table names
+and transaction verbs while deliberately still permitting current-schema
+`CREATE TABLE`.
+
+## Presentation adapters vs domain/storage
+
+A presentation module (an HTTP server, a renderer, a CLI front end) adapts and
+displays. It must not also own domain parsing, validation or storage
+transactions — when it does, the policy is unreachable from any other consumer
+and untestable except through the presentation surface.
+
+Worked example, `src/dashboard.py` → `src/dashboard_schedules.py`:
+
+> Dashboard HTTP handlers and rendering code must delegate schedule parsing,
+> validation and atomic `crons.json` mutation to `src/dashboard_schedules.py`.
+> Schedule mutations must remain locked read-modify-write operations; do not
+> rebuild cron validation or persistence inside a route.
+
+The split point that matters: **the adapter resolves the path, the domain module
+receives it.** `dashboard.py` keeps `_crons_path()` (workspace + host-label
+resolution is deployment knowledge); `dashboard_schedules.py` takes a `Path` and
+owns the locked read→merge→write. That keeps the domain module free of workspace
+resolution while leaving the adapter with no persistence logic of its own.
+
+Enforced by `tests/dashboard-schedule-delegation.test.py`, which asserts the
+delegation is real and scans `dashboard.py` for the atomic-write primitives
+(`os.replace`, `.tmp` construction, a local `threading.Lock()`) that would mean
+a route had rebuilt its own transaction.
+
 ## Decision guide for new code
 
 This section explains the architectural categories. The repository-specific
