@@ -93,7 +93,7 @@ class TestHookRegistration(unittest.TestCase):
         self._settings(self._all_registered(repo_path="/somewhere/else/sutando"))
         out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
         self.assertEqual(out["status"], "warn")
-        self.assertIn("NOT invoking this checkout", out["detail"])
+        self.assertIn("NOT running the installer's command", out["detail"])
 
     def test_unparseable_HOOKS_array_warns_rather_than_reporting_clean(self):
         # An empty owned-list would otherwise mean "0 missing of 0" -> "ok", i.e. a
@@ -161,7 +161,7 @@ class TestHookRegistration(unittest.TestCase):
                 repo = self._one_hook_repo(root, cmd)
                 out = self.hc.check_claude_hook_registration(repo_dir=repo)
                 self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("NOT invoking this checkout", out["detail"])
+                self.assertIn("NOT running the installer's command", out["detail"])
 
     def test_a_GENUINE_checkout_is_not_reported_foreign(self):
         # Over-trigger control for the fix above: a warning that fires on healthy hosts is
@@ -238,7 +238,7 @@ class TestHookRegistration(unittest.TestCase):
                 )
                 out = self.hc.check_claude_hook_registration(repo_dir=repo)
                 self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("NOT invoking this checkout", out["detail"])
+                self.assertIn("NOT running the installer's command", out["detail"])
 
     def test_the_installers_OWN_command_shape_is_what_counts_as_registered(self):
         # Over-trigger control for the above: the command the installer actually
@@ -304,15 +304,16 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _repo(self, stop_command):
-        r = Path(self._tmp.name) / f"repo{abs(hash(stop_command)) % 99999}"
+    def _repo(self, stop_command, archive_command=None):
+        r = Path(self._tmp.name) / f"repo{abs(hash((stop_command, archive_command))) % 99999}"
         (r / "src").mkdir(parents=True)
         (r / ".claude").mkdir(parents=True)
         (r / "src" / "install-claude-hooks.sh").write_text(self.installer_src)
         handoff = f'bash {r}/src/session-handoff.sh "$TRANSCRIPT_PATH"'
         (r / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
             "PreCompact": [{"hooks": [
-                {"command": 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/x.jsonl"'},
+                {"command": archive_command or
+                 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/x.jsonl"'},
                 {"command": handoff}]}],
             "SessionEnd": [{"hooks": [{"command": handoff}]}],
             "Stop": [{"hooks": [{"command": stop_command.format(
@@ -337,7 +338,32 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
             with self.subTest(decoy=label):
                 out = self.hc.check_claude_hook_registration(repo_dir=self._repo(cmd))
                 self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("NOT invoking this checkout", out["detail"])
+                self.assertIn("NOT running the installer's command", out["detail"])
+
+    def test_the_ARCHIVE_hook_is_validated_too_not_just_src_paths(self):
+        # I exempted every marker that is not a `src/` path from command-shape
+        # validation, reasoning that a non-repo path has no identity to compare.
+        # That confused path identity with command shape: the archive hook still
+        # has an installer-owned command, and `echo` is not `cp`. Under the old
+        # substring-only test BOTH of these read as a healthy archiver — and the
+        # second is the one that settles it, because a destructive command
+        # certified as a working archive hook inverts the probe's whole purpose.
+        for label, cmd in {
+            "echo": "echo sutando-conversations/",
+            "rm -rf": "rm -rf sutando-conversations/",
+            "a different copier": "rsync x sutando-conversations/",
+        }.items():
+            with self.subTest(decoy=label):
+                out = self.hc.check_claude_hook_registration(
+                    repo_dir=self._repo("bash {p}", archive_command=cmd))
+                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
+                self.assertIn("sutando-conversations/", out["detail"])
+
+    def test_the_genuine_archive_cp_still_registers(self):
+        # Over-trigger control. The real command interpolates $HOME and $(date …),
+        # so this must not become a shape-pinning test that warns on healthy hosts.
+        out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
+        self.assertEqual(out["status"], "ok", out["detail"])
 
     def test_an_unreducible_template_fails_CLOSED(self):
         # The fallback used to accept the path anywhere in the first two tokens. A

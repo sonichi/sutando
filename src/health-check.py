@@ -4515,7 +4515,7 @@ def _same_path(a: str, b_norm: str, b_real: str) -> bool:
     return os.path.normpath(a) == b_norm or os.path.realpath(a) == b_real
 
 
-def _hook_command_targets(command: str, expected: Path, owned_cmd: str) -> bool:
+def _hook_command_targets(command: str, expected, owned_cmd: str) -> bool:
     """Does this command INVOKE `expected` — not merely mention it, not merely contain it?
 
     Two false-cleans this has to reject, both found in review, both of which let a
@@ -4536,9 +4536,35 @@ def _hook_command_targets(command: str, expected: Path, owned_cmd: str) -> bool:
     registered hook must match. Leading tokens must agree, so `echo` cannot stand in
     for `bash`, and the script position must be the same path.
     """
+    owned = _shell_tokens(_unwrap_installer_command(owned_cmd))
+    got = _shell_tokens(command)
+    if not owned or not got:
+        return False
+
+    # PROGRAM CHECK — applies to EVERY owned hook, not just repo-relative ones.
+    # This was previously skipped for markers that are not `src/` paths, on the
+    # reasoning that a non-repo path has no identity to compare. That conflated
+    # path identity with command-shape validation: the archive hook still has an
+    # installer-owned shape, and `echo` is not `cp`. With only the substring test,
+    # BOTH of these certified as a healthy archive hook:
+    #     echo sutando-conversations/
+    #     rm -rf sutando-conversations/
+    # The second is the one that settles it — a destructive command reported as a
+    # working archiver is the opposite of what this probe is for.
+    if got[0] != owned[0]:
+        return False
+
+    if expected is None:
+        # Marker is not repo-relative (the archive hook writes outside the repo),
+        # so there is no path to compare positionally. Program + the marker
+        # substring the caller already matched is what can be owned here. Not
+        # tightened further on purpose: the real archive command interpolates
+        # $HOME and $(date …), so pinning argument shape would warn on healthy
+        # hosts — the failure this probe must not have.
+        return True
+
     want = os.path.normpath(os.path.expanduser(str(expected)))
     want_real = os.path.realpath(want)
-    owned = _shell_tokens(_unwrap_installer_command(owned_cmd))
     idx = next((i for i, t in enumerate(owned) if _same_path(t, want, want_real)), None)
     if idx is None:
         # FAIL CLOSED. This branch used to accept the path anywhere in the first two
@@ -4548,7 +4574,6 @@ def _hook_command_targets(command: str, expected: Path, owned_cmd: str) -> bool:
         # as registered on the only path that ships. A fallback that the real data
         # always takes is not a fallback, it is the behaviour.
         return False
-    got = _shell_tokens(command)
     if len(got) <= idx:
         return False
     return _same_path(got[idx], want, want_real) and got[:idx] == owned[:idx]
@@ -4657,8 +4682,12 @@ def check_claude_hook_registration(
         hit = [c for c in cmds if marker in c]
         if not hit:
             missing.append(f"{event}:{marker}")
-        elif marker.startswith("src/") and not any(
-            _hook_command_targets(c, repo / marker, owned_cmd.replace("$REPO_DIR", str(repo)))
+        elif not any(
+            _hook_command_targets(
+                c,
+                (repo / marker) if marker.startswith("src/") else None,
+                owned_cmd.replace("$REPO_DIR", str(repo)),
+            )
             for c in hit
         ):
             # Present, but not actually invoking this checkout's script — either aimed
@@ -4669,9 +4698,9 @@ def check_claude_hook_registration(
         if missing:
             bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
         if foreign:
-            bits.append(f"{len(foreign)} registered but NOT invoking this checkout's script "
-                        f"— another checkout, or the path is only an argument "
-                        f"({', '.join(foreign)})")
+            bits.append(f"{len(foreign)} registered but NOT running the installer's command "
+                        f"— a different program, another checkout, or the path is "
+                        f"only an argument ({', '.join(foreign)})")
         return {"name": name, "status": "warn",
                 "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
     return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
