@@ -1232,12 +1232,26 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         dropped = []
 
     # A shipped entry can be one this host must NOT carry. `state/current-track.md`
-    # is per-host state that #2534 added at a flat, SHARED vault path: two cores write
-    # the same path, and on 2026-08-03 that overwrote a peer's 1056-line anchor.
-    # Telling an operator to re-add it walks them back into that incident, so the
-    # REMEDY is split rather than the entry hidden — silently filtering it would
-    # suppress a real divergence. Delete this list once the host-qualified migration
-    # (#2567/#2568) lands: the flat path stops being shipped and stops appearing here.
+    # is per-host state that #2534 added at a flat, SHARED vault path, so two cores
+    # write the same file and each host's sync resolves the resulting conflict in its
+    # own favour — a peer's anchor lands in your working copy, and neither side's
+    # merge keeps the other's.
+    #
+    # This comment previously said that "overwrote a peer's 1056-line anchor". It did
+    # not, and the correction matters because I wrote the original from a misread of
+    # the sync code rather than from the vault. The vault uses PER-HOST branches
+    # (`host/<host>/<wsid>`); a host only ever merges a peer INTO its own branch and
+    # never writes to the peer's. Checked afterwards: both branches were byte-identical
+    # and this host's index referenced 263 memory files against the discarded copy's
+    # 262 — a strict superset, nothing missing. Chi corrected the claim; Sutando-Pro
+    # independently confirmed it from `state/current-track.md`'s own two-commit history.
+    #
+    # The guidance is unchanged — do not re-add it — but the reason is cross-host
+    # CONTENT DELIVERY on a shared path, not data loss. Telling an operator to re-add
+    # walks them back into that, so the REMEDY is split rather than the entry hidden;
+    # silently filtering it would suppress a real divergence. Delete this list once the
+    # host-qualified migration (#2567/#2568) lands: the flat path stops being shipped
+    # and stops appearing here.
     UNSAFE_TO_READD = ("state/current-track.md",)
     unsafe = [e for e in dropped if e in UNSAFE_TO_READD]
     safe = [e for e in dropped if e not in UNSAFE_TO_READD]
@@ -1319,8 +1333,9 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         parts.append(
             f"{len(unsafe)} shipped carrier path(s) are missing here and must NOT be re-added "
             f"({', '.join(unsafe)}) — per-host state carried at a flat, SHARED vault path, so "
-            f"re-adding re-creates the cross-host overwrite that destroyed a peer's anchor "
-            f"(#2567). Leave them out until the host-qualified migration lands"
+            f"re-adding puts two hosts on one file: a peer's copy lands in yours and each "
+            f"sync keeps its own side (#2567). Leave them out until the host-qualified "
+            f"migration lands"
         )
     return {"name": name, "status": "fail", "detail": "; ".join(parts)}
 
