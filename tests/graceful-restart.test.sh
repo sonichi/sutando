@@ -184,6 +184,39 @@ grep -q '"restart_id":"seam-rid"' "$WS7/state/restart-ready.json" 2>/dev/null \
   && say ok "seam ready sentinel" || say FAIL "seam ready sentinel"
 
 echo
+
+# --- GNU-style `stat -f` must not break alive_age() (qingyun review, 2026-08-02) --------
+# On GNU/Linux `stat -f` means --file-system: it prints a multi-line dump AND
+# EXITS 0, so a `stat -f ... || stat -c ...` fallback never fires and the dump
+# reaches `$(( ))`. The lock path already guarded this; alive_age() did not.
+# The failure is silent in the dangerous direction: a dead core whose .alive is
+# unreadable could stay in the busy wait instead of taking the dead path.
+echo "8. GNU-style stat -f output → alive_age() reports STALE, does not die"
+WS7="$TMP/ws7"; mkws "$WS7"
+# a dead core: heartbeat present but ancient, status claims running-but-stale
+printf '{"status":"running","step":"gone","ts":%s}\n' "$(( $(date +%s) - 100 ))" > "$WS7/state/core-status.json"
+FAKEBIN="$TMP/fakebin7"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/stat" <<'STATEOF'
+#!/bin/bash
+# Mimic GNU coreutils: -f is --file-system (multi-line dump, exit 0); -c is format.
+if [ "${1:-}" = "-f" ]; then
+  printf '  File: "%s"\n    ID: 0 Namelen: 255 Type: apfs\n' "${3:-${2:-}}"
+  exit 0
+fi
+if [ "${1:-}" = "-c" ]; then exec /usr/bin/stat -f %m "${3:-}"; fi
+exec /usr/bin/stat "$@"
+STATEOF
+chmod +x "$FAKEBIN/stat"
+start=$(date +%s)
+out="$(PATH="$FAKEBIN:$PATH" GR_WS="$WS7" GR_SYNC_CMD="true" GR_POLL_S=1 GR_STATUS_TTL_S=5 bash "$GR" --dry-run 2>&1)"; rc=$?
+took=$(( $(date +%s) - start ))
+[ "$rc" = 0 ] && say ok "exit 0 under GNU-style stat" || say FAIL "exit 0 under GNU-style stat (got $rc): $out"
+echo "$out" | grep -qiE 'integer expression|unbound variable|File:' \
+  && say FAIL "no arithmetic/unbound diagnostic leaked: $out" \
+  || say ok "no arithmetic/unbound diagnostic"
+[ "$took" -le 10 ] && say ok "did not hang in the busy wait (${took}s)" || say FAIL "did not hang (took ${took}s)"
+echo "$out" | grep -q "DRY-RUN — would exec" && say ok "still reached the restart decision" || say FAIL "still reached the restart decision: $out"
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else

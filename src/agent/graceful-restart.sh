@@ -73,6 +73,23 @@ mkdir -p "$WS/state/locks"
 # A holder that died before its trap ran would wedge restarts forever, so an
 # old lock is reapable — same liveness reasoning as workspace_lock.py, which
 # keys on freshness rather than pid (pids recycle; a hung holder should lose it).
+mtime_of() {  # epoch mtime, or EMPTY if unreadable/nonnumeric
+  # `stat -f %m` is BSD/macOS; on GNU/Linux `-f` means --file-system and prints
+  # a multi-line dump with exit 0, so the `||` fallback never fires and the dump
+  # reaches `$(( ))`. The digit guard is the load-bearing part: ANY unexpected
+  # output becomes empty so every caller takes its own explicit failure branch
+  # instead of dying in arithmetic under `set -euo pipefail`.
+  # Callers choose their OWN fail-safe direction — they are opposite here:
+  #   lock age  -> unreadable means assume LIVE and defer (never kill blind)
+  #   .alive age -> unreadable means assume STALE (never let a dead core hide)
+  local _ts
+  _ts="$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true)"
+  case "$_ts" in
+    ''|*[!0-9]*) _ts="" ;;
+  esac
+  printf '%s' "$_ts"
+}
+
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
   # Age comes from the DIRECTORY's own mtime, which `mkdir` sets atomically as
   # part of the same operation that claims the lock. An earlier revision of this
@@ -80,19 +97,8 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
   # the very race being fixed: a peer arriving in the gap read no ts, computed
   # `age = now - 0` (a full epoch), declared a one-second-old lock stale, reaped
   # it, and both runs restarted. Caught by the 30-iteration probe below.
-  # Portable mtime. `stat -f %m` is BSD/macOS; on GNU/Linux `-f` means
-  # --file-system and emits a multi-line filesystem dump, which then fed
-  # `$(( ... ))` and — under `set -euo pipefail` — killed the script SILENTLY:
-  # the peer neither restarted nor logged a reason. CI caught it as
-  # "peer deferred with a reason in only 0/10 pairs" while the "exactly one
-  # restart decision" assertion still passed, because a silently-dead peer and
-  # a correctly-deferring peer are indistinguishable by that check alone.
-  # The digit guard is the load-bearing part: ANY unexpected output becomes
-  # empty and takes the fail-closed branch instead of reaching arithmetic.
-  held_ts="$(stat -f %m "$LOCKDIR" 2>/dev/null || stat -c %Y "$LOCKDIR" 2>/dev/null || true)"
-  case "$held_ts" in
-    ''|*[!0-9]*) held_ts="" ;;
-  esac
+  # Age via mtime_of (portable + digit-guarded); see its note for why.
+  held_ts="$(mtime_of "$LOCKDIR")"
   if [ -z "$held_ts" ]; then
     # Cannot read the holder's age -> assume LIVE and defer. Failing closed is
     # the only safe default when the alternative is a spurious destructive kill.
@@ -131,7 +137,12 @@ rm -f "$READY" "$FAILED"
 
 alive_age() {
   [ -f "$ALIVE" ] || { echo 999999; return; }
-  echo "$(( $(date +%s) - $(stat -f %m "$ALIVE" 2>/dev/null || echo 0) ))"
+  local _ts; _ts="$(mtime_of "$ALIVE")"
+  # Unreadable mtime -> report STALE, same as a missing heartbeat. Opposite of
+  # the lock's fail-closed: a dead core with a fresh core-status.json must not
+  # be able to hide behind an unreadable .alive and stay in the busy wait.
+  [ -n "$_ts" ] || { echo 999999; return; }
+  echo "$(( $(date +%s) - _ts ))"
 }
 
 # Busy = core-status.json claims "running" AND its self-reported ts is fresh.
