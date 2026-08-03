@@ -91,7 +91,10 @@ if [ "$BUNDLED_MODE" = "1" ]; then
   # one (external review on #2182): a missing voice/proxy/etc artifact would
   # otherwise fail inside a background job while boot still prints ✓.
   _MISSING_DIST=""
-  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers; do
+  # web-voice-transport.browser is the browser-side artifact the web UI loads
+  # for voice; it is built by the same build:bundle contract but is NOT a node
+  # service, so it has no run_node_service entry to catch its absence later.
+  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers web-voice-transport.browser; do
     [ -f "$REPO/dist/$_artifact.js" ] || _MISSING_DIST="$_MISSING_DIST $_artifact.js"
   done
   if [ -n "$_MISSING_DIST" ]; then
