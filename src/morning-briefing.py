@@ -385,6 +385,72 @@ def _load_notifier():
 _CPQ = _load_notifier()
 
 
+#: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
+#: DM'd, so a title clipped mid-word is read aloud as a mid-word fragment. A hard
+#: `title[:60]` produced, from a real 2026-08-02 run:
+#:     "WIRE - awaiting your verdict / steer (no urgency; nothing bl"
+#: - cut inside "blocked", and leaving an unmatched "(" so the parenthetical never
+#: closes. Clip on a word boundary instead, and drop a parenthetical that the clip
+#: left open rather than speaking half of it.
+def _cut_at_imbalance(s: str) -> str:
+    """Truncate `s` at the first bracket that cannot be matched, either way.
+
+    Both directions matter and only one was handled before. Stripping a leading
+    "(" shifts the slice window one character right, which can pull the matching
+    ")" into the output ALONE -- the mirror image of the orphan being removed:
+
+        clip_for_speech("(abcdefghi) long trailing title", 11) -> "abcdefghi)..."
+
+    A single left-to-right pass covers both: an unmatched ")" truncates before
+    itself; anything still open at the end truncates before the FIRST unmatched
+    "(" (not the last -- cutting at the first is what guarantees balance when
+    several are open).
+    """
+    stack: list[int] = []
+    for i, ch in enumerate(s):
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")":
+            if not stack:
+                return s[:i]
+            stack.pop()
+    return s[:stack[0]] if stack else s
+
+
+#: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
+#: DM'd, so a title clipped mid-word is read aloud as a mid-word fragment. A hard
+#: `title[:60]` produced, from a real 2026-08-02 run:
+#:     "WIRE - awaiting your verdict / steer (no urgency; nothing bl"
+#: - cut inside "blocked", and leaving an unmatched "(" so the parenthetical never
+#: closes. Clip on a word boundary instead, and never emit an unbalanced bracket.
+def clip_for_speech(text: str, limit: int) -> str:
+    """Clip to <= limit chars without cutting a word or orphaning a bracket.
+
+    Returns text unchanged when it already fits, so the common case is untouched
+    -- including text that is ALREADY unbalanced at the source. The contract is
+    "clipping must not create an orphan", not "rewrite titles we did not clip".
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+
+    def _shorten(s: str) -> str:
+        # limit - 1 reserves the ellipsis, so the result is never over the limit.
+        head = s[:limit - 1]
+        cut = head.rfind(" ")
+        if cut > 0:
+            head = head[:cut]
+        return _cut_at_imbalance(head).rstrip(" ,;:-\u2014/(")
+
+    head = _shorten(text)
+    if not head:
+        # The whole window sat inside a parenthetical opening at character 0.
+        # Drop the bracket and re-shorten -- through the SAME balance guard, which
+        # is what the first version of this fix missed.
+        head = _shorten(text.lstrip("(").lstrip())
+    return head + "\u2026"
+
+
 def get_pending_questions() -> list[str]:
     """Return unanswered questions, delegating to check-pending-questions.py.
 
@@ -427,7 +493,7 @@ def get_pending_questions() -> list[str]:
         title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
         if not title:
             continue
-        out.append(title[:60])
+        out.append(clip_for_speech(title, 60))
     return out
 
 
