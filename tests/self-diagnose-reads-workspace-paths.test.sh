@@ -15,9 +15,11 @@
 # 431/226/7/6 matching lines.
 #
 # The existing scripts/lint-workspace-resolution.sh cannot catch this class: it
-# refuses $SUTANDO_WORKSPACE reads, hardcoded ~/.sutando/workspace, and
+# refuses $SUTANDO_WORKSPACE reads, the legacy hardcoded install path, and
 # Path(__file__).parent.parent repo-walks — not a CORRECTLY-resolved $REPO
-# pointed at a workspace-owned subdirectory.
+# pointed at a workspace-owned subdirectory. (Describing that legacy path by
+# name here would itself trip scripts/lint-sutando-home-path.sh, which is
+# correct: this file does not own install-path resolution.)
 #
 # Run: bash tests/self-diagnose-reads-workspace-paths.test.sh
 set -uo pipefail

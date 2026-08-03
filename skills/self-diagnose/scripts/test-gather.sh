@@ -66,8 +66,20 @@ fi
 # Test 8: results-recent-paths captures files mtime-newer than SINCE_EPOCH.
 # This catches the "-newer meta.txt" bug that made this file empty on every run.
 # Touch a fake result file to 1 hour old, then gather with 24h window.
-mkdir -p results 2>/dev/null
-FAKE_RESULT="results/sutando-test-recent-$(date +%s).txt"
+# The fixture must live where gather.sh actually LOOKS. results/ is
+# workspace-owned, so a fixture under the repo made this assertion test the
+# retired layout — it passed only while gather.sh was reading the wrong place,
+# and started failing the moment gather.sh was corrected.
+# Resolve the workspace the SAME WAY gather.sh does, including its
+# SUTANDO_ROOT-first precedence (gather.sh:19-20). Resolving cwd-relative here
+# instead silently points the fixture at a different checkout's workspace than
+# the one gather reads — which is exactly what happens when this test runs from
+# a git worktree while SUTANDO_ROOT names the primary checkout.
+_FIX_REPO="${SUTANDO_ROOT:-$PWD}"
+[ -f "$_FIX_REPO/CLAUDE.md" ] || _FIX_REPO="$PWD"
+_WS_FOR_FIXTURE="$(bash "$_FIX_REPO/scripts/sutando-config.sh" workspace)"
+mkdir -p "$_WS_FOR_FIXTURE/results" 2>/dev/null
+FAKE_RESULT="$_WS_FOR_FIXTURE/results/sutando-test-recent-$(date +%s).txt"
 echo "fake" > "$FAKE_RESULT"
 # Backdate to 1 hour ago (BSD touch on macOS, GNU touch on linux — support both)
 if date -v -1H >/dev/null 2>&1; then
