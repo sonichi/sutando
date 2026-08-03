@@ -111,7 +111,19 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # lying to itself about what its runtime does. Undeclared env vars are also
 # forbidden by AGENTS.md (qingyun-wu, #2449).
 MEMORY_INDEX_LOAD_LINES = 200
-MEMORY_INDEX_LOAD_BYTES = 25 * 1024
+# 25 KB DECIMAL (25_000), not 25 KiB. The docs say "the first 25KB"; encoding it
+# as 25 * 1024 made this check 600 B more generous than the runtime, so a file
+# between 25_000 and 25_600 reports healthy while its tail is already dropped.
+#
+# The runtime settles it: its own over-limit warning prints the limit as
+# "24.4KB", and 25_000 / 1024 = 24.41 — a 25_600 limit would print "25.0KB".
+# Observed on this repo 2026-08-02, where MEMORY.md was truncated at session
+# start while this check called it under the limit.
+#
+# NB this is a UNITS fix, not a return to the "measured-by-eye ~24KB" cutoff
+# that #2449 rightly rejected — that guess also claimed the whole index stops
+# loading, which remains wrong: truncation is a suffix drop.
+MEMORY_INDEX_LOAD_BYTES = 25_000
 # Warn while there is still room to compact deliberately rather than in a panic.
 MEMORY_INDEX_NEAR_LIMIT = 0.9
 
@@ -1169,7 +1181,8 @@ def check_memory_index_integrity() -> "dict | None":
 
     def _size_note() -> str:
         return (f"{effective_bytes / 1024:.1f}KB / {effective_lines} lines of loadable "
-                f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1024:.0f}KB / "
+                f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1000:.0f}KB "
+                f"({MEMORY_INDEX_LOAD_BYTES:,} B) / "
                 f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
 
     def _hub_note() -> str:
