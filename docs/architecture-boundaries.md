@@ -122,6 +122,16 @@ mechanics. For example, `src/presenter_mode.py` owns the presenter sentinel path
 and expiry semantics; Discord, Slack, Telegram, and notification jobs decide
 what delivery to suppress when that policy reports active.
 
+### Shared result-file lifecycle
+
+The task/result filesystem protocol is core infrastructure, including its
+claim, crash-recovery, collision, and retry rules. A dependency-light core
+helper owns each shared state transition; adapters supply their resolved paths
+and retain only provider-specific delivery. For example,
+`src/proactive_recovery.py` restores proactive delivery claims stranded by a
+crash, while Discord, Slack, and Telegram decide how the recovered result is
+sent. Copying the filesystem state machine into each adapter is not permitted.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known
@@ -210,6 +220,32 @@ The dependencies are ordinary constructor arguments (store, human-action adapter
 actor, executor map) — no injection framework. Note the executor map must be *read*
 from the instance, not from the module global, or the argument is decorative and a
 caller injecting fakes silently gets the real executors.
+
+## Skill-internal boundaries
+
+The core/adapter/skill split is not the only boundary that matters. A large skill
+can carry the same layering problem internally: analysis policy welded to data
+loading, CLI parsing and presentation, so the rules can only be exercised by
+running the whole tool.
+
+Worked example, `skills/call-diagnostics/scripts/diagnose.py` →
+`scripts/analysis.py`:
+
+> Complex skill diagnostics must separate pure analysis policy from data
+> loading, CLI and presentation. Call-diagnostics detection, categorization and
+> repair policy lives in its analysis module; loaders and renderers consume it
+> and must not carry copied detection rules.
+
+The analysis module is import-safe by contract — it resolves no workspace, reads
+no `sys.argv`, opens no database or file, prints nothing and generates no HTML.
+That contract is asserted directly, by scanning the module source (docstring
+excluded, since it legitimately names what it avoids) and by importing it under a
+polluted `sys.argv` and asserting silence.
+
+This boundary is skill-internal: the policy stays inside `skills/call-diagnostics/`
+and is not promoted into `src/`. The delegation check is narrow — it forbids the
+renderer redefining moved symbols while leaving presentation labels and styles
+alone.
 
 ## Presentation adapters vs domain/storage
 

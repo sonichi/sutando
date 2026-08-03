@@ -290,6 +290,27 @@ print(_host_label(), end='')
     printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
     ;;
 
+  python-bin)
+    # SINGLE SOURCE OF TRUTH for the Python interpreter, mirroring node-bin.
+    # $PY is resolved at the top of this file with the documented precedence:
+    #   1. $SUTANDO_PY               (exported by launch-sutando.sh)
+    #   2. <engine>/runtime/python   (the bundle-vendored relocatable python)
+    #   3. system `python3`          (may be Apple's CLT stub — see below)
+    #
+    # Exposed because callers were re-deriving it and getting it WRONG in a way
+    # that fails silently. src/startup-runtime.sh's managed-credential gate
+    # probed `command -v python3` then Homebrew, skipping tiers 1 and 2, so a
+    # host with a broken `python3` first on PATH and a perfectly good $SUTANDO_PY
+    # concluded "no usable python3" and left voice disabled while a valid managed
+    # credential sat on disk (sonichi/sutando#2197 review, 2026-08-02).
+    #
+    # Deliberately NOT fail-closed the way node-bin is: tier 3 may legitimately
+    # be the Xcode CLT stub, which is `-x` but does not run. Only EXECUTING an
+    # interpreter proves it works, and that probe belongs to the caller, which
+    # knows what it needs to import. This prints the interpreter to TRY FIRST;
+    # it does not promise the interpreter runs.
+    echo "$PY"
+    ;;
   node-bin)
     # SINGLE SOURCE OF TRUTH for the Node executable (G1.5 node-bundle,
     # owner-adopted design + owner review 2026-07-19). Precedence:
@@ -563,9 +584,32 @@ except Exception:
 # independent); dirty flags uncommitted edits. A stronger working-tree
 # 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
 # follow-up alongside the identity block.
-def _git(*a):
+# Resolve ONCE, before any spawn. Two gates, both required:
+#   1. No .git marker -> not a checkout, so every field below would be None
+#      anyway. The packaged app ships the engine as an rsync copy WITHOUT .git,
+#      so on that install these five calls did no useful work at all.
+#      os.path.exists, NOT isdir: a linked worktree or submodule has .git as a
+#      FILE containing a gitdir: pointer, and isdir() blanked the identity
+#      fields on those perfectly valid checkouts (@john-the-dev, #2478).
+#   2. No runnable git -> on a Mac without developer tools /usr/bin/git is the
+#      Xcode-CLT stub, and SPAWNING it raises the modal install dialog before it
+#      can fail. Catching a non-zero exit is too late; the prompt already fired.
+# The desktop app polls this descriptor (core_terminal.rs), so the old code
+# leaked that dialog on every poll of a packaged, toolchain-free install.
+_git_bin = None
+if os.path.exists(os.path.join(repo, '.git')):
     try:
-        r = subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, timeout=5)
+        sys.path.insert(0, os.path.join(repo, 'src'))
+        from git_binary import resolve_git
+        _git_bin = resolve_git()
+    except Exception:
+        _git_bin = None
+
+def _git(*a):
+    if _git_bin is None:
+        return None
+    try:
+        r = subprocess.run([_git_bin, '-C', repo, *a], capture_output=True, text=True, timeout=5)
         return (r.stdout.strip() or None) if r.returncode == 0 else None
     except Exception:
         return None
