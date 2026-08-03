@@ -26,7 +26,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from discord_addressee import is_addressed_in_shared_channel  # noqa: E402
+from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402
 
 ME = 1512984771305799792          # this bot
 PRO = 1504316176686120980         # another agent
@@ -82,6 +82,35 @@ def main() -> int:
     assert '_channel_role(str(message.channel.id)) != "bot2bot"' in bridge, \
         "discord-bridge.py does not carve out role:'bot2bot' channels"
     print("  ok  bridge carves out bot2bot channels")
+
+
+    # --- reference_is_reply: a FORWARD is not a REPLY (owner-reported 2026-07-27) ---
+    class _T:                      # mimics discord.MessageReferenceType members
+        def __init__(self, name): self.name = name
+
+    assert reference_is_reply(True, _T("default")) is True, "reply -> is a reply"
+    print("  ok  reference.type=default is a reply")
+
+    assert reference_is_reply(True, _T("forward")) is False, "forward -> NOT a reply"
+    print("  ok  reference.type=forward is NOT a reply")
+
+    assert reference_is_reply(False, None) is False, "no reference -> not a reply"
+    print("  ok  no reference at all is not a reply")
+
+    assert reference_is_reply(True, None) is True, "missing type -> pre-forward default"
+    print("  ok  missing reference.type keeps the pre-forward default")
+
+    assert reference_is_reply(True, "forward") is False, "raw string name also handled"
+    print("  ok  raw string type name handled (not just enum members)")
+
+    # --- the actual bug: an owner FORWARD in a shared channel must not be skipped ---
+    # Before the fix the bridge passed is_reply=True for a forward; a forward has no
+    # reply.resolved.author, so reply_author_id is None and the gate skipped it.
+    _fwd_is_reply = reference_is_reply(True, _T("forward"))
+    assert _fwd_is_reply is False, (
+        "an owner's forward must reach the gate as is_reply=False, else it is "
+        "classified as a reply-not-addressed-to-us and the forward handler never runs")
+    print("  ok  owner FORWARD is not classified as a reply-to-someone-else")
 
     print("\nAll addressee-gate cases pass.")
     return 0
