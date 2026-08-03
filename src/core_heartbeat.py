@@ -204,6 +204,40 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     except Exception:
         pass
 
+    # The executable's accounting NAME is not a reliable handle for the core.
+    # Claude Code installs a version-named binary
+    # (`~/.local/share/claude/versions/<ver>`), and `pgrep -x` matches the
+    # kernel accounting name (`ps -o ucomm=`), which is then `<ver>` — NOT
+    # `claude`. So on a versioned install the branch above matches nothing for a
+    # perfectly healthy core, the `runtime == "claude"` bail below returns None
+    # forever, and `.alive` is never written at all. Measured on a live host:
+    # `ps -o comm=` said `claude` (that is argv[0]) while `ps -o ucomm=` said
+    # `2.1.220`, and a core alive for ten minutes read as dead to every reader.
+    # That is the exact inverse of the bug #2488 fixed, reached through the same
+    # gate — and it is the more dangerous direction, because a consumer that
+    # relaunches a "dead" core would then relaunch a live one in a loop.
+    #
+    # Fix the pid ENUMERATION rather than the identity test: ask tmux for the
+    # panes of THIS exact session and apply the same `--name <sess>` argv check
+    # to them. Both #2488 guards survive — the candidates are scoped to the
+    # exact session (never "any pane on the socket"), and identity still comes
+    # from argv, never from the pane's foreground command. Strictly stronger
+    # than the non-Claude fallback below, so it runs for every runtime.
+    try:
+        lp = _tmux(sock, "list-panes", "-t", f"={sess}", "-F", "#{pane_pid}")
+        if lp is not None and lp.returncode == 0:
+            for pid_s in lp.stdout.split():
+                if not pid_s.isdigit():
+                    continue
+                ps = subprocess.run(["ps", "-o", "args=", "-p", pid_s],
+                                    capture_output=True, text=True, timeout=5)
+                if ps.returncode != 0:
+                    continue
+                if _argv_names_session(ps.stdout.strip(), sess):
+                    return int(pid_s)
+    except Exception:
+        pass
+
     # A Claude session with no matching `claude --name <sess>` process is DEAD,
     # not "fall back to whatever pane is left" (review-caught, john-the-dev on
     # #2488). The pane fallback exists for NON-Claude runtimes; applied to a

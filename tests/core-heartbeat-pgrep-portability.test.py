@@ -113,20 +113,39 @@ check(".alive removed once death is confirmed", not alive.exists())
 # identification skips the fallback — unknown must keep the old behaviour, so a
 # healthy non-Claude host can never be turned into a permanent false death.
 
-def _farm(runtime_line: str, claude_alive: bool, kill_config: bool = False):
-    """Fake toolchain: tmux answers has-session / show-environment / list-panes."""
+def _farm(runtime_line: str, claude_alive: bool, kill_config: bool = False,
+          pane_pid: int = 7777):
+    """Fake toolchain: tmux answers has-session / show-environment / list-panes.
+
+    `ps` is deliberately PID-AWARE. It used to echo the core's argv for every
+    pid, which made the fixture unable to express the difference between "this
+    pane IS the core" and "this pane is a leftover shell in the core's session"
+    — the two cases the `--name <sess>` argv test exists to separate. With a
+    blanket stub, any pane-scoped lookup trivially "finds" a core, so a change
+    that resurrects a corpse and a change that correctly identifies a live core
+    are indistinguishable. Only 4242 is the core here; every other pid is a
+    shell, which is what a surviving sibling pane actually looks like.
+    """
     d = Path(tempfile.mkdtemp(prefix="ch-rt-"))
     tmux = "\n".join([
         'case "$*" in',
         '  *has-session*)      exit 0 ;;',
         f'  *show-environment*) {runtime_line}; exit 0 ;;',
-        '  *list-panes*)       echo 7777; exit 0 ;;',
+        f'  *list-panes*)       echo {pane_pid}; exit 0 ;;',
         'esac',
         'exit 0',
     ])
     _bin(d, "tmux", tmux)
     _bin(d, "pgrep", "echo 4242\nexit 0" if claude_alive else "exit 1")
-    _bin(d, "ps", f'echo "claude --name {SESSION} --resume"')
+    _bin(d, "ps", "\n".join([
+        'last=""',
+        'for a in "$@"; do last="$a"; done',
+        'case "$last" in',
+        f'  4242) echo "claude --name {SESSION} --resume" ;;',
+        '  *)    echo "-zsh" ;;',
+        'esac',
+        'exit 0',
+    ]))
     if kill_config:
         # Truly-undeterminable runtime: the session env is unset AND the config
         # fallback cannot answer. Without this the config in THIS repo says
@@ -171,6 +190,10 @@ def _restore_config(token):
         sys.modules["sutando_config"] = saved
 
 
+# The `alive` column is "does `pgrep -x claude` match?", NOT "is the core
+# running?". Conflating the two is what hid the versioned-binary case below:
+# every pre-existing row set pgrep to answer, so no row could express a host
+# where the core is healthy but its executable is not NAMED `claude`.
 CASES = [
     ("claude session + claude process   -> the claude pid",
      'echo SUTANDO_CORE_RUNTIME=claude', True,  4242),
@@ -180,11 +203,22 @@ CASES = [
      'echo SUTANDO_CORE_RUNTIME=codex',  False, 7777),
     ("UNKNOWN runtime + no claude proc  -> pane fallback preserved",
      'echo "-SUTANDO_CORE_RUNTIME"',     False, 7777, True),
+    # Versioned install: Claude Code runs from `~/.local/share/claude/versions/
+    # <ver>`, so the kernel accounting name that `pgrep -x` matches is `<ver>`,
+    # not `claude` — pgrep matches NOTHING for a perfectly healthy core. The
+    # core is the session's own pane, and its argv still names the session, so
+    # the pane-scoped argv check must resolve it. Before the fix this returned
+    # None, `.alive` was never written, and a live core read dead to every
+    # reader — the inverse of #2488 and the more dangerous direction, since a
+    # consumer that relaunches a dead core would relaunch a live one in a loop.
+    ("versioned binary (pgrep -x misses) -> pane argv still identifies the core",
+     'echo SUTANDO_CORE_RUNTIME=claude', False, 4242, False, 4242),
 ]
 for case in CASES:
     label, rt, alive, want = case[:4]
     _kill = bool(len(case) > 4 and case[4])
-    box = _farm(rt, alive, kill_config=_kill)
+    _pane = case[5] if len(case) > 5 else 7777
+    box = _farm(rt, alive, kill_config=_kill, pane_pid=_pane)
     _op = os.environ["PATH"]
     os.environ["PATH"] = f"{box}:{_op}"
     _tok = _blind_config() if _kill else None
