@@ -2,9 +2,9 @@
 
 *Status: draft for review — G8 of the desktop-parity plan
 (`design-desktop-onboarding-parity.md` in the roadmap vault). Companion to the
-first refactor slice, **#2197 (open, in review)**, which introduces
+first refactor slice, **#2197 (MERGED 2026-08-03)**, which introduced
 `src/credential-resolver.ts` + the TS `GEMINI_*` reader sweep — file paths
-below describe that PR's head, not current `main`. Owner call outstanding:
+below are now current `main`. Owner call outstanding:
 confirm **managed pilot = Gemini voice**.*
 
 ## Problem
@@ -89,7 +89,7 @@ the tier list grows.
 
 ## Migration plan (reader sweep)
 
-- **Phase 1 — TS surfaces (#2197, open — the implementing PR):** `voice-agent.ts`, `voice-key.ts`,
+- **Phase 1 — TS surfaces (#2197, MERGED — the implementing PR):** `voice-agent.ts`, `voice-key.ts`,
   `browser-tools.ts`, `recording-tools.ts` + `startup-runtime.sh` gate +
   health-check surface. Tests: `tests/credential-resolver.test.ts` (tier
   order, fallback, malformed-file, byte-identical-legacy).
