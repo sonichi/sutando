@@ -117,6 +117,67 @@ class TestHookRegistration(unittest.TestCase):
             self.fail(f"must not propagate: {e!r}")
         self.assertEqual(out["status"], "warn")
 
+    def test_VALID_json_of_the_wrong_shape_warns_and_never_aborts_the_run(self):
+        # Unparseable JSON was covered; PARSEABLE-but-wrong-shape was not, and that is a
+        # different axis. `[]` parses fine and then .get() raises AttributeError, which
+        # takes down every probe after this one in run_all_checks(). Cover the shape axis,
+        # not just the two spellings a reviewer happened to name.
+        for payload in ("[]", '"a string"', "3", "null",
+                        '{"hooks": []}', '{"hooks": "nope"}', '{"hooks": 7}'):
+            with self.subTest(payload=payload):
+                (self.repo / ".claude" / "settings.json").write_text(payload)
+                try:
+                    out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+                except Exception as e:
+                    self.fail(f"{payload!r} must warn, not propagate {e!r}")
+                self.assertEqual(out["status"], "warn", payload)
+
+    def _one_hook_repo(self, root_name, command):
+        """A repo with a single owned Stop hook registered to `command`."""
+        repo = Path(self._tmp.name) / root_name
+        (repo / "src").mkdir(parents=True)
+        (repo / ".claude").mkdir(parents=True)
+        (repo / "src" / "install-claude-hooks.sh").write_text(
+            '#!/usr/bin/env bash\nSETTINGS="$REPO_DIR/.claude/settings.json"\n'
+            'HOOKS=(\n  "Stop|src/check-pending-tasks.sh|bash $REPO_DIR/src/check-pending-tasks.sh"\n)\n'
+        )
+        (repo / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": command(repo)}]}]}}))
+        return repo
+
+    def test_a_path_that_merely_SHARES_A_PREFIX_is_a_different_checkout(self):
+        # `str(repo) in command` says these are the same checkout. They are not — and this
+        # is precisely the present-but-pointing-elsewhere case the probe exists to catch,
+        # so a substring test certifying it clean defeats the probe's whole purpose.
+        # Both directions: the stale copy longer than the repo, and shorter.
+        cases = {
+            "sibling-suffix": ("a/sutando", lambda r: f"bash {r}-old/src/check-pending-tasks.sh"),
+            "sibling-prefix": ("b/sutando-new", lambda r: f"bash {str(r)[:-4]}/src/check-pending-tasks.sh"),
+            "same-basename-elsewhere": ("c/sutando", lambda r: "bash /opt/sutando/src/check-pending-tasks.sh"),
+        }
+        for label, (root, cmd) in cases.items():
+            with self.subTest(case=label):
+                repo = self._one_hook_repo(root, cmd)
+                out = self.hc.check_claude_hook_registration(repo_dir=repo)
+                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
+                self.assertIn("another checkout", out["detail"])
+
+    def test_a_GENUINE_checkout_is_not_reported_foreign(self):
+        # Over-trigger control for the fix above: a warning that fires on healthy hosts is
+        # its own defect. Exact path, and the same path reached through a symlink (macOS
+        # /var -> /private/var makes this the common case, not an exotic one).
+        repo = self._one_hook_repo("real", lambda r: f"bash {r}/src/check-pending-tasks.sh")
+        self.assertEqual(self.hc.check_claude_hook_registration(repo_dir=repo)["status"], "ok")
+
+        link = Path(self._tmp.name) / "linked"
+        link.symlink_to(repo)
+        out = self.hc.check_claude_hook_registration(repo_dir=link)
+        self.assertEqual(out["status"], "ok", f"symlinked checkout must not read as foreign: {out['detail']}")
+
+    def test_a_quoted_path_with_spaces_still_resolves(self):
+        repo = self._one_hook_repo("has space", lambda r: f'bash "{r}/src/check-pending-tasks.sh"')
+        self.assertEqual(self.hc.check_claude_hook_registration(repo_dir=repo)["status"], "ok")
+
     def test_not_a_sutando_checkout_is_ok_not_a_warning(self):
         (self.repo / "src" / "install-claude-hooks.sh").unlink()
         out = self.hc.check_claude_hook_registration(repo_dir=self.repo)

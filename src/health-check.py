@@ -4470,6 +4470,35 @@ def _host_runs_comm_sweep(
     return False
 
 
+def _hook_command_targets(command: str, expected: Path) -> bool:
+    """Does this hook command actually invoke `expected`, as a path — not as a substring?
+
+    Substring containment is not checkout identity. `/tmp/sutando` is a substring of
+    `/tmp/sutando-old/src/check-pending-tasks.sh`, so a `str(repo) in command` test
+    certifies a sibling checkout as this one — silently passing the very
+    present-but-pointing-elsewhere failure this probe exists to catch.
+
+    So the command is shell-split and each absolute token compared to `expected` as a
+    path. Falls back to realpath equality, which keeps a symlinked-but-genuine checkout
+    (macOS `/var` -> `/private/var`) from being reported as foreign. A relative token
+    can't be resolved without knowing the hook's cwd, so it never counts as a match:
+    unprovable identity warns, consistent with every other branch here.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:  # unbalanced quoting — degrade rather than raise
+        tokens = command.split()
+    want = os.path.normpath(os.path.expanduser(str(expected)))
+    want_real = os.path.realpath(want)
+    for tok in tokens:
+        tok = os.path.expanduser(tok)
+        if not os.path.isabs(tok):
+            continue
+        if os.path.normpath(tok) == want or os.path.realpath(tok) == want_real:
+            return True
+    return False
+
+
 def check_claude_hook_registration(
     repo_dir: Optional[Path] = None,
 ) -> dict:
@@ -4535,7 +4564,21 @@ def check_claude_hook_registration(
     except (OSError, json.JSONDecodeError) as exc:
         return {"name": name, "status": "warn", "detail": f"{settings.name} unreadable ({exc})"}
 
-    hooks = conf.get("hooks") or {}
+    # Parseable is not the same as well-shaped: `[]` is valid JSON, and `.get()` on it
+    # raises AttributeError, which would abort every remaining probe in run_all_checks().
+    # A malformed schema has to fail toward a warning like every other ambiguous branch.
+    if not isinstance(conf, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"{settings.name} top level is {type(conf).__name__}, not an object — "
+                          f"cannot verify {len(owned)} hook(s)"}
+    hooks = conf.get("hooks")
+    if hooks is None:
+        hooks = {}
+    elif not isinstance(hooks, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"{settings.name} \"hooks\" is {type(hooks).__name__}, not an object — "
+                          f"cannot verify {len(owned)} hook(s)"}
+
     missing, foreign = [], []
     for event, marker in owned:
         cmds = [h.get("command", "")
@@ -4544,7 +4587,9 @@ def check_claude_hook_registration(
         hit = [c for c in cmds if marker in c]
         if not hit:
             missing.append(f"{event}:{marker}")
-        elif marker.startswith("src/") and not any(str(repo) in c for c in hit):
+        elif marker.startswith("src/") and not any(
+            _hook_command_targets(c, repo / marker) for c in hit
+        ):
             # Registered, but aimed at another checkout — runs stale code forever.
             foreign.append(f"{event}:{marker}")
     if missing or foreign:
