@@ -24,6 +24,7 @@ Run: python3 tests/health-check-carrier-set-enforced.test.py
 from __future__ import annotations
 import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -185,27 +186,76 @@ class CarrierSetProbe(unittest.TestCase):
         self._patch_resolved([])
         self.assertIsNone(self.hc.check_carrier_set_enforced(workspace_dir=ws))
 
-    def test_a_failing_git_invocation_does_not_crash_the_probe(self):
-        # health-check must never die on one probe. If check-ignore cannot run,
-        # that entry is skipped rather than reported as a failure — guessing
-        # "stale" from a broken subprocess would cry wolf.
+    def _with_run(self, fake):
+        # Save the ORIGINAL first. `self.hc.subprocess` IS the shared module, so
+        # re-importing it in the restore hands back the patched function and the
+        # break leaks into every later test.
+        original = self.hc.subprocess.run
+        self.hc.subprocess.run = fake
+        self.addCleanup(lambda: setattr(self.hc.subprocess, "run", original))
+
+    def test_a_git_that_CANNOT_RUN_is_reported_UNKNOWN_not_healthy(self):
+        # This assertion previously demanded "ok", on the reasoning that a broken
+        # subprocess must not cry wolf. That was wrong, and qingyun-wu caught it:
+        # an unmeasured carrier set is not a measured-healthy one, and reporting
+        # green when the measurement could not run is the EXACT failure this probe
+        # was written to catch — reproduced inside the probe itself.
         ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
                           ["notes/a.md", "state/current-track.md"])
         self._patch_resolved(["notes/", "state/current-track.md"])
         self._patch_shipped(["notes/", "state/current-track.md"])
         def boom(*a, **k):
             raise OSError("git missing")
-        # Save the ORIGINAL first. `self.hc.subprocess` IS the shared module, so
-        # re-importing it in the restore hands back the patched function and the
-        # break leaks into every later test.
-        original = self.hc.subprocess.run
-        self.hc.subprocess.run = boom
-        try:
-            r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
-        finally:
-            self.hc.subprocess.run = original
+        self._with_run(boom)
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
         self.assertIsNotNone(r)
-        self.assertEqual(r["status"], "ok", "a broken git call must not manufacture a failure")
+        self.assertNotEqual(r["status"], "ok",
+                            "a carrier set that could not be measured must not read healthy")
+        self.assertIn("UNKNOWN", r["detail"])
+
+    def test_a_git_EXIT_128_is_not_folded_in_with_exit_1(self):
+        # check-ignore's contract: 0 = ignored, 1 = NOT ignored, anything else =
+        # the command failed. `returncode != 0` treated 128 exactly like 1, so a
+        # git that errored reported the path as carried.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "state/current-track.md"])
+        self._patch_resolved(["notes/", "state/current-track.md"])
+        self._patch_shipped(["notes/", "state/current-track.md"])
+        class R:
+            returncode = 128
+            stdout = b""
+            stderr = b"fatal: not a git repository"
+        self._with_run(lambda *a, **k: R())
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertNotEqual(r["status"], "ok", "exit 128 is a failed measurement, not a pass")
+        self.assertIn("UNKNOWN", r["detail"])
+
+    def test_it_does_NOT_spawn_a_bare_git(self):
+        # On macOS /usr/bin/git is an Xcode-CLT shim that pops an install dialog
+        # when the tools are absent. This probe runs from a BACKGROUND health
+        # check, so nobody is there to dismiss it. Everything must go through the
+        # repo's resolver, which refuses that shim rather than spawning it.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "state/current-track.md"])
+        self._patch_resolved(["notes/", "state/current-track.md"])
+        self._patch_shipped(["notes/", "state/current-track.md"])
+        seen = []
+        class R:
+            returncode = 1
+            stdout = b""
+            stderr = b""
+        def spy(argv, *a, **k):
+            seen.append(list(argv))
+            return R()
+        self._with_run(spy)
+        self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertTrue(seen, "probe made no git call at all — the assertion proves nothing")
+        for argv in seen:
+            self.assertNotEqual(argv[0], "git",
+                                "bare 'git' can be the CLT shim; route through git_argv")
+            self.assertTrue(os.path.isabs(argv[0]),
+                            f"expected a resolved absolute git path, got {argv[0]!r}")
 
     def test_an_unreadable_shipped_config_degrades_to_the_stale_branch_only(self):
         # Malformed/absent shipped config must not crash or fabricate a

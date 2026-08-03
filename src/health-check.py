@@ -42,7 +42,7 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from git_binary import git_argv  # noqa: E402
+from git_binary import GitUnavailable, git_argv  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
@@ -1127,27 +1127,42 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         return None
 
     stale: "list[str]" = []
+    unmeasured: "list[str]" = []
     for entry in resolved:
         rep = _carrier_representative(workspace, entry)
         if rep is None:
             continue
         try:
             proc = subprocess.run(
-                ["git", "-C", str(workspace), "check-ignore", "--no-index", "-q",
-                 str(rep.relative_to(workspace))],
+                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
+                         str(rep.relative_to(workspace))),
                 capture_output=True, timeout=10,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (GitUnavailable, OSError, subprocess.SubprocessError):
+            # Could not run the measurement at all. NOT the same as "carried".
+            unmeasured.append(entry)
             continue
-        # exit 0 == the path IS ignored, i.e. configured but not carried.
+        # `git_argv` rather than a bare "git": on macOS the stock /usr/bin/git is
+        # an Xcode-CLT shim that pops an install dialog when the tools are absent,
+        # and this probe runs from a BACKGROUND health check where nobody is there
+        # to dismiss it. The resolver refuses that shim instead of spawning it.
+        #
         # `--no-index` is LOAD-BEARING (sync-workspace.sh says so at its own
         # check-ignore call): without it, git reports an ALREADY-TRACKED file as
         # not-ignored regardless of the rules, so a host whose file was carried
         # once and whose exclude later went stale reads healthy forever. Caught
         # by restoring this host's real pre-fix exclude and watching the probe
         # still say OK.
+        #
+        # check-ignore's contract is 0 = ignored, 1 = NOT ignored, anything else
+        # = it failed. Treating "not 0" as healthy folded exit 128 in with exit 1,
+        # so a git that could not run reported the carrier set as fine — the exact
+        # unmeasured-reads-as-healthy failure this probe exists to catch, in the
+        # probe itself.
         if proc.returncode == 0:
             stale.append(entry)
+        elif proc.returncode != 1:
+            unmeasured.append(entry)
 
     # Read the SHIPPED file directly rather than through load_config(), which
     # deep-merges the local override and would therefore return `resolved` —
@@ -1163,11 +1178,18 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     except (OSError, json.JSONDecodeError, AttributeError):
         dropped = []
 
-    if not stale and not dropped:
+    if not stale and not dropped and not unmeasured:
         return {"name": name, "status": "ok",
                 "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault"}
 
     parts = []
+    if unmeasured:
+        parts.append(
+            f"could NOT measure {len(unmeasured)} carrier path(s) "
+            f"({', '.join(unmeasured[:4])}{'…' if len(unmeasured) > 4 else ''}) — git was "
+            f"unavailable or check-ignore failed, so whether the vault is backing them up is "
+            f"UNKNOWN, not fine"
+        )
     if stale:
         parts.append(
             f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
