@@ -109,10 +109,16 @@ jobs:
       # discover it — wire both explicitly here. `--all --strict` validates every
       # skills/*/manifest.json (the path skills/MANIFEST.md documents) and fails on
       # warnings (e.g. a network permission that doesn't match the code).
+      # Each call is wrapped in `timeout -k 5 120` for the same reason as the
+      # discovered-suite loops below: this job's timeout-minutes is the only
+      # other bound, so an unbounded hang here burns the whole job budget and
+      # the job is CANCELED mid-step — which renders as `fail` and hides which
+      # suite hung. These two steps are hand-wired lists rather than loops, so
+      # they were missed when the loops were bounded.
       - name: Lint skill manifests
         run: |
-          python3 scripts/lint-skill.test.py
-          python3 scripts/lint-skill.py --all --strict
+          timeout -k 5 120 python3 scripts/lint-skill.test.py
+          timeout -k 5 120 python3 scripts/lint-skill.py --all --strict
 
       # Python tests that live OUTSIDE tests/ and so are invisible to the
       # `find tests -name '*.test.py'` step below. Same reason the skill-manifest
@@ -123,20 +129,20 @@ jobs:
       # which is the guard against src/ and the package silently diverging.
       - name: Run out-of-tree Python tests
         run: |
-          python3 src/remote-gateway-bridge.test.py
-          python3 packages/ag2-sparrow/tests/test_gateway_status.py
-          python3 packages/ag2-sparrow/tests/test_dns_timeout.py
-          python3 packages/ag2-sparrow/tests/test_ack_retry.py
-          python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
-          python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
-          python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
-          python3 packages/ag2-sparrow/tests/test_event_consumer.py
-          python3 packages/ag2-sparrow/tests/test_event_wiring.py
-          python3 packages/ag2-sparrow/tests/test_human_action.py
-          python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
-          python3 packages/ag2-sparrow/tools/test_no_drift.py
-          python3 skills/agent-room-ops/test_room_ops.py
-          python3 skills/make-viral-video/scripts/test_source_tag.py
+          timeout -k 5 120 python3 src/remote-gateway-bridge.test.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_timeout.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_human_action.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
+          timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py
+          timeout -k 5 120 python3 skills/make-viral-video/scripts/test_source_tag.py
 
       - name: Run tests
         run: npm test
