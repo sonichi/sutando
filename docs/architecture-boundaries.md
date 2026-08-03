@@ -146,6 +146,29 @@ call a named operation, then emit its result. Filesystem reconciliation and
 response assembly belong in module-level operations that can be tested without a
 socket. Protect both the operation contract and one route-wiring path.
 
+The same rule governs result-body markers, with an explicit one-way dependency
+direction:
+
+    result_markers.parse_markers()   # protocol interpretation
+              |
+              v
+    send_allowlist.is_path_sendable()  # delivery authorization
+              |
+              v
+    provider-specific upload mechanism
+
+`src/result_markers.py` owns marker syntax, precedence, stripping, and action
+extraction. `src/send_allowlist.py` owns attachment-path authorization. Delivery
+consumers (Discord, Slack, Telegram, gateway, and the `dm-result.py` REST
+fallback) own transport routing and upload calls only — they must not define
+marker regexes or path-policy copies.
+
+Parsing never authorizes and authorization never parses: `parse_markers()`
+extracts any marker value and leaves the decision about whether a path may be
+opened to the allowlist. A consumer that filters values during parsing
+re-couples the two and drifts — which is precisely how `dm-result.py` came to
+deliver literal `[file: ...]` text that every other consumer stripped.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known

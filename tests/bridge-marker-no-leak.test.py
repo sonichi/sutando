@@ -138,6 +138,38 @@ def main() -> int:
     if not any(a.kind == "attach" for a in r.actions):
         return fail("parse_markers did not emit an attach action")
 
+    # ---- Adoption guards: no consumer may re-define the marker grammar ----
+    # Scoped deliberately to the two delivery consumers that once carried a
+    # private copy. A repo-wide ban would reject docs, tests, and unrelated
+    # protocols, so keep this file-specific.
+    consumers = ("src/discord-bridge.py", "src/dm-result.py")
+    for rel in consumers:
+        src = (REPO / rel).read_text()
+        if "_FILE_MARKER_RE" in src:
+            return fail(
+                f"{rel} defines/uses _FILE_MARKER_RE — the attachment-marker "
+                "grammar belongs solely to src/result_markers.py",
+                rel,
+            )
+        if "def _split_file_markers" in src:
+            return fail(
+                f"{rel} defines _split_file_markers() — derive attachments from "
+                'parse_markers() actions with kind == "attach" instead',
+                rel,
+            )
+
+    # dm-result.py must actually USE the canonical parser for delivery prep,
+    # not merely import it for skip markers.
+    dm = (REPO / "src" / "dm-result.py").read_text()
+    if "from result_markers import parse_markers" not in dm:
+        return fail("dm-result.py does not import parse_markers from result_markers")
+    if "parse_markers(text)" not in dm:
+        return fail("dm-result.py does not call parse_markers(text) for delivery preparation")
+    if 'kind == "attach"' not in dm:
+        return fail(
+            'dm-result.py does not derive attachments from actions with kind == "attach"'
+        )
+
     print("PASS: bridges route marker decisions through parse_markers + parser strips all markers from body.")
     return 0
 

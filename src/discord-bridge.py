@@ -309,31 +309,6 @@ def _chunk_for_discord(text: str, max_len: int = 1900):
     """
     yield from chunk_message(text, max_len)
 
-# Marker regex for inline file references in result bodies. The pattern
-# requires absolute paths (`/...` or `~/...`) — the earlier relative-
-# path-allowing form resolved against the bridge's CWD, which differed
-# between launchd-managed and bare-shell runs. Three call sites in this
-# module (poll_results, poll_proactive, poll_dm_fallback channel-
-# redirect) previously re-defined this regex inline; consolidated here
-# so a future hardening only needs one edit.
-_FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*((?:/|~/)[^\]:]+)\]')
-
-
-def _split_file_markers(text: str) -> tuple[str, list[str]]:
-    """Split a result body into ``(clean_text, files)``.
-
-    ``files`` is the list of paths extracted from ``[file:|send:|attach:]``
-    markers (in textual order). ``clean_text`` is the original text with
-    every marker removed and surrounding whitespace stripped.
-
-    Pure function — single source of truth for the marker pattern
-    across every send path in this bridge.
-    """
-    files = _FILE_MARKER_RE.findall(text)
-    clean_text = _FILE_MARKER_RE.sub('', text).strip()
-    return clean_text, files
-
-
 # Thin alias — actual logic lives in src/send_allowlist.py so the
 # REST-fallback delivery path (src/dm-result.py) stays in lock-step.
 # Public name kept (_is_path_sendable) so existing call sites in this

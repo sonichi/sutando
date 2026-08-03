@@ -389,6 +389,20 @@ Tasks arrive from multiple channels via the same file bridge:
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body (regardless of marker order), so a body carrying private data can never be *redirected* out to a shared channel. It marks dm-only intent but does not by itself force a DM — that stays the consumer's job. In practice the private producer (the morning briefing's calendar + email) is emitted as a proactive result (`results/proactive-*.txt`), which every bridge already delivers to the owner's DM; `[dm-only]` reinforces that by guaranteeing no stray `[channel:]` redirect overrides it. **Detected anywhere in the body** — that is what makes the guard undefeatable by marker order, and over-triggering it fails safe. **Stripped only when the marker stands alone on its line**, before delivery and before voice speaks it; a marker mentioned inline in prose is detected but the text is delivered verbatim. Parsed by `result_markers.parse_markers`.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
 
+**Marker parsing is centralised — do not re-implement it.** Every Python result
+consumer MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`),
+and derive attachments from actions whose `kind == "attach"`. A consumer may apply
+only the actions its transport supports, but must NOT recognise, strip, or prioritise
+markers with local regexes or `startswith` checks. Attachment-path authorization is a
+separate concern owned by `src/send_allowlist.py`, applied immediately before the
+upload sink. The dependency direction is one-way:
+
+    parse_markers()  ->  send_allowlist.is_path_sendable()  ->  transport upload
+
+Private copies drift: `discord-bridge.py` and `dm-result.py` each carried a regex that
+only matched `/...` or `~/...` values, so a marker every other consumer stripped was
+delivered to the owner as literal text. Guarded by `tests/bridge-marker-no-leak.test.py`.
+
 **Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
 - phone → key built via `phoneCallKey(callSid)` → `phone-<safe(call-sid)>`
 
