@@ -34,7 +34,7 @@
       "audience": ["users", "operators", "agents"],
       "status": "canonical",
       "canonical_for": "built-in capability catalog",
-      "last_verified": null
+      "last_verified": "2026-07-29"
     },
     "docs/codex-core.md": {
       "title": "Codex CLI as the Sutando core",

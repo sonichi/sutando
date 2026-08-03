@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import personal_path  # noqa: E402
+from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 
@@ -108,7 +109,7 @@ def get_waiting_questions():
     # this cut the heading-agnostic split below sweeps the whole file and
     # every resolved entry is miscounted as pending, re-notifying the owner
     # about already-answered questions. No-op when there is no such divider.
-    content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
+    content = active_region(content)
     questions = []
     # Walk each ## section; a section is waiting if its body contains
     # `Status: unanswered`, `Status: Waiting` or `Status: open`, OR has no
