@@ -366,15 +366,17 @@ fi
 # point its OTLP exporter at the collector (which serves /v1/metrics). Enable
 # ONLY metrics — logs/traces stay off so hooks remain the sole obs source (no
 # duplicate events). JSON OTLP so the collector parses it without protobuf.
-# Gated on the same endpoint; honors any pre-set OTEL_* so a real OTel backend
-# isn't overridden.
-if [ -n "$OBS_ENDPOINT" ] && [ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then
+# Metrics may use the default-on local collector without enabling plaintext
+# prompt/tool hooks. An explicit SUTANDO_OBS_ENDPOINT retains the legacy
+# combined behavior. Honor any pre-set OTEL_* so a real backend is not replaced.
+METRICS_ENDPOINT="${SUTANDO_OBS_METRICS_ENDPOINT:-$OBS_ENDPOINT}"
+if [ -n "$METRICS_ENDPOINT" ] && [ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then
   export CLAUDE_CODE_ENABLE_TELEMETRY=1
   export OTEL_METRICS_EXPORTER=otlp
   export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
-  export OTEL_EXPORTER_OTLP_ENDPOINT="$OBS_ENDPOINT"
+  export OTEL_EXPORTER_OTLP_ENDPOINT="$METRICS_ENDPOINT"
   export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-10000}" # ms; 10s (CC default 60s)
-  echo "obs metering: → $OBS_ENDPOINT/v1/metrics (CC OTel token+cost, every ${OTEL_METRIC_EXPORT_INTERVAL}ms)"
+  echo "obs metering: → $METRICS_ENDPOINT/v1/metrics (CC OTel token+cost, every ${OTEL_METRIC_EXPORT_INTERVAL}ms)"
 fi
 
 # --restart: kill any existing session before starting fresh. Without this,
