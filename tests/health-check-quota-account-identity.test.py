@@ -149,6 +149,39 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         self.assertIsNone(hc._scoped_keychain_service("   "))
         self.assertIsNone(hc._scoped_keychain_service(None))
 
+    # ---- degraded environments: never crash the whole health run ----------
+
+    def test_missing_plist_is_ok_not_an_error(self):
+        """Proxy running but not launchd-managed (dev host, manual launch).
+        There is no plist to compare against; that is not a fault."""
+        core = "/Users/x/ws/.claude-sutando"
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": core}, clear=False), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)):
+            out = hc.check_quota_account_identity("ok")   # no plist written
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("launchd", out["detail"])
+
+    def test_corrupt_plist_warns_rather_than_raising(self):
+        """A truncated/garbage plist must degrade to a warn, not propagate an
+        exception into the health run and take every later check with it."""
+        core = "/Users/x/ws/.claude-sutando"
+        path = self.home / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
+        path.write_bytes(b"\x00not a plist\x00")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": core}, clear=False), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)):
+            out = hc.check_quota_account_identity("ok")
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("cannot read", out["detail"])
+
+    def test_keychain_probe_failure_is_swallowed(self):
+        """`security` missing or the keychain locked must read as 'no such
+        item', not raise. Non-macOS CI hits this path."""
+        with mock.patch.object(hc.subprocess, "run", side_effect=OSError("no security binary")):
+            self.assertFalse(hc._keychain_service_exists(VANILLA))
+        with mock.patch.object(hc.subprocess, "run",
+                               side_effect=hc.subprocess.SubprocessError("timeout")):
+            self.assertFalse(hc._keychain_service_exists(VANILLA))
+
     def test_reads_no_secret_material(self):
         """The check must never invoke `security ... -w` (the flag that prints
         the password). Item-existence only."""
