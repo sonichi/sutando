@@ -42,7 +42,13 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+# Kept as two lines on purpose: tests/git-binary-resolution.test.py:109 asserts
+# the literal `from git_binary import git_argv` to prove each call site imports
+# the resolver instead of hardcoding a git path. Merging these into one import
+# breaks that substring check — which guards 27 other call sites, so the import
+# bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
+from git_binary import GitUnavailable  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
@@ -270,6 +276,37 @@ def _resolve_dotenv() -> Path:
 _VOICE_ENV_KEYS = ("SKIP_VOICE", "GEMINI_VOICE_API_KEY", "GEMINI_API_KEY")
 
 
+def managed_voice_credential_present(path: Optional[Path] = None) -> bool:
+    """True when the managed-credentials file carries a usable voice key.
+
+    Mirrors `_managed_voice_credential_present` in startup-runtime.sh, including
+    its fallback order (`CAPABILITY_FALLBACKS['gemini-voice']`) and its
+    malformed-file contract: an unreadable or malformed file SKIPS the tier
+    rather than raising, matching readManaged()'s try/catch.
+
+    Deliberately NOT fail-closed, unlike the dotenv parsing above. The two cases
+    differ: a malformed SKIP_VOICE means someone configured voice and we cannot
+    tell how, so hiding it would mask an outage. A malformed managed file means
+    the managed tier is unusable, so startup will not boot voice either — and
+    reporting "enabled" there would invent an outage that cannot exist. Match
+    the launcher, because the whole bug was the two disagreeing.
+    """
+    if path is None:
+        path = WORKSPACE_DIR / "state" / "auth" / "managed-credentials.json"
+    try:
+        caps = (json.loads(Path(path).read_text()) or {}).get("capabilities") or {}
+        if not isinstance(caps, dict):
+            return False
+    except Exception:
+        return False
+    for slot in ("gemini-voice", "gemini-text"):
+        entry = caps.get(slot)
+        key = entry.get("key") if isinstance(entry, dict) else None
+        if isinstance(key, str) and key:
+            return True
+    return False
+
+
 def resolve_voice_health_config(
     env: Optional[dict] = None,
     env_path: Optional[Path] = None,
@@ -331,6 +368,22 @@ def resolve_voice_health_config(
         return {"enabled": True, "detail": "Gemini voice credential configured"}
     if skip_voice not in ("", "0", "1"):
         return {"enabled": True, "error": f"invalid SKIP_VOICE={skip_voice!r}"}
+    # The MANAGED tier, checked in the same order startup-runtime.sh uses: BYO env
+    # first, then managed, and only then SKIP_VOICE. Without this the two disagree —
+    # startup-runtime.sh:52-58 boots voice on a managed credential while this
+    # returned "disabled", so all four voice checks reported `ok — disabled` over a
+    # running-and-broken voice agent. A health check that reports "disabled" about a
+    # service that is actually running is worse than no check: it converts an outage
+    # into a green light. (#2197 review blocker, john-the-dev 2026-07-30T01:53.)
+    #
+    # This check MUST sit above the SKIP_VOICE=1 return, not below it. Placing it
+    # below narrowed the bug without resolving it: the launcher *unsets* an inherited
+    # SKIP_VOICE when a managed credential exists, so the composition "managed key +
+    # inherited SKIP_VOICE=1" still had startup booting voice while health reported
+    # disabled. The managed-only test could not catch it because it omits SKIP_VOICE.
+    # (#2197 review blocker, john-the-dev 2026-07-31T05:37.)
+    if managed_voice_credential_present():
+        return {"enabled": True, "detail": "managed voice credential configured"}
     if skip_voice == "1":
         return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
@@ -1061,6 +1114,168 @@ def check_memory_dir_siblings() -> "dict | None":
             "only; which slug is canonical is an open decision."
         ),
     }
+
+
+def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
+    """Resolve one existing concrete path for a carrier-set entry, or None.
+
+    Entries are gitignore-style and may be globs (`hosts/*/`), directories
+    (`notes/`) or plain files (`state/current-track.md`). We only need ONE
+    materialized path per entry to ask git whether the entry is being carried;
+    an entry with nothing on disk yet is not evidence of anything, so it is
+    skipped rather than reported.
+    """
+    rel = entry.strip().lstrip("/").rstrip("/")
+    if not rel:
+        return None
+    if any(ch in rel for ch in "*?["):
+        for hit in sorted(workspace.glob(rel)):
+            return hit
+        return None
+    candidate = workspace / rel
+    return candidate if candidate.exists() else None
+
+
+def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
+    """A configured carrier-set entry that git still ignores is not being backed up.
+
+    `sync-workspace.sh:generate_exclude` REFUSES to rewrite an existing
+    `.git/info/exclude` that differs from the generated content (the #1445 guard
+    against clobbering operator-authored rules), and `_enforce_carrier_set_pre`
+    (`:613`) swallows that refusal so the tick continues. The sync then pushes and
+    reports success while the carrier set is silently stale — observed on two
+    hosts independently (65 refusals / 63 followed by `pushed to` on one, 4/4 on
+    the other; see #2565). Every existing check reads healthy: the config IS
+    correct, the checkout IS current, and only the generated artifact is stale.
+
+    Two distinct causes produce the identical symptom and need different remedies,
+    so they are reported separately rather than collapsed:
+
+      1. STALE EXCLUDE — the resolved config lists an entry that git still
+         ignores. Remedy: `bash scripts/sync-workspace.sh --force-gitignore`.
+      2. DROPPED BY OVERRIDE — a local `vault.sync.include` REPLACES the shipped
+         default rather than merging into it (#2531), so shipped entries added
+         later never reach this host. Remedy: add them to the local list. Here
+         the on-disk exclude legitimately MATCHES the resolved config, so cause 1
+         is dormant and a resolved-vs-disk comparison alone reads healthy.
+
+    Asking git directly (`check-ignore`) rather than regenerating the exclude and
+    diffing is deliberate: it tests the OUTCOME, cannot drift as the generator's
+    formatting changes, and is immune to the two legitimate no-diff branches
+    (`:562` no-op when already matching, `:570` safe legacy `hosts/<label>/` ->
+    `hosts/*/` widening) — after either, the paths ARE un-ignored, so there is
+    nothing to false-positive on.
+
+    Returns None when the workspace is not a git repo (vault never initialized),
+    which is a valid unconfigured state and not a defect.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    name = "carrier-set"
+    if not (workspace / ".git").exists():
+        return None
+
+    vault = _resolved_vault()
+    resolved = [e for e in (vault.get("sync") or {}).get("include") or [] if isinstance(e, str)]
+    if not resolved:
+        return None
+
+    stale: "list[str]" = []
+    unmeasured: "list[str]" = []
+    for entry in resolved:
+        rep = _carrier_representative(workspace, entry)
+        if rep is None:
+            continue
+        try:
+            proc = subprocess.run(
+                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
+                         str(rep.relative_to(workspace))),
+                capture_output=True, timeout=10,
+            )
+        except (GitUnavailable, OSError, subprocess.SubprocessError):
+            # Could not run the measurement at all. NOT the same as "carried".
+            unmeasured.append(entry)
+            continue
+        # `git_argv` rather than a bare "git": on macOS the stock /usr/bin/git is
+        # an Xcode-CLT shim that pops an install dialog when the tools are absent,
+        # and this probe runs from a BACKGROUND health check where nobody is there
+        # to dismiss it. The resolver refuses that shim instead of spawning it.
+        #
+        # `--no-index` is LOAD-BEARING (sync-workspace.sh says so at its own
+        # check-ignore call): without it, git reports an ALREADY-TRACKED file as
+        # not-ignored regardless of the rules, so a host whose file was carried
+        # once and whose exclude later went stale reads healthy forever. Caught
+        # by restoring this host's real pre-fix exclude and watching the probe
+        # still say OK.
+        #
+        # check-ignore's contract is 0 = ignored, 1 = NOT ignored, anything else
+        # = it failed. Treating "not 0" as healthy folded exit 128 in with exit 1,
+        # so a git that could not run reported the carrier set as fine — the exact
+        # unmeasured-reads-as-healthy failure this probe exists to catch, in the
+        # probe itself.
+        if proc.returncode == 0:
+            stale.append(entry)
+        elif proc.returncode != 1:
+            unmeasured.append(entry)
+
+    # Read the SHIPPED file directly rather than through load_config(), which
+    # deep-merges the local override and would therefore return `resolved` —
+    # the very list we are testing against. There is no shipped-only public
+    # loader, and inventing one behind a broad `except` would make this branch a
+    # silent no-op the day the name was wrong.
+    dropped: "list[str]" = []
+    try:
+        shipped_cfg = json.loads((Path(REPO_DIR) / "sutando.config.json").read_text())
+        shipped = ((shipped_cfg.get("vault") or {}).get("sync") or {}).get("include")
+        if isinstance(shipped, list):
+            dropped = [e for e in shipped if isinstance(e, str) and e not in resolved]
+    except (OSError, json.JSONDecodeError, AttributeError):
+        dropped = []
+
+    # A shipped entry can be one this host must NOT carry. `state/current-track.md`
+    # is per-host state that #2534 added at a flat, SHARED vault path: two cores write
+    # the same path, and on 2026-08-03 that overwrote a peer's 1056-line anchor.
+    # Telling an operator to re-add it walks them back into that incident, so the
+    # REMEDY is split rather than the entry hidden — silently filtering it would
+    # suppress a real divergence. Delete this list once the host-qualified migration
+    # (#2567/#2568) lands: the flat path stops being shipped and stops appearing here.
+    UNSAFE_TO_READD = ("state/current-track.md",)
+    unsafe = [e for e in dropped if e in UNSAFE_TO_READD]
+    safe = [e for e in dropped if e not in UNSAFE_TO_READD]
+
+    if not stale and not dropped and not unmeasured:
+        return {"name": name, "status": "ok",
+                "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault"}
+
+    parts = []
+    if unmeasured:
+        parts.append(
+            f"could NOT measure {len(unmeasured)} carrier path(s) "
+            f"({', '.join(unmeasured[:4])}{'…' if len(unmeasured) > 4 else ''}) — git was "
+            f"unavailable or check-ignore failed, so whether the vault is backing them up is "
+            f"UNKNOWN, not fine"
+        )
+    if stale:
+        parts.append(
+            f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
+            f"backing them up ({', '.join(stale[:4])}{'…' if len(stale) > 4 else ''}) — the exclude "
+            f"file is stale and sync refused to regenerate it; fix with "
+            f"`bash scripts/sync-workspace.sh --force-gitignore` (diff it first)"
+        )
+    if safe:
+        parts.append(
+            f"{len(safe)} shipped carrier path(s) are missing from this host's resolved include "
+            f"({', '.join(safe[:4])}{'…' if len(safe) > 4 else ''}) — a local "
+            f"`vault.sync.include` REPLACES the shipped default (#2531), so upstream additions never "
+            f"arrive; add them to the local list"
+        )
+    if unsafe:
+        parts.append(
+            f"{len(unsafe)} shipped carrier path(s) are missing here and must NOT be re-added "
+            f"({', '.join(unsafe)}) — per-host state carried at a flat, SHARED vault path, so "
+            f"re-adding re-creates the cross-host overwrite that destroyed a peer's anchor "
+            f"(#2567). Leave them out until the host-qualified migration lands"
+        )
+    return {"name": name, "status": "fail", "detail": "; ".join(parts)}
 
 
 def check_memory_index_integrity() -> "dict | None":
@@ -4609,6 +4824,10 @@ def run_all_checks() -> list[dict]:
     _mem_index = check_memory_index_integrity()
     if _mem_index:
         checks.append(_mem_index)
+
+    # Carrier-set enforcement — a stale exclude means the vault is silently not
+    # backing up paths the config says it carries (#2565).
+    checks.extend(c for c in (check_carrier_set_enforced(),) if c)
 
     # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
