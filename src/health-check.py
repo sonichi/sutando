@@ -1207,14 +1207,33 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     stale = [e for e in stale if e not in UNSAFE_TO_READD]
 
     if not stale and not dropped and not unmeasured:
-        detail = f"all {len(resolved)} configured carrier path(s) un-ignored in the vault"
-        if stale_expected:
-            detail = (
+        if not stale_expected:
+            return {
+                "name": name,
+                "status": "ok",
+                "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault",
+            }
+        # NOT `ok`: this host is in the correct state, but it got there by DIVERGING
+        # from the shipped default, which still ships the flat path in
+        # `vault.sync.include` and still re-carries it on `--force-gitignore` or in a
+        # fresh workspace. Reporting `ok` would claim the default is safe when only
+        # this host is (qingyun-wu on #2570). `warn` is the honest level: `main()`
+        # excludes it from `issues`, so it never alerts and never reaches the --fix
+        # loop that would re-add the path — but it stays visible until phase 2 of
+        # #2567 removes the entry from the default, at which point the path stops
+        # being configured at all and this branch stops being reachable.
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
                 f"{len(resolved) - len(stale_expected)} configured carrier path(s) un-ignored; "
-                f"{', '.join(stale_expected)} correctly NOT carried (shipped at a flat, shared path — "
-                f"do not `--force-gitignore` it back until #2567 lands)"
-            )
-        return {"name": name, "status": "ok", "detail": detail}
+                f"{', '.join(stale_expected)} correctly NOT carried on this host — but the shipped "
+                f"default still lists it in `vault.sync.include`, so a fresh workspace or "
+                f"`--force-gitignore` re-carries it at the flat, SHARED path and can resume the "
+                f"cross-host overwrite. This host is right and the default is not; do not "
+                f"`--force-gitignore` it back. Clears when phase 2 of #2567 drops the entry"
+            ),
+        }
 
     parts = []
     if unmeasured:

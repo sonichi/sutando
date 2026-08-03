@@ -315,7 +315,7 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIn("add them to the local list", r["detail"])
         self.assertNotIn("must NOT be re-added", r["detail"])
 
-    def test_an_UNSAFE_path_that_is_NOT_carried_is_correct_not_a_failure(self):
+    def test_an_UNSAFE_path_that_is_NOT_carried_is_not_a_failure(self):
         # Found by running the merged probe on a live host. That host had
         # deliberately un-carried `state/current-track.md` to stop overwriting a
         # peer's anchor — the RIGHT state — and the probe reported `fail` with the
@@ -323,17 +323,26 @@ class CarrierSetProbe(unittest.TestCase):
         # resumes the cross-host overwrite.
         #
         # #2566 gave the dropped branch this carve-out; the stale branch never got
-        # it. Here it must INVERT the verdict, not just soften the wording: not
-        # carrying a path that must not be carried is success.
+        # it. Here it must move the verdict off `fail` — not carrying a path that
+        # must not be carried is not a failure.
+        #
+        # But NOT to `ok` either (qingyun-wu, #2570): this host is only right
+        # because it DIVERGED from the shipped default, which still lists the flat
+        # path and still re-carries it in a fresh workspace. `warn` is the honest
+        # level — visible, but `main()` excludes it from `issues`, so it neither
+        # alerts nor reaches the --fix loop that would re-add the path.
         ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
                           ["notes/a.md", "state/current-track.md"])
         self._patch_resolved(["notes/", "state/current-track.md"])
         self._patch_shipped(["notes/", "state/current-track.md"])
         r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
         self.assertIsNotNone(r)
-        self.assertEqual(r["status"], "ok",
-                         "an unsafe-to-carry path that is not carried is the correct state")
+        self.assertEqual(r["status"], "warn",
+                         "correct on this host, but the shipped default still re-carries it")
         self.assertIn("correctly NOT carried", r["detail"])
+        # The detail must name the DEFAULT as the thing still unsafe, or the warn
+        # reads as a local nit rather than a live gap in the shipped contract.
+        self.assertIn("default", r["detail"])
         # The command name legitimately appears as a PROHIBITION ("do not
         # `--force-gitignore` it back"). Asserting its mere absence would forbid
         # the warning as well as the instruction — what must never appear is the
@@ -341,6 +350,21 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIn("do not `--force-gitignore`", r["detail"])
         self.assertNotIn("fix with `bash scripts/sync-workspace.sh --force-gitignore`", r["detail"],
                          "must never hand back the command that resumes the overwrite")
+
+    def test_the_UNSAFE_carve_out_never_reaches_the_alerting_issue_list(self):
+        # The carve-out's whole safety property is that it does not alert and does
+        # not reach the --fix loop, because that loop's remedy is the command that
+        # resumes the overwrite. `main()` computes `issues` as everything whose
+        # status is not ok/warn, so this pins the classification rather than the
+        # string — if a later change moves the verdict to any other status, this
+        # fails even though the wording still looks right.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "state/current-track.md"])
+        self._patch_resolved(["notes/", "state/current-track.md"])
+        self._patch_shipped(["notes/", "state/current-track.md"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIn(r["status"], ("ok", "warn"),
+                      "must stay out of main()'s issues list, which drives alerts and --fix")
 
     def test_a_genuinely_stale_SAFE_path_still_fails_with_its_remedy(self):
         # Over-trigger control. The carve-out must not blind the stale branch to
