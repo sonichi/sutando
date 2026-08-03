@@ -114,7 +114,7 @@ check(".alive removed once death is confirmed", not alive.exists())
 # healthy non-Claude host can never be turned into a permanent false death.
 
 def _farm(runtime_line: str, claude_alive: bool, kill_config: bool = False,
-          pane_pid: int = 7777):
+          pane_pid: "int | str" = 7777):
     """Fake toolchain: tmux answers has-session / show-environment / list-panes.
 
     `ps` is deliberately PID-AWARE. It used to echo the core's argv for every
@@ -131,7 +131,10 @@ def _farm(runtime_line: str, claude_alive: bool, kill_config: bool = False,
         'case "$*" in',
         '  *has-session*)      exit 0 ;;',
         f'  *show-environment*) {runtime_line}; exit 0 ;;',
-        f'  *list-panes*)       echo {pane_pid}; exit 0 ;;',
+        # Unquoted on purpose: a multi-token `pane_pid` becomes one line per
+        # token, which is how `list-panes -F '#{pane_pid}'` reports >1 pane and
+        # how a non-pid token (tmux noise, a blank line) reaches the parser.
+        f"  *list-panes*)       printf '%s\\n' {pane_pid}; exit 0 ;;",
         'esac',
         'exit 0',
     ])
@@ -213,6 +216,13 @@ CASES = [
     # consumer that relaunches a dead core would relaunch a live one in a loop.
     ("versioned binary (pgrep -x misses) -> pane argv still identifies the core",
      'echo SUTANDO_CORE_RUNTIME=claude', False, 4242, False, 4242),
+    # Same host shape, but `list-panes` emits a NON-PID token before the real
+    # pane. Real tmux can put a blank line or a warning on stdout, and a
+    # non-numeric token must be skipped rather than crash the resolver or abort
+    # the scan — the core is still found on the next token. Without this row the
+    # `if not pid_s.isdigit(): continue` guard is never executed by any test.
+    ("noisy list-panes (non-pid token first) -> skipped, core still found",
+     'echo SUTANDO_CORE_RUNTIME=claude', False, 4242, False, "- 4242"),
 ]
 for case in CASES:
     label, rt, alive, want = case[:4]
