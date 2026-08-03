@@ -26,6 +26,7 @@ Exit: 0 on pass, 1 on fail.
 """
 
 from pathlib import Path
+import re
 import sys
 
 REPO = Path(__file__).resolve().parent.parent
@@ -139,17 +140,15 @@ def main() -> int:
         return fail("parse_markers did not emit an attach action")
 
     # ---- Adoption guards: no consumer may re-define the marker grammar ----
-    # Scoped deliberately to the two delivery consumers this change migrates.
-    # A repo-wide ban would reject docs, tests, and unrelated protocols, so keep
-    # this file-specific.
+    # Scoped deliberately to the delivery consumers. A repo-wide ban would
+    # reject docs, tests, and unrelated protocols, so keep this file-specific.
     #
-    # KNOWN GAP, stated so the guard is not mistaken for full coverage:
-    # src/telegram-bridge.py still compiles its own file|send|attach regex in
-    # send_reply(). It is NOT in `consumers` below because it would fail — that
-    # is a real outstanding migration, not an oversight. Adding Telegram here is
-    # the follow-up; until then this guard proves only that Discord and the REST
-    # fallback stay clean.
-    consumers = ("src/discord-bridge.py", "src/dm-result.py")
+    # Telegram was previously a KNOWN GAP here: send_reply() compiled its own
+    # file|send|attach regex, so it stripped attachment markers but left every
+    # other marker in the body — and poll_proactive() passes raw result text,
+    # leaking [dm-only]/[channel:] to the owner. send_reply() now derives
+    # attachments from parse_markers() actions, so Telegram is in scope.
+    consumers = ("src/discord-bridge.py", "src/dm-result.py", "src/telegram-bridge.py")
     for rel in consumers:
         src = (REPO / rel).read_text()
         if "_FILE_MARKER_RE" in src:
@@ -164,6 +163,23 @@ def main() -> int:
                 'parse_markers() actions with kind == "attach" instead',
                 rel,
             )
+        # Name-independent check. The two guards above only catch the grammar
+        # when it is spelled with those exact identifiers; Telegram's drift was
+        # an anonymous `file_pattern = re.compile(r'\[(?:file|send|attach)...')`,
+        # which both would have waved through. Match the GRAMMAR itself in any
+        # regex literal so a renamed local parser cannot reintroduce the drift.
+        for m in re.finditer(r"re\.compile\((.{0,120}?)\)", src, re.S):
+            literal = m.group(1)
+            if re.search(r"file\s*\|\s*send\s*\|\s*attach", literal) or (
+                "attach:" in literal and "file:" in literal
+            ):
+                return fail(
+                    f"{rel} compiles a local attachment-marker regex "
+                    f"({literal.strip()[:60]}...) — the marker grammar belongs "
+                    "solely to src/result_markers.py; derive attachments from "
+                    'parse_markers() actions with kind == "attach"',
+                    rel,
+                )
 
     # dm-result.py must actually USE the canonical parser for delivery prep,
     # not merely import it for skip markers.
