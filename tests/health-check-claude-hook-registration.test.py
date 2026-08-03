@@ -178,6 +178,46 @@ class TestHookRegistration(unittest.TestCase):
         repo = self._one_hook_repo("has space", lambda r: f'bash "{r}/src/check-pending-tasks.sh"')
         self.assertEqual(self.hc.check_claude_hook_registration(repo_dir=repo)["status"], "ok")
 
+    # --- the fail-soft branches themselves. Arguing a probe "fails toward noise"
+    # and then leaving its error paths unexercised is how the argument stops being
+    # true; each of these was uncovered until CI said so.
+
+    def test_unbalanced_quoting_in_a_hook_command_does_not_raise(self):
+        # shlex.split raises ValueError on an unterminated quote. A settings file is
+        # hand-editable, so this is reachable, and it must degrade rather than take
+        # out the run like the wrong-shape JSON did.
+        cmd = 'bash "{r}/src/check-pending-tasks.sh'
+        # Assert the fixture actually enters the branch. Without this the test could
+        # pass while shlex parsed the string fine, i.e. never exercising the handler
+        # it claims to cover.
+        with self.assertRaises(ValueError):
+            __import__("shlex").split(cmd.format(r="/x"))
+        repo = self._one_hook_repo("unbalanced", lambda r: cmd.format(r=r))
+        try:
+            out = self.hc.check_claude_hook_registration(repo_dir=repo)
+        except Exception as e:
+            self.fail(f"must degrade, not propagate: {e!r}")
+        self.assertEqual(out["status"], "warn")
+
+    def test_an_unreadable_installer_warns_rather_than_raising(self):
+        # Patched rather than chmod 000: CI runs as root, where 000 is still readable,
+        # so a permissions fixture would pass locally and silently never exercise this.
+        import unittest.mock as mock
+        self._settings(self._all_registered())
+        with mock.patch.object(Path, "read_text", side_effect=OSError("boom")):
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("cannot read installer", out["detail"])
+
+    def test_settings_with_no_hooks_key_at_all_is_treated_as_none_registered(self):
+        # Distinct from {"hooks": {}}: the key is ABSENT, so conf.get returns None.
+        # A file that has never had hooks written to it takes this path, which makes
+        # it the likely shape on a fresh host — the one this probe exists to catch.
+        (self.repo / ".claude" / "settings.json").write_text(json.dumps({"model": "opus"}))
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("4 NOT registered", out["detail"])
+
     def test_not_a_sutando_checkout_is_ok_not_a_warning(self):
         (self.repo / "src" / "install-claude-hooks.sh").unlink()
         out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
