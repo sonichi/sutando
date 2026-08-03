@@ -280,6 +280,33 @@ def main() -> int:
     assert pf.state_hash(pf.raw_state([a], OWNER)) != pf.state_hash(pf.raw_state([b], OWNER))
     print("  ok  a change of principal refires the digest")
 
+
+    # ---- a FAILED trailer fetch is UNKNOWN, never a verdict ----------------
+    # qingyun-wu on #2553: _attach_commits turned any gh/GraphQL failure into
+    # commits=[], which read downstream as "no Stand trailer" -> unattributed ->
+    # is_mine False. A transient error could therefore relabel this agent's own
+    # PRs as someone else's -- a confident wrong identity, which is precisely the
+    # defect this module exists to remove.
+    failed = _pr(40, OWNER, commit_bodies=[])
+    failed[pf.STANDS_UNAVAILABLE] = True
+    g = pf.raw_state([failed], OWNER, stand=PRO)[0]
+    assert g["principal"] == "unknown", g
+    assert g["is_mine"] is None, "a fetch failure must not assert ownership either way"
+    assert g["stands"] == [], g
+    print("  ok  failed trailer fetch -> principal 'unknown', is_mine None")
+
+    # and it stays distinguishable from a genuine no-trailer PR
+    none_found = pf.raw_state([_pr(41, OWNER, commit_bodies=["no trailer"])], OWNER, stand=PRO)[0]
+    assert none_found["principal"] == "unattributed" and none_found["is_mine"] is False
+    assert none_found["principal"] != g["principal"], "looked-and-found-none != could-not-look"
+    print("  ok  'unattributed' (looked, none) stays distinct from 'unknown' (could not look)")
+
+    # the dedup hash must move between them too, or a fetch outage silently
+    # inherits the previous run's identity verdict
+    assert pf.state_hash(pf.raw_state([failed], OWNER, stand=PRO)) != \
+           pf.state_hash(pf.raw_state([_pr(40, OWNER, commit_bodies=["x\n\nStand: " + PRO])], OWNER, stand=PRO))
+    print("  ok  an unknown principal refires rather than reusing the last verdict")
+
     print("\nAll pr-flag core cases pass.")
     return 0
 

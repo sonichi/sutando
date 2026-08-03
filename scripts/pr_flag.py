@@ -68,8 +68,17 @@ def _stands(pr: dict) -> list:
     return sorted(seen)
 
 
-def _principal(stands: list) -> str:
-    """One label for who authored the PR: the stand, "joint", or "unattributed"."""
+# Sentinel key set by _attach_commits when the trailer fetch could not be made.
+# It has to be distinguishable from a successful fetch that found no trailer:
+# "we looked and there is none" and "we could not look" are different facts, and
+# only the first licenses a verdict about who authored the PR.
+STANDS_UNAVAILABLE = "_stands_unavailable"
+
+
+def _principal(stands: list, unavailable: bool = False) -> str:
+    """Who authored the PR: the stand, "joint", "unattributed", or "unknown"."""
+    if unavailable:
+        return "unknown"
     if not stands:
         return "unattributed"
     return stands[0] if len(stands) == 1 else "joint"
@@ -126,6 +135,7 @@ def raw_state(prs: list, owner_login: str, stand: str = None) -> list:
             continue
         author = (pr.get("author") or {}).get("login", "")
         stands = _stands(pr)
+        stands_unavailable = bool(pr.get(STANDS_UNAVAILABLE))
         head = pr.get("headRefOid") or ""
         # Two passes over the same reviews, differing ONLY in whether a review at
         # an older commit is admitted. Kept as one loop with a flag so the two
@@ -155,14 +165,18 @@ def raw_state(prs: list, owner_login: str, stand: str = None) -> list:
             "title": pr.get("title", ""),
             "author": author,
             "stands": stands,
-            "principal": _principal(stands),
+            "principal": _principal(stands, stands_unavailable),
             # `is_mine` is trailer-derived, NOT `author == owner_login`. The old
             # form was true for EVERY agent sharing the account, so a field named
             # "mine" actually answered "is this the shared login?" -- which read
             # as "the owner's PR" to one consumer and "my PR" to another, and was
             # wrong for both. None when no --stand is supplied: unknown beats a
             # confident guess.
-            "is_mine": (stand in stands) if stand else None,
+            # None when no --stand was supplied, AND when the fetch failed: a
+            # transient gh/GraphQL error must not silently relabel this agent's
+            # own PRs as someone else's. Reporting False there would be the very
+            # defect this change exists to remove -- a confident wrong identity.
+            "is_mine": None if (stands_unavailable or not stand) else (stand in stands),
             "base": pr.get("baseRefName") or "",
             "head": head,
             "ci": _ci_state(pr.get("statusCheckRollup")),
@@ -243,12 +257,14 @@ def _attach_commits(repo: str, prs: list) -> list:  # pragma: no cover - gh glue
         if res.returncode != 0:
             print(f"pr-flag: stand fetch failed for #{num}: {res.stderr[:120]}", file=sys.stderr)
             pr["commits"] = []
+            pr[STANDS_UNAVAILABLE] = True
             continue
         try:
             nodes = json.loads(res.stdout)["data"]["repository"]["pullRequest"]["commits"]["nodes"]
             pr["commits"] = [{"messageBody": n["commit"].get("messageBody") or ""} for n in nodes]
         except (KeyError, TypeError, json.JSONDecodeError):
             pr["commits"] = []
+            pr[STANDS_UNAVAILABLE] = True
     return prs
 
 def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic covered in tests
