@@ -29,7 +29,7 @@ def _load():
 INSTALLER = '''#!/usr/bin/env bash
 SETTINGS="$REPO_DIR/.claude/settings.json"
 HOOKS=(
-  "PreCompact|sutando-conversations/|cp x y"
+  "PreCompact|sutando-conversations/|cp \\"\\$TRANSCRIPT_PATH\\" \\"\\$HOME/Desktop/sutando-conversations/\\$(date +%Y).jsonl\\""
   "PreCompact|src/session-handoff.sh|bash $REPO_DIR/src/session-handoff.sh"
   "SessionEnd|src/session-handoff.sh|bash $REPO_DIR/src/session-handoff.sh"
   "Stop|src/check-pending-tasks.sh|bash $REPO_DIR/src/check-pending-tasks.sh"
@@ -58,7 +58,7 @@ class TestHookRegistration(unittest.TestCase):
     def _all_registered(self, repo_path=None):
         r = str(repo_path or self.repo)
         return {
-            "PreCompact": [{"hooks": [{"command": "cp $TRANSCRIPT_PATH ~/Desktop/sutando-conversations/x.jsonl"},
+            "PreCompact": [{"hooks": [{"command": 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/x.jsonl"'},
                                       {"command": f"bash {r}/src/session-handoff.sh"}]}],
             "SessionEnd": self._entry(f"bash {r}/src/session-handoff.sh"),
             "Stop": self._entry(f"bash {r}/src/check-pending-tasks.sh"),
@@ -358,6 +358,45 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
                     repo_dir=self._repo("bash {p}", archive_command=cmd))
                 self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
                 self.assertIn("sutando-conversations/", out["detail"])
+
+    def test_a_cp_that_carries_the_marker_but_archives_the_WRONG_THING(self):
+        # Program-only validation left these two: both are `cp`, both carry the
+        # marker, neither archives the session transcript to the owned destination.
+        #
+        # I had justified stopping at the program with a "compatibility boundary"
+        # argument — the installer preserves operator-customized archive hooks, so
+        # any cp must be acceptable. That was WRONG, and checkable: Phase 0 does
+        # skip sweeping a custom archiver, but Phase 1 detects presence by EXACT
+        # command string (`index($cmd)`), so a custom cp never satisfies it and the
+        # installer ADDS its own alongside. They coexist — meaning the installer's
+        # own command IS present on any host where it ran, and the probe can say so.
+        cases = {
+            "wrong source": 'cp /tmp/not-the-transcript "$HOME/Desktop/sutando-conversations/x.jsonl"',
+            "wrong destination": 'cp "$TRANSCRIPT_PATH" /tmp/sutando-conversations/not-desktop.jsonl',
+        }
+        for label, cmd in cases.items():
+            with self.subTest(case=label):
+                out = self.hc.check_claude_hook_registration(
+                    repo_dir=self._repo("bash {p}", archive_command=cmd))
+                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
+                self.assertIn("sutando-conversations/", out["detail"])
+
+    def test_the_installer_template_parses_into_CLEAN_tokens(self):
+        # The genuine case regressed to `warn` twice while I was fixing the above,
+        # both times because the template failed to tokenize and fell back to a
+        # whitespace split that keeps stray quotes. Pin the parse itself so the
+        # next person sees the cause, not just a mysterious false warning.
+        import re
+        src = (REPO / "src" / "install-claude-hooks.sh").read_text()
+        body = re.search(r"^HOOKS=\((.*?)^\)", src, re.M | re.S).group(1)
+        line = [l.strip() for l in body.split("\n")
+                if l.strip().startswith('"') and "sutando-conversations" in l][0]
+        _ev, _marker, cmd = line.strip('"').split("|", 2)
+        toks = self.hc._shell_tokens(self.hc._unwrap_installer_command(cmd))
+        self.assertEqual(len(toks), 3, f"archive template did not tokenize cleanly: {toks}")
+        self.assertEqual(toks[0], "cp")
+        for t in toks:
+            self.assertNotIn('"', t, f"stray quote survived tokenization: {t!r}")
 
     def test_the_genuine_archive_cp_still_registers(self):
         # Over-trigger control. The real command interpolates $HOME and $(date …),

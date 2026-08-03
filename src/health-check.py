@@ -4495,15 +4495,35 @@ def _unwrap_installer_command(command: str) -> str:
     # perfectly healthy host — which is the whole reason the installer uses shq.
     out = _SHQ_CALL.sub(lambda m: shlex.quote(m.group(1).strip("\"'")), command)
     # The array literal is itself quoted in shell, so inner quotes arrive escaped.
-    return out.replace('\\"', '"').replace("\\$", "$")
+    out = out.replace('\\"', '"').replace("\\$", "$")
+    # The HOOKS entry is a quoted shell string, so parsing it strips the entry's
+    # own closing quote and leaves the backslash that escaped it dangling. That
+    # makes shlex raise and drop us into the whitespace fallback, where a token
+    # keeps a stray opening quote and no comparison can match — it cost a GENUINE
+    # archive hook a false warning. The dangling backslash WAS that closing quote,
+    # so restore it rather than deleting it: deleting leaves the quote unbalanced,
+    # which is the same failure one step later.
+    if out.endswith("\\") and not out.endswith("\\\\"):
+        out = out[:-1] + '"'
+    return out
 
 
 def _shell_tokens(command: str) -> list:
-    """Shell-split, degrading to whitespace split on unbalanced quoting."""
+    """Shell-split, degrading to whitespace split on unbalanced quoting.
+
+    The fallback keeps surrounding quotes on each token, so tokens are normalized
+    either way — otherwise a comparison silently depends on WHICH split path ran.
+    """
     try:
-        return shlex.split(command)
+        toks = shlex.split(command)
     except ValueError:  # a hand-edited settings file can be unquotable
-        return command.split()
+        toks = command.split()
+    out = []
+    for tok in toks:
+        if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+            tok = tok[1:-1]
+        out.append(tok)
+    return out
 
 
 def _same_path(a: str, b_norm: str, b_real: str) -> bool:
@@ -4515,7 +4535,7 @@ def _same_path(a: str, b_norm: str, b_real: str) -> bool:
     return os.path.normpath(a) == b_norm or os.path.realpath(a) == b_real
 
 
-def _hook_command_targets(command: str, expected, owned_cmd: str) -> bool:
+def _hook_command_targets(command: str, expected, owned_cmd: str, marker: str = "") -> bool:
     """Does this command INVOKE `expected` — not merely mention it, not merely contain it?
 
     Two false-cleans this has to reject, both found in review, both of which let a
@@ -4556,12 +4576,33 @@ def _hook_command_targets(command: str, expected, owned_cmd: str) -> bool:
 
     if expected is None:
         # Marker is not repo-relative (the archive hook writes outside the repo),
-        # so there is no path to compare positionally. Program + the marker
-        # substring the caller already matched is what can be owned here. Not
-        # tightened further on purpose: the real archive command interpolates
-        # $HOME and $(date …), so pinning argument shape would warn on healthy
-        # hosts — the failure this probe must not have.
-        return True
+        # so there is no repo path to compare positionally. Program alone is NOT
+        # enough: `cp /tmp/other "$HOME/Desktop/sutando-conversations/x"` and
+        # `cp "$TRANSCRIPT_PATH" /tmp/sutando-conversations/y` both pass a program
+        # check while archiving the wrong thing, or to the wrong place.
+        #
+        # An earlier revision of this comment called that an intentional
+        # "compatibility boundary", on the reasoning that the installer preserves
+        # operator-customized archive hooks. That reasoning was WRONG, and it is
+        # worth recording why, because it read as principled: Phase 0 does skip
+        # sweeping a custom archiver (install-claude-hooks.sh:170-185), but Phase 1
+        # detects presence by EXACT command-string match — `index($cmd)` at :262 —
+        # so a custom `cp` never satisfies it and the installer ADDS its own
+        # command alongside. The two COEXIST. On any host where the installer has
+        # run, its own command is therefore present, and this probe should say so.
+        #
+        # Compared: the program, the SOURCE argument the installer writes, and the
+        # destination prefix up through the marker. Everything after the marker is
+        # free — that is where the installer's own $(date …) filename varies, so
+        # pinning it would warn on healthy hosts.
+        o_src = owned[1] if len(owned) > 1 else None
+        o_dst = next((tok for tok in owned if marker and marker in tok), None)
+        if o_src is None or o_dst is None:
+            return False
+        if len(got) < 2 or got[1] != o_src:
+            return False
+        prefix = o_dst[: o_dst.index(marker) + len(marker)]
+        return any(tok.startswith(prefix) for tok in got[1:])
 
     want = os.path.normpath(os.path.expanduser(str(expected)))
     want_real = os.path.realpath(want)
@@ -4687,6 +4728,7 @@ def check_claude_hook_registration(
                 c,
                 (repo / marker) if marker.startswith("src/") else None,
                 owned_cmd.replace("$REPO_DIR", str(repo)),
+                marker,
             )
             for c in hit
         ):
