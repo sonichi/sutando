@@ -185,23 +185,98 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# Named-instance support (multi-gateway): one core may run SEVERAL bridge
+# processes, each pointed at a different gateway (e.g. prod + dev homeservers)
+# via its own REMOTE_TASK_TOKEN env. GATEWAY_INSTANCE names this process's
+# instance; it suffixes the per-BRIDGE state files below and the singleton lock
+# role, so two instances never clobber each other's ledgers or contend one
+# lock. Unset (default) keeps every filename byte-identical to before — the
+# single-bridge install sees zero change. Deliberately NOT suffixed:
+# tasks/ + results/ (the shared task bus — the core is one consumer),
+# last-owner-activity.json (owner presence is one signal regardless of which
+# door the message came through), and core-status.json (the core's, not ours).
+# THE instance-name contract — single source of truth. The import guard below
+# and _LOCAL_TID_RE both derive from this pattern, because every drift between
+# them has produced the same bug class (queue + ACK + silently-stranded
+# results): first a length mismatch (>32 chars, review P1 round 5), then a
+# charset mismatch (str.isalnum() accepts Unicode letters the ASCII regex
+# rejects — GATEWAY_INSTANCE=é imported fine and stranded results, round 6).
+# ASCII [A-Za-z0-9_-], 1-32 chars, and nothing else — if this ever needs to
+# change, it changes HERE and both consumers follow.
+_INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+GATEWAY_INSTANCE = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
+if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
+    sys.exit("FATAL: GATEWAY_INSTANCE must match "
+             f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
+_INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+
+
+def _local_tid(broker_tid: str) -> str:
+    """Instance-namespaced LOCAL task id (P1 fixes, PR review 2026-08-02 ×2).
+
+    Broker ids are only unique WITHIN a gateway, so named instances must not
+    share the primary's local id space. The encoding is `task-<inst>~<broker_id>`
+    (broker id embedded VERBATIM after `~`):
+    - INJECTIVE across every (instance, broker_id) pair including the
+      unsuffixed primary: `~` is outside the broker id alphabet
+      (`[A-Za-z0-9._-]`, `_TID_RE`) and outside the GATEWAY_INSTANCE charset
+      (import guard), so no primary pass-through id can equal a named-instance
+      encoding, and the first `~` splits unambiguously. The earlier
+      `task-<inst>.<rest>` scheme was NOT injective — a primary broker id
+      `task-dev.X` collided with dev's mapping of `task-X` (review P1 #2).
+    - Still matches every consumer's `task-*` glob (watcher, archiver).
+    - May exceed _TID_RE's 64-char wire bound (review P1 #1) — local
+      consumers therefore gate on `_valid_local_tid`, and the wire id is
+      re-derived and `_valid_tid`-checked at the ack/result egress points.
+    Unset instance → identity (legacy single-gateway installs unchanged)."""
+    if not GATEWAY_INSTANCE:
+        return broker_tid
+    return f"task-{GATEWAY_INSTANCE}~{broker_tid}"
+
+
+def _broker_tid(local_tid: str) -> str:
+    """Reverse of `_local_tid` — the id the GATEWAY knows this task by."""
+    if not GATEWAY_INSTANCE:
+        return local_tid
+    prefix = f"task-{GATEWAY_INSTANCE}~"
+    if local_tid.startswith(prefix):
+        return local_tid[len(prefix):]
+    return local_tid
+
+
+_LOCAL_TID_RE = re.compile(rf"task-{_INSTANCE_RE.pattern}~([A-Za-z0-9._-]{{1,64}})")
+
+
+def _valid_local_tid(tid: str) -> bool:
+    """A safe LOCAL id: either a plain wire-valid id (primary/legacy) or a
+    named-instance encoding whose embedded broker id is itself wire-valid.
+    Centralizes the widened bound so every local consumer accepts what
+    `_local_tid` can produce (max ≈ 5+32+1+64 chars — filename-safe)."""
+    if _valid_tid(tid):
+        return True
+    m = _LOCAL_TID_RE.fullmatch(tid)
+    return bool(m) and m.group(1) not in (".", "..")
+
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
 # gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
-# cross-send other channels' (Discord/Telegram) results to the gateway.
-INFLIGHT_FILE = _STATE / "remote-task-inflight.json"
+# cross-send other channels' (Discord/Telegram) results to the gateway. The
+# per-instance suffix is what keeps a second bridge from claiming results this
+# instance delegated (each instance only POSTs ids in ITS OWN ledger).
+INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # Sidecar map {task id → origin room id}, recorded at queue time. Outbound
 # file-attach needs the room because media uploads go to the room-scoped
 # endpoint (POST /v1/rooms/{room}/media) while text results go to /v1/results
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
-TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
+TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 # sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
 # guessing from tmux-window presence. Written on every poll outcome: connected
 # after a healthy round-trip, reconnecting in the backoff branches.
-GATEWAY_STATUS_FILE = _STATE / "gateway-status.json"
+GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
 
 # Launch provenance + in-bridge file log. A supervisor that persists stdout
 # (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
@@ -334,19 +409,30 @@ def _token_from_ag2space_env():
             # is empty, so without this the URL chain has nothing and the bridge
             # fatals on "no gateway URL" in the exact scenario this fix targets.
             url = vals.get("REMOTE_TASK_URL") or vals.get("AG2_REMOTE_URL") or ""
-            return tok, url
-    return "", ""
+            # Return the source file path too: it is the durable token source the
+            # auth-recovery path re-reads on rejection. In the desktop-spawned case
+            # this is the ONLY thing that arms recovery — REMOTE_TASK_TOKEN_FILE is
+            # unset there, so without carrying `path` into TOKEN_FILE the bridge
+            # keeps the historical FATAL/crash-loop behavior exactly on the desktop.
+            return tok, url, path
+    return "", "", ""
 
 
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
 _URL_FALLBACK = ""
+_TOKEN_FILE_FALLBACK = ""
 if not _RAW:
-    _RAW, _URL_FALLBACK = _token_from_ag2space_env()
+    _RAW, _URL_FALLBACK, _TOKEN_FILE_FALLBACK = _token_from_ag2space_env()
 _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# The ONE auth-header dict shared with long-lived consumers (event channel,
+# card poster). They must hold this dict BY REFERENCE (no copy) so a token
+# rotation (_reload_rotated_token) propagates to their next request without a
+# restart. _req() itself reads the TOKEN global per call and needs no dict.
+_AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 HEARTBEAT_INTERVAL = 60
 # When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
 # instead of hammering it — but only for this cooldown, then retry. A permanent
@@ -354,6 +440,18 @@ HEARTBEAT_INTERVAL = 60
 # picked up until the worker restarts; time-gating makes it self-healing.
 ACK_UNSUPPORTED_COOLDOWN = int(os.environ.get("REMOTE_ACK_RETRY_COOLDOWN") or "300")
 _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipped
+# Auth-rejection recovery: when the gateway rejects the bearer (401/403 — the
+# key was revoked or expired), the historical behavior is an immediate FATAL
+# exit. Under a supervisor that blindly relaunches, that becomes a silent
+# crash-loop hammering the gateway until a human notices. When
+# REMOTE_TASK_TOKEN_FILE names the durable token source (a dotenv-style file
+# with a REMOTE_TASK_TOKEN= line, or the raw onboarding string alone on a
+# line), the bridge instead re-reads that file on rejection: a DIFFERENT token
+# there (the connect/onboarding flow re-ran) is swapped in live — no restart —
+# and an unchanged one holds the bridge in a slow re-check loop until rotation
+# happens. Unset → exactly the pre-existing FATAL-exit behavior.
+TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or ""
+AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
@@ -641,16 +739,153 @@ def _http_error_body(e) -> str:
         return ""
 
 
+def _read_token_file(path: str) -> str:
+    """The onboarding string from a token file, or "" (missing / unreadable /
+    empty — the caller treats all three as no-rotation). Two accepted shapes:
+    a dotenv-style file carrying a REMOTE_TASK_TOKEN= line (legacy
+    AG2_REMOTE_TOKEN= honored, optional `export `, surrounding quotes
+    stripped), or the raw onboarding string alone on the first non-comment,
+    '='-free line."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    # Collect BOTH alias assignments across the WHOLE file, then apply the
+    # documented precedence REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN regardless of
+    # line order (review P1: a migration-era env with a stale legacy line
+    # ABOVE the current canonical one made recovery hot-swap back to the stale
+    # legacy secret — first-match-in-file-order inverted startup.sh's
+    # precedence). Last assignment of a repeated key wins, matching shell
+    # sourcing semantics.
+    found: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+            if line.startswith(key + "="):
+                found[key] = line[len(key) + 1:].strip().strip("'\"")
+    for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+        if found.get(key):
+            return found[key]
+    for line in text.splitlines():
+        line = line.strip()
+        if line and "=" not in line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def _read_token_file_url(path: str) -> str:
+    """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) from a SPLIT-layout token
+    file, or "" if absent/unreadable. The combined `url|secret` form embeds the
+    URL (extracted by _parse_onboarding_token), but a split file (bare
+    REMOTE_TASK_TOKEN + a separate REMOTE_TASK_URL line) does not — and
+    _read_token_file discards that URL. The reload path needs it so a split file
+    rewritten by connect to a DIFFERENT gateway is caught by the same
+    cross-gateway guard the combined form already gets; otherwise a re-onboard
+    to a new gateway would hot-swap the new bearer onto the OLD running URL
+    (the exact credential-boundary split the guard exists to prevent)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    found: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        for key in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
+            if line.startswith(key + "="):
+                found[key] = line[len(key) + 1:].strip().strip("'\"")
+    return found.get("REMOTE_TASK_URL") or found.get("AG2_REMOTE_URL") or ""
+
+
+def _reload_rotated_token() -> bool:
+    """Re-read TOKEN_FILE and swap in a rotated SECRET. True only when a
+    usable, DIFFERENT secret was found for the SAME gateway: the TOKEN global
+    and the shared _AUTH_HEADERS dict are updated in place, so the poll loop,
+    event channel, and card poster resume with the new bearer without a
+    process restart.
+
+    A rotation NEVER moves URL. The long-lived consumers (EventChannel,
+    CardPoster) captured the base URL at construction, so honoring a new URL
+    here would split the process across gateways — the poller on the new
+    base, SSE + card posts still on the old one, now carrying the freshly
+    rotated bearer to the old endpoint (review P1). Changing gateways is a
+    reconfiguration, not a key rotation: refuse it loudly and keep waiting —
+    a restart picks the new URL up through the normal import-time parse."""
+    global TOKEN
+    if not TOKEN_FILE:
+        return False
+    raw = _read_token_file(TOKEN_FILE)
+    if not raw:
+        return False
+    # Route through the SAME parse used at import time (_parse_onboarding_token)
+    # so a rotation written in the URL-encoded form (https://gw/relay%7C<secret>,
+    # the desktop connect flow) splits correctly. A literal "|" split treated the
+    # encoded form as a bare secret and set the bearer to the whole URL string,
+    # so a valid rotation kept failing auth (regression caught on #2323 once
+    # #2307's %7C onboarding parser reached main).
+    url_from_token, secret = _parse_onboarding_token(raw)
+    # The URL guard must cover BOTH layouts: the combined url|secret form
+    # (url_from_token) AND the split form (bare secret + a separate
+    # REMOTE_TASK_URL line, which _read_token_file drops). Without the split
+    # fallback, a split file re-pointed by connect to a new gateway sends the
+    # new bearer to the OLD running URL — the credential split this guards.
+    file_url = (url_from_token or _read_token_file_url(TOKEN_FILE)).rstrip("/")
+    if file_url and file_url != URL:
+        _log(f"token file names a DIFFERENT gateway ({file_url}) "
+             f"than the running one ({URL}) — a URL change is not hot-swappable; "
+             "restart the bridge to move gateways")
+        return False
+    if not secret or secret == TOKEN:
+        return False
+    TOKEN = secret
+    _AUTH_HEADERS["Authorization"] = f"Bearer {TOKEN}"
+    return True
+
+
+def _recover_auth(code: int) -> bool:
+    """Auth-rejection recovery. An immediate re-read catches a rotation that
+    already happened (the bridge lagged behind a re-onboard); otherwise hold
+    in a slow re-check loop — keeping the poller singleton heartbeated so a
+    supervisor sees ONE live waiting process instead of a crash-loop — until
+    the token file rotates. Returns True once a rotated token is live; False
+    when no TOKEN_FILE is configured (caller keeps the historical FATAL
+    exit)."""
+    if _reload_rotated_token():
+        _log("auth rejected but token file already rotated — resuming with new token")
+        return True
+    if not TOKEN_FILE:
+        return False
+    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation in "
+         f"{TOKEN_FILE} (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    while True:
+        _emit_gateway_status(False,
+                             error=f"auth rejected HTTP {code} — waiting for re-connect",
+                             backoff_s=AUTH_RECHECK_INTERVAL)
+        time.sleep(AUTH_RECHECK_INTERVAL)
+        if not _heartbeat_singleton():
+            sys.exit("FATAL: lost poller singleton while waiting for token rotation")
+        if _reload_rotated_token():
+            _log("rotated token detected — resuming")
+            return True
+
+
 def _post_task_ack(tid: str) -> bool:
     """Tell the gateway a task made it safely into the local queue."""
     global _ack_disabled_until
-    if not _valid_tid(tid):
+    # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
+    # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
+    # the local form stranded queued results while the gateway waited forever.
+    if not _valid_tid(_broker_tid(tid)):
         return False
     if _ack_disabled_until and time.time() < _ack_disabled_until:
         return False  # gateway recently 404'd /ack — retry after the cooldown
     try:
-        safe_tid = urllib.parse.quote(tid, safe="")
-        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": tid}, timeout=10)
+        wire_tid = _broker_tid(tid)
+        safe_tid = urllib.parse.quote(wire_tid, safe="")
+        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": wire_tid}, timeout=10)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         return True
     except urllib.error.HTTPError as e:
@@ -1066,13 +1301,18 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
 def _write_task(task: dict) -> str | None:
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns the task id, or None if it has no id / already present."""
-    tid = str(task.get("id") or "").strip()
-    if not tid:
+    broker_tid = str(task.get("id") or "").strip()
+    if not broker_tid:
         _log("dropping task with no id")
         return None
-    if not _valid_tid(tid):
-        _log(f"dropping task with unsafe id {tid!r}")
+    if not _valid_tid(broker_tid):
+        _log(f"dropping task with unsafe id {broker_tid!r}")
         return None
+    # Everything from here down — filenames, ledgers, archives, the serialized
+    # id: header the core echoes back as the result filename — uses the LOCAL
+    # id; `_broker_tid` restores the wire id at the ack/result POST boundary.
+    tid = _local_tid(broker_tid)
+    task = {**task, "id": tid}
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived.
     if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
@@ -1318,7 +1558,7 @@ def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
     for tid in list(inflight):
-        if not _valid_tid(tid):  # defense-in-depth: never read an unsafe path
+        if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
@@ -1370,7 +1610,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
         try:
-            _req("POST", "/v1/results", {"id": tid, "body": out_body})
+            _req("POST", "/v1/results", {"id": _broker_tid(tid), "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
@@ -1402,7 +1642,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     check and the discard is then picked up by the next `_post_ready_results`
     instead of being raced. Returns the new suspects set for the next pass."""
     gone = {tid for tid in inflight
-            if _valid_tid(tid)
+            if _valid_local_tid(tid)
             and not (TASKS_DIR / f"{tid}.txt").exists()
             and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
             and not (RESULTS_DIR / f"{tid}.txt").exists()}
@@ -1425,7 +1665,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
 # lock-layer error → poll anyway (a lock bug must never silence task delivery;
 # the only risk of a dropped guard is the pre-existing dual-poller). Kill-switch:
 # SUTANDO_BRIDGE_LOCK=0 lets the owner disable it in prod without a redeploy.
-_LOCK_ROLE = "gateway-bridge"
+_LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"  # per-instance: dual-poller guard stays per-gateway
 _LOCK_WS = _STATE.parent  # _STATE = <workspace>/state (injected) or ~/.ag2-sparrow/state
 
 
@@ -1495,7 +1735,8 @@ def _maybe_start_event_channel() -> None:
         from .event_inbox import EventInbox
         from .event_channel import EventChannel
         inbox = EventInbox(str(_STATE / "event-inbox.db"))
-        ch = EventChannel(inbox, URL, {"Authorization": f"Bearer {TOKEN}"}, log=_log)
+        ch = EventChannel(inbox, URL, _AUTH_HEADERS, log=_log,
+                          auth_retry=bool(TOKEN_FILE))
         threading.Thread(target=ch.run, name="sparrow-event-channel", daemon=True).start()
         _EVENT_CHANNEL = ch
         # P1: drain the inbox into the Core's attention (taskify → tasks/) on a
@@ -1514,7 +1755,7 @@ def _maybe_start_event_channel() -> None:
             store = ActionStore(str(_STATE / "human-actions"))
             handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
             if ha_room:
-                poster = CardPoster(store, URL, {"Authorization": f"Bearer {TOKEN}"},
+                poster = CardPoster(store, URL, _AUTH_HEADERS,
                                     ha_room, log=_log,
                                     include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
                                     .strip().lower() in ("1", "true", "yes", "on"))
@@ -1597,6 +1838,9 @@ def main() -> None:
             _emit_gateway_status(True)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
+                if _recover_auth(e.code):
+                    backoff = 1
+                    continue
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
