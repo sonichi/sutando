@@ -44,6 +44,7 @@ had, because that is a separate question from where the audit trail begins.
 from __future__ import annotations
 
 import re
+import sys
 
 # Permissive on the suffix (`# Resolved (archive)` is a real divider) but anchored
 # with `[ \t]` rather than `\s`, so the whitespace class cannot span a newline and
@@ -80,7 +81,7 @@ def mask_html_comments(text: str) -> str:
     return _COMMENT_RE.sub(lambda m: _blank(m.group(0)), text)
 
 
-def mask_fenced_code(text: str) -> str:
+def mask_fenced_code(text: str, *, report_unclosed: bool = False):
     """Blank fenced code blocks (``` and ~~~), preserving length and line breaks.
 
     Closing rules follow CommonMark, because the loose versions are what a decoy
@@ -91,12 +92,14 @@ def mask_fenced_code(text: str) -> str:
     zero this module exists to prevent.
     """
     out, in_fence, char, size = [], False, '', 0
+    off, open_off = 0, 0
     for line in text.split('\n'):
         if not in_fence:
             m = _FENCE_OPEN_RE.match(line)
             # A backtick opener may not carry a backtick in its info string.
             if m and not (m.group(2)[0] == '`' and '`' in m.group(3)):
                 in_fence, char, size = True, m.group(2)[0], len(m.group(2))
+                open_off = off
                 out.append(_blank(line))
             else:
                 out.append(line)
@@ -113,7 +116,23 @@ def mask_fenced_code(text: str) -> str:
             if (stripped and set(stripped) == {char} and len(stripped) >= size
                     and re.match(r'^ {0,3}\S', line) is not None):
                 in_fence = False
-    return '\n'.join(out)
+        off += len(line) + 1          # +1 for the '\n' split consumed
+    masked = '\n'.join(out)
+    # Closure is STRUCTURAL state the parser already has. Callers that need to
+    # tell a runaway fence from a deliberate example must ask for it here rather
+    # than infer it from content — inferring it produced two false alarms
+    # (a closed fence at EOF, review of #2558).
+    #
+    # Reported as the unclosed fence's RANGE, not a bare bool. "Is there an
+    # unclosed fence anywhere in this document" cannot answer "did an unclosed
+    # fence hide THIS divider": a closed fence quoting `# Resolved` plus an
+    # unrelated runaway fence later in the file made the quoted divider warn as
+    # damage, on a document where nothing was hidden and nothing archived was
+    # served as live (qingyun-wu P1 on 8ad855ac, reproduced here before fixing).
+    # A span lets the caller ask the local question. `None` when the document is
+    # balanced, so truthiness still reads the way the old bool did.
+    span = (open_off, len(text)) if in_fence else None
+    return (masked, span) if report_unclosed else masked
 
 
 def _backtick_runs(text: str) -> list[tuple[int, int]]:
@@ -159,7 +178,7 @@ def _opens_span(text: str, start: int, length: int) -> bool:
     return "`" in info        # invalid fence info -> inline
 
 
-def _mask_nonfence_spans(text: str) -> str:
+def _mask_nonfence_spans(text: str, report_ranges: bool = False):
     """Blank inline spans whose OPENER cannot be a fence marker.
 
     Such an opener is unambiguously a span delimiter, so it may close on the next
@@ -174,6 +193,7 @@ def _mask_nonfence_spans(text: str) -> str:
     runs = _backtick_runs(text)
     opens = [_opens_span(text, s, n) for s, n in runs]
     out = list(text)
+    ranges: "list[tuple[int, int]]" = []
     k = 0
     while k < len(runs):
         if not opens[k]:
@@ -188,10 +208,16 @@ def _mask_nonfence_spans(text: str) -> str:
             for q in range(start, end):
                 if out[q] != "\n":
                     out[q] = " "
+            ranges.append((start, end))
             k = m + 1
         else:
             k += 1
-    return "".join(out)
+    masked = "".join(out)
+    # `report_ranges` exists because "was a question swallowed" has to be asked
+    # about the SPECIFIC span that hid a given divider. Newlines are preserved
+    # above, so a masked region is not a contiguous run of changed characters and
+    # cannot be recovered by diffing the two strings.
+    return (masked, ranges) if report_ranges else masked
 
 
 def mask_markup(text: str) -> str:
@@ -218,11 +244,154 @@ def mask_markup(text: str) -> str:
     return mask_fenced_code(_mask_nonfence_spans(mask_html_comments(text)))
 
 
+
+
+def _is_question_shape(line: str) -> bool:
+    """True when a READER would count this line as a question entry."""
+    return bool(line.startswith("## ") or re.match(r'^\s*-\s+\*\*\[(.+?)\]', line))
+
+
+def _question_entry_masked_in(text: str, masked: str, lo: int, hi: int) -> bool:
+    """True when the span covering [lo, hi) swallowed a reader-recognised question.
+
+    Scoped deliberately. Asking the question document-globally meant a question
+    swallowed by ONE deliberate span counted as damage for a divider hidden by a
+    DIFFERENT, unrelated span — two independent balanced quotes in the same file
+    warned even though each was intentional and nothing live was lost.
+    """
+    pos = 0
+    for raw_line, masked_line in zip(text.split("\n"), masked.split("\n")):
+        start, end = pos, pos + len(raw_line)
+        pos = end + 1                                  # +1 for the newline
+        if end <= lo or start >= hi:
+            continue                                   # outside THIS span
+        if raw_line == masked_line:
+            continue
+        # The RECOGNISED PREFIX must be what disappeared. Testing only "raw looks
+        # like a question AND the line changed" fired when a span opened AFTER the
+        # `## `, leaving the heading fully visible to every reader while some later
+        # part of its line was quoted. Nothing was swallowed; the entry is still
+        # readable. So: raw matches the shape, masked no longer does.
+        if _is_question_shape(raw_line) and not _is_question_shape(masked_line):
+            return True
+    return False
+
+
+def _dividers_hidden_by_damage(text: str, divider: re.Pattern) -> list[tuple[int, str]]:
+    """Every divider hidden by DAMAGED markup, as (line, matched text).
+
+    Three review rounds went into this predicate; the corrections are the point.
+
+    **An unpaired backtick run masks NOTHING** (`_mask_nonfence_spans` only blanks a
+    run that finds an equal-length partner). So the real-world damage was never
+    "unbalanced markup" — it was a span that pairs LEGITIMATELY across ~1,900 lines
+    and swallows the divider on the way. That is structurally identical to a
+    deliberate two-line quote, so nothing about the span itself separates them.
+
+    What separates them is what the span SWALLOWS. A deliberate quote covers the
+    divider it is quoting; runaway markup takes live questions with it. Hence:
+
+      hidden by the FENCE pass  -> damage only if that fence never closes, which is
+                                   structural state read back from the parser, not
+                                   guessed from "is there content after it" (that
+                                   guess false-alarmed on a closed fence at EOF).
+      hidden by the SPAN pass   -> damage only if a reader-recognised question
+                                   (`## ` heading or `- **[label]**` bullet) was
+                                   swallowed too. A balanced quote swallows none.
+
+    Rejected by measurement, in order: "any raw divider match" (fired on quoted
+    banners); "everything after the divider is masked" (FALSE on the real damaged
+    file — 4,542 unmasked tail chars); "masked to EOF" (fired on a closed fence at
+    EOF). Each looked right and each was wrong on a real shape.
+    """
+    comments_only = mask_html_comments(text)
+    fenced, fence_span = mask_fenced_code(comments_only, report_unclosed=True)
+    # What the SPAN pass alone swallowed. `mask_markup` runs comments -> spans ->
+    # fences, so diffing these two isolates the span step: fences are applied to
+    # NEITHER side, and comments are applied to BOTH.
+    spanned, span_ranges = _mask_nonfence_spans(comments_only, report_ranges=True)
+    masked = mask_markup(text)
+    hidden = []
+    for m in divider.finditer(comments_only):
+        if masked[m.start():m.end()].strip() != "":
+            continue                                  # not hidden at all
+        if fenced[m.start():m.end()].strip() == "":
+            # The fence pass hid it — but only the UNCLOSED fence that actually
+            # covers this divider implicates it. Asking "is any fence in the
+            # document unclosed" warned on a divider safely inside a CLOSED
+            # fenced example whenever an unrelated runaway fence appeared later
+            # in the file. Same range-local shape the span branch below already
+            # uses; this branch was the half that never got it.
+            damaged = bool(fence_span
+                           and fence_span[0] <= m.start()
+                           and m.end() <= fence_span[1])
+        else:
+            # Scope the damage test to the pass that actually hid the divider.
+            # Comparing raw-vs-all-maskers instead made any legitimately FENCED
+            # `## ` heading elsewhere in the file look like span damage, so a
+            # separate, balanced span quoting the divider warned on healthy
+            # markup — reproduced by three reviewers at 06f3dfc4. The fence pass
+            # has its own branch above; it must not leak into this one.
+            # Only the span that actually hid THIS divider can implicate it.
+            # Scoping to the pass was not enough: the test still ran across the
+            # whole document, so an unrelated deliberate span elsewhere supplied
+            # the "swallowed question" for a divider it never touched.
+            damaged = any(
+                _question_entry_masked_in(comments_only, spanned, lo, hi)
+                for lo, hi in span_ranges
+                if lo <= m.start() and m.end() <= hi
+            )
+        if damaged:
+            hidden.append((text.count("\n", 0, m.start()) + 1, text[m.start():m.end()]))
+    return hidden
+
+
 def active_region(text: str, divider: re.Pattern = DIVIDER_RE) -> str:
     """`text` up to the first real (non-quoted) archive divider.
 
     Returns `text` unchanged when there is no divider — a file that keeps no audit
     trail is entirely active.
+
+    THIRD failure mode (2026-08-03), distinct from the two in the module header: the
+    divider is present and correctly spelled, but a single unbalanced backtick above
+    it opens an inline span that closes on the next backtick far below, so
+    `mask_markup` blanks the divider and it becomes unfindable. Measured on one host:
+    two ticks 1,971 lines apart, the whole 2,951-line file served as active, retired
+    entries re-surfacing as pending. Nothing errors and the file renders normally on
+    GitHub — the only visible symptom is a waiting-count that moves when an unrelated
+    section is edited.
+
+    This WARNS and deliberately does NOT change the return value. Falling back to the
+    raw match would cut at a `# Resolved` inside a fenced example — the exact thing
+    masking exists to prevent — and that fails in the dangerous direction: live
+    questions hidden, silently. The damaged state over-counts, which is noisy but
+    safe. Noisy beats silent.
     """
-    m = divider.search(mask_markup(text))
-    return text[:m.start()] if m else text
+    masked = mask_markup(text)
+    m = divider.search(masked)
+    if m:
+        return text[:m.start()]
+    hidden = _dividers_hidden_by_damage(text, divider)
+    if hidden:
+        # Report EVERY span-hidden candidate, with each one's own line and its own
+        # matched text as the label. Reporting only the first was wrong twice
+        # (qingyun-wu, review of #2558): the first raw match can be a QUOTED banner
+        # that is masked on purpose, and the label was hard-coded to '# Resolved'
+        # even under DIVIDER_OR_DONE_RE, so a real `# Done` divider was announced
+        # under a name that is not in the file.
+        #
+        # A quoted banner and a real divider can BOTH survive comment/fence masking
+        # and both be swallowed by the same runaway span, so nothing here can single
+        # out "the real one" — and a diagnostic that guesses sends the reader to
+        # harmless markup. Listing every candidate is the honest shape: the reader
+        # is looking for one unbalanced backtick, and every line below is downstream
+        # of it.
+        where = ", ".join(f"{label!r} at line {line}" for line, label in hidden)
+        print(
+            f"pending-questions: divider {where} MASKED by markup above it (an "
+            "unclosed backtick span or code fence), so the archive below is being "
+            "served as LIVE. Fix the unbalanced markup at or above the FIRST line "
+            "listed; see sonichi/sutando#2557.",
+            file=sys.stderr,
+        )
+    return text
