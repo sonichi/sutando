@@ -1116,24 +1116,139 @@ def check_memory_dir_siblings() -> "dict | None":
     }
 
 
-def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
-    """Resolve one existing concrete path for a carrier-set entry, or None.
+def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
+    """EVERY existing concrete path a carrier-set entry matches.
 
     Entries are gitignore-style and may be globs (`hosts/*/`), directories
-    (`notes/`) or plain files (`state/current-track.md`). We only need ONE
-    materialized path per entry to ask git whether the entry is being carried;
-    an entry with nothing on disk yet is not evidence of anything, so it is
-    skipped rather than reported.
+    (`notes/`) or plain files (`state/current-track.md`).
+
+    Deliberately ALL matches, not the first. Sampling one is sound for the stale
+    branch (which asks "is the entry this host configured actually in effect" —
+    one witness settles it), but not for judging whether a *local* rule covers a
+    *shipped* one: a narrower local rule can cover one child of a shipped
+    wildcard while leaving its siblings ignored, and a first-hit check that
+    happened to land on the covered child would report the vault healthy while a
+    whole host subtree went unbacked (qingyun-wu P1 on #2572).
+
+    Enumeration is bounded by construction: glob matches are the entry's own
+    direct matches (`hosts/*/` -> one path per host), never a recursive walk of
+    their contents.
     """
     rel = entry.strip().lstrip("/").rstrip("/")
     if not rel:
-        return None
+        return []
     if any(ch in rel for ch in "*?["):
-        for hit in sorted(workspace.glob(rel)):
-            return hit
-        return None
+        return sorted(workspace.glob(rel))
     candidate = workspace / rel
-    return candidate if candidate.exists() else None
+    return [candidate] if candidate.exists() else []
+
+
+def _carrier_probe_files(rep: "Path") -> "list[Path]":
+    """Every concrete file a materialized representative stands for.
+
+    A file represents itself; a DIRECTORY is represented by every file beneath
+    it, sorted for determinism.
+
+    Deliberately EXHAUSTIVE. The first cut sampled the first 25 and said so in a
+    comment — "past the cap the probe can UNDER-report" — which treated a stated
+    caveat as an acceptable conclusion rather than a defect. john-the-dev built
+    the obvious counterexample on that head: 26 files with only the 26th ignored
+    read `ok`, so a stale exclude left a real carrier file unbacked while health
+    certified the subtree. In a probe whose entire purpose is catching silent
+    non-backup, a sample is not proof of coverage.
+
+    Cost is bounded by asking git ONCE for the whole list (`check-ignore
+    --stdin`) rather than once per file, so exhaustiveness costs a filesystem
+    walk plus a single process — not N processes. See `_carrier_target_verdict`.
+    """
+    if rep.is_file():
+        return [rep]
+    if not rep.is_dir():
+        return []
+    return sorted(f for f in rep.rglob("*") if f.is_file())
+
+
+def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
+    """`"carried"` | `"dropped"` | `"unmeasured"` for ONE materialized path.
+
+    A DIRECTORY and the files inside it are different questions for git, and the
+    first cut asked the wrong one. `*` + `!hosts/` + `!hosts/*/` un-ignores the
+    directories while every file beneath stays ignored — `!hosts/**` is what
+    carries the contents. So `check-ignore` on `hosts/a` answered "not ignored"
+    while `hosts/a/current-track.md` was ignored and unbacked, and the probe
+    reported the vault healthy with the very file it exists to protect not being
+    backed up. Reproduced independently by john-the-dev and qingyun-wu on
+    a958d06f, and confirmed here before changing anything.
+
+    So a directory is probed through EVERY file beneath it, and any ignored one
+    condemns the entry. Exhaustive rather than sampled: a 26-file directory whose
+    26th file alone was ignored read `ok` under the old 25-file cap
+    (john-the-dev, #2572), which is the exact silent non-backup this exists for.
+
+    `--no-index` stays load-bearing and the instrument stays `check-ignore` for
+    a reason worth recording: the obvious alternative,
+    `ls-files --others --ignored`, is index-AWARE, so it calls a tracked file
+    carried. That silently reverses a documented behavior —
+    `test_a_TRACKED_file_with_a_stale_exclude_is_still_reported` exists because a
+    host that carried a file once and then let its exclude go stale read healthy
+    forever while nothing NEW under that entry was being carried. I wrote the
+    ls-files version first and that test failed; it was right and I was wrong.
+
+    Used by BOTH the stale and dropped branches. The stale branch probes a
+    directory representative too and had the same blindness; fixing only the
+    branch that was reported would have left the identical defect one step to
+    the left, which is how this class of bug has survived three rounds here.
+    """
+    targets = _carrier_probe_files(rep)
+    if not targets:
+        # A materialized directory with no files under it yet. Nothing to
+        # measure — treated as carried so an empty `hosts/<label>/` cannot
+        # manufacture a failure; the "nothing on disk" case is handled by the
+        # callers, which report an entry with no representatives at all.
+        return "carried"
+
+    # NUL-delimited, not newline. A filename may CONTAIN a newline, and
+    # `"\n".join(...)` then splits one real path into two bogus ones — both of
+    # which are typically un-ignored, so the genuinely ignored carrier file reads
+    # as carried. Reproduced on a real tree (john-the-dev, #2572):
+    #
+    #     notes/z\nx.md  check-ignore -q  -> 0  (IGNORED, not backed up)
+    #     split halves   notes/z, x.md    -> 1, 1 (both un-ignored)
+    #     newline-joined batch            -> 1  -> reads CARRIED, false green
+    #     NUL-joined with -z              -> 0  -> dropped, correct
+    #
+    # `-z` makes git read NUL-separated input, which is the only delimiter a
+    # POSIX filename cannot contain.
+    rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
+    try:
+        proc = subprocess.run(
+            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-z", "--stdin"),
+            input=rels, capture_output=True, text=True, timeout=60,
+        )
+    except (GitUnavailable, OSError, subprocess.SubprocessError):
+        return "unmeasured"
+    # check-ignore's contract, unchanged by --stdin: 0 = at least one path is
+    # ignored, 1 = none are, anything else = it failed. Folding "not 0" into
+    # healthy would count exit 128 as carried.
+    if proc.returncode == 0:
+        return "dropped"
+    if proc.returncode == 1:
+        return "carried"
+    return "unmeasured"
+
+
+def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
+    """One existing concrete path for a carrier-set entry, or None.
+
+    The single-witness form, kept for the stale branch: that branch asks whether
+    the entry THIS host configured is in effect, and one materialized path
+    answers it. An entry with nothing on disk yet is not evidence of anything,
+    so it is skipped rather than reported. Use `_carrier_representatives` when
+    the question is coverage of a *different* (shipped) entry — see its
+    docstring for why one witness is not enough there.
+    """
+    reps = _carrier_representatives(workspace, entry)
+    return reps[0] if reps else None
 
 
 def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
@@ -1182,39 +1297,42 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     stale: "list[str]" = []
     unmeasured: "list[str]" = []
     for entry in resolved:
-        rep = _carrier_representative(workspace, entry)
-        if rep is None:
-            continue
-        try:
-            proc = subprocess.run(
-                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
-                         str(rep.relative_to(workspace))),
-                capture_output=True, timeout=10,
-            )
-        except (GitUnavailable, OSError, subprocess.SubprocessError):
-            # Could not run the measurement at all. NOT the same as "carried".
-            unmeasured.append(entry)
+        # EVERY materialized match, not one. `_carrier_representative()` (singular)
+        # collapses `hosts/*/` to its first match, so a two-host workspace whose
+        # exclude carries host A but not host B reported `ok` while B's subtree
+        # was ignored and unbacked — the same false green the dropped branch was
+        # fixed for, on the OTHER axis.
+        #
+        # The previous round shared the directory-vs-file instrument across both
+        # branches and stopped there. Coverage has two independent axes — WHICH
+        # paths you probe, and WHAT you ask about each — and generalizing one of
+        # them left the other singular here. Both branches now enumerate.
+        # (john-the-dev and qingyun-wu, independently, on cf059ca8.)
+        reps = _carrier_representatives(workspace, entry)
+        if not reps:
             continue
         # `git_argv` rather than a bare "git": on macOS the stock /usr/bin/git is
         # an Xcode-CLT shim that pops an install dialog when the tools are absent,
         # and this probe runs from a BACKGROUND health check where nobody is there
         # to dismiss it. The resolver refuses that shim instead of spawning it.
         #
-        # `--no-index` is LOAD-BEARING (sync-workspace.sh says so at its own
-        # check-ignore call): without it, git reports an ALREADY-TRACKED file as
-        # not-ignored regardless of the rules, so a host whose file was carried
-        # once and whose exclude later went stale reads healthy forever. Caught
-        # by restoring this host's real pre-fix exclude and watching the probe
-        # still say OK.
-        #
-        # check-ignore's contract is 0 = ignored, 1 = NOT ignored, anything else
-        # = it failed. Treating "not 0" as healthy folded exit 128 in with exit 1,
-        # so a git that could not run reported the carrier set as fine — the exact
-        # unmeasured-reads-as-healthy failure this probe exists to catch, in the
-        # probe itself.
-        if proc.returncode == 0:
+        # `--no-index` is LOAD-BEARING on the file path (sync-workspace.sh says so
+        # at its own check-ignore call): without it, git reports an ALREADY-TRACKED
+        # file as not-ignored regardless of the rules, so a host whose file was
+        # carried once and whose exclude later went stale reads healthy forever.
+        # Caught by restoring this host's real pre-fix exclude and watching the
+        # probe still say OK. Both that and the directory/contents distinction now
+        # live in `_carrier_target_verdict` so the two branches cannot drift.
+        verdict = "carried"
+        for rep in reps:
+            got = _carrier_target_verdict(workspace, rep)
+            if got != "carried":
+                verdict = got
+                break
+        if verdict == "dropped":
             stale.append(entry)
-        elif proc.returncode != 1:
+        elif verdict == "unmeasured":
+            # Could not run the measurement at all. NOT the same as "carried".
             unmeasured.append(entry)
 
     # Read the SHIPPED file directly rather than through load_config(), which
@@ -1226,10 +1344,54 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     try:
         shipped_cfg = json.loads((Path(REPO_DIR) / "sutando.config.json").read_text())
         shipped = ((shipped_cfg.get("vault") or {}).get("sync") or {}).get("include")
-        if isinstance(shipped, list):
-            dropped = [e for e in shipped if isinstance(e, str) and e not in resolved]
     except (OSError, json.JSONDecodeError, AttributeError):
-        dropped = []
+        # The shipped config itself is unreadable, so there is no comparison to
+        # make. This except must stay narrow and must NOT wrap the measurement
+        # loop below: the first cut did, so one entry's git timeout jumped here
+        # and reset `dropped = []`, erasing findings already collected — a
+        # fail-OPEN that turned a failed measurement into a green report, three
+        # lines under a comment promising the opposite (qingyun-wu P1 on #2572).
+        shipped = None
+
+    if isinstance(shipped, list):
+        missing = [e for e in shipped if isinstance(e, str) and e not in resolved]
+        # String inequality is not absence of coverage. A local entry can be
+        # strictly BROADER than the shipped one it replaces — `hosts/` covers
+        # everything `hosts/*/` does — and the whole point of this probe is to
+        # judge by outcome, not by config text. The `stale` branch above already
+        # asks git; this branch used to revert to string equality, so it reported
+        # a fully-carried subtree as missing and advised "add them to the local
+        # list", i.e. told the operator to NARROW a config that was already
+        # correct (#2571, reported against #2566 by Sutando-Pro).
+        #
+        # EVERY materialized match must be covered, not one sampled witness. A
+        # narrower local rule (`hosts/a/`) covers one child of a shipped wildcard
+        # (`hosts/*/`) while its siblings stay ignored, and first-hit sampling
+        # that landed on the covered child reported the vault healthy with a host
+        # subtree silently unbacked.
+        #
+        # An entry with nothing materialized yet stays reported: there is no
+        # outcome to measure, but the divergence is real and becomes silent data
+        # loss the moment the first file lands under it.
+        for entry in missing:
+            reps = _carrier_representatives(workspace, entry)
+            if not reps:
+                dropped.append(entry)
+                continue
+            verdict = "covered"
+            for rep in reps:
+                # Same instrument as the stale branch, deliberately shared: a
+                # DIRECTORY representative and the files under it are different
+                # questions for git, and asking about the directory reported a
+                # subtree healthy while its carrier file was ignored.
+                got = _carrier_target_verdict(workspace, rep)
+                if got != "carried":
+                    verdict = got
+                    break
+            if verdict == "dropped":
+                dropped.append(entry)
+            elif verdict == "unmeasured":
+                unmeasured.append(entry)
 
     # A shipped entry can be one this host must NOT carry. `state/current-track.md`
     # is per-host state that #2534 added at a flat, SHARED vault path, so two cores
@@ -2101,14 +2263,45 @@ LAUNCHD_BACKED_CHECKS = {
 
 
 def fix_launchd(label: str) -> str:
-    """Try to reload a launchd job."""
+    """Try to reload a launchd job.
+
+    A missing plist is NOT an edge case for these two services, and saying
+    "no plist found" reads like a launchd failure when it is not one. The
+    voice-agent / web-client plists are generated by **Sutando.app's
+    installer** (see `_voice_log_path`); this repo ships installers only for
+    credential-proxy, cron-runner, health-check and the app itself. On a plain
+    checkout `src/startup.sh` launches both services directly instead —
+    `run_node_service voice-agent src/voice-agent.ts ... &` — precisely because
+    it checks `launchctl print` first and falls through when there is no job.
+
+    So on any host without Sutando.app installed, --fix reaches this function
+    for a stale voice-agent, prints one internal-sounding line, and can never
+    restart it. Observed on the 24/7 node 2026-08-03: `voice-agent: stale
+    (code is 2159 min newer than process)` survived repeated `--fix` runs,
+    each reporting `no plist found for com.sutando.voice-agent`.
+
+    Two distinct misses share one message, and only one of them is a bug:
+      * label absent from plist_map  -> a real "we don't know this job"
+      * label known, plist missing   -> the service is simply not launchd-
+        managed here, and the operator needs the command that DOES work
+    """
     plist_map = {
         "com.sutando.voice-agent": Path.home() / "Library/LaunchAgents/com.sutando.voice-agent.plist",
         "com.sutando.web-client": Path.home() / "Library/LaunchAgents/com.sutando.web-client.plist",
     }
     plist = plist_map.get(label)
-    if not plist or not plist.exists():
+    if not plist:
         return f"no plist found for {label}"
+    if not plist.exists():
+        # Deliberately names a runnable command. A --fix line that reports a
+        # miss without naming the remedy is indistinguishable, to whoever
+        # reads the log, from a fix that was attempted and failed.
+        return (
+            f"{label} is not launchd-managed on this host (no {plist.name} in "
+            f"~/Library/LaunchAgents — that plist comes from Sutando.app's installer). "
+            f"startup.sh launches this service directly instead, so --fix cannot "
+            f"restart it. Remedy: bash src/restart.sh"
+        )
 
     uid = subprocess.run(["/usr/bin/id", "-u"], capture_output=True, text=True).stdout.strip()
     # Try kickstart
