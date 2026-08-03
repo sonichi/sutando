@@ -44,6 +44,7 @@ had, because that is a separate question from where the audit trail begins.
 from __future__ import annotations
 
 import re
+import sys
 
 # Permissive on the suffix (`# Resolved (archive)` is a real divider) but anchored
 # with `[ \t]` rather than `\s`, so the whitespace class cannot span a newline and
@@ -218,11 +219,60 @@ def mask_markup(text: str) -> str:
     return mask_fenced_code(_mask_nonfence_spans(mask_html_comments(text)))
 
 
+def _masks_real_sections(text: str, masked: str) -> bool:
+    """True when masking has swallowed at least one real `## ` question heading.
+
+    This is the discriminator between DAMAGE and a legitimate quoted example, and it
+    is deliberately not a threshold. A `# Resolved` shown inside a bounded fence
+    masks only the example itself — zero question headings — and must stay quiet,
+    because a warning that cries wolf on healthy files is a warning nobody reads. An
+    unclosed span, by contrast, swallows live sections: measured 66 on the host where
+    this was found, versus 0 for a fenced example.
+
+    Chosen by measurement after a cleverer-looking condition ("everything after the
+    divider is masked too") was tested against the real damaged file and turned out
+    FALSE there — 4,542 unmasked characters remained in the tail — so that guard
+    would not have fired on the very defect it was written for.
+    """
+    return any(
+        raw_line.startswith("## ") and raw_line != masked_line
+        for raw_line, masked_line in zip(text.split("\n"), masked.split("\n"))
+    )
+
+
 def active_region(text: str, divider: re.Pattern = DIVIDER_RE) -> str:
     """`text` up to the first real (non-quoted) archive divider.
 
     Returns `text` unchanged when there is no divider — a file that keeps no audit
     trail is entirely active.
+
+    THIRD failure mode (2026-08-03), distinct from the two in the module header: the
+    divider is present and correctly spelled, but a single unbalanced backtick above
+    it opens an inline span that closes on the next backtick far below, so
+    `mask_markup` blanks the divider and it becomes unfindable. Measured on one host:
+    two ticks 1,971 lines apart, the whole 2,951-line file served as active, retired
+    entries re-surfacing as pending. Nothing errors and the file renders normally on
+    GitHub — the only visible symptom is a waiting-count that moves when an unrelated
+    section is edited.
+
+    This WARNS and deliberately does NOT change the return value. Falling back to the
+    raw match would cut at a `# Resolved` inside a fenced example — the exact thing
+    masking exists to prevent — and that fails in the dangerous direction: live
+    questions hidden, silently. The damaged state over-counts, which is noisy but
+    safe. Noisy beats silent.
     """
-    m = divider.search(mask_markup(text))
-    return text[:m.start()] if m else text
+    masked = mask_markup(text)
+    m = divider.search(masked)
+    if m:
+        return text[:m.start()]
+    raw = divider.search(text)
+    if raw is not None and _masks_real_sections(text, masked):
+        line = text.count("\n", 0, raw.start()) + 1
+        print(
+            f"pending-questions: '# Resolved' divider at line {line} is MASKED by "
+            "markup above it (an unclosed backtick span or code fence), so the "
+            "archive below it is being served as LIVE. Fix the unbalanced markup; "
+            "see sonichi/sutando#2557.",
+            file=sys.stderr,
+        )
+    return text
