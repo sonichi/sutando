@@ -10,6 +10,7 @@
 import { execSync, execFileSync } from 'node:child_process';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { requirePython, shellQuote } from '../../src/python-binary.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -401,7 +402,13 @@ export const joinZoomTool: ToolDefinition = {
 				// Click Join button if preview window appears
 				await new Promise(r => setTimeout(r, 3000));
 				try {
-					execSync(`/usr/bin/python3 -c "
+					// requirePython throws when the host has no runnable interpreter —
+					// absorbed by the `catch` below, which already degrades this to
+					// "Join button not clicked". Never hardcode /usr/bin/python3: on a
+					// Mac without developer tools that is the Xcode-CLT stub and
+					// spawning it raises a modal install dialog. shellQuote because
+					// this is a shell string and the resolved path may contain spaces.
+					execSync(`${shellQuote(requirePython())} -c "
 import Quartz, subprocess, time
 result = subprocess.run(['osascript', '-e', '''
 tell application \\\"zoom.us\\\" to activate
