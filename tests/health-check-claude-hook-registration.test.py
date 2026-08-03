@@ -93,7 +93,7 @@ class TestHookRegistration(unittest.TestCase):
         self._settings(self._all_registered(repo_path="/somewhere/else/sutando"))
         out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
         self.assertEqual(out["status"], "warn")
-        self.assertIn("another checkout", out["detail"])
+        self.assertIn("NOT invoking this checkout", out["detail"])
 
     def test_unparseable_HOOKS_array_warns_rather_than_reporting_clean(self):
         # An empty owned-list would otherwise mean "0 missing of 0" -> "ok", i.e. a
@@ -160,7 +160,7 @@ class TestHookRegistration(unittest.TestCase):
                 repo = self._one_hook_repo(root, cmd)
                 out = self.hc.check_claude_hook_registration(repo_dir=repo)
                 self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("another checkout", out["detail"])
+                self.assertIn("NOT invoking this checkout", out["detail"])
 
     def test_a_GENUINE_checkout_is_not_reported_foreign(self):
         # Over-trigger control for the fix above: a warning that fires on healthy hosts is
@@ -217,6 +217,56 @@ class TestHookRegistration(unittest.TestCase):
         out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
         self.assertEqual(out["status"], "warn")
         self.assertIn("4 NOT registered", out["detail"])
+
+    def test_a_command_that_only_MENTIONS_the_script_is_not_an_invocation(self):
+        # The nastiest false-clean: the expected path is present, so both a substring
+        # test AND a scan-every-token test say "registered" — while something else
+        # entirely runs. A stale or replaced hook keeps the probe green just by
+        # carrying its old target as inert data.
+        decoys = {
+            "echo": "echo {p}",
+            "printf-with-format": 'printf "%s" {p}',
+            "runs a DIFFERENT script, path as arg": "bash /tmp/other.sh {p}",
+            "path in a comment-ish trailing arg": "bash /tmp/other.sh --note {p}",
+        }
+        for label, tmpl in decoys.items():
+            with self.subTest(decoy=label):
+                repo = self._one_hook_repo(
+                    f"decoy-{abs(hash(label))}",
+                    lambda r, _t=tmpl: _t.format(p=f"{r}/src/check-pending-tasks.sh"),
+                )
+                out = self.hc.check_claude_hook_registration(repo_dir=repo)
+                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
+                self.assertIn("NOT invoking this checkout", out["detail"])
+
+    def test_the_installers_OWN_command_shape_is_what_counts_as_registered(self):
+        # Over-trigger control for the above: the command the installer actually
+        # writes must still read as registered, or the probe just cries wolf.
+        repo = self._one_hook_repo("genuine-cmd", lambda r: f"bash {r}/src/check-pending-tasks.sh")
+        self.assertEqual(self.hc.check_claude_hook_registration(repo_dir=repo)["status"], "ok")
+
+    def test_malformed_shapes_at_EVERY_nesting_level_warn_instead_of_raising(self):
+        # Round one validated the top two containers only. These are the levels below
+        # it, and each raised TypeError straight out of the probe — which, because it
+        # runs inside run_all_checks(), aborted every later check. Cover the DEPTH
+        # axis, not the two shapes a reviewer happened to name.
+        shapes = {
+            "event value is an int": {"Stop": 7},
+            "event value is a string": {"Stop": "nope"},
+            "group is not a dict": {"Stop": [5]},
+            "group.hooks is an int": {"Stop": [{"hooks": 7}]},
+            "group.hooks entry not a dict": {"Stop": [{"hooks": [5]}]},
+            "command is an int": {"Stop": [{"hooks": [{"command": 7}]}]},
+            "command is a list": {"Stop": [{"hooks": [{"command": ["bash"]}]}]},
+        }
+        for label, hooks in shapes.items():
+            with self.subTest(shape=label):
+                self._settings(hooks)
+                try:
+                    out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+                except Exception as e:
+                    self.fail(f"{label} must warn, not propagate {e!r}")
+                self.assertEqual(out["status"], "warn", label)
 
     def test_not_a_sutando_checkout_is_ok_not_a_warning(self):
         (self.repo / "src" / "install-claude-hooks.sh").unlink()

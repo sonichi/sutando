@@ -4470,33 +4470,62 @@ def _host_runs_comm_sweep(
     return False
 
 
-def _hook_command_targets(command: str, expected: Path) -> bool:
-    """Does this hook command actually invoke `expected`, as a path — not as a substring?
+def _as_list(value) -> list:
+    """A settings file is hand-editable; anything not a list yields nothing to scan."""
+    return value if isinstance(value, list) else []
 
-    Substring containment is not checkout identity. `/tmp/sutando` is a substring of
-    `/tmp/sutando-old/src/check-pending-tasks.sh`, so a `str(repo) in command` test
-    certifies a sibling checkout as this one — silently passing the very
-    present-but-pointing-elsewhere failure this probe exists to catch.
 
-    So the command is shell-split and each absolute token compared to `expected` as a
-    path. Falls back to realpath equality, which keeps a symlinked-but-genuine checkout
-    (macOS `/var` -> `/private/var`) from being reported as foreign. A relative token
-    can't be resolved without knowing the hook's cwd, so it never counts as a match:
-    unprovable identity warns, consistent with every other branch here.
-    """
+def _shell_tokens(command: str) -> list:
+    """Shell-split, degrading to whitespace split on unbalanced quoting."""
     try:
-        tokens = shlex.split(command)
-    except ValueError:  # unbalanced quoting — degrade rather than raise
-        tokens = command.split()
+        return shlex.split(command)
+    except ValueError:  # a hand-edited settings file can be unquotable
+        return command.split()
+
+
+def _same_path(a: str, b_norm: str, b_real: str) -> bool:
+    a = os.path.expanduser(a)
+    if not os.path.isabs(a):
+        # Unresolvable without knowing the hook's cwd, so it never counts as a
+        # match: unprovable identity warns, like every other branch here.
+        return False
+    return os.path.normpath(a) == b_norm or os.path.realpath(a) == b_real
+
+
+def _hook_command_targets(command: str, expected: Path, owned_cmd: str) -> bool:
+    """Does this command INVOKE `expected` — not merely mention it, not merely contain it?
+
+    Two false-cleans this has to reject, both found in review, both of which let a
+    stale or replaced hook keep the probe green:
+
+    1. **Substring containment is not checkout identity.** `/tmp/sutando` is a
+       substring of `/tmp/sutando-old/src/check-pending-tasks.sh`, so `str(repo) in
+       command` certifies a sibling checkout as this one.
+    2. **A path in argument position is not an invocation.** Scanning every absolute
+       token accepts `echo <path>`, `printf "%s" <path>`, and
+       `bash /tmp/other.sh <path>` — the expected script appears as inert data while
+       something else entirely runs.
+
+    So the comparison is positional, against the command the INSTALLER itself writes
+    (the third field of its `HOOKS` entry). The installer stays the single source of
+    truth for the command shape exactly as it already is for the hook list: whatever
+    interpreter it uses, and whichever position it puts its script in, is what a
+    registered hook must match. Leading tokens must agree, so `echo` cannot stand in
+    for `bash`, and the script position must be the same path.
+    """
     want = os.path.normpath(os.path.expanduser(str(expected)))
     want_real = os.path.realpath(want)
-    for tok in tokens:
-        tok = os.path.expanduser(tok)
-        if not os.path.isabs(tok):
-            continue
-        if os.path.normpath(tok) == want or os.path.realpath(tok) == want_real:
-            return True
-    return False
+    owned = _shell_tokens(owned_cmd)
+    idx = next((i for i, t in enumerate(owned) if _same_path(t, want, want_real)), None)
+    if idx is None:
+        # The installer's own template does not name this path — nothing to compare
+        # positionally, so fall back to "is it invoked at all" rather than guessing.
+        got = _shell_tokens(command)
+        return any(_same_path(t, want, want_real) for t in got[:2])
+    got = _shell_tokens(command)
+    if len(got) <= idx:
+        return False
+    return _same_path(got[idx], want, want_real) and got[:idx] == owned[:idx]
 
 
 def check_claude_hook_registration(
@@ -4547,7 +4576,9 @@ def check_claude_hook_registration(
                 continue
             parts = line.strip('"').split("|", 2)
             if len(parts) == 3:
-                owned.append((parts[0], parts[1]))
+                # third field is the command the installer WRITES — kept so the probe
+                # compares against the real command shape rather than guessing one.
+                owned.append((parts[0], parts[1], parts[2]))
     if not owned:
         return {"name": name, "status": "warn",
                 "detail": "could not parse HOOKS=(...) from install-claude-hooks.sh — "
@@ -4580,24 +4611,41 @@ def check_claude_hook_registration(
                           f"cannot verify {len(owned)} hook(s)"}
 
     missing, foreign = [], []
-    for event, marker in owned:
-        cmds = [h.get("command", "")
-                for g in (hooks.get(event) or []) if isinstance(g, dict)
-                for h in (g.get("hooks") or []) if isinstance(h, dict)]
+    for event, marker, owned_cmd in owned:
+        # Every container on this path is type-checked, at EVERY level. Validating
+        # only the top two left `{"hooks":{"Stop":7}}`, `{"hooks":{"Stop":[{"hooks":7}]}}`
+        # and a numeric `command` still raising TypeError straight out of the probe —
+        # and since this runs inside run_all_checks(), a raise aborts every later check.
+        # A malformed shape yields no commands, so the hook reads as unregistered: the
+        # promised warning, not a crash and not a false clean.
+        cmds = []
+        for g in _as_list(hooks.get(event)):
+            if not isinstance(g, dict):
+                continue
+            for h in _as_list(g.get("hooks")):
+                if not isinstance(h, dict):
+                    continue
+                c = h.get("command")
+                if isinstance(c, str):
+                    cmds.append(c)
         hit = [c for c in cmds if marker in c]
         if not hit:
             missing.append(f"{event}:{marker}")
         elif marker.startswith("src/") and not any(
-            _hook_command_targets(c, repo / marker) for c in hit
+            _hook_command_targets(c, repo / marker, owned_cmd.replace("$REPO_DIR", str(repo)))
+            for c in hit
         ):
-            # Registered, but aimed at another checkout — runs stale code forever.
+            # Present, but not actually invoking this checkout's script — either aimed
+            # at another checkout or carrying the path as an inert argument.
             foreign.append(f"{event}:{marker}")
     if missing or foreign:
         bits = []
         if missing:
             bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
         if foreign:
-            bits.append(f"{len(foreign)} pointing at another checkout ({', '.join(foreign)})")
+            bits.append(f"{len(foreign)} registered but NOT invoking this checkout's script "
+                        f"— another checkout, or the path is only an argument "
+                        f"({', '.join(foreign)})")
         return {"name": name, "status": "warn",
                 "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
     return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
