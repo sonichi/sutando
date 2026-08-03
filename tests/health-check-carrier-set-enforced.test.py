@@ -169,6 +169,58 @@ class CarrierSetProbe(unittest.TestCase):
         self._patch_resolved(["notes/"])
         self.assertIsNone(self.hc.check_carrier_set_enforced(workspace_dir=ws))
 
+    def test_entries_that_resolve_to_nothing_are_skipped_cleanly(self):
+        # Empty/whitespace entries and globs matching nothing must resolve to
+        # None rather than raising or inventing a path.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"], ["notes/a.md"])
+        self.assertIsNone(self.hc._carrier_representative(ws, ""))
+        self.assertIsNone(self.hc._carrier_representative(ws, "   "))
+        self.assertIsNone(self.hc._carrier_representative(ws, "nope/*/"))
+        self.assertIsNone(self.hc._carrier_representative(ws, "missing.md"))
+        self.assertIsNotNone(self.hc._carrier_representative(ws, "notes/"))
+
+    def test_no_configured_include_is_not_a_finding(self):
+        # A host with no carrier set configured has nothing to enforce.
+        ws = _mkworkspace(self.tmp, [], [])
+        self._patch_resolved([])
+        self.assertIsNone(self.hc.check_carrier_set_enforced(workspace_dir=ws))
+
+    def test_a_failing_git_invocation_does_not_crash_the_probe(self):
+        # health-check must never die on one probe. If check-ignore cannot run,
+        # that entry is skipped rather than reported as a failure — guessing
+        # "stale" from a broken subprocess would cry wolf.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "state/current-track.md"])
+        self._patch_resolved(["notes/", "state/current-track.md"])
+        self._patch_shipped(["notes/", "state/current-track.md"])
+        def boom(*a, **k):
+            raise OSError("git missing")
+        # Save the ORIGINAL first. `self.hc.subprocess` IS the shared module, so
+        # re-importing it in the restore hands back the patched function and the
+        # break leaks into every later test.
+        original = self.hc.subprocess.run
+        self.hc.subprocess.run = boom
+        try:
+            r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        finally:
+            self.hc.subprocess.run = original
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", "a broken git call must not manufacture a failure")
+
+    def test_an_unreadable_shipped_config_degrades_to_the_stale_branch_only(self):
+        # Malformed/absent shipped config must not crash or fabricate a
+        # "dropped by override" claim it cannot substantiate.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**", "state/", "state/current-track.md"],
+                          ["notes/a.md", "state/current-track.md"])
+        self._patch_resolved(["notes/", "state/current-track.md"])
+        bad = self.tmp / "badrepo"
+        bad.mkdir(parents=True, exist_ok=True)
+        (bad / "sutando.config.json").write_text("{ not json")
+        self.hc.REPO_DIR = bad
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", r.get("detail"))
+
     def test_the_probe_is_registered_in_the_run_list(self):
         # A probe nobody calls cannot report anything. This is the assertion
         # that fails if the function is added but never wired in.

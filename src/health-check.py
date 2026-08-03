@@ -4734,9 +4734,7 @@ def run_all_checks() -> list[dict]:
 
     # Carrier-set enforcement — a stale exclude means the vault is silently not
     # backing up paths the config says it carries (#2565).
-    _carrier = check_carrier_set_enforced()
-    if _carrier:
-        checks.append(_carrier)
+    checks.extend(c for c in (check_carrier_set_enforced(),) if c)
 
     # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
