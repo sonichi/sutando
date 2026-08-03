@@ -4595,14 +4595,21 @@ def _hook_command_targets(command: str, expected, owned_cmd: str, marker: str = 
         # destination prefix up through the marker. Everything after the marker is
         # free — that is where the installer's own $(date …) filename varies, so
         # pinning it would warn on healthy hosts.
-        o_src = owned[1] if len(owned) > 1 else None
-        o_dst = next((tok for tok in owned if marker and marker in tok), None)
-        if o_src is None or o_dst is None:
+        d_idx = next((i for i, tok in enumerate(owned) if marker and marker in tok), None)
+        if len(owned) < 2 or d_idx is None:
             return False
-        if len(got) < 2 or got[1] != o_src:
+        # POSITION and ARITY, not "the prefix appears somewhere". Accepting the
+        # prefix in any token certified a three-operand
+        #     cp "$TRANSCRIPT_PATH" /tmp/not-the-archive ".../sutando-conversations/x"
+        # which cp treats as two SOURCES and a destination — and which fails at
+        # runtime unless that last path is a directory, so nothing is archived while
+        # the probe reports clean. The installer writes exactly program/source/dest
+        # and Phase 1 requires that exact string, so anything of a different arity
+        # is not the command it installs.
+        if len(got) != len(owned) or got[1] != owned[1]:
             return False
-        prefix = o_dst[: o_dst.index(marker) + len(marker)]
-        return any(tok.startswith(prefix) for tok in got[1:])
+        prefix = owned[d_idx][: owned[d_idx].index(marker) + len(marker)]
+        return got[d_idx].startswith(prefix)
 
     want = os.path.normpath(os.path.expanduser(str(expected)))
     want_real = os.path.realpath(want)

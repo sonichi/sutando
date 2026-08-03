@@ -373,6 +373,14 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         cases = {
             "wrong source": 'cp /tmp/not-the-transcript "$HOME/Desktop/sutando-conversations/x.jsonl"',
             "wrong destination": 'cp "$TRANSCRIPT_PATH" /tmp/sutando-conversations/not-desktop.jsonl',
+            # Three-operand cp: the owned prefix IS present, just not in the
+            # destination position. cp reads this as two sources plus a target and
+            # fails at runtime unless the last path is a directory — so nothing is
+            # archived. Accepting the prefix in "any token" certified it.
+            "extra operand, prefix not in dest position":
+                'cp "$TRANSCRIPT_PATH" /tmp/not-the-archive "$HOME/Desktop/sutando-conversations/x.jsonl"',
+            # Same shape, fewer operands than the installer writes.
+            "too few operands": 'cp "$HOME/Desktop/sutando-conversations/x.jsonl"',
         }
         for label, cmd in cases.items():
             with self.subTest(case=label):
