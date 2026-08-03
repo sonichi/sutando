@@ -4440,25 +4440,75 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
     return None
 
 
-def check_comm_sweep_freshness() -> dict:
+def _host_runs_comm_sweep(
+    workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
+) -> bool:
+    """True when THIS host has a comm-sweep driver wired, i.e. its own crons.json
+    schedules one.
+
+    Comm handling is a SINGLE-OWNER lane: exactly one host in the fleet runs the
+    sweep, because a second cron would duplicate sweeps over the owner's real
+    comms. So "no stamp here" is only a defect on the host that actually owns it.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    host = host_label or _host_label()
+    try:
+        crons = json.loads((workspace / "hosts" / host / "crons.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(crons, list):
+        return False
+    for entry in crons:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("prompt_skill") == "comm-sweep":
+            return True
+        # A prompt-body entry that invokes the skill or its script counts too —
+        # matching how the driver is actually scheduled, not one spelling of it.
+        if "comm-sweep" in f"{entry.get('name', '')} {entry.get('prompt', '')}":
+            return True
+    return False
+
+
+def check_comm_sweep_freshness(
+    workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
+) -> dict:
     """Comm-handling liveness (P1 of the comm-handling overhaul).
 
     The comm-sweep driver stamps state/last-comm-sweep.json every run. A stale
     stamp means comm handling has silently STOPPED — the exact failure that let
     the inbox-score loop die 2026-07-21 and owner-comm sweeps lapse for days
     with nobody alerted (comm handling was a *discipline*, not a *mechanism*).
-    This probe makes that loud instead of silent: warn past ~2h, down past ~6h,
-    warn (not down) when the stamp is absent — a host that never wired the
-    driver isn't "broken", it just hasn't adopted P1 yet.
+    This probe makes that loud instead of silent: warn past ~2h, down past ~6h.
+
+    LANE-AWARENESS (2026-08-03). The absent-stamp branch used to warn on every
+    host, with the detail "driver not wired on this host yet (P1)". That wording
+    asserted a per-host adoption gap and was wrong twice over: comm handling is a
+    single-owner lane (the driver lives in sonichi/sutando-personal and runs on
+    ONE host by design — a second cron would duplicate sweeps over the owner's
+    comms), so a non-owning host has nothing to adopt and warns FOREVER. A
+    permanent warn is how a health output gets ignored, which would have cost the
+    very alarm this probe exists to raise. So absence is now judged against
+    whether this host actually schedules the driver.
+
+    Deliberately gated on the ABSENT branch ONLY: once a stamp exists, the age
+    thresholds apply unconditionally. Gating those on config too would mean
+    deleting the cron entry silently disarms a real stall — failing in the
+    dangerous direction.
 
     Age-checked (unlike quota-telemetry, which is absence-only): comm handling
     is expected to run on a fixed cadence, so a lengthening age IS the signal.
     """
-    path = status_read_path("last-comm-sweep.json", WORKSPACE_DIR)
+    path = status_read_path("last-comm-sweep.json", workspace_dir or WORKSPACE_DIR)
     name = "comm-sweep"
     if not path.exists():
+        if not _host_runs_comm_sweep(workspace_dir, host_label):
+            return {"name": name, "status": "ok",
+                    "detail": "comm-sweep not scheduled on this host — single-owner lane, "
+                              "probe N/A here"}
         return {"name": name, "status": "warn",
-                "detail": "no last-comm-sweep.json — comm-sweep driver not wired on this host yet (P1)"}
+                "detail": "comm-sweep is scheduled on this host but has never stamped "
+                          "last-comm-sweep.json — driver wired but not producing"}
     try:
         age_h = (time.time() - path.stat().st_mtime) / 3600
     except OSError as exc:
