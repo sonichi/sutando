@@ -101,16 +101,37 @@ before = OWNER_ACT.read_text()
 rgb._write_owner_activity({"task": "rick here", "source": "ag2space", "user_id": "@rick:ag2.space", "channel_id": "!r:hs"})
 check("teammate does not clobber owner's activity record", OWNER_ACT.read_text() == before)
 
-# --- clamp: the map can only DOWN-tier, never escalate above LOCAL_TIER ---
-# 12. on a LOCAL_TIER=team node, a map entry of "owner" is clamped to team, while
-# a "other" entry still down-tiers. Guards against a misconfigured/compromised
-# access.json escalating a sender above the node's own default.
+# --- per-sender owner tier on a least-privilege node (the shared-gateway shape) ---
+# 12. BEHAVIOR CHANGE (deliberate, owner-approved): an EXPLICITLY LISTED sender now
+# gets the tier the owner mapped them to, including one ABOVE LOCAL_TIER. This
+# previously clamped to <= LOCAL_TIER, which made the only way to grant owner a
+# BLANKET REMOTE_TASK_TIER=owner that every unlisted sender inherited (fail-OPEN).
+# Mirrors discord/slack, which resolve `tierMap[sender_id]` with no clamp.
+# The lookup key is the broker-attested user_id, so the WIRE still cannot escalate;
+# only the owner's own local access.json can, and only for a sender named in it.
 _prev_local = rgb.LOCAL_TIER
 rgb.LOCAL_TIER = "team"
-_write_map({"@rick:ag2.space": "owner", "@stranger:ag2.space": "other"})
-check("map cannot escalate above LOCAL_TIER (owner clamped to team)", rgb._tier_for("@rick:ag2.space") == "team")
-check("map still down-tiers below LOCAL_TIER (team node, 'other' honored)", rgb._tier_for("@stranger:ag2.space") == "other")
+_write_map({"@dana:ag2.space": "owner", "@stranger:ag2.space": "other"})
+check("listed sender IS up-tiered above LOCAL_TIER (team node, explicit owner)",
+      rgb._tier_for("@dana:ag2.space") == "owner")
+check("map still down-tiers below LOCAL_TIER (team node, 'other' honored)",
+      rgb._tier_for("@stranger:ag2.space") == "other")
+# 12b. the escalation is EXPLICIT-ONLY: an unlisted sender on the same node keeps
+# the least-privilege default. This is the property that makes the shared-gateway
+# config default-CLOSED, and it is what a blanket owner default cannot give you.
+check("unlisted sender on a team node stays team (no blanket escalation)",
+      rgb._tier_for("@nobody:ag2.space") == "team")
+# 12c. an invalid mapped value still cannot escalate — it is ignored, not honored.
+_write_map({"@rick:ag2.space": "admin"})
+check("invalid mapped value on a team node does NOT escalate",
+      rgb._tier_for("@rick:ag2.space") == "team")
 rgb.LOCAL_TIER = _prev_local
+
+# 12d. no silent demotion: on an owner-default node an unlisted sender is STILL
+# owner, so existing single-owner installs are untouched by this change.
+_write_map({"@rick:ag2.space": "team"})
+check("owner-default node: unlisted sender still owner (no regression)",
+      rgb._tier_for("@unknown:ag2.space") == "owner")
 
 # --- fail-safe: a transient read error preserves the last-known-good map ---
 # 13. once a teammate is down-tiered, a malformed/mid-write access.json must NOT
@@ -122,6 +143,6 @@ rgb._TIER_MAP_CACHE["mtime"] = -1                    # force a re-read attempt (
 check("malformed re-read keeps the down-tier (fail-safe, not fail-open to owner)",
       rgb._tier_for("@rick:ag2.space") == "team")
 
-_total = 13
+_total = 17
 print(f"\nResults: {_total - len(failures)}/{_total} passed" if not failures else f"\nResults: FAILED {failures}")
 sys.exit(1 if failures else 0)

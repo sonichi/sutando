@@ -574,26 +574,34 @@ def _load_tier_map():
     return tm
 
 
-# Privilege ordering — a higher rank is MORE privileged. Used to clamp a mapped
-# tier so the owner file can only ever DOWN-tier (never escalate above the node's
-# own default), keeping the "map only down-tiers named senders" safety invariant
-# true in code rather than only in the comment.
+# Known tier vocabulary. Also an ordering (higher == more privileged); kept for
+# validating a mapped value. It no longer CLAMPS — see _tier_for.
 _TIER_RANK = {"other": 0, "team": 1, "owner": 2}
 
 
 def _tier_for(user_id):
     """Resolve the access_tier for a task's broker-attested sender.
 
-    A listed sender gets their mapped tier, CLAMPED to <= LOCAL_TIER: the map can
-    down-tier a sender below this node's default but never raise them above it, so
-    a compromised/misconfigured access.json can never ESCALATE. Everyone else
-    (unlisted / no user_id) gets LOCAL_TIER."""
+    An EXPLICITLY LISTED sender gets exactly the tier the owner mapped them to —
+    including a tier ABOVE this node's LOCAL_TIER. That is the point: it lets a
+    SHARED gateway run a least-privilege default (REMOTE_TASK_TIER=team) and name
+    the one sender who is the owner, instead of the only previously-available
+    shape — a blanket `owner` default that every unlisted sender inherits.
+
+    This mirrors the discord and slack bridges, which have always resolved
+    `access_tier = tierMap[sender_id]` with no clamp. The map is LOCAL,
+    owner-owned config with the same trust standing as REMOTE_TASK_TIER itself,
+    and the lookup key is the BROKER-ATTESTED user_id, never a task-body
+    self-claim — so the WIRE still cannot escalate anyone. Only the owner's own
+    local file can, and only for a sender they named explicitly.
+
+    Everyone else (unlisted / no user_id) gets LOCAL_TIER, unchanged: no existing
+    install is silently demoted, and an unknown sender never gains privilege."""
     uid = (user_id or "").strip()
     if uid:
         mapped = _load_tier_map().get(uid)
         if mapped in _TIER_RANK:
-            local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
-            return mapped if _TIER_RANK[mapped] <= local_rank else LOCAL_TIER
+            return mapped
     return LOCAL_TIER
 
 
