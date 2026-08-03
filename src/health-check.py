@@ -4470,6 +4470,94 @@ def _host_runs_comm_sweep(
     return False
 
 
+def check_claude_hook_registration(
+    repo_dir: Optional[Path] = None,
+) -> dict:
+    """Are the Claude Code hooks `install-claude-hooks.sh` owns actually registered?
+
+    Nothing checked this before. On 2026-08-03 this host was found with **zero of
+    the four owned hooks** in the installer's own target — including both PreCompact
+    entries, so `session-state.md` was never regenerated on compaction and the
+    transcript archiver had never run at all. It had been that way for days, silently,
+    because no probe looks at hook registration. A peer host showed the same shape.
+
+    The owned list is READ FROM THE INSTALLER's `HOOKS=(...)` array rather than
+    duplicated here: a second copy would drift from the script that does the
+    installing, and a stale allow-list is how a probe starts lying. Same reason the
+    target file is read from its `SETTINGS=` line instead of being assumed.
+
+    Fails toward NOISE, never toward a false clean:
+      * installer absent          -> ok, not a sutando checkout (nothing to verify)
+      * HOOKS array unparseable   -> WARN. A parse that yields zero hooks would
+                                     otherwise report "all registered" over an empty
+                                     population, which is the exact shape of a probe
+                                     that cannot fail.
+      * settings.json absent      -> warn (installer has never run here)
+      * settings.json malformed   -> warn, never raise
+      * a hook registered but its command points at a DIFFERENT checkout -> warn.
+        This host had a SessionEnd entry aimed at a five-day-old `Desktop/sutando`
+        copy, so fixes to the live script never executed — present-but-wrong is the
+        failure that looks healthiest.
+    """
+    name = "claude-hooks"
+    repo = Path(repo_dir or REPO_DIR)
+    installer = repo / "src" / "install-claude-hooks.sh"
+    if not installer.is_file():
+        return {"name": name, "status": "ok", "detail": "no install-claude-hooks.sh — not a sutando checkout"}
+    try:
+        src = installer.read_text(errors="ignore")
+    except OSError as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot read installer ({exc})"}
+
+    m = re.search(r"^HOOKS=\((.*?)^\)", src, re.M | re.S)
+    owned = []
+    if m:
+        for line in m.group(1).split("\n"):
+            line = line.strip()
+            if not line.startswith('"'):
+                continue
+            parts = line.strip('"').split("|", 2)
+            if len(parts) == 3:
+                owned.append((parts[0], parts[1]))
+    if not owned:
+        return {"name": name, "status": "warn",
+                "detail": "could not parse HOOKS=(...) from install-claude-hooks.sh — "
+                          "cannot verify registration (reporting rather than assuming clean)"}
+
+    sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
+    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
+    if not settings.is_file():
+        return {"name": name, "status": "warn",
+                "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "
+                          f"{len(owned)} hook(s) unregistered"}
+    try:
+        conf = json.loads(settings.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "warn", "detail": f"{settings.name} unreadable ({exc})"}
+
+    hooks = conf.get("hooks") or {}
+    missing, foreign = [], []
+    for event, marker in owned:
+        cmds = [h.get("command", "")
+                for g in (hooks.get(event) or []) if isinstance(g, dict)
+                for h in (g.get("hooks") or []) if isinstance(h, dict)]
+        hit = [c for c in cmds if marker in c]
+        if not hit:
+            missing.append(f"{event}:{marker}")
+        elif marker.startswith("src/") and not any(str(repo) in c for c in hit):
+            # Registered, but aimed at another checkout — runs stale code forever.
+            foreign.append(f"{event}:{marker}")
+    if missing or foreign:
+        bits = []
+        if missing:
+            bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
+        if foreign:
+            bits.append(f"{len(foreign)} pointing at another checkout ({', '.join(foreign)})")
+        return {"name": name, "status": "warn",
+                "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+    return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
+
+
 def check_comm_sweep_freshness(
     workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
 ) -> dict:
@@ -4577,6 +4665,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
+    checks.append(check_claude_hook_registration())
     checks.append(check_cron_runner())
     checks.append(check_session_cron_registration())
 
