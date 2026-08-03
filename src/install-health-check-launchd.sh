@@ -166,15 +166,34 @@ resolve_python_verified() {
     done
 
     if [ -n "$__first" ]; then
-        # Every candidate failed. Refusing would block an install over a probe
-        # that might itself be wrong; installing silently is the bug being
-        # fixed. So proceed with the preferred one and say so, loudly.
-        echo "WARNING: no python3 could import health-check.py. Installing with" >&2
-        echo "         $__first anyway; the job will likely fail every run." >&2
-        echo "         Fix the interpreter, or set SUTANDO_PYTHON_CANDIDATES," >&2
-        echo "         then re-run this installer." >&2
-        echo "$__first"
-        return 0
+        # FAIL CLOSED. An earlier version warned and installed with the broken
+        # interpreter anyway, reasoning that refusing would block an install over
+        # a probe that might be wrong. That trade is backwards, for two reasons
+        # (review-caught, qingyun-wu on #2582):
+        #
+        #   1. The caller runs `bootout_if_loaded` AFTER this resolves. Proceeding
+        #      therefore UNLOADS a job that may currently be working and replaces
+        #      it with one already proven unable to start. Failing here preserves
+        #      whatever is installed.
+        #   2. The installer would report success. A safety net that reports
+        #      installed and cannot run is worse than a failed install, because
+        #      nothing else watches this job — that is the whole premise of the
+        #      change.
+        #
+        # And it is not a hypothetical branch: on the host that motivated this,
+        # the default list collapses to the same broken interpreter twice
+        # (Homebrew, and PATH resolving to it), so ALL candidates fail.
+        #
+        # The probe being wrong is still handled — $SUTANDO_PYTHON_CANDIDATES
+        # overrides the list — so failing closed strands nobody.
+        echo "ERROR: no candidate python3 can import health-check.py." >&2
+        echo "       Tried:$__seen" >&2
+        echo "       Refusing to install: the job would fail every run while" >&2
+        echo "       reporting success, and installing would unload any working" >&2
+        echo "       job already in place." >&2
+        echo "       Fix the interpreter, or pin a known-good one:" >&2
+        echo "         SUTANDO_PYTHON_CANDIDATES=/path/to/python3 $0 install" >&2
+        exit 1
     fi
 
     echo "ERROR: no python3 found" >&2

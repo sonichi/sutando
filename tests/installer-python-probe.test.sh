@@ -81,20 +81,38 @@ check "skips SEVERAL broken candidates" \
 check "a broken preferred interpreter does not win over a working later one" \
       "$(run_resolve "$box/broken1 $box/good1 $box/good2")" "$box/good1"
 
-# All broken: fall back to the first EXISTING one rather than refusing, but the
-# caller is warned. Refusing outright would block an install over a probe that
-# might itself be wrong; installing silently is what this whole change is about.
-check "all candidates broken -> falls back to the first, does not refuse" \
-      "$(run_resolve "$box/broken1 $box/broken2")" "$box/broken1"
-
-warned=$(SUTANDO_PYTHON_CANDIDATES="$box/broken1 $box/broken2" bash -c "
+# All broken: FAIL CLOSED. An earlier version warned and installed with the
+# broken interpreter anyway. That is backwards — the caller runs
+# bootout_if_loaded AFTER this resolves, so proceeding unloads a possibly-working
+# job and replaces it with one proven unable to start, while reporting success.
+# Nothing else watches this job, so a successful-looking dead install is the
+# worst outcome available. (Review-caught, qingyun-wu on #2582.)
+allbroken_status=0
+SUTANDO_PYTHON_CANDIDATES="$box/broken1 $box/broken2" bash -c "
     REPO='$REPO'
     $(sed -n '/^probe_python()/,/^}$/p' "$SCRIPT")
     $(sed -n '/^resolve_python_verified()/,/^}$/p' "$SCRIPT")
     resolve_python_verified
-" 2>&1 >/dev/null | grep -c "WARNING")
-check "all-broken fallback WARNS (a silent broken install is the bug)" \
-      "$([ "$warned" -ge 1 ] && echo yes || echo no)" "yes"
+" >/dev/null 2>&1 || allbroken_status=$?
+check "all candidates broken -> exits NON-ZERO (installs nothing)" \
+      "$([ "$allbroken_status" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+
+allbroken_out=$(SUTANDO_PYTHON_CANDIDATES="$box/broken1 $box/broken2" bash -c "
+    REPO='$REPO'
+    $(sed -n '/^probe_python()/,/^}$/p' "$SCRIPT")
+    $(sed -n '/^resolve_python_verified()/,/^}$/p' "$SCRIPT")
+    resolve_python_verified
+" 2>&1 >/dev/null)
+check "all-broken failure prints no interpreter on stdout (nothing to install)" \
+      "$(SUTANDO_PYTHON_CANDIDATES="$box/broken1 $box/broken2" bash -c "
+          REPO='$REPO'
+          $(sed -n '/^probe_python()/,/^}$/p' "$SCRIPT")
+          $(sed -n '/^resolve_python_verified()/,/^}$/p' "$SCRIPT")
+          resolve_python_verified
+      " 2>/dev/null | tr -d '[:space:]')" ""
+
+check "all-broken failure names the override so it is not a dead end" \
+      "$(printf '%s' "$allbroken_out" | grep -c 'SUTANDO_PYTHON_CANDIDATES' | head -1)" "1"
 
 # Non-existent paths are not candidates at all, and must not be reported as
 # broken interpreters — that would send someone debugging a python that is
@@ -118,6 +136,23 @@ dupes=$(SUTANDO_PYTHON_CANDIDATES="$box/broken1 $box/broken1 $box/good1" bash -c
     resolve_python_verified
 " 2>&1 >/dev/null | grep -c "broken1")
 check "a duplicate candidate is probed once, not twice" "$dupes" "1"
+
+# STRUCTURAL: the interpreter must be resolved BEFORE bootout_if_loaded in the
+# install path. That ordering is the whole reason failing closed is safe — it
+# preserves any job already installed. A future reorder would silently turn a
+# clean refusal back into "unload the working job, then fail".
+# Asserted as "no bootout CALL precedes the resolution", not "a bootout follows
+# it". The follows-it form is what I wrote first and it cannot fail: inserting a
+# bootout above the resolution leaves the later one in place, so the check still
+# saw a bootout after and passed. Verified by perturbation — moving bootout above
+# the resolution must make this FAIL.
+# The `^\s*bootout_if_loaded\s*$` shape matches CALLS only; the definition line
+# is `bootout_if_loaded() {` and is excluded.
+py_line=$(grep -n 'PYTHON_BIN="$(resolve_python_verified)"' "$SCRIPT" | head -1 | cut -d: -f1)
+prior_bootout=$(grep -nE '^[[:space:]]*bootout_if_loaded[[:space:]]*$' "$SCRIPT" \
+                | cut -d: -f1 | awk -v s="$py_line" '$1 < s {print; exit}')
+check "no bootout_if_loaded runs BEFORE resolution (preserves an existing job)" \
+      "$([ -n "$py_line" ] && [ -z "$prior_bootout" ] && echo yes || echo no)" "yes"
 
 echo
 if [ "$fails" -ne 0 ]; then
