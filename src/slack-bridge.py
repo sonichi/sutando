@@ -145,43 +145,17 @@ if not BOT_TOKEN or not APP_TOKEN:
     sys.exit(1)
 
 
-# Outbound file-send allowlist — mirrors _is_path_sendable() in
-# discord-bridge.py + telegram-bridge.py. Fail-closed by default.
-SEND_ALLOWED_ROOTS = (
-    str(REPO / "results"),
-    str(REPO / "notes"),
-    str(REPO / "docs"),
-    str(INBOX_DIR),
-)
-SEND_ALLOWED_PREFIXES = (
-    "/tmp/sutando-",
-    "/private/tmp/sutando-",
-    "/tmp/echo-",
-    "/private/tmp/echo-",
-)
+# Outbound attachment allowlisting is canonical policy — src/send_allowlist.py
+# is the single source of truth (a hand-written copy here drifted from it and
+# silently dropped files other bridges would send). Slack extends it with its
+# OWN inbound dir so an uploaded file can be echoed back; that root stays
+# Slack-local rather than becoming global.
+from send_allowlist import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
 
 
 def _is_path_sendable(fpath: str) -> bool:
-    """True iff `fpath` is a real file AND resolves under an allowed root.
-
-    Uses os.path.realpath + startswith — CodeQL recognizes this pattern as
-    a path-injection sanitizer. Do NOT swap for Path.resolve() without
-    re-proving to CodeQL. Same shape as the discord/telegram allowlist.
-    """
-    if not os.path.isfile(fpath):
-        return False
-    try:
-        real = os.path.realpath(fpath)
-    except OSError:
-        return False
-    for root in SEND_ALLOWED_ROOTS:
-        root_real = os.path.realpath(root)
-        if real == root_real or real.startswith(root_real + os.sep):
-            return True
-    for prefix in SEND_ALLOWED_PREFIXES:
-        if real.startswith(prefix):
-            return True
-    return False
+    """Canonical allowlist + Slack's inbound dir. See src/send_allowlist.py."""
+    return _is_path_sendable_canonical(fpath, extra_roots=(str(INBOX_DIR),))
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
