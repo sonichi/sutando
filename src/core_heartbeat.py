@@ -223,8 +223,29 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     # exact session (never "any pane on the socket"), and identity still comes
     # from argv, never from the pane's foreground command. Strictly stronger
     # than the non-Claude fallback below, so it runs for every runtime.
+    # `-s` = every pane in the SESSION. WITHOUT it, `list-panes -t "={sess}"`
+    # resolves to that session's CURRENT WINDOW only — and this repo deliberately
+    # keeps sibling windows (gateway, monitor) in the core's session, healing
+    # window-scoped so they survive (`src/agent/claude/cli/start-cli.sh`). Select
+    # a sibling and this branch inspects only that sibling, misses the live core
+    # in another window, and returns None again — the very failure being fixed.
+    #
+    # `src/health-check.py` already learned this and says so in its own docstring
+    # ("the first version of this helper targeted the session ... which tmux
+    # resolves to that session's current window"), landing on
+    # `list-panes -s -t "={session}"` plus the argv identity check. This is the
+    # same resolver problem, so it gets the same shape rather than a second
+    # answer. Note that file also records why window NAME is no discriminator:
+    # on a versioned install the core's window is auto-named after the version —
+    # the same `ucomm` fact that motivates this PR.
+    #
+    # Review-caught, qingyun-wu, with an exact-head canary: gateway window
+    # current, real core pane in a sibling window -> `core_pid` returned None.
+    # `-t "={sess}"` still pins the exact session, so #2488's "never any pane on
+    # the socket" guard is untouched — `-s` widens across windows WITHIN this
+    # session, never across sessions.
     try:
-        lp = _tmux(sock, "list-panes", "-t", f"={sess}", "-F", "#{pane_pid}")
+        lp = _tmux(sock, "list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}")
         if lp is not None and lp.returncode == 0:
             for pid_s in lp.stdout.split():
                 if not pid_s.isdigit():
@@ -251,8 +272,12 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     if (_session_runtime(sock, sess) or "").lower() == "claude":
         return None
 
-    # Non-Claude runtime: panes of THIS session only (never `-a`).
-    lp = _tmux(sock, "list-panes", "-t", f"={sess}", "-F", "#{pane_pid}")
+    # Non-Claude runtime: panes of THIS session only (never `-a`), across all its
+    # windows (`-s`) for the same reason as the branch above — without it, a core
+    # in a non-selected window is invisible and this returns None for a live
+    # core. Same one-token correction under the same guard: `-t "={sess}"` keeps
+    # it pinned to the exact session.
+    lp = _tmux(sock, "list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}")
     if lp is None or lp.returncode != 0:
         return None
     for line in lp.stdout.split():

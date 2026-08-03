@@ -114,7 +114,7 @@ check(".alive removed once death is confirmed", not alive.exists())
 # healthy non-Claude host can never be turned into a permanent false death.
 
 def _farm(runtime_line: str, claude_alive: bool, kill_config: bool = False,
-          pane_pid: "int | str" = 7777):
+          pane_pid: "int | str" = 7777, other_window_pid: "int | None" = None):
     """Fake toolchain: tmux answers has-session / show-environment / list-panes.
 
     `ps` is deliberately PID-AWARE. It used to echo the core's argv for every
@@ -134,6 +134,15 @@ def _farm(runtime_line: str, claude_alive: bool, kill_config: bool = False,
         # Unquoted on purpose: a multi-token `pane_pid` becomes one line per
         # token, which is how `list-panes -F '#{pane_pid}'` reports >1 pane and
         # how a non-pid token (tmux noise, a blank line) reaches the parser.
+        # Two cases, because tmux distinguishes them and the resolver must too:
+        #   `list-panes -s -t =sess` -> every pane in the SESSION (all windows)
+        #   `list-panes    -t =sess` -> only the CURRENT WINDOW's panes
+        # `other_window_pid` is a pane in the session but NOT in the selected
+        # window, so it is reachable only via `-s`. Modelling it is the
+        # difference between "several tokens on one result" and "several
+        # WINDOWS" — the axis that let a core in a sibling window read as absent.
+        f"  *list-panes*-s*|*-s*list-panes*)  printf '%s\\n' {other_window_pid} {pane_pid}; exit 0 ;;"
+        if other_window_pid else "",
         f"  *list-panes*)       printf '%s\\n' {pane_pid}; exit 0 ;;",
         'esac',
         'exit 0',
@@ -223,12 +232,26 @@ CASES = [
     # `if not pid_s.isdigit(): continue` guard is never executed by any test.
     ("noisy list-panes (non-pid token first) -> skipped, core still found",
      'echo SUTANDO_CORE_RUNTIME=claude', False, 4242, False, "- 4242"),
+    # TWO WINDOWS. `list-panes -t =sess` reports only the CURRENT window, so a
+    # core in a non-selected sibling window is invisible to this branch and the
+    # resolver returns None for a LIVE core — the same failure this PR fixes,
+    # reached through a different door. Sibling windows (gateway, monitor) are
+    # kept deliberately in the core's session by start-cli.sh, so whichever
+    # window is selected decided whether the core could be found.
+    #
+    # Here the selected window holds only pane 7777 (a shell) and the core 4242
+    # lives in another window of the same session — reachable only via `-s`.
+    # Review-caught, qingyun-wu, exact-head canary: gateway window current, real
+    # core pane in a sibling -> core_pid returned None.
+    ("core in a NON-SELECTED window of the same session is still found (-s)",
+     'echo SUTANDO_CORE_RUNTIME=claude', False, 4242, False, 7777, 4242),
 ]
 for case in CASES:
     label, rt, alive, want = case[:4]
     _kill = bool(len(case) > 4 and case[4])
     _pane = case[5] if len(case) > 5 else 7777
-    box = _farm(rt, alive, kill_config=_kill, pane_pid=_pane)
+    _otherw = case[6] if len(case) > 6 else None
+    box = _farm(rt, alive, kill_config=_kill, pane_pid=_pane, other_window_pid=_otherw)
     _op = os.environ["PATH"]
     os.environ["PATH"] = f"{box}:{_op}"
     _tok = _blind_config() if _kill else None
