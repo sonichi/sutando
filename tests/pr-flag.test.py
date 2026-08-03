@@ -307,6 +307,58 @@ def main() -> int:
            pf.state_hash(pf.raw_state([_pr(40, OWNER, commit_bodies=["x\n\nStand: " + PRO])], OWNER, stand=PRO))
     print("  ok  an unknown principal refires rather than reusing the last verdict")
 
+    # ---- a TRUNCATED commit fetch is also UNKNOWN (100/101 boundary) --------
+    # qingyun-wu + john-the-dev on #2553, both at head 32a5ce73: the query was
+    # `commits(first:100)` with no pageInfo/cursor, and _attach_commits treated
+    # that first page as the whole history. The STANDS_UNAVAILABLE sentinel
+    # covered a FAILED fetch but not a SUCCESSFUL, incomplete one -- so a Stand
+    # trailer on commit 101 was dropped and the script still emitted a confident
+    # principal. Same defect class the PR exists to remove, one layer down.
+    # These exercise _attach_commits() itself, not just raw_state() fixtures.
+    def _page_factory(pages):
+        calls = []
+        def _fake(owner, name, num, after):
+            calls.append(after)
+            return pages[len(calls) - 1]
+        return _fake, calls
+
+    real_page = pf._gh_stands_page
+    try:
+        # page 1: 100 commits, no trailer, hasNextPage.  page 2: commit 101 HAS it.
+        p1 = [{"commit": {"messageBody": f"c{i}"}} for i in range(100)]
+        p2 = [{"commit": {"messageBody": "c100\n\nStand: " + PRO}}]
+        pf._gh_stands_page, calls = _page_factory([
+            (True, p1, True, "CUR1"),
+            (True, p2, False, None),
+        ])
+        prs = pf._attach_commits("o/n", [{"number": 101}])
+        assert len(prs[0]["commits"]) == 101, len(prs[0]["commits"])
+        assert calls == [None, "CUR1"], calls
+        assert not prs[0].get(pf.STANDS_UNAVAILABLE), "a COMPLETE paged read is not unavailable"
+        got = pf.raw_state([_pr(101, OWNER, commit_bodies=[c["messageBody"] for c in prs[0]["commits"]])],
+                           OWNER, stand=PRO)[0]
+        assert got["principal"] == PRO, got
+        assert got["is_mine"] is True, got
+        print("  ok  a Stand trailer on commit 101 survives pagination")
+
+        # a page that FAILS mid-walk must fail closed, never report a partial set
+        pf._gh_stands_page, _ = _page_factory([
+            (True, p1, True, "CUR1"),
+            (False, [], False, None),
+        ])
+        trunc = pf._attach_commits("o/n", [{"number": 102}])[0]
+        assert trunc[pf.STANDS_UNAVAILABLE] is True, trunc
+        assert trunc["commits"] == [], "a partial history must not be published as complete"
+        print("  ok  a mid-walk page failure fails CLOSED, not partial")
+
+        # hasNextPage true but no cursor: cannot continue -> also closed
+        pf._gh_stands_page, _ = _page_factory([(True, p1, True, None)])
+        stuck = pf._attach_commits("o/n", [{"number": 103}])[0]
+        assert stuck[pf.STANDS_UNAVAILABLE] is True and stuck["commits"] == []
+        print("  ok  hasNextPage without a cursor fails CLOSED")
+    finally:
+        pf._gh_stands_page = real_page
+
     print("\nAll pr-flag core cases pass.")
     return 0
 

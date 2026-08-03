@@ -228,14 +228,46 @@ def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — sub
 
 
 
-_STANDS_Q = """query($owner:String!,$name:String!,$n:Int!){
+_STANDS_Q = """query($owner:String!,$name:String!,$n:Int!,$after:String){
   repository(owner:$owner,name:$name){
-    pullRequest(number:$n){ commits(first:100){ nodes{ commit{ messageBody } } } }
+    pullRequest(number:$n){ commits(first:100, after:$after){
+      pageInfo{ hasNextPage endCursor }
+      nodes{ commit{ messageBody } }
+    } }
   }
 }"""
 
+# Defensive ceiling: 100 pages = 10,000 commits. Hitting it means something is
+# pathological, and the right answer there is "unknown", never a truncated set
+# silently reported as complete -- which is the exact bug this module exists to
+# remove, one level up.
+_MAX_STAND_PAGES = 100
 
-def _attach_commits(repo: str, prs: list) -> list:  # pragma: no cover - gh glue
+
+def _gh_stands_page(owner, name, num, after):  # pragma: no cover - subprocess boundary
+    """One page of a PR's commit bodies.
+
+    Returns (ok, nodes, has_next, end_cursor). `ok=False` means we could not
+    look -- the caller must fail CLOSED rather than treat it as "found none".
+    Kept as its own seam so `_attach_commits` is testable without a network.
+    """
+    argv = ["gh", "api", "graphql", "-f", "query=" + _STANDS_Q,
+            "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"n={num}"]
+    if after:
+        argv += ["-F", f"after={after}"]
+    res = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        print(f"pr-flag: stand fetch failed for #{num}: {res.stderr[:120]}", file=sys.stderr)
+        return False, [], False, None
+    try:
+        conn = json.loads(res.stdout)["data"]["repository"]["pullRequest"]["commits"]
+        info = conn.get("pageInfo") or {}
+        return True, conn["nodes"], bool(info.get("hasNextPage")), info.get("endCursor")
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return False, [], False, None
+
+
+def _attach_commits(repo: str, prs: list) -> list:
     """Populate each PR's `commits` with message bodies only.
 
     Deliberately NOT folded into the `gh pr list --json` call: asking that query
@@ -250,21 +282,26 @@ def _attach_commits(repo: str, prs: list) -> list:  # pragma: no cover - gh glue
         num = pr.get("number")
         if num is None:
             continue
-        res = subprocess.run(
-            ["gh", "api", "graphql", "-f", "query=" + _STANDS_Q,
-             "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"n={num}"],
-            capture_output=True, text=True, timeout=60)
-        if res.returncode != 0:
-            print(f"pr-flag: stand fetch failed for #{num}: {res.stderr[:120]}", file=sys.stderr)
+        nodes, after, complete = [], None, False
+        for _ in range(_MAX_STAND_PAGES):
+            ok, page, has_next, cursor = _gh_stands_page(owner, name, num, after)
+            if not ok:
+                break
+            nodes += page
+            if not has_next:
+                complete = True
+                break
+            after = cursor
+            if not after:      # hasNextPage true but no cursor -> cannot continue
+                break
+        if not complete:
+            # Could not read the WHOLE history. A truncated read is not a small
+            # error here: one missing commit can drop the only Stand trailer and
+            # turn "mine" into a confident "unattributed".
             pr["commits"] = []
             pr[STANDS_UNAVAILABLE] = True
             continue
-        try:
-            nodes = json.loads(res.stdout)["data"]["repository"]["pullRequest"]["commits"]["nodes"]
-            pr["commits"] = [{"messageBody": n["commit"].get("messageBody") or ""} for n in nodes]
-        except (KeyError, TypeError, json.JSONDecodeError):
-            pr["commits"] = []
-            pr[STANDS_UNAVAILABLE] = True
+        pr["commits"] = [{"messageBody": n["commit"].get("messageBody") or ""} for n in nodes]
     return prs
 
 def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic covered in tests
