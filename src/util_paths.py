@@ -111,6 +111,15 @@ def _host_label() -> str:
     conventions stay in lockstep. Kept in lockstep with `_host()` in
     sync-workspace.sh (same precedence)."""
     env = os.environ.get("SUTANDO_HOST_LABEL") or os.environ.get("SUTANDO_HOST_OVERRIDE")
+    # Strip before testing: a blank-but-set override (`SUTANDO_HOST_LABEL=" "`,
+    # trivially produced by an unquoted expansion in a launcher) is truthy in
+    # Python, so `if env:` returned the whitespace itself as the label. That
+    # yields `hosts/   /` and `state/cores/   .alive` — the same per-host path
+    # split as the 2026-06-22 DHCP-drift incident above, but self-inflicted and
+    # far harder to spot in a directory listing. Blank means "not set": fall
+    # through to scutil/hostname. Matches SutandoConfig.hostLabel() in
+    # src/Sutando/main.swift, which already trims.
+    env = (env or "").strip()
     if env:
         return env
     try:
