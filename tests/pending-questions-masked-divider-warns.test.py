@@ -356,6 +356,36 @@ class TestMaskedDividerWarns(unittest.TestCase):
         self.assertIn("MASKED by markup", err,
                       "same-span damage must still warn after the scoping")
 
+    def test_a_span_opening_AFTER_the_heading_prefix_is_not_damage(self):
+        # qingyun-wu at 777ee325. The range-local relation was right but the test
+        # inside it was still "raw looks like a question AND the line changed".
+        # A balanced span can open AFTER the `## `, quote the divider and close
+        # normally — the heading stays fully visible to every reader, so nothing
+        # was swallowed. Only the disappearance of the RECOGNISED PREFIX counts.
+        text = (
+            f"## live question opens {TICK}\n"
+            "# Resolved\n"
+            f"{TICK} closing quote\n"
+            "## still live\n"
+        )
+        out, err = _run(text)
+        self.assertEqual(err, "",
+                         "the heading survives masking — no question was swallowed")
+        self.assertEqual(out, text)
+
+    def test_a_span_opening_AFTER_a_bullet_label_is_not_damage_either(self):
+        # Same defect via the other reader-recognised shape; fixing only the
+        # heading half would leave the bullet half live.
+        text = (
+            f"- **[label, 2026-01-01]** opens {TICK}\n"
+            "# Resolved\n"
+            f"{TICK} closes\n"
+            "## still live\n"
+        )
+        out, err = _run(text)
+        self.assertEqual(err, "", "the bullet label survives masking — nothing swallowed")
+        self.assertEqual(out, text)
+
     def test_no_divider_at_all_is_silent(self):
         text = "## only live questions\nbody\n"
         out, err = _run(text)

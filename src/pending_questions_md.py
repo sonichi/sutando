@@ -231,14 +231,11 @@ def mask_markup(text: str) -> str:
     return mask_fenced_code(_mask_nonfence_spans(mask_html_comments(text)))
 
 
-def _question_entry_masked(text: str, masked: str) -> bool:
-    """True when masking swallowed something a READER counts as a question."""
-    for raw_line, masked_line in zip(text.split("\n"), masked.split("\n")):
-        if raw_line == masked_line:
-            continue
-        if raw_line.startswith("## ") or re.match(r'^\s*-\s+\*\*\[(.+?)\]', raw_line):
-            return True
-    return False
+
+
+def _is_question_shape(line: str) -> bool:
+    """True when a READER would count this line as a question entry."""
+    return bool(line.startswith("## ") or re.match(r'^\s*-\s+\*\*\[(.+?)\]', line))
 
 
 def _question_entry_masked_in(text: str, masked: str, lo: int, hi: int) -> bool:
@@ -257,7 +254,12 @@ def _question_entry_masked_in(text: str, masked: str, lo: int, hi: int) -> bool:
             continue                                   # outside THIS span
         if raw_line == masked_line:
             continue
-        if raw_line.startswith("## ") or re.match(r'^\s*-\s+\*\*\[(.+?)\]', raw_line):
+        # The RECOGNISED PREFIX must be what disappeared. Testing only "raw looks
+        # like a question AND the line changed" fired when a span opened AFTER the
+        # `## `, leaving the heading fully visible to every reader while some later
+        # part of its line was quoted. Nothing was swallowed; the entry is still
+        # readable. So: raw matches the shape, masked no longer does.
+        if _is_question_shape(raw_line) and not _is_question_shape(masked_line):
             return True
     return False
 
