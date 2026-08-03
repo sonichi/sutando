@@ -235,6 +235,35 @@ echo "$out" | grep -qiE 'integer expression|unbound variable|File:' \
   || say ok "no arithmetic/unbound diagnostic"
 [ "$rc" = 0 ] && say ok "exit 0 under GNU-style stat" || say FAIL "exit 0 under GNU-style stat (got $rc): $out"
 
+echo "9. A LIVE holder waiting longer than LOCK_STALE_S must NOT be reaped (qingyun review, #2334)"
+# The quiet gate is deliberately unbounded on a healthy core, but lock staleness
+# is judged from $LOCKDIR's mtime, which `mkdir` stamps ONCE. So a holder that
+# waits past LOCK_STALE_S looked abandoned, and a peer reaped a LIVE lock and
+# entered the restart decision concurrently — two destructive restarts.
+# Here the wait (5s) deliberately exceeds LOCK_STALE_S (2s).
+WS9="$TMP/ws9"; mkws "$WS9"
+printf '{"status":"running","ts":%s}\n' "$(date +%s)" > "$WS9/state/core-status.json"
+# Keep the core convincingly ALIVE and BUSY so the holder never exits the gate.
+( for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    touch "$WS9/state/cores/$HOST.alive"
+    printf '{"status":"running","ts":%s}\n' "$(date +%s)" > "$WS9/state/core-status.json"
+    sleep 1
+  done ) >/dev/null 2>&1 &
+keeper=$!
+( GR_WS="$WS9" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run \
+    >"$TMP/ws9_holder.out" 2>&1 ) &
+holder=$!
+sleep 5   # >> LOCK_STALE_S: an un-renewed lock now reads as abandoned
+b_out="$(GR_WS="$WS9" GR_SYNC_CMD="true" GR_POLL_S=1 GR_LOCK_STALE_S=2 bash "$GR" --dry-run 2>&1)"
+b_rc=$?
+kill "$holder" "$keeper" 2>/dev/null || true
+wait "$holder" "$keeper" 2>/dev/null || true
+if [ "$b_rc" = 4 ] && printf '%s' "$b_out" | grep -q 'deferring'; then
+  say ok "live holder waiting 5s > LOCK_STALE_S=2s was NOT reaped (peer deferred, rc=4)"
+else
+  say FAIL "peer REAPED a live holder's lock (rc=$b_rc) — concurrent destructive restart: $(printf '%s' "$b_out" | grep -i 'reap\|deferr' | tail -1)"
+fi
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else

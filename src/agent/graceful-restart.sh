@@ -186,6 +186,20 @@ else
     fi
     i=$((i + 1))
     [ $((i % 15)) -eq 0 ] && log "still busy — waiting (no give-up timer on a healthy core)…"
+    # RENEW THE LOCK. The wait above is deliberately unbounded on a healthy core,
+    # but the lock's staleness is judged from $LOCKDIR's own mtime, which `mkdir`
+    # stamps ONCE at acquisition. Without this touch, a holder that waits longer
+    # than LOCK_STALE_S looks abandoned to a second orchestrator, which reaps the
+    # live holder's lock and enters the restart decision concurrently — two
+    # destructive restarts, which is the exact thing this lock exists to prevent
+    # (qingyun-wu, #2334). Renewing keeps "lock is fresh" meaning "holder is
+    # alive", which is what the age check already assumes.
+    #
+    # Touching the DIRECTORY (not a file inside it) is deliberate: the reaper
+    # reads the directory's mtime, so the renewal must move the same clock the
+    # reaper reads. Writing a sibling `ts` file is what an earlier revision did,
+    # and it reintroduced the race documented at the top of this file.
+    touch "$LOCKDIR" 2>/dev/null || true
     sleep "$POLL_S"
   done
 fi
