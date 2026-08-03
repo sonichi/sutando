@@ -1075,6 +1075,11 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
    { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
    || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
   [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  # Tell the bridge where the durable token lives so auth-rejection recovery
+  # (revoked/expired key) can re-read it after the connect flow rewrites it —
+  # hot-swap instead of a supervisor crash-loop. Only when the file exists:
+  # env-only onboarding has no file to watch and keeps the FATAL-exit path.
+  [ -f "$_RELAY_ENV" ] && export REMOTE_TASK_TOKEN_FILE="$_RELAY_ENV"
   # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
   # legacy token may be the combined "url|secret" form, which the bridge splits.
   REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
