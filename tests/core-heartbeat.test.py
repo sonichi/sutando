@@ -61,13 +61,27 @@ class TestHeartbeatWrite(unittest.TestCase):
 
     def test_write_beat_payload_schema(self):
         import core_heartbeat
-        core_heartbeat.write_beat(status="custom-status")
+        # Pin the core-pid resolver. Before schema 3 this test asserted
+        # `pid == os.getpid()` and passed only because CI runners have no tmux
+        # server on the socket — on a machine that DID, it would have failed.
+        # Pinning makes the contract, not the environment, decide.
+        _orig = core_heartbeat.core_pid
+        core_heartbeat.core_pid = lambda socket_path=None: 4242
+        try:
+            core_heartbeat.write_beat(status="custom-status")
+        finally:
+            core_heartbeat.core_pid = _orig
         data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
         # Required fields
         self.assertEqual(data["host"], _short_host())
-        self.assertEqual(data["pid"], os.getpid())
+        # schema 3: `pid` is the CORE's (what the docstring always claimed);
+        # the writer's own pid moved to `heartbeat_pid`. Before this, a dead
+        # core read as healthy because the writer outlives core restarts.
+        self.assertEqual(data["pid"], 4242)
+        self.assertEqual(data["heartbeat_pid"], os.getpid())
+        self.assertNotEqual(data["pid"], data["heartbeat_pid"])
         self.assertEqual(data["status"], "custom-status")
-        self.assertEqual(data["schema_version"], 2)
+        self.assertEqual(data["schema_version"], 3)
         # locality (Track 10): {kind, host}, self-reported. Default kind=local.
         self.assertEqual(data["locality"], {"kind": "local", "host": _short_host()})
         # socket: the runtime-authored tmux socket the core runs on. Consumed by
@@ -187,9 +201,27 @@ class TestHeartbeatCli(unittest.TestCase):
         leave immediately rather than wait for mtime staleness."""
         import signal as _signal
         script = ROOT / "src" / "core_heartbeat.py"
+        # A beat is only published AFTER a core has been observed (4fda4a4b:
+        # before first sighting the loop publishes nothing and unlinks any stale
+        # record, so a cold boot that never gets a core cannot advertise itself
+        # healthy). This test is about SIGTERM cleanup, and it needs a file to
+        # clean up — so give the child a toolchain that reports a real core
+        # instead of asserting the pre-4fda4a4b fail-open behaviour.
+        _bin = self.tmp / "fakebin"
+        _bin.mkdir(parents=True, exist_ok=True)
+        for _name, _body in (
+            ("tmux",  "#!/bin/sh\nexit 0\n"),
+            ("pgrep", "#!/bin/sh\necho 4242\n"),
+            ("ps",    "#!/bin/sh\necho 'claude --name sutando-core --resume'\n"),
+        ):
+            _f = _bin / _name
+            _f.write_text(_body)
+            _f.chmod(0o755)
+        _env = dict(self.env)
+        _env["PATH"] = f"{_bin}:{_env.get('PATH', '')}"
         proc = subprocess.Popen(
             [sys.executable, str(script), "--interval", "0.5"],
-            env=self.env,
+            env=_env,
         )
         # Wait for first beat to land.
         alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
@@ -197,7 +229,8 @@ class TestHeartbeatCli(unittest.TestCase):
             if alive.exists():
                 break
             time.sleep(0.1)
-        self.assertTrue(alive.exists(), "first beat should have landed within 4s")
+        self.assertTrue(alive.exists(),
+                        "first beat should have landed within 4s once a core is observed")
         # Signal graceful shutdown.
         proc.send_signal(_signal.SIGTERM)
         proc.wait(timeout=5)
