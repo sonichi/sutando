@@ -182,6 +182,31 @@ check("valid unchanged cache keeps the up-tier (hot path not projected)",
       rgb._tier_for("@dana:ag2.space") == "owner" and rgb._tier_for("@dana:ag2.space") == "owner")
 rgb.LOCAL_TIER = _prev_local
 
-_total = 22
+# --- the OTHER _tier_for consumer: owner-presence gate, under UP-tiering ---
+# _write_owner_activity gates on the SENDER's resolved tier. Its docstring reasons
+# only about DOWN-tiering ("a down-tiered teammate must not overwrite..."), because
+# until now an above-LOCAL_TIER entry was unreachable. The up-tier creates a case it
+# never contemplated, and presence drives the proactive loop's "owner active" signal
+# plus the core-supervisor escalation target — a silent break here is expensive and
+# hard to trace, so pin both directions.
+_prev_local = rgb.LOCAL_TIER
+rgb.LOCAL_TIER = "team"
+_write_map({"@dana:ag2.space": "owner"})
+
+# 23. an UP-tiered sender on a team node DOES register owner presence
+OWNER_ACT.unlink(missing_ok=True)
+rgb._write_owner_activity({"task": "hi", "source": "ag2space",
+                           "user_id": "@dana:ag2.space", "channel_id": "!r:hs"})
+check("up-tiered owner registers owner-presence on a team node", OWNER_ACT.exists())
+
+# 24. ...and an unlisted sender on that same node still does NOT
+OWNER_ACT.unlink(missing_ok=True)
+rgb._write_owner_activity({"task": "hi", "source": "ag2space",
+                           "user_id": "@nobody:ag2.space", "channel_id": "!r:hs"})
+check("unlisted sender does NOT register owner-presence on a team node",
+      not OWNER_ACT.exists())
+rgb.LOCAL_TIER = _prev_local
+
+_total = 24
 print(f"\nResults: {_total - len(failures)}/{_total} passed" if not failures else f"\nResults: FAILED {failures}")
 sys.exit(1 if failures else 0)

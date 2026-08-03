@@ -1297,6 +1297,11 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     supervisor escalation target). `sender_tier` is passed in by `_write_task` so
     the task tier and this gate share a SINGLE resolution (no divergence, no
     double tierMap read); a direct caller can omit it and we resolve here. For an
+    Since the map may now grant a tier ABOVE LOCAL_TIER, the mirror case also
+    holds: a sender explicitly mapped to owner on a least-privilege node DOES
+    register owner presence — that is the point of naming them owner. Tests 23/24
+    pin both directions, because a refactor that regated this on LOCAL_TIER would
+    silently stop recording the real owner's activity. For an
     unlisted sender `_tier_for` returns LOCAL_TIER, so the single-owner case is
     unchanged. Never trusts the gateway's own claim (it is outside the trust
     boundary) — only the broker-attested user_id keyed against the owner's LOCAL
