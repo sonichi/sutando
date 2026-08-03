@@ -394,6 +394,42 @@ class CarrierSetProbe(unittest.TestCase):
                             "a measurement that failed is UNKNOWN, never a pass")
         self.assertIn("data/", r["detail"], "the entry we could not measure must be named")
 
+    def test_an_ODD_EXIT_CODE_is_also_unmeasured_not_covered(self):
+        # The other half of "the measurement failed", and a separate line: the
+        # test above makes check-ignore RAISE, this makes it RETURN an exit code
+        # that is neither 0 (ignored) nor 1 (not ignored) — a git that ran and
+        # could not answer, e.g. 128 on a broken repo.
+        #
+        # Worth its own case because the tempting shape is `if rc != 0: covered`,
+        # which silently folds 128 in with 1 and reports a path as carried on the
+        # strength of a failed read. That is the same defect this probe exists to
+        # catch, and #2566 shipped it in the stale branch before review found it.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/x.md", "data/f.md"])
+        self._patch_resolved(["notes/"])
+        self._patch_shipped(["notes/", "data/"])
+        real = self.hc.subprocess.run
+
+        class _Odd:
+            returncode = 128
+            stdout = b""
+            stderr = b"fatal: not a git repository"
+
+        def odd_exit(argv, *a, **kw):
+            if any("data" in str(x) for x in argv):
+                return _Odd()
+            return real(argv, *a, **kw)
+
+        self.hc.subprocess.run = odd_exit
+        try:
+            r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        finally:
+            self.hc.subprocess.run = real
+        self.assertIsNotNone(r)
+        self.assertNotEqual(r["status"], "ok",
+                            "exit 128 is a git that could not answer, not a pass")
+        self.assertIn("data/", r["detail"])
+
     def test_a_shipped_entry_with_nothing_on_disk_is_still_reported(self):
         # The coverage test can only speak when something is materialized. An entry
         # the local config omits and that has NOTHING under it yet has no outcome to
