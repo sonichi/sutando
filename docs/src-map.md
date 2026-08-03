@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-184 modules indexed.
+190 modules indexed.
 
 ## `src/`
 
@@ -30,6 +30,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
+- **`conversation-store-migrations.ts`** — Startup-only SQLite migration policy for the conversation store.
 - **`conversation-store.ts`** — SQLite mirror of conversation.log — per-surface tables.
 - **`core-input-watch.py`** — core-input-watch.py — the core supervisor MONITOR (M1).
 - **`core-supervisor-gate.py`** — core-supervisor-gate.py — the RECOVER decision gate (sonichi#2401 prototype).
@@ -39,6 +40,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
+- **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
@@ -74,6 +76,8 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
+- **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
+- **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
@@ -192,6 +196,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`realtime.ts`** — Realtime usage CLIENT — the voice agent (`src/voice-agent.ts`) and phone server (`skills/phone-conversation`) SEND raw usage payloads to the collector (`POST /ingest/realtime`); the collector's RealtimeNormalizer maps them to spine primitives and writes them through the SAME sink-set + meter ledger as every other source.
 - **`sink.py`** — Observability sinks (Python twin of sink.ts).
 - **`sink.ts`** — Observability sinks.
+- **`startup-policy.sh`** — Startup policy helpers for the local observability collector.
 - **`ticker.ts`** — Generic interval-based usage ticker — emit usage records while a session is live instead of accumulating everything into one end-of-session burst.
 - **`usage.py`** — The usage record (Python twin of types.ts).
 - **`usage.ts`** — The usage record — the durable, billable/attributable primitive.
@@ -222,6 +227,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 
 ## `src/runtime-api/`
 
+- **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
 - **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.

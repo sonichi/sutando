@@ -50,7 +50,7 @@ def main() -> int:
     srv.ha.open_approval = boom
     err = None
     try:
-        srv._issue("approval", "approval.request", {"action": "x.y"},
+        srv.dispatcher._issue("approval", "approval.request", {"action": "x.y"},
                    required=("action",))
     except rt.ProtocolError as e:
         err = e
@@ -63,17 +63,17 @@ def main() -> int:
           "the durable row is marked failed with the mirror error recorded")
     check(all(r["status"] != "pending" for r in rows),
           "no unanswerable pending row survives the failure")
-    srv._ha_of.clear()
-    srv.recover()
-    check(srv._ha_of == {}, "restart recovery re-links nothing for the failed row")
+    srv.dispatcher._ha_of.clear()
+    srv.dispatcher.recover()
+    check(srv.dispatcher._ha_of == {}, "restart recovery re-links nothing for the failed row")
 
     # 4: success path unchanged
     srv.ha.open_approval = lambda rec: "ha_" + rec["requestId"][-12:]
-    out = srv._issue("approval", "approval.request", {"action": "x.y"},
+    out = srv.dispatcher._issue("approval", "approval.request", {"action": "x.y"},
                      required=("action",))
     got = srv.store.get(out["requestId"])
     check(out["status"] == "pending" and got["status"] == "pending"
-          and srv._ha_of.get(out["requestId"]),
+          and srv.dispatcher._ha_of.get(out["requestId"]),
           "successful mirror: row pending + ha mapping recorded")
 
     print(f"\n{'PASS — issue failure-injection green' if not FAILS else f'FAILED ({len(FAILS)})'}")
