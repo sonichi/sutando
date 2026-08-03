@@ -1092,6 +1092,14 @@ _migrate_flat_anchor() {
     _dest="$WORKSPACE_DIR/hosts/$(_host)/current-track.md"
     [ -f "$_flat" ] || return 0
     [ -e "$_dest" ] && return 0
+    # DRY_RUN is checked HERE, not only at the call site: this helper runs before
+    # _pull_only_impl's dry-run early return (it must, to beat an incoming
+    # deletion), so the guard has to live with the mutation it protects. A future
+    # caller cannot reintroduce the violation by placing the call differently.
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "DRY-RUN: would migrate state/current-track.md -> hosts/$(_host)/current-track.md (#2567)" >&2
+        return 0
+    fi
     mkdir -p "$(dirname "$_dest")" || return 0
     cp "$_flat" "$_dest" || return 0
     log "_migrate_flat_anchor: copied state/current-track.md -> hosts/$(_host)/current-track.md before pull (#2567)"

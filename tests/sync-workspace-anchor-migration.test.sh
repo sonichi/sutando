@@ -24,6 +24,7 @@ printf 'MY ANCHOR — 1044 lines of irreplaceable context\n' > "$WS/state/curren
 
 # Extract the helper and run it against a fixture, exactly as sync would.
 WORKSPACE_DIR="$WS"
+DRY_RUN=0
 _host(){ echo "test-host"; }
 log(){ :; }
 eval "$(awk '/^_migrate_flat_anchor\(\) \{/,/^\}/' "$REPO/scripts/sync-workspace.sh")"
@@ -43,6 +44,23 @@ chk "second run does NOT overwrite an existing per-host anchor" \
 rm -f "$WS/state/current-track.md"
 _migrate_flat_anchor 2>/dev/null; rc=$?
 chk "no-op (exit 0) when the flat anchor is absent" "[ $rc -eq 0 ]"
+
+# --- DRY-RUN CONTRACT (#2568 review): an explicitly non-mutating command must
+# not write workspace state. The helper runs BEFORE _pull_only_impl's dry-run
+# early return by necessity, so the guard lives inside the helper.
+T3=$(mktemp -d); WS3="$T3/ws"; mkdir -p "$WS3/state" "$WS3/hosts"
+printf 'MY ANCHOR\n' > "$WS3/state/current-track.md"
+WORKSPACE_DIR="$WS3"; DRY_RUN=1
+_migrate_flat_anchor 2>/dev/null
+ref "DRY_RUN=1 does NOT create the per-host anchor" \
+    "[ -e '$WS3/hosts/test-host/current-track.md' ]"
+chk "DRY_RUN=1 leaves the flat anchor untouched" "[ -f '$WS3/state/current-track.md' ]"
+# and the positive control: same fixture, DRY_RUN off, MUST create it
+DRY_RUN=0
+_migrate_flat_anchor 2>/dev/null
+chk "with DRY_RUN=0 the same fixture DOES migrate (control)" \
+    "[ -f '$WS3/hosts/test-host/current-track.md' ]"
+unset DRY_RUN
 
 # --- THE FALSIFICATION: without the helper the anchor is lost to a peer deletion
 T2=$(mktemp -d); WS2="$T2/ws"; mkdir -p "$WS2/state" "$WS2/hosts"
