@@ -60,6 +60,9 @@ sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
+from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
+from presenter_mode import presenter_mode_active  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -72,7 +75,7 @@ from result_markers import parse_markers  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from util_paths import channel_access_path, claude_home_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
@@ -142,43 +145,17 @@ if not BOT_TOKEN or not APP_TOKEN:
     sys.exit(1)
 
 
-# Outbound file-send allowlist — mirrors _is_path_sendable() in
-# discord-bridge.py + telegram-bridge.py. Fail-closed by default.
-SEND_ALLOWED_ROOTS = (
-    str(REPO / "results"),
-    str(REPO / "notes"),
-    str(REPO / "docs"),
-    str(INBOX_DIR),
-)
-SEND_ALLOWED_PREFIXES = (
-    "/tmp/sutando-",
-    "/private/tmp/sutando-",
-    "/tmp/echo-",
-    "/private/tmp/echo-",
-)
+# Outbound attachment allowlisting is canonical policy — src/send_allowlist.py
+# is the single source of truth (a hand-written copy here drifted from it and
+# silently dropped files other bridges would send). Slack extends it with its
+# OWN inbound dir so an uploaded file can be echoed back; that root stays
+# Slack-local rather than becoming global.
+from send_allowlist import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
 
 
 def _is_path_sendable(fpath: str) -> bool:
-    """True iff `fpath` is a real file AND resolves under an allowed root.
-
-    Uses os.path.realpath + startswith — CodeQL recognizes this pattern as
-    a path-injection sanitizer. Do NOT swap for Path.resolve() without
-    re-proving to CodeQL. Same shape as the discord/telegram allowlist.
-    """
-    if not os.path.isfile(fpath):
-        return False
-    try:
-        real = os.path.realpath(fpath)
-    except OSError:
-        return False
-    for root in SEND_ALLOWED_ROOTS:
-        root_real = os.path.realpath(root)
-        if real == root_real or real.startswith(root_real + os.sep):
-            return True
-    for prefix in SEND_ALLOWED_PREFIXES:
-        if real.startswith(prefix):
-            return True
-    return False
+    """Canonical allowlist + Slack's inbound dir. See src/send_allowlist.py."""
+    return _is_path_sendable_canonical(fpath, extra_roots=(str(INBOX_DIR),))
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
@@ -223,22 +200,6 @@ def archive_file(src: Path, kind: str, task_id: str) -> None:
             src.unlink(missing_ok=True)
         except Exception:
             pass
-
-
-PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
-
-
-def presenter_mode_active() -> bool:
-    if not PRESENTER_SENTINEL.exists():
-        return False
-    try:
-        expire_iso = PRESENTER_SENTINEL.read_text().strip()
-        if not expire_iso or not expire_iso[0].isdigit():
-            return False
-        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        return now_iso < expire_iso
-    except Exception:
-        return False
 
 
 ACCESS_FILE = channel_access_path("slack")
@@ -299,8 +260,7 @@ def _backup_access_to_disk(data: dict) -> None:
         return
     try:
         ACCESS_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_BACKUP_FILE.write_text(json.dumps(data, indent=2) + "\n")
-        os.chmod(ACCESS_BACKUP_FILE, 0o600)
+        write_private_text(ACCESS_BACKUP_FILE, json.dumps(data, indent=2) + "\n")
     except OSError:
         pass  # best-effort; backup must never break the write path
 
@@ -317,8 +277,7 @@ def _restore_access_from_disk() -> bool:
         return False
     try:
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_FILE.write_text(json.dumps(backup, indent=2) + "\n")
-        os.chmod(ACCESS_FILE, 0o600)
+        write_private_text(ACCESS_FILE, json.dumps(backup, indent=2) + "\n")
         _update_access_cache(backup)
         print(
             "  [access] restored access.json from durable on-disk backup "
@@ -339,8 +298,7 @@ def _restore_access_from_cache() -> bool:
         return False
     try:
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ACCESS_FILE.write_text(json.dumps(cached, indent=2) + "\n")
-        os.chmod(ACCESS_FILE, 0o600)
+        write_private_text(ACCESS_FILE, json.dumps(cached, indent=2) + "\n")
         print(
             "  [access] restored access.json from in-memory cache "
             "(external deletion detected — #899)",
@@ -432,13 +390,12 @@ def _ensure_tier_map_seeded() -> bool:
     # access-control file BEFORE writing, so a disk-full / interrupt / partial
     # write can destroy allowFrom — and with fail-closed tier resolution that
     # locks legitimate owners out against a corrupt file, at bridge startup.
-    # Write a sibling temp, chmod it, then os.replace() atomically. The pid+uuid
+    # Write a sibling temp BORN 0600 (write_private_text), then os.replace(). The pid+uuid
     # suffix avoids colliding with a concurrent .tmp; on any failure the original
     # access.json bytes are left intact and the orphan temp is removed.
     tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
-        os.chmod(tmp, 0o600)
+        write_private_text(tmp, json.dumps(data, indent=2) + "\n")
         os.replace(tmp, ACCESS_FILE)
         _update_access_cache(data)
         print(f"  [tier-map] grandfathered {len(allow)} existing allowFrom member(s) as owner; new additions now default to read-only", flush=True)
@@ -450,6 +407,42 @@ def _ensure_tier_map_seeded() -> bool:
             pass
         print(f"  [tier-map] WARNING: failed to persist grandfather tierMap ({e}); allowlisted users resolve read-only (other) until seeded", flush=True)
         return False
+
+
+def resolve_access_tier(user_id: str, tier_map: dict, seeded_ok: bool) -> str:
+    """Resolve a sender's access_tier from a loaded tierMap. Owner comes
+    STRICTLY from membership in a successfully-persisted map:
+      1. uid present in tierMap        → its recorded tier (owner/team/other)
+      2. tierMap present, uid missing  → "other" (a new allowlist addition;
+         prevents silent privilege escalation when the operator forgets a
+         tierMap line)
+      3. tierMap empty/unconfirmed     → "other" (fail CLOSED). A legit
+         pre-tierMap config is grandfathered into a NON-empty map by
+         _ensure_tier_map_seeded, so an empty map here means the seed could
+         not persist/read — never grant owner off that (#2161 CR: a transient
+         error must not escalate every allowlisted user to owner).
+      4. Unknown tier value in config  → degrade safely to "other" rather
+         than treating as owner.
+    See #893 for the split-default rationale; #2161 for the fail-closed fix.
+    Exercised directly by tests/slack-bridge-tier-map.test.py (#2512).
+    """
+    if user_id in tier_map:
+        access_tier = tier_map[user_id]
+    else:
+        access_tier = "other"
+        if tier_map:
+            print(
+                f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
+                flush=True,
+            )
+        elif not seeded_ok:
+            print(
+                f"  [tier-map] WARNING: grandfather seed unavailable; {user_id} resolved read-only (other), not owner",
+                flush=True,
+            )
+    if access_tier not in ("owner", "team", "other"):
+        access_tier = "other"
+    return access_tier
 
 
 def tofu_onboard(user_id: str, username: str | None) -> set:
@@ -477,8 +470,7 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
         "tofuOnboardedAt": int(time.time()),
         "tofuOnboardedUsername": username or None,
     }
-    ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
-    os.chmod(ACCESS_FILE, 0o600)
+    write_private_text(ACCESS_FILE, json.dumps(payload, indent=2) + "\n")
     _update_access_cache(payload)
     print(
         f"  TOFU: auto-onboarded @{username} (id={user_id}) as owner — wrote {ACCESS_FILE}",
@@ -672,20 +664,16 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     [File attached:] line unchanged. Any error from the subprocess is swallowed;
     transcription failure must never block task delivery.
     """
-    import subprocess
     skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
-    if not skill_script.exists():
-        return None
-    try:
-        result = subprocess.run(
-            [sys.executable, str(skill_script), local_path],
-            capture_output=True, text=True, timeout=25,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    except Exception as e:
-        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
-    return None
+    return _run_optional_script_shared(
+        skill_script,
+        [local_path],
+        timeout=25,
+        on_error=lambda exc: print(
+            f"  [stt] skill call failed for {os.path.basename(local_path)}: {exc}",
+            flush=True,
+        ),
+    )
 
 
 # When a sender ADDRESSES the bot (a DM, or an @mention — every _write_task call
@@ -957,38 +945,12 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     else:
         thread_ts = None
 
-    # Resolve access_tier from `tierMap`. Owner comes STRICTLY from membership
-    # in a successfully-persisted map:
-    #   1. uid present in tierMap        → its recorded tier (owner/team/other)
-    #   2. tierMap present, uid missing  → "other" (a new allowlist addition;
-    #      prevents silent privilege escalation when the operator forgets a
-    #      tierMap line)
-    #   3. tierMap empty/unconfirmed     → "other" (fail CLOSED). A legit
-    #      pre-tierMap config is grandfathered into a NON-empty map by
-    #      _ensure_tier_map_seeded above, so an empty map here means the seed
-    #      could not persist/read — never grant owner off that (#2161 CR:
-    #      a transient error must not escalate every allowlisted user to owner).
-    # See #893 for the split-default rationale; #2161 for the fail-closed fix.
+    # Resolve access_tier from `tierMap`. The fail-closed rules live on
+    # resolve_access_tier's docstring, and tests/slack-bridge-tier-map.test.py
+    # exercises that same symbol (#2512 — coverage claim now matches reality).
     seeded_ok = _ensure_tier_map_seeded()
     tier_map = load_tier_map()
-    if user_id in tier_map:
-        access_tier = tier_map[user_id]
-    else:
-        access_tier = "other"
-        if tier_map:
-            print(
-                f"  [tier-map] WARNING: User {user_id} in allowFrom but missing from tierMap; defaulting to 'other'",
-                flush=True,
-            )
-        elif not seeded_ok:  # pragma: no cover — rare seed-failure warning; the empty-map→other fail-closed resolution is unit-tested in tests/bridges-allowlist-default-readonly.test.py
-            print(
-                f"  [tier-map] WARNING: grandfather seed unavailable; {user_id} resolved read-only (other), not owner",
-                flush=True,
-            )
-    if access_tier not in ("owner", "team", "other"):
-        # Unknown tier value in config → degrade safely to "other" rather
-        # than treating as owner.
-        access_tier = "other"
+    access_tier = resolve_access_tier(user_id, tier_map, seeded_ok)
 
     # Intercept vault commands before any disk write — must happen AFTER
     # access_tier is resolved so untrusted senders cannot write to Keychain.
@@ -1476,7 +1438,7 @@ def result_watcher():
                 archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
 
             # Proactive messages (sent to owner DM)
-            if not presenter_mode_active():
+            if not presenter_mode_active(REPO):
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
                         continue
@@ -1575,47 +1537,9 @@ def _no_events_hint_thread():
 
 
 def _recover_orphan_sending_files() -> int:
-    """Restart-safety: rename any orphan `results/proactive-*.sending`
-    files back to `*.txt` so they get re-claimed on the next poll.
-    Returns the number of files recovered.
+    """Recover this adapter's stranded proactive delivery claims."""
+    return recover_orphan_sending_files(RESULTS_DIR)
 
-    Atomic-claim-by-rename (`proactive-*.txt` → `.sending`) prevents
-    same-tick double-deliveries between concurrent poll iterations.
-    But if the bridge crashes BETWEEN the rename and the delivery,
-    the `.sending` file sits orphaned in `results/` — no poll
-    iteration ever looks at `.sending` suffixes, so the owner
-    notification is silently dropped until next manual intervention.
-
-    Mirrors `_recover_orphan_sending_files` in discord-bridge.py and
-    telegram-bridge.py (PR #1046). See those docstrings for the full
-    bug-class write-up.
-    """
-    if not RESULTS_DIR.exists():
-        return 0
-    recovered = 0
-    for f in RESULTS_DIR.iterdir():
-        if not (f.name.startswith("proactive-") and f.suffix == ".sending"):
-            continue
-        target = f.with_suffix(".txt")
-        try:
-            if target.exists():
-                print(
-                    f"  [startup] skipping orphan recovery: {target.name} "
-                    f"already exists (collision with {f.name})",
-                    flush=True,
-                )
-                continue
-            f.rename(target)
-            recovered += 1
-            print(f"  [startup] recovered orphan {f.name} → {target.name}", flush=True)
-        except FileNotFoundError:
-            # Lost the race to another process; fine.
-            pass
-        except Exception as e:
-            print(f"  [startup] failed to recover {f.name}: {e}", flush=True)
-    if recovered:
-        print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
-    return recovered
 
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE

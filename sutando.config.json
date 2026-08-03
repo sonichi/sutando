@@ -28,7 +28,8 @@
       "include": [
         "notes/",
         "hosts/*/",
-        ".claude-sutando/projects/*/memory/"
+        ".claude-sutando/projects/*/memory/",
+        "state/current-track.md"
       ],
       "exclude": [
         "tasks/",
@@ -36,5 +37,8 @@
       ]
     },
     "interval_seconds": 1800
+  },
+  "bridges": {
+    "progress_stream": false
   }
 }

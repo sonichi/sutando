@@ -91,7 +91,10 @@ if [ "$BUNDLED_MODE" = "1" ]; then
   # one (external review on #2182): a missing voice/proxy/etc artifact would
   # otherwise fail inside a background job while boot still prints ✓.
   _MISSING_DIST=""
-  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers; do
+  # web-voice-transport.browser is the browser-side artifact the web UI loads
+  # for voice; it is built by the same build:bundle contract but is NOT a node
+  # service, so it has no run_node_service entry to catch its absence later.
+  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers web-voice-transport.browser; do
     [ -f "$REPO/dist/$_artifact.js" ] || _MISSING_DIST="$_MISSING_DIST $_artifact.js"
   done
   if [ -n "$_MISSING_DIST" ]; then
@@ -237,6 +240,16 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
     exit 1
   fi
   rm -f "$_ccd_err"
+fi
+
+# Boot gate (#2396): verify the resolved CLAUDE_CONFIG_DIR can boot the CLI
+# authenticated BEFORE any service launches. A logged-out CLI (locked keychain
+# on SSH boots, fresh config dir) otherwise yields a half-up core — tmux +
+# bridges alive, CLI parked at /login, processing nothing (2026-07-30 outage).
+# The gate fails loud (stderr + notification + pending-questions + proactive
+# DM file) and aborts; SUTANDO_SKIP_AUTH_PREFLIGHT=1 is the escape hatch.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  bash "$REPO/src/auth-preflight-gate.sh" "$CLAUDE_CONFIG_DIR" || exit $?
 fi
 
 # Git committer attribution: REMOVED (2026-05-21). This block used to set
@@ -693,32 +706,42 @@ else
   export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
 
-# 0b. Obs collector (OPTIONAL — opt-in via SUTANDO_OBS_COLLECTOR=1).
-# The single, source-agnostic local collector: it receives Claude Code hooks
-# (and, later, voice / filewatcher / bridge events) on /ingest/<source>,
-# normalizes them into the one event schema, and writes the durable JSONL floor
-# at <workspace>/logs/events-*.jsonl (the visualizer tails that). Off by default
-# — it's an observability/dev tool, not required for the agent to run.
-#
-# When enabled we also point the core's hooks at it (SUTANDO_OBS_ENDPOINT) UNLESS
-# an endpoint is already set — e.g. a remote upstream collector — so the "always
-# set hooks, only export when told where" contract still holds.
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+# 0b. Local usage collector. Token/cost metrics are on by default so dashboard
+# usage panels work out of the box; plaintext prompt/tool hooks retain their
+# previous explicit SUTANDO_OBS_COLLECTOR=1 opt-in. Set the flag to 0 to disable
+# the local collector entirely. Cloud forwarding remains separately opt-in.
+# shellcheck source=src/observability/startup-policy.sh
+source "$REPO/src/observability/startup-policy.sh"
+OBS_COLLECTOR_READY=0
+if obs_collector_enabled; then
   OBS_PORT="${SUTANDO_OBS_PORT:-4000}"
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
       run_node_service boot "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
-    echo "  ✓ obs collector"
-  else
-    echo "  ✓ obs collector (already running on $OBS_PORT)"
+    for _obs_wait in 1 2 3 4 5 6 7 8 9 10; do
+      obs_collector_healthy "$OBS_PORT" && break
+      sleep 0.2
+    done
   fi
-  # Wire the core's hooks to the local collector unless an endpoint is already set.
-  if [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
-    export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+  if obs_collector_healthy "$OBS_PORT"; then
+    OBS_COLLECTOR_READY=1
+    echo "  ✓ obs collector (verified on $OBS_PORT)"
+  else
+    echo "  ⚠ obs collector unavailable or foreign listener on $OBS_PORT — metrics/hook capture disabled" >&2
+  fi
+  if [ "$OBS_COLLECTOR_READY" = "1" ]; then
+    # Default-on path is metrics-only. Preserve the old explicit =1 behavior
+    # for operators who intentionally opted into prompt/tool hook capture.
+    if [ -z "${SUTANDO_OBS_METRICS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_METRICS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
+    if obs_hooks_enabled && [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
   fi
 else
-  echo "  ~ obs collector (disabled — set SUTANDO_OBS_COLLECTOR=1 to enable)"
+  echo "  ~ obs collector (disabled via SUTANDO_OBS_COLLECTOR=0)"
 fi
 # A port can LISTEN while the service never responds (single-threaded server
 # blocked on a silent connection, hung event loop). The lsof guards below only
@@ -1076,12 +1099,35 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # REMOTE_MEDIA_MARKER (e.g. from the channel .env) still wins.
   REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
-  if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
-    python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
-    echo "  ✓ gateway bridge"
-  else
-    echo "  ✓ gateway bridge (already running)"
-  fi
+  # Always spawn; the bridge's own unsuffixed singleton lock self-defers a
+  # duplicate. The previous `pgrep -f remote-gateway-bridge` guard was a P1
+  # (john, PR review 2026-08-02): every named-instance bridge shares the SAME
+  # argv, so a live secondary satisfied the pgrep and suppressed restart of a
+  # DEAD primary indefinitely. Instance identity lives only in env, which
+  # pgrep cannot see — the lock (role `gateway-bridge`, per-instance suffixed)
+  # is the only process-identity source that can arbitrate this.
+  # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
+  # the redirect below); the bridge stamps launched_via into gateway-status
+  # and skips its own bare-launch file log. See remote_gateway_bridge._log.
+  SUTANDO_SUPERVISED=1 python3 "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+  echo "  ✓ gateway bridge (self-defers if already running)"
+
+  # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
+  # the environment launches one extra bridge for that gateway (e.g.
+  # AG2_REMOTE_TOKEN_DEV → instance "dev" against the dev homeserver). Each
+  # instance gets its own lock role + state files via GATEWAY_INSTANCE, and
+  # deliberately inherits NO REMOTE_PROACTIVE_ROOM — proactive nudges stay with
+  # the primary (owner-DM) gateway only.
+  # No pgrep dedupe here (env vars are invisible to pgrep -f): the bridge's own
+  # per-instance singleton lock (role gateway-bridge.<inst>) makes a duplicate
+  # launch self-defer and exit, so always-spawn is safe and simpler.
+  for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
+    _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
+    SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+      REMOTE_PROACTIVE_ROOM= \
+      python3 "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+    echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
+  done
 fi
 
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
@@ -1226,7 +1272,7 @@ fi
 if phone_stack_enabled && grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
 for port_name in $VERIFY_PORTS; do

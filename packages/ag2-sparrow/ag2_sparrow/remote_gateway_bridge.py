@@ -174,6 +174,7 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 # the path (no repo-walking; the old triple-parent form predated the move into
 # src/ and pointed outside the repo).
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
+from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
@@ -184,23 +185,113 @@ TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
+# Named-instance support (multi-gateway): one core may run SEVERAL bridge
+# processes, each pointed at a different gateway (e.g. prod + dev homeservers)
+# via its own REMOTE_TASK_TOKEN env. GATEWAY_INSTANCE names this process's
+# instance; it suffixes the per-BRIDGE state files below and the singleton lock
+# role, so two instances never clobber each other's ledgers or contend one
+# lock. Unset (default) keeps every filename byte-identical to before — the
+# single-bridge install sees zero change. Deliberately NOT suffixed:
+# tasks/ + results/ (the shared task bus — the core is one consumer),
+# last-owner-activity.json (owner presence is one signal regardless of which
+# door the message came through), and core-status.json (the core's, not ours).
+# THE instance-name contract — single source of truth. The import guard below
+# and _LOCAL_TID_RE both derive from this pattern, because every drift between
+# them has produced the same bug class (queue + ACK + silently-stranded
+# results): first a length mismatch (>32 chars, review P1 round 5), then a
+# charset mismatch (str.isalnum() accepts Unicode letters the ASCII regex
+# rejects — GATEWAY_INSTANCE=é imported fine and stranded results, round 6).
+# ASCII [A-Za-z0-9_-], 1-32 chars, and nothing else — if this ever needs to
+# change, it changes HERE and both consumers follow.
+_INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+GATEWAY_INSTANCE = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
+if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
+    sys.exit("FATAL: GATEWAY_INSTANCE must match "
+             f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
+_INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+
+
+def _local_tid(broker_tid: str) -> str:
+    """Instance-namespaced LOCAL task id (P1 fixes, PR review 2026-08-02 ×2).
+
+    Broker ids are only unique WITHIN a gateway, so named instances must not
+    share the primary's local id space. The encoding is `task-<inst>~<broker_id>`
+    (broker id embedded VERBATIM after `~`):
+    - INJECTIVE across every (instance, broker_id) pair including the
+      unsuffixed primary: `~` is outside the broker id alphabet
+      (`[A-Za-z0-9._-]`, `_TID_RE`) and outside the GATEWAY_INSTANCE charset
+      (import guard), so no primary pass-through id can equal a named-instance
+      encoding, and the first `~` splits unambiguously. The earlier
+      `task-<inst>.<rest>` scheme was NOT injective — a primary broker id
+      `task-dev.X` collided with dev's mapping of `task-X` (review P1 #2).
+    - Still matches every consumer's `task-*` glob (watcher, archiver).
+    - May exceed _TID_RE's 64-char wire bound (review P1 #1) — local
+      consumers therefore gate on `_valid_local_tid`, and the wire id is
+      re-derived and `_valid_tid`-checked at the ack/result egress points.
+    Unset instance → identity (legacy single-gateway installs unchanged)."""
+    if not GATEWAY_INSTANCE:
+        return broker_tid
+    return f"task-{GATEWAY_INSTANCE}~{broker_tid}"
+
+
+def _broker_tid(local_tid: str) -> str:
+    """Reverse of `_local_tid` — the id the GATEWAY knows this task by."""
+    if not GATEWAY_INSTANCE:
+        return local_tid
+    prefix = f"task-{GATEWAY_INSTANCE}~"
+    if local_tid.startswith(prefix):
+        return local_tid[len(prefix):]
+    return local_tid
+
+
+_LOCAL_TID_RE = re.compile(rf"task-{_INSTANCE_RE.pattern}~([A-Za-z0-9._-]{{1,64}})")
+
+
+def _valid_local_tid(tid: str) -> bool:
+    """A safe LOCAL id: either a plain wire-valid id (primary/legacy) or a
+    named-instance encoding whose embedded broker id is itself wire-valid.
+    Centralizes the widened bound so every local consumer accepts what
+    `_local_tid` can produce (max ≈ 5+32+1+64 chars — filename-safe)."""
+    if _valid_tid(tid):
+        return True
+    m = _LOCAL_TID_RE.fullmatch(tid)
+    return bool(m) and m.group(1) not in (".", "..")
+
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
 # gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
-# cross-send other channels' (Discord/Telegram) results to the gateway.
-INFLIGHT_FILE = _STATE / "remote-task-inflight.json"
+# cross-send other channels' (Discord/Telegram) results to the gateway. The
+# per-instance suffix is what keeps a second bridge from claiming results this
+# instance delegated (each instance only POSTs ids in ITS OWN ledger).
+INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # Sidecar map {task id → origin room id}, recorded at queue time. Outbound
 # file-attach needs the room because media uploads go to the room-scoped
 # endpoint (POST /v1/rooms/{room}/media) while text results go to /v1/results
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
-TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
+TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 # sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
 # guessing from tmux-window presence. Written on every poll outcome: connected
 # after a healthy round-trip, reconnecting in the backoff branches.
-GATEWAY_STATUS_FILE = _STATE / "gateway-status.json"
+GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
+
+# Launch provenance + in-bridge file log. A supervisor that persists stdout
+# (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
+# SUTANDO_SUPERVISED=1, and _log stays stdout-only — byte-identical to before.
+# Launched any other way ("bare": a hand-run of the script, a debug shell, an
+# app spawn that forgot the redirect), stdout persists nowhere — the exact
+# diagnostic hole of the 2026-07-25 tester wedge (bridge stuck 21h, zero logs
+# or discoverable status to read). So a bare launch ALSO appends every _log
+# line to <state-parent>/logs/gateway-bridge.log (<workspace>/logs/ when
+# sutando injects dirs, ~/.ag2-sparrow/logs/ under defaults), size-capped with
+# a single .1 rotation, best-effort — log I/O must never break the bridge.
+_LAUNCHED_VIA = "supervised" if os.environ.get("SUTANDO_SUPERVISED") else "bare"
+_LOG_DIR = _STATE.parent / "logs"
+_LOG_FILE = _LOG_DIR / "gateway-bridge.log"
+_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # AWP P0: the persistent event channel (if enabled) — a module-level handle so
 # gateway-status can report per-channel health. None until _maybe_start_event_channel.
@@ -604,7 +695,22 @@ def _redact_url(value: str) -> str:
 
 
 def _log(msg: str) -> None:
-    print(f"[remote-gateway-bridge] {msg}", flush=True)
+    line = f"[remote-gateway-bridge] {msg}"
+    print(line, flush=True)
+    if _LAUNCHED_VIA == "supervised":
+        return  # stdout already persisted by the supervisor's redirect
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if _LOG_FILE.stat().st_size > _LOG_MAX_BYTES:
+                _LOG_FILE.replace(_LOG_FILE.with_suffix(".log.1"))
+        except FileNotFoundError:
+            pass
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(_LOG_FILE, "a") as f:
+            f.write(f"{stamp} {line}\n")
+    except Exception:  # noqa: BLE001 — logging must never break the bridge
+        pass
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
@@ -769,13 +875,17 @@ def _recover_auth(code: int) -> bool:
 def _post_task_ack(tid: str) -> bool:
     """Tell the gateway a task made it safely into the local queue."""
     global _ack_disabled_until
-    if not _valid_tid(tid):
+    # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
+    # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
+    # the local form stranded queued results while the gateway waited forever.
+    if not _valid_tid(_broker_tid(tid)):
         return False
     if _ack_disabled_until and time.time() < _ack_disabled_until:
         return False  # gateway recently 404'd /ack — retry after the cooldown
     try:
-        safe_tid = urllib.parse.quote(tid, safe="")
-        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": tid}, timeout=10)
+        wire_tid = _broker_tid(tid)
+        safe_tid = urllib.parse.quote(wire_tid, safe="")
+        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": wire_tid}, timeout=10)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         return True
     except urllib.error.HTTPError as e:
@@ -914,6 +1024,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "backoff_s": int(backoff_s),
             "error": _one_line(error) if error else None,
             "gateway": _redact_url(URL),
+            "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
         }
         # AWP P0 per-channel health: the task connection is `connected` above; the
@@ -1158,6 +1269,9 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         body = (task.get("task") or "").lstrip()
         if body.startswith("[") and "]" in body:
             body = body[body.index("]") + 1:].lstrip()
+        # #2267 parity: the presence summary is persisted state too — a pasted
+        # token must not survive in last-owner-activity.json either.
+        body = filter_chat_secrets(body).text
         payload = {
             "ts": int(time.time()),
             "channel": task.get("source") or PROVIDER,
@@ -1187,13 +1301,18 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
 def _write_task(task: dict) -> str | None:
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns the task id, or None if it has no id / already present."""
-    tid = str(task.get("id") or "").strip()
-    if not tid:
+    broker_tid = str(task.get("id") or "").strip()
+    if not broker_tid:
         _log("dropping task with no id")
         return None
-    if not _valid_tid(tid):
-        _log(f"dropping task with unsafe id {tid!r}")
+    if not _valid_tid(broker_tid):
+        _log(f"dropping task with unsafe id {broker_tid!r}")
         return None
+    # Everything from here down — filenames, ledgers, archives, the serialized
+    # id: header the core echoes back as the result filename — uses the LOCAL
+    # id; `_broker_tid` restores the wire id at the ack/result POST boundary.
+    tid = _local_tid(broker_tid)
+    task = {**task, "id": tid}
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived.
     if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
@@ -1224,6 +1343,7 @@ def _write_task(task: dict) -> str | None:
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
+    _secret_types: tuple = ()
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -1247,7 +1367,17 @@ def _write_task(task: dict) -> str | None:
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
-            lines.append(f"task: {_one_line(_fetched)}")
+            # Redact pasted secrets BEFORE the body is persisted (#2267 parity
+            # with the discord/slack/telegram bridges): a token pasted into a
+            # room message must never land on disk. Runs AFTER media
+            # resolution so a signed media-proxy URL is consumed intact and
+            # only the resolved text is filtered.
+            _filtered = filter_chat_secrets(_fetched)
+            if _filtered.secret_types:
+                _secret_types = tuple(_filtered.secret_types)
+                _log(f"redacted pasted secret(s) in {tid} body: "
+                     f"{', '.join(sorted(_secret_types))}")
+            lines.append(f"task: {_one_line(_filtered.text)}")
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
             # alongside the legacy [File attached:] body line (dual-write) via the
@@ -1285,6 +1415,12 @@ def _write_task(task: dict) -> str | None:
     # no double read of the tierMap).
     sender_tier = _tier_for(task.get("user_id"))
     lines.append(f"access_tier: {sender_tier}")
+    # #2267 parity, second half: the other bridges append the in-band security
+    # notice so the core neither reproduces nor re-requests the redacted value.
+    # Appended AFTER access_tier: the notice is bridge-generated fixed text with
+    # no header-shaped lines, so the access-tier-wins-last invariant holds.
+    if _secret_types:
+        lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
@@ -1422,7 +1558,7 @@ def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
     for tid in list(inflight):
-        if not _valid_tid(tid):  # defense-in-depth: never read an unsafe path
+        if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
@@ -1474,7 +1610,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
         try:
-            _req("POST", "/v1/results", {"id": tid, "body": out_body})
+            _req("POST", "/v1/results", {"id": _broker_tid(tid), "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
@@ -1506,7 +1642,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     check and the discard is then picked up by the next `_post_ready_results`
     instead of being raced. Returns the new suspects set for the next pass."""
     gone = {tid for tid in inflight
-            if _valid_tid(tid)
+            if _valid_local_tid(tid)
             and not (TASKS_DIR / f"{tid}.txt").exists()
             and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
             and not (RESULTS_DIR / f"{tid}.txt").exists()}
@@ -1529,7 +1665,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
 # lock-layer error → poll anyway (a lock bug must never silence task delivery;
 # the only risk of a dropped guard is the pre-existing dual-poller). Kill-switch:
 # SUTANDO_BRIDGE_LOCK=0 lets the owner disable it in prod without a redeploy.
-_LOCK_ROLE = "gateway-bridge"
+_LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"  # per-instance: dual-poller guard stays per-gateway
 _LOCK_WS = _STATE.parent  # _STATE = <workspace>/state (injected) or ~/.ag2-sparrow/state
 
 
@@ -1659,6 +1795,13 @@ def main() -> None:
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
+    # Always name where the diagnostics live: after an incident this line is the
+    # trailhead (a bare-launched bridge under default dirs writes status to
+    # ~/.ag2-sparrow/state/, where nobody thinks to look).
+    _log(f"launched_via={_LAUNCHED_VIA} status={GATEWAY_STATUS_FILE}")
+    if _LAUNCHED_VIA == "bare":
+        _log(f"running unsupervised — output also logged to {_LOG_FILE}; "
+             f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
     _emit_gateway_status(False, error="starting — not yet connected")
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
