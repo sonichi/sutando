@@ -4475,6 +4475,29 @@ def _as_list(value) -> list:
     return value if isinstance(value, list) else []
 
 
+#: `$(shq "…")` / `$(shq …)` — the installer shell-quotes its paths through a helper
+#: before writing them into settings.json. Reading HOOKS as literal source text means
+#: the substitution is still unevaluated, so the path is welded into a token like
+#: `$(shq` + `<path>)` and never compares equal to anything.
+_SHQ_CALL = re.compile(r"\$\(\s*shq\s+(\"[^\"]*\"|'[^']*'|[^)]*)\)")
+
+
+def _unwrap_installer_command(command: str) -> str:
+    """Reduce an installer HOOKS command template to the shape it actually WRITES.
+
+    The template is bash SOURCE, not the stored command. `bash $(shq "$REPO_DIR/x.sh")`
+    is written to settings.json as `bash /abs/path/x.sh`, so comparing against the raw
+    source can never match — which is exactly how every production hook slipped past
+    the positional check and into a permissive fallback.
+    """
+    # Re-quote rather than inline raw: `shq` IS shell-quoting, and a repo path
+    # containing a space would otherwise split across tokens and fail closed on a
+    # perfectly healthy host — which is the whole reason the installer uses shq.
+    out = _SHQ_CALL.sub(lambda m: shlex.quote(m.group(1).strip("\"'")), command)
+    # The array literal is itself quoted in shell, so inner quotes arrive escaped.
+    return out.replace('\\"', '"').replace("\\$", "$")
+
+
 def _shell_tokens(command: str) -> list:
     """Shell-split, degrading to whitespace split on unbalanced quoting."""
     try:
@@ -4515,13 +4538,16 @@ def _hook_command_targets(command: str, expected: Path, owned_cmd: str) -> bool:
     """
     want = os.path.normpath(os.path.expanduser(str(expected)))
     want_real = os.path.realpath(want)
-    owned = _shell_tokens(owned_cmd)
+    owned = _shell_tokens(_unwrap_installer_command(owned_cmd))
     idx = next((i for i, t in enumerate(owned) if _same_path(t, want, want_real)), None)
     if idx is None:
-        # The installer's own template does not name this path — nothing to compare
-        # positionally, so fall back to "is it invoked at all" rather than guessing.
-        got = _shell_tokens(command)
-        return any(_same_path(t, want, want_real) for t in got[:2])
+        # FAIL CLOSED. This branch used to accept the path anywhere in the first two
+        # tokens, which read as a safe fallback and was not: the real installer writes
+        # `bash $(shq "$REPO_DIR/x.sh")`, so before the unwrap above NO production hook
+        # resolved positionally and EVERY one landed here — making `echo <path>` count
+        # as registered on the only path that ships. A fallback that the real data
+        # always takes is not a fallback, it is the behaviour.
+        return False
     got = _shell_tokens(command)
     if len(got) <= idx:
         return False

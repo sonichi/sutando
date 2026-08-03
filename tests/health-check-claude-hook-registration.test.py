@@ -139,7 +139,8 @@ class TestHookRegistration(unittest.TestCase):
         (repo / ".claude").mkdir(parents=True)
         (repo / "src" / "install-claude-hooks.sh").write_text(
             '#!/usr/bin/env bash\nSETTINGS="$REPO_DIR/.claude/settings.json"\n'
-            'HOOKS=(\n  "Stop|src/check-pending-tasks.sh|bash $REPO_DIR/src/check-pending-tasks.sh"\n)\n'
+            # production shape: the installer shell-quotes via $(shq ...)
+            'HOOKS=(\n  "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"\n)\n'
         )
         (repo / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
             "Stop": [{"hooks": [{"type": "command", "command": command(repo)}]}]}}))
@@ -278,6 +279,72 @@ class TestHookRegistration(unittest.TestCase):
         names = [c.get("name") for c in self.hc.run_all_checks() if isinstance(c, dict)]
         self.assertIn("claude-hooks", names)
 
+
+
+class TestAgainstTheRealInstaller(unittest.TestCase):
+    """Everything above uses a SIMPLIFIED fixture, and that is how three rounds of
+    review kept finding false-cleans this suite was green through.
+
+    The real `src/install-claude-hooks.sh` writes its command as
+    `bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")`. The probe reads HOOKS as
+    literal source, so before the unwrap the path was welded into a `$(shq` token and
+    NO production hook resolved positionally — every one took the permissive fallback,
+    which meant `echo <path>` counted as registered on the only path that ships.
+
+    So this class builds its fixture from the repository's OWN installer. If the
+    installer's command shape changes into something the parser can't reduce, these
+    fail — which a hand-written approximation of it could never do.
+    """
+
+    def setUp(self):
+        self.hc = _load()
+        self.installer_src = (REPO / "src" / "install-claude-hooks.sh").read_text()
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _repo(self, stop_command):
+        r = Path(self._tmp.name) / f"repo{abs(hash(stop_command)) % 99999}"
+        (r / "src").mkdir(parents=True)
+        (r / ".claude").mkdir(parents=True)
+        (r / "src" / "install-claude-hooks.sh").write_text(self.installer_src)
+        handoff = f'bash {r}/src/session-handoff.sh "$TRANSCRIPT_PATH"'
+        (r / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+            "PreCompact": [{"hooks": [
+                {"command": 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/x.jsonl"'},
+                {"command": handoff}]}],
+            "SessionEnd": [{"hooks": [{"command": handoff}]}],
+            "Stop": [{"hooks": [{"command": stop_command.format(
+                p=f"{r}/src/check-pending-tasks.sh")}]}],
+        }}))
+        return r
+
+    def test_the_installers_real_shq_command_reads_as_registered(self):
+        # Over-trigger control, and the one that matters most: failing closed is only
+        # correct if the genuine production shape still passes. If this breaks, the
+        # probe warns on every healthy host.
+        out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
+        self.assertEqual(out["status"], "ok", out["detail"])
+        self.assertIn("4", out["detail"])
+
+    def test_decoys_are_rejected_on_the_REAL_installer_shape(self):
+        for label, cmd in {
+            "echo": "echo {p}",
+            "printf": 'printf "%s" {p}',
+            "different script, path as arg": "bash /tmp/other.sh {p}",
+        }.items():
+            with self.subTest(decoy=label):
+                out = self.hc.check_claude_hook_registration(repo_dir=self._repo(cmd))
+                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
+                self.assertIn("NOT invoking this checkout", out["detail"])
+
+    def test_an_unreducible_template_fails_CLOSED(self):
+        # The fallback used to accept the path anywhere in the first two tokens. A
+        # fallback the real data always took was not a fallback — it was the behaviour.
+        # If a future wrapper defeats the unwrap, warn; never silently accept.
+        self.assertFalse(self.hc._hook_command_targets(
+            "echo /repo/src/x.sh", Path("/repo/src/x.sh"), "somecmd $(unknown_wrapper x)"))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
