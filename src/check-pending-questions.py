@@ -363,10 +363,80 @@ def deliver(questions, count, titles):
     return summary
 
 
+def zero_reason():
+    """Explain a zero so a parse fault cannot look like a quiet day.
+
+    Every other early return in main() prints something; this one did not, and on
+    2026-07-30 that cost ~11 hours. A divider-anchor bug made the active region
+    collapse to the file's own header, `get_waiting_questions()` returned 0 while 43
+    questions were open, and each hourly run exited in silence. The silence was
+    indistinguishable from "nothing to report" — worse, it was misread as the
+    cooldown branch, which actually does print.
+
+    The tell was available the whole time: **zero out of a 5000-line file is a
+    suspicious answer.** So report the denominator, not just the verdict. A count is
+    only meaningful next to what was counted.
+    """
+    if not PQ_FILE.exists():
+        return f"0 pending questions — no file at {PQ_FILE}"
+
+    text = PQ_FILE.read_text()
+    active_text = active_region(text)
+
+    # The denominator must cover the SAME populations the numerator counts.
+    # get_waiting_questions() recognizes BOTH `## ` sections and the free-form
+    # `- **[label]** ...` bullets the proactive loop writes in practice, so counting
+    # only sections leaves the bullet-only file — a real, supported shape — able to
+    # report a trusted-looking zero in exactly the situation this function exists to
+    # flag. Found in review of the first revision, with a reproduction: a file that is
+    # nothing but `# Resolved` + one bullet yielded "every one is explicitly
+    # resolved/answered", which is the opposite of the intended signal.
+    SECTION_RE = r'^## '
+    BULLET_RE = r'^\s*-\s+\*\*\['
+
+    def _tally(s: str) -> tuple[int, int]:
+        return (len(re.findall(SECTION_RE, s, flags=re.MULTILINE)),
+                len(re.findall(BULLET_RE, s, flags=re.MULTILINE)))
+
+    file_secs, file_bullets = _tally(text)
+    act_secs, act_bullets = _tally(active_text)
+    file_total = file_secs + file_bullets
+    act_total = act_secs + act_bullets
+
+    def _describe(secs: int, bullets: int) -> str:
+        parts = []
+        if secs:
+            parts.append(f"{secs} '## ' section(s)")
+        if bullets:
+            parts.append(f"{bullets} bullet entr(ies)")
+        return " + ".join(parts) if parts else "nothing"
+
+    if file_total == 0:
+        return "0 pending questions — the file holds no sections or bullets at all"
+
+    # Suspicious shape: the file has entries, the ACTIVE region has none. Fires for
+    # sections, bullets, or any mix — the population that vanished does not matter.
+    if act_total == 0:
+        return (
+            f"0 pending questions, but {PQ_FILE.name} holds {_describe(file_secs, file_bullets)} "
+            f"and NONE are in the active region (above the archive divider). "
+            f"That is the shape of a parse fault, not a quiet day — check the "
+            f"'# Resolved' divider before trusting this zero."
+        )
+
+    return (
+        f"0 pending questions — the active region holds "
+        f"{_describe(act_secs, act_bullets)} (of {_describe(file_secs, file_bullets)} "
+        f"in the file) and every one is explicitly resolved/answered"
+    )
+
+
 def main():
     force = "--force" in sys.argv
     questions = get_waiting_questions()
     if not questions:
+        # Never return silently: see zero_reason.__doc__.
+        print(zero_reason())
         return
 
     if not force and presenter_mode_active(WORKSPACE):
