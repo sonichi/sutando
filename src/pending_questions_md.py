@@ -220,7 +220,9 @@ def mask_markup(text: str) -> str:
 
 
 def _divider_hidden_by_inline_span(text: str, divider: re.Pattern) -> bool:
-    """True when the divider survives comment+fence masking but an inline span hides it.
+    """Every divider that survives comment+fence masking but is then hidden by an inline span.
+
+    Returns a list of (line, matched_text); empty when nothing is span-hidden.
 
     This is the discriminator between DAMAGE and a legitimately quoted divider, and it
     asks the only question that actually separates them: **which masker hid it?**
@@ -257,7 +259,13 @@ def _divider_hidden_by_inline_span(text: str, divider: re.Pattern) -> bool:
     have fired on the defect it was written for.
     """
     fenced_and_comments_only = mask_fenced_code(mask_html_comments(text))
-    return bool(divider.search(fenced_and_comments_only))
+    masked = mask_markup(text)
+    hidden = []
+    for m in divider.finditer(fenced_and_comments_only):
+        # Hidden by the inline-span pass specifically: present here, gone after it.
+        if masked[m.start():m.end()].strip() == "":
+            hidden.append((text.count("\n", 0, m.start()) + 1, text[m.start():m.end()]))
+    return hidden
 
 
 def active_region(text: str, divider: re.Pattern = DIVIDER_RE) -> str:
@@ -285,14 +293,27 @@ def active_region(text: str, divider: re.Pattern = DIVIDER_RE) -> str:
     m = divider.search(masked)
     if m:
         return text[:m.start()]
-    raw = divider.search(text)
-    if raw is not None and _divider_hidden_by_inline_span(text, divider):
-        line = text.count("\n", 0, raw.start()) + 1
+    hidden = _divider_hidden_by_inline_span(text, divider)
+    if hidden:
+        # Report EVERY span-hidden candidate, with each one's own line and its own
+        # matched text as the label. Reporting only the first was wrong twice
+        # (qingyun-wu, review of #2558): the first raw match can be a QUOTED banner
+        # that is masked on purpose, and the label was hard-coded to '# Resolved'
+        # even under DIVIDER_OR_DONE_RE, so a real `# Done` divider was announced
+        # under a name that is not in the file.
+        #
+        # A quoted banner and a real divider can BOTH survive comment/fence masking
+        # and both be swallowed by the same runaway span, so nothing here can single
+        # out "the real one" — and a diagnostic that guesses sends the reader to
+        # harmless markup. Listing every candidate is the honest shape: the reader
+        # is looking for one unbalanced backtick, and every line below is downstream
+        # of it.
+        where = ", ".join(f"{label!r} at line {line}" for line, label in hidden)
         print(
-            f"pending-questions: '# Resolved' divider at line {line} is MASKED by "
-            "markup above it (an unclosed backtick span or code fence), so the "
-            "archive below it is being served as LIVE. Fix the unbalanced markup; "
-            "see sonichi/sutando#2557.",
+            f"pending-questions: divider {where} MASKED by markup above it (an "
+            "unclosed backtick span or code fence), so the archive below is being "
+            "served as LIVE. Fix the unbalanced markup at or above the FIRST line "
+            "listed; see sonichi/sutando#2557.",
             file=sys.stderr,
         )
     return text

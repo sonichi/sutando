@@ -116,6 +116,51 @@ class TestMaskedDividerWarns(unittest.TestCase):
         self.assertEqual(err, "", "a bounded fenced example must stay quiet")
         self.assertEqual(out, text)
 
+    def test_quoted_banner_before_a_damaged_divider_reports_BOTH_not_just_the_first(self):
+        # REVIEW FIX 2 (qingyun-wu, #2558). The warning used the FIRST raw divider
+        # match, so a line-initial QUOTED banner — masked on purpose — was announced
+        # as the damage while the real divider further down went unmentioned.
+        #
+        # A banner and a real divider can BOTH survive comment/fence masking and be
+        # swallowed by the SAME runaway span, so nothing can single out "the real
+        # one". Guessing sends the reader to harmless markup; listing every
+        # candidate is honest and still actionable, since one unbalanced backtick
+        # explains all of them.
+        text = (
+            f"intro: writers must never append below the {TICK}\n"
+            f"# Resolved{TICK} heading. (quoted banner)\n"
+            f"stray {TICK}\n"
+            "\n"
+            "# Resolved\n"
+            "\n"
+            "- **[RETIRED]** archived\n"
+            f"end {TICK}\n"
+        )
+        out, err = _run(text)
+        self.assertIn("line 2", err, "the quoted banner is a candidate and must be listed")
+        self.assertIn("line 5", err, "the REAL divider must not be dropped in favour of the banner")
+        self.assertEqual(out, text, "still warn-only")
+
+    def test_label_comes_from_the_MATCH_not_a_hardcoded_string(self):
+        # Same review: the label was hard-coded '# Resolved', so friction-detector's
+        # DIVIDER_OR_DONE_RE reported a real `# Done` divider under a name that does
+        # not appear anywhere in the file — sending the reader to search for a
+        # heading that is not there.
+        from pending_questions_md import DIVIDER_OR_DONE_RE
+        text = (
+            f"intro stray {TICK}\n"
+            "# Done\n"
+            "\n"
+            "- **[RETIRED]** y\n"
+            f"end {TICK}\n"
+        )
+        err = io.StringIO()
+        with redirect_stderr(err):
+            out = active_region(text, DIVIDER_OR_DONE_RE)
+        self.assertIn("'# Done'", err.getvalue(), "label must be the matched text")
+        self.assertNotIn("Resolved", err.getvalue(), "must not name a divider absent from the file")
+        self.assertEqual(out, text)
+
     def test_no_divider_at_all_is_silent(self):
         text = "## only live questions\nbody\n"
         out, err = _run(text)
