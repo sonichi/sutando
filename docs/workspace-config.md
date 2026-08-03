@@ -60,6 +60,25 @@ Keys whose name starts with `_` (e.g. `_comment`) are stripped before validation
 // 3. Enable vault sync to a private remote
 { "vault": { "enabled": true, "remote_url": "https://vault.example.com/you/workspace.git" } }
 
+// 3b. Pin a host that intentionally runs off a non-main branch (e.g. the
+//     dual-run pinned nodes). health-check's live-checkout-branch probe warns
+//     when the live checkout drifts off this branch; default is "main".
+//     Config (not env) is the durable home — launchd/Sutando.app callers
+//     never inherit an interactive shell's exports. SUTANDO_EXPECTED_BRANCH
+//     remains a per-invocation env override (wins over config).
+{ "core": { "expected_branch": "v0.4.0-pre-workspace-revamp" } }
+
+// 3c. Tune when a checkout on the RIGHT branch is nonetheless too stale.
+//     Being on `main` is only half of being current — a checkout can sit on
+//     main and still execute weeks-old code, which is how merged guards end up
+//     not running with nothing to report it. Default 10; deliberately not 1,
+//     because main moves several times a day and a probe that fires on every
+//     ordinary delta is one the reader learns to skip. Invalid values
+//     (non-integer, zero, negative) fall back to 10 rather than crashing the
+//     health check or warning on an up-to-date checkout. No env-var override —
+//     config is the only home.
+{ "core": { "checkout_behind_warn": 25 } }
+
 // 4. Multiple overrides
 {
   "workspace": { "path": "/Users/you/.sutando/workspace" },

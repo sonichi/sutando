@@ -111,6 +111,15 @@ def _host_label() -> str:
     conventions stay in lockstep. Kept in lockstep with `_host()` in
     sync-workspace.sh (same precedence)."""
     env = os.environ.get("SUTANDO_HOST_LABEL") or os.environ.get("SUTANDO_HOST_OVERRIDE")
+    # Strip before testing: a blank-but-set override (`SUTANDO_HOST_LABEL=" "`,
+    # trivially produced by an unquoted expansion in a launcher) is truthy in
+    # Python, so `if env:` returned the whitespace itself as the label. That
+    # yields `hosts/   /` and `state/cores/   .alive` — the same per-host path
+    # split as the 2026-06-22 DHCP-drift incident above, but self-inflicted and
+    # far harder to spot in a directory listing. Blank means "not set": fall
+    # through to scutil/hostname. Matches SutandoConfig.hostLabel() in
+    # src/Sutando/main.swift, which already trims.
+    env = (env or "").strip()
     if env:
         return env
     try:
@@ -154,7 +163,8 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     Returns the FIRST existing path. If none exist, returns the preferred
     private-dir path so the caller's `.exists()` check fails gracefully.
     """
-    ws = workspace if workspace is not None else _workspace_root()
+    explicit_ws = workspace is not None
+    ws = workspace if explicit_ws else _workspace_root()
 
     # New per-host canonical home (workspace-as-git-repo, #1717). Probed first
     # so relocated files are found; absent → falls through to legacy order.
@@ -179,8 +189,31 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     if p.exists():
         return p
 
-    # Nothing exists; return preferred (private if configured, else workspace)
+    # Nothing exists — this is the path the caller will CREATE. It must stay
+    # inside the workspace the caller named, or their isolation is a fiction.
+    #
+    # The read probes above may legitimately return a legacy machine-<host>/
+    # file: that is the migration fallback and it is load-bearing while those
+    # files still exist. But the WRITE destination is a different question, and
+    # answering it from $SUTANDO_MEMORY_DIR ignored the argument entirely — so
+    # `personal_path("x.md", <fresh tmp>)` handed back a path in the operator's
+    # real, vault-SYNCED memory tree. A test that passed a tmpdir believing it
+    # was isolated wrote into Chi's vault instead; ALPHA/BRAVO fixtures reached
+    # it that way (#2452). Passing a tmpdir is not isolation unless the resolved
+    # path is actually inside it.
+    #
+    # When no workspace was passed the caller has accepted ambient resolution,
+    # so the env-based private dir remains correct and behavior is unchanged.
+    # The escape exists ONLY when a private dir is configured: that is the branch
+    # that answered from the environment instead of from `ws`. When it is None the
+    # code already fell through to `ws / filename`, which is inside the workspace
+    # and needs no change — and `tests/util-paths-hosts-resolution.test.py` pins
+    # that as a deliberate #1717 decision ("the fix is read-side only; write
+    # target is untouched"). So keep the write target where #1717 put it, the
+    # workspace root, and change only WHOSE workspace answers.
     if private is not None:
+        if explicit_ws:
+            return ws / filename
         return private / filename
     if filename in {"stand-avatar.png"}:
         return ws / "assets" / filename
@@ -342,3 +375,35 @@ def _emit_claude_home_fallback_banner_once() -> None:
         "location post-#1454. Suppress with SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1.",
         file=sys.stderr,
     )
+
+def write_private_text(path: "Path", text: str) -> None:
+    """Write ``text`` to ``path`` as an owner-only (0600) file, with no window.
+
+    ``Path.write_text()`` creates at the process umask — commonly 0644 — so the
+    familiar ``write_text(...)`` + ``os.chmod(..., 0o600)`` pair leaves the file
+    world-readable for the interval between the two calls. For access-control
+    data (allowlists, owner ids, tier maps) that interval is the whole exposure.
+
+    ``os.open`` applies the mode at CREATION, and ``fchmod`` covers the case
+    where the file already existed (the mode argument is ignored then). O_TRUNC
+    rather than O_EXCL deliberately: this is used on best-effort paths wrapped in
+    broad excepts, and O_EXCL would turn a leftover temp file from a crash into a
+    permanent silent failure.
+    """
+    # Order matters for DATA INTEGRITY, not just permissions. O_TRUNC empties the
+    # file at OPEN, so with `O_CREAT|O_TRUNC` then fchmod, a hardening failure
+    # leaves an EXISTING backup empty -- a permission error would destroy exactly
+    # the durable copy that exists to survive a wipe. (The old
+    # write_text()+chmod at least failed with correct data and loose perms.)
+    #
+    # So: open WITHOUT O_TRUNC, harden first, and only truncate once nothing can
+    # still fail destructively.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)   # existing file: mode arg above was ignored
+        os.ftruncate(fd, 0)    # nothing destroyed until hardening succeeded
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "w") as fh:  # fdopen takes ownership of fd from here
+        fh.write(text)
