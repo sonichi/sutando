@@ -44,6 +44,8 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -55,9 +57,10 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from util_paths import channel_access_path, claude_home_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
+from presenter_mode import presenter_mode_active  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
@@ -69,35 +72,12 @@ RESULTS_DIR = REPO / "results"
 
 # Allowlist for paths that may be sent via Telegram [file: /path] markers.
 # Mirrors _is_path_sendable() in discord-bridge.py.
-SEND_ALLOWED_ROOTS = (
-    str(REPO / "results"),
-    str(REPO / "notes"),
-    str(REPO / "docs"),
-)
-SEND_ALLOWED_PREFIXES = (
-    "/tmp/sutando-",
-    "/private/tmp/sutando-",
-    "/tmp/echo-",
-    "/private/tmp/echo-",
-)
-
-
-def _is_path_sendable(fpath: str) -> bool:
-    """True iff `fpath` is a real file AND resolves under an allowed root."""
-    if not os.path.isfile(fpath):
-        return False
-    try:
-        real = os.path.realpath(fpath)
-    except OSError:
-        return False
-    for root in SEND_ALLOWED_ROOTS:
-        root_real = os.path.realpath(root)
-        if real == root_real or real.startswith(root_real + os.sep):
-            return True
-    for prefix in SEND_ALLOWED_PREFIXES:
-        if real.startswith(prefix):
-            return True
-    return False
+# Outbound attachment allowlisting is canonical policy — src/send_allowlist.py
+# is the single source of truth. A hand-written copy here drifted from it: it
+# lacked the personal-notes, iclr-backups and launch-assets roots, so a file
+# Discord would happily send was silently dropped from a Telegram reply.
+# Telegram inherits the complete canonical policy with no extra roots.
+from send_allowlist import is_path_sendable as _is_path_sendable  # noqa: E402
 
 
 # --- Config loading (independent of _is_path_sendable above) ---
@@ -230,28 +210,6 @@ def archive_file(src: "Path", kind: str, task_id: str) -> None:
         except Exception:
             pass
 
-# Presenter mode: silence proactive DMs during ICLR/talk windows. Sentinel
-# is written by scripts/presenter-mode.sh with an ISO-8601 expiry. Matches
-# the check in src/check-pending-questions.py and src/discord-bridge.py.
-PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
-
-
-def presenter_mode_active():
-    if not PRESENTER_SENTINEL.exists():
-        return False
-    try:
-        expire_iso = PRESENTER_SENTINEL.read_text().strip()
-        # Require an ISO-8601-ish prefix (starts with a digit). Without
-        # this guard, malformed sentinel content like "garbage" compares
-        # LESS than any real now_iso ("2" < "g" in ASCII) and the mode
-        # fails OPEN — appears active forever.
-        if not expire_iso or not expire_iso[0].isdigit():
-            return False
-        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        return now_iso < expire_iso
-    except Exception:
-        return False
-
 # Load access config
 ACCESS_FILE = channel_access_path("telegram")
 
@@ -337,8 +295,7 @@ def tofu_onboard(sender_id, username):
         "tofuOnboardedAt": int(time.time()),
         "tofuOnboardedUsername": username or None,
     }
-    ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
-    os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Telegram user ID
+    write_private_text(ACCESS_FILE, json.dumps(payload, indent=2) + "\n")  # don't inherit umask 644 — file holds owner's Telegram user ID
     print(f"  TOFU: auto-onboarded @{username} (id={sender_id}) as owner — wrote {ACCESS_FILE}")
     return {sender_id}
 
@@ -366,20 +323,16 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     Optional — if the skill is absent the caller falls back to [Voice note attached:].
     Errors are swallowed; transcription failure must never block task delivery.
     """
-    import subprocess
     skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
-    if not skill_script.exists():
-        return None
-    try:
-        result = subprocess.run(
-            [sys.executable, str(skill_script), local_path],
-            capture_output=True, text=True, timeout=25,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    except Exception as e:
-        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
-    return None
+    return _run_optional_script_shared(
+        skill_script,
+        [local_path],
+        timeout=25,
+        on_error=lambda exc: print(
+            f"  [stt] skill call failed for {os.path.basename(local_path)}: {exc}",
+            flush=True,
+        ),
+    )
 
 
 def download_file(file_id, name_hint="file"):
@@ -497,37 +450,8 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     return {"text_chunks": text_chunks, "files_sent": files_sent, "ok": delivered_ok}
 
 def _recover_orphan_sending_files() -> int:
-    """Restart-safety: rename any orphan `results/proactive-*.sending`
-    files back to `*.txt` so they get re-claimed on the next poll.
-
-    Mirrors `_recover_orphan_sending_files` in discord-bridge.py.
-    See that docstring for the bug class this closes.
-    """
-    if not RESULTS_DIR.exists():
-        return 0
-    recovered = 0
-    for f in RESULTS_DIR.iterdir():
-        if not (f.name.startswith("proactive-") and f.suffix == ".sending"):
-            continue
-        target = f.with_suffix(".txt")
-        try:
-            if target.exists():
-                print(
-                    f"  [startup] skipping orphan recovery: {target.name} "
-                    f"already exists (collision with {f.name})",
-                    flush=True,
-                )
-                continue
-            f.rename(target)
-            recovered += 1
-            print(f"  [startup] recovered orphan {f.name} → {target.name}", flush=True)
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            print(f"  [startup] failed to recover {f.name}: {e}", flush=True)
-    if recovered:
-        print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
-    return recovered
+    """Recover this adapter's stranded proactive delivery claims."""
+    return recover_orphan_sending_files(RESULTS_DIR)
 
 
 # --- Opt-in owner progress streaming (Telegram parity with Discord PR #97) ---
@@ -954,7 +878,7 @@ def main():  # pragma: no cover
         from proactive_routing import should_claim_proactive
         try:
             if (
-                not presenter_mode_active()
+                not presenter_mode_active(REPO)
                 and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
             ):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
