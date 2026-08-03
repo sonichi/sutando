@@ -2915,6 +2915,27 @@ def check_quota_account_identity(proxy_status: str) -> dict:
         return {"name": name, "status": "ok",
                 "detail": "credential proxy not up — nothing to compare"}
 
+    # Whose account only matters if THIS core's requests go through that proxy.
+    # A proxy can be up while the running core bypasses it entirely — a Codex or
+    # direct runtime, or a supervisor-launched core that never got
+    # ANTHROPIC_BASE_URL. Warning there would assert "requests bill that account"
+    # and "/login here will not reach the proxy", neither of which is true of a
+    # core that does not route. check_quota_telemetry needed the same gate for
+    # the same class, so reuse its runtime marker.
+    if _runtime_may_skip_proxy():
+        return {"name": name, "status": "ok",
+                "detail": "core runtime is not proxy-routed — its credential is not this proxy's"}
+    # Positive confirmation only. health-check runs as a child of the core, so it
+    # inherits the core's environment; ANTHROPIC_BASE_URL present is direct
+    # evidence the core routes. Absent, we cannot show it routes — and an
+    # unprovable premise must silence the check rather than license a warning
+    # whose every clause depends on it.
+    if not os.environ.get("ANTHROPIC_BASE_URL"):
+        return {"name": name, "status": "ok",
+                "detail": ("cannot confirm this core routes through the proxy "
+                           "(no ANTHROPIC_BASE_URL in the inherited environment) — "
+                           "identity comparison inactive here")}
+
     core_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not core_cfg:
         return {"name": name, "status": "ok",
@@ -2926,10 +2947,30 @@ def check_quota_account_identity(proxy_status: str) -> dict:
                 "detail": "credential proxy is not launchd-managed on this host"}
     try:
         rendered = plistlib.loads(plist.read_bytes())
-        proxy_cfg = (rendered.get("EnvironmentVariables") or {}).get("CLAUDE_CONFIG_DIR")
     except (OSError, ValueError) as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the credential-proxy plist ({exc})"}
+    # A plist can PARSE and still be the wrong shape — `EnvironmentVariables`
+    # encoded as a string, say. `.get` on that raises AttributeError, which is
+    # not caught above and would abort the whole health run, taking every later
+    # check with it. Validate both containers as mappings; a parseable file of
+    # the wrong shape is a warn, never an exception.
+    if not isinstance(rendered, dict):
+        return {"name": name, "status": "warn",
+                "detail": (f"credential-proxy plist parsed but its root is "
+                           f"{type(rendered).__name__}, not a dict — cannot read its environment")}
+    env_block = rendered.get("EnvironmentVariables")
+    if env_block is None:
+        env_block = {}
+    if not isinstance(env_block, dict):
+        return {"name": name, "status": "warn",
+                "detail": (f"credential-proxy plist has EnvironmentVariables as "
+                           f"{type(env_block).__name__}, not a dict — cannot read CLAUDE_CONFIG_DIR")}
+    proxy_cfg = env_block.get("CLAUDE_CONFIG_DIR")
+    if proxy_cfg is not None and not isinstance(proxy_cfg, str):
+        return {"name": name, "status": "warn",
+                "detail": (f"credential-proxy plist has CLAUDE_CONFIG_DIR as "
+                           f"{type(proxy_cfg).__name__}, not a string — cannot resolve its keychain item")}
 
     core_service = _resolved_credential_service(core_cfg)
     proxy_service = _resolved_credential_service(proxy_cfg)

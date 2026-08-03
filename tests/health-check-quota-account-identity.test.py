@@ -63,16 +63,98 @@ class TestQuotaAccountIdentity(unittest.TestCase):
                                          "EnvironmentVariables": env}))
         return path
 
-    def _run(self, core_cfg, plist_cfg, existing_services, proxy_status="ok"):
+    def _run(self, core_cfg, plist_cfg, existing_services, proxy_status="ok",
+             routed=True, codex_runtime=False):
+        """`routed` controls the ANTHROPIC_BASE_URL the core would have inherited;
+        every case must state it, because the check is gated on it."""
         self._write_plist(plist_cfg)
         env = {"CLAUDE_CONFIG_DIR": core_cfg} if core_cfg else {}
+        if routed:
+            env["ANTHROPIC_BASE_URL"] = "http://localhost:7846"
         with mock.patch.dict(os.environ, env, clear=False), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=codex_runtime), \
              mock.patch.object(hc, "_keychain_service_exists",
                                side_effect=lambda s: s in existing_services):
             if not core_cfg:
                 os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            if not routed:
+                os.environ.pop("ANTHROPIC_BASE_URL", None)
             return hc.check_quota_account_identity(proxy_status)
+
+    # ---- routing gate: the false-positive class qingyun-wu blocked on --------
+
+    def test_proxy_up_but_core_not_routed_does_not_warn(self):
+        """THE routing-gate pin. Divergent keychain items AND a live proxy, but
+        this core has no ANTHROPIC_BASE_URL — it does not send requests through
+        that proxy at all. Every clause of the warning ("requests bill that
+        account", "/login here will not reach the proxy") would be false, so the
+        check must stay silent rather than describe a relationship that does not
+        exist."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core_cfg=core, plist_cfg=None,
+                        existing_services={_scoped(core), VANILLA}, routed=False)
+        self.assertEqual(out["status"], "ok",
+                         "an unrouted core must not be told the proxy is billing its requests")
+        self.assertIn("cannot confirm", out["detail"])
+
+    def test_non_proxy_runtime_does_not_warn(self):
+        """Same divergence, but the runtime marker says this core is not
+        proxy-routed (Codex). check_quota_telemetry gates on the same marker."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core_cfg=core, plist_cfg=None,
+                        existing_services={_scoped(core), VANILLA}, codex_runtime=True)
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("not proxy-routed", out["detail"])
+
+    # ---- parseable-but-wrong-shape plists: must warn, never raise -----------
+
+    def test_env_block_wrong_type_warns_not_raises(self):
+        """A plist that PARSES with `EnvironmentVariables` as a string. `.get` on
+        a str raises AttributeError, which the OSError/ValueError handler does not
+        catch — it would abort the entire health run and take every later check
+        with it. Reproduced by qingyun-wu on d208c539."""
+        core = "/Users/x/ws/.claude-sutando"
+        path = self.home / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
+        path.write_bytes(plistlib.dumps({"EnvironmentVariables": "not-a-dict"}))
+        with mock.patch.dict(os.environ,
+                             {"CLAUDE_CONFIG_DIR": core,
+                              "ANTHROPIC_BASE_URL": "http://localhost:7846"}, clear=False), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
+            out = hc.check_quota_account_identity("ok")   # must not raise
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("EnvironmentVariables", out["detail"])
+
+    def test_plist_root_wrong_type_warns_not_raises(self):
+        """Widening the same axis rather than patching the one case found: a
+        plist whose ROOT is an array parses fine and has no `.get` either."""
+        core = "/Users/x/ws/.claude-sutando"
+        path = self.home / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
+        path.write_bytes(plistlib.dumps(["not", "a", "dict"]))
+        with mock.patch.dict(os.environ,
+                             {"CLAUDE_CONFIG_DIR": core,
+                              "ANTHROPIC_BASE_URL": "http://localhost:7846"}, clear=False), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
+            out = hc.check_quota_account_identity("ok")
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("root", out["detail"])
+
+    def test_config_dir_wrong_type_warns_not_raises(self):
+        """Third point on the axis: the key exists but holds an integer, so it
+        cannot be hashed into a keychain service name."""
+        core = "/Users/x/ws/.claude-sutando"
+        path = self.home / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
+        path.write_bytes(plistlib.dumps({"EnvironmentVariables": {"CLAUDE_CONFIG_DIR": 42}}))
+        with mock.patch.dict(os.environ,
+                             {"CLAUDE_CONFIG_DIR": core,
+                              "ANTHROPIC_BASE_URL": "http://localhost:7846"}, clear=False), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
+            out = hc.check_quota_account_identity("ok")
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("CLAUDE_CONFIG_DIR", out["detail"])
 
     # ---- THE regression pin: fails on the parent commit -------------------
 
