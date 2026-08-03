@@ -207,7 +207,18 @@ if [ "${1:-}" = "-f" ]; then
   printf '  File: "%s"\n    ID: 0 Namelen: 255 Type: apfs\n' "${3:-${2:-}}"
   exit 0
 fi
-if [ "${1:-}" = "-c" ]; then exec /usr/bin/stat -f %m "${3:-}"; fi
+if [ "${1:-}" = "-c" ]; then
+  # Return the REAL mtime. The HOST's /usr/bin/stat may itself be GNU (CI) or
+  # BSD (macOS), so this fallback cannot hardcode either syntax — an earlier
+  # revision hardcoded `-f %m` and the fixture silently yielded nothing on
+  # ubuntu-latest, tripping this very test. Same output-shape rule as mtime_of.
+  _f="${3:-}"
+  for _real in "-c %Y" "-f %m"; do
+    _o="$(/usr/bin/stat $_real "$_f" 2>/dev/null || true)"
+    case "$_o" in ""|*[!0-9]*) ;; *) printf "%s\n" "$_o"; exit 0 ;; esac
+  done
+  exit 1
+fi
 exec /usr/bin/stat "$@"
 STATEOF
 chmod +x "$FAKEBIN/stat"
