@@ -122,6 +122,16 @@ mechanics. For example, `src/presenter_mode.py` owns the presenter sentinel path
 and expiry semantics; Discord, Slack, Telegram, and notification jobs decide
 what delivery to suppress when that policy reports active.
 
+### Shared result-file lifecycle
+
+The task/result filesystem protocol is core infrastructure, including its
+claim, crash-recovery, collision, and retry rules. A dependency-light core
+helper owns each shared state transition; adapters supply their resolved paths
+and retain only provider-specific delivery. For example,
+`src/proactive_recovery.py` restores proactive delivery claims stranded by a
+crash, while Discord, Slack, and Telegram decide how the recovered result is
+sent. Copying the filesystem state machine into each adapter is not permitted.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known
@@ -164,6 +174,103 @@ Both should move toward dependency inversion:
 
 Moving files without first removing these dependencies would make the boundary
 look cleaner without making it real.
+
+## Schema migration vs live writer
+
+A module that owns live write APIs must not also own destructive one-time schema
+transformations. Migration code is high-consequence, runs once at startup, and is
+almost impossible to test through the live surface — embedded in a writer it ends
+up exercised only by driving a real session.
+
+Worked example, `src/conversation-store.ts` → `src/conversation-store-migrations.ts`:
+
+> `conversation-store.ts` owns current schema initialization and live write APIs.
+> Destructive or legacy SQLite transformations belong in
+> `conversation-store-migrations.ts`, are idempotent, transaction-tested and
+> invoked before views/statements are prepared. Do not place migration SQL in a
+> live record function.
+
+The ordering is part of the contract: current-table DDL → migrations → view
+rebuild → prepared statements. The migration module never creates current-schema
+DDL (that stays the caller's job) and never propagates failure — the store must
+still initialize after a handled, rolled-back migration.
+
+Enforced by `tests/conversation-store-migration-delegation.test.ts`, which checks
+the delegation and the ordering, and scans the store for the legacy table names
+and transaction verbs while deliberately still permitting current-schema
+`CREATE TABLE`.
+
+## Transport vs request domain
+
+A transport (socket server, HTTP handler, message consumer) owns framing, connection
+lifecycle and daemon composition. It must not own authorization, policy or durable
+state transitions — when it does, the security rules can only be exercised by
+driving the transport, and any second transport is free to reimplement them
+differently.
+
+Worked example, `src/runtime-api/server.py` → `src/runtime-api/dispatcher.py`:
+
+> `server.py` owns Unix-socket transport and daemon composition. JSON-RPC method
+> dispatch, approval/elicitation validation, governed-capability authorization,
+> idempotency and durable request transitions belong in `dispatcher.py`. Actor
+> identity is resolved daemon-side and passed in explicitly; a client parameter
+> must never override it.
+
+The dependencies are ordinary constructor arguments (store, human-action adapter,
+actor, executor map) — no injection framework. Note the executor map must be *read*
+from the instance, not from the module global, or the argument is decorative and a
+caller injecting fakes silently gets the real executors.
+
+## Skill-internal boundaries
+
+The core/adapter/skill split is not the only boundary that matters. A large skill
+can carry the same layering problem internally: analysis policy welded to data
+loading, CLI parsing and presentation, so the rules can only be exercised by
+running the whole tool.
+
+Worked example, `skills/call-diagnostics/scripts/diagnose.py` →
+`scripts/analysis.py`:
+
+> Complex skill diagnostics must separate pure analysis policy from data
+> loading, CLI and presentation. Call-diagnostics detection, categorization and
+> repair policy lives in its analysis module; loaders and renderers consume it
+> and must not carry copied detection rules.
+
+The analysis module is import-safe by contract — it resolves no workspace, reads
+no `sys.argv`, opens no database or file, prints nothing and generates no HTML.
+That contract is asserted directly, by scanning the module source (docstring
+excluded, since it legitimately names what it avoids) and by importing it under a
+polluted `sys.argv` and asserting silence.
+
+This boundary is skill-internal: the policy stays inside `skills/call-diagnostics/`
+and is not promoted into `src/`. The delegation check is narrow — it forbids the
+renderer redefining moved symbols while leaving presentation labels and styles
+alone.
+
+## Presentation adapters vs domain/storage
+
+A presentation module (an HTTP server, a renderer, a CLI front end) adapts and
+displays. It must not also own domain parsing, validation or storage
+transactions — when it does, the policy is unreachable from any other consumer
+and untestable except through the presentation surface.
+
+Worked example, `src/dashboard.py` → `src/dashboard_schedules.py`:
+
+> Dashboard HTTP handlers and rendering code must delegate schedule parsing,
+> validation and atomic `crons.json` mutation to `src/dashboard_schedules.py`.
+> Schedule mutations must remain locked read-modify-write operations; do not
+> rebuild cron validation or persistence inside a route.
+
+The split point that matters: **the adapter resolves the path, the domain module
+receives it.** `dashboard.py` keeps `_crons_path()` (workspace + host-label
+resolution is deployment knowledge); `dashboard_schedules.py` takes a `Path` and
+owns the locked read→merge→write. That keeps the domain module free of workspace
+resolution while leaving the adapter with no persistence logic of its own.
+
+Enforced by `tests/dashboard-schedule-delegation.test.py`, which asserts the
+delegation is real and scans `dashboard.py` for the atomic-write primitives
+(`os.replace`, `.tmp` construction, a local `threading.Lock()`) that would mean
+a route had rebuilt its own transaction.
 
 ## Decision guide for new code
 
