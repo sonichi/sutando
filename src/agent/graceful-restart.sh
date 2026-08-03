@@ -84,7 +84,8 @@ mtime_of() {  # epoch mtime, or EMPTY if no variant yields a numeric answer
   #   .alive age unreadable -> assume STALE (never let a dead core hide)
   local _ts
   for _fmt in "-f %m" "-c %Y"; do
-    # shellcheck disable=SC2086 -- _fmt is two intentional argv words
+    # _fmt is two intentional argv words, so it must stay unquoted.
+    # shellcheck disable=SC2086
     _ts="$(stat $_fmt "$1" 2>/dev/null || true)"
     case "$_ts" in
       ''|*[!0-9]*) ;;                       # not a bare epoch — try the next variant
