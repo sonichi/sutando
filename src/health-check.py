@@ -1143,32 +1143,29 @@ def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
     return [candidate] if candidate.exists() else []
 
 
-# How many materialized files under a directory representative to ask git about.
-# Bounded because a carrier entry can name a large subtree and this runs from a
-# background health check. The bound is honest about its direction: past the cap
-# the probe can UNDER-report (an ignored file beyond it goes unseen), never
-# over-report — the same failure direction as the no-network ref staleness.
-_PROBE_FILES_PER_DIR = 25
-
-
 def _carrier_probe_files(rep: "Path") -> "list[Path]":
-    """The concrete files to ask git about for one materialized representative.
+    """Every concrete file a materialized representative stands for.
 
-    A file represents itself. A DIRECTORY is represented by the files beneath
-    it, sorted for determinism (an unsorted walk would make the probe's verdict
-    depend on filesystem order) and capped at `_PROBE_FILES_PER_DIR`.
+    A file represents itself; a DIRECTORY is represented by every file beneath
+    it, sorted for determinism.
+
+    Deliberately EXHAUSTIVE. The first cut sampled the first 25 and said so in a
+    comment — "past the cap the probe can UNDER-report" — which treated a stated
+    caveat as an acceptable conclusion rather than a defect. john-the-dev built
+    the obvious counterexample on that head: 26 files with only the 26th ignored
+    read `ok`, so a stale exclude left a real carrier file unbacked while health
+    certified the subtree. In a probe whose entire purpose is catching silent
+    non-backup, a sample is not proof of coverage.
+
+    Cost is bounded by asking git ONCE for the whole list (`check-ignore
+    --stdin`) rather than once per file, so exhaustiveness costs a filesystem
+    walk plus a single process — not N processes. See `_carrier_target_verdict`.
     """
     if rep.is_file():
         return [rep]
     if not rep.is_dir():
         return []
-    out = []
-    for f in sorted(rep.rglob("*")):
-        if f.is_file():
-            out.append(f)
-            if len(out) >= _PROBE_FILES_PER_DIR:
-                break
-    return out
+    return sorted(f for f in rep.rglob("*") if f.is_file())
 
 
 def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
@@ -1183,8 +1180,10 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
     backed up. Reproduced independently by john-the-dev and qingyun-wu on
     a958d06f, and confirmed here before changing anything.
 
-    So a directory is probed through the FILES beneath it, bounded by
-    `_PROBE_FILES_PER_DIR`, and any ignored one condemns the entry.
+    So a directory is probed through EVERY file beneath it, and any ignored one
+    condemns the entry. Exhaustive rather than sampled: a 26-file directory whose
+    26th file alone was ignored read `ok` under the old 25-file cap
+    (john-the-dev, #2572), which is the exact silent non-backup this exists for.
 
     `--no-index` stays load-bearing and the instrument stays `check-ignore` for
     a reason worth recording: the obvious alternative,
@@ -1208,22 +1207,22 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
         # callers, which report an entry with no representatives at all.
         return "carried"
 
-    for target in targets:
-        try:
-            proc = subprocess.run(
-                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
-                         str(target.relative_to(workspace))),
-                capture_output=True, timeout=10,
-            )
-        except (GitUnavailable, OSError, subprocess.SubprocessError):
-            return "unmeasured"
-        # check-ignore's contract: 0 = ignored, 1 = NOT ignored, anything else =
-        # it failed. Folding "not 0" into healthy would count exit 128 as carried.
-        if proc.returncode == 0:
-            return "dropped"
-        if proc.returncode != 1:
-            return "unmeasured"
-    return "carried"
+    rels = "\n".join(str(t.relative_to(workspace)) for t in targets)
+    try:
+        proc = subprocess.run(
+            git_argv("-C", str(workspace), "check-ignore", "--no-index", "--stdin"),
+            input=rels, capture_output=True, text=True, timeout=60,
+        )
+    except (GitUnavailable, OSError, subprocess.SubprocessError):
+        return "unmeasured"
+    # check-ignore's contract, unchanged by --stdin: 0 = at least one path is
+    # ignored, 1 = none are, anything else = it failed. Folding "not 0" into
+    # healthy would count exit 128 as carried.
+    if proc.returncode == 0:
+        return "dropped"
+    if proc.returncode == 1:
+        return "carried"
+    return "unmeasured"
 
 
 def _carrier_representative(workspace: Path, entry: str) -> "Path | None":

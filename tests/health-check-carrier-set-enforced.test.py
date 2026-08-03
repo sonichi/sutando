@@ -411,7 +411,11 @@ class CarrierSetProbe(unittest.TestCase):
         real = self.hc.subprocess.run
 
         def flaky(argv, *a, **kw):
-            if any("hosts/b" in str(x) for x in argv):
+            # Paths travel via STDIN now (one `check-ignore --stdin` call per
+            # representative), not argv — so key on the input. Keying on argv
+            # silently stopped matching when the instrument changed, and the test
+            # passed by never firing its own stub.
+            if "hosts/b" in (kw.get("input") or ""):
                 raise self.hc.subprocess.SubprocessError("probe failed on host b")
             return real(argv, *a, **kw)
 
@@ -424,19 +428,57 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertNotEqual(r["status"], "ok",
                             "a host we could not measure is UNKNOWN, not carried")
 
-    def test_the_directory_probe_is_actually_BOUNDED(self):
-        # The cap is the whole reason this walk is safe to run from a background
-        # health check, and an unenforced cap is just a slow unbounded walk. Pin
-        # the bound itself rather than trusting the constant to be wired up.
-        d = self.tmp / "many"
-        d.mkdir()
-        for i in range(self.hc._PROBE_FILES_PER_DIR + 12):
-            (d / f"f{i:03d}.md").write_text("x\n")
-        got = self.hc._carrier_probe_files(d)
-        self.assertEqual(len(got), self.hc._PROBE_FILES_PER_DIR)
-        # Sorted, so the verdict cannot depend on filesystem walk order — an
-        # unsorted sample would make the probe answer differently run to run.
-        self.assertEqual(got, sorted(got))
+    def _dir_with_n_files(self, carried: int, total: int):
+        """A workspace whose `notes/` holds `total` files, the first `carried`
+        un-ignored. Used for the pair below."""
+        lines = ["notes/"] + [f"notes/f{i:03d}.md" for i in range(carried)]
+        files = [f"notes/f{i:03d}.md" for i in range(total)]
+        ws = _mkworkspace(self.tmp, lines, files)
+        self._patch_resolved(["notes/"])
+        self._patch_shipped(["notes/"])
+        return ws
+
+    def test_the_26th_file_being_ignored_is_NOT_ok(self):
+        # john-the-dev on e146c2b3. The probe sampled the first 25 files and a
+        # comment admitted it could "UNDER-report past the cap" — a stated caveat
+        # treated as an acceptable conclusion. 26 files with only the 26th
+        # ignored therefore read `ok`, leaving a real carrier file unbacked while
+        # health certified the subtree. A sample is not proof of coverage.
+        ws = self._dir_with_n_files(carried=25, total=26)
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertNotEqual(r["status"], "ok",
+                            "the 26th file is ignored; sampling the first 25 hides it")
+
+    def test_all_26_carried_still_reads_ok(self):
+        # The paired control. Failing closed on COUNT would have satisfied the
+        # test above and broken this one — which is why the fix is an exhaustive
+        # single `check-ignore --stdin` call rather than a bound that gives up.
+        ws = self._dir_with_n_files(carried=26, total=26)
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", r.get("detail"))
+
+    def test_the_probe_asks_git_ONCE_per_representative(self):
+        # Exhaustiveness must not cost one process per file: that is what made a
+        # cap tempting in the first place. Pin the call count so a future refactor
+        # cannot quietly reintroduce the per-file loop and the pressure to sample.
+        ws = self._dir_with_n_files(carried=26, total=26)
+        real = self.hc.subprocess.run
+        calls = []
+
+        def counting(argv, *a, **kw):
+            if any("check-ignore" in str(x) for x in argv):
+                calls.append(argv)
+            return real(argv, *a, **kw)
+
+        self.hc.subprocess.run = counting
+        try:
+            self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        finally:
+            self.hc.subprocess.run = real
+        self.assertEqual(len(calls), 1,
+                         f"26 files must cost ONE check-ignore call, got {len(calls)}")
 
     def test_an_EMPTY_carrier_directory_does_not_manufacture_a_failure(self):
         # `hosts/<label>/` exists but nothing has been written under it yet.
