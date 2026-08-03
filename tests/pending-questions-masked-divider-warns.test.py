@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from pending_questions_md import active_region  # noqa: E402
 
 TICK = chr(96)
+FENCE = TICK * 3
 
 
 def _run(text: str):
@@ -224,6 +225,67 @@ class TestMaskedDividerWarns(unittest.TestCase):
         out, err = _run(text)
         self.assertEqual(err, "", "a balanced quote swallows no question — not damage")
         self.assertEqual(out, text)
+
+    def test_a_FENCED_example_elsewhere_does_not_make_a_balanced_span_look_damaged(self):
+        # The exact repro john-the-dev, qingyun-wu and bassilkhilo-ag2 each
+        # reproduced at 06f3dfc4. The span branch compared RAW text against the
+        # fully `mask_markup`-ed text, so a legitimately FENCED `## ` heading
+        # anywhere in the document — masked by the FENCE pass, not the span pass —
+        # counted as "a question was swallowed". A separate, perfectly balanced
+        # span quoting the divider then warned on healthy markup.
+        #
+        # Both halves are required: drop the fenced heading and the old code was
+        # already quiet (that is the test above), so this is the combination, not
+        # either piece.
+        text = (
+            "## live\n"
+            f"{FENCE}\n"
+            "## heading inside a legitimate fenced example\n"
+            f"{FENCE}\n"
+            f"prose opens {TICK}\n"
+            "# Resolved\n"
+            f"{TICK} closing prose\n"
+            "## still live\n"
+        )
+        out, err = _run(text)
+        self.assertEqual(err, "",
+                         "a fenced example elsewhere is not span damage — the damage test "
+                         "must be scoped to the pass that hid the divider")
+        self.assertEqual(out, text)
+
+    def test_a_FENCED_BULLET_elsewhere_also_does_not_trigger_it(self):
+        # Same defect via the other reader-recognised shape. `_question_entry_masked`
+        # accepts `## ` OR `- **[label]**`, so fixing only the heading half would
+        # leave the bullet half live.
+        text = (
+            "## live\n"
+            f"{FENCE}\n"
+            "- **[example, 2026-01-01]** a bullet inside a legitimate fenced block\n"
+            f"{FENCE}\n"
+            f"prose opens {TICK}\n"
+            "# Resolved\n"
+            f"{TICK} closing prose\n"
+            "## still live\n"
+        )
+        out, err = _run(text)
+        self.assertEqual(err, "", "a fenced bullet example is not span damage either")
+        self.assertEqual(out, text)
+
+    def test_a_span_that_swallows_a_REAL_question_still_warns(self):
+        # Over-trigger control for the scoping change. Narrowing the comparison
+        # must not blind the detector to the case it exists for: a span that pairs
+        # legitimately and takes a LIVE question with it on the way.
+        text = (
+            "## live one\n"
+            f"prose opens {TICK}\n"
+            "## a live question the span swallowed\n"
+            "# Resolved\n"
+            "archived body\n"
+            f"{TICK} closes\n"
+        )
+        out, err = _run(text)
+        self.assertIn("MASKED by markup", err,
+                      "scoping the damage test must not silence real span damage")
 
     def test_no_divider_at_all_is_silent(self):
         text = "## only live questions\nbody\n"

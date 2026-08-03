@@ -263,6 +263,10 @@ def _dividers_hidden_by_damage(text: str, divider: re.Pattern) -> list[tuple[int
     """
     comments_only = mask_html_comments(text)
     fenced, fence_unclosed = mask_fenced_code(comments_only, report_unclosed=True)
+    # What the SPAN pass alone swallowed. `mask_markup` runs comments -> spans ->
+    # fences, so diffing these two isolates the span step: fences are applied to
+    # NEITHER side, and comments are applied to BOTH.
+    spanned = _mask_nonfence_spans(comments_only)
     masked = mask_markup(text)
     hidden = []
     for m in divider.finditer(comments_only):
@@ -271,7 +275,13 @@ def _dividers_hidden_by_damage(text: str, divider: re.Pattern) -> list[tuple[int
         if fenced[m.start():m.end()].strip() == "":
             damaged = fence_unclosed                  # the fence pass hid it
         else:
-            damaged = _question_entry_masked(text, masked)   # a span hid it
+            # Scope the damage test to the pass that actually hid the divider.
+            # Comparing raw-vs-all-maskers instead made any legitimately FENCED
+            # `## ` heading elsewhere in the file look like span damage, so a
+            # separate, balanced span quoting the divider warned on healthy
+            # markup — reproduced by three reviewers at 06f3dfc4. The fence pass
+            # has its own branch above; it must not leak into this one.
+            damaged = _question_entry_masked(comments_only, spanned)
         if damaged:
             hidden.append((text.count("\n", 0, m.start()) + 1, text[m.start():m.end()]))
     return hidden
