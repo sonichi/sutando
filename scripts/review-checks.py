@@ -14,6 +14,12 @@ import re
 import sys
 
 flags = [p for p in os.environ.get("RC_FLAGS", "").split("\n") if p]
+# Patterns that must equal the WHOLE path token rather than appear inside it.
+# A full executable path needs this: '/usr/bin/swift' as a substring also
+# rejects '/usr/bin/swift-inspect', a separate real binary (its own inode, link
+# count 1) — so a substring rule turns the gate into a blocker for legitimate
+# platform tools, which is how a check gets disabled (#2474 review).
+flags_exact = [p for p in os.environ.get("RC_FLAGS_EXACT", "").split("\n") if p]
 allows = [a for a in os.environ.get("RC_ALLOWS", "").split("\n") if a]
 # Each entry is "TOKEN_PREFIX :: COMPANION": the token is exempt ONLY when the
 # same added line also contains COMPANION. Encodes "portable candidate list"
@@ -622,6 +628,168 @@ def allowed(tok):
 _DOCSTRING_OPEN = re.compile(r"^[rbuf]{0,2}('''|" + '"' * 3 + ")", re.IGNORECASE)
 
 
+def _block_transition(line, in_block):
+    """Block-comment (`/* … */`) state AFTER `line`, given the state before it.
+
+    STATEFUL on purpose. A first attempt skipped any line whose stripped form
+    began with `* `, on the theory that only JSDoc bodies look like that. It is
+    also valid JavaScript for a continued multiplication:
+
+        const n = 2
+          * "/usr/bin/python3".length;
+
+    …so the second line was treated as prose and the path went unflagged — a
+    scanner bypass, not a false negative on prose (@john-the-dev, reviewing
+    #2474). Tracking the real `/*` … `*/` span means a line is exempt because
+    it IS inside a comment, never because of how it happens to start.
+
+    A one-liner `/* … */ code` opens and closes within the line, so it ends
+    OUTSIDE the block and the code on it is still scanned — a comment cannot
+    smuggle a path onto a code line.
+
+    Known limitation, shared with the docstring tracker above: a `/*` or `*/`
+    inside a string literal moves the state. Erring toward scanning is the safe
+    direction, and the flagged-path cost of the reverse is what this fixes.
+    """
+    return _mask_comments(line, in_block)[1]
+
+
+def _mask_comments(line, in_block):
+    """Blank out block-comment REGIONS of `line`; return (masked, state_after).
+
+    Position-level rather than line-level, because both halves of a line matter:
+
+        /** helper for /usr/bin/python3 resolution     ← path is inside the
+                                                         comment it opens: exempt
+        /* note */ const p = "/usr/bin/git";           ← path is after the close:
+                                                         still scanned
+
+    A line-level `was_in_block` test gets the first case wrong (the comment is
+    entered ON this line, so the state BEFORE it is False) — which flagged
+    legitimate resolver documentation (@john-the-dev, reviewing #2474).
+
+    Masking with spaces rather than deleting keeps every column index stable, so
+    the reported token and line number still line up with the real source.
+    """
+    out = []
+    i = 0
+    n = len(line)
+    state = in_block
+    while i < n:
+        if not state and line.startswith("/*", i):
+            state = True
+            out.append("  ")
+            i += 2
+            continue
+        if state and line.startswith("*/", i):
+            state = False
+            out.append("  ")
+            i += 2
+            continue
+        out.append(" " if state else line[i])
+        i += 1
+    return "".join(out), state
+
+
+def _hunk_opens_in_block(lines):
+    """True when a hunk's own content proves it began INSIDE a block comment.
+
+    A unified diff shows three lines of context, so editing a JSDoc body more
+    than three lines below its `/**` leaves the opener outside the hunk
+    entirely. Resetting block state at every `@@` therefore scanned ordinary
+    documentation as code — the single most likely way this gate would start
+    rejecting legitimate resolver docs (@john-the-dev, reviewing #2474).
+
+    The inference requires CORROBORATION, not just a closer. A line-start `*/`
+    alone is not proof: it is reachable from ordinary code via a multi-line
+    template literal, whose opening backtick the single-line
+    `_blank_string_literals` cannot carry across lines —
+
+        const p = "/usr/bin/python3"; const tpl = `
+        */
+        `;
+
+    — which let a hidden closer start the whole hunk in block state and mask the
+    executable stub path on line 1 (@john-the-dev, reviewing #2474; an earlier
+    revision of this docstring claimed the line-start rule prevented exactly
+    that, and this control disproved it).
+
+    So a closer only counts when some EARLIER line in the hunk already looks
+    like comment body (`*` or `/*` leading). Real JSDoc always has that; the
+    template literal does not. Everything else means "assume code" — so the
+    multiplication bypass (`const n = 2` / `  * "…"`, which has no closer at
+    all) is still scanned.
+    """
+    saw_comment_body = False
+    quote = None
+    for text in lines:
+        # Delimiter-aware: a `*/` inside a string literal is data, not a comment
+        # close. Without this, `const closer = "*/";` established block state for
+        # the whole hunk and masked the executable code before it — a bypass in
+        # the SUPPRESSION direction, the reverse of the string-literal caveat on
+        # _mask_comments (@john-the-dev, reviewing #2474).
+        bare, quote = _blank_string_literals(text, quote)
+        if "/*" in bare:
+            return False
+        # Require the closer to be the first thing on its line — the canonical
+        # JSDoc shape (` */`). A mid-line `*/` that survived string-blanking is
+        # not evidence a comment was opened ABOVE this hunk.
+        stripped = bare.lstrip()
+        if stripped.startswith("*/"):
+            return saw_comment_body
+        if stripped.startswith("*"):
+            saw_comment_body = True
+    return False
+
+
+def _blank_string_literals(text, quote=None):
+    """Blank quoted spans so delimiters inside them are ignored.
+
+    Returns (blanked, quote_after). `quote_after` is a BACKTICK or None: a
+    template literal is the only JS string that survives a newline, so it is the
+    only state worth carrying to the next line. An unterminated ' or " is a
+    single-line syntax error, not state.
+
+    Carrying that state is what closes the corroboration bypass. Both the
+    evidence line AND the closer can sit inside one multiline template:
+
+        const p = "/usr/bin/python3"; const tpl = `
+        * template content
+        */
+        `;
+
+    which is valid JS. Line-at-a-time blanking saw `* template content` as
+    comment-body evidence and `*/` as a closer, inferred the hunk had opened
+    inside a comment, and masked the executable path on line 1
+    (@john-the-dev, reviewing #2474). With the backtick carried, lines 2-3 are
+    blanked as string content and provide no evidence at all.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                out.append("  ")
+                i += 2
+                continue
+            out.append(" ")
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'`":
+            quote = ch
+            out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    # Only a template literal survives to the next line.
+    return "".join(out), (quote if quote == "`" else None)
+
+
 def _doc_transition(line, in_doc):
     """Triple-quote (docstring) state AFTER `line`, given the state before it.
 
@@ -639,6 +807,21 @@ def _doc_transition(line, in_doc):
     return bool(_DOCSTRING_OPEN.match(line.lstrip())) and quotes % 2 == 1
 
 
+def _hunk_body(all_lines, start):
+    """New-file view of the hunk beginning after index `start`: context + added
+    lines with their diff marker stripped, stopping at the next hunk or file."""
+    body = []
+    j = start + 1
+    while j < len(all_lines):
+        nxt = all_lines[j]
+        if nxt.startswith("@@ ") or nxt.startswith("+++ ") or nxt.startswith("diff "):
+            break
+        if nxt.startswith(" ") or nxt.startswith("+"):
+            body.append(nxt[1:])
+        j += 1
+    return body
+
+
 def main():
     diff = sys.stdin.read()  # streamed by the runner — see module docstring (#2281)
     skip = False
@@ -646,12 +829,13 @@ def main():
     cur_file = ""
     hits = 0
     in_doc = False   # inside a triple-quoted docstring/string block (reset per hunk)
+    in_block = False # inside a /* … */ block comment (inferred per hunk)
     # Executable text of the PREVIOUS added line. A JS member expression can
     # continue across a newline, so `paths\n["k"]` is an index even though the
     # bracket starts its line. Reset per file and per hunk — a gap between hunks
     # means the preceding line is unknown, and unknown must not read as "standalone".
     prev_added = None
-    _lines = diff.split("\n")
+    all_lines = diff.split("\n")
 
     # Next-MEANINGFUL-line links, precomputed once in a single backward pass.
     #
@@ -666,11 +850,11 @@ def main():
     # executable text is non-blank, or None when a hunk boundary intervenes.
     # Building it is O(lines); following it is O(_CHAIN_LOOKAHEAD) per token, so
     # blanks cost nothing at either end.
-    _codes = [None] * len(_lines)
-    _nm = [None] * len(_lines)
+    _codes = [None] * len(all_lines)
+    _nm = [None] * len(all_lines)
     _carry = None
-    for _k in range(len(_lines) - 1, -1, -1):
-        _l = _lines[_k]
+    for _k in range(len(all_lines) - 1, -1, -1):
+        _l = all_lines[_k]
         if _l.startswith("+++") or not (_l.startswith("+") or _l.startswith(" ")):
             _carry = None                 # boundary: nothing past it is reachable
             continue
@@ -697,8 +881,8 @@ def main():
             j = _nm[j]
         return tuple(out) or None
 
-    for _i, raw in enumerate(_lines):
-        next_added = _next_code(_i)
+    for idx, raw in enumerate(all_lines):
+        next_added = _next_code(idx)
         if raw.startswith("+++ "):
             f = raw[4:].split("\t")[0]
             if f.startswith("b/"):
@@ -708,6 +892,7 @@ def main():
             skip = bool(SKIP.search(f))
             in_doc = False
             prev_added = None
+            in_block = False
             continue
         if raw.startswith("@@ "):
             m = re.search(r"\+(\d+)", raw)
@@ -718,6 +903,10 @@ def main():
             # this hunk is tracked, without carrying stale state across a gap.
             in_doc = False
             prev_added = None
+            # Block state cannot simply reset: the `/**` opener is routinely
+            # outside the 3 lines of context. Infer it from the hunk's own
+            # content instead (see _hunk_opens_in_block).
+            in_block = _hunk_opens_in_block(_hunk_body(all_lines, idx))
             continue
         if raw.startswith("-"):
             continue
@@ -726,6 +915,7 @@ def main():
             # new-file line counter just like additions do — and they move the
             # docstring state (a docstring may open on unchanged context).
             in_doc = _doc_transition(raw[1:], in_doc)
+            in_block = _block_transition(raw[1:], in_block)
             ln += 1
             # A context line is part of the NEW file too, so it can be the
             # expression a following added bracket subscripts. Not carrying it
@@ -746,24 +936,32 @@ def main():
             # the opening `"""` line itself is still checked.
             was_in_doc = in_doc
             in_doc = _doc_transition(line, in_doc)
+            # Mask block-comment REGIONS so a path is judged by where it sits on
+            # the line, not by the line's state before it. `scan` is what the
+            # patterns are matched against; `stripped` stays the real source so
+            # the reported line is readable.
+            scan_line, in_block = _mask_comments(line, in_block)
             stripped = line.lstrip()
             if was_in_doc or stripped.startswith("#") or stripped.startswith("//"):
                 continue
-            # EVERY occurrence of each flag, not just the first. `paired_allowed`
-            # is a PARTIAL exemption, so once the first token on a line pairs
-            # successfully a first-occurrence-only scan stops looking — and a
-            # second, companion-less literal on the same line passes silently.
-            # Harmless before this PR (nothing ever exempted an /opt/ token, so
-            # the first occurrence always flagged); a real hole once partial
-            # exemptions exist.
+            # EVERY occurrence of each flag, not just the first (`paired_allowed`
+            # is a PARTIAL exemption — a first-occurrence-only scan would let a
+            # second, companion-less literal on the same line pass silently), and
+            # (pattern, exact) pairs — exact patterns fire only when the extracted
+            # token IS the pattern (swift-inspect vs swift stays untouched).
+            # Scans the comment-MASKED text (offset-preserving), pairing context
+            # reads the original line.
             reported = False
-            for p in flags:
+            for p, exact in [(f, False) for f in flags] + [(f, True) for f in flags_exact]:
                 start = 0
                 while True:
-                    pos = line.find(p, start)
+                    pos = scan_line.find(p, start)
                     if pos < 0:
                         break
-                    tok = token_at(line, pos)
+                    tok = token_at(scan_line, pos)
+                    if exact and tok != p:
+                        start = pos + len(p)
+                        continue
                     if not allowed(tok) and not paired_allowed(tok, line, pos, cur_file, prev_added, next_added):
                         print("%s:%d: hardcoded path (%s): %s" % (cur_file, cur, tok, stripped))
                         hits += 1

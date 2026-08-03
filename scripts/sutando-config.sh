@@ -33,13 +33,29 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Resolve the Python interpreter. On a fresh Mac there is NO system python3 — the
+# bare `python3` name resolves to Apple's Xcode-CLT stub, which prints an "install
+# developer tools" notice and returns NOTHING, so callers that don't export
+# SUTANDO_PY (e.g. the desktop's Tauri sign-in, which shells this to resolve
+# CLAUDE_CONFIG_DIR) got an empty result and failed with "could not resolve the
+# bundled CLAUDE_CONFIG_DIR". Prefer, in order: an explicit SUTANDO_PY (set by
+# launch-sutando.sh), the bundle-vendored relocatable python next to the engine
+# copy (`<engine>/runtime/python`, i.e. REPO_ROOT/../runtime), then system python3.
+if [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
+  PY="$SUTANDO_PY"
+elif [ -x "$REPO_ROOT/../runtime/python/bin/python3" ]; then
+  PY="$REPO_ROOT/../runtime/python/bin/python3"
+else
+  PY="python3"
+fi
+
 cmd="${1:-workspace}"
 
 case "$cmd" in
   workspace)
     # `python3 -c` instead of `-m` so we don't pollute argv[0] with a module
     # path that confuses the loader's exe-anchored repo discovery.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_workspace
@@ -48,7 +64,7 @@ print(resolve_workspace(), end='')
     ;;
 
   vault-enabled)
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -57,7 +73,7 @@ print('true' if resolve_vault().get('enabled') else 'false', end='')
     ;;
 
   vault-url)
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -69,7 +85,7 @@ print(resolve_vault().get('remote_url', ''), end='')
     # PR-3: print sync.include paths one-per-line. Consumed by
     # sync-workspace.sh::_compose_gitignore_content to drive the carrier-set
     # whitelist. Schema in sutando_config.py::resolve_vault.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -82,7 +98,7 @@ for p in resolve_vault().get('sync', {}).get('include', []):
     # PR-3: print sync.exclude paths one-per-line. Explicit denies emitted
     # AFTER the include whitelist (gitignore last-match wins), so user can
     # carve out subpaths from an otherwise-included directory.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -95,7 +111,7 @@ for p in resolve_vault().get('sync', {}).get('exclude', []):
     # Print migrate.stale_hosts (one per line) — per-clone machine-<host> dirs
     # the legacy import should DROP. Lives in sutando.config.local.json (gitignored,
     # per-clone), NOT .env: this is config, not a secret. Default empty.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import load_config
@@ -108,7 +124,7 @@ for h in load_config().get('migrate', {}).get('stale_hosts', []):
     # Print migrate.skip_skills (one per line) — per-clone host-only skill names
     # the legacy import should NOT salvage to shared (stale/superseded). Same
     # gitignored per-clone config home as migrate-stale-hosts. Default empty.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import load_config
@@ -123,7 +139,7 @@ for s in load_config().get('migrate', {}).get('skip_skills', []):
     # legacy `claude_sutando_config_dir.subdir` (deprecation-warned) →
     # `<workspace>/.claude-sutando` baked default. `synced=true` entries are
     # validated to be under the workspace at load time.
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_claude_sutando_config_dir
@@ -179,7 +195,7 @@ print(resolve_claude_sutando_config_dir(), end='')
     # Optional second arg picks by id or type; defaults to first type=claude.
     # Example: `bash sutando-config.sh core-config-dir-env-name` → CLAUDE_CONFIG_DIR
     _selector="${2:-claude}"
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import find_core_config_dir
@@ -191,7 +207,7 @@ print(entry['env_name'], end='')
     ;;
 
   core-runtime)
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_core_runtime
@@ -204,7 +220,7 @@ print(resolve_core_runtime(), end='')
     # core_config_dirs entry. Selector semantics identical to
     # core-config-dir-env-name.
     _selector="${2:-claude}"
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import find_core_config_dir
@@ -219,12 +235,32 @@ print(entry['value'], end='')
     # v0.9 — print all resolved core_config_dirs entries as JSON (one object
     # per line — JSON Lines). For tooling that wants to enumerate without
     # parsing the full merged config.
-    python3 -c "
+    "$PY" -c "
 import json, sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_core_config_dirs
 for entry in resolve_core_config_dirs():
     print(json.dumps(entry))
+"
+    ;;
+
+  stand)
+    # This instance's `Stand:` commit-trailer value, from the per-clone config
+    # key `stand` (sutando.config.local.json). Empty when unset.
+    #
+    # Both fleet instances commit under the owner's GH-mapped email (CLA), so no
+    # git field distinguishes them; the trailer is the only discriminator, and
+    # consumers need it WITHOUT an environment (the scheduled cron exports
+    # nothing — john-the-dev, sutando#2484). Deliberately has NO fallback guess:
+    # an unset key must read as "unknown" so callers decline rather than
+    # attribute a foreign identity. Never infer it from the host name — that is
+    # installation-specific policy and would assign this owner's Stand values on
+    # someone else's machine.
+    "$PY" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import load_config
+print(str(load_config().get('stand', '') or '').strip(), end='')
 "
     ;;
 
@@ -239,7 +275,7 @@ for entry in resolve_core_config_dirs():
     #   1. $SUTANDO_HOST_LABEL (or legacy $SUTANDO_HOST_OVERRIDE)
     #   2. macOS `scutil --get LocalHostName` (stable Bonjour name)
     #   3. short `hostname`
-    python3 -c "
+    "$PY" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.util_paths import _host_label
@@ -313,7 +349,7 @@ print(_host_label(), end='')
     ;;
 
   dump)
-    python3 -m src.sutando_config
+    "$PY" -m src.sutando_config
     ;;
 
   subdirs)
@@ -400,7 +436,7 @@ print(_host_label(), end='')
     # socket. Reuses src/runtime-health.py for alive/health/authenticated (single
     # liveness source of truth) and the canonical resolve_claude_sutando_config_dir()
     # for brain (honors core_config_dirs[type=claude] customization).
-    python3 -c "
+    "$PY" -c "
 import sys, os, json, time, subprocess
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_workspace, resolve_claude_sutando_config_dir
@@ -527,9 +563,32 @@ except Exception:
 # independent); dirty flags uncommitted edits. A stronger working-tree
 # 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
 # follow-up alongside the identity block.
-def _git(*a):
+# Resolve ONCE, before any spawn. Two gates, both required:
+#   1. No .git marker -> not a checkout, so every field below would be None
+#      anyway. The packaged app ships the engine as an rsync copy WITHOUT .git,
+#      so on that install these five calls did no useful work at all.
+#      os.path.exists, NOT isdir: a linked worktree or submodule has .git as a
+#      FILE containing a gitdir: pointer, and isdir() blanked the identity
+#      fields on those perfectly valid checkouts (@john-the-dev, #2478).
+#   2. No runnable git -> on a Mac without developer tools /usr/bin/git is the
+#      Xcode-CLT stub, and SPAWNING it raises the modal install dialog before it
+#      can fail. Catching a non-zero exit is too late; the prompt already fired.
+# The desktop app polls this descriptor (core_terminal.rs), so the old code
+# leaked that dialog on every poll of a packaged, toolchain-free install.
+_git_bin = None
+if os.path.exists(os.path.join(repo, '.git')):
     try:
-        r = subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, timeout=5)
+        sys.path.insert(0, os.path.join(repo, 'src'))
+        from git_binary import resolve_git
+        _git_bin = resolve_git()
+    except Exception:
+        _git_bin = None
+
+def _git(*a):
+    if _git_bin is None:
+        return None
+    try:
+        r = subprocess.run([_git_bin, '-C', repo, *a], capture_output=True, text=True, timeout=5)
         return (r.stdout.strip() or None) if r.returncode == 0 else None
     except Exception:
         return None

@@ -16,6 +16,7 @@ MODPATH = REPO / "scripts" / "review-checks.py"
 
 # Module reads RC_FLAGS / RC_ALLOWS at import time — set them first.
 os.environ["RC_FLAGS"] = "\n".join(["/Users/", "/home/", "~/.claude"])
+os.environ["RC_FLAGS_EXACT"] = "\n".join(["/usr/bin/swift", "/usr/bin/make"])
 os.environ["RC_ALLOWS"] = "\n".join(["/tmp/", "/nonexistent", "example.com"])
 # Contextual (paired) allow — exercised below. Parsed at import like the others.
 os.environ["RC_ALLOW_PAIRED"] = "/opt/homebrew/ :: /usr/local/"
@@ -1060,6 +1061,204 @@ ok("_is_candidate_container: a paren at COLUMN 0 is still a tuple (python)",
 ok("paired: a token under NO configured paired prefix falls through the loop",
    not rc.paired_allowed("/Users/alice/ffmpeg",
                          '["/Users/alice/ffmpeg", "/usr/local/bin/ffmpeg"]', 2))
+# --- JSDoc / block-comment continuation lines -------------------------------
+# The `#` and `//` skips had no equivalent for ` * ` continuation lines, so
+# prose inside a /** … */ block was scanned as code. That bites once the flag
+# list carries tool paths, because the modules that RESOLVE those tools
+# necessarily document the hazard in JSDoc.
+code, out = scan(
+    '+++ b/src/app.ts\n'
+    '@@ -1,0 +1,4 @@\n'
+    '+/**\n'
+    '+ * Legacy note: the old path was /Users/legacy/thing.\n'
+    '+ *\n'
+    '+ */'
+)
+ok("JSDoc continuation prose is NOT flagged", out.strip() == "")
+
+# The two shapes that must STAY scannable, so the skip cannot be used as a
+# bypass: a `/* … */ code` one-liner, and a generator method (`*name()`, no
+# space after the star).
+code, out = scan(
+    '+++ b/src/app.ts\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+/* inline */ const sneaky = "/Users/a/b";'
+)
+ok("an inline /* */ comment does not exempt code on the same line",
+   "src/app.ts:1:" in out)
+
+code, out = scan(
+    '+++ b/src/app.ts\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+  *gen() { return "/Users/a/b"; }'
+)
+ok("a generator method is not mistaken for a comment", "src/app.ts:1:" in out)
+
+# --- block-comment suppression must be STATEFUL (#2474 review, bypass) ------
+# `* ` at the start of a line is not proof of a comment: it is also a continued
+# multiplication. Suppressing on that shape alone let a real path through.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,2 @@\n'
+    '+const n = 2\n'
+    '+  * "/Users/alice/secret".length;'
+)
+ok("continued multiplication is NOT mistaken for JSDoc (scanner bypass)",
+   "/Users/alice/secret" in out)
+
+# Genuine JSDoc prose stays exempt...
+code, out = scan(
+    '+++ b/src/x.ts\n'
+    '@@ -1,0 +1,4 @@\n'
+    '+/**\n'
+    '+ * Legacy note: the old path was /Users/legacy/thing.\n'
+    '+ *\n'
+    '+ */'
+)
+ok("JSDoc body inside a real /* */ span is exempt", out.strip() == "")
+
+# ...and code AFTER the block closes is scanned again.
+code, out = scan(
+    '+++ b/src/x.ts\n'
+    '@@ -1,0 +1,3 @@\n'
+    '+/** note */\n'
+    '+const p = "/Users/after/block";'
+)
+ok("code after a closed block comment is scanned", "/Users/after/block" in out)
+
+# --- JSDoc body whose opener is OUTSIDE the hunk (#2474 review) -------------
+# A unified diff carries 3 context lines, so editing a JSDoc body more than 3
+# lines below its `/**` leaves the opener out of the hunk. Block state must be
+# inferred from the hunk's own content, not reset to False.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -20,3 +20,4 @@\n'
+    ' * earlier prose\n'
+    '+ * On macOS /Users/legacy/thing is gone.\n'
+    ' */\n'
+    ' export function x() {}'
+)
+ok("JSDoc body is exempt when its opener is outside the hunk", out.strip() == "")
+
+# The path sits in the comment portion of the line that OPENS the comment, so a
+# line-level `state before this line` test gets it wrong.
+code, out = scan(
+    '+++ b/src/y.js\n'
+    '@@ -1,0 +1,2 @@\n'
+    '+/** helper for /Users/legacy/thing resolution\n'
+    '+ *  more prose'
+)
+ok("path inside the comment portion of an opening line is exempt", out.strip() == "")
+
+# ...but code AFTER a close on the same line is still scanned.
+code, out = scan(
+    '+++ b/src/z.js\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+/* note */ const p = "/Users/after/close";'
+)
+ok("code after a same-line comment close is scanned", "/Users/after/close" in out)
+
+# The inference must not swallow the bypass: no delimiters in the hunk at all
+# means "assume code".
+code, out = scan(
+    '+++ b/src/m.js\n'
+    '@@ -1,0 +1,2 @@\n'
+    '+const n = 2\n'
+    '+  * "/Users/alice/secret".length;'
+)
+ok("hunk inference does not resurrect the multiplication bypass",
+   "/Users/alice/secret" in out)
+
+# --- a quoted "*/" must not establish block state (#2474 review, bypass) ----
+# The hunk-start inference treated the first `*/` anywhere as proof the hunk
+# began inside a comment, so a string literal containing it masked the
+# executable code before it.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+const p = "/Users/alice/secret"; const closer = "*/";'
+)
+ok("a quoted */ does not establish block state (scanner bypass)",
+   "/Users/alice/secret" in out)
+
+# _blank_string_literals directly: escapes and each quote style.
+# _blank_string_literals returns (blanked, carry) — index [0] for the text.
+ok("blank: double-quoted span is blanked",
+   rc._blank_string_literals('a = "*/" ; b')[0] == 'a =      ; b')
+ok("blank: single-quoted span is blanked",
+   "*/" not in rc._blank_string_literals("a = '*/'")[0])
+ok("blank: template literal is blanked",
+   "*/" not in rc._blank_string_literals("a = `*/`")[0])
+ok("blank: escaped quote does not end the span early",
+   "*/" not in rc._blank_string_literals('a = "x\\"*/" ; end')[0])
+ok("blank: code outside strings is preserved",
+   rc._blank_string_literals("const x = 1;")[0] == "const x = 1;")
+
+# An UNquoted mid-line */ still does not establish block state — only a
+# line-start closer does, so a stray token cannot suppress the rest of a hunk.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,1 @@\n'
+    '+foo(); /* note */ const p = "/Users/mid/line";'
+)
+ok("mid-line comment close does not suppress later code", "/Users/mid/line" in out)
+
+# --- a line-start */ hidden in a MULTI-LINE template literal (#2474 review) --
+# _blank_string_literals is single-line, so it loses the opening backtick before
+# the next line is examined. A closer therefore only counts when an earlier line
+# in the hunk already looks like comment body.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,3 @@\n'
+    '+const p = "/Users/alice/secret"; const tpl = `\n'
+    '+*/\n'
+    '+`;'
+)
+ok("a */ inside a multi-line template does not establish block state",
+   "/Users/alice/secret" in out)
+
+# --- corroboration must not come from INSIDE a template literal (#2474) -----
+# Both the evidence line and the closer can sit in one multiline template, which
+# is valid JS. Line-at-a-time string blanking treated them as comment evidence.
+code, out = scan(
+    '+++ b/src/x.js\n'
+    '@@ -1,0 +1,4 @@\n'
+    '+const p = "/Users/alice/secret"; const tpl = `\n'
+    '+* template content\n'
+    '+*/\n'
+    '+`;'
+)
+ok("comment-body evidence inside a template does not establish block state",
+   "/Users/alice/secret" in out)
+
+# _blank_string_literals now reports carry-over state: a backtick survives the
+# line, a single/double quote does not (unterminated is a syntax error, not state).
+_b, q = rc._blank_string_literals("const t = `open")
+ok("blank: an open backtick carries to the next line", q == "`")
+_b, q = rc._blank_string_literals('const s = "closed"')
+ok("blank: a balanced quote carries nothing", q is None)
+_b, q = rc._blank_string_literals("const s = 'unterminated")
+ok("blank: an unterminated single quote does not carry", q is None)
+_b, q = rc._blank_string_literals("still inside", "`")
+ok("blank: content stays blanked while inside a template", "still" not in _b)
+
+# --- flag_exact: whole-token, not substring (#2474 review) ------------------
+# A full executable path must not reject longer siblings in the same directory
+# family: /usr/bin/swift-inspect is a separate REAL binary (own inode, link
+# count 1) while /usr/bin/swift is the stub.
+code, out = scan('+++ b/src/a.swift\n@@ -1,0 +1,1 @@\n+p = "/usr/bin/swift"')
+ok("flag_exact matches the exact token", "/usr/bin/swift" in out)
+
+code, out = scan('+++ b/src/a.swift\n@@ -1,0 +1,1 @@\n+p = "/usr/bin/swift-inspect"')
+ok("flag_exact does NOT match a longer sibling (swift-inspect)", out.strip() == "")
+
+code, out = scan('+++ b/src/a.sh\n@@ -1,0 +1,1 @@\n+p = "/usr/bin/makeinfo"')
+ok("flag_exact does NOT match a longer sibling (makeinfo)", out.strip() == "")
+
+# `flag` keeps its substring semantics — /Users/ must still match a longer path.
+code, out = scan('+++ b/src/a.py\n@@ -1,0 +1,1 @@\n+p = "/Users/alice/deep/path"')
+ok("flag (substring) semantics unchanged alongside flag_exact",
+   "/Users/alice/deep/path" in out)
 
 print("---")
 if failed:

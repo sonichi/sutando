@@ -115,7 +115,12 @@ class TestDmOnlyMarker(unittest.TestCase):
         r = parse_markers("[channel: 1527723291324842135]\nsecret [dm-only] stuff")
         self.assertIsNone(first_action(r, "redirect"))
         self.assertEqual(first_action(r, "dm-only").kind, "dm-only")
-        self.assertNotIn("[dm-only]", r.body)
+        # The marker STAYS in the body here, on purpose: it is inline prose,
+        # and stripping it rewrote the owner's sentence ("secret  stuff").
+        # Only a standalone marker is stripped now. Detection is unchanged —
+        # the two assertions above, which are what this test is named for,
+        # still prove dm-only wins regardless of order.
+        self.assertIn("[dm-only]", r.body)
         self.assertNotIn("[channel:", r.body)
 
     def test_skip_still_beats_dm_only(self):

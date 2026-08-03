@@ -23,10 +23,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // fallback). The Swift loader twin lives at
     // src/Sutando/SutandoConfig.swift and matches src/sutando_config.{py,ts}
     // byte-for-byte. Resolution order:
-    //   1. $SUTANDO_WORKSPACE env var (legacy escape hatch; warn once)
-    //   2. sutando.config.local.json -> workspace.path (per-clone override)
-    //   3. sutando.config.json -> workspace.path (tracked defaults)
-    //   4. ${REPO_DIR}/workspace baked-in default
+    //   1. sutando.config.local.json -> workspace.path (per-clone override)
+    //   2. sutando.config.json -> workspace.path (tracked defaults)
+    //   3. ${REPO_DIR}/workspace baked-in default
+    // $SUTANDO_WORKSPACE is NOT in the order — removed in v0.8; a set env var
+    // only warns. This comment claims to match sutando_config.{py,ts}
+    // byte-for-byte, so it has to track that removal too.
     //
     // Pre-#762 main.swift wrote tasks/logs/state under the repo checkout via
     // CLAUDE.md walk-up. Post-#762 that dir no longer exists, so writeTask
@@ -343,6 +345,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Force Restart Core CLI", action: #selector(forceRestartCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Stop Core CLI", action: #selector(stopCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart Sutando App", action: #selector(restartSelf), keyEquivalent: ""))
@@ -410,6 +414,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // rather than waiting 30min.
         DispatchQueue.global(qos: .background).async { [weak self] in
             self?.runHealthCheck()
+        }
+
+        // Easy-restart intent poller (sonichi#2401): every 5s, consume
+        // <workspace>/state/core-restart-requested.json (written by a bridge
+        // on the owner's "restart core" / "stop core" chat command — bridges
+        // survive core death, which is exactly when this matters) and run the
+        // action HERE, in the GUI login session, so the relaunch comes up
+        // authenticated (no SSH keychain wall — the 2026-07-29 outage class).
+        // Human-triggered only: nothing writes this file autonomously, and a
+        // consumed "stop" has no auto-restart anywhere. Consume-before-act +
+        // 10-min staleness drop mirror core_restart_intent.py exactly.
+        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.pollRestartIntent()
         }
 
         // Presenter mode: poll iclr-highlight server for on/off state.
@@ -612,7 +629,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// per-host paths from the scutil-named Chis-MacBook-Pro subtree; #1745).
     func perHostLabel() -> String {
         let env = ProcessInfo.processInfo.environment
-        if let v = env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"], !v.isEmpty {
+        // `!v.isEmpty` is false for "   ", so a blank-but-set override became the
+        // label and produced `hosts/   /`. Trim first; blank means unset, same as
+        // the scutil branch below already does. Lockstep with util_paths.py/.ts.
+        if let v = (env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
             return v
         }
         if let lhn = runShell("/usr/sbin/scutil", ["--get", "LocalHostName"])?
@@ -1865,20 +1886,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openCore() {
-        // Activate Terminal running Claude Code
-        let script = NSAppleScript(source: """
-        tell application "Terminal"
-            activate
-            -- Find the window running claude
-            repeat with w in windows
-                if name of w contains "claude" or name of w contains "sutando" then
-                    set index of w to 1
-                    exit repeat
-                end if
-            end repeat
-        end tell
-        """)
-        script?.executeAndReturnError(nil)
+        // Open a Terminal window ATTACHED to the core tmux session via a
+        // generated .command file + `open -a Terminal` — the TCC-free path
+        // (sonichi#2410). The old AppleScript raise-by-title was a no-op with
+        // the core detached (no window to find, title never matched, and it
+        // required an Automation grant most installs never made).
+        let socket = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SOCKET"] ?? "/tmp/sutando-tmux.sock"
+        let session = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SESSION"] ?? "sutando-core"
+        let cmdPath = workspace + "/state/attach-core.command"
+        let body = """
+        #!/bin/bash
+        # Auto-generated by Sutando.app Open Core CLI (sonichi#2410) — attaches
+        # this Terminal window to the core session. Safe to re-run; delete freely.
+        exec tmux -S '\(socket)' attach -t '\(session)'
+        """
+        do {
+            try FileManager.default.createDirectory(atPath: workspace + "/state",
+                                                    withIntermediateDirectories: true)
+            try body.write(toFile: cmdPath, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cmdPath)
+        } catch {
+            notify("Sutando", "Open Core CLI failed to prepare attach script: \(error.localizedDescription)")
+            return
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        proc.arguments = ["-a", "Terminal", cmdPath]
+        do { try proc.run() } catch {
+            notify("Sutando", "Open Core CLI failed to open Terminal: \(error.localizedDescription)")
+        }
     }
 
     @objc func openDashboard() {
@@ -2446,7 +2482,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let script = repoRoot + "/src/agent/start-cli.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [script, "--restart"]
+        proc.arguments = [script, "--restart", "--visible"]
         // Capture stderr so we can surface failures via notify rather than
         // silently swallowing (per Mini's #608 review nit #1). stdout still
         // discarded — script's success messages aren't useful to the user.
@@ -2469,6 +2505,91 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let preview = String(errStr.prefix(200))
                 self?.notify("Sutando", "Core restart failed (exit \(proc.terminationStatus)): \(preview)")
             }
+        }
+    }
+
+    /// Force-restart the core CLI: SIGTERM → SIGKILL escalation for a wedged /
+    /// unresponsive core that plain "Restart Core CLI" (graceful) refuses to
+    /// hammer. Separate menu item per sonichi's review — the default restart
+    /// never SIGKILLs a possibly-mid-task core; this one does, explicitly.
+    /// Same detached-bash + stderr-on-failure contract as restartCore.
+    @objc func forceRestartCore() {
+        notify("Sutando", "Force-restarting Core CLI…")
+        runCoreAction(script: repoRoot + "/src/agent/start-cli.sh", args: ["--force-restart"],
+                      okMessage: "Core force-restarted. Attach via Open Core CLI in menu.",
+                      failVerb: "Core force-restart")
+    }
+
+    /// Stop ONLY the core CLI session (sonichi#2401 "stop means stop"):
+    /// bridges and services keep running, and nothing relaunches the core
+    /// until the user asks (menu or chat command).
+    @objc func stopCore() {
+        notify("Sutando", "Stopping Core CLI…")
+        runCoreAction(script: repoRoot + "/src/agent/stop-core.sh", args: [],
+                      okMessage: "Core stopped. It stays stopped until you restart it.",
+                      failVerb: "Core stop")
+    }
+
+    /// Shared runner for core start/stop scripts: detached bash, stderr
+    /// surfaced via notify on failure (same contract as restartCore).
+    private func runCoreAction(script: String, args: [String],
+                               okMessage: String, failVerb: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script] + args
+        let errPipe = Pipe()
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = errPipe
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                try proc.run()
+            } catch {
+                self?.notify("Sutando", "\(failVerb) failed to start: \(error.localizedDescription)")
+                return
+            }
+            proc.waitUntilExit()
+            if proc.terminationStatus == 0 {
+                self?.notify("Sutando", okMessage)
+            } else {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8) ?? ""
+                let preview = String(errStr.prefix(200))
+                self?.notify("Sutando", "\(failVerb) failed (exit \(proc.terminationStatus)): \(preview)")
+            }
+        }
+    }
+
+    /// Consume <workspace>/state/core-restart-requested.json and perform the
+    /// requested action in THIS (GUI) session. Mirrors core_restart_intent.py:
+    /// delete-before-act, unknown/malformed/stale (>600s) intents dropped —
+    /// and the delete must SUCCEED before any dispatch: an undeletable file
+    /// would re-fire the same action every 5s poll, so fail closed instead
+    /// (qingyun review, #2408).
+    func pollRestartIntent() {
+        let path = workspace + "/state/core-restart-requested.json"
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        let raw = try? String(contentsOfFile: path, encoding: .utf8)
+        do {
+            try FileManager.default.removeItem(atPath: path)  // consume FIRST
+        } catch {
+            notify("Sutando", "Restart request file couldn't be consumed — NOT acting (would loop). Remove it manually: \(path)")
+            return
+        }
+        guard let raw = raw,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let action = obj["action"] as? String,
+              let requestedAt = obj["requested_at"] as? Double,
+              Date().timeIntervalSince1970 - requestedAt <= 600 else { return }
+        switch action {
+        case "restart":
+            notify("Sutando", "Chat-requested core restart — relaunching…")
+            restartCore()
+        case "stop":
+            notify("Sutando", "Chat-requested core stop.")
+            stopCore()
+        default:
+            return
         }
     }
 

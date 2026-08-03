@@ -67,6 +67,10 @@ parse_list() {  # $1 = flag|allow ; reads $GUIDE
     ' "$GUIDE"
 }
 FLAGS="$(parse_list flag)"
+# flag_exact: patterns that must match the WHOLE path token, not a substring.
+# Needed for full executable paths — '/usr/bin/swift' as a substring also
+# rejects the real, separate '/usr/bin/swift-inspect' binary (#2474 review).
+FLAGS_EXACT="$(parse_list flag_exact)"
 ALLOWS="$(parse_list allow)"
 ALLOW_PAIRED="$(parse_list allow_paired)"
 NOTE=""
@@ -84,7 +88,7 @@ fi
 # — so a large PR diff (~8MB) can't hit 'Argument list too long' and make the
 # scanner fail to launch while we blindly print PASS (#2281). `printf` is a bash
 # builtin, so piping the whole diff carries no exec-size limit.
-HITS="$(printf '%s' "$DIFF" | RC_FLAGS="$FLAGS" RC_ALLOWS="$ALLOWS" RC_ALLOW_PAIRED="$ALLOW_PAIRED" python3 "$HERE/review-checks.py")"
+HITS="$(printf '%s' "$DIFF" | RC_FLAGS="$FLAGS" RC_FLAGS_EXACT="$FLAGS_EXACT" RC_ALLOWS="$ALLOWS" RC_ALLOW_PAIRED="$ALLOW_PAIRED" python3 "$HERE/review-checks.py")"
 SCAN_RC=$?
 # Fail closed: if the scanner didn't run to completion (exec failure, crash),
 # its exit is non-zero. Do NOT interpret an empty stdout as "clean" — error out.
