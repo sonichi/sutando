@@ -57,18 +57,11 @@ refute() {
 # 1. The shipped default list itself. Read sutando.config.json directly — this
 #    is the assertion whose absence let the entry be removed silently.
 # ---------------------------------------------------------------------------
-refute "shipped sutando.config.json does NOT list the FLAT state/current-track.md (#2567)" \
+check "shipped sutando.config.json lists state/current-track.md in vault.sync.include" \
     python3 -c "
 import json, pathlib, sys
 inc = json.loads(pathlib.Path('$REPO/sutando.config.json').read_text())['vault']['sync']['include']
 sys.exit(0 if 'state/current-track.md' in inc else 1)
-"
-
-check "shipped sutando.config.json still carries hosts/*/ (the anchor's new home)" \
-    python3 -c "
-import json, pathlib, sys
-inc = json.loads(pathlib.Path('$REPO/sutando.config.json').read_text())['vault']['sync']['include']
-sys.exit(0 if 'hosts/*/' in inc else 1)
 "
 
 check "...and does NOT blanket-include state/ (which would carry transient churn)" \
@@ -100,9 +93,7 @@ git init -q --bare "$FIXTURE_VAULT"
 
 # Point the workspace at the fixture and populate the discriminating files.
 mkdir -p "$FIXTURE_WS/state" "$FIXTURE_WS/notes"
-mkdir -p "$FIXTURE_WS/hosts/carrier-host"
-printf 'pinned track\n'  > "$FIXTURE_WS/hosts/carrier-host/current-track.md"
-printf 'stale flat\n'    > "$FIXTURE_WS/state/current-track.md"
+printf 'pinned track\n'  > "$FIXTURE_WS/state/current-track.md"
 printf '{"status":"idle"}\n' > "$FIXTURE_WS/state/core-status.json"
 printf '{"v":1}\n'       > "$FIXTURE_WS/state/voice-state.json"
 printf '12345\n'         > "$FIXTURE_WS/state/watch-tasks-stream.pid"
@@ -128,7 +119,9 @@ env "${SYNC_ENV[@]}" bash "$SYNC" \
 
 RULES="$FIXTURE_WS/.git/info/exclude"
 
-refute "generated rules do NOT un-ignore the FLAT state/current-track.md (#2567)" \
+check "generated rules un-ignore the state/ ancestor" \
+    grep -qFx '!state/' "$RULES"
+check "generated rules un-ignore state/current-track.md itself" \
     grep -qFx '!state/current-track.md' "$RULES"
 refute "generated rules do NOT contain !state/** (would carry transient churn)" \
     grep -qFx '!state/**' "$RULES"
@@ -139,9 +132,7 @@ refute "generated rules do NOT contain !state/** (would carry transient churn)" 
 # ---------------------------------------------------------------------------
 git -C "$FIXTURE_WS" add -A >/dev/null 2>&1 || true
 
-check "git tracks the PER-HOST anchor hosts/<label>/current-track.md" \
-    git -C "$FIXTURE_WS" ls-files --error-unmatch hosts/carrier-host/current-track.md
-refute "git does NOT track the flat state/current-track.md (the shared path that collided)" \
+check "git tracks state/current-track.md" \
     git -C "$FIXTURE_WS" ls-files --error-unmatch state/current-track.md
 check "git tracks notes/ (default carrier set still intact)" \
     git -C "$FIXTURE_WS" ls-files --error-unmatch notes/a.md

@@ -1,7 +1,17 @@
 #!/bin/bash
-# Regression (#2567): a peer's carrier-set deletion must not destroy an
-# unmigrated host's anchor. The guarantee is LOCAL and pre-pull — a pushing
-# host can only add its OWN hosts/<label>/ copy, never the puller's.
+# PHASE 1 of the #2567 migration: every host copies its own anchor to the
+# host-qualified path BEFORE any pull, so that a LATER change can retire the
+# shared flat path without orphaning anyone.
+#
+# WHAT THIS TEST PROVES: the helper is correct and idempotent in isolation.
+# WHAT IT DOES NOT PROVE — stated because a reviewer had to point it out:
+# it calls the helper directly against one fixture, so the 'pulling' side
+# always has the fix by construction. It therefore CANNOT exercise the
+# mixed-version rolling upgrade (host A on new code, host B on old), which
+# is exactly the sequence that loses data. That is why this PR no longer
+# removes the flat carrier entry: phase 1 ships only the helper, so there is
+# no deletion for an old host to pull. Removal waits for phase 2, gated on
+# evidence that every host has migrated.
 # Run: bash tests/sync-workspace-anchor-migration.test.sh
 # Falsification harness for _migrate_flat_anchor (#2567): the peer-deletion path.
 set -uo pipefail
