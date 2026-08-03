@@ -345,6 +345,40 @@ class HealthCheckDegradesWithoutGit(unittest.TestCase):
         self.assertEqual(spawned, [], "probe spawned a process with no runnable git")
         self.assertRegex(result["detail"], r"(?i)git not runnable|no runnable git")
 
+    def test_checkout_is_canonical_degrades_without_git(self):
+        """`_checkout_is_canonical` must resolve git, not invoke a bare `git`.
+
+        It shipped in #2316 calling `subprocess.run(["git", "-C", ...])` twice
+        with a bare argv[0], while this module already imported `git_argv`. On a
+        Mac without the developer tools that string resolves to the /usr/bin/git
+        shim and pops the modal install dialog — and this function runs from
+        `fix_down_bridges`'s default "restart" action on EVERY health pass where
+        a bridge is down, so it repeats rather than firing once (qingyun-wu
+        2026-08-02, reproduced independently by bassilkhilo-ag2 at 8f029ebc).
+
+        Asserts the BEHAVIOUR that matters, matching the sibling test above:
+        with no runnable git the probe spawns NOTHING (a spawn is what raises
+        the modal) and fails closed. Reverting either call site to `["git", ...]`
+        makes `spawned` non-empty and this test red — that is the control.
+        """
+        spawned = []
+        real_run = subprocess.run
+
+        def spy(argv, *a, **k):
+            spawned.append(argv[0] if isinstance(argv, list) else argv)
+            return real_run(argv, *a, **k)
+
+        git_binary.reset_cache_for_tests()
+        try:
+            with patch.object(git_binary, "path_candidates", return_value=[]), \
+                 patch.object(subprocess, "run", spy):
+                ok, reason = health_check._checkout_is_canonical(REPO)
+        finally:
+            git_binary.reset_cache_for_tests()
+        self.assertEqual(spawned, [], "spawned a process with no runnable git — the CLT modal path")
+        self.assertFalse(ok, "must fail closed when git state is unreadable")
+        self.assertIn("unreadable", reason)
+
     def test_runs_against_a_real_git_without_raising(self):
         """Exercises both git invocations on a host that does have git.
 

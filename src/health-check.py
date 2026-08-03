@@ -1798,12 +1798,21 @@ def _checkout_is_canonical(repo_dir) -> tuple:
     and fail-closed: if git state is unreadable, treat it as non-canonical.
     """
     try:
+        # Route through git_argv, never a bare "git": a bare-string PATH lookup
+        # resolves to the /usr/bin/git SHIM on a macOS host without the Xcode
+        # command line tools, which pops the modal "install command line
+        # developer tools" dialog. This function runs from fix_down_bridges'
+        # default "restart" action on EVERY health-check pass where a bridge is
+        # down, so that dialog would repeat rather than appear once
+        # (qingyun-wu 2026-08-02, independently reproduced by bassilkhilo-ag2).
+        # git_argv raises GitUnavailable (an OSError) when the host has no git;
+        # the except below already turns that into the fail-closed verdict.
         branch_proc = subprocess.run(
-            ["git", "-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+            git_argv("-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"),
             capture_output=True, text=True, timeout=10,
         )
         dirty_proc = subprocess.run(
-            ["git", "-C", str(repo_dir), "status", "--porcelain"],
+            git_argv("-C", str(repo_dir), "status", "--porcelain"),
             capture_output=True, text=True, timeout=10,
         )
     except Exception as e:  # noqa: BLE001 — any git failure → fail closed
