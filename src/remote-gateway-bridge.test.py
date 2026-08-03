@@ -155,6 +155,148 @@ def main() -> int:
           "invalid REMOTE_TASK_TIER fails CLOSED to team (never silently owner)")
     os.environ.pop("REMOTE_TASK_TIER", None)
 
+    # ── GATEWAY_INSTANCE (multi-gateway): named instance suffixes the per-bridge
+    # state files + lock role; unset stays byte-identical to legacy ─────────────
+    os.environ["GATEWAY_INSTANCE"] = "dev"
+    _gspec = importlib.util.spec_from_file_location("rtc_inst", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _grtc = importlib.util.module_from_spec(_gspec)
+    _gspec.loader.exec_module(_grtc)
+    check(_grtc.INFLIGHT_FILE.name == "remote-task-inflight.dev.json",
+          "GATEWAY_INSTANCE=dev suffixes the inflight ledger")
+    check(_grtc.TASK_ROOMS_FILE.name == "remote-task-rooms.dev.json",
+          "GATEWAY_INSTANCE=dev suffixes the task-rooms sidecar")
+    check(_grtc.GATEWAY_STATUS_FILE.name == "gateway-status.dev.json",
+          "GATEWAY_INSTANCE=dev suffixes gateway-status")
+    check(_grtc._LOCK_ROLE == "gateway-bridge.dev",
+          "GATEWAY_INSTANCE=dev gets its OWN singleton lock role (per-gateway dual-poller guard)")
+    # A >32-char instance must refuse at import — the bound must equal
+    # _LOCAL_TID_RE's instance segment or a legal-looking env config accepts
+    # tasks, ACKs them, and silently strands their results (review P1, round 5).
+    os.environ["GATEWAY_INSTANCE"] = "a" * 33
+    _ospec = importlib.util.spec_from_file_location("rtc_overlong", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _ortc = importlib.util.module_from_spec(_ospec)
+    try:
+        _ospec.loader.exec_module(_ortc)
+        check(False, "GATEWAY_INSTANCE longer than 32 chars refuses at import")
+    except SystemExit:
+        check(True, "GATEWAY_INSTANCE longer than 32 chars refuses at import")
+    # A Unicode-letter instance must refuse at import — str.isalnum() accepted
+    # é/中 while the ASCII local-id regex rejected them: same strand class as
+    # the length bug, closed by deriving BOTH checks from one _INSTANCE_RE
+    # (review P1, round 6).
+    os.environ["GATEWAY_INSTANCE"] = "é"
+    _uspec = importlib.util.spec_from_file_location("rtc_unicode", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _urtc = importlib.util.module_from_spec(_uspec)
+    try:
+        _uspec.loader.exec_module(_urtc)
+        check(False, "Unicode-letter GATEWAY_INSTANCE refuses at import")
+    except SystemExit:
+        check(True, "Unicode-letter GATEWAY_INSTANCE refuses at import")
+    # A path-shaped instance name must refuse at import (it lands in filenames).
+    os.environ["GATEWAY_INSTANCE"] = "../evil"
+    _bspec = importlib.util.spec_from_file_location("rtc_badinst", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _brtc = importlib.util.module_from_spec(_bspec)
+    try:
+        _bspec.loader.exec_module(_brtc)
+        check(False, "GATEWAY_INSTANCE with path characters refuses at import")
+    except SystemExit:
+        check(True, "GATEWAY_INSTANCE with path characters refuses at import")
+    os.environ.pop("GATEWAY_INSTANCE", None)
+    _lspec = importlib.util.spec_from_file_location("rtc_legacy", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _lrtc = importlib.util.module_from_spec(_lspec)
+    _lspec.loader.exec_module(_lrtc)
+    check(_lrtc.INFLIGHT_FILE.name == "remote-task-inflight.json"
+          and _lrtc.TASK_ROOMS_FILE.name == "remote-task-rooms.json"
+          and _lrtc.GATEWAY_STATUS_FILE.name == "gateway-status.json"
+          and _lrtc._LOCK_ROLE == "gateway-bridge",
+          "GATEWAY_INSTANCE unset keeps every legacy filename + lock role byte-identical")
+
+    # ── P1 regression (john, PR #2503 review): two gateways minting the SAME
+    # broker id must not share a local task/result file. Prod (legacy module)
+    # and dev (named instance) both receive broker id task-COLLIDE against the
+    # SAME workspace; the local bus must keep them distinct, and the dev
+    # instance's result POST must carry the BROKER id back on the wire. ──────
+    check(_grtc._local_tid("task-COLLIDE") == "task-dev~task-COLLIDE"
+          and _grtc._broker_tid("task-dev~task-COLLIDE") == "task-COLLIDE"
+          and _lrtc._local_tid("task-COLLIDE") == "task-COLLIDE",
+          "local/broker id mapping round-trips (dev) and is identity (legacy)")
+    # P1 (review #2): the mapping must be INJECTIVE across instances INCLUDING
+    # the unsuffixed primary. The old dotted scheme collided: primary broker id
+    # task-dev.COLLIDE == dev's mapping of task-COLLIDE. Under ~-encoding the
+    # ranges are disjoint (broker ids cannot contain ~), so the ambiguous
+    # primary id maps to itself and differs from dev's encoding — and a wire id
+    # carrying ~ is refused outright.
+    check(_lrtc._local_tid("task-dev.COLLIDE") == "task-dev.COLLIDE"
+          and _grtc._local_tid("task-COLLIDE") != "task-dev.COLLIDE",
+          "prefix-overlap case is collision-free (primary task-dev.X vs dev task-X)")
+    check(not _lrtc._valid_tid("task-dev~task-X"),
+          "the ~ encoding is unreachable from the wire (broker id charset excludes it)")
+    # P1 (review #1): a MAX-LENGTH broker id (64 chars) must survive the whole
+    # named-instance path — queue, ack, result POST — even though the local
+    # encoding exceeds the 64-char wire bound. Previously the ack refused it and
+    # _post_ready_results dropped it from inflight with the result stranded.
+    _maxid = "task-" + "M" * 59
+    check(_lrtc._valid_tid(_maxid), "max-length broker id is wire-valid (precondition)")
+    _mt = _grtc._write_task({"id": _maxid, "timestamp": "2026-08-02T00:00:00Z",
+                             "task": "MAXLEN", "source": "remote-gateway",
+                             "channel_id": "!p:example.org", "user_id": "@q:example.org"})
+    check(_mt == f"task-dev~{_maxid}" and (_grtc.TASKS_DIR / f"{_mt}.txt").exists(),
+          "max-length broker id queues under the instance encoding")
+    check(_grtc._valid_local_tid(_mt) and not _lrtc._valid_tid(_mt),
+          "local validator accepts the over-64 encoding the wire validator refuses")
+    _ab = len(STATE["acks"])
+    check(_grtc._post_task_ack(_mt) is True
+          and STATE["acks"][-1]["body"]["id"] == _maxid,
+          "ack posts the WIRE id for the max-length task (no local-form refusal)")
+    (_grtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    (_grtc.RESULTS_DIR / f"{_mt}.txt").write_text("maxlen answer")
+    _rb2 = len(STATE["results"])
+    _mi = {_mt}
+    _grtc._post_ready_results(_mi)
+    check(len(STATE["results"]) == _rb2 + 1
+          and STATE["results"][-1]["id"] == _maxid
+          and STATE["results"][-1]["body"] == "maxlen answer",
+          "max-length result POSTs with the broker id — not silently dropped from inflight")
+    STATE["results"].pop(); STATE["acks"].pop()
+    for _f in (f"{_mt}.txt",):
+        try: (_grtc.TASKS_DIR / _f).unlink()
+        except FileNotFoundError: pass
+    try: (_grtc.ARCHIVE_RESULTS_DIR / f"{_mt}.txt").unlink()
+    except FileNotFoundError: pass
+    _collide = {"id": "task-COLLIDE", "timestamp": "2026-08-02T00:00:00Z",
+                "task": "PROD TASK", "source": "remote-gateway",
+                "channel_id": "!p:example.org", "user_id": "@qingyun:example.org"}
+    _pt = _lrtc._write_task(dict(_collide))
+    _dt = _grtc._write_task({**_collide, "task": "DEV TASK"})
+    check(_pt == "task-COLLIDE" and _dt == "task-dev~task-COLLIDE",
+          "same broker id yields DISTINCT local ids per instance")
+    check((_lrtc.TASKS_DIR / "task-COLLIDE.txt").exists()
+          and (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").exists(),
+          "both task files exist — no instance shadowed the other's queue write")
+    check("id: task-dev~task-COLLIDE" in (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").read_text()
+          and "DEV TASK" in (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").read_text(),
+          "dev task file serializes the LOCAL id (result filename follows it)")
+    (_grtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    (_grtc.RESULTS_DIR / "task-dev~task-COLLIDE.txt").write_text("dev answer")
+    _rb = len(STATE["results"])
+    _grtc._post_ready_results({"task-dev~task-COLLIDE"})
+    check(len(STATE["results"]) == _rb + 1
+          and STATE["results"][-1]["id"] == "task-COLLIDE"
+          and STATE["results"][-1]["body"] == "dev answer",
+          "dev result POST translates back to the BROKER id on the wire")
+    check(not (_lrtc.RESULTS_DIR / "task-COLLIDE.txt").exists(),
+          "prod's result slot untouched — no cross-instance claim")
+    # Restore the harness's world EXACTLY: later assertions use ABSOLUTE counts
+    # (`len(STATE["results"]) == 1`), so pop this block's posted result and
+    # remove its task files + archived result. (First CI run caught this; the
+    # local "exit 0" that missed it was a piped-exit-code misread — lesson.)
+    STATE["results"].pop()
+    for _f in ("task-COLLIDE.txt", "task-dev~task-COLLIDE.txt"):
+        try: (_lrtc.TASKS_DIR / _f).unlink()
+        except FileNotFoundError: pass
+    try: (_grtc.ARCHIVE_RESULTS_DIR / "task-dev~task-COLLIDE.txt").unlink()
+    except FileNotFoundError: pass
+
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),
     # and the access_tier-clamp + newline-forge assertions — which expect the

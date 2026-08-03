@@ -57,7 +57,7 @@ def main() -> int:
     # (post-refactor, PR #1029) — both shapes satisfy the contract. We
     # scan both sources and use whichever has the function definition.
     HELPER_RE = re.compile(
-        r"def (?:_)?is_path_sendable\(fpath:\s*str\)\s*->\s*bool:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\n\n[A-Z]|\Z)",
+        r"def (?:_)?is_path_sendable\(fpath:\s*str.*?\)\s*->\s*bool:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\n\n[A-Z]|\Z)",
     )
     helper_body = None
     found_in = None

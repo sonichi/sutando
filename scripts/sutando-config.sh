@@ -244,6 +244,26 @@ for entry in resolve_core_config_dirs():
 "
     ;;
 
+  stand)
+    # This instance's `Stand:` commit-trailer value, from the per-clone config
+    # key `stand` (sutando.config.local.json). Empty when unset.
+    #
+    # Both fleet instances commit under the owner's GH-mapped email (CLA), so no
+    # git field distinguishes them; the trailer is the only discriminator, and
+    # consumers need it WITHOUT an environment (the scheduled cron exports
+    # nothing — john-the-dev, sutando#2484). Deliberately has NO fallback guess:
+    # an unset key must read as "unknown" so callers decline rather than
+    # attribute a foreign identity. Never infer it from the host name — that is
+    # installation-specific policy and would assign this owner's Stand values on
+    # someone else's machine.
+    "$PY" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import load_config
+print(str(load_config().get('stand', '') or '').strip(), end='')
+"
+    ;;
+
   host-label)
     # Per-host directory label for hosts/<host>/ paths, mirroring
     # src/util_paths.py:_host_label() for shell callers. Use this instead of the
@@ -543,9 +563,32 @@ except Exception:
 # independent); dirty flags uncommitted edits. A stronger working-tree
 # 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
 # follow-up alongside the identity block.
-def _git(*a):
+# Resolve ONCE, before any spawn. Two gates, both required:
+#   1. No .git marker -> not a checkout, so every field below would be None
+#      anyway. The packaged app ships the engine as an rsync copy WITHOUT .git,
+#      so on that install these five calls did no useful work at all.
+#      os.path.exists, NOT isdir: a linked worktree or submodule has .git as a
+#      FILE containing a gitdir: pointer, and isdir() blanked the identity
+#      fields on those perfectly valid checkouts (@john-the-dev, #2478).
+#   2. No runnable git -> on a Mac without developer tools /usr/bin/git is the
+#      Xcode-CLT stub, and SPAWNING it raises the modal install dialog before it
+#      can fail. Catching a non-zero exit is too late; the prompt already fired.
+# The desktop app polls this descriptor (core_terminal.rs), so the old code
+# leaked that dialog on every poll of a packaged, toolchain-free install.
+_git_bin = None
+if os.path.exists(os.path.join(repo, '.git')):
     try:
-        r = subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, timeout=5)
+        sys.path.insert(0, os.path.join(repo, 'src'))
+        from git_binary import resolve_git
+        _git_bin = resolve_git()
+    except Exception:
+        _git_bin = None
+
+def _git(*a):
+    if _git_bin is None:
+        return None
+    try:
+        r = subprocess.run([_git_bin, '-C', repo, *a], capture_output=True, text=True, timeout=5)
         return (r.stdout.strip() or None) if r.returncode == 0 else None
     except Exception:
         return None
