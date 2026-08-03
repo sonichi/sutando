@@ -147,10 +147,24 @@ function migrateLegacyIfNeeded(d: DatabaseSync): void {
  *  drop keeps its own independent error handling: one failing must not prevent
  *  the other from being attempted. */
 function dropObsoleteSessionColumns(db: DatabaseSync): void {
-	const sessionCols = new Set(
-		(db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>)
-			.map(c => c.name),
-	);
+	// The schema probe itself must not escape. This runner documents a
+	// best-effort contract ("every failure is logged and swallowed"), and the
+	// caller marks the whole store `initFailed` on any exception out of here —
+	// so an unguarded PRAGMA would turn a metadata read error into "all
+	// conversation and session recording is silently off for the process
+	// lifetime" (CR #2541, qingyun-wu). If we cannot read the schema we cannot
+	// know which columns exist, so log and skip the drops; they are re-attempted
+	// on the next start.
+	let sessionCols: Set<string>;
+	try {
+		sessionCols = new Set(
+			(db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>)
+				.map(c => c.name),
+		);
+	} catch (e) {
+		console.error('[conversation-store] could not read sessions schema; skipping obsolete-column drops:', e);
+		return;
+	}
 	if (sessionCols.has('tool_calls')) {
 		try {
 			db.exec('ALTER TABLE sessions DROP COLUMN tool_calls');

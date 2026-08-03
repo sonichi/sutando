@@ -248,6 +248,33 @@ test('current sessions schema: no-op', () => {
 	assert.deepEqual(cols(d, 'sessions'), before);
 });
 
+// ── fault: the schema probe must not escape (CR #2541) ──────────────────────
+test('a failing sessions schema probe is swallowed, not propagated', () => {
+	const d = freshDb();
+	currentSchema(d);
+	const realPrepare = d.prepare.bind(d);
+	// Fault-inject the probe only; everything else behaves normally.
+	(d as unknown as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
+		if (sql.includes('PRAGMA table_info(sessions)')) throw new Error('session-probe-boom');
+		return realPrepare(sql);
+	};
+	// Must NOT throw. The caller marks the whole store initFailed on any escape,
+	// which would silently disable ALL conversation/session recording for the
+	// process lifetime — the runner's contract is best-effort.
+	assert.doesNotThrow(() => runConversationStoreMigrations(d));
+});
+
+test('a failing legacy-table probe is also swallowed', () => {
+	const d = freshDb();
+	currentSchema(d);
+	const realPrepare = d.prepare.bind(d);
+	(d as unknown as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
+		if (sql.includes('sqlite_master')) throw new Error('legacy-probe-boom');
+		return realPrepare(sql);
+	};
+	assert.doesNotThrow(() => runConversationStoreMigrations(d));
+});
+
 // ── 12. idempotence ──────────────────────────────────────────────────────────
 test('second invocation is idempotent and does not duplicate rows', () => {
 	const d = freshDb();
