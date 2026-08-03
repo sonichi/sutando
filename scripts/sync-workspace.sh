@@ -207,6 +207,12 @@ _host() {
     # Comcast → Chis-MBP) and split per-host paths/branches from the stable
     # LocalHostName (Chis-MacBook-Pro). 2026-06-22 incident.
     local env="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+    # Trim first: `[ -n "  " ]` is true, so a blank-but-set override became the
+    # host label and produced a whitespace-named branch/dir. Lockstep with
+    # _host_label()'s strip() — trim the ENDS only, so an (unusual but legal)
+    # label containing a space is preserved rather than silently compacted.
+    env="${env#"${env%%[![:space:]]*}"}"
+    env="${env%"${env##*[![:space:]]}"}"
     if [ -n "$env" ]; then
         printf '%s\n' "$env"
         return
