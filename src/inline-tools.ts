@@ -993,7 +993,10 @@ export const recentContextTool: ToolDefinition = {
 		'Call this when the user references something with a deictic pronoun ("the post", "the draft", "the one I just typed") that you can\'t place from your own recent transcript. ' +
 		'Also fine to call proactively at the start of an active session to ground yourself. ' +
 		'Returns JSON with keys: active_drafts (array), pending_action (object|null), last_results (array of {task_id, subject, ts}). ' +
-		'If the file is missing or empty, returns {note: "no context recorded yet"}.',
+		'If the file is missing or empty, returns {note: "no context recorded yet"}. ' +
+		'The response also carries age_hours, and stale:true with a note when the context predates this session. ' +
+		'Age is load-bearing: when stale is set, do NOT state pending_action or active_drafts as current — ' +
+		'say how old it is, or ask the user to confirm, before acting on it.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
