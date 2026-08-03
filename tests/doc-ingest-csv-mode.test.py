@@ -24,6 +24,7 @@ import io
 import json
 import sys
 import tempfile
+import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -169,6 +170,47 @@ try:
           f"rc={rc} tail={out.strip().splitlines()[-1] if out.strip() else '<empty>'}")
 finally:
     ingest.CSV_MAX_SOURCE_BYTES = real_src_budget
+
+# 6b. OOXML zip-bomb: a SMALL compressed archive whose UNCOMPRESSED payload is
+# over the source budget must be refused BEFORE openpyxl parses it — the
+# compressed-size gate alone can't see the inflation (qingyun CR #2434). Proven
+# host-independently by blocking the openpyxl import and asserting the inflation
+# error fires anyway, i.e. load_workbook is never reached.
+bomb = tmp / "bomb.xlsx"
+with zipfile.ZipFile(bomb, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr("xl/sharedStrings.xml", b"A" * 4096)  # ~tiny compressed, 4096 uncompressed
+real_src_budget2 = ingest.CSV_MAX_SOURCE_BYTES
+ingest.CSV_MAX_SOURCE_BYTES = 1024  # compressed file < 1024 (passes), uncompressed 4096 > 1024
+try:
+    check("zip-bomb: compressed file is under the source budget",
+          bomb.stat().st_size < 1024, f"size={bomb.stat().st_size}")
+    builtins.__import__ = _no_openpyxl  # if the preflight fires, openpyxl is never imported
+    try:
+        try:
+            ingest.extract_table_csv(bomb)
+            check("zip-bomb: refused before openpyxl", False, "no exception raised")
+        except RuntimeError as e:
+            check("zip-bomb: refused on UNCOMPRESSED size before openpyxl",
+                  "uncompressed" in str(e) and "openpyxl" not in str(e), str(e)[:160])
+        except Exception as e:  # noqa: BLE001
+            check("zip-bomb: refused before openpyxl", False,
+                  f"wrong exception {type(e).__name__}: {e}")
+    finally:
+        builtins.__import__ = real_import
+    # --csv-no-budget opts out of the inflation preflight: it should reach the
+    # openpyxl path (here blocked → the openpyxl-needed error, NOT the inflation error).
+    builtins.__import__ = _no_openpyxl
+    try:
+        try:
+            ingest.extract_table_csv(bomb, unbounded=True)
+            check("zip-bomb + --csv-no-budget: preflight skipped", False, "no exception raised")
+        except RuntimeError as e:
+            check("zip-bomb + --csv-no-budget: skips inflation preflight (reaches openpyxl)",
+                  "openpyxl" in str(e), str(e)[:160])
+    finally:
+        builtins.__import__ = real_import
+finally:
+    ingest.CSV_MAX_SOURCE_BYTES = real_src_budget2
 
 # 7. render budgets bound cells and output bytes even when the file-size gate
 # passes — and the error is loud, not a truncation.

@@ -761,6 +761,25 @@ def extract_table_csv(path: Path, unbounded: bool = False) -> str:
         delimiter = "\t" if suffix == ".tsv" else ","
         with open(path, newline="", encoding="utf-8", errors="replace") as fh:
             return _stream_rows_to_csv(csv.reader(fh, delimiter=delimiter), budget)
+    # XLSX/XLSM path. The compressed-size gate above cannot catch an OOXML zip
+    # bomb (a small archive whose sharedStrings/worksheet XML inflates far past
+    # the budget) — openpyxl.load_workbook would allocate past the compute budget
+    # before any cell/byte budget could fire. Preflight the UNCOMPRESSED archive
+    # size here, BEFORE importing/handing the file to openpyxl, so the bomb is
+    # rejected even where openpyxl is absent. Mirrors extract_xlsx's
+    # _validate_ooxml_archive_bounded (qingyun CR #2434). --csv-no-budget opts out.
+    if not unbounded:
+        try:
+            with zipfile.ZipFile(path) as zf:
+                uncompressed = sum(info.file_size for info in zf.infolist())
+        except zipfile.BadZipFile:
+            uncompressed = None  # not a zip — let openpyxl raise its own clear error
+        if uncompressed is not None and uncompressed > CSV_MAX_SOURCE_BYTES:
+            raise RuntimeError(
+                f"--csv xlsx inflates to {uncompressed:,} uncompressed bytes, over "
+                f"the {CSV_MAX_SOURCE_BYTES // (1024 * 1024)} MiB compute budget "
+                "(fail-closed: attachments are untrusted and compute-exact mode "
+                "never truncates); rerun with --csv-no-budget to override")
     try:
         import openpyxl  # noqa: PLC0415
     except ImportError as exc:
