@@ -60,8 +60,15 @@ are implemented by #2197's `src/credential-resolver.ts`; rule 3's Settings/healt
 { "version": 1, "capabilities": { "gemini-voice": { "key": "…" }, "gemini-text": { "key": "…" } } }
 ```
 
-Writers: the desktop onboarding flow (G1/G2, air's lane) or AU provisioning.
-Written atomically (tmp + rename), mode 0600, only under `state/auth/`.
+Writers (**required of a future provisioner — not yet implemented**): the
+desktop onboarding flow (G1/G2, air's lane) or AU provisioning. **No production
+writer exists today** — `origin/main` ships only readers (`#2197`'s
+`readManaged()`, startup, health) plus test-fixture writes; a production
+writer-pattern scan across `src`/`electron`/`integrations` returns none. When
+that provisioner is built it MUST write the file atomically (tmp + rename), mode
+0600, only under `state/auth/`. Until then, treat the atomic/0600 persistence as
+a requirement on the writer, not a shipped guarantee — do not rely on it as an
+existing security property.
 `version` is reserved for future schema changes. **Not yet enforced:** #2197's
 `readManaged()` reads `capabilities` regardless of `version`, so an unknown
 version does not currently skip the tier — a `{ "version": 999, … }` file with a
