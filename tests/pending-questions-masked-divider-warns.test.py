@@ -194,6 +194,37 @@ class TestMaskedDividerWarns(unittest.TestCase):
         self.assertEqual(err, "", "a closed fence is deliberate quoting, not damage")
         self.assertEqual(out, text)
 
+    def test_a_CLOSED_fence_at_EOF_does_not_warn(self):
+        # john-the-dev, review of 94850b40. The previous discriminator asked "is
+        # everything after the divider masked?", which is TRUE for a closed fence
+        # whose closer is the last line — masking blanks the closer too. The old
+        # bounded-fence control passed only because it happened to add live text
+        # after the closer, so the guard looked correct while false-alarming on the
+        # simplest possible documentation snippet.
+        fence = TICK * 3
+        text = f"## live\n{fence}\n# Resolved\n{fence}\n"
+        out, err = _run(text)
+        self.assertEqual(err, "", "a CLOSED fence is deliberate, even with nothing after it")
+        self.assertEqual(out, text)
+
+    def test_a_BALANCED_multiline_span_quoting_a_divider_does_not_warn(self):
+        # qingyun-wu, same round. An UNPAIRED backtick run masks nothing at all
+        # (_mask_nonfence_spans only blanks a run that finds an equal-length
+        # partner), so the real-world damage was never "unbalanced markup" — it was
+        # a span pairing legitimately across ~1,900 lines. That is structurally
+        # identical to this deliberate two-line quote; only what it SWALLOWS differs.
+        text = (
+            "## live\n"
+            f"prose opens {TICK}\n"
+            "# Resolved\n"
+            f"{TICK} closing prose\n"
+            "\n"
+            "## still live\n"
+        )
+        out, err = _run(text)
+        self.assertEqual(err, "", "a balanced quote swallows no question — not damage")
+        self.assertEqual(out, text)
+
     def test_no_divider_at_all_is_silent(self):
         text = "## only live questions\nbody\n"
         out, err = _run(text)
