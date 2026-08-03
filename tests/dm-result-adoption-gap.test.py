@@ -33,6 +33,7 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -45,7 +46,27 @@ from send_allowlist import is_path_sendable  # noqa: E402
 # no token file is created and $HOME is never touched. (The older
 # discord-bridge-file-markers test wrote ~/.claude/channels/discord/.env —
 # deliberately not repeated here.)
-os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
+# --- Hermetic config root -------------------------------------------------
+# dm-result resolves its token by READING FILES (`_load_token`), not from the
+# environment, and resolves the owner from access.json. Left alone, this test
+# silently borrows the developer's real ~/.claude/channels/discord/* — it then
+# passes locally and fails in CI, where nothing resolves, send_dm() returns
+# early, and every assertion sees "".
+#
+# (That host file exists here because the now-deleted
+# tests/discord-bridge-file-markers.test.py created it — precisely the shape
+# this tidy removes.)
+#
+# So: point CLAUDE_CONFIG_DIR at a throwaway root and seed a fake token there.
+# Temp dirs + isolated config roots only; never ~/.claude, never a real token.
+_CFG = Path(tempfile.mkdtemp(prefix="sutando-adoption-cfg-"))
+(_CFG / "channels" / "discord").mkdir(parents=True, exist_ok=True)
+(_CFG / "channels" / "discord" / ".env").write_text(
+    "DISCORD_BOT_TOKEN=test-token-not-real\n"
+)
+os.environ["CLAUDE_CONFIG_DIR"] = str(_CFG)
+os.environ["DISCORD_BOT_TOKEN"] = "test-token-not-real"
+os.environ["SUTANDO_DM_OWNER_ID"] = "test-owner-id-not-real"
 _spec = importlib.util.spec_from_file_location("dm_result_gap", REPO / "src" / "dm-result.py")
 dm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dm)
@@ -161,13 +182,15 @@ class MarkerNeverLeaks(unittest.TestCase):
             sent, t = _attachments(f"See file [file: {allowed}]")
             self.assertIn("See file", sent)
             self.assertNotIn("[file:", sent)
-            # the file was uploaded, not silently dropped
-            self.assertTrue(
-                any("multipart" in str(c.get("body", "")).lower()
-                    or c.get("body", {}).get("_raw") is not None
-                    for c in t.calls),
-                "allowlisted file produced no upload request",
-            )
+            # The file was uploaded, not silently dropped. Inspect only calls
+            # that actually carried a payload: the DM-channel-open request is
+            # captured with body=None, and `.get("body", {})` does NOT guard
+            # that (the default applies to a MISSING key, not a None value).
+            uploads = [
+                c for c in t.calls
+                if isinstance(c.get("body"), dict) and c["body"].get("_raw") is not None
+            ]
+            self.assertTrue(uploads, "allowlisted file produced no upload request")
         finally:
             os.unlink(allowed)
 
