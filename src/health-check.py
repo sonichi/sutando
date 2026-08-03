@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import plistlib
 import shlex
 import shutil
 import tempfile
@@ -41,6 +42,7 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+from git_binary import git_argv  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
@@ -109,7 +111,19 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # lying to itself about what its runtime does. Undeclared env vars are also
 # forbidden by AGENTS.md (qingyun-wu, #2449).
 MEMORY_INDEX_LOAD_LINES = 200
-MEMORY_INDEX_LOAD_BYTES = 25 * 1024
+# 25 KB DECIMAL (25_000), not 25 KiB. The docs say "the first 25KB"; encoding it
+# as 25 * 1024 made this check 600 B more generous than the runtime, so a file
+# between 25_000 and 25_600 reports healthy while its tail is already dropped.
+#
+# The runtime settles it: its own over-limit warning prints the limit as
+# "24.4KB", and 25_000 / 1024 = 24.41 — a 25_600 limit would print "25.0KB".
+# Observed on this repo 2026-08-02, where MEMORY.md was truncated at session
+# start while this check called it under the limit.
+#
+# NB this is a UNITS fix, not a return to the "measured-by-eye ~24KB" cutoff
+# that #2449 rightly rejected — that guess also claimed the whole index stops
+# loading, which remains wrong: truncation is a suffix drop.
+MEMORY_INDEX_LOAD_BYTES = 25_000
 # Warn while there is still room to compact deliberately rather than in a panic.
 MEMORY_INDEX_NEAR_LIMIT = 0.9
 
@@ -1167,7 +1181,8 @@ def check_memory_index_integrity() -> "dict | None":
 
     def _size_note() -> str:
         return (f"{effective_bytes / 1024:.1f}KB / {effective_lines} lines of loadable "
-                f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1024:.0f}KB / "
+                f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1000:.0f}KB "
+                f"({MEMORY_INDEX_LOAD_BYTES:,} B) / "
                 f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
 
     def _hub_note() -> str:
@@ -1588,6 +1603,11 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
         return {"name": name, "status": "ok",
                 "detail": "no runnable git (resolver) — skipping"}
     try:
+        # `git_bin` came from the resolver above, so it is never a bare `git`
+        # resolving through PATH — which on a Mac without developer tools lands
+        # on the Xcode-CLT stub, whose modal install dialog fires BEFORE the
+        # return-code check below can degrade. This check is registered
+        # unconditionally, so it ran on every health pass.
         out = subprocess.run(
             [git_bin, "-C", str(repo), "branch", "--show-current"],
             capture_output=True, text=True, timeout=10,
@@ -2080,8 +2100,13 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
     deploys aren't hidden.
     """
     try:
+        # git_argv raises GitUnavailable (an OSError) when this host has no
+        # runnable git — caught below and treated as "can't tell", exactly like
+        # any other git error. Never invoke /usr/bin/git directly: on a Mac
+        # without developer tools that is the CLT shim and it raises a modal
+        # install dialog, which a health check must never be able to do.
         log = subprocess.run(
-            ["/usr/bin/git", "log", "-1", "--format=%ct", "HEAD", "--", str(src_file)],
+            git_argv("log", "-1", "--format=%ct", "HEAD", "--", str(src_file)),
             cwd=REPO_DIR, capture_output=True, text=True, timeout=5
         )
         if log.returncode != 0 or not log.stdout.strip():
@@ -2092,7 +2117,7 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
             return False
         # No commits since proc_start; check for uncommitted edits
         diff = subprocess.run(
-            ["/usr/bin/git", "diff", "--quiet", "HEAD", "--", str(src_file)],
+            git_argv("diff", "--quiet", "HEAD", "--", str(src_file)),
             cwd=REPO_DIR, capture_output=True, timeout=5
         )
         return diff.returncode == 0  # 0 = no diff
@@ -2551,6 +2576,155 @@ def _marker_predates_running_core(marker: dict) -> bool:
     return started < launched - margin
 
 
+def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
+    """This HOST's core tmux socket, or None if this host has no live heartbeat.
+
+    Deliberately NOT `_live_core_socket()`. That resolver globs every synced
+    `state/cores/*.alive` and takes the freshest, which the workspace contract
+    permits to be ANOTHER MACHINE's — the vault carries one heartbeat per host.
+    A reviewer reproduced it with two fresh records: the local one at mtime N-1
+    and a peer at N, and the probe targeted `/tmp/peer-core.sock`. That socket
+    does not exist locally, so the tri-state correctly degraded to None — which
+    silently suppresses the very warning this check exists to raise. Correct
+    behaviour, wrong target, false green.
+
+    Host matching uses `_local_host_labels()` rather than one label, because the
+    reader and the launchers do not share a host-label contract (see that
+    function). Returning None when this host has no fresh heartbeat is right:
+    "no local core is running" is not evidence that a core bypasses the proxy.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return None
+    labels = _local_host_labels()
+    now = time.time()
+    best_mtime, best_socket = None, None
+    for alive_file in cores_dir.glob("*.alive"):
+        if alive_file.stem not in labels:
+            continue                      # another machine's heartbeat
+        try:
+            mtime = alive_file.stat().st_mtime
+            if now - mtime >= 90.0:
+                continue                  # stale — not a live core
+            payload = json.loads(alive_file.read_text())
+            if not isinstance(payload, dict):
+                continue
+            sock = payload.get("socket")
+        except (OSError, ValueError):
+            continue
+        if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
+            best_mtime, best_socket = mtime, sock
+    return best_socket
+
+
+def core_env_has_proxy_url(
+    socket_path: Optional[str] = None,
+    session: str = "sutando-core",
+    tmux_runner=None,
+    ps_runner=None,
+) -> Optional[bool]:
+    """Whether the RUNNING core process carries ANTHROPIC_BASE_URL in its environment.
+
+    ``True``  -> the core is routed through the credential proxy.
+    ``False`` -> it demonstrably is NOT (its environment was read, and the var is absent).
+    ``None``  -> could not be determined. **Never collapse None into False**: an
+                 unreadable environment is not evidence of a bypass, and a warning
+                 manufactured from it would be the same defect this check is fixing,
+                 pointed the other way.
+
+    Why this exists: ``quota-state.json`` is written by the credential proxy, not by
+    the core, so a FRESH file only proves *something* routed through the proxy — not
+    that the core did. Measured on 2026-08-02: one throwaway ``claude -p`` run with
+    the variable set refreshed the file and flipped this check from a truthful
+    ``warn`` (18h stale) to ``ok`` for the whole 6h staleness window, while the
+    production core was exactly as unrouted as before. Freshness is a property of the
+    artifact; routing is a property of the process.
+
+    The pid comes from tmux rather than ``pgrep``: ``pgrep -f claude`` matches any argv
+    containing the string — including the shell running this check — and macOS
+    ``pgrep -a`` lists ancestors, not argv.
+
+    But a pane pid is only useful if it is the CORE's pane. The first version of this
+    helper targeted the session (``list-panes -t =sutando-core``), which tmux resolves
+    to that session's **current window** — and this repo deliberately keeps sibling
+    windows (gateway, monitor) in the same session, healing window-scoped precisely so
+    they survive (`src/agent/claude/cli/start-cli.sh`). A reviewer built the case and it
+    reproduced: with the ``gateway`` window active, the production command returned the
+    gateway's pid, so the helper would report on a sibling's environment — false green or
+    false warning, independent of the real core. Window NAME is no discriminator either;
+    on this host the core's window is auto-named ``2.1.220`` after the claude version.
+
+    So enumerate EVERY pane in the session (``list-panes -s``) and identify the core by
+    what it actually is: the process whose argv carries ``--name <session>``, which is
+    exactly how `start-cli.sh` launches it. Zero matches or more than one -> ``None``;
+    an ambiguous session is not evidence of a bypass.
+
+    Both subprocess calls are injectable so the contract is testable without a live
+    core; production passes neither.
+    """
+    tmux_runner = tmux_runner or (lambda sock, *a: _run_tmux(sock, *a))
+    if ps_runner is None:
+        def ps_runner(pid):
+            return subprocess.run(
+                ["ps", "eww", "-o", "command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=15,
+            )
+    sock = socket_path or _local_core_socket()
+    if not sock:
+        return None                       # no live LOCAL core -> unknown, not a bypass
+    # `-s` = every pane in the SESSION, not just the current window's.
+    panes = tmux_runner(sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
+    if panes is None or getattr(panes, "returncode", 1) != 0:
+        return None                       # no such session / tmux unavailable
+    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
+    if not pids:
+        return None
+    # Identify the core by argv, not by position: `--name <session>` is what
+    # start-cli.sh passes and no sibling window carries it.
+    #
+    # TOKEN equality, never substring. `f"--name {session}" in argv` also matches
+    # `--name sutando-core-watcher`, so a prefix-named sibling in the same session
+    # was accepted as the core (john-the-dev, reproduced on a sole pane: returned
+    # True where the contract is None). This is the SAME lookalike class as the
+    # `ANTHROPIC_BASE_URL_OLD` control already in the suite — I guarded the env-var
+    # axis and then introduced the identical hole on the session-name axis.
+    def _names_this_session(argv: str) -> bool:
+        toks = argv.split()
+        for i, t in enumerate(toks):
+            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
+                return True
+            if t == f"--name={session}":  # the =-joined spelling
+                return True
+        return False
+
+    matches = []
+    for pid in pids:
+        try:
+            proc = ps_runner(pid)
+        except Exception:                 # noqa: BLE001 — a probe failure is "unknown"
+            return None
+        if proc is None or getattr(proc, "returncode", 1) != 0:
+            continue                      # this pane vanished; keep looking
+        out = proc.stdout or ""
+        if _names_this_session(out):
+            matches.append(out)
+    # Zero matches: the core is not in this session (or ps could not read any pane).
+    # More than one: ambiguous, and an ambiguous session is not evidence of a bypass.
+    if len(matches) != 1:
+        return None
+    tokens = matches[0].split()
+    # `ps eww` prints argv THEN the environment. On a process whose env we are not
+    # permitted to read it prints argv alone, which contains no KEY=VALUE pairs — and
+    # "no pairs" is indistinguishable from "an empty environment". Requiring at least
+    # one pair is what keeps an unreadable env reporting None instead of False.
+    env_pairs = [t for t in tokens if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
+    if not env_pairs:
+        return None
+    return any(t.startswith("ANTHROPIC_BASE_URL=") for t in env_pairs)
+
+
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
 
@@ -2572,7 +2746,7 @@ def _agent_activity_age() -> "float | None":
         return None
 
 
-def check_quota_telemetry(proxy_status: str) -> dict:
+def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
     quota-state.json is written by the proxy from the quota headers on
@@ -2614,6 +2788,13 @@ def check_quota_telemetry(proxy_status: str) -> dict:
     it stays silent, and a host that never wired at all still takes the
     absent-file branch below.
     """
+    # `core_env_prober` is an injectable seam, defaulting to the real probe. It exists
+    # because the first version of this branch called `core_env_has_proxy_url()`
+    # unconditionally: the existing 39-case suite overrides WORKSPACE_DIR but had no way
+    # to override THAT, so its fixtures escaped into the developer's live tmux, observed
+    # the real (unrouted) core, and 3 of 39 flipped to `warn`. A required suite whose
+    # result depends on ambient host state is worse than the bug it guards -- and CI,
+    # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
     if proxy_status != "ok":
         check["detail"] = "credential proxy not running — quota telemetry not expected"
@@ -2624,6 +2805,22 @@ def check_quota_telemetry(proxy_status: str) -> dict:
             quota_age = time.time() - path.stat().st_mtime
             age_min = int(quota_age / 60)
             check["detail"] = f"quota state present (updated {age_min}m ago)"
+            # A FRESH file is not proof the CORE routed — the proxy writes this file
+            # for whatever talks to it. Only a demonstrated absence downgrades; None
+            # (env unreadable) leaves the fresh reading alone.
+            probe = core_env_prober or core_env_has_proxy_url
+            if quota_age <= QUOTA_STATE_STALE_SEC and not _runtime_may_skip_proxy() \
+                    and probe() is False:
+                check["status"] = "warn"
+                check["detail"] = (
+                    f"quota state is fresh ({age_min}m) but the RUNNING core has no "
+                    "ANTHROPIC_BASE_URL in its environment, so the core is not routed "
+                    "through the proxy — something else produced that file (a one-off "
+                    "`claude -p`, another core, a manual probe). Quota-based budgeting "
+                    "is reading numbers this core did not generate. Relaunch the core "
+                    "via src/agent/start-cli.sh with the proxy listening on 7846."
+                )
+                return check
         except OSError:
             # Degrade to the less precise detail rather than raising — and with
             # no age there is nothing to call stale, so never warn from here.
@@ -2668,6 +2865,173 @@ def check_quota_telemetry(proxy_status: str) -> dict:
         "Quota-based budgeting is blind on this host."
     )
     return check
+
+
+def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
+    """Mirror of credential-proxy.ts `scopedKeychainService`.
+
+    Empty/whitespace -> None, so the caller falls back to the vanilla item —
+    the same contract the proxy implements.
+    """
+    dir_ = (config_dir or "").strip()
+    if not dir_:
+        return None
+    digest = hashlib.sha256(dir_.encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{digest}"
+
+
+def _keychain_service_exists(service: str) -> bool:
+    try:
+        return subprocess.run(
+            ["security", "find-generic-password", "-s", service],
+            capture_output=True, timeout=5,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
+    """First EXISTING item of [scoped(config_dir), vanilla] — the proxy's order."""
+    for service in (_scoped_keychain_service(config_dir), "Claude Code-credentials"):
+        if service and _keychain_service_exists(service):
+            return service
+    return None
+
+
+def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
+    """Does the proxy inject THIS core's login, or a different account's?
+
+    `check_quota_telemetry` above answers "is quota-state fresh, and does it
+    exist" — both are questions about WHEN, and neither can see the failure
+    this check exists for: a proxy that is up, routing, and writing a
+    seconds-old file **for someone else's account**.
+
+    Observed 2026-08-03. The owner's login showed 7% of the 7d window used
+    while every routed request billed a different account at 88%; the core
+    throttled itself to near-idle for an hour against a ceiling that was not
+    his. `quota-state.json` was never stale, so no existing branch fired.
+
+    Mechanism: the proxy picks its credential by preferring the keychain item
+    scoped to its own CLAUDE_CONFIG_DIR, falling back to vanilla. launchd does
+    not inherit the installing shell's environment, so if the plist omits
+    CLAUDE_CONFIG_DIR the proxy can only ever resolve the vanilla item — while
+    an interactive `/login` in a namespaced core writes the SCOPED one. It does
+    not self-heal: the proxy re-reads per request, but re-reads the wrong item
+    and refreshes that token back into itself.
+
+    Compares the item the CORE would resolve against the item the PROXY would,
+    reading only the plist and keychain ITEM NAMES. No token, and no secret
+    material of any kind, is read or logged.
+    """
+    name = "quota-account-identity"
+    if proxy_status != "ok":
+        return {"name": name, "status": "ok",
+                "detail": "credential proxy not up — nothing to compare"}
+
+    # Whose account only matters if THIS core's requests go through that proxy.
+    # A proxy can be up while the running core bypasses it entirely — a Codex or
+    # direct runtime, or a supervisor-launched core that never got
+    # ANTHROPIC_BASE_URL. Warning there would assert "requests bill that account"
+    # and "/login here will not reach the proxy", neither of which is true of a
+    # core that does not route. check_quota_telemetry needed the same gate for
+    # the same class, so reuse its runtime marker.
+    if _runtime_may_skip_proxy():
+        return {"name": name, "status": "ok",
+                "detail": "core runtime is not proxy-routed — its credential is not this proxy's"}
+    # Probe the RUNNING CORE's environment, not this process's.
+    #
+    # The first version of this gate read `os.environ` on the theory that
+    # health-check runs as a child of the core and inherits it. True on the
+    # proactive-loop path, and false on the app / fallback-launchd / manual
+    # paths, which this file already documents do not carry the core's env
+    # (see the launchd notes around line 1417). On those a routed core with a
+    # genuine account mismatch would read "comparison inactive" and stay
+    # silent — the check disabled exactly where nobody is watching.
+    #
+    # `core_env_has_proxy_url` is TRI-STATE and its contract is that None must
+    # never collapse into False. Applied here:
+    #   True  -> the core routes; the comparison below is meaningful.
+    #   False -> demonstrably NOT routed; the proxy's account is irrelevant to
+    #            it, so every clause of the warning would be false. Silent.
+    #   None  -> undeterminable (no tmux, ambiguous session, unreadable env).
+    #            Silent, and says so — an unprovable premise licenses nothing.
+    # `core_env_prober` is the same injectable seam check_quota_telemetry uses:
+    # without it a fixture escapes into the developer's live tmux and reports on
+    # the real core, which is how 3 of that suite's 39 cases once flipped.
+    probe = core_env_prober or core_env_has_proxy_url
+    routed = probe()
+    if routed is False:
+        return {"name": name, "status": "ok",
+                "detail": ("the running core has no ANTHROPIC_BASE_URL — it is not routed "
+                           "through this proxy, so whose login the proxy holds is moot")}
+    if routed is None:
+        return {"name": name, "status": "ok",
+                "detail": ("could not read the running core's environment — identity "
+                           "comparison inactive here (not evidence either way)")}
+
+    core_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not core_cfg:
+        return {"name": name, "status": "ok",
+                "detail": "core has no CLAUDE_CONFIG_DIR — both sides resolve the vanilla item"}
+
+    plist = Path.home() / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
+    if not plist.is_file():
+        return {"name": name, "status": "ok",
+                "detail": "credential proxy is not launchd-managed on this host"}
+    try:
+        rendered = plistlib.loads(plist.read_bytes())
+    except (OSError, ValueError) as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"cannot read the credential-proxy plist ({exc})"}
+    # A plist can PARSE and still be the wrong shape — `EnvironmentVariables`
+    # encoded as a string, say. `.get` on that raises AttributeError, which is
+    # not caught above and would abort the whole health run, taking every later
+    # check with it. Validate both containers as mappings; a parseable file of
+    # the wrong shape is a warn, never an exception.
+    if not isinstance(rendered, dict):
+        return {"name": name, "status": "warn",
+                "detail": (f"credential-proxy plist parsed but its root is "
+                           f"{type(rendered).__name__}, not a dict — cannot read its environment")}
+    env_block = rendered.get("EnvironmentVariables")
+    if env_block is None:
+        env_block = {}
+    if not isinstance(env_block, dict):
+        return {"name": name, "status": "warn",
+                "detail": (f"credential-proxy plist has EnvironmentVariables as "
+                           f"{type(env_block).__name__}, not a dict — cannot read CLAUDE_CONFIG_DIR")}
+    proxy_cfg = env_block.get("CLAUDE_CONFIG_DIR")
+    if proxy_cfg is not None and not isinstance(proxy_cfg, str):
+        return {"name": name, "status": "warn",
+                "detail": (f"credential-proxy plist has CLAUDE_CONFIG_DIR as "
+                           f"{type(proxy_cfg).__name__}, not a string — cannot resolve its keychain item")}
+
+    core_service = _resolved_credential_service(core_cfg)
+    proxy_service = _resolved_credential_service(proxy_cfg)
+
+    if core_service is None or proxy_service is None:
+        # No readable credential on one side (locked keychain, fresh host).
+        # Say so rather than returning a bare ok that looks like agreement.
+        return {"name": name, "status": "ok",
+                "detail": "no readable credential on one side — comparison inactive here"}
+
+    if core_service == proxy_service:
+        return {"name": name, "status": "ok",
+                "detail": f"proxy injects this core's login ({core_service})"}
+
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (
+            f"the credential proxy injects a DIFFERENT login than this core's: proxy "
+            f"resolves '{proxy_service}', core would resolve '{core_service}'. Quota "
+            f"numbers describe the proxy's account, not yours, and requests bill it — "
+            f"a `/login` here will not reach the proxy. Cause is almost always the "
+            f"launchd plist omitting CLAUDE_CONFIG_DIR (launchd inherits no shell env): "
+            f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
+            f"Fix: pin CLAUDE_CONFIG_DIR in "
+            f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
+        ),
+    }
 
 
 def check_bodhi_dist() -> dict:
@@ -4076,25 +4440,75 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
     return None
 
 
-def check_comm_sweep_freshness() -> dict:
+def _host_runs_comm_sweep(
+    workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
+) -> bool:
+    """True when THIS host has a comm-sweep driver wired, i.e. its own crons.json
+    schedules one.
+
+    Comm handling is a SINGLE-OWNER lane: exactly one host in the fleet runs the
+    sweep, because a second cron would duplicate sweeps over the owner's real
+    comms. So "no stamp here" is only a defect on the host that actually owns it.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    host = host_label or _host_label()
+    try:
+        crons = json.loads((workspace / "hosts" / host / "crons.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(crons, list):
+        return False
+    for entry in crons:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("prompt_skill") == "comm-sweep":
+            return True
+        # A prompt-body entry that invokes the skill or its script counts too —
+        # matching how the driver is actually scheduled, not one spelling of it.
+        if "comm-sweep" in f"{entry.get('name', '')} {entry.get('prompt', '')}":
+            return True
+    return False
+
+
+def check_comm_sweep_freshness(
+    workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
+) -> dict:
     """Comm-handling liveness (P1 of the comm-handling overhaul).
 
     The comm-sweep driver stamps state/last-comm-sweep.json every run. A stale
     stamp means comm handling has silently STOPPED — the exact failure that let
     the inbox-score loop die 2026-07-21 and owner-comm sweeps lapse for days
     with nobody alerted (comm handling was a *discipline*, not a *mechanism*).
-    This probe makes that loud instead of silent: warn past ~2h, down past ~6h,
-    warn (not down) when the stamp is absent — a host that never wired the
-    driver isn't "broken", it just hasn't adopted P1 yet.
+    This probe makes that loud instead of silent: warn past ~2h, down past ~6h.
+
+    LANE-AWARENESS (2026-08-03). The absent-stamp branch used to warn on every
+    host, with the detail "driver not wired on this host yet (P1)". That wording
+    asserted a per-host adoption gap and was wrong twice over: comm handling is a
+    single-owner lane (the driver lives in sonichi/sutando-personal and runs on
+    ONE host by design — a second cron would duplicate sweeps over the owner's
+    comms), so a non-owning host has nothing to adopt and warns FOREVER. A
+    permanent warn is how a health output gets ignored, which would have cost the
+    very alarm this probe exists to raise. So absence is now judged against
+    whether this host actually schedules the driver.
+
+    Deliberately gated on the ABSENT branch ONLY: once a stamp exists, the age
+    thresholds apply unconditionally. Gating those on config too would mean
+    deleting the cron entry silently disarms a real stall — failing in the
+    dangerous direction.
 
     Age-checked (unlike quota-telemetry, which is absence-only): comm handling
     is expected to run on a fixed cadence, so a lengthening age IS the signal.
     """
-    path = status_read_path("last-comm-sweep.json", WORKSPACE_DIR)
+    path = status_read_path("last-comm-sweep.json", workspace_dir or WORKSPACE_DIR)
     name = "comm-sweep"
     if not path.exists():
+        if not _host_runs_comm_sweep(workspace_dir, host_label):
+            return {"name": name, "status": "ok",
+                    "detail": "comm-sweep not scheduled on this host — single-owner lane, "
+                              "probe N/A here"}
         return {"name": name, "status": "warn",
-                "detail": "no last-comm-sweep.json — comm-sweep driver not wired on this host yet (P1)"}
+                "detail": "comm-sweep is scheduled on this host but has never stamped "
+                          "last-comm-sweep.json — driver wired but not producing"}
     try:
         age_h = (time.time() - path.stat().st_mtime) / 3600
     except OSError as exc:
@@ -4153,6 +4567,10 @@ def run_all_checks() -> list[dict]:
 
     # Quota telemetry — only meaningful when the proxy is actually up.
     checks.append(check_quota_telemetry(proxy_check["status"]))
+    # ...and WHOSE account those numbers describe. The check above answers
+    # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
+    # passes every branch above (observed 2026-08-03).
+    checks.append(check_quota_account_identity(proxy_check["status"]))
 
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.
@@ -5542,6 +5960,39 @@ def community_support_line() -> str:
     return "  Stuck? Community support (real humans + community agents): https://discord.gg/uZHWXXmrCS"
 
 
+#: Statuses that are NOT problems. Everything else is, by the same rule the
+#: issue list uses: `issues = [c for c in checks if c["status"] not in ("ok", "warn")]`.
+#: `stale` is an issue but gets its own glyph because it names a specific remedy.
+_BENIGN_STATUSES = ("ok", "warn")
+
+
+def status_icon(status: str) -> str:
+    """Glyph for a probe status — unrecognized reads as a PROBLEM, not a shrug.
+
+    The human-readable listing used to enumerate `down`/`missing`/`not_loaded` as
+    severe and fall back to `~` for anything else. That put **`fail`** — the most
+    severe status any probe emits, and the one nine probes use — on the least
+    alarming glyph, sharing it with "status I don't recognize". `error` (5 probes)
+    and `wedged` landed there too.
+
+    It is a real miss, not a cosmetic one: a peer host filtered health-check output
+    with `grep -E "⚠|✗"` and the single `fail` line was the one the filter hid, so a
+    run with a genuine failure read as three routine warnings.
+
+    `--quiet` never had this bug — it renders every non-stale issue as `✗`. The two
+    output modes disagreed about the same status. This makes them agree by deriving
+    both from one predicate, and inverts the default so a status added later shows
+    up as a problem until someone deliberately classifies it as benign.
+    """
+    if status == "ok":
+        return "✓"
+    if status == "warn":
+        return "⚠"
+    if status == "stale":
+        return "♻"
+    return "✗"
+
+
 def summary_line(checks) -> str:
     """The no-failures summary. Warnings are deliberately NOT issues — they must
     not fail the exit code or wake the launchd notifier, and that is unchanged.
@@ -5639,7 +6090,7 @@ def main():
     if quiet:
         if issues:
             for c in issues:
-                icon = "♻" if c["status"] == "stale" else "✗"
+                icon = status_icon(c["status"])
                 print(f"{icon} {c['name']}: {c['status']} ({c['detail']})")
             if do_fix:
                 # Fall through to existing fix path below
@@ -5655,7 +6106,7 @@ def main():
         print("=" * 40)
 
         for c in checks:
-            icon = "✓" if c["status"] == "ok" else "⚠" if c["status"] == "warn" else "✗" if c["status"] in ("down", "missing", "not_loaded") else "♻" if c["status"] == "stale" else "~"
+            icon = status_icon(c["status"])
             print(f"  {icon} {c['name']:30s} {c['status']:12s} {c['detail']}")
 
         print()

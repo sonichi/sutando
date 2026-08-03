@@ -25,9 +25,24 @@
 # simplification (versus the earlier canonical-id translation-layer design).
 #
 # User-configurable carrier set: vault.sync.{include, exclude} in
-# sutando.config.{json,local.json}. Include adds to default; exclude
-# subtracts (rsync semantics, exclude wins on conflict). Currently
-# defaults-only (config-merge tracked for follow-up).
+# sutando.config.{json,local.json}.
+#
+# `include` REPLACES the default list wholesale — it does NOT add to it.
+# Config merging is `_deep_merge` (src/sutando_config.py), whose contract is
+# "dicts merge; everything else (lists, scalars, None) is REPLACED by the
+# override", and that behaviour is pinned by
+# tests/sutando-config.test.py::test_local_replaces_arrays_wholesale.
+#
+# This matters more than an ordinary doc nit because the carrier set is a
+# WHITELIST: _compose_exclude_content() emits `*` (ignore everything) and then
+# un-ignores exactly the include list. So setting vault.sync.include to add one
+# path silently DROPS every default path — notes/, hosts/*/ and the whole
+# .claude-sutando/projects/*/memory/ corpus — out of the backup, while this
+# script goes on printing "pushed to <branch>" on every run. To add a path you
+# must restate the full carrier set.
+#
+# `exclude` subtracts, carving subpaths out of an included parent (emitted after
+# the includes so gitignore's last-match-wins applies).
 #
 # Usage:
 #   bash scripts/sync-workspace.sh                # default: pull + push (one tick)
@@ -207,6 +222,12 @@ _host() {
     # Comcast → Chis-MBP) and split per-host paths/branches from the stable
     # LocalHostName (Chis-MacBook-Pro). 2026-06-22 incident.
     local env="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+    # Trim first: `[ -n "  " ]` is true, so a blank-but-set override became the
+    # host label and produced a whitespace-named branch/dir. Lockstep with
+    # _host_label()'s strip() — trim the ENDS only, so an (unusual but legal)
+    # label containing a space is preserved rather than silently compacted.
+    env="${env#"${env%%[![:space:]]*}"}"
+    env="${env%"${env##*[![:space:]]}"}"
     if [ -n "$env" ]; then
         printf '%s\n' "$env"
         return
