@@ -92,12 +92,14 @@ def mask_fenced_code(text: str, *, report_unclosed: bool = False):
     zero this module exists to prevent.
     """
     out, in_fence, char, size = [], False, '', 0
+    off, open_off = 0, 0
     for line in text.split('\n'):
         if not in_fence:
             m = _FENCE_OPEN_RE.match(line)
             # A backtick opener may not carry a backtick in its info string.
             if m and not (m.group(2)[0] == '`' and '`' in m.group(3)):
                 in_fence, char, size = True, m.group(2)[0], len(m.group(2))
+                open_off = off
                 out.append(_blank(line))
             else:
                 out.append(line)
@@ -114,12 +116,23 @@ def mask_fenced_code(text: str, *, report_unclosed: bool = False):
             if (stripped and set(stripped) == {char} and len(stripped) >= size
                     and re.match(r'^ {0,3}\S', line) is not None):
                 in_fence = False
+        off += len(line) + 1          # +1 for the '\n' split consumed
     masked = '\n'.join(out)
     # Closure is STRUCTURAL state the parser already has. Callers that need to
     # tell a runaway fence from a deliberate example must ask for it here rather
     # than infer it from content — inferring it produced two false alarms
     # (a closed fence at EOF, review of #2558).
-    return (masked, in_fence) if report_unclosed else masked
+    #
+    # Reported as the unclosed fence's RANGE, not a bare bool. "Is there an
+    # unclosed fence anywhere in this document" cannot answer "did an unclosed
+    # fence hide THIS divider": a closed fence quoting `# Resolved` plus an
+    # unrelated runaway fence later in the file made the quoted divider warn as
+    # damage, on a document where nothing was hidden and nothing archived was
+    # served as live (qingyun-wu P1 on 8ad855ac, reproduced here before fixing).
+    # A span lets the caller ask the local question. `None` when the document is
+    # balanced, so truthiness still reads the way the old bool did.
+    span = (open_off, len(text)) if in_fence else None
+    return (masked, span) if report_unclosed else masked
 
 
 def _backtick_runs(text: str) -> list[tuple[int, int]]:
@@ -292,7 +305,7 @@ def _dividers_hidden_by_damage(text: str, divider: re.Pattern) -> list[tuple[int
     EOF). Each looked right and each was wrong on a real shape.
     """
     comments_only = mask_html_comments(text)
-    fenced, fence_unclosed = mask_fenced_code(comments_only, report_unclosed=True)
+    fenced, fence_span = mask_fenced_code(comments_only, report_unclosed=True)
     # What the SPAN pass alone swallowed. `mask_markup` runs comments -> spans ->
     # fences, so diffing these two isolates the span step: fences are applied to
     # NEITHER side, and comments are applied to BOTH.
@@ -303,7 +316,15 @@ def _dividers_hidden_by_damage(text: str, divider: re.Pattern) -> list[tuple[int
         if masked[m.start():m.end()].strip() != "":
             continue                                  # not hidden at all
         if fenced[m.start():m.end()].strip() == "":
-            damaged = fence_unclosed                  # the fence pass hid it
+            # The fence pass hid it — but only the UNCLOSED fence that actually
+            # covers this divider implicates it. Asking "is any fence in the
+            # document unclosed" warned on a divider safely inside a CLOSED
+            # fenced example whenever an unrelated runaway fence appeared later
+            # in the file. Same range-local shape the span branch below already
+            # uses; this branch was the half that never got it.
+            damaged = bool(fence_span
+                           and fence_span[0] <= m.start()
+                           and m.end() <= fence_span[1])
         else:
             # Scope the damage test to the pass that actually hid the divider.
             # Comparing raw-vs-all-maskers instead made any legitimately FENCED

@@ -392,6 +392,67 @@ class TestMaskedDividerWarns(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(out, text)
 
+    def test_an_UNRELATED_later_unclosed_fence_is_not_damage(self):
+        # qingyun-wu P1 on 8ad855ac. The fence branch asked a DOCUMENT-WIDE
+        # question — "is any fence in this file unclosed" — which cannot answer
+        # the local one, "did an unclosed fence hide THIS divider".
+        #
+        # Here the divider sits inside a CLOSED fenced example. It hid nothing
+        # and served no archived content as live. A later, entirely unrelated
+        # runaway fence then made it warn as damage. The span branch had already
+        # been made range-local in an earlier round; this branch was the half
+        # that never got it, so the same defect survived in the sibling.
+        text = (
+            "## live\n"
+            "\n"
+            f"{FENCE}\n"
+            "# Resolved\n"
+            f"{FENCE}\n"
+            "\n"
+            "## still live\n"
+            "\n"
+            f"{FENCE}\n"
+            "unclosed later\n"
+        )
+        out, err = _run(text)
+        self.assertEqual(err, "", "a divider inside a CLOSED fence is not damage")
+        self.assertEqual(out, text)
+
+    def test_the_SAME_document_without_the_later_fence_is_also_silent(self):
+        # The control that isolates the cause: identical except for the runaway
+        # fence. Both must be silent, and before the fix only this one was —
+        # which is what proves the later fence was the thing implicating an
+        # unrelated divider.
+        text = (
+            "## live\n"
+            "\n"
+            f"{FENCE}\n"
+            "# Resolved\n"
+            f"{FENCE}\n"
+            "\n"
+            "## still live\n"
+        )
+        out, err = _run(text)
+        self.assertEqual(err, "")
+        self.assertEqual(out, text)
+
+    def test_a_divider_INSIDE_the_unclosed_fence_still_warns(self):
+        # Over-trigger control. Range-scoping must not silence the real case:
+        # here the runaway fence genuinely swallows the divider, so everything
+        # after it is masked and archived content would be served as live. This
+        # is the failure the whole check exists to catch.
+        text = (
+            "## live\n"
+            "\n"
+            f"{FENCE}\n"
+            "stuff\n"
+            "# Resolved\n"
+            "more\n"
+        )
+        out, err = _run(text)
+        self.assertNotEqual(err, "", "a divider hidden by the UNCLOSED fence is real damage")
+        self.assertIn("MASKED", err)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
