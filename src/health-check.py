@@ -2885,7 +2885,7 @@ def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
     return None
 
 
-def check_quota_account_identity(proxy_status: str) -> dict:
+def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
     """Does the proxy inject THIS core's login, or a different account's?
 
     `check_quota_telemetry` above answers "is quota-state fresh, and does it
@@ -2925,16 +2925,36 @@ def check_quota_account_identity(proxy_status: str) -> dict:
     if _runtime_may_skip_proxy():
         return {"name": name, "status": "ok",
                 "detail": "core runtime is not proxy-routed — its credential is not this proxy's"}
-    # Positive confirmation only. health-check runs as a child of the core, so it
-    # inherits the core's environment; ANTHROPIC_BASE_URL present is direct
-    # evidence the core routes. Absent, we cannot show it routes — and an
-    # unprovable premise must silence the check rather than license a warning
-    # whose every clause depends on it.
-    if not os.environ.get("ANTHROPIC_BASE_URL"):
+    # Probe the RUNNING CORE's environment, not this process's.
+    #
+    # The first version of this gate read `os.environ` on the theory that
+    # health-check runs as a child of the core and inherits it. True on the
+    # proactive-loop path, and false on the app / fallback-launchd / manual
+    # paths, which this file already documents do not carry the core's env
+    # (see the launchd notes around line 1417). On those a routed core with a
+    # genuine account mismatch would read "comparison inactive" and stay
+    # silent — the check disabled exactly where nobody is watching.
+    #
+    # `core_env_has_proxy_url` is TRI-STATE and its contract is that None must
+    # never collapse into False. Applied here:
+    #   True  -> the core routes; the comparison below is meaningful.
+    #   False -> demonstrably NOT routed; the proxy's account is irrelevant to
+    #            it, so every clause of the warning would be false. Silent.
+    #   None  -> undeterminable (no tmux, ambiguous session, unreadable env).
+    #            Silent, and says so — an unprovable premise licenses nothing.
+    # `core_env_prober` is the same injectable seam check_quota_telemetry uses:
+    # without it a fixture escapes into the developer's live tmux and reports on
+    # the real core, which is how 3 of that suite's 39 cases once flipped.
+    probe = core_env_prober or core_env_has_proxy_url
+    routed = probe()
+    if routed is False:
         return {"name": name, "status": "ok",
-                "detail": ("cannot confirm this core routes through the proxy "
-                           "(no ANTHROPIC_BASE_URL in the inherited environment) — "
-                           "identity comparison inactive here")}
+                "detail": ("the running core has no ANTHROPIC_BASE_URL — it is not routed "
+                           "through this proxy, so whose login the proxy holds is moot")}
+    if routed is None:
+        return {"name": name, "status": "ok",
+                "detail": ("could not read the running core's environment — identity "
+                           "comparison inactive here (not evidence either way)")}
 
     core_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not core_cfg:

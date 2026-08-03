@@ -105,7 +105,9 @@ class TestQuotaAccountIdentity(unittest.TestCase):
                                side_effect=lambda s: s in existing_services):
             if not core_cfg:
                 os.environ.pop("CLAUDE_CONFIG_DIR", None)
-            return hc.check_quota_account_identity(proxy_status)
+            # The PROBE is what the gate consults — never this process's env.
+            return hc.check_quota_account_identity(
+                proxy_status, core_env_prober=lambda: routed)
 
     # ---- routing gate: the false-positive class qingyun-wu blocked on --------
 
@@ -121,7 +123,46 @@ class TestQuotaAccountIdentity(unittest.TestCase):
                         existing_services={_scoped(core), VANILLA}, routed=False)
         self.assertEqual(out["status"], "ok",
                          "an unrouted core must not be told the proxy is billing its requests")
-        self.assertIn("cannot confirm", out["detail"])
+        self.assertIn("not routed", out["detail"])
+
+    def test_probes_the_CORE_env_not_this_process(self):
+        """THE qingyun-wu P1 pin: health-check's OWN environment lacks
+        ANTHROPIC_BASE_URL while the probed running core HAS it.
+
+        The first gate read `os.environ`, on the theory that health-check is a
+        child of the core and inherits it. That holds on the proactive-loop path
+        and fails on the app / fallback-launchd / manual paths, which this file
+        documents do not carry the core's env. There, a routed core with a real
+        account mismatch would read "comparison inactive" and go silent — the
+        check disabled precisely where no human is watching.
+
+        So: subprocess env stripped, prober says True, and the comparison must
+        still run to a WARN on divergent items."""
+        core = "/Users/x/ws/.claude-sutando"
+        self._write_plist(None)                      # proxy resolves vanilla
+        env = {"CLAUDE_CONFIG_DIR": core}
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False), \
+             mock.patch.object(hc, "_keychain_service_exists",
+                               side_effect=lambda s: s in {_scoped(core), VANILLA}):
+            os.environ.pop("ANTHROPIC_BASE_URL", None)   # THIS process is unrouted
+            out = hc.check_quota_account_identity("ok", core_env_prober=lambda: True)
+        self.assertEqual(out["status"], "warn",
+                         "a routed CORE must be compared even when health-check's own "
+                         "env lacks the variable")
+        self.assertIn(_scoped(core), out["detail"])
+
+    def test_undeterminable_core_env_is_silent_and_says_so(self):
+        """`core_env_has_proxy_url` is tri-state and None must NEVER collapse to
+        False. Undeterminable (no tmux, ambiguous session) is not evidence of a
+        bypass — stay silent, and state the no-op rather than returning a bare
+        ok indistinguishable from a real comparison."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core_cfg=core, plist_cfg=None,
+                        existing_services={_scoped(core), VANILLA}, routed=None)
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("inactive", out["detail"])
 
     def test_non_proxy_runtime_does_not_warn(self):
         """Same divergence, but the runtime marker says this core is not
@@ -145,7 +186,8 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         with self._routed_env(core), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
-            out = hc.check_quota_account_identity("ok")   # must not raise
+            out = hc.check_quota_account_identity(
+                "ok", core_env_prober=lambda: True)   # must not raise
         self.assertEqual(out["status"], "warn")
         self.assertIn("EnvironmentVariables", out["detail"])
 
@@ -158,7 +200,7 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         with self._routed_env(core), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
-            out = hc.check_quota_account_identity("ok")
+            out = hc.check_quota_account_identity("ok", core_env_prober=lambda: True)
         self.assertEqual(out["status"], "warn")
         self.assertIn("root", out["detail"])
 
@@ -171,7 +213,7 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         with self._routed_env(core), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
-            out = hc.check_quota_account_identity("ok")
+            out = hc.check_quota_account_identity("ok", core_env_prober=lambda: True)
         self.assertEqual(out["status"], "warn")
         self.assertIn("CLAUDE_CONFIG_DIR", out["detail"])
 
@@ -259,7 +301,8 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         with self._routed_env(core), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
-            out = hc.check_quota_account_identity("ok")   # no plist written
+            out = hc.check_quota_account_identity(
+                "ok", core_env_prober=lambda: True)   # no plist written
         self.assertEqual(out["status"], "ok")
         self.assertIn("launchd", out["detail"])
 
@@ -272,7 +315,7 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         with self._routed_env(core), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
-            out = hc.check_quota_account_identity("ok")
+            out = hc.check_quota_account_identity("ok", core_env_prober=lambda: True)
         self.assertEqual(out["status"], "warn")
         self.assertIn("cannot read", out["detail"])
 
