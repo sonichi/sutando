@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import plistlib
 import shlex
 import shutil
 import tempfile
@@ -2853,6 +2854,112 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     return check
 
 
+def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
+    """Mirror of credential-proxy.ts `scopedKeychainService`.
+
+    Empty/whitespace -> None, so the caller falls back to the vanilla item —
+    the same contract the proxy implements.
+    """
+    dir_ = (config_dir or "").strip()
+    if not dir_:
+        return None
+    digest = hashlib.sha256(dir_.encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{digest}"
+
+
+def _keychain_service_exists(service: str) -> bool:
+    try:
+        return subprocess.run(
+            ["security", "find-generic-password", "-s", service],
+            capture_output=True, timeout=5,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
+    """First EXISTING item of [scoped(config_dir), vanilla] — the proxy's order."""
+    for service in (_scoped_keychain_service(config_dir), "Claude Code-credentials"):
+        if service and _keychain_service_exists(service):
+            return service
+    return None
+
+
+def check_quota_account_identity(proxy_status: str) -> dict:
+    """Does the proxy inject THIS core's login, or a different account's?
+
+    `check_quota_telemetry` above answers "is quota-state fresh, and does it
+    exist" — both are questions about WHEN, and neither can see the failure
+    this check exists for: a proxy that is up, routing, and writing a
+    seconds-old file **for someone else's account**.
+
+    Observed 2026-08-03. The owner's login showed 7% of the 7d window used
+    while every routed request billed a different account at 88%; the core
+    throttled itself to near-idle for an hour against a ceiling that was not
+    his. `quota-state.json` was never stale, so no existing branch fired.
+
+    Mechanism: the proxy picks its credential by preferring the keychain item
+    scoped to its own CLAUDE_CONFIG_DIR, falling back to vanilla. launchd does
+    not inherit the installing shell's environment, so if the plist omits
+    CLAUDE_CONFIG_DIR the proxy can only ever resolve the vanilla item — while
+    an interactive `/login` in a namespaced core writes the SCOPED one. It does
+    not self-heal: the proxy re-reads per request, but re-reads the wrong item
+    and refreshes that token back into itself.
+
+    Compares the item the CORE would resolve against the item the PROXY would,
+    reading only the plist and keychain ITEM NAMES. No token, and no secret
+    material of any kind, is read or logged.
+    """
+    name = "quota-account-identity"
+    if proxy_status != "ok":
+        return {"name": name, "status": "ok",
+                "detail": "credential proxy not up — nothing to compare"}
+
+    core_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not core_cfg:
+        return {"name": name, "status": "ok",
+                "detail": "core has no CLAUDE_CONFIG_DIR — both sides resolve the vanilla item"}
+
+    plist = Path.home() / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
+    if not plist.is_file():
+        return {"name": name, "status": "ok",
+                "detail": "credential proxy is not launchd-managed on this host"}
+    try:
+        rendered = plistlib.loads(plist.read_bytes())
+        proxy_cfg = (rendered.get("EnvironmentVariables") or {}).get("CLAUDE_CONFIG_DIR")
+    except (OSError, ValueError) as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"cannot read the credential-proxy plist ({exc})"}
+
+    core_service = _resolved_credential_service(core_cfg)
+    proxy_service = _resolved_credential_service(proxy_cfg)
+
+    if core_service is None or proxy_service is None:
+        # No readable credential on one side (locked keychain, fresh host).
+        # Say so rather than returning a bare ok that looks like agreement.
+        return {"name": name, "status": "ok",
+                "detail": "no readable credential on one side — comparison inactive here"}
+
+    if core_service == proxy_service:
+        return {"name": name, "status": "ok",
+                "detail": f"proxy injects this core's login ({core_service})"}
+
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (
+            f"the credential proxy injects a DIFFERENT login than this core's: proxy "
+            f"resolves '{proxy_service}', core would resolve '{core_service}'. Quota "
+            f"numbers describe the proxy's account, not yours, and requests bill it — "
+            f"a `/login` here will not reach the proxy. Cause is almost always the "
+            f"launchd plist omitting CLAUDE_CONFIG_DIR (launchd inherits no shell env): "
+            f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
+            f"Fix: pin CLAUDE_CONFIG_DIR in "
+            f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
+        ),
+    }
+
+
 def check_bodhi_dist() -> dict:
     """Verify the installed bodhi-realtime-agent dist has the Gemini 3.1
     wire-format fixes applied. Greps the Gemini sendAudio/sendFile bodies
@@ -4336,6 +4443,10 @@ def run_all_checks() -> list[dict]:
 
     # Quota telemetry — only meaningful when the proxy is actually up.
     checks.append(check_quota_telemetry(proxy_check["status"]))
+    # ...and WHOSE account those numbers describe. The check above answers
+    # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
+    # passes every branch above (observed 2026-08-03).
+    checks.append(check_quota_account_identity(proxy_check["status"]))
 
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.
