@@ -332,6 +332,40 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertNotIn("hosts/*/", r["detail"])
         self.assertNotIn("add them to the local list", r["detail"])
 
+    def test_a_DIRECTORY_un_ignored_while_its_FILES_are_ignored_is_not_carried(self):
+        # john-the-dev and qingyun-wu, independently, on a958d06f. A directory
+        # and the files inside it are different questions for git: `!hosts/` and
+        # `!hosts/*/` un-ignore the DIRECTORIES while every file beneath stays
+        # ignored — `!hosts/**` is what carries the contents.
+        #
+        #   check-ignore --no-index hosts/a                  -> 1  (not ignored)
+        #   check-ignore --no-index hosts/a/current-track.md -> 0  (IGNORED)
+        #
+        # so probing the representative directory reported `ok — all configured
+        # carrier path(s) un-ignored` while the actual carrier file was unbacked.
+        # A false GREEN in the probe whose only job is catching silent non-backup.
+        ws = _mkworkspace(self.tmp, ["hosts/", "hosts/*/"],       # note: no hosts/**
+                          ["hosts/a/current-track.md"])
+        self._patch_resolved(["hosts/*/"])
+        self._patch_shipped(["hosts/*/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertNotEqual(r["status"], "ok",
+                            "the directory is un-ignored but its carrier file is not")
+        self.assertIn("hosts/*/", r["detail"])
+
+    def test_the_SAME_tree_with_contents_carried_reads_ok(self):
+        # Over-trigger control, and the line that isolates the cause: identical
+        # except for `!hosts/**`. Without it this fix would just make every
+        # directory entry fail.
+        ws = _mkworkspace(self.tmp, ["hosts/", "hosts/*/", "hosts/**"],
+                          ["hosts/a/current-track.md"])
+        self._patch_resolved(["hosts/*/"])
+        self._patch_shipped(["hosts/*/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", r.get("detail"))
+
     def test_a_NARROWER_local_rule_covering_one_child_is_not_coverage(self):
         # qingyun-wu P1 on #2572. `_carrier_representative` returned the FIRST
         # glob match, so a shipped wildcard matching several paths was judged on

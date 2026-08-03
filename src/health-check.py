@@ -1143,6 +1143,89 @@ def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
     return [candidate] if candidate.exists() else []
 
 
+# How many materialized files under a directory representative to ask git about.
+# Bounded because a carrier entry can name a large subtree and this runs from a
+# background health check. The bound is honest about its direction: past the cap
+# the probe can UNDER-report (an ignored file beyond it goes unseen), never
+# over-report — the same failure direction as the no-network ref staleness.
+_PROBE_FILES_PER_DIR = 25
+
+
+def _carrier_probe_files(rep: "Path") -> "list[Path]":
+    """The concrete files to ask git about for one materialized representative.
+
+    A file represents itself. A DIRECTORY is represented by the files beneath
+    it, sorted for determinism (an unsorted walk would make the probe's verdict
+    depend on filesystem order) and capped at `_PROBE_FILES_PER_DIR`.
+    """
+    if rep.is_file():
+        return [rep]
+    if not rep.is_dir():
+        return []
+    out = []
+    for f in sorted(rep.rglob("*")):
+        if f.is_file():
+            out.append(f)
+            if len(out) >= _PROBE_FILES_PER_DIR:
+                break
+    return out
+
+
+def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
+    """`"carried"` | `"dropped"` | `"unmeasured"` for ONE materialized path.
+
+    A DIRECTORY and the files inside it are different questions for git, and the
+    first cut asked the wrong one. `*` + `!hosts/` + `!hosts/*/` un-ignores the
+    directories while every file beneath stays ignored — `!hosts/**` is what
+    carries the contents. So `check-ignore` on `hosts/a` answered "not ignored"
+    while `hosts/a/current-track.md` was ignored and unbacked, and the probe
+    reported the vault healthy with the very file it exists to protect not being
+    backed up. Reproduced independently by john-the-dev and qingyun-wu on
+    a958d06f, and confirmed here before changing anything.
+
+    So a directory is probed through the FILES beneath it, bounded by
+    `_PROBE_FILES_PER_DIR`, and any ignored one condemns the entry.
+
+    `--no-index` stays load-bearing and the instrument stays `check-ignore` for
+    a reason worth recording: the obvious alternative,
+    `ls-files --others --ignored`, is index-AWARE, so it calls a tracked file
+    carried. That silently reverses a documented behavior —
+    `test_a_TRACKED_file_with_a_stale_exclude_is_still_reported` exists because a
+    host that carried a file once and then let its exclude go stale read healthy
+    forever while nothing NEW under that entry was being carried. I wrote the
+    ls-files version first and that test failed; it was right and I was wrong.
+
+    Used by BOTH the stale and dropped branches. The stale branch probes a
+    directory representative too and had the same blindness; fixing only the
+    branch that was reported would have left the identical defect one step to
+    the left, which is how this class of bug has survived three rounds here.
+    """
+    targets = _carrier_probe_files(rep)
+    if not targets:
+        # A materialized directory with no files under it yet. Nothing to
+        # measure — treated as carried so an empty `hosts/<label>/` cannot
+        # manufacture a failure; the "nothing on disk" case is handled by the
+        # callers, which report an entry with no representatives at all.
+        return "carried"
+
+    for target in targets:
+        try:
+            proc = subprocess.run(
+                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
+                         str(target.relative_to(workspace))),
+                capture_output=True, timeout=10,
+            )
+        except (GitUnavailable, OSError, subprocess.SubprocessError):
+            return "unmeasured"
+        # check-ignore's contract: 0 = ignored, 1 = NOT ignored, anything else =
+        # it failed. Folding "not 0" into healthy would count exit 128 as carried.
+        if proc.returncode == 0:
+            return "dropped"
+        if proc.returncode != 1:
+            return "unmeasured"
+    return "carried"
+
+
 def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
     """One existing concrete path for a carrier-set entry, or None.
 
@@ -1206,36 +1289,23 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         rep = _carrier_representative(workspace, entry)
         if rep is None:
             continue
-        try:
-            proc = subprocess.run(
-                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
-                         str(rep.relative_to(workspace))),
-                capture_output=True, timeout=10,
-            )
-        except (GitUnavailable, OSError, subprocess.SubprocessError):
-            # Could not run the measurement at all. NOT the same as "carried".
-            unmeasured.append(entry)
-            continue
         # `git_argv` rather than a bare "git": on macOS the stock /usr/bin/git is
         # an Xcode-CLT shim that pops an install dialog when the tools are absent,
         # and this probe runs from a BACKGROUND health check where nobody is there
         # to dismiss it. The resolver refuses that shim instead of spawning it.
         #
-        # `--no-index` is LOAD-BEARING (sync-workspace.sh says so at its own
-        # check-ignore call): without it, git reports an ALREADY-TRACKED file as
-        # not-ignored regardless of the rules, so a host whose file was carried
-        # once and whose exclude later went stale reads healthy forever. Caught
-        # by restoring this host's real pre-fix exclude and watching the probe
-        # still say OK.
-        #
-        # check-ignore's contract is 0 = ignored, 1 = NOT ignored, anything else
-        # = it failed. Treating "not 0" as healthy folded exit 128 in with exit 1,
-        # so a git that could not run reported the carrier set as fine — the exact
-        # unmeasured-reads-as-healthy failure this probe exists to catch, in the
-        # probe itself.
-        if proc.returncode == 0:
+        # `--no-index` is LOAD-BEARING on the file path (sync-workspace.sh says so
+        # at its own check-ignore call): without it, git reports an ALREADY-TRACKED
+        # file as not-ignored regardless of the rules, so a host whose file was
+        # carried once and whose exclude later went stale reads healthy forever.
+        # Caught by restoring this host's real pre-fix exclude and watching the
+        # probe still say OK. Both that and the directory/contents distinction now
+        # live in `_carrier_target_verdict` so the two branches cannot drift.
+        verdict = _carrier_target_verdict(workspace, rep)
+        if verdict == "dropped":
             stale.append(entry)
-        elif proc.returncode != 1:
+        elif verdict == "unmeasured":
+            # Could not run the measurement at all. NOT the same as "carried".
             unmeasured.append(entry)
 
     # Read the SHIPPED file directly rather than through load_config(), which
@@ -1283,24 +1353,13 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
                 continue
             verdict = "covered"
             for rep in reps:
-                try:
-                    proc = subprocess.run(
-                        git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
-                                 str(rep.relative_to(workspace))),
-                        capture_output=True, timeout=10,
-                    )
-                except (GitUnavailable, OSError, subprocess.SubprocessError):
-                    verdict = "unmeasured"
-                    break
-                # Same contract as the stale branch: 0 = ignored (so this match is
-                # genuinely not carried), 1 = not ignored (covered by a broader
-                # local rule). Anything else is a failed measurement, which is
-                # UNKNOWN — never "covered".
-                if proc.returncode == 0:
-                    verdict = "dropped"
-                    break
-                if proc.returncode != 1:
-                    verdict = "unmeasured"
+                # Same instrument as the stale branch, deliberately shared: a
+                # DIRECTORY representative and the files under it are different
+                # questions for git, and asking about the directory reported a
+                # subtree healthy while its carrier file was ignored.
+                got = _carrier_target_verdict(workspace, rep)
+                if got != "carried":
+                    verdict = got
                     break
             if verdict == "dropped":
                 dropped.append(entry)
