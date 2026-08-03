@@ -1242,9 +1242,56 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     unsafe = [e for e in dropped if e in UNSAFE_TO_READD]
     safe = [e for e in dropped if e not in UNSAFE_TO_READD]
 
+    # The same carve-out has to reach the STALE branch, and there it inverts the
+    # verdict rather than just softening the wording. A path that must not be
+    # carried and is NOT being carried is in its CORRECT state — reporting that as
+    # a failure whose remedy is `--force-gitignore` would walk the operator into
+    # re-carrying it, which is the cross-host overwrite this carve-out exists to
+    # prevent. Found by running the merged probe on a live host that had
+    # deliberately un-carried the path: it said `fail` and named the exact command
+    # that resumes the incident.
+    stale_expected = [e for e in stale if e in UNSAFE_TO_READD]
+    stale = [e for e in stale if e not in UNSAFE_TO_READD]
+
     if not stale and not dropped and not unmeasured:
-        return {"name": name, "status": "ok",
-                "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault"}
+        if not stale_expected:
+            return {
+                "name": name,
+                "status": "ok",
+                "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault",
+            }
+        # NOT `ok`: this host is in the correct state, but it got there by DIVERGING
+        # from the shipped default, which still ships the flat path in
+        # `vault.sync.include` and still re-carries it on `--force-gitignore` or in a
+        # fresh workspace. Reporting `ok` would claim the default is safe when only
+        # this host is (qingyun-wu on #2570).
+        #
+        # `warn` + an EXPLICIT `alerting: False`. The first cut set `warn` alone and
+        # claimed in this comment that it "never alerts" because `main()` excludes
+        # warn from `issues` — which was simply false. `issues` is a local list used
+        # to print a summary; `--emit-task`, `--notify-on-fail` and `--notify-slack`
+        # each consume the FULL checks list and treat a plain warn as a failure, so
+        # this state still fired a task and a notification on first transition
+        # (qingyun-wu again, with a one-check witness). The claim was tested against
+        # the list I happened to have named rather than the surfaces that enforce.
+        #
+        # Suppression is right HERE specifically: the owner cannot act on it. Phase 2
+        # of #2567 is gated on migration evidence, so paging about it would repeat a
+        # non-actionable message until that lands, and this branch stops being
+        # reachable once the flat path leaves the shipped default.
+        return {
+            "name": name,
+            "status": "warn",
+            "alerting": False,
+            "detail": (
+                f"{len(resolved) - len(stale_expected)} configured carrier path(s) un-ignored; "
+                f"{', '.join(stale_expected)} correctly NOT carried on this host — but the shipped "
+                f"default still lists it in `vault.sync.include`, so a fresh workspace or "
+                f"`--force-gitignore` re-carries it at the flat, SHARED path and can resume the "
+                f"cross-host overwrite. This host is right and the default is not; do not "
+                f"`--force-gitignore` it back. Clears when phase 2 of #2567 drops the entry"
+            ),
+        }
 
     parts = []
     if unmeasured:
@@ -5184,6 +5231,29 @@ def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -
     return False
 
 
+def _alerts_suppressed(check: dict) -> bool:
+    """True when a check must NOT wake anyone, whatever its status says.
+
+    `main()` computes a local `issues` list, and it is tempting to treat that as
+    "what alerts". It is not. `--emit-task`, `--notify-on-fail` and
+    `--notify-slack` each consume the FULL `checks` list through their own
+    filters, and all three count a plain `warn` as a failure. A carve-out tested
+    only against `issues` therefore still fires a task and a macOS notification
+    on the first transition (qingyun-wu, #2570 — verified on the exact head with
+    a one-check witness: notification written, 1 Slack message, 1 task file).
+
+    So suppression has to be an explicit property of the CHECK, honored at every
+    surface that can wake someone, rather than a status the reader hopes is
+    benign. A probe sets `"alerting": False` when its result is genuinely
+    informational — visible on the dashboard, never a page.
+
+    Deliberately narrow: only an explicit `False` suppresses. A missing key
+    alerts, so no existing check changes behavior by omission, and a typo cannot
+    silence a real failure.
+    """
+    return check.get("alerting") is False
+
+
 def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
     """Emit a task file describing health-check failures so the proactive
     loop's CLI session sees them via the watcher and can decide what to do
@@ -5215,7 +5285,9 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     # watchdog catches the bug class that motivated this PR. Excluding
     # would have missed Mini's discord-bridge issue this morning. Per
     # her PR review note 2026-05-05.
-    failures = [c for c in checks if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")]
+    failures = [c for c in checks
+                if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")
+                and not _alerts_suppressed(c)]
     if not failures:
         return
 
@@ -5300,7 +5372,9 @@ def notify_for_failures(
     defaults to `osascript` driving `display notification`. Tests inject a
     fake to avoid spamming the developer's own notification center.
     """
-    failures = [c for c in checks if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")]
+    failures = [c for c in checks
+                if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")
+                and not _alerts_suppressed(c)]
     if not failures:
         return
 
@@ -5365,9 +5439,12 @@ def _slack_failures(checks: list[dict]) -> list[dict]:
     out = []
     for c in checks:
         st = c["status"]
+        if _alerts_suppressed(c):
+            continue
         if st in ("down", "missing", "not_loaded", "fail", "stale"):
             out.append(c)
-        elif st == "warn" and "on-demand" not in (c.get("detail") or ""):
+        elif st == "warn" and "on-demand" not in (c.get("detail") or "") \
+                and not _alerts_suppressed(c):
             out.append(c)
     return out
 
