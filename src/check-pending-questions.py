@@ -146,7 +146,17 @@ def get_waiting_questions():
             and not re.match(r'^(\*\*)?Status:(\*\*)?', l.strip(), re.IGNORECASE)
         ]
         snippet = snippet_lines[0][:120] if snippet_lines else ""
-        questions.append({"id": title[:40], "title": title, "snippet": snippet})
+        # `body` is the FULL section text. `snippet` is a 120-char action hint and
+        # `title` a heading, so a caller checking "did my question land?" against
+        # them can only ever match the first ~100 characters of an entry. The
+        # documented verification in the proactive-loop skill does exactly that:
+        #   any('<phrase>' in str(q) for q in get_waiting_questions())
+        # and its own text calls a True "the only proof the question exists". A
+        # phrase further into the entry made that return False for a question that
+        # was filed, above the divider, and counted — a verification step whose
+        # failure mode is reporting the healthy case as broken.
+        questions.append({"id": title[:40], "title": title, "snippet": snippet,
+                          "body": body.strip()})
 
     # Also recognize the free-form bullet format the proactive-loop and skills
     # actually append in: `- **[label, timestamp]** ...`. The `## `-section walk
@@ -159,7 +169,17 @@ def get_waiting_questions():
         title = m.group(1).strip()
         if title and title not in seen:
             seen.add(title)
-            questions.append({"id": title[:40], "title": title})
+            # `title` is only the BRACKETED LABEL, so bodying to it would leave the
+            # rest of the bullet — where the actual ask lives — just as unsearchable
+            # as the section case this change exists to fix. Take the whole line.
+            # Anchor off m.end(), not m.start(): `^\s*` lets \s match the preceding
+            # NEWLINE, so on a bullet with a blank line above it the match begins on
+            # that blank line and a start-anchored slice comes back empty.
+            line_start = content.rfind("\n", 0, m.end()) + 1
+            line_end = content.find("\n", m.end())
+            body = content[line_start:line_end if line_end != -1 else len(content)].strip()
+            questions.append({"id": title[:40], "title": title,
+                              "snippet": "", "body": body or title})
     return questions
 
 
