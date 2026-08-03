@@ -417,6 +417,30 @@ def main() -> int:
             hc.subprocess.run = real_run
         check(got == [], f"v7b) a failed TREE DIFF yields no drift claim, got {got}")
 
+    # v7c) The LOG call's non-zero branch. Adding the tree-diff gate made this
+    #      unreachable from v6: a bad ref now fails at the DIFF and returns
+    #      early, so the log call is never issued. The branch is still live in
+    #      production though — the diff can succeed while the log fails — and it
+    #      must degrade the same way rather than return a half-answer. Reaching
+    #      it needs the diff to SUCCEED with output and only the log to fail.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        real_run = hc.subprocess.run
+
+        def _log_fails(argv, *a, **kw):
+            if "log" in argv:
+                class _Bad:
+                    returncode, stdout, stderr = 128, "", "fatal"
+                return _Bad()
+            return real_run(argv, *a, **kw)
+
+        hc.subprocess.run = _log_fails
+        try:
+            got = hc._behind_commits_changing(work, "main", "skills/")
+        finally:
+            hc.subprocess.run = real_run
+        check(got == [], f"v7c) diff succeeds but log fails -> no drift claim, got {got}")
+
     # v8) Over-trigger control for v7: a skill change that is NOT reverted must
     #     still warn, or the tree-diff gate would have silenced the real case
     #     along with the false one.
