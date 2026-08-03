@@ -106,13 +106,44 @@ def check_pending_questions():
 
 
 def check_stale_tasks():
-    """Find task files older than 1 hour (should be processed within minutes)."""
+    """Find task files older than 1 hour with no result anywhere.
+
+    A top-level task file can outlive a completed result when a consumer fails
+    to archive the pair.  Treating the task file alone as pending produced an
+    853-item false alarm (and repeated owner DMs) even though every task had a
+    matching result.  Mirror the queue health check's completion namespaces:
+    live results, bridge archives, and startup retention archives.
+    """
     issues = []
     tasks_dir = WORKSPACE / "tasks"
     if not tasks_dir.exists():
         return []
+
+    completed_names = set()
+
+    def record_result(path: Path) -> None:
+        if not path.is_file():
+            return
+        completed_names.add(path.name)
+        renamed = re.match(r"^(.+)-[0-9]+\.txt$", path.name)
+        if renamed:
+            completed_names.add(f"{renamed.group(1)}.txt")
+
+    for path in RESULTS_DIR.glob("task-*.txt"):
+        record_result(path)
+    for path in (RESULTS_DIR / "archive").glob("*.txt"):
+        record_result(path)
+    for path in (RESULTS_DIR / "archive").glob("*/*.txt"):
+        record_result(path)
+    for retention_dir in RESULTS_DIR.glob("archive-*"):
+        if retention_dir.is_dir():
+            for path in retention_dir.glob("*.txt"):
+                record_result(path)
+
     now = datetime.now().timestamp()
     for f in tasks_dir.glob("task-*.txt"):
+        if f.name in completed_names:
+            continue
         age_hours = (now - f.stat().st_mtime) / 3600
         if age_hours > 1:
             issues.append(f"Stale task unprocessed for {age_hours:.0f}h: {f.name}")
