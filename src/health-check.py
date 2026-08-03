@@ -1063,6 +1063,128 @@ def check_memory_dir_siblings() -> "dict | None":
     }
 
 
+def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
+    """Resolve one existing concrete path for a carrier-set entry, or None.
+
+    Entries are gitignore-style and may be globs (`hosts/*/`), directories
+    (`notes/`) or plain files (`state/current-track.md`). We only need ONE
+    materialized path per entry to ask git whether the entry is being carried;
+    an entry with nothing on disk yet is not evidence of anything, so it is
+    skipped rather than reported.
+    """
+    rel = entry.strip().lstrip("/").rstrip("/")
+    if not rel:
+        return None
+    if any(ch in rel for ch in "*?["):
+        for hit in sorted(workspace.glob(rel)):
+            return hit
+        return None
+    candidate = workspace / rel
+    return candidate if candidate.exists() else None
+
+
+def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
+    """A configured carrier-set entry that git still ignores is not being backed up.
+
+    `sync-workspace.sh:generate_exclude` REFUSES to rewrite an existing
+    `.git/info/exclude` that differs from the generated content (the #1445 guard
+    against clobbering operator-authored rules), and `_enforce_carrier_set_pre`
+    (`:613`) swallows that refusal so the tick continues. The sync then pushes and
+    reports success while the carrier set is silently stale — observed on two
+    hosts independently (65 refusals / 63 followed by `pushed to` on one, 4/4 on
+    the other; see #2565). Every existing check reads healthy: the config IS
+    correct, the checkout IS current, and only the generated artifact is stale.
+
+    Two distinct causes produce the identical symptom and need different remedies,
+    so they are reported separately rather than collapsed:
+
+      1. STALE EXCLUDE — the resolved config lists an entry that git still
+         ignores. Remedy: `bash scripts/sync-workspace.sh --force-gitignore`.
+      2. DROPPED BY OVERRIDE — a local `vault.sync.include` REPLACES the shipped
+         default rather than merging into it (#2531), so shipped entries added
+         later never reach this host. Remedy: add them to the local list. Here
+         the on-disk exclude legitimately MATCHES the resolved config, so cause 1
+         is dormant and a resolved-vs-disk comparison alone reads healthy.
+
+    Asking git directly (`check-ignore`) rather than regenerating the exclude and
+    diffing is deliberate: it tests the OUTCOME, cannot drift as the generator's
+    formatting changes, and is immune to the two legitimate no-diff branches
+    (`:562` no-op when already matching, `:570` safe legacy `hosts/<label>/` ->
+    `hosts/*/` widening) — after either, the paths ARE un-ignored, so there is
+    nothing to false-positive on.
+
+    Returns None when the workspace is not a git repo (vault never initialized),
+    which is a valid unconfigured state and not a defect.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    name = "carrier-set"
+    if not (workspace / ".git").exists():
+        return None
+
+    vault = _resolved_vault()
+    resolved = [e for e in (vault.get("sync") or {}).get("include") or [] if isinstance(e, str)]
+    if not resolved:
+        return None
+
+    stale: "list[str]" = []
+    for entry in resolved:
+        rep = _carrier_representative(workspace, entry)
+        if rep is None:
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(workspace), "check-ignore", "--no-index", "-q",
+                 str(rep.relative_to(workspace))],
+                capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        # exit 0 == the path IS ignored, i.e. configured but not carried.
+        # `--no-index` is LOAD-BEARING (sync-workspace.sh says so at its own
+        # check-ignore call): without it, git reports an ALREADY-TRACKED file as
+        # not-ignored regardless of the rules, so a host whose file was carried
+        # once and whose exclude later went stale reads healthy forever. Caught
+        # by restoring this host's real pre-fix exclude and watching the probe
+        # still say OK.
+        if proc.returncode == 0:
+            stale.append(entry)
+
+    # Read the SHIPPED file directly rather than through load_config(), which
+    # deep-merges the local override and would therefore return `resolved` —
+    # the very list we are testing against. There is no shipped-only public
+    # loader, and inventing one behind a broad `except` would make this branch a
+    # silent no-op the day the name was wrong.
+    dropped: "list[str]" = []
+    try:
+        shipped_cfg = json.loads((Path(REPO_DIR) / "sutando.config.json").read_text())
+        shipped = ((shipped_cfg.get("vault") or {}).get("sync") or {}).get("include")
+        if isinstance(shipped, list):
+            dropped = [e for e in shipped if isinstance(e, str) and e not in resolved]
+    except (OSError, json.JSONDecodeError, AttributeError):
+        dropped = []
+
+    if not stale and not dropped:
+        return {"name": name, "status": "ok",
+                "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault"}
+
+    parts = []
+    if stale:
+        parts.append(
+            f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
+            f"backing them up ({', '.join(stale[:4])}{'…' if len(stale) > 4 else ''}) — the exclude "
+            f"file is stale and sync refused to regenerate it; fix with "
+            f"`bash scripts/sync-workspace.sh --force-gitignore` (diff it first)"
+        )
+    if dropped:
+        parts.append(
+            f"{len(dropped)} shipped carrier path(s) are missing from this host's resolved include "
+            f"({', '.join(dropped[:4])}{'…' if len(dropped) > 4 else ''}) — a local "
+            f"`vault.sync.include` REPLACES the shipped default (#2531), so upstream additions never "
+            f"arrive; add them to the local list"
+        )
+    return {"name": name, "status": "fail", "detail": "; ".join(parts)}
+
+
 def check_memory_index_integrity() -> "dict | None":
     """Catch memories that exist on disk but will never load into a session.
 
@@ -4609,6 +4731,12 @@ def run_all_checks() -> list[dict]:
     _mem_index = check_memory_index_integrity()
     if _mem_index:
         checks.append(_mem_index)
+
+    # Carrier-set enforcement — a stale exclude means the vault is silently not
+    # backing up paths the config says it carries (#2565).
+    _carrier = check_carrier_set_enforced()
+    if _carrier:
+        checks.append(_carrier)
 
     # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
