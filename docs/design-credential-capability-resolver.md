@@ -25,7 +25,9 @@ resolver decides which credential satisfies it:
 resolveCredential('gemini-voice')  →  { key, source: 'managed' | 'env' | 'none' }
 ```
 
-Three rules, all load-bearing (implemented by #2197's `src/credential-resolver.ts`):
+Three rules, all load-bearing. Rules 1–2 and the *resolver-seam* half of rule 3
+are implemented by #2197's `src/credential-resolver.ts`; rule 3's Settings/health
+*presentation* is follow-up (each rule states what is shipped vs. follow-up):
 
 1. **Tier order: managed → env.** The managed tier reads
    `<workspace>/state/auth/managed-credentials.json` — per-host durable
@@ -39,10 +41,18 @@ Three rules, all load-bearing (implemented by #2197's `src/credential-resolver.t
    identically at every tier. With no managed file present, resolution is
    **byte-for-byte identical** to the legacy env chain — the refactor moves
    where the decision lives, not what it decides.
-3. **`source` is surfaced, not swallowed.** Settings and health-check report
-   "voice: managed" / "voice: BYO" / "voice: none". Managed-vs-BYO drop-in is
-   observable rather than asserted — this is the property the desktop
-   first-run banner (G5) and Settings (G6) build on.
+3. **`source` is surfaced, not swallowed.** #2197 implements this at the
+   *resolver seam*: `resolveCredential()` returns `source: 'managed' | 'env' |
+   'none'`, so which tier satisfied the capability is a returned, inspectable
+   property rather than something swallowed. **Not yet implemented:** the
+   Settings / health-check *presentation* of that property as
+   "voice: managed" / "voice: BYO" / "voice: none" — `src/health-check.py`
+   today reports "managed voice credential configured" / "Gemini voice
+   credential configured" / disabled and does not yet consume
+   `ResolvedCredential.source`. Turning the returned `source` into that
+   owner-visible three-state vocabulary is follow-up work — exactly what the
+   desktop first-run banner (G5) and Settings (G6) build on the returned
+   property to do.
 
 ## Managed-file schema
 
@@ -93,10 +103,13 @@ the tier list grows.
   `browser-tools.ts`, `recording-tools.ts` + `startup-runtime.sh` gate +
   health-check surface. Tests: `tests/credential-resolver.test.ts` (tier
   order, fallback, malformed-file, byte-identical-legacy).
-- **Phase 2 — Python readers:** `grep -rn "GEMINI\w*_API_KEY" --include="*.py"`
-  enumerates the surface; a `src/credential_resolver.py` twin implements the
-  SAME contract (shared test vectors, per the policy-twin lesson from #2516:
-  twins share canaries so a latent defect can't survive in one language).
+- **Phase 2 — Python readers (OPEN: PR #2575):** `grep -rn "GEMINI\w*_API_KEY"
+  --include="*.py"` enumerates the surface; a `src/credential_resolver.py`
+  twin implements the SAME contract (shared test vectors, per the policy-twin
+  lesson from #2516: twins share canaries so a latent defect can't survive in
+  one language). The twin has landed as **PR #2575** (john-approved, awaiting
+  merge); the follow-on reader sweep routing the enumerated `GEMINI_*` readers
+  through `resolve_credential` follows once it merges.
 - **Phase 3 — non-Gemini keys:** one provider at a time, each a
   capability-vocabulary addition + reader sweep, never a big-bang.
 
@@ -116,5 +129,5 @@ the tier list grows.
 
 1. **Owner:** confirm managed pilot = Gemini voice (G8 call, stands).
 2. **Owner:** G7 vault-vs-`.env` (shapes the tier list, blocks nothing here).
-3. Phase-2 Python twin (mine, after #2197 merges).
+3. Phase-2 Python twin — **PR #2575** (open, john-approved, awaiting merge); reader sweep follows its merge.
 4. Desktop consumers of `source` (G5 banner, G6 Settings — air's lane).
