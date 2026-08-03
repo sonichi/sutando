@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-186 modules indexed.
+187 modules indexed.
 
 ## `src/`
 
@@ -40,6 +40,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
+- **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.

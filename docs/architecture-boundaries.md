@@ -190,6 +190,31 @@ the delegation and the ordering, and scans the store for the legacy table names
 and transaction verbs while deliberately still permitting current-schema
 `CREATE TABLE`.
 
+## Presentation adapters vs domain/storage
+
+A presentation module (an HTTP server, a renderer, a CLI front end) adapts and
+displays. It must not also own domain parsing, validation or storage
+transactions — when it does, the policy is unreachable from any other consumer
+and untestable except through the presentation surface.
+
+Worked example, `src/dashboard.py` → `src/dashboard_schedules.py`:
+
+> Dashboard HTTP handlers and rendering code must delegate schedule parsing,
+> validation and atomic `crons.json` mutation to `src/dashboard_schedules.py`.
+> Schedule mutations must remain locked read-modify-write operations; do not
+> rebuild cron validation or persistence inside a route.
+
+The split point that matters: **the adapter resolves the path, the domain module
+receives it.** `dashboard.py` keeps `_crons_path()` (workspace + host-label
+resolution is deployment knowledge); `dashboard_schedules.py` takes a `Path` and
+owns the locked read→merge→write. That keeps the domain module free of workspace
+resolution while leaving the adapter with no persistence logic of its own.
+
+Enforced by `tests/dashboard-schedule-delegation.test.py`, which asserts the
+delegation is real and scans `dashboard.py` for the atomic-write primitives
+(`os.replace`, `.tmp` construction, a local `threading.Lock()`) that would mean
+a route had rebuilt its own transaction.
+
 ## Decision guide for new code
 
 This section explains the architectural categories. The repository-specific
