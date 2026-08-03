@@ -129,7 +129,7 @@ Path computation is centralized; do NOT reinvent the fallback per-script.
 2. `sutando.config.json` → `workspace.path` (tracked defaults at repo root).
 3. `<repo>/workspace/` baked-in default.
 
-**Today (pre-#1440):** `$SUTANDO_WORKSPACE` env var is honored as a legacy escape hatch ahead of step 1, with a one-time deprecation warning. PR #1440 removes that step.
+**`$SUTANDO_WORKSPACE` is not honored.** #1440 (v0.8) removed it from the order; a set env var fires a one-time deprecation warning and its value is ignored. It is still *scanned* as a migration source — see §C below — which is a different thing from resolving to it.
 
 ## 3. Migration from earlier versions
 
