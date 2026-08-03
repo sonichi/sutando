@@ -1801,16 +1801,42 @@ def _behind_warn_threshold(repo: "Path") -> int:
     return raw if raw > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
 
 
-def _behind_commits_touching(repo: "Path", branch: str, prefix: str,
+def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
                              git_bin: str = "git") -> "list[str]":
-    """Subjects of not-yet-pulled commits that change files under ``prefix``.
+    """Subjects of not-yet-pulled commits that EFFECTIVELY change ``prefix``.
 
-    Same last-fetched-ref, no-network contract as `_commits_behind` — and the
+    Two different questions, and the first cut answered the wrong one. "Did a
+    not-yet-pulled commit TOUCH this path" is commit-path history; "would
+    pulling change any bytes here" is a tree diff. They diverge whenever history
+    is reversible: upstream adds `skills/demo/SKILL.md` and removes it in the
+    next commit, a clone sits two commits behind, and
+    `git log HEAD..origin/main -- skills/` lists both commits while
+    `git diff --name-only HEAD..origin/main -- skills/` is EMPTY. Pulling would
+    change no skill bytes, yet the probe warned — a false behavioral-staleness
+    alarm, which is precisely the alert fatigue this check argues against.
+    Reproduced independently by qingyun-wu and john-the-dev on #2573.
+
+    So the TREE DIFF is the gate and history is only the message: if nothing
+    under ``prefix`` differs, return nothing; only when it does differ, name the
+    commits so the warning is actionable.
+
+    Same last-fetched-ref, no-network contract as `_commits_behind`, and the
     same honest consequence: a stale local ref makes this UNDER-report, never
-    cry wolf. Returns `[]` on any failure for the same reason: this is an
+    cry wolf. Returns `[]` on any failure for the same reason — this is an
     additional signal layered on a probe that must not become the thing that
     breaks the health run.
     """
+    try:
+        changed = subprocess.run(
+            [git_bin, "-C", str(repo), "diff", "--name-only",
+             f"HEAD..origin/{branch}", "--", prefix],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if changed.returncode != 0 or not changed.stdout.strip():
+        return []
+
     try:
         out = subprocess.run(
             [git_bin, "-C", str(repo), "log", "--no-merges", "--format=%s",
@@ -1965,7 +1991,7 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # whose two-writer collision had destroyed a peer's anchor hours earlier
     # (#2567/#2568). The running skill and the merged skill disagreed, and both
     # looked correct from where anyone was standing.
-    stale_skills = _behind_commits_touching(repo, expected, "skills/", git_bin)
+    stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     if stale_skills:
         return {"name": name, "status": "warn",
                 "detail": f"live checkout is on {expected!r} and only {behind} commit(s) behind "

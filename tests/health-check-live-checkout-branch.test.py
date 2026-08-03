@@ -343,7 +343,7 @@ def main() -> int:
 
         hc.subprocess.run = _boom_on_log
         try:
-            got = hc._behind_commits_touching(work, "main", "skills/")
+            got = hc._behind_commits_changing(work, "main", "skills/")
             r = hc.check_live_checkout_branch(work)
         finally:
             hc.subprocess.run = real_run
@@ -356,8 +356,85 @@ def main() -> int:
     #     non-zero, and the two are different lines in the function.
     with tempfile.TemporaryDirectory() as td:
         work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
-        got = hc._behind_commits_touching(work, "no-such-branch-xyz", "skills/")
+        got = hc._behind_commits_changing(work, "no-such-branch-xyz", "skills/")
         check(got == [], f"v6) non-zero rc yields no commits, got {got}")
+
+    # v7) NET-ZERO history must stay quiet. Upstream adds a skill and removes it
+    #     in the next commit; the clone fetches and sits two commits behind.
+    #     Commit-path history lists BOTH commits, but the tree diff is empty —
+    #     pulling would change no skill bytes. Warning here is a false
+    #     behavioral-staleness alarm, i.e. exactly the alert fatigue this check
+    #     exists to argue against. Reproduced independently by qingyun-wu and
+    #     john-the-dev on #2573; this pins the tree-diff gate that fixes it.
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        up = _mk_repo(td, "main")
+        work = td / "work"
+        subprocess.run(["git", "clone", "-q", str(up), str(work)],
+                       check=True, capture_output=True)
+        (up / "skills" / "demo").mkdir(parents=True)
+        (up / "skills" / "demo" / "SKILL.md").write_text("y\n")
+        _git(up, "add", "-A"); _git(up, "commit", "-q", "-m", "add skills/demo")
+        _git(up, "rm", "-q", "skills/demo/SKILL.md")
+        _git(up, "commit", "-q", "-m", "remove skills/demo")
+        _git(work, "fetch", "-q", "origin")
+
+        # The two questions must genuinely disagree here, or this fixture proves
+        # nothing — assert the disagreement before asserting the verdict.
+        hist = subprocess.run(["git", "-C", str(work), "log", "--no-merges",
+                               "--format=%s", "HEAD..origin/main", "--", "skills/"],
+                              capture_output=True, text=True).stdout.split()
+        tree = subprocess.run(["git", "-C", str(work), "diff", "--name-only",
+                               "HEAD..origin/main", "--", "skills/"],
+                              capture_output=True, text=True).stdout.strip()
+        check(len(hist) > 0 and tree == "",
+              f"v7) fixture must have history-yes/tree-no, got hist={len(hist)} tree={tree!r}")
+
+        got = hc._behind_commits_changing(work, "main", "skills/")
+        check(got == [], f"v7) net-zero skill history yields no drift, got {got}")
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "ok",
+              f"v7) and must not warn on reversible history, got {r['status']} / {r['detail'][:100]}")
+
+    # v7b) The TREE-DIFF call has its own failure branch, distinct from the log
+    #      call's (v5). It runs FIRST and is the gate, so if it raises and the
+    #      code fell through to history, the net-zero false positive would come
+    #      straight back on any host where the diff happens to fail. Degrade
+    #      closed: no diff answer, no drift claim.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        real_run = hc.subprocess.run
+
+        def _boom_on_diff(argv, *a, **kw):
+            if "diff" in argv:
+                raise OSError("git vanished before the tree diff")
+            return real_run(argv, *a, **kw)
+
+        hc.subprocess.run = _boom_on_diff
+        try:
+            got = hc._behind_commits_changing(work, "main", "skills/")
+        finally:
+            hc.subprocess.run = real_run
+        check(got == [], f"v7b) a failed TREE DIFF yields no drift claim, got {got}")
+
+    # v8) Over-trigger control for v7: a skill change that is NOT reverted must
+    #     still warn, or the tree-diff gate would have silenced the real case
+    #     along with the false one.
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        up = _mk_repo(td, "main")
+        work = td / "work"
+        subprocess.run(["git", "clone", "-q", str(up), str(work)],
+                       check=True, capture_output=True)
+        (up / "skills" / "demo").mkdir(parents=True)
+        (up / "skills" / "demo" / "SKILL.md").write_text("y\n")
+        _git(up, "add", "-A"); _git(up, "commit", "-q", "-m", "add skills/demo")
+        _git(work, "fetch", "-q", "origin")
+        got = hc._behind_commits_changing(work, "main", "skills/")
+        check(got == ["add skills/demo"], f"v8) a real skill change still reports, got {got}")
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "warn",
+              f"v8) and still warns, got {r['status']}")
 
     # m) No remote ref at all (fresh init, renamed remote) -> degrade to ok.
     #    A probe that cannot answer must not invent an alarm.
