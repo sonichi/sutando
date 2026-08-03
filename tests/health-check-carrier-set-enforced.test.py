@@ -290,7 +290,14 @@ class CarrierSetProbe(unittest.TestCase):
         # It must still be REPORTED — silently filtering it would hide a real
         # divergence, which is the failure this whole probe exists to prevent.
         # What had to go is the instruction, not the information.
-        ws = _mkworkspace(self.tmp, ["notes/", "notes/**", "state/", "state/current-track.md"],
+        #
+        # The exclude must NOT un-ignore `state/current-track.md` here. This fixture
+        # originally did, which made the entry carried BY OUTCOME while the test
+        # asserted it was dropped — it only passed because the dropped branch
+        # compared config strings and never looked at disk. Once that branch asks
+        # git (#2571), an over-specified fixture like that stops describing the
+        # state it claims to test.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
                           ["notes/a.md", "state/current-track.md"])
         self._patch_resolved(["notes/"])                                   # host dropped it
         self._patch_shipped(["notes/", "state/current-track.md"])          # shipped still has it
@@ -302,6 +309,42 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIn("#2567", r["detail"], "must name why")
         self.assertNotIn("add them to the local list", r["detail"],
                          "the data-loss instruction must not accompany this entry")
+
+    def test_a_BROADER_local_entry_is_coverage_not_a_dropped_entry(self):
+        # #2571, reported by Sutando-Pro against #2566 within minutes of merge.
+        # Their host's local config carries `hosts/` where the shipped default says
+        # `hosts/*/` — strictly BROADER, and the whole subtree is demonstrably
+        # carried. The dropped branch compared strings, so it reported `hosts/*/`
+        # missing and advised "add them to the local list", i.e. told the operator
+        # to narrow a config that was already right.
+        #
+        # The irony is the point: this probe exists to catch "config claims carried,
+        # reality says not". This is the inverse — reality says carried, the config
+        # string says not — and it fired anyway.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**", "hosts/", "hosts/**"],
+                          ["notes/a.md", "hosts/h/current-track.md"])
+        self._patch_resolved(["notes/", "hosts/"])       # broader than shipped
+        self._patch_shipped(["notes/", "hosts/*/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok",
+                         "a broader local rule carries the subtree; nothing is dropped")
+        self.assertNotIn("hosts/*/", r["detail"])
+        self.assertNotIn("add them to the local list", r["detail"])
+
+    def test_a_shipped_entry_with_nothing_on_disk_is_still_reported(self):
+        # The coverage test can only speak when something is materialized. An entry
+        # the local config omits and that has NOTHING under it yet has no outcome to
+        # measure — but the divergence is real and turns into silent data loss the
+        # moment the first file lands there. Report it rather than let "no evidence
+        # of harm yet" read as covered.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"], ["notes/a.md"])
+        self._patch_resolved(["notes/"])
+        self._patch_shipped(["notes/", "data/"])         # data/ does not exist yet
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertIn("data/", r["detail"])
+        self.assertIn("add them to the local list", r["detail"])
 
     def test_a_SAFE_dropped_entry_still_gets_the_add_it_remedy(self):
         # Over-trigger control: the unsafe carve-out must not swallow the ordinary

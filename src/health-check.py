@@ -1227,8 +1227,37 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         shipped_cfg = json.loads((Path(REPO_DIR) / "sutando.config.json").read_text())
         shipped = ((shipped_cfg.get("vault") or {}).get("sync") or {}).get("include")
         if isinstance(shipped, list):
-            dropped = [e for e in shipped if isinstance(e, str) and e not in resolved]
-    except (OSError, json.JSONDecodeError, AttributeError):
+            missing = [e for e in shipped if isinstance(e, str) and e not in resolved]
+            # String inequality is not absence of coverage. A local entry can be
+            # strictly BROADER than the shipped one it replaces — `hosts/` covers
+            # everything `hosts/*/` does — and the whole point of this probe is to
+            # judge by outcome, not by config text. The `stale` branch above already
+            # asks git; this branch used to revert to string equality, so it reported
+            # a fully-carried subtree as missing and advised "add them to the local
+            # list", i.e. told the operator to NARROW a config that was already
+            # correct (#2571, reported against #2566 by Sutando-Pro).
+            #
+            # So an entry only counts as dropped once git agrees nothing under it is
+            # carried. An entry with nothing materialized yet stays reported: there is
+            # no outcome to measure, but the divergence is real and becomes silent
+            # data loss the moment the first file lands under it.
+            for entry in missing:
+                rep = _carrier_representative(workspace, entry)
+                if rep is None:
+                    dropped.append(entry)
+                    continue
+                proc = subprocess.run(
+                    git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
+                             str(rep.relative_to(workspace))),
+                    capture_output=True, timeout=10,
+                )
+                # Same contract as the stale branch: 0 = ignored (so genuinely not
+                # carried), 1 = not ignored (covered by some broader local rule).
+                # Anything else is a failed measurement — keep reporting it rather
+                # than let an unmeasured read count as covered.
+                if proc.returncode != 1:
+                    dropped.append(entry)
+    except (OSError, json.JSONDecodeError, AttributeError, GitUnavailable, subprocess.SubprocessError):
         dropped = []
 
     # A shipped entry can be one this host must NOT carry. `state/current-track.md`
