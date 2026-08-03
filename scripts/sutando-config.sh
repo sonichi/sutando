@@ -290,6 +290,27 @@ print(_host_label(), end='')
     printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
     ;;
 
+  python-bin)
+    # SINGLE SOURCE OF TRUTH for the Python interpreter, mirroring node-bin.
+    # $PY is resolved at the top of this file with the documented precedence:
+    #   1. $SUTANDO_PY               (exported by launch-sutando.sh)
+    #   2. <engine>/runtime/python   (the bundle-vendored relocatable python)
+    #   3. system `python3`          (may be Apple's CLT stub — see below)
+    #
+    # Exposed because callers were re-deriving it and getting it WRONG in a way
+    # that fails silently. src/startup-runtime.sh's managed-credential gate
+    # probed `command -v python3` then Homebrew, skipping tiers 1 and 2, so a
+    # host with a broken `python3` first on PATH and a perfectly good $SUTANDO_PY
+    # concluded "no usable python3" and left voice disabled while a valid managed
+    # credential sat on disk (sonichi/sutando#2197 review, 2026-08-02).
+    #
+    # Deliberately NOT fail-closed the way node-bin is: tier 3 may legitimately
+    # be the Xcode CLT stub, which is `-x` but does not run. Only EXECUTING an
+    # interpreter proves it works, and that probe belongs to the caller, which
+    # knows what it needs to import. This prints the interpreter to TRY FIRST;
+    # it does not promise the interpreter runs.
+    echo "$PY"
+    ;;
   node-bin)
     # SINGLE SOURCE OF TRUTH for the Node executable (G1.5 node-bundle,
     # owner-adopted design + owner review 2026-07-19). Precedence:
