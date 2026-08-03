@@ -52,6 +52,36 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         (self.home / "Library/LaunchAgents").mkdir(parents=True)
         self.addCleanup(self._tmp.cleanup)
 
+    def _routed_env(self, core_cfg, routed=True):
+        """Env context that is HERMETIC about the routing gate.
+
+        `mock.patch.dict(..., clear=False)` inherits the ambient environment, so
+        on a developer host whose core IS proxy-routed these cases silently
+        inherited a real ANTHROPIC_BASE_URL and passed for the wrong reason —
+        green locally, red on CI, which is exactly what happened on 211b97a1.
+        Every case must state its own routing premise rather than borrow the
+        host's.
+        """
+        env = {"CLAUDE_CONFIG_DIR": core_cfg} if core_cfg else {}
+        if routed:
+            env["ANTHROPIC_BASE_URL"] = "http://localhost:7846"
+        ctx = mock.patch.dict(os.environ, env, clear=False)
+        if routed:
+            return ctx
+        # Not-routed must be asserted, not assumed: strip any inherited value.
+        outer = mock.patch.dict(os.environ, env, clear=False)
+
+        class _Unrouted:
+            def __enter__(self_inner):
+                outer.__enter__()
+                os.environ.pop("ANTHROPIC_BASE_URL", None)
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return outer.__exit__(*exc)
+
+        return _Unrouted()
+
     def _write_plist(self, config_dir):
         """Render a credential-proxy plist. config_dir=None omits the key —
         the pre-fix shape, which is the whole point of the divergence case."""
@@ -68,18 +98,13 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         """`routed` controls the ANTHROPIC_BASE_URL the core would have inherited;
         every case must state it, because the check is gated on it."""
         self._write_plist(plist_cfg)
-        env = {"CLAUDE_CONFIG_DIR": core_cfg} if core_cfg else {}
-        if routed:
-            env["ANTHROPIC_BASE_URL"] = "http://localhost:7846"
-        with mock.patch.dict(os.environ, env, clear=False), \
+        with self._routed_env(core_cfg, routed=routed), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=codex_runtime), \
              mock.patch.object(hc, "_keychain_service_exists",
                                side_effect=lambda s: s in existing_services):
             if not core_cfg:
                 os.environ.pop("CLAUDE_CONFIG_DIR", None)
-            if not routed:
-                os.environ.pop("ANTHROPIC_BASE_URL", None)
             return hc.check_quota_account_identity(proxy_status)
 
     # ---- routing gate: the false-positive class qingyun-wu blocked on --------
@@ -117,9 +142,7 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         core = "/Users/x/ws/.claude-sutando"
         path = self.home / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
         path.write_bytes(plistlib.dumps({"EnvironmentVariables": "not-a-dict"}))
-        with mock.patch.dict(os.environ,
-                             {"CLAUDE_CONFIG_DIR": core,
-                              "ANTHROPIC_BASE_URL": "http://localhost:7846"}, clear=False), \
+        with self._routed_env(core), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
             out = hc.check_quota_account_identity("ok")   # must not raise
@@ -132,9 +155,7 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         core = "/Users/x/ws/.claude-sutando"
         path = self.home / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
         path.write_bytes(plistlib.dumps(["not", "a", "dict"]))
-        with mock.patch.dict(os.environ,
-                             {"CLAUDE_CONFIG_DIR": core,
-                              "ANTHROPIC_BASE_URL": "http://localhost:7846"}, clear=False), \
+        with self._routed_env(core), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
             out = hc.check_quota_account_identity("ok")
@@ -147,9 +168,7 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         core = "/Users/x/ws/.claude-sutando"
         path = self.home / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
         path.write_bytes(plistlib.dumps({"EnvironmentVariables": {"CLAUDE_CONFIG_DIR": 42}}))
-        with mock.patch.dict(os.environ,
-                             {"CLAUDE_CONFIG_DIR": core,
-                              "ANTHROPIC_BASE_URL": "http://localhost:7846"}, clear=False), \
+        with self._routed_env(core), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
             out = hc.check_quota_account_identity("ok")
@@ -237,8 +256,9 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         """Proxy running but not launchd-managed (dev host, manual launch).
         There is no plist to compare against; that is not a fault."""
         core = "/Users/x/ws/.claude-sutando"
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": core}, clear=False), \
-             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)):
+        with self._routed_env(core), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
             out = hc.check_quota_account_identity("ok")   # no plist written
         self.assertEqual(out["status"], "ok")
         self.assertIn("launchd", out["detail"])
@@ -249,8 +269,9 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         core = "/Users/x/ws/.claude-sutando"
         path = self.home / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
         path.write_bytes(b"\x00not a plist\x00")
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": core}, clear=False), \
-             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)):
+        with self._routed_env(core), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
             out = hc.check_quota_account_identity("ok")
         self.assertEqual(out["status"], "warn")
         self.assertIn("cannot read", out["detail"])
