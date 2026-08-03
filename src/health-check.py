@@ -5960,6 +5960,39 @@ def community_support_line() -> str:
     return "  Stuck? Community support (real humans + community agents): https://discord.gg/uZHWXXmrCS"
 
 
+#: Statuses that are NOT problems. Everything else is, by the same rule the
+#: issue list uses: `issues = [c for c in checks if c["status"] not in ("ok", "warn")]`.
+#: `stale` is an issue but gets its own glyph because it names a specific remedy.
+_BENIGN_STATUSES = ("ok", "warn")
+
+
+def status_icon(status: str) -> str:
+    """Glyph for a probe status — unrecognized reads as a PROBLEM, not a shrug.
+
+    The human-readable listing used to enumerate `down`/`missing`/`not_loaded` as
+    severe and fall back to `~` for anything else. That put **`fail`** — the most
+    severe status any probe emits, and the one nine probes use — on the least
+    alarming glyph, sharing it with "status I don't recognize". `error` (5 probes)
+    and `wedged` landed there too.
+
+    It is a real miss, not a cosmetic one: a peer host filtered health-check output
+    with `grep -E "⚠|✗"` and the single `fail` line was the one the filter hid, so a
+    run with a genuine failure read as three routine warnings.
+
+    `--quiet` never had this bug — it renders every non-stale issue as `✗`. The two
+    output modes disagreed about the same status. This makes them agree by deriving
+    both from one predicate, and inverts the default so a status added later shows
+    up as a problem until someone deliberately classifies it as benign.
+    """
+    if status == "ok":
+        return "✓"
+    if status == "warn":
+        return "⚠"
+    if status == "stale":
+        return "♻"
+    return "✗"
+
+
 def summary_line(checks) -> str:
     """The no-failures summary. Warnings are deliberately NOT issues — they must
     not fail the exit code or wake the launchd notifier, and that is unchanged.
@@ -6057,7 +6090,7 @@ def main():
     if quiet:
         if issues:
             for c in issues:
-                icon = "♻" if c["status"] == "stale" else "✗"
+                icon = status_icon(c["status"])
                 print(f"{icon} {c['name']}: {c['status']} ({c['detail']})")
             if do_fix:
                 # Fall through to existing fix path below
@@ -6073,7 +6106,7 @@ def main():
         print("=" * 40)
 
         for c in checks:
-            icon = "✓" if c["status"] == "ok" else "⚠" if c["status"] == "warn" else "✗" if c["status"] in ("down", "missing", "not_loaded") else "♻" if c["status"] == "stale" else "~"
+            icon = status_icon(c["status"])
             print(f"  {icon} {c['name']:30s} {c['status']:12s} {c['detail']}")
 
         print()
