@@ -993,6 +993,20 @@ export function annotateContextFreshness(
 	// is clamped to 0 (healthy, never negative); beyond it the stamp cannot be
 	// trusted at all, so it degrades to unknown rather than to fresh.
 	const ageMs = nowMs - updatedMs;
+	// Close the CLASS, not the case. The reviewed defect was a future timestamp
+	// producing a negative age that satisfied neither branch; a non-finite `nowMs`
+	// (NaN/Infinity, e.g. a caller passing a parsed value) fails both the same way
+	// and reads as fresh. Found by enumerating this function's inputs rather than
+	// waiting for a fourth review round. Any age arithmetic that is not a finite
+	// number means the age is unknowable, so it degrades to unknown — never fresh.
+	if (!Number.isFinite(ageMs)) {
+		base.freshness = 'unknown';
+		base.note =
+			'context age could not be computed (the current time was not a finite value), so it ' +
+			'cannot be trusted. Treat pending_action and active_drafts as historical unless the ' +
+			'user confirms them.';
+		return base;
+	}
 	if (ageMs < -VOICE_CONTEXT_SKEW_TOLERANCE_MS) {
 		const aheadHours = Math.round((-ageMs / 3_600_000) * 10) / 10;
 		base.age_hours = Math.round((ageMs / 3_600_000) * 10) / 10;

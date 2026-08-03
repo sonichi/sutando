@@ -78,6 +78,23 @@ describe('recent_context freshness annotation', () => {
 		assert.equal(out.age_hours, 0, 'clamped to 0, never negative');
 	});
 
+	it('a non-finite clock is unknown, never fresh (closes the class, not the case)', () => {
+		// SELF-REVIEW, not a reviewer finding. The reviewed defect was a FUTURE stamp
+		// producing a negative age that satisfied neither branch. Enumerating the rest
+		// of the input space turned up the same shape one step over: a non-finite
+		// `nowMs` yields age=NaN, which is not >= the threshold and is not caught by
+		// the isFinite check on updated_at — so it read as FRESH.
+		//
+		// Fixing the case (future stamps) and not the class (non-finite arithmetic)
+		// is what produced three review rounds; this closes the arithmetic itself.
+		for (const badNow of [Number.NaN, Number.POSITIVE_INFINITY]) {
+			const out = annotateContextFreshness({ updated_at: iso(1), pending_action: {} }, badNow);
+			assert.equal(out.freshness, 'unknown', `nowMs=${badNow} must not read as fresh`);
+			assert.equal(out.stale, undefined);
+			assert.ok(out.pending_action, 'payload still returned');
+		}
+	});
+
 	it('survives a null/empty payload without throwing', () => {
 		assert.equal(annotateContextFreshness(null, NOW).freshness, 'unknown');
 		assert.equal(annotateContextFreshness({}, NOW).freshness, 'unknown');
