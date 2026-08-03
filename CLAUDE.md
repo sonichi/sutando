@@ -16,8 +16,11 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 
 - **Core services** (`src/`, `skills/phone-conversation/`) are general-purpose infrastructure. They provide generic capabilities (audio streaming, task bridge, tool execution) but must NOT contain feature-specific logic.
 - **Skills** (`skills/`) contain feature-specific logic. Each skill is self-contained and optional — core services work without any skill installed. When implementing new capabilities, start as a skill.
+- **Shared adapter policy is core; provider I/O stays at the edge.** When two or more adapters interpret the same workspace state or policy, put that interpretation in a dependency-light `src/` module and keep only provider-specific receive/send mechanics in each adapter. Do not copy policy code between bridges.
 - **Inline tools** are only for tools that need instant response from Gemini. Prefer skill scripts for complex logic. Only promote to inline if the user says the skill approach is too slow.
 - **Skill config goes in the skill's `manifest.json` `config` block — not ad-hoc env vars.** See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the convention — declaration, the `CLI > env > manifest > config-file > state` read-precedence, and config-only manifests. Don't invent an undocumented env var (Chi 2026-06-16).
+- **Optional capability discovery stays at the adapter edge.** Shared runners may standardize provider-neutral execution behavior, but adapters must inject script or capability paths. Core helpers must not name, locate, or import a concrete skill. Add direct contract tests for the runner and wiring tests for every adapter that delegates to it.
+- **Shared result-file lifecycle policy has one implementation.** Claim, recovery, collision, and retry rules for the common task/result protocol belong in dependency-light `src/` helpers. Adapters bind their resolved directories and retain provider-specific delivery only; do not copy filesystem state machines between bridges. Pin both the shared contract and every adapter's delegation in tests.
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 
 ### Where does new code belong? (decision guide — issue #222)
@@ -31,6 +34,14 @@ Walk this list top-to-bottom and stop at the first match:
 5. **Is it core infrastructure shared by multiple skills (task bridge, health check, memory sync)?** → `src/`.
 
 If two layers seem to fit, prefer the more specific one (skill > core). If you're patching a bug, keep the patch in the layer where the bug lives — don't smuggle a refactor into a fix commit.
+
+**Destructive/legacy schema migrations live apart from the live writer.** `conversation-store.ts` owns current schema initialization and live write APIs. Destructive or legacy SQLite transformations belong in `conversation-store-migrations.ts`, are idempotent, transaction-tested and invoked before views/statements are prepared. Do not place migration SQL in a live record function. Enforced by `tests/conversation-store-migration-delegation.test.ts`.
+
+**Transport does not own authorization or durable state.** `src/runtime-api/server.py` owns Unix-socket transport and daemon composition; JSON-RPC method dispatch, approval/elicitation policy, governed-capability authorization, idempotency and durable request transitions belong in `src/runtime-api/dispatcher.py`. Actor identity is resolved daemon-side and passed to the dispatcher explicitly — a client parameter must never override it. Do not reimplement approval or capability behavior in a transport.
+
+**Complex skill diagnostics separate analysis from IO and presentation.** Pure analysis policy must not live in a loader, CLI or renderer. Call-diagnostics detection, categorization and repair policy lives in `skills/call-diagnostics/scripts/analysis.py`; loaders and renderers consume it and must not carry copied detection rules. The policy stays inside the skill — do not promote it into `src/`. Enforced by `tests/call-diagnostics-analysis.test.py`.
+
+**Presentation modules don't own domain/storage policy.** Dashboard HTTP handlers and rendering code must delegate schedule parsing, validation and atomic `crons.json` mutation to `src/dashboard_schedules.py`. Schedule mutations must remain locked read-modify-write operations; do not rebuild cron validation or persistence inside a route. The adapter resolves the path (`_crons_path()` — workspace + host label); the domain module receives it. Enforced by `tests/dashboard-schedule-delegation.test.py`. See [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md) "Presentation adapters vs domain/storage".
 
 ## Repo rules
 
@@ -94,6 +105,8 @@ If `PERSONAL_CLAUDE.md` exists, read and follow it. It contains user-specific ru
 
 ## Work Status
 
+> **Core-only — guests skip this (full rationale in [Chat-path task tracking](#chat-path-task-tracking-issue-585) below).** If you are a scheduled/one-shot/review automation that merely opened this repo (a `codex exec`/headless run, a PR-review or branch-hygiene cron, or any agent that auto-loaded this file by virtue of the repo being your cwd), you are a **guest in this checkout, not the live core**: do NOT write `core-status.json` or any `state/` liveness. Status/heartbeat/liveness writes belong to the single live Sutando core. The "applies to all work" note below scopes the core's *own* activities — it does not enlist guests.
+
 Signal your work status to the workspace `core-status.json` so the web UI and `health-check.py` can display it. Write the **absolute** workspace path: the session cwd is the repo, so a bare `state/core-status.json` lands in `<repo>/state/` — where no reader looks. Readers resolve `<workspace>/state/core-status.json` via `status_read_path` (`src/workspace_default.py`), where `<workspace>` = the M0 canonical (`<repo>/workspace/` by default; env-overridable as the legacy escape).
 
 ```bash
@@ -105,6 +118,8 @@ echo '{"status":"idle","ts":<epoch>}' > "$CORE_STATUS"                          
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
 ## Chat-path task tracking (issue #585)
+
+> **Core-only — automation/one-shot agents MUST skip this and every other runtime-operational section below** (task/result writing, the task watcher, the proactive loop, status/heartbeat/liveness writes). These mechanics belong to the *single live Sutando core* that owns this checkout. If you are instead a scheduled or one-shot agent that merely opened this repo — a Codex/Claude **review** automation, a `codex exec`/headless run, a PR-review or branch-hygiene cron, or any agent that auto-loaded this file by virtue of the repo being your cwd — you are a **guest in this checkout, not the core**: do NOT write `task-*` / `task-chat-*` / `results/` files, do NOT start the watcher, do NOT run the proactive loop, do NOT write `state/` liveness. Doing so injects fake tasks into the core's queue that it will process as real owner requests. (2026-07-11 incident: a Codex automation with `cwds=[this repo]` auto-loaded AGENTS.md and self-wrote a `task-chat` every 10 min; the core swallowed each one. Fix: run such automations in an isolated `/private/tmp` worktree with no repo cwd, per the safe pattern.)
 
 When you accept a non-trivial commitment from the user via **chat** (direct text input, not through voice/Discord/Telegram bridges), write a task file so the dashboard can track it.
 
@@ -360,7 +375,7 @@ Tasks arrive from multiple channels via the same file bridge:
 - `[no-send]` — Discord bridge skips delivery for this task (still archives). Use when the task is internally handled but produces no user-visible reply.
 - `[REPLIED]` — Discord bridge skips delivery (already sent through another path).
 - `[channel: <channel-id>]` — when this is the first non-empty line of the body, the bridge delivers the rest of the body to `<channel-id>` instead of the originating channel (and drops `thread_ts` since the post is moving threads). Discord ids are 17-20 digits; Slack ids match `[CDG][A-Z0-9]+`. Use when a task arrives in a noisy channel but the reply belongs somewhere else (e.g. #dev). Telegram silently drops it — no concept of "channels" on that surface.
-- `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body (regardless of marker order), so a body carrying private data can never be *redirected* out to a shared channel. It marks dm-only intent but does not by itself force a DM — that stays the consumer's job. In practice the private producer (the morning briefing's calendar + email) is emitted as a proactive result (`results/proactive-*.txt`), which every bridge already delivers to the owner's DM; `[dm-only]` reinforces that by guaranteeing no stray `[channel:]` redirect overrides it. Stripped before delivery and before voice speaks it. Parsed by `result_markers.parse_markers`.
+- `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body (regardless of marker order), so a body carrying private data can never be *redirected* out to a shared channel. It marks dm-only intent but does not by itself force a DM — that stays the consumer's job. In practice the private producer (the morning briefing's calendar + email) is emitted as a proactive result (`results/proactive-*.txt`), which every bridge already delivers to the owner's DM; `[dm-only]` reinforces that by guaranteeing no stray `[channel:]` redirect overrides it. **Detected anywhere in the body** — that is what makes the guard undefeatable by marker order, and over-triggering it fails safe. **Stripped only when the marker stands alone on its line**, before delivery and before voice speaks it; a marker mentioned inline in prose is detected but the text is delivered verbatim. Parsed by `result_markers.parse_markers`.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
 
 **Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
