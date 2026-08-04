@@ -24,6 +24,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+from util_paths import _host_label  # noqa: E402 — needs the sys.path above
+
 
 def _load(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -59,11 +61,36 @@ api.WORKSPACE_DIR = tmp
 api.TASK_DIR = tmp / "tasks"
 api.API_TOKEN = "test-token-123"
 
-# personal_path() puts the file under hosts/<hostname>/ — ask the module where,
-# rather than recomputing the host convention here.
-PQ_FILE = Path(api.personal_path("pending-questions.md", tmp))
+# Create the file at the per-host path FIRST, then let personal_path find it.
+#
+# Asking personal_path where to WRITE looked equivalent and was not. Its probes
+# run in order — `<ws>/hosts/<host>/`, then the legacy `$SUTANDO_MEMORY_DIR/
+# machine-<host>/` — and return the first that EXISTS. With a fresh tmp the
+# hosts/ probe misses, so on any machine that still has a legacy file the call
+# returned a path in the operator's real, vault-SYNCED memory tree, and the
+# write below landed there. Reproduced on a live host: this test rewrote
+# `…/memory/machine-<host>/pending-questions.md` on every run, and the vault
+# sync then committed the fixture.
+#
+# #2452 fixed the not-yet-existing case; this is the existing-legacy-file case
+# its own test deliberately leaves open (`personal-path-workspace-isolation`
+# docstring), because the read fallback is load-bearing for migration. So the
+# fix belongs here in the caller, not in the resolver.
+#
+# Creating it under hosts/ first makes the FIRST probe hit, so resolution never
+# reaches the legacy branch.
+PQ_FILE = tmp / "hosts" / _host_label() / "pending-questions.md"
 PQ_FILE.parent.mkdir(parents=True, exist_ok=True)
 PQ_FILE.write_text(PQ)
+
+# The property that actually matters, asserted rather than assumed: the path the
+# module resolves is the one inside tmp. Passing a tmpdir is not isolation
+# unless the RESOLVED path is inside it — without this line the escape is
+# silent, which is exactly how the fixture reached the vault.
+_resolved = Path(api.personal_path("pending-questions.md", tmp))
+assert _resolved == PQ_FILE, (
+    f"personal_path escaped the tmp workspace: {_resolved} is not {PQ_FILE}"
+)
 
 # Handler runs on the MAIN thread (plain HTTPServer + handle_request loop);
 # requests are issued from a worker thread. Inverted on purpose: the coverage
