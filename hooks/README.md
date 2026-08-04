@@ -136,3 +136,48 @@ PY
 ```
 
 Test: `python3 tests/gmail-write-guard.test.py`.
+
+## `result-file-marker-guard.py`
+
+Denies a **Write/Edit into `<workspace>/results/`** whose body carries a
+`[file:|send:|attach:]` marker pointing at a path the bridge will refuse to send
+(policy: `src/send_allowlist.py`). Parsing and the verdict both come from the
+modules the delivery path itself uses (`result_markers` + `send_allowlist`), so
+the guard cannot drift from what it enforces.
+
+Why: on 2026-08-04 a finished video was attached from `skill-repos/`, which is not
+on the allowlist. The bridge posted a literal `(file not allowed: …)` into the
+owner's channel and the task archived as delivered — the file existed, the marker
+parsed, the write succeeded, nothing errored. Every signal available to the author
+said "sent". The owner found it: *"Can't see this file. And I don't want to
+babysit."* The check therefore has to run where the marker is **authored**.
+
+Denies rather than warns — a warning still puts a broken message in the owner's
+channel. The reason names the offending path and the allowed roots, so the fix
+(re-encode or copy into `results/`, then point the marker there) is one step.
+
+Fails **open** on any internal error, unlike `context-source-guard.py`, which fails
+closed. That one prevents blacklisted content entering context, where being wrong
+means a leak; here being wrong means a message the owner can see and re-request,
+so wedging the core would be the larger harm.
+
+Escape hatch: `SUTANDO_SKIP_FILE_MARKER_GUARD=1`.
+
+### Deploy (per node)
+
+```bash
+cp hooks/result-file-marker-guard.py ~/.claude/hooks/
+python3 - <<'PY'
+import json, os
+sp = os.path.expanduser("~/.claude/settings.json"); s = json.load(open(sp))
+cmd = "python3 ~/.claude/hooks/result-file-marker-guard.py"
+pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])
+for m in ("Write", "Edit", "MultiEdit"):
+    blk = next((b for b in pre if b.get("matcher") == m), None)
+    if blk is None: pre.append({"matcher": m, "hooks": [{"type": "command", "command": cmd}]})
+    elif cmd not in [h.get("command") for h in blk["hooks"]]: blk["hooks"].append({"type": "command", "command": cmd})
+json.dump(s, open(sp, "w"), indent=2)
+PY
+```
+
+Tests: `python3 tests/result-file-marker-guard.test.py`
