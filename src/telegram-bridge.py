@@ -117,15 +117,7 @@ if channels_env.exists():  # pragma: no cover — telegram import path not drive
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not TOKEN:
-    # Last resort: the Keychain vault. A peer host lost this token for eight
-    # weeks because the only copy lived in a running process's environment and
-    # `vault set` was not read by anything.
-    from channel_token import token_from_vault  # noqa: E402
-    TOKEN = token_from_vault("TELEGRAM_BOT_TOKEN")
-
-if not TOKEN:
-    print("TELEGRAM_BOT_TOKEN not set in channels/telegram/.env and not in the "
-          "vault (`vault set TELEGRAM_BOT_TOKEN`)")
+    print("TELEGRAM_BOT_TOKEN not set")
     exit(1)
 
 TASKS_DIR = REPO / "tasks"
