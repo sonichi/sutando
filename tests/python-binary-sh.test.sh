@@ -74,6 +74,19 @@ else
   printf "  skip developer tools absent on this host — case 5 not exercised\n"
 fi
 
+# --- 5b. NON-Darwin: the stub rule must not apply --------------------------
+# The rule is a macOS artifact. On Linux /usr/bin/python3 is an ordinary
+# interpreter and xcode-select does not exist, so applying it everywhere
+# returned EMPTY and every caller broke with
+#   sutando-config.sh: line 56: : command not found
+# This suite only ever ran on macOS, so CI caught it and the tests did not.
+lab5=$(mktemp -d)
+printf '#!/bin/sh\necho Linux\n' > "$lab5/uname"; chmod +x "$lab5/uname"
+printf '#!/bin/sh\nexit 2\n' > "$lab5/xcode-select"; chmod +x "$lab5/xcode-select"
+out=$(PATH="$lab5:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
+if [ -n "$out" ]; then ok "non-Darwin: system python is used (stub rule is macOS-only)"
+else bad "non-Darwin: system python is used (stub rule is macOS-only)" "got empty — callers break"; fi
+
 # --- 6. bundled runtime beats PATH ------------------------------------------
 lab4=$(mklab)
 mkdir -p "$lab4/engine/../runtime/python/bin"

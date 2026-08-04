@@ -75,6 +75,16 @@ resolve_python() {
 	_path_py="$(command -v python3 2>/dev/null)" || _path_py=""
 	[ -n "$_path_py" ] || return 0
 
+	# The stub is a macOS artifact. On Linux/BSD /usr/bin/python3 is an ordinary
+	# interpreter and there is no xcode-select, so applying the rule everywhere
+	# refused a perfectly good binary and left $PY empty — which is how CI broke
+	# ("sutando-config.sh: line 56: : command not found"). src/git_binary.py
+	# guards the same rule with `is_darwin`; this is that guard.
+	if [ "$(uname -s 2>/dev/null)" != "Darwin" ]; then
+		printf '%s' "$_path_py"
+		return 0
+	fi
+
 	# Homebrew / python.org / pyenv — a real interpreter, use it as-is with no
 	# toolchain requirement.
 	if ! _sutando_is_system_stub "$_path_py"; then
