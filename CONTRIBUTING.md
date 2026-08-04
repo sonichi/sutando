@@ -85,6 +85,42 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 - **Before/after evidence — the single most-requested thing on this repo.** Paste the *actual output* for both states, not a description of it: the failing command/test at the parent commit, then passing at HEAD. "I verified X changes to Y" is not evidence; the pasted command that shows X→Y is. A reviewer should not have to reproduce your result to believe it.
 - What tests did you run? Include commands and results.
 - **Touching a live path (bridge, network, delivery loop, startup)?** A unit test or harness is not sufficient on its own — include a real post-restart round trip on the affected host (input received → reply delivered), with timings when latency is the point. This is the most common reason an otherwise-correct live-path fix is held from approval.
+
+  <details>
+  <summary><strong>How to capture that round trip without checking the branch out over your live checkout</strong></summary>
+
+  The obvious way — `git checkout <branch>` in the running checkout, restart, capture, switch back — puts your live service on a branch and leaves the checkout dirty if anything interrupts you. It also weakens the evidence: a reviewer cannot tell from the log which commit actually ran.
+
+  Run the service from a **detached worktree at the PR head** instead, with the workspace pinned to the real one. `discord-bridge.py` (and the other `src/` entry points) resolve their modules via `Path(__file__).resolve().parent`, so the worktree's `src/` is genuinely what executes.
+
+  ```bash
+  OID=$(gh pr view <N> --json headRefOid --jq .headRefOid)
+  git fetch origin "pull/<N>/head:pr<N>"
+  [ "$(git rev-parse pr<N>)" = "$OID" ] || { echo "ref != PR head — stop"; exit 1; }
+  git worktree add --detach /tmp/wt-pr<N> pr<N>
+
+  # Point the worktree at the LIVE workspace. Without this it resolves to its OWN
+  # empty workspace/ and every probe reports clean no matter what the code does.
+  cp sutando.config.local.json /tmp/wt-pr<N>/
+  python3 - <<'EOF'
+  import json, pathlib
+  p = pathlib.Path("/tmp/wt-pr<N>/sutando.config.local.json"); c = json.loads(p.read_text())
+  c["workspace"] = {"path": "<the live workspace path>"}; p.write_text(json.dumps(c, indent=2))
+  EOF
+  ```
+
+  Preflight **before** stopping the running service, because a bridge restart takes down the owner's live path:
+
+  - `rev-parse` equals `headRefOid` (above) — otherwise you are testing a stale ref;
+  - `python3 -m py_compile src/<entrypoint>.py` in the worktree;
+  - credentials resolve from `$CLAUDE_CONFIG_DIR`, not the checkout;
+  - nothing will auto-restart the old process on top of yours (`health-check.py --fix` restarts bridges — do not run it during the window);
+  - write the rollback command down first.
+
+  Then capture the log lines showing the same input shape before and after. Quote the task file, not just the log, when the discriminator is a field: a task file records `reply_to_author_id`, `access_tier`, `channel_id`, so it proves *which* case you exercised rather than asserting it.
+
+  Restore the service from the normal checkout when you are done, and say in the PR that you did.
+  </details>
 - **Stacked PR?** Name the parent PR and intended merge order. Keep each layer to one concern, and after a parent lands, rebase/update the child and rerun its full checks before asking reviewers to treat it as merge-ready.
 - **Hardcoded-path check.** Scan added lines for host-specific paths (`/Users/<name>`, `/home/<name>`, clone-specific absolute paths, and inline home/config fallbacks). Production code must use the repo's path helpers; test fixtures must be clearly scoped as fixtures rather than silently exempting an entire line from review.
 - **For voice / phone / audio PRs: include a manual test result.** A transcript excerpt (from `data/conversation.sqlite`) showing the live turn/`[Tool]` flow, or a voice recording demonstrating the change. Voice paths are weakly covered by unit tests, so a maintainer needs observable evidence the live session behaves — not just that the code compiles. See the gold-standard example below.
