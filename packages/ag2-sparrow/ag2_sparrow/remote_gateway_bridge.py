@@ -527,9 +527,13 @@ if LOCAL_TIER not in ("owner", "team", "other"):
 # We key the lookup on the BROKER-attested `user_id` (Matrix sender the broker
 # writes into the task, not a task-body self-claim), so this stays a LOCAL trust
 # decision — same principle as LOCAL_TIER. Only listed senders are re-tiered;
-# everyone else keeps LOCAL_TIER, so an unknown sender can never ESCALATE (the
-# map only DOWN-tiers named senders; owner stays owner by being absent from it).
-# Hot: re-read on mtime change so the owner can add teammates without a restart.
+# everyone else keeps LOCAL_TIER, so an UNLISTED sender can never escalate. A LISTED
+# sender gets exactly the tier the owner mapped them to — including one ABOVE
+# LOCAL_TIER, which is how a least-privilege node names its owner. See the CONTRACT
+# note on _tier_for for why that cannot be driven from the wire.
+# Hot: the cache keys on (st_mtime_ns, st_size, st_ino) and never serves an
+# above-LOCAL_TIER grant without a fresh read, so the owner can add teammates AND
+# revoke them without a restart.
 def _ag2space_access_path():
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
     return os.path.join(base, "channels", "ag2space", "access.json")
