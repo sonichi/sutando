@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""The pre-send length guard in skills/bot2bot-post/post.py.
+
+Hermetic BY CONSTRUCTION: exercises `check_length` on strings only. It never
+loads config, never resolves a channel, and never opens a socket — the guard is
+pure arithmetic over the composed content, which is the whole reason it can run
+before the network call it exists to avoid.
+"""
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+_spec = importlib.util.spec_from_file_location(
+    "bot2bot_post", REPO / "skills" / "bot2bot-post" / "post.py"
+)
+post_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(post_mod)
+
+LIMIT = post_mod.DISCORD_MAX_CONTENT
+FAILURES: list[str] = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    if cond:
+        print(f"  ok   {name}")
+    else:
+        FAILURES.append(f"{name}{(' — ' + detail) if detail else ''}")
+        print(f"  FAIL {name} {detail}")
+
+
+def main() -> int:
+    print("bot2bot-post length guard:")
+
+    check("the limit is Discord's documented 2000", LIMIT == 2000, f"got {LIMIT}")
+
+    # --- under / at / over the boundary ------------------------------------
+    check("a short message passes", post_mod.check_length("hi") is None)
+    check("EXACTLY at the limit passes",
+          post_mod.check_length("x" * LIMIT) is None,
+          "2000 is allowed; only >2000 is rejected")
+    check("one over the limit is refused",
+          post_mod.check_length("x" * (LIMIT + 1)) is not None)
+
+    # --- the refusal has to be ACTIONABLE ----------------------------------
+    # An error that says only "too long" reproduces the API's own uselessness:
+    # the caller still cannot tell how much to cut.
+    # `or ""` so a guard that wrongly returns None REPORTS each missing element
+    # instead of raising TypeError on the first one. A crash names one symptom;
+    # this names every property that regressed, which is what a failure is for.
+    msg = post_mod.check_length("x" * (LIMIT + 135)) or ""
+    check("names the actual length", "2135" in msg, f"got: {msg!r}")
+    check("names the overage", "135" in msg, f"got: {msg!r}")
+    check("names the limit", str(LIMIT) in msg, f"got: {msg!r}")
+    check("states that nothing was sent",
+          "NOTHING WAS SENT" in msg.upper(), f"got: {msg!r}")
+
+    # --- the prefix is the part callers forget -----------------------------
+    # `<@1509329143110565888> done: ` is 29 chars, so a body sized to exactly
+    # 2000 is already over. The guard must report the body budget, not just the
+    # total, or the caller trims to the wrong number and fails twice.
+    overhead = len("<@1509329143110565888> done: ")
+    over_msg = post_mod.check_length("x" * (LIMIT + 50), overhead=overhead) or ""
+    check("with overhead, reports the BODY budget",
+          str(LIMIT - overhead) in over_msg, f"overhead={overhead} got: {over_msg}")
+    check("without overhead, omits the body-budget clause",
+          "routing prefix" not in (post_mod.check_length("x" * (LIMIT + 50)) or ""))
+
+    # --- POSITIVE CONTROL --------------------------------------------------
+    # Every assertion above still passes against a `check_length` that returns a
+    # constant string. This one fails then, because it requires a None.
+    check("POSITIVE CONTROL — the guard can also say YES",
+          post_mod.check_length("x" * (LIMIT - 1)) is None,
+          "if this fails while the refusal cases pass, the guard refuses everything")
+
+    # --- the composed length is what gets measured -------------------------
+    # Mirrors main(): overhead is derived as len(message) - len(body), so a
+    # future change to the prefix format cannot silently desync the two.
+    body = "y" * 1990
+    composed = f"<@123> done: {body}"
+    derived = len(composed) - len(body)
+    check("derived overhead matches the real prefix",
+          derived == len("<@123> done: "), f"got {derived}")
+    check("a body under the limit can still be refused once composed",
+          post_mod.check_length(composed, overhead=derived) is not None,
+          "1990-char body + 13-char prefix = 2003 > 2000")
+
+    print()
+    if FAILURES:
+        print(f"FAILED ({len(FAILURES)}):")
+        for f in FAILURES:
+            print(f"  - {f}")
+        return 1
+    print("bot2bot-post length guard: all checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
