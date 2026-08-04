@@ -51,6 +51,18 @@ def archive_file(
     the stale live source, matching the adapters' established fail-open policy.
     ``False`` means the source was absent or the move failed.
     """
+    # Validate BEFORE the try. `base = tasks if kind == "tasks" else results`
+    # routed every other value — "task", "Tasks", a typo — silently to results,
+    # misfiling the archive rather than raising. Latent today (all three
+    # adapters pass literals) but this is shared policy with three callers and
+    # gravity toward more (review nit, @sonichi #2505).
+    #
+    # OUTSIDE the try on purpose: the fail-open handler below catches
+    # Exception, so a guard placed inside it is swallowed and ALSO unlinks the
+    # source — turning a caller's typo into silent data loss. A programming
+    # error is not the failure mode fail-open exists for.
+    if kind not in ("tasks", "results"):
+        raise ValueError(f"archive_file: kind must be 'tasks' or 'results', got {kind!r}")
     if not src.exists():
         return False
     try:

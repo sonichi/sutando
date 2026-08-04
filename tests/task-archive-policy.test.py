@@ -77,6 +77,25 @@ class TaskArchivePolicyTests(unittest.TestCase):
                 (results / "2026-08" / "task-2.txt").read_text(), "result body"
             )
 
+    def test_unknown_kind_raises_instead_of_misfiling(self):
+        """Review nit (@sonichi, #2505): `tasks if kind == "tasks" else results`
+        routed EVERY other value to results, so "task"/"Tasks"/a typo silently
+        misfiled the archive. Latent today (all three adapters pass literals)
+        but this is shared policy with three callers and gravity toward more."""
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "x.txt"
+            src.write_text("x")
+            tasks = Path(d) / "at"
+            results = Path(d) / "ar"
+            with self.assertRaises(ValueError) as ctx:
+                archive_file(src, "task", "task-1", tasks, results)  # singular typo
+            msg = str(ctx.exception)
+            self.assertIn("tasks", msg)
+            self.assertIn("results", msg)
+            # and it must not have written anywhere
+            self.assertFalse(tasks.exists())
+            self.assertFalse(results.exists())
+
     def test_missing_source_is_a_noop(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
