@@ -226,6 +226,22 @@ class Patch:
 _fake = lambda: tmp
 """) == [], "the assignment was safe when it ran")
 
+    # A class namespace is NOT a lexical scope for its methods: an unqualified
+    # name inside a method skips the class body and resolves module/enclosing.
+    # So a class ATTRIBUTE of the same name must not condemn the method
+    # (@john-the-dev, #2622). Pairs with the method case just below — one says
+    # methods DO inherit module late-binding, this says they do NOT inherit the
+    # class body's own names. Both must hold or the model is wrong in one
+    # direction.
+    check("a class attribute is not in scope for the method",
+          viols("""
+_fake = lambda *a, **kw: tmp
+class P:
+    _fake = lambda: tmp
+    def patch(self):
+        wd.resolve_workspace = _fake
+""") == [], "the method's unqualified _fake resolves the SAFE module global")
+
     # ...and the counter-case that stops the cheap fix. Simply excluding ClassDef
     # from late-binding would also lose it for METHODS, whose bodies ARE deferred.
     check("a METHOD inside a class is still late-bound",

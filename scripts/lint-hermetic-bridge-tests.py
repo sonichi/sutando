@@ -1085,16 +1085,27 @@ class _ScopeWalk:
     """
 
     def __init__(self, env: "dict[str, bool]", out: "list[tuple[int, str]]",
-                 inherited: "set[str] | None" = None) -> None:
+                 inherited: "set[str] | None" = None, *, class_body: bool = False) -> None:
         self.env = dict(env)
         self.out = out
         # Names an ENCLOSING scope ever binds unsafely. Carried down so a method
         # defined inside a class still gets late-binding treatment, even though
         # the class body itself does not.
         self.ever_unsafe: "set[str]" = set(inherited or ())
+        # A class namespace is NOT a lexical scope for its methods: an
+        # unqualified name inside a method skips the class body entirely and
+        # resolves module/enclosing-function. So what a method inherits is the
+        # state at the CLASS statement, never the class body's own bindings.
+        self.class_body = class_body
+        self.func_env = dict(env)
+        self.func_unsafe = set(inherited or ())
 
     def run(self, body: "list[ast.stmt]") -> None:
-        self.ever_unsafe |= _unsafe_names_in_scope(body)
+        own = _unsafe_names_in_scope(body)
+        self.ever_unsafe |= own
+        if not self.class_body:
+            # A class body's own names must not reach its methods (see __init__).
+            self.func_unsafe |= own
         for stmt in body:
             self.visit(stmt)
 
@@ -1104,10 +1115,12 @@ class _ScopeWalk:
             # time — a binding written after the `def` still reaches it. No
             # definition-point snapshot can see that, so any name this scope
             # ever binds to a zero-arg lambda is unsafe inside the nest.
-            inner = dict(self.env)
-            for nm in self.ever_unsafe:
+            base_env = self.func_env if self.class_body else self.env
+            base_unsafe = self.func_unsafe if self.class_body else self.ever_unsafe
+            inner = dict(base_env)
+            for nm in base_unsafe:
                 inner[nm] = True
-            _ScopeWalk(inner, self.out, self.ever_unsafe).run(node.body)
+            _ScopeWalk(inner, self.out, base_unsafe).run(node.body)
             return
         if isinstance(node, ast.ClassDef):
             # A class body executes IMMEDIATELY, at this statement — it is not
@@ -1115,7 +1128,7 @@ class _ScopeWalk:
             # and the late-binding widening above would be a false positive
             # (@john-the-dev, #2622). Methods defined inside it are still
             # deferred, so `ever_unsafe` is carried down for them.
-            _ScopeWalk(self.env, self.out, self.ever_unsafe).run(node.body)
+            _ScopeWalk(self.env, self.out, self.ever_unsafe, class_body=True).run(node.body)
             return
         if isinstance(node, ast.Assign):
             self._assign(node)
