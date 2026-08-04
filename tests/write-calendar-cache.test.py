@@ -188,6 +188,122 @@ test_cli_error_paths()
 test_nonempty_payload_no_usable_events_preserves_prior()
 test_cache_path_default_location()
 
+# --- `--from-gws`: the calendar is UNKNOWN on failure, never empty ------------
+# The briefing reported "couldn't read your calendar" on this host from
+# 2026-07-30 to 2026-08-04 because the only documented producer was an
+# agent-only connector and nothing invoked it. `gws` could reach the calendar
+# the whole time. These pin the property that makes the new source safe to run
+# unattended: a fetch that fails must leave the cache alone and exit nonzero.
+
+def _fake_gws(responses):
+    """responses: list of (returncode, stdout) consumed in call order."""
+    calls = {"n": 0}
+    def run(argv, capture_output=True, text=True):
+        i = calls["n"]; calls["n"] += 1
+        if i >= len(responses):
+            raise AssertionError(f"unexpected extra gws call: {argv}")
+        rc, out = responses[i]
+        if out is FileNotFoundError:
+            raise FileNotFoundError("gws")
+        return unittest.mock.Mock(returncode=rc, stdout=out, stderr="")
+    return run, calls
+
+
+CAL_LIST = json.dumps({"items": [
+    {"id": "a@x.com", "selected": True}, {"id": "b@x.com", "selected": True}]})
+
+
+def test_from_gws_binary_missing_raises():
+    run, _ = _fake_gws([(0, FileNotFoundError)])
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc.events_from_gws()
+            ok("gws missing raises", False, "returned instead of raising")
+        except wcc.GwsUnavailable:
+            ok("gws missing raises GwsUnavailable", True)
+
+
+def test_from_gws_nonzero_raises():
+    run, _ = _fake_gws([(1, "boom")])
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc.events_from_gws(); ok("gws nonzero raises", False)
+        except wcc.GwsUnavailable: ok("gws nonzero exit raises", True)
+
+
+def test_from_gws_api_error_object_raises():
+    run, _ = _fake_gws([(0, json.dumps({"error": {"code": 403, "message": "denied"}}))])
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc.events_from_gws(); ok("gws error object raises", False)
+        except wcc.GwsUnavailable: ok("gws API error object raises", True)
+
+
+def test_from_gws_partial_failure_is_total_failure():
+    """One calendar OK, the next fails -> raise. A subset is the falsely-clear bug."""
+    first_cal = json.dumps({"items": [{"summary": "standup",
+                                       "start": {"dateTime": "2026-08-04T09:00:00-07:00"},
+                                       "end": {"dateTime": "2026-08-04T09:15:00-07:00"}}]})
+    run, _ = _fake_gws([(0, CAL_LIST), (0, first_cal), (1, "second calendar exploded")])
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc.events_from_gws()
+            ok("partial calendar failure raises", False,
+               "returned the survivors — a 1-event day that is really 2 calendars deep")
+        except wcc.GwsUnavailable:
+            ok("partial calendar failure raises (subset never written)", True)
+
+
+def test_from_gws_all_answered_zero_events_is_verified_empty():
+    """The ONE case this source may certify empty: every calendar answered."""
+    empty = json.dumps({"items": []})
+    run, _ = _fake_gws([(0, CAL_LIST), (0, empty), (0, empty)])
+    with unittest.mock.patch("subprocess.run", run):
+        ok("all calendars answered, zero events -> [] (verified empty)",
+           wcc.events_from_gws() == [])
+
+
+def test_from_gws_cli_failure_leaves_prior_cache_untouched():
+    """The durability property: yesterday's cache must survive a failed fetch."""
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "calendar-today.json"
+        cache.write_text(json.dumps({"date": "1999-01-01", "events": [{"raw": "OLD", "calendar": ""}]}))
+        run, _ = _fake_gws([(0, FileNotFoundError)])
+        with unittest.mock.patch("subprocess.run", run), \
+             unittest.mock.patch.object(wcc, "cache_path", lambda: cache):
+            rc = wcc.main(["--from-gws"])
+        ok("--from-gws failure exits nonzero", rc != 0, f"rc={rc}")
+        after = json.loads(cache.read_text())
+        ok("--from-gws failure leaves the prior cache byte-identical",
+           after["events"] == [{"raw": "OLD", "calendar": ""}] and after["date"] == "1999-01-01",
+           f"cache was rewritten to {after}")
+
+
+def test_event_to_raw_shapes():
+    ev = {"summary": "1:1", "start": {"dateTime": "2026-08-04T07:30:00-07:00"},
+          "end": {"dateTime": "2026-08-04T08:00:00-07:00"}}
+    ok("timed event renders as a time range", wcc.event_to_raw(ev) == "7:30am-8am 1:1",
+       wcc.event_to_raw(ev))
+    allday = {"summary": "Holiday", "start": {"date": "2026-08-04"}, "end": {"date": "2026-08-05"}}
+    ok("all-day event says all-day (no fake time)", wcc.event_to_raw(allday) == "all-day Holiday",
+       wcc.event_to_raw(allday))
+    ok("no summary is labelled, not blank", "(no title)" in wcc.event_to_raw(
+        {"start": {"date": "2026-08-04"}}))
+    dec = dict(ev, attendees=[{"self": True, "responseStatus": "declined"}])
+    ok("a DECLINED invite is MARKED, not dropped", wcc.event_to_raw(dec).endswith("[DECLINED]"),
+       wcc.event_to_raw(dec))
+    acc = dict(ev, attendees=[{"self": True, "responseStatus": "accepted"}])
+    ok("an accepted invite is NOT marked declined", "[DECLINED]" not in wcc.event_to_raw(acc))
+
+
+test_from_gws_binary_missing_raises()
+test_from_gws_nonzero_raises()
+test_from_gws_api_error_object_raises()
+test_from_gws_partial_failure_is_total_failure()
+test_from_gws_all_answered_zero_events_is_verified_empty()
+test_from_gws_cli_failure_leaves_prior_cache_untouched()
+test_event_to_raw_shapes()
+
 print()
 if _failed:
     print(f"FAIL — {_failed} of {_passed + _failed}")
