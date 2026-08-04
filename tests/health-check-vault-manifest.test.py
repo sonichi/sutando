@@ -104,6 +104,48 @@ def main() -> int:
         r = hc.check_vault_manifest_integrity(many, _probe(["K0"]), max_keys=4)
         check("capped scan discloses the cap", "checked first 4 of 10" in r["detail"], r["detail"])
 
+        # --- the REAL probe path, which every case above bypasses ----------
+        # Cases above inject `keychain_probe`, so none of them exercises how the
+        # probe behaves with no stub. Each branch below is a distinct way the
+        # check can be unable to answer, and every one of them must resolve to
+        # "not asserting" — an unanswerable check that warns is a false alarm.
+
+        # (i) no `security` binary -> cannot verify, must NOT claim divergence.
+        _which = hc.shutil.which
+        hc.shutil.which = lambda name: None if name == "security" else _which(name)
+        try:
+            r = hc.check_vault_manifest_integrity(_manifest(tmp, ["K1", "K2"]))
+        finally:
+            hc.shutil.which = _which
+        check("no `security` binary -> ok, not warn", r["status"] == "ok", repr(r))
+        check("  ...and says it cannot verify", "cannot verify" in r["detail"], r["detail"])
+
+        # (ii) vault_intercept not importable (trimmed install) -> ok, not warn.
+        _saved = sys.modules.get("vault_intercept")
+        sys.modules["vault_intercept"] = None  # makes `import vault_intercept` raise
+        try:
+            r = hc.check_vault_manifest_integrity(_manifest(tmp, ["K1"]))
+        finally:
+            if _saved is None:
+                sys.modules.pop("vault_intercept", None)
+            else:
+                sys.modules["vault_intercept"] = _saved
+        check("vault_intercept unimportable -> ok", r["status"] == "ok", repr(r))
+
+        # (iii) the real Keychain probe answers False for an absent key and does
+        # not raise. Read-only: `find-generic-password` never creates anything.
+        real = hc.check_vault_manifest_integrity(_manifest(tmp, ["ZZ_NO_SUCH_KEY_88131"]))
+        check("real keychain probe runs without raising",
+              real["status"] == "ok", repr(real))
+        check("  ...and 0-resolved is reported as unverifiable, not divergence",
+              "unverifiable" in real["detail"], real["detail"])
+
+        # (iv) a manifest that is valid JSON but not an object must not crash.
+        arr = tmp / "arr.json"
+        arr.write_text('["K1", "K2"]')
+        r = hc.check_vault_manifest_integrity(arr, _probe([]))
+        check("non-object manifest -> ok, no crash", r["status"] == "ok", repr(r))
+
         # --- the probe is registered, not just defined ---------------------
         src = (REPO / "src" / "health-check.py").read_text()
         check("registered in the check list",
