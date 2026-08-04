@@ -87,6 +87,52 @@ def main() -> int:
           post_mod.check_length(composed, overhead=derived) is not None,
           "1990-char body + 13-char prefix = 2003 > 2000")
 
+    # --- post() ENFORCES it, and does so BEFORE the network -----------------
+    # Everything above tests `check_length` in isolation, which is not the same
+    # as testing the call site: the guard could be correct and simply not wired
+    # into post(). Same gap @john-the-dev flagged for the main()->post() handoff.
+    #
+    # The network is stubbed with a RECORDER rather than a raiser, so "did not
+    # send" is asserted from an observation (`calls == []`) instead of from the
+    # absence of an exception — which would also hold if post() returned early
+    # for some unrelated reason.
+    calls: list[str] = []
+    _orig_urlopen = post_mod.urllib.request.urlopen
+
+    class _Resp:
+        def read(self):
+            return b'{"id":"STUB"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _recording_urlopen(req, timeout=None):
+        calls.append(getattr(req, "full_url", "?"))
+        return _Resp()
+
+    post_mod.urllib.request.urlopen = _recording_urlopen
+    try:
+        raised = ""
+        try:
+            post_mod.post("chan", "x" * (LIMIT + 200), "tok", overhead=29)
+        except SystemExit as e:
+            raised = str(e)
+        check("post(): over-length raises SystemExit", bool(raised))
+        check("post(): the refusal carries the measured numbers",
+              "2200" in raised and "200" in raised, f"got: {raised!r}")
+        check("post(): NOTHING was sent — the network was never touched", calls == [])
+
+        # POSITIVE CONTROL for the stub itself: a normal message must reach it,
+        # otherwise `calls == []` above would pass even with a mis-wired recorder.
+        post_mod.post("chan", "short and fine", "tok", overhead=9)
+        check("POSITIVE CONTROL — a normal message DOES reach the network",
+              len(calls) == 1, f"calls={calls}")
+    finally:
+        post_mod.urllib.request.urlopen = _orig_urlopen
+
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")
