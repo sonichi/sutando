@@ -136,13 +136,30 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     if not notice:
         return                                    # still inside the write window
     print(f"  {notice}", flush=True)
+    # TERMINAL means every task-scoped map, not just the one that stops the
+    # re-poll. @john-the-dev's second blocker: the first version cleared
+    # `pending_replies` and archived only the RESULT, so `pending_reply_anchors`,
+    # the progress placeholder and the SOURCE TASK all survived. The task then
+    # stayed visible to queue-health and task-discovery while being, by this
+    # branch's own claim, finished — a half-terminal disposition that is worse
+    # than the stall, because it reports resolved.
+    #
+    # Mirrors the normal-delivery cleanup at :4349-4370 deliberately: the two
+    # paths differ in OUTCOME (failure vs reply), never in what they leave
+    # behind. Anything popped there is popped here.
     _empty_result_polls.pop(task_id, None)
-    channel = pending_replies.pop(task_id, None)  # TERMINAL: stop re-polling it
+    channel = pending_replies.pop(task_id, None)  # stop re-polling it
     _atomic_write_pending_replies(
         {k: str(getattr(v, "id", v)) for k, v in pending_replies.items()})
+    pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
+    _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
     await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
     archive_file(result_file, "results", task_id)
+    # Archive the SOURCE TASK too. Without this the task file sits in tasks/
+    # forever: discovery re-reads it and queue health counts it as pending work.
+    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
+    archive_file(task_file, "tasks", task_id)
 
 
 import local_task_protocol  # noqa: E402

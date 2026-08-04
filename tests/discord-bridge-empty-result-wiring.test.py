@@ -73,6 +73,10 @@ _LIVE = Path(db.RESULTS_DIR)
 _live_before = sorted(p.name for p in _LIVE.iterdir()) if _LIVE.exists() else None
 
 
+OWNER_ID = "424242424242"      # hermetic owner for the recipient proof
+SENT: list = []               # (recipient_id, text) actually written to a DM
+
+
 class _Tick(Exception):
     """Ends one poll_results iteration at its trailing sleep."""
 
@@ -90,7 +94,43 @@ def _drive(box: Path, task_id: str, iterations: int) -> list[str]:
     db.ARCHIVE_TASKS_DIR = box / "archive-tasks"
     db.TASKS_DIR = box / "tasks"
     db.TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    db.client = type("C", (), {"is_ready": lambda self: False})()
+
+    # RECIPIENT PROOF (@john-the-dev: "recipient proof remains vacuous").
+    # The old stub client had only `is_ready`, so `_report_delivery_failure`
+    # died at `client.fetch_user` and landed in its own except branch — which
+    # still prints a line containing "delivery-failure". Asserting on that
+    # string therefore passed while NO DM was ever attempted, let alone
+    # addressed. Give the client a real fetch_user -> create_dm -> send chain
+    # and record WHO was written to, so the assertion is about delivery rather
+    # than about logging.
+    db.ACCESS_FILE = box / "access.json"
+    db.ACCESS_FILE.write_text(json.dumps({"allowFrom": [OWNER_ID]}))
+    SENT.clear()
+
+    class _DM:
+        def __init__(self, uid):
+            self.id = f"dm-{uid}"
+            self.recipient_id = str(uid)
+
+        async def send(self, text):
+            SENT.append((self.recipient_id, str(text)))
+
+    class _User:
+        def __init__(self, uid):
+            self.id = str(uid)
+            self.bot = False
+
+        async def create_dm(self):
+            return _DM(self.id)
+
+    class _Client:
+        def is_ready(self):
+            return False
+
+        async def fetch_user(self, uid):
+            return _User(uid)
+
+    db.client = _Client()
     out: list[str] = []
 
     async def _sleep(_s):
@@ -123,6 +163,17 @@ def main() -> int:
     box = Path(tempfile.mkdtemp(prefix="empty-wire-"))
     (box / "task-STUCK.txt").write_text("")
     db._empty_result_polls.clear()
+    # Preseed the SOURCE TASK — @john-the-dev's focused discriminator. Without
+    # it the lifecycle assertion below is vacuously true: there is no task file
+    # to leave behind, so "absent afterwards" passes on code that never archives
+    # anything. The fixture has to exist for the assertion to mean anything.
+    db_tasks = box / "tasks"
+    db_tasks.mkdir(parents=True, exist_ok=True)
+    (db_tasks / "task-STUCK.txt").write_text("id: task-STUCK\ntask: something\n")
+    # Seed the other task-scoped maps so "cleared" is a state CHANGE, not an
+    # absence that was already there.
+    db.pending_reply_anchors["task-STUCK"] = 123456789
+    db._progress_msgs["task-STUCK"] = {"message_id": 1, "chan": 2}
     out = _drive(box, "task-STUCK", T + 5)
     # Count FIRES, not MENTIONS. `"PRESENT BUT EMPTY" in line` reported 2 — the
     # notice itself, plus the §9.3 delivery-failure line which quotes the notice
@@ -156,9 +207,32 @@ def main() -> int:
     check("  ...the result file is archived, not left to re-poll",
           not (box / "task-STUCK.txt").exists(),
           "left in results/ — the next poll finds it empty all over again")
-    check("  ...the owner-notification path was ENTERED",
-          any("delivery-failure" in line for line in out),
-          "no owner DM attempted; §9.3 requires one for any delivery failure")
+    # RECIPIENT PROOF, not a log-line count. The previous assertion here was
+    # `any("delivery-failure" in line for line in out)`, which the code satisfies
+    # from inside its OWN except branch when the DM never happens — so it passed
+    # against a bridge that notified nobody. These assert the write itself.
+    check("OWNER-VISIBLE: exactly one DM was actually sent",
+          len(SENT) == 1,
+          f"{len(SENT)} DMs sent — 0 means nobody was notified and the previous "
+          f"string assertion was passing on the failure path itself")
+    check("  ...addressed to the resolved OWNER, not just 'someone'",
+          bool(SENT) and SENT[0][0] == OWNER_ID,
+          f"went to {SENT[0][0] if SENT else '<nobody>'}, expected {OWNER_ID}")
+    check("  ...and the body names the task, so the owner can act on it",
+          bool(SENT) and "task-STUCK" in SENT[0][1],
+          SENT[0][1][:120] if SENT else "<nothing sent>")
+
+    # LIFECYCLE: every task-scoped map, and the SOURCE TASK, not just the result.
+    check("TERMINAL: the source task is archived out of tasks/",
+          not (box / "tasks" / "task-STUCK.txt").exists(),
+          "left in tasks/ — queue health and task discovery still see it as "
+          "pending work while this branch claims the task is finished")
+    check("  ...the reply anchor is cleared",
+          "task-STUCK" not in db.pending_reply_anchors,
+          f"stale anchor {db.pending_reply_anchors.get('task-STUCK')} leaks")
+    check("  ...the progress placeholder state is cleared",
+          "task-STUCK" not in db._progress_msgs,
+          "placeholder tracking leaks; the ⏳ line never clears")
     check("  ...and the counter is cleared so a resend starts fresh",
           db._empty_result_polls.get("task-STUCK") is None,
           f"left at {db._empty_result_polls.get('task-STUCK')}")
