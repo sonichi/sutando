@@ -30,7 +30,19 @@ check() {  # check <name> <condition-exit> <detail>
 
 TMP="$(mktemp -d -t migrate-hook-bridge-XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/dest" "$TMP/src"
+mkdir -p "$TMP/dest" "$TMP/src/a" "$TMP/src/b" "$TMP/src/c" "$TMP/home"
+
+# FULL isolation of every source the script discovers, not just DEST.
+# @qingyun-wu on #2624: the first version created $TMP/src and never wired it in,
+# so `--commit` ran against the caller's REAL source discovery and REAL $HOME —
+# `B_PATH` defaults to "$HOME/.sutando/workspace" (:279) and the post-commit path
+# invokes `sutando-shell-setup.sh --import` against the real Claude config (:1650).
+# A test proving the migration does not touch real config must not itself scan,
+# copy, or adopt real config. Correct, and exactly the defect class this PR fixes.
+#
+# `--no-claude-import` opts out of the unrelated import. The two bridge opt-outs
+# (--no-hook-bridge / --no-channel-bridge) are deliberately NOT passed: they are
+# the code paths under test, and disabling them would make every assertion vacuous.
 
 CCD="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
 SETTINGS="$CCD/settings.json"
@@ -43,7 +55,12 @@ echo "  (resolved config dir: ${CCD:-<none>})"
 # --commit, NOT --dry-run: the bridges live in commit_main(), so a dry run
 # never reaches them. My first version used --dry-run and produced IDENTICAL
 # output with and without the fix — a reporter that cannot discriminate.
-OUT="$(SUTANDO_MIGRATE_DEST="$TMP/dest" bash "$REPO/scripts/sutando-migrate.sh" --commit 2>&1)"
+OUT="$(HOME="$TMP/home" \
+       SUTANDO_MIGRATE_DEST="$TMP/dest" \
+       SUTANDO_MIGRATE_SRC_A="$TMP/src/a" \
+       SUTANDO_MIGRATE_SRC_B="$TMP/src/b" \
+       SUTANDO_MIGRATE_SRC_C="$TMP/src/c" \
+       bash "$REPO/scripts/sutando-migrate.sh" --commit --no-confirm --no-claude-import 2>&1)"
 
 # 1. The guard announces itself. Silence would be indistinguishable from the
 #    bridge having run and found nothing to do.
