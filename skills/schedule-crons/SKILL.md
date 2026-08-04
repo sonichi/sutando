@@ -43,9 +43,12 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 3. For each job in the config:
    - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
    - **Skip any entry with `"launchd": true`** — it is owned by the OS-level cron-runner (see "Reliable OS-level crons" below), which emits its task independently. Registering it here too would double-fire (duplicate deliveries — the exact noise class the launchd path was built to avoid).
-   - **If a job for this entry already exists, RE-REGISTER it rather than skipping** — `CronDelete`
-     the existing job, then `CronCreate` from the current `crons.json` text, and confirm the
-     replacement in `CronList`. A session cron is a **snapshot of the prompt taken at registration
+   - **For a `CronCreate`-registered entry (one visible as a job in `CronList`): if a job for this
+     entry already exists, RE-REGISTER it rather than skipping** — `CronDelete` the existing job,
+     then `CronCreate` from the current `crons.json` text, and confirm the replacement in
+     `CronList`. This bullet does **not** apply to the dynamic-loop branch below (`loop: "dynamic"`),
+     which is never `CronCreate`d and keeps its own freshness-sentinel guard — re-launching one
+     mid-session would re-run the loop body immediately, the exact failure that guard prevents. A session cron is a **snapshot of the prompt taken at registration
      time**; editing `crons.json` afterwards does not reach it. The former rule here was "skip if a
      job with matching prompt/name already exists", which made that snapshot permanent for the life
      of the session: a long-lived core kept firing a prompt its own config had already superseded,
