@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import contextlib
 import importlib
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -38,6 +39,91 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     else:
         FAILURES.append(f"{name}{(' — ' + detail) if detail else ''}")
         print(f"  FAIL {name} {detail}")
+
+
+def _load_bridge_starved(filename: str, mod_name: str, wants: list[str], stubs: tuple,
+                         vault_value=None):
+    """Load a bridge with NO token in env and NO `.env` on disk — vault only.
+
+    HERMETIC by construction: `CLAUDE_CONFIG_DIR` points at an empty temp dir so
+    the real `channels/*/.env` is unreachable, and `channel_token` is replaced in
+    `sys.modules` so the bridge's `from channel_token import token_from_vault`
+    binds to a stub. The operator's Keychain is never consulted — same rule the
+    rest of this suite holds itself to.
+
+    Returns (module, [vars the vault was asked for]) or None if the module could
+    not be loaded in this environment (missing third-party dep, etc.).
+    """
+    import importlib.util
+    import types
+
+    asked: list[str] = []
+    fake_ct = types.ModuleType("channel_token")
+    fake_ct.token_from_vault = lambda var, vault_get=None: (
+        asked.append(var) or (f"vault-{var}" if vault_value is None else vault_value))
+
+    saved_mods = {k: sys.modules.get(k) for k in ("channel_token", *stubs)}
+    saved_env = {k: os.environ.get(k) for k in (*wants, "CLAUDE_CONFIG_DIR", "SUTANDO_TEST_MODE")}
+    tmp = tempfile.mkdtemp(prefix="starved-")
+    try:
+        sys.modules["channel_token"] = fake_ct
+        for s in stubs:
+            if s == "discord":
+                d = types.ModuleType("discord")
+                d.Intents = type("Intents", (), {"default": staticmethod(lambda: types.SimpleNamespace(
+                    message_content=True, members=True, guilds=True))})
+                d.Client = type("Client", (), {
+                    "__init__": lambda self, **k: None,
+                    # discord.py registers handlers via `@client.event`; without
+                    # it the module dies AFTER the token block, which would still
+                    # pass the assertion below but on a half-executed module.
+                    "event": lambda self, fn=None: (fn if fn else (lambda f: f)),
+                    "run": lambda self, *a, **k: None,
+                    "get_channel": lambda self, *a, **k: None,
+                })
+                d.File = type("File", (), {"__init__": lambda self, *a, **k: None})
+                d.Object = type("Object", (), {"__init__": lambda self, *a, **k: None})
+                d.errors = types.SimpleNamespace(HTTPException=Exception, Forbidden=Exception)
+                sys.modules["discord"] = d
+            elif s == "slack_bolt":
+                b = types.ModuleType("slack_bolt")
+                b.App = type("App", (), {"__init__": lambda self, **k: None,
+                                         "event": lambda self, *a, **k: (lambda fn: fn),
+                                         "message": lambda self, *a, **k: (lambda fn: fn),
+                                         "command": lambda self, *a, **k: (lambda fn: fn)})
+                sys.modules["slack_bolt"] = b
+                ad = types.ModuleType("slack_bolt.adapter")
+                sm = types.ModuleType("slack_bolt.adapter.socket_mode")
+                sm.SocketModeHandler = type("H", (), {"__init__": lambda self, *a, **k: None})
+                sys.modules["slack_bolt.adapter"] = ad
+                sys.modules["slack_bolt.adapter.socket_mode"] = sm
+        for v in wants:
+            os.environ.pop(v, None)
+        os.environ["CLAUDE_CONFIG_DIR"] = tmp
+        os.environ["SUTANDO_TEST_MODE"] = "1"
+        spec = importlib.util.spec_from_file_location(mod_name, REPO / "src" / filename)
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except SystemExit as exc:
+            # A bridge with no token anywhere prints the `vault set` hint and
+            # exits 1. That is the intended refusal, not a test failure.
+            return "EXIT" if (exc.code or 0) != 0 else "EXIT0"
+        except BaseException as exc:
+            print(f"    (note: {filename} raised {type(exc).__name__}: {str(exc)[:90]})")
+            return (mod, asked) if asked else None
+        return mod, asked
+    finally:
+        for k, v in saved_mods.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def main() -> int:
@@ -170,13 +256,57 @@ def main() -> int:
           f"got={got!r} real_reader_touches={real_used['n']}")
 
     # --- every bridge actually calls the tier -------------------------------
-    # The helper existing is not the fix; the bridges using it is.
-    for bridge, var in (("discord-bridge.py", "DISCORD_BOT_TOKEN"),
-                        ("telegram-bridge.py", "TELEGRAM_BOT_TOKEN"),
-                        ("slack-bridge.py", "SLACK_BOT_TOKEN")):
-        src = (REPO / "src" / bridge).read_text()
-        check(f"{bridge} consults the vault for {var}",
-              "token_from_vault" in src and var in src)
+    # The helper existing is not the fix; the bridges USING it is. This used to
+    # assert `"token_from_vault" in src` — a substring check that passes on a
+    # commented-out call, a call in dead code, or the wrong variable name, and
+    # that executes none of the added lines. `diff coverage` caught it honestly:
+    # 25% on all three bridges. Counting a reference is not exercising it.
+    #
+    # So each bridge is LOADED with no token anywhere except the vault, and the
+    # assertion is that its module-level TOKEN ends up holding the vault value.
+    for bridge, mod_name, wants, stubs in (
+        ("telegram-bridge.py", "tg_vault", ["TELEGRAM_BOT_TOKEN"], ()),
+        ("discord-bridge.py", "dc_vault", ["DISCORD_BOT_TOKEN"], ("discord",)),
+        ("slack-bridge.py", "sk_vault", ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"], ("slack_bolt",)),
+    ):
+        got = _load_bridge_starved(bridge, mod_name, wants, stubs)
+        if got is None:
+            check(f"{bridge} consults the vault for {wants[0]}", False, "module failed to load")
+            continue
+        mod, asked = got
+        token = getattr(mod, "TOKEN", None) or getattr(mod, "BOT_TOKEN", None)
+        check(f"{bridge} takes its token FROM THE VAULT when nothing else has it",
+              token == f"vault-{wants[0]}" and wants[0] in asked,
+              f"TOKEN={token!r} vault asked for {asked}")
+        if len(wants) > 1:
+            check(f"{bridge} resolves {wants[1]} from the vault independently",
+                  getattr(mod, "APP_TOKEN", None) == f"vault-{wants[1]}" and wants[1] in asked,
+                  f"APP_TOKEN={getattr(mod, 'APP_TOKEN', None)!r} asked={asked}")
+
+    # --- and the OTHER side: nothing anywhere must refuse to start -----------
+    # The vault answering "" is the state an operator lands in after `vault set`
+    # of the wrong name. The bridge must exit non-zero rather than run tokenless.
+    for bridge, mod_name, wants, stubs in (
+        ("telegram-bridge.py", "tg_none", ["TELEGRAM_BOT_TOKEN"], ()),
+        ("discord-bridge.py", "dc_none", ["DISCORD_BOT_TOKEN"], ("discord",)),
+    ):
+        rc = _load_bridge_starved(bridge, mod_name, wants, stubs, vault_value="")
+        check(f"{bridge} REFUSES to start when even the vault is empty",
+              rc == "EXIT", f"got {rc!r} instead of a non-zero exit")
+
+    # --- the two remaining branches of the helper itself ---------------------
+    check("_clean rejects a non-string (a vault backend may return None)",
+          ct._clean(None) == "" and ct._clean(b"bytes") == "")
+    _saved = sys.modules.get("vault_intercept")
+    sys.modules["vault_intercept"] = None      # makes `from vault_intercept ...` raise
+    try:
+        check("an unimportable vault_intercept degrades to '' (never crashes a bridge)",
+              ct.token_from_vault("ANY") == "")
+    finally:
+        if _saved is None:
+            sys.modules.pop("vault_intercept", None)
+        else:
+            sys.modules["vault_intercept"] = _saved
 
     print()
     if FAILURES:
