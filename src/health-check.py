@@ -23,7 +23,6 @@ import hashlib
 import json
 import os
 import re
-import plistlib
 import shlex
 import shutil
 import tempfile
@@ -1608,6 +1607,119 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     return {"name": name, "status": "fail", "detail": "; ".join(parts)}
 
 
+def _index_growth_note(index: Path, effective_bytes: int) -> str:
+    """A trend for the memory-index warning, or "" when it cannot be measured.
+
+    The level alone reads as scenery. This probe warned "approaching the session
+    read limit" for hours on 2026-08-04 and was correctly ignored by the agent it
+    was warning, because "approaching" says nothing about whether that is a week
+    away or an hour. The history says which:
+
+        08-03 14:04   24,988 B   headroom     12 B   <- survived by 12 bytes
+        08-03 17:36   23,567 B                       <- compacted back
+        08-03 22:07   24,238 B   headroom    762 B   <- climbing again
+
+    Two hosts write this file through the vault, so neither one's own edits
+    account for the curve. A warning that cannot say "it nearly truncated today"
+    is a warning that invites exactly the shrug it got.
+
+    Fail-open by construction: no git, not a repo, no history for the path, or
+    an unparsable blob all yield "" and leave the existing message untouched. A
+    trend is a nicety; suppressing the level would be a regression.
+    """
+    try:
+        rel = index.name
+        repo = index.parent
+        proc = subprocess.run(
+            git_argv("-C", str(repo), "log", "--format=%H %at", "-n", "12", "--", rel),
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return ""
+        # One `cat-file --batch` instead of a `git show` per commit. The first
+        # draft spawned 1 + N processes (13 here) on a path that runs EVERY
+        # proactive pass for as long as the warning stands — 658 ms on
+        # Sutando-Pro's host, 122 ms on mine (wall time is host-dependent, the
+        # spawn count is not).
+        #
+        # `--batch`, not `--batch-check`: the sizes have to be measured in the
+        # SAME units as the live level, and that means having the CONTENT.
+        # `effective_bytes` comes from `_index_effective_text`, which strips
+        # frontmatter and whole-line HTML comments before the runtime measures
+        # its limit. Comparing a raw blob length against it is a unit mismatch:
+        # a revision whose bulk sits inside `<!-- ... -->` is huge raw and tiny
+        # effective, and the first draft of this helper reported
+        # "ALREADY EXCEEDED ... entries were dropped then" for exactly that
+        # shape — a FALSE claim of proven loss, in a note whose entire purpose
+        # is that the reported number describes the artifact.
+        # (john-the-dev and qingyun-wu each reproduced it independently on #2610.)
+        stamps: "list[tuple[str, int]]" = []
+        for line in proc.stdout.splitlines():
+            sha, _, at = line.partition(" ")
+            if not sha or not at.strip().isdigit():
+                continue
+            stamps.append((sha, int(at)))
+        if not stamps:
+            return ""
+        batch = subprocess.run(
+            git_argv("-C", str(repo), "cat-file", "--batch"),
+            input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode(),
+            capture_output=True, timeout=20,
+        )
+        if batch.returncode != 0:
+            return ""
+        points: "list[tuple[int, int]]" = []
+        buf, idx = batch.stdout, 0
+        for sha, at in stamps:
+            nl = buf.find(b"\n", idx)
+            if nl < 0:
+                break
+            header = buf[idx:nl].decode("utf-8", "ignore").split()
+            idx = nl + 1
+            # a bad spec prints "<spec> missing" and no body
+            if len(header) < 3 or not header[-1].isdigit():
+                continue
+            size = int(header[-1])
+            body, idx = buf[idx:idx + size], idx + size + 1   # +1 trailing \n
+            # SAME decode + strip the live path uses (read_text(errors="ignore")
+            # then _index_effective_text), then encoded bytes — so peak and rate
+            # are in the units the cap is defined on.
+            eff = _index_effective_text(body.decode("utf-8", "ignore"))
+            points.append((at, len(eff.encode("utf-8"))))
+        if len(points) < 2:
+            return ""
+        points.sort()
+        # Closest the index has come to the cut in the recorded window. This is
+        # the number that makes the warning land, and no point reading has it.
+        peak = max(sz for _, sz in points)
+        oldest_at, oldest_sz = points[0]
+        newest_at, _ = points[-1]
+        hours = (newest_at - oldest_at) / 3600.0
+        grew = effective_bytes - oldest_sz
+        note = ""
+        if peak > MEMORY_INDEX_LOAD_BYTES:
+            # Not "nearly" — it was OVER, so the tail was genuinely unread for as
+            # long as that revision stood. The first draft of this note printed
+            # "came within -156 B of the cut", which is how a sign error ships as
+            # reassurance: the one history that proves real loss rendered as the
+            # calmest wording in the message.
+            note += (f"; it has ALREADY EXCEEDED the cut in this history, by "
+                     f"{peak - MEMORY_INDEX_LOAD_BYTES:,} B — entries were dropped then, "
+                     f"and only a compaction brought it back")
+        elif peak > MEMORY_INDEX_LOAD_BYTES * 0.97:
+            note += (f"; it came within {MEMORY_INDEX_LOAD_BYTES - peak:,} B of the cut "
+                     f"inside this history and was pulled back by a compaction, not by headroom")
+        if hours >= 0.5 and grew > 0:
+            rate = grew / hours
+            left = MEMORY_INDEX_LOAD_BYTES - effective_bytes
+            note += (f"; +{grew:,} B over the last {hours:.1f}h"
+                     + (f", which is ~{left / rate:.1f}h of remaining headroom at that rate"
+                        if rate > 0 and left > 0 else ""))
+        return note
+    except (GitUnavailable, OSError, subprocess.SubprocessError, ValueError):
+        return ""
+
+
 def check_memory_index_integrity() -> "dict | None":
     """Catch memories that exist on disk but will never load into a session.
 
@@ -1752,6 +1864,7 @@ def check_memory_index_integrity() -> "dict | None":
         parts.append(
             f"MEMORY.md is approaching the session read limit ({_size_note()})"
             + (" and is already truncated" if truncated else "")
+            + _index_growth_note(index, effective_bytes)
             + " — compact it now; entries past the cut are dropped silently while "
               "every memory file still looks fine on disk"
         )
@@ -2256,9 +2369,16 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # Observed 2026-08-03 on this node: exactly ONE commit behind — far under the
     # threshold, so this probe reported ok — while the live `context-reconstruct`
     # still instructed writing `state/current-track.md`, the shared flat path
-    # whose two-writer collision had destroyed a peer's anchor hours earlier
+    # that delivers one host's anchor onto another host at the same local path
     # (#2567/#2568). The running skill and the merged skill disagreed, and both
     # looked correct from where anyone was standing.
+    #
+    # This sentence used to say that collision "had destroyed a peer's anchor".
+    # Nothing was destroyed — see the UNSAFE_TO_READD comment above, which is the
+    # authority: the vault uses per-host branches, so a host only ever merges a
+    # peer INTO its own branch. The example still lands, because it never needed
+    # the destruction to: the point is that the running skill and the merged one
+    # disagreed invisibly, and that is true of any content difference.
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     if stale_skills:
         return {"name": name, "status": "warn",
@@ -3633,6 +3753,31 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     if not plist.is_file():
         return {"name": name, "status": "ok",
                 "detail": "credential proxy is not launchd-managed on this host"}
+    # Imported HERE, not at module scope, and this placement is the whole point.
+    # `plistlib` pulls in `xml.parsers.expat` -> the `pyexpat` C extension, which
+    # is the single most fragile import in the stdlib: it dlopens libexpat, so a
+    # Python whose pyexpat was built against a different libexpat than the one it
+    # finds at runtime raises ImportError. Measured on a live host 2026-08-03,
+    # same file, same commit, two interpreters:
+    #
+    #   /opt/homebrew/bin/python3 3.14.5 -> ImportError: dlopen pyexpat, symbol
+    #                                       _XML_SetAllocTrackerActivationThreshold
+    #                                       not found in /usr/lib/libexpat.1.dylib
+    #                                       ->  0 of 39 checks ran
+    #   /usr/bin/python3          3.9.6  -> 39 of 39 checks ran
+    #
+    # At module scope that ImportError is unreachable by any handler and kills
+    # the process before a single check runs — one optional probe on one platform
+    # silently taking down the whole health check, which is the one tool whose
+    # job is to notice things being down. Lazy, it costs this probe only. See
+    # PR #2582 for the installer-side half (choosing an interpreter that works).
+    try:
+        import plistlib
+    except ImportError as exc:
+        return {"name": name, "status": "warn",
+                "detail": (f"cannot parse the credential-proxy plist — this Python "
+                           f"cannot import plistlib ({exc.__class__.__name__}: {exc}). "
+                           f"Every other check is unaffected.")}
     try:
         rendered = plistlib.loads(plist.read_bytes())
     except (OSError, ValueError) as exc:
