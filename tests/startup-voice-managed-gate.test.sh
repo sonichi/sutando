@@ -268,6 +268,9 @@ got="$(SUTANDO_PY="$REAL_PY" bash "$REPO/scripts/sutando-config.sh" python-bin 2
 BUNDLE="$TMP/engine"
 mkdir -p "$BUNDLE/sutando/scripts" "$BUNDLE/runtime/python/bin"
 cp "$REPO/scripts/sutando-config.sh" "$BUNDLE/sutando/scripts/sutando-config.sh"
+# sutando-config.sh sources this; without it the bundle fixture dies on the
+# `.` and the tier-2 assertions below never run (CI, #2599).
+cp "$REPO/scripts/python-binary.sh" "$BUNDLE/sutando/scripts/python-binary.sh"
 ln -sf "$REAL_PY" "$BUNDLE/runtime/python/bin/python3"
 
 got="$(env -i PATH="$STUBBIN:/usr/bin:/bin" \
