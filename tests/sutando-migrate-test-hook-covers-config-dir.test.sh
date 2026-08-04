@@ -48,13 +48,31 @@ mkdir -p "$TMP/dest" "$TMP/src/a" "$TMP/src/b" "$TMP/src/c" "$TMP/home"
 # (--no-hook-bridge / --no-channel-bridge) are deliberately NOT passed: they are
 # the code paths under test, and disabling them would make every assertion vacuous.
 
-CCD="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
-SETTINGS="$CCD/settings.json"
-BEFORE=""
-[ -n "$CCD" ] && [ -f "$SETTINGS" ] && BEFORE="$(stat -f %m "$SETTINGS" 2>/dev/null || stat -c %Y "$SETTINGS" 2>/dev/null)"
+# NO live-config probe here. Earlier versions resolved claude-sutando-config-dir
+# and stat'd the operator's settings.json around the run, as belt-and-braces
+# evidence that the real config was untouched. @john-the-dev's blocker on
+# e302e717: that assertion can only fire AFTER the write, so it is a post-mortem
+# rather than a guard, and obtaining it puts live operator state inside the blast
+# radius of the very regression under test. On his detached worktree the file was
+# absent and the assertion silently skipped, which is the other half of the
+# problem — a probe that cannot fire where it runs and can only do harm where it
+# would.
+#
+# Nothing is lost. Both directions are already discriminated without touching
+# live state: the skip-message assertions prove the guard fires under the hook,
+# and the positive control below proves it does NOT fire without it. Verified by
+# mutation — making the gate unconditional fails two NAMED assertions, neither of
+# which was the mtime one.
+#
+# The stronger version @john-the-dev offered as an alternative — run the
+# migration from a throwaway checkout whose Sutando config points at fixture
+# state — was tried and does not work by symlinking a repo skeleton:
+# `resolve_claude_sutando_config_dir()` derives from the repo root that
+# `sutando-config.sh` computes as `cd "$(dirname "$0")/.." && pwd`, which
+# resolved back to the real checkout. A real copy of src/ + scripts/ would do it;
+# that is a larger change than this PR's single concern.
 
 echo "sutando-migrate: test hook covers the config dir, not just DEST"
-echo "  (resolved config dir: ${CCD:-<none>})"
 
 # --commit, NOT --dry-run: the bridges live in commit_main(), so a dry run
 # never reaches them. My first version used --dry-run and produced IDENTICAL
@@ -81,17 +99,6 @@ check "hook bridge did not run" $? "the bridge announced an install under a redi
 ! grep -q "bridging channels (Sutando bridge access lists" <<<"$OUT"
 check "channel bridge did not run" $? "the bridge announced a copy under a redirected DEST"
 
-# 3. Belt and braces: the operator's real settings.json must be untouched.
-#    mtime, NOT content — the install is idempotent, so a hash comparison passes
-#    even when the file was rewritten. Skipped (not passed) when absent, so an
-#    unresolvable config dir cannot masquerade as a green assertion.
-if [ -n "$BEFORE" ]; then
-    AFTER="$(stat -f %m "$SETTINGS" 2>/dev/null || stat -c %Y "$SETTINGS" 2>/dev/null)"
-    [ "$BEFORE" = "$AFTER" ]
-    check "operator settings.json mtime unchanged" $? "mtime $BEFORE -> $AFTER (the bridge wrote the real config dir)"
-else
-    echo "  skip operator settings.json mtime (no settings.json at ${CCD:-<unresolved>})"
-fi
 
 # --- POSITIVE CONTROL: WITHOUT the test hook the bridges must STILL RUN --------
 # Self-audit after @john-the-dev's review of #2628: he disabled a gate entirely
