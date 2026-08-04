@@ -344,6 +344,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(pauseItem)
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        // Core Runtime picker — switch the persistent core between Claude and
+        // Codex without hand-editing config. Each item shells to
+        // start-cli.sh --runtime <name> --restart (see switchRuntime), which
+        // persists core.runtime to sutando.config.local.json and refreshes the
+        // runtime marker before restarting into the chosen CLI. The current
+        // runtime (sutando-config.sh core-runtime) gets the ● checkmark.
+        let currentRuntime = (runShell("/bin/bash",
+            [repoRoot + "/scripts/sutando-config.sh", "core-runtime"]) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let runtimeSubmenu = NSMenu()
+        for (label, value) in [("Claude", "claude"), ("Codex", "codex")] {
+            let ri = NSMenuItem(title: label, action: #selector(switchRuntimeMenu(_:)), keyEquivalent: "")
+            ri.target = self
+            ri.representedObject = value
+            ri.state = (value == currentRuntime) ? .on : .off
+            runtimeSubmenu.addItem(ri)
+        }
+        let runtimeItem = NSMenuItem(title: "Core Runtime", action: nil, keyEquivalent: "")
+        runtimeItem.submenu = runtimeSubmenu
+        menu.addItem(runtimeItem)
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Force Restart Core CLI", action: #selector(forceRestartCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Stop Core CLI", action: #selector(stopCore), keyEquivalent: ""))
@@ -2504,6 +2524,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let errStr = String(data: errData, encoding: .utf8) ?? ""
                 let preview = String(errStr.prefix(200))
                 self?.notify("Sutando", "Core restart failed (exit \(proc.terminationStatus)): \(preview)")
+            }
+        }
+    }
+
+    /// Menu action for the Core Runtime picker items. The chosen runtime rides
+    /// on representedObject (set at build time) so one selector serves both.
+    @objc func switchRuntimeMenu(_ sender: NSMenuItem) {
+        guard let runtime = sender.representedObject as? String else { return }
+        switchRuntime(runtime)
+    }
+
+    /// Switch the persistent core runtime (claude|codex) and restart into it.
+    /// Mirrors restartCore's detached-bash + stderr-on-failure contract, but
+    /// passes --runtime so start-cli.sh persists the choice to
+    /// sutando.config.local.json and refreshes the runtime marker before
+    /// restarting. No-op-safe if the chosen runtime is already active (the
+    /// config write + restart just re-selects the same CLI).
+    func switchRuntime(_ runtime: String) {
+        notify("Sutando", "Switching core runtime to \(runtime)…")
+        let script = repoRoot + "/src/agent/start-cli.sh"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script, "--runtime", runtime, "--restart", "--visible"]
+        let errPipe = Pipe()
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = errPipe
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                try proc.run()
+            } catch {
+                self?.notify("Sutando", "Runtime switch failed to start: \(error.localizedDescription)")
+                return
+            }
+            proc.waitUntilExit()
+            if proc.terminationStatus == 0 {
+                self?.notify("Sutando", "Core runtime switched to \(runtime). Attach via Open Core CLI in menu.")
+            } else {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8) ?? ""
+                let preview = String(errStr.prefix(200))
+                self?.notify("Sutando", "Runtime switch failed (exit \(proc.terminationStatus)): \(preview)")
             }
         }
     }

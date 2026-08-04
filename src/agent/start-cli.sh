@@ -28,6 +28,81 @@ if [ -f "$REPO/.env" ]; then
   unset _self_dev_was_set _self_dev_ambient
 fi
 
+# --runtime <claude|codex>: switch the configured core runtime, then restart
+# into it (the desktop app's "Core Runtime" picker calls this). We persist the
+# choice to sutando.config.local.json so it survives every launch path, and we
+# refresh the core-runtime.json marker for the TARGET runtime. That marker is
+# otherwise written only by the Codex launcher, so a Codex->Claude switch would
+# leave it claiming "codex" and mislead health-check's runtime detection until
+# the next Codex boot. Parsed here (before runtime resolution) and stripped from
+# "$@" so the value never leaks to the runtime-specific launcher.
+requested_runtime=""
+_passthru=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --runtime)
+      requested_runtime="${2:-}"
+      if [ "$#" -lt 2 ]; then
+        echo "start-cli: --runtime needs a value (claude|codex)" >&2; exit 2
+      fi
+      shift 2 ;;
+    --runtime=*)
+      requested_runtime="${1#--runtime=}"; shift ;;
+    *)
+      _passthru+=("$1"); shift ;;
+  esac
+done
+set -- ${_passthru[@]+"${_passthru[@]}"}
+
+if [ -n "$requested_runtime" ]; then
+  case "$requested_runtime" in
+    claude|codex) ;;
+    *) echo "start-cli: unsupported --runtime: $requested_runtime (expected claude|codex)" >&2; exit 2 ;;
+  esac
+  # Persist core.runtime into the per-clone local config (atomic merge).
+  python3 - "$REPO" "$requested_runtime" <<'PY'
+import json, os, sys, tempfile
+repo, rt = sys.argv[1], sys.argv[2]
+path = os.path.join(repo, "sutando.config.local.json")
+try:
+    cfg = json.load(open(path))
+    if not isinstance(cfg, dict):
+        cfg = {}
+except (OSError, ValueError):
+    cfg = {}
+core = cfg.get("core")
+if not isinstance(core, dict):
+    core = {}
+core["runtime"] = rt
+cfg["core"] = core
+fd, tmp = tempfile.mkstemp(dir=repo, prefix=".sutando-cfg-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+finally:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+PY
+  # Refresh the marker for the target so runtime-detection is correct at once
+  # (the running launcher will overwrite it on boot; this fixes the interim +
+  # the Codex->Claude case the Claude launcher never writes).
+  _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+  mkdir -p "$_ws/state"
+  printf '{"runtime":"%s","session":"%s","started_at":%s,"source":"runtime-switch"}\n' \
+    "$requested_runtime" "${SUTANDO_TMUX_SESSION:-sutando-core}" "$(date +%s)" \
+    > "$_ws/state/core-runtime.json"
+  # A runtime switch must restart into the new CLI, even if the caller didn't
+  # pass --restart.
+  case " $* " in
+    *" --restart "*) ;;
+    *) set -- --restart ${1+"$@"} ;;
+  esac
+fi
+
 runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
   echo "start-cli: failed to resolve core runtime" >&2
   exit 1
