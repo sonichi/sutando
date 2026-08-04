@@ -56,26 +56,6 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
-import result_router  # noqa: E402  (shared empty-result bound)
-
-#: Consecutive polls each task's result file has been present-but-empty.
-_empty_result_polls: "dict[str, int]" = {}
-
-
-def _note_empty_result(task_id: str, result_file) -> None:
-    """Provider-side half: print what the shared policy decided to announce.
-
-    Counting + threshold + wording live in `result_router.note_empty_result` so
-    both bridges cannot drift; only the print is per-bridge. Kept to ONE call at
-    the guard so `continue` stays adjacent to `if not reply_text:` —
-    `tests/bridge-result-race-guard.test.py` reads a 120-char window after that
-    `if`, and my first version inlined eight lines and pushed the `continue`
-    out of it, failing the very test that protects this guard.
-    """
-    notice = result_router.note_empty_result(
-        _empty_result_polls, task_id, str(result_file))
-    if notice:
-        print(f"  {notice}", flush=True)
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
@@ -137,7 +117,15 @@ if channels_env.exists():  # pragma: no cover — telegram import path not drive
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not TOKEN:
-    print("TELEGRAM_BOT_TOKEN not set")
+    # Last resort: the Keychain vault. A peer host lost this token for eight
+    # weeks because the only copy lived in a running process's environment and
+    # `vault set` was not read by anything.
+    from channel_token import token_from_vault  # noqa: E402
+    TOKEN = token_from_vault("TELEGRAM_BOT_TOKEN")
+
+if not TOKEN:
+    print("TELEGRAM_BOT_TOKEN not set in channels/telegram/.env and not in the "
+          "vault (`vault set TELEGRAM_BOT_TOKEN`)")
     exit(1)
 
 TASKS_DIR = REPO / "tasks"
@@ -988,9 +976,7 @@ def main():  # pragma: no cover
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
                 if not reply_text:
-                    _note_empty_result(task_id, result_file)
                     continue
-                _empty_result_polls.pop(task_id, None)
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
                 # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,

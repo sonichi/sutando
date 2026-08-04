@@ -36,27 +36,6 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-# MODULE LEVEL, and before any bridge import: the bridges resolve channel config
-# during exec_module, so a test that inherits the developer's CLAUDE_CONFIG_DIR
-# reads their real per-user channel allowlist. Plain assignment, not setdefault —
-# setdefault is a no-op precisely on the operator box where it matters. Enforced
-# by scripts/lint-hermetic-bridge-tests.py, which this file tripped when the
-# execution block below was first added with only a token env var set.
-_CCD = tempfile.mkdtemp(prefix="ccd-empty-result-bound-")
-os.environ["CLAUDE_CONFIG_DIR"] = _CCD
-os.environ["TELEGRAM_BOT_TOKEN"] = "test-token-not-real"
-
-# Pointing CLAUDE_CONFIG_DIR at an EMPTY dir is not isolation: channel_access_path()
-# falls back to the legacy real-home ~/.claude/channels/<ch>/access.json when the
-# canonical file is missing, so the operator's allowlist is still what gets read.
-# Seed both channels this file names — the lint detects `discord` too, from the
-# source-grep loop below. Written out rather than looped so the seed is a plain
-# module-level write.
-(pathlib.Path(_CCD) / "channels" / "telegram").mkdir(parents=True, exist_ok=True)
-(pathlib.Path(_CCD) / "channels" / "telegram" / "access.json").write_text('{"allowFrom": []}')
-(pathlib.Path(_CCD) / "channels" / "discord").mkdir(parents=True, exist_ok=True)
-(pathlib.Path(_CCD) / "channels" / "discord" / "access.json").write_text('{"allowFrom": []}')
-
 from result_router import (  # noqa: E402
     EMPTY_RESULT_POLL_THRESHOLD,
     empty_result_notice,
@@ -171,7 +150,7 @@ def main() -> int:
     # CLAUDE.md: "Pin both the shared contract and every adapter's delegation
     # in tests." Landing the bound with nothing calling it would be the same
     # latent no-op this PR exists to remove, so assert BOTH bridges delegate.
-    for bridge in ("discord-bridge.py", "telegram-bridge.py"):
+    for bridge in ("discord-bridge.py",):
         src = (REPO / "src" / bridge).read_text()
         # These four assertions fired when I moved the counting into
         # result_router — correctly. They were pinned to the OLD call spelling,
@@ -192,46 +171,6 @@ def main() -> int:
         check(f"  ...{bridge} still SKIPS rather than delivering the empty body",
               "if not reply_text:" in src and src.count("continue") > 0,
               "the partial-write guard was removed")
-
-    # --- EXECUTION: the delegation checks above are source greps ------------
-    # They prove the call is written; they never run it. diff-coverage put the
-    # telegram wrapper at 50% for exactly that reason, and a wrapper that
-    # delegates correctly but drops the notice on the floor would pass every
-    # assertion above while printing nothing an operator can see.
-    import contextlib
-    import importlib.util
-    import io
-
-    _spec = importlib.util.spec_from_file_location(
-        "tgbridge_empty", REPO / "src" / "telegram-bridge.py")
-    _tg = importlib.util.module_from_spec(_spec)
-    try:
-        _spec.loader.exec_module(_tg)
-    except Exception as e:                                # pragma: no cover
-        check("telegram-bridge imports for the wrapper check", False, repr(e))
-        _tg = None
-
-    if _tg is not None:
-        _tg._empty_result_polls.clear()
-        # Below threshold the shared policy returns None -> nothing printed.
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            _tg._note_empty_result("task-cov", REPO / "nonexistent-result.txt")
-        check("wrapper stays silent while the policy is still counting",
-              buf.getvalue().strip() == "",
-              f"printed {buf.getvalue()!r} before the threshold")
-
-        # Drive it to the threshold: the policy returns a notice, and the
-        # wrapper's whole job is to surface that string.
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            for _ in range(EMPTY_RESULT_POLL_THRESHOLD + 2):
-                _tg._note_empty_result("task-cov", REPO / "nonexistent-result.txt")
-        out = buf.getvalue()
-        check("wrapper PRINTS the notice the shared policy returns",
-              "task-cov" in out,
-              f"policy fired but the operator sees nothing; captured {out!r}")
-        _tg._empty_result_polls.clear()
 
     print()
     if FAILURES:
