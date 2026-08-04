@@ -402,6 +402,28 @@ def main() -> int:
     assert unknown["complete"] is None, unknown
     print("  ok  complete: True below ceiling, False AT it, None when uncountable")
 
+    # A non-numeric --limit must degrade to "ceiling unknown", never crash the
+    # digest. scope_descriptor parses whatever argv actually carries, so a
+    # future flag change (`--limit auto`, a templated value) reaches int() as a
+    # string. Certifying completeness against an unparseable ceiling would be
+    # the exact over-claim this descriptor exists to prevent, so the fallback
+    # has to be `limit=None` -> `complete=None`, not a guess.
+    real_argv = pf.fetch_argv
+    try:
+        pf.fetch_argv = lambda repo, owner: [
+            "gh", "pr", "list", "--repo", repo, "--state", "open",
+            "--author", owner, "--limit", "not-a-number",
+        ]
+        odd = pf.scope_descriptor("o/n", "someowner", record_count=30)
+        assert odd["limit"] is None, odd
+        assert odd["complete"] is None, odd
+        # and the rest of the descriptor still works — the author filter is
+        # unaffected by an unparseable limit.
+        assert odd["filter"] == "author:someowner", odd
+        print("  ok  an unparseable --limit yields complete=None, not a false certification")
+    finally:
+        pf.fetch_argv = real_argv
+
     # And the fetch itself must actually use that argv, or the descriptor
     # describes a command that isn't the one being run.
     argv = pf.fetch_argv("o/n", "someowner")
