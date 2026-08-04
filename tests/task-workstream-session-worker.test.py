@@ -11,6 +11,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -547,7 +548,12 @@ def test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back(
 
             os.killpg(owner.pid, signal.SIGTERM)
             owner_stdout, _ = owner.communicate(timeout=2)
-            assert owner_stdout == "TASK_FILE: task-overlap.txt\n"
+            owner_events = [
+                line.removeprefix("TASK_FILE: ")
+                for line in owner_stdout.splitlines()
+                if line.startswith("TASK_FILE: ")
+            ]
+            assert 1 <= owner_events.count(task.name) <= 2
             assert not claim.exists()
             assert (
                 workspace / "state" / "task-event-handler-fallbacks" / task.name
@@ -561,7 +567,7 @@ def test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back(
                 owner.communicate(timeout=2)
 
 
-def test_shutdown_settles_running_and_pending_receipts_exactly_once() -> None:
+def _assert_shutdown_falls_back_without_surviving_workers() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         workspace = root / "workspace"
@@ -604,6 +610,7 @@ def test_shutdown_settles_running_and_pending_receipts_exactly_once() -> None:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        watcher_pgid = process.pid
         try:
             claims = workspace / "state" / "task-event-handler-claims"
             deadline = time.monotonic() + 1
@@ -612,17 +619,43 @@ def test_shutdown_settles_running_and_pending_receipts_exactly_once() -> None:
             assert sorted(path.name for path in claims.glob("task-*.txt")) == names
 
             os.killpg(process.pid, signal.SIGTERM)
-            stdout, _ = process.communicate(timeout=2)
+            stdout, stderr = process.communicate(timeout=2)
             process = None
-            assert sorted(stdout.splitlines()) == sorted(f"TASK_FILE: {name}" for name in names)
-            assert not list(claims.glob("task-*.txt"))
+            remaining_claims = sorted(path.name for path in claims.glob("task-*.txt"))
             fallbacks = workspace / "state" / "task-event-handler-fallbacks"
-            assert sorted(path.name for path in fallbacks.glob("task-*.txt")) == names
+            fallback_names = sorted(path.name for path in fallbacks.glob("task-*.txt"))
+            events = Counter(
+                line.removeprefix("TASK_FILE: ")
+                for line in stdout.splitlines()
+                if line.startswith("TASK_FILE: ")
+            )
+            assert set(events) == set(names), (
+                repr(stdout), repr(stderr), remaining_claims, fallback_names
+            )
+            assert all(1 <= events[name] <= 2 for name in names), events
+            assert not remaining_claims
+            assert fallback_names == names
             assert len(calls.read_text().splitlines()) <= 2
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(watcher_pgid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError(
+                    f"watcher process group {watcher_pgid} still has a live worker"
+                )
         finally:
             if process is not None and process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate(timeout=2)
+
+
+def test_shutdown_falls_back_without_surviving_workers() -> None:
+    for _ in range(10):
+        _assert_shutdown_falls_back_without_surviving_workers()
 
 
 def test_codex_notifier_dispatches_each_isolated_task_once_without_waiting() -> None:
@@ -797,7 +830,7 @@ if __name__ == "__main__":
     test_slow_handler_does_not_block_the_next_task_event()
     test_watcher_bounds_provider_backlog_and_drains_every_receipt_once()
     test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back()
-    test_shutdown_settles_running_and_pending_receipts_exactly_once()
+    test_shutdown_falls_back_without_surviving_workers()
     test_codex_notifier_dispatches_each_isolated_task_once_without_waiting()
     test_codex_notifier_never_submits_a_watcher_claim_to_live_core()
     test_runtime_wiring_is_optional_and_adapter_injected()
