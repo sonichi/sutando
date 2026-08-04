@@ -887,10 +887,15 @@ def check_session_cron_registration(
     2026-07-23 on a peer instance as 2/18 registered. The script-visible signal:
     /schedule-crons writes
     `hosts/<hostname>/schedule-crons-stamp.json` when it finishes; if that
-    host-owned stamp predates the running core's `started_at` (from the
-    heartbeat payload), the current session never completed registration.
-    Stamp AGE alone is deliberately not used — long-lived sessions would
-    false-warn.
+    host-owned stamp predates the CURRENT SESSION'S LAUNCH
+    (`_last_core_launch_at`, from `state/session-starts.log`), the current
+    session never completed registration. Stamp AGE alone is deliberately not
+    used — long-lived sessions would false-warn.
+
+    The boundary is deliberately NOT `.alive.started_at`: that field tracks the
+    heartbeat writer, which is retained across launches, so restarting the
+    heartbeat under a live session made this probe report every still-registered
+    cron as gone. Same field, same mistake, same fix as #2446.
     """
     workspace = Path(workspace_dir or WORKSPACE_DIR)
     host = host_label or _host_label()
@@ -931,14 +936,28 @@ def check_session_cron_registration(
         # story); zero expected → nothing to verify.
         return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
 
-    alive_file = workspace / "state" / "cores" / f"{host}.alive"
-    started_at = None
-    try:
-        alive = json.loads(alive_file.read_text())
-        if isinstance(alive, dict):
-            started_at = float(alive.get("started_at"))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass  # no heartbeat → can't anchor to a boot; fall through to stamp-only
+    # The SESSION boundary, not the heartbeat's age. `.alive.started_at` is
+    # `core_heartbeat._STARTED_AT`, stamped once at module load, and both launch
+    # paths RETAIN an existing heartbeat process — so it tracks the heartbeat
+    # writer, not the session that owns the crons. #2446 established exactly that
+    # for `_marker_predates_running_core`, and `_last_core_launch_at` is the
+    # boundary it introduced; this probe was still comparing against the field
+    # that PR ruled out, for the same staleness question.
+    #
+    # Observed on Chis-Mac-mini 2026-08-04T03:0xZ, all nine expected crons live:
+    #     core      pid 30961  started 11:32:30   <- .alive "pid" (the core)
+    #     heartbeat pid 72981  started 16:13:56   <- .alive "heartbeat_pid"
+    #     .alive started_at    16:13:56           <- tracks the WRITER
+    #     stamp ts             11:37:21           <- 5 min after the core booted
+    # The stamp was written for this very boot and got reported as predating it
+    # by 16595s, telling the operator to re-run /schedule-crons against a session
+    # whose crons were all present.
+    #
+    # None keeps its meaning from #2446: "no evidence", never "stale" — so a host
+    # with no session-starts.log falls through to the stamp-only checks below
+    # rather than warning.
+    launch = _last_core_launch_at(workspace)
+    started_at = launch[0] if launch else None
 
     stamp_file = workspace / "hosts" / host / "schedule-crons-stamp.json"
     try:
@@ -963,7 +982,7 @@ def check_session_cron_registration(
             "name": name,
             "status": "warn",
             "detail": (
-                f"stamp predates this core boot ({int(started_at - stamp_ts)}s older) — "
+                f"stamp predates this session's launch ({int(started_at - stamp_ts)}s older) — "
                 f"session crons are gone with the old session; re-run /schedule-crons"
             ),
         }
@@ -1116,24 +1135,226 @@ def check_memory_dir_siblings() -> "dict | None":
     }
 
 
-def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
-    """Resolve one existing concrete path for a carrier-set entry, or None.
+def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
+    """EVERY existing concrete path a carrier-set entry matches.
 
     Entries are gitignore-style and may be globs (`hosts/*/`), directories
-    (`notes/`) or plain files (`state/current-track.md`). We only need ONE
-    materialized path per entry to ask git whether the entry is being carried;
-    an entry with nothing on disk yet is not evidence of anything, so it is
-    skipped rather than reported.
+    (`notes/`) or plain files (`state/current-track.md`).
+
+    Deliberately ALL matches, not the first. Sampling one is sound for the stale
+    branch (which asks "is the entry this host configured actually in effect" —
+    one witness settles it), but not for judging whether a *local* rule covers a
+    *shipped* one: a narrower local rule can cover one child of a shipped
+    wildcard while leaving its siblings ignored, and a first-hit check that
+    happened to land on the covered child would report the vault healthy while a
+    whole host subtree went unbacked (qingyun-wu P1 on #2572).
+
+    Enumeration is bounded by construction: glob matches are the entry's own
+    direct matches (`hosts/*/` -> one path per host), never a recursive walk of
+    their contents.
     """
     rel = entry.strip().lstrip("/").rstrip("/")
     if not rel:
-        return None
+        return []
     if any(ch in rel for ch in "*?["):
-        for hit in sorted(workspace.glob(rel)):
-            return hit
-        return None
+        return sorted(workspace.glob(rel))
     candidate = workspace / rel
-    return candidate if candidate.exists() else None
+    return [candidate] if candidate.exists() else []
+
+
+def _carrier_probe_files(rep: "Path") -> "list[Path]":
+    """Every concrete file a materialized representative stands for.
+
+    A file represents itself; a DIRECTORY is represented by every file beneath
+    it, sorted for determinism.
+
+    Deliberately EXHAUSTIVE. The first cut sampled the first 25 and said so in a
+    comment — "past the cap the probe can UNDER-report" — which treated a stated
+    caveat as an acceptable conclusion rather than a defect. john-the-dev built
+    the obvious counterexample on that head: 26 files with only the 26th ignored
+    read `ok`, so a stale exclude left a real carrier file unbacked while health
+    certified the subtree. In a probe whose entire purpose is catching silent
+    non-backup, a sample is not proof of coverage.
+
+    Cost is bounded by asking git ONCE for the whole list (`check-ignore
+    --stdin`) rather than once per file, so exhaustiveness costs a filesystem
+    walk plus a single process — not N processes. See `_carrier_target_verdict`.
+    """
+    if rep.is_file():
+        return [rep]
+    if not rep.is_dir():
+        return []
+    return sorted(f for f in rep.rglob("*") if f.is_file())
+
+
+# The one rule file the carrier set is written to. `check-ignore -v` reports
+# the deciding rule's SOURCE, and only rules from here speak to whether the
+# vault is carrying a path.
+CARRIER_EXCLUDE_SOURCE = ".git/info/exclude"
+
+
+def _carrier_carveout_patterns() -> "set[str]":
+    """Every gitignore pattern the generator emits that is SUPPOSED to ignore a
+    file inside a carried parent.
+
+    Two sources, both from `sync-workspace.sh:_compose_exclude_content`:
+
+      * `vault.sync.exclude` -> `_emit_exclude_lines` (`:371`): a trailing-slash
+        entry emits `path/` AND `path/**`; anything else is emitted verbatim.
+      * the unconditional hard-deny block (`:461-482`) — credentials, transient
+        state and secret material are denied "regardless of carrier set", so a
+        file caught by one of those is correctly not backed up.
+
+    Mirrored rather than parsed out of the live `.git/info/exclude`, because the
+    file on disk is the very artifact under test: reading the rules from it
+    would make any stale or hand-edited rule self-justifying, which is the
+    failure mode #2566 was opened for.
+    """
+    patterns = {
+        # Hard-deny block — keep in step with sync-workspace.sh:461-482.
+        ".env*", "*.heartbeat", "*.alive", "*.sentinel", "*.pid",
+        "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+        "*.pem", "*.key", "*.p12", "*.pfx", "*.ppk", "*.keystore", "*.jks",
+    }
+    for entry in ((_resolved_vault().get("sync") or {}).get("exclude") or []):
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        e = entry.strip()
+        if e.endswith("/"):
+            patterns.add(e)
+            patterns.add(e + "**")
+        else:
+            patterns.add(e)
+    return patterns
+
+
+def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
+    """`"carried"` | `"dropped"` | `"unmeasured"` for ONE materialized path.
+
+    A DIRECTORY and the files inside it are different questions for git, and the
+    first cut asked the wrong one. `*` + `!hosts/` + `!hosts/*/` un-ignores the
+    directories while every file beneath stays ignored — `!hosts/**` is what
+    carries the contents. So `check-ignore` on `hosts/a` answered "not ignored"
+    while `hosts/a/current-track.md` was ignored and unbacked, and the probe
+    reported the vault healthy with the very file it exists to protect not being
+    backed up. Reproduced independently by john-the-dev and qingyun-wu on
+    a958d06f, and confirmed here before changing anything.
+
+    So a directory is probed through EVERY file beneath it, and any ignored one
+    condemns the entry. Exhaustive rather than sampled: a 26-file directory whose
+    26th file alone was ignored read `ok` under the old 25-file cap
+    (john-the-dev, #2572), which is the exact silent non-backup this exists for.
+
+    `--no-index` stays load-bearing and the instrument stays `check-ignore` for
+    a reason worth recording: the obvious alternative,
+    `ls-files --others --ignored`, is index-AWARE, so it calls a tracked file
+    carried. That silently reverses a documented behavior —
+    `test_a_TRACKED_file_with_a_stale_exclude_is_still_reported` exists because a
+    host that carried a file once and then let its exclude go stale read healthy
+    forever while nothing NEW under that entry was being carried. I wrote the
+    ls-files version first and that test failed; it was right and I was wrong.
+
+    Used by BOTH the stale and dropped branches. The stale branch probes a
+    directory representative too and had the same blindness; fixing only the
+    branch that was reported would have left the identical defect one step to
+    the left, which is how this class of bug has survived three rounds here.
+    """
+    targets = _carrier_probe_files(rep)
+    if not targets:
+        # A materialized directory with no files under it yet. Nothing to
+        # measure — treated as carried so an empty `hosts/<label>/` cannot
+        # manufacture a failure; the "nothing on disk" case is handled by the
+        # callers, which report an entry with no representatives at all.
+        return "carried"
+
+    # NUL-delimited, not newline. A filename may CONTAIN a newline, and
+    # `"\n".join(...)` then splits one real path into two bogus ones — both of
+    # which are typically un-ignored, so the genuinely ignored carrier file reads
+    # as carried. Reproduced on a real tree (john-the-dev, #2572):
+    #
+    #     notes/z\nx.md  check-ignore -q  -> 0  (IGNORED, not backed up)
+    #     split halves   notes/z, x.md    -> 1, 1 (both un-ignored)
+    #     newline-joined batch            -> 1  -> reads CARRIED, false green
+    #     NUL-joined with -z              -> 0  -> dropped, correct
+    #
+    # `-z` makes git read NUL-separated input, which is the only delimiter a
+    # POSIX filename cannot contain.
+    rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
+    try:
+        proc = subprocess.run(
+            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
+            input=rels, capture_output=True, text=True, timeout=60,
+        )
+    except (GitUnavailable, OSError, subprocess.SubprocessError):
+        return "unmeasured"
+    # `-v` names the RULE that decided each path, and that is the whole point:
+    # "some file under here is ignored" is NOT the same question as "is this
+    # entry being carried". `vault.sync.exclude` deliberately ignores files
+    # INSIDE an included parent (`_emit_exclude_lines`, sync-workspace.sh:371),
+    # so on any real workspace the carve-outs fire constantly:
+    #
+    #     notes/    9970 of 11369 files ignored  (*.mp4, .DS_Store, node_modules/)
+    #     hosts/       9 of    67 files ignored  (data/)
+    #
+    # The pre-`-v` version condemned an entry when ANY file beneath it was
+    # ignored, so both read `dropped` while the vault was demonstrably backing
+    # them up (1400 and 58 files tracked, synced minutes earlier, zero diff).
+    # It survived because the one entry with no carve-out beneath it —
+    # `.claude-sutando/projects/*/memory/`, 1322 files, 0 ignored — passed, so
+    # the probe looked like it discriminated. The prescribed remedy made it
+    # permanent: `--force-gitignore` regenerates a byte-identical file (eight
+    # consecutive syncs logged `existing exclude matches; no-op`), so the
+    # failure could never clear no matter how often it was obeyed.
+    #
+    # NOTE `-v` also CHANGES THE EXIT-CODE CONTRACT the old code relied on: a
+    # path matching a negation (`!notes/**`, i.e. carried) is still reported and
+    # still exits 0. Verified before depending on it:
+    #
+    #     notes/a.md   -> !notes/**  exit 0   (NOT ignored)
+    #     notes/b.mp4  -> *.mp4      exit 0   (ignored, deliberately)
+    #     other/c.txt  -> *          exit 0   (ignored — genuinely dropped)
+    #
+    # So the verdict now comes from the parsed patterns; only a hard failure
+    # (neither 0 nor 1) is still read off the exit code.
+    if proc.returncode not in (0, 1):
+        return "unmeasured"
+    allowed = _carrier_carveout_patterns()
+    fields = proc.stdout.split("\0")
+    # Records are 4 NUL-separated fields: source, linenum, pattern, pathname.
+    for i in range(0, len(fields) - 3, 4):
+        source, pattern = fields[i], fields[i + 2]
+        if pattern.startswith("!"):
+            continue          # un-ignored by the carrier rule — carried
+        if source != CARRIER_EXCLUDE_SOURCE:
+            # A nested `.gitignore` committed inside a carried tree, or a global
+            # core.excludesFile. Not the vault carrier mechanism, so not this
+            # probe's question — and condemning on it would make every vendored
+            # project a permanent failure. Real instance: a Remotion app under
+            # `notes/` ignores its own `out/` build dir, which is correct.
+            continue
+        if pattern in allowed:
+            continue          # a configured carve-out — deliberate, not a defect
+        # Ignored by `.git/info/exclude` via something that is NOT a carve-out:
+        # either the whitelist catch-all `*` (this entry's un-ignore never took
+        # effect) or an operator-authored rule that `generate_exclude`'s refusal
+        # guard left standing because `_enforce_carrier_set_pre` swallows the
+        # refusal. Both mean the entry is genuinely not being backed up.
+        return "dropped"
+    return "carried"
+
+
+def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
+    """One existing concrete path for a carrier-set entry, or None.
+
+    The single-witness form, kept for the stale branch: that branch asks whether
+    the entry THIS host configured is in effect, and one materialized path
+    answers it. An entry with nothing on disk yet is not evidence of anything,
+    so it is skipped rather than reported. Use `_carrier_representatives` when
+    the question is coverage of a *different* (shipped) entry — see its
+    docstring for why one witness is not enough there.
+    """
+    reps = _carrier_representatives(workspace, entry)
+    return reps[0] if reps else None
 
 
 def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
@@ -1182,39 +1403,42 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     stale: "list[str]" = []
     unmeasured: "list[str]" = []
     for entry in resolved:
-        rep = _carrier_representative(workspace, entry)
-        if rep is None:
-            continue
-        try:
-            proc = subprocess.run(
-                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-q",
-                         str(rep.relative_to(workspace))),
-                capture_output=True, timeout=10,
-            )
-        except (GitUnavailable, OSError, subprocess.SubprocessError):
-            # Could not run the measurement at all. NOT the same as "carried".
-            unmeasured.append(entry)
+        # EVERY materialized match, not one. `_carrier_representative()` (singular)
+        # collapses `hosts/*/` to its first match, so a two-host workspace whose
+        # exclude carries host A but not host B reported `ok` while B's subtree
+        # was ignored and unbacked — the same false green the dropped branch was
+        # fixed for, on the OTHER axis.
+        #
+        # The previous round shared the directory-vs-file instrument across both
+        # branches and stopped there. Coverage has two independent axes — WHICH
+        # paths you probe, and WHAT you ask about each — and generalizing one of
+        # them left the other singular here. Both branches now enumerate.
+        # (john-the-dev and qingyun-wu, independently, on cf059ca8.)
+        reps = _carrier_representatives(workspace, entry)
+        if not reps:
             continue
         # `git_argv` rather than a bare "git": on macOS the stock /usr/bin/git is
         # an Xcode-CLT shim that pops an install dialog when the tools are absent,
         # and this probe runs from a BACKGROUND health check where nobody is there
         # to dismiss it. The resolver refuses that shim instead of spawning it.
         #
-        # `--no-index` is LOAD-BEARING (sync-workspace.sh says so at its own
-        # check-ignore call): without it, git reports an ALREADY-TRACKED file as
-        # not-ignored regardless of the rules, so a host whose file was carried
-        # once and whose exclude later went stale reads healthy forever. Caught
-        # by restoring this host's real pre-fix exclude and watching the probe
-        # still say OK.
-        #
-        # check-ignore's contract is 0 = ignored, 1 = NOT ignored, anything else
-        # = it failed. Treating "not 0" as healthy folded exit 128 in with exit 1,
-        # so a git that could not run reported the carrier set as fine — the exact
-        # unmeasured-reads-as-healthy failure this probe exists to catch, in the
-        # probe itself.
-        if proc.returncode == 0:
+        # `--no-index` is LOAD-BEARING on the file path (sync-workspace.sh says so
+        # at its own check-ignore call): without it, git reports an ALREADY-TRACKED
+        # file as not-ignored regardless of the rules, so a host whose file was
+        # carried once and whose exclude later went stale reads healthy forever.
+        # Caught by restoring this host's real pre-fix exclude and watching the
+        # probe still say OK. Both that and the directory/contents distinction now
+        # live in `_carrier_target_verdict` so the two branches cannot drift.
+        verdict = "carried"
+        for rep in reps:
+            got = _carrier_target_verdict(workspace, rep)
+            if got != "carried":
+                verdict = got
+                break
+        if verdict == "dropped":
             stale.append(entry)
-        elif proc.returncode != 1:
+        elif verdict == "unmeasured":
+            # Could not run the measurement at all. NOT the same as "carried".
             unmeasured.append(entry)
 
     # Read the SHIPPED file directly rather than through load_config(), which
@@ -1226,10 +1450,54 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     try:
         shipped_cfg = json.loads((Path(REPO_DIR) / "sutando.config.json").read_text())
         shipped = ((shipped_cfg.get("vault") or {}).get("sync") or {}).get("include")
-        if isinstance(shipped, list):
-            dropped = [e for e in shipped if isinstance(e, str) and e not in resolved]
     except (OSError, json.JSONDecodeError, AttributeError):
-        dropped = []
+        # The shipped config itself is unreadable, so there is no comparison to
+        # make. This except must stay narrow and must NOT wrap the measurement
+        # loop below: the first cut did, so one entry's git timeout jumped here
+        # and reset `dropped = []`, erasing findings already collected — a
+        # fail-OPEN that turned a failed measurement into a green report, three
+        # lines under a comment promising the opposite (qingyun-wu P1 on #2572).
+        shipped = None
+
+    if isinstance(shipped, list):
+        missing = [e for e in shipped if isinstance(e, str) and e not in resolved]
+        # String inequality is not absence of coverage. A local entry can be
+        # strictly BROADER than the shipped one it replaces — `hosts/` covers
+        # everything `hosts/*/` does — and the whole point of this probe is to
+        # judge by outcome, not by config text. The `stale` branch above already
+        # asks git; this branch used to revert to string equality, so it reported
+        # a fully-carried subtree as missing and advised "add them to the local
+        # list", i.e. told the operator to NARROW a config that was already
+        # correct (#2571, reported against #2566 by Sutando-Pro).
+        #
+        # EVERY materialized match must be covered, not one sampled witness. A
+        # narrower local rule (`hosts/a/`) covers one child of a shipped wildcard
+        # (`hosts/*/`) while its siblings stay ignored, and first-hit sampling
+        # that landed on the covered child reported the vault healthy with a host
+        # subtree silently unbacked.
+        #
+        # An entry with nothing materialized yet stays reported: there is no
+        # outcome to measure, but the divergence is real and becomes silent data
+        # loss the moment the first file lands under it.
+        for entry in missing:
+            reps = _carrier_representatives(workspace, entry)
+            if not reps:
+                dropped.append(entry)
+                continue
+            verdict = "covered"
+            for rep in reps:
+                # Same instrument as the stale branch, deliberately shared: a
+                # DIRECTORY representative and the files under it are different
+                # questions for git, and asking about the directory reported a
+                # subtree healthy while its carrier file was ignored.
+                got = _carrier_target_verdict(workspace, rep)
+                if got != "carried":
+                    verdict = got
+                    break
+            if verdict == "dropped":
+                dropped.append(entry)
+            elif verdict == "unmeasured":
+                unmeasured.append(entry)
 
     # A shipped entry can be one this host must NOT carry. `state/current-track.md`
     # is per-host state that #2534 added at a flat, SHARED vault path, so two cores
@@ -1801,6 +2069,55 @@ def _behind_warn_threshold(repo: "Path") -> int:
     return raw if raw > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
 
 
+def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
+                             git_bin: str = "git") -> "list[str]":
+    """Subjects of not-yet-pulled commits that EFFECTIVELY change ``prefix``.
+
+    Two different questions, and the first cut answered the wrong one. "Did a
+    not-yet-pulled commit TOUCH this path" is commit-path history; "would
+    pulling change any bytes here" is a tree diff. They diverge whenever history
+    is reversible: upstream adds `skills/demo/SKILL.md` and removes it in the
+    next commit, a clone sits two commits behind, and
+    `git log HEAD..origin/main -- skills/` lists both commits while
+    `git diff --name-only HEAD..origin/main -- skills/` is EMPTY. Pulling would
+    change no skill bytes, yet the probe warned — a false behavioral-staleness
+    alarm, which is precisely the alert fatigue this check argues against.
+    Reproduced independently by qingyun-wu and john-the-dev on #2573.
+
+    So the TREE DIFF is the gate and history is only the message: if nothing
+    under ``prefix`` differs, return nothing; only when it does differ, name the
+    commits so the warning is actionable.
+
+    Same last-fetched-ref, no-network contract as `_commits_behind`, and the
+    same honest consequence: a stale local ref makes this UNDER-report, never
+    cry wolf. Returns `[]` on any failure for the same reason — this is an
+    additional signal layered on a probe that must not become the thing that
+    breaks the health run.
+    """
+    try:
+        changed = subprocess.run(
+            [git_bin, "-C", str(repo), "diff", "--name-only",
+             f"HEAD..origin/{branch}", "--", prefix],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if changed.returncode != 0 or not changed.stdout.strip():
+        return []
+
+    try:
+        out = subprocess.run(
+            [git_bin, "-C", str(repo), "log", "--no-merges", "--format=%s",
+             f"HEAD..origin/{branch}", "--", prefix],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
 def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
     """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
 
@@ -1925,6 +2242,36 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           "silence reads as health). Refresh with "
                           f"`git -C {repo} pull --ff-only` + restart. Count is against the "
                           "last-fetched ref; this probe does not fetch."}
+    # Count is the wrong instrument for BEHAVIORAL staleness, and the threshold
+    # above is deliberately 10 to avoid alert fatigue — correctly, since `main`
+    # moves several times a day. But one commit that rewrites a skill outranks
+    # nine that touch docs, and a count cannot tell them apart.
+    #
+    # Skills are the case with no other detector. `src/` needs a restart to take
+    # effect, so the `*-stale` probes catch it by comparing a running process
+    # against its source. A skill has no process: the agent reads the markdown
+    # from THIS checkout on every invocation, so a merged skill fix that has not
+    # been pulled is simply not in effect, with nothing anywhere to compare.
+    #
+    # Observed 2026-08-03 on this node: exactly ONE commit behind — far under the
+    # threshold, so this probe reported ok — while the live `context-reconstruct`
+    # still instructed writing `state/current-track.md`, the shared flat path
+    # whose two-writer collision had destroyed a peer's anchor hours earlier
+    # (#2567/#2568). The running skill and the merged skill disagreed, and both
+    # looked correct from where anyone was standing.
+    stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
+    if stale_skills:
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on {expected!r} and only {behind} commit(s) behind "
+                          f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
+                          f"nag threshold — but {len(stale_skills)} of them change `skills/`, "
+                          "which the agent re-reads from this checkout on EVERY invocation. "
+                          "Those merged skill fixes are not in effect here, and no "
+                          "restart-staleness probe can see it: a skill has no running process "
+                          f"to compare against. ({'; '.join(stale_skills[:3])}"
+                          f"{'; …' if len(stale_skills) > 3 else ''}) Refresh with "
+                          f"`git -C {repo} pull --ff-only`. Measured against the last-fetched "
+                          "ref; this probe does not fetch, so it can only under-report."}
     return {"name": name, "status": "ok",
             "detail": f"live checkout on {expected!r}"
                       + (f", {behind} commits behind" if behind else "")}
@@ -2022,14 +2369,45 @@ LAUNCHD_BACKED_CHECKS = {
 
 
 def fix_launchd(label: str) -> str:
-    """Try to reload a launchd job."""
+    """Try to reload a launchd job.
+
+    A missing plist is NOT an edge case for these two services, and saying
+    "no plist found" reads like a launchd failure when it is not one. The
+    voice-agent / web-client plists are generated by **Sutando.app's
+    installer** (see `_voice_log_path`); this repo ships installers only for
+    credential-proxy, cron-runner, health-check and the app itself. On a plain
+    checkout `src/startup.sh` launches both services directly instead —
+    `run_node_service voice-agent src/voice-agent.ts ... &` — precisely because
+    it checks `launchctl print` first and falls through when there is no job.
+
+    So on any host without Sutando.app installed, --fix reaches this function
+    for a stale voice-agent, prints one internal-sounding line, and can never
+    restart it. Observed on the 24/7 node 2026-08-03: `voice-agent: stale
+    (code is 2159 min newer than process)` survived repeated `--fix` runs,
+    each reporting `no plist found for com.sutando.voice-agent`.
+
+    Two distinct misses share one message, and only one of them is a bug:
+      * label absent from plist_map  -> a real "we don't know this job"
+      * label known, plist missing   -> the service is simply not launchd-
+        managed here, and the operator needs the command that DOES work
+    """
     plist_map = {
         "com.sutando.voice-agent": Path.home() / "Library/LaunchAgents/com.sutando.voice-agent.plist",
         "com.sutando.web-client": Path.home() / "Library/LaunchAgents/com.sutando.web-client.plist",
     }
     plist = plist_map.get(label)
-    if not plist or not plist.exists():
+    if not plist:
         return f"no plist found for {label}"
+    if not plist.exists():
+        # Deliberately names a runnable command. A --fix line that reports a
+        # miss without naming the remedy is indistinguishable, to whoever
+        # reads the log, from a fix that was attempted and failed.
+        return (
+            f"{label} is not launchd-managed on this host (no {plist.name} in "
+            f"~/Library/LaunchAgents — that plist comes from Sutando.app's installer). "
+            f"startup.sh launches this service directly instead, so --fix cannot "
+            f"restart it. Remedy: bash src/restart.sh"
+        )
 
     uid = subprocess.run(["/usr/bin/id", "-u"], capture_output=True, text=True).stdout.strip()
     # Try kickstart
@@ -2748,7 +3126,7 @@ def _local_host_labels() -> "set[str]":
     return {x for x in labels if x}
 
 
-def _last_core_launch_at() -> "tuple[float, str | None] | None":
+def _last_core_launch_at(workspace_dir: Optional[Path] = None) -> "tuple[float, str | None] | None":
     """When the CURRENT core was launched, from `state/session-starts.log`.
 
     Returns `(timestamp, runtime)`, where `runtime` is the identity the launcher
@@ -2788,7 +3166,7 @@ def _last_core_launch_at() -> "tuple[float, str | None] | None":
     "stale".
     """
     try:
-        raw = (status_read_path("session-starts.log", WORKSPACE_DIR)).read_text()
+        raw = (status_read_path("session-starts.log", workspace_dir or WORKSPACE_DIR)).read_text()
     except OSError:
         return None
     for line in reversed(raw.splitlines()):
@@ -4747,6 +5125,291 @@ def _host_runs_comm_sweep(
     return False
 
 
+def _as_list(value) -> list:
+    """A settings file is hand-editable; anything not a list yields nothing to scan."""
+    return value if isinstance(value, list) else []
+
+
+#: `$(shq "…")` / `$(shq …)` — the installer shell-quotes its paths through a helper
+#: before writing them into settings.json. Reading HOOKS as literal source text means
+#: the substitution is still unevaluated, so the path is welded into a token like
+#: `$(shq` + `<path>)` and never compares equal to anything.
+_SHQ_CALL = re.compile(r"\$\(\s*shq\s+(\"[^\"]*\"|'[^']*'|[^)]*)\)")
+
+
+def _unwrap_installer_command(command: str) -> str:
+    """Reduce an installer HOOKS command template to the shape it actually WRITES.
+
+    The template is bash SOURCE, not the stored command. `bash $(shq "$REPO_DIR/x.sh")`
+    is written to settings.json as `bash /abs/path/x.sh`, so comparing against the raw
+    source can never match — which is exactly how every production hook slipped past
+    the positional check and into a permissive fallback.
+    """
+    # Re-quote rather than inline raw: `shq` IS shell-quoting, and a repo path
+    # containing a space would otherwise split across tokens and fail closed on a
+    # perfectly healthy host — which is the whole reason the installer uses shq.
+    out = _SHQ_CALL.sub(lambda m: shlex.quote(m.group(1).strip("\"'")), command)
+    # The array literal is itself quoted in shell, so inner quotes arrive escaped.
+    out = out.replace('\\"', '"').replace("\\$", "$")
+    # The HOOKS entry is a quoted shell string, so parsing it strips the entry's
+    # own closing quote and leaves the backslash that escaped it dangling. That
+    # makes shlex raise and drop us into the whitespace fallback, where a token
+    # keeps a stray opening quote and no comparison can match — it cost a GENUINE
+    # archive hook a false warning. The dangling backslash WAS that closing quote,
+    # so restore it rather than deleting it: deleting leaves the quote unbalanced,
+    # which is the same failure one step later.
+    if out.endswith("\\") and not out.endswith("\\\\"):
+        out = out[:-1] + '"'
+    return out
+
+
+def _shell_tokens(command: str) -> list:
+    """Shell-split, degrading to whitespace split on unbalanced quoting.
+
+    The fallback keeps surrounding quotes on each token, so tokens are normalized
+    either way — otherwise a comparison silently depends on WHICH split path ran.
+    """
+    try:
+        toks = shlex.split(command)
+    except ValueError:  # a hand-edited settings file can be unquotable
+        toks = command.split()
+    out = []
+    for tok in toks:
+        if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+            tok = tok[1:-1]
+        out.append(tok)
+    return out
+
+
+def _same_path(a: str, b_norm: str, b_real: str) -> bool:
+    a = os.path.expanduser(a)
+    if not os.path.isabs(a):
+        # Unresolvable without knowing the hook's cwd, so it never counts as a
+        # match: unprovable identity warns, like every other branch here.
+        return False
+    return os.path.normpath(a) == b_norm or os.path.realpath(a) == b_real
+
+
+def _hook_command_targets(command: str, expected, owned_cmd: str, marker: str = "") -> bool:
+    """Does this command INVOKE `expected` — not merely mention it, not merely contain it?
+
+    Two false-cleans this has to reject, both found in review, both of which let a
+    stale or replaced hook keep the probe green:
+
+    1. **Substring containment is not checkout identity.** `/tmp/sutando` is a
+       substring of `/tmp/sutando-old/src/check-pending-tasks.sh`, so `str(repo) in
+       command` certifies a sibling checkout as this one.
+    2. **A path in argument position is not an invocation.** Scanning every absolute
+       token accepts `echo <path>`, `printf "%s" <path>`, and
+       `bash /tmp/other.sh <path>` — the expected script appears as inert data while
+       something else entirely runs.
+
+    So the comparison is positional, against the command the INSTALLER itself writes
+    (the third field of its `HOOKS` entry). The installer stays the single source of
+    truth for the command shape exactly as it already is for the hook list: whatever
+    interpreter it uses, and whichever position it puts its script in, is what a
+    registered hook must match. Leading tokens must agree, so `echo` cannot stand in
+    for `bash`, and the script position must be the same path.
+    """
+    owned = _shell_tokens(_unwrap_installer_command(owned_cmd))
+    got = _shell_tokens(command)
+    if not owned or not got:
+        return False
+
+    # PROGRAM CHECK — applies to EVERY owned hook, not just repo-relative ones.
+    # This was previously skipped for markers that are not `src/` paths, on the
+    # reasoning that a non-repo path has no identity to compare. That conflated
+    # path identity with command-shape validation: the archive hook still has an
+    # installer-owned shape, and `echo` is not `cp`. With only the substring test,
+    # BOTH of these certified as a healthy archive hook:
+    #     echo sutando-conversations/
+    #     rm -rf sutando-conversations/
+    # The second is the one that settles it — a destructive command reported as a
+    # working archiver is the opposite of what this probe is for.
+    if got[0] != owned[0]:
+        return False
+
+    if expected is None:
+        # Marker is not repo-relative (the archive hook writes outside the repo),
+        # so there is no repo path to compare positionally. Program alone is NOT
+        # enough: `cp /tmp/other "$HOME/Desktop/sutando-conversations/x"` and
+        # `cp "$TRANSCRIPT_PATH" /tmp/sutando-conversations/y` both pass a program
+        # check while archiving the wrong thing, or to the wrong place.
+        #
+        # An earlier revision of this comment called that an intentional
+        # "compatibility boundary", on the reasoning that the installer preserves
+        # operator-customized archive hooks. That reasoning was WRONG, and it is
+        # worth recording why, because it read as principled: Phase 0 does skip
+        # sweeping a custom archiver (install-claude-hooks.sh:170-185), but Phase 1
+        # detects presence by EXACT command-string match — `index($cmd)` at :262 —
+        # so a custom `cp` never satisfies it and the installer ADDS its own
+        # command alongside. The two COEXIST. On any host where the installer has
+        # run, its own command is therefore present, and this probe should say so.
+        #
+        # Compared: the program, the SOURCE argument the installer writes, and the
+        # destination prefix up through the marker. Everything after the marker is
+        # free — that is where the installer's own $(date …) filename varies, so
+        # pinning it would warn on healthy hosts.
+        d_idx = next((i for i, tok in enumerate(owned) if marker and marker in tok), None)
+        if len(owned) < 2 or d_idx is None:
+            return False
+        # POSITION and ARITY, not "the prefix appears somewhere". Accepting the
+        # prefix in any token certified a three-operand
+        #     cp "$TRANSCRIPT_PATH" /tmp/not-the-archive ".../sutando-conversations/x"
+        # which cp treats as two SOURCES and a destination — and which fails at
+        # runtime unless that last path is a directory, so nothing is archived while
+        # the probe reports clean. The installer writes exactly program/source/dest
+        # and Phase 1 requires that exact string, so anything of a different arity
+        # is not the command it installs.
+        if len(got) != len(owned) or got[1] != owned[1]:
+            return False
+        prefix = owned[d_idx][: owned[d_idx].index(marker) + len(marker)]
+        return got[d_idx].startswith(prefix)
+
+    want = os.path.normpath(os.path.expanduser(str(expected)))
+    want_real = os.path.realpath(want)
+    idx = next((i for i, t in enumerate(owned) if _same_path(t, want, want_real)), None)
+    if idx is None:
+        # FAIL CLOSED. This branch used to accept the path anywhere in the first two
+        # tokens, which read as a safe fallback and was not: the real installer writes
+        # `bash $(shq "$REPO_DIR/x.sh")`, so before the unwrap above NO production hook
+        # resolved positionally and EVERY one landed here — making `echo <path>` count
+        # as registered on the only path that ships. A fallback that the real data
+        # always takes is not a fallback, it is the behaviour.
+        return False
+    if len(got) <= idx:
+        return False
+    return _same_path(got[idx], want, want_real) and got[:idx] == owned[:idx]
+
+
+def check_claude_hook_registration(
+    repo_dir: Optional[Path] = None,
+) -> dict:
+    """Are the Claude Code hooks `install-claude-hooks.sh` owns actually registered?
+
+    Nothing checked this before. On 2026-08-03 this host was found with **zero of
+    the four owned hooks** in the installer's own target — including both PreCompact
+    entries, so `session-state.md` was never regenerated on compaction and the
+    transcript archiver had never run at all. It had been that way for days, silently,
+    because no probe looks at hook registration. A peer host showed the same shape.
+
+    The owned list is READ FROM THE INSTALLER's `HOOKS=(...)` array rather than
+    duplicated here: a second copy would drift from the script that does the
+    installing, and a stale allow-list is how a probe starts lying. Same reason the
+    target file is read from its `SETTINGS=` line instead of being assumed.
+
+    Fails toward NOISE, never toward a false clean:
+      * installer absent          -> ok, not a sutando checkout (nothing to verify)
+      * HOOKS array unparseable   -> WARN. A parse that yields zero hooks would
+                                     otherwise report "all registered" over an empty
+                                     population, which is the exact shape of a probe
+                                     that cannot fail.
+      * settings.json absent      -> warn (installer has never run here)
+      * settings.json malformed   -> warn, never raise
+      * a hook registered but its command points at a DIFFERENT checkout -> warn.
+        This host had a SessionEnd entry aimed at a five-day-old `Desktop/sutando`
+        copy, so fixes to the live script never executed — present-but-wrong is the
+        failure that looks healthiest.
+    """
+    name = "claude-hooks"
+    repo = Path(repo_dir or REPO_DIR)
+    installer = repo / "src" / "install-claude-hooks.sh"
+    if not installer.is_file():
+        return {"name": name, "status": "ok", "detail": "no install-claude-hooks.sh — not a sutando checkout"}
+    try:
+        src = installer.read_text(errors="ignore")
+    except OSError as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot read installer ({exc})"}
+
+    m = re.search(r"^HOOKS=\((.*?)^\)", src, re.M | re.S)
+    owned = []
+    if m:
+        for line in m.group(1).split("\n"):
+            line = line.strip()
+            if not line.startswith('"'):
+                continue
+            parts = line.strip('"').split("|", 2)
+            if len(parts) == 3:
+                # third field is the command the installer WRITES — kept so the probe
+                # compares against the real command shape rather than guessing one.
+                owned.append((parts[0], parts[1], parts[2]))
+    if not owned:
+        return {"name": name, "status": "warn",
+                "detail": "could not parse HOOKS=(...) from install-claude-hooks.sh — "
+                          "cannot verify registration (reporting rather than assuming clean)"}
+
+    sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
+    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
+    if not settings.is_file():
+        return {"name": name, "status": "warn",
+                "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "
+                          f"{len(owned)} hook(s) unregistered"}
+    try:
+        conf = json.loads(settings.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "warn", "detail": f"{settings.name} unreadable ({exc})"}
+
+    # Parseable is not the same as well-shaped: `[]` is valid JSON, and `.get()` on it
+    # raises AttributeError, which would abort every remaining probe in run_all_checks().
+    # A malformed schema has to fail toward a warning like every other ambiguous branch.
+    if not isinstance(conf, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"{settings.name} top level is {type(conf).__name__}, not an object — "
+                          f"cannot verify {len(owned)} hook(s)"}
+    hooks = conf.get("hooks")
+    if hooks is None:
+        hooks = {}
+    elif not isinstance(hooks, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"{settings.name} \"hooks\" is {type(hooks).__name__}, not an object — "
+                          f"cannot verify {len(owned)} hook(s)"}
+
+    missing, foreign = [], []
+    for event, marker, owned_cmd in owned:
+        # Every container on this path is type-checked, at EVERY level. Validating
+        # only the top two left `{"hooks":{"Stop":7}}`, `{"hooks":{"Stop":[{"hooks":7}]}}`
+        # and a numeric `command` still raising TypeError straight out of the probe —
+        # and since this runs inside run_all_checks(), a raise aborts every later check.
+        # A malformed shape yields no commands, so the hook reads as unregistered: the
+        # promised warning, not a crash and not a false clean.
+        cmds = []
+        for g in _as_list(hooks.get(event)):
+            if not isinstance(g, dict):
+                continue
+            for h in _as_list(g.get("hooks")):
+                if not isinstance(h, dict):
+                    continue
+                c = h.get("command")
+                if isinstance(c, str):
+                    cmds.append(c)
+        hit = [c for c in cmds if marker in c]
+        if not hit:
+            missing.append(f"{event}:{marker}")
+        elif not any(
+            _hook_command_targets(
+                c,
+                (repo / marker) if marker.startswith("src/") else None,
+                owned_cmd.replace("$REPO_DIR", str(repo)),
+                marker,
+            )
+            for c in hit
+        ):
+            # Present, but not actually invoking this checkout's script — either aimed
+            # at another checkout or carrying the path as an inert argument.
+            foreign.append(f"{event}:{marker}")
+    if missing or foreign:
+        bits = []
+        if missing:
+            bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
+        if foreign:
+            bits.append(f"{len(foreign)} registered but NOT running the installer's command "
+                        f"— a different program, another checkout, or the path is "
+                        f"only an argument ({', '.join(foreign)})")
+        return {"name": name, "status": "warn",
+                "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+    return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
+
+
 def check_comm_sweep_freshness(
     workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
 ) -> dict:
@@ -4854,6 +5517,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
+    checks.append(check_claude_hook_registration())
     checks.append(check_cron_runner())
     checks.append(check_session_cron_registration())
 
