@@ -81,11 +81,28 @@ fi
 #   sutando-config.sh: line 56: : command not found
 # This suite only ever ran on macOS, so CI caught it and the tests did not.
 lab5=$(mktemp -d)
-printf '#!/bin/sh\necho Linux\n' > "$lab5/uname"; chmod +x "$lab5/uname"
 printf '#!/bin/sh\nexit 2\n' > "$lab5/xcode-select"; chmod +x "$lab5/xcode-select"
-out=$(PATH="$lab5:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
+# Drive the platform through $OSTYPE, which is what the resolver now reads —
+# see case 5c for why a stubbed `uname` must NOT be able to decide this.
+out=$(OSTYPE=linux-gnu PATH="$lab5:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
 if [ -n "$out" ]; then ok "non-Darwin: system python is used (stub rule is macOS-only)"
 else bad "non-Darwin: system python is used (stub rule is macOS-only)" "got empty — callers break"; fi
+
+# --- 5c. platform identity must not come from a PATH lookup -----------------
+# tests/codex-core-launcher.test.py:89 stubs `uname` to print "Darwin" for the
+# launcher's own macOS branch. A uname-based platform check therefore took the
+# macOS path on the Linux CI runner, found no xcode-select, and refused a real
+# /usr/bin/python3 -- 21 failures in that suite. $OSTYPE is set by the shell,
+# so a PATH stub cannot reach it.
+lab6=$(mktemp -d)
+printf '#!/bin/bash\nprintf "Darwin\\n"\n' > "$lab6/uname"; chmod +x "$lab6/uname"
+printf '#!/bin/sh\nexit 2\n' > "$lab6/xcode-select"; chmod +x "$lab6/xcode-select"
+out=$(OSTYPE=linux-gnu PATH="$lab6:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
+if [ -n "$out" ]; then ok "a stubbed uname cannot flip the platform (non-mac stays non-mac)"
+else bad "a stubbed uname cannot flip the platform" "got empty — PATH spoofed the platform"; fi
+
+out=$(OSTYPE=darwin25 PATH="$lab6:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
+check "control: a real Mac with no CLT still refuses the stub" "$out" ""
 
 # --- 6. bundled runtime beats PATH ------------------------------------------
 lab4=$(mklab)

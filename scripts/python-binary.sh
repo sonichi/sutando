@@ -80,7 +80,19 @@ resolve_python() {
 	# refused a perfectly good binary and left $PY empty — which is how CI broke
 	# ("sutando-config.sh: line 56: : command not found"). src/git_binary.py
 	# guards the same rule with `is_darwin`; this is that guard.
-	if [ "$(uname -s 2>/dev/null)" != "Darwin" ]; then
+	#
+	# $OSTYPE, not `uname`: the shell sets it at build time, so a PATH stub
+	# cannot reach it. tests/codex-core-launcher.test.py:89 deliberately stubs
+	# `uname` to print "Darwin" for the launcher's own macOS branch, which made
+	# a uname-based check take the macOS path on the Linux runner, find no
+	# xcode-select, and refuse a real interpreter — 21 failures. Platform
+	# identity must not come from a PATH lookup. `uname` remains the fallback
+	# for a POSIX-sh caller where $OSTYPE is unset.
+	case "${OSTYPE:-$(uname -s 2>/dev/null)}" in
+		darwin*|Darwin) _is_mac=1 ;;
+		*) _is_mac=0 ;;
+	esac
+	if [ "$_is_mac" -ne 1 ]; then
 		printf '%s' "$_path_py"
 		return 0
 	fi
