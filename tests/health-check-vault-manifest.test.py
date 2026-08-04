@@ -189,6 +189,65 @@ def main() -> int:
         check("  ...and discloses it read the legacy fallback",
               "LEGACY" in r["detail"], r["detail"])
 
+        # (vi) MALFORMED CANONICAL + VALID LEGACY. The sibling of (v), and the
+        # one selecting on `.exists()` still got wrong: the canonical file is
+        # PRESENT but unparseable. `_read_manifest()` catches JSONDecodeError
+        # inside its per-candidate loop and continues, so production still
+        # advertises the legacy names; a probe that returns on the first decode
+        # error reports "list_vault_keys() would return nothing" while
+        # list_vault_keys() returns ['PHANTOM', 'REAL']. qingyun-wu's activated
+        # control on db708178. Asserted against the REAL function, not against a
+        # remembered description of it.
+        bad_canonical = tmp / "malformed-canonical.json"
+        bad_canonical.write_text("{ not json at all")
+        # `_read_manifest()` takes NO legacy argument — it reads the module
+        # constant. Patching only `_manifest_path` left it resolving the
+        # OPERATOR's real legacy vault, and the parity assertion below reported
+        # this host's actual key names. It failed loudly, which is the whole
+        # reason the parity line exists; had I asserted only on the probe (which
+        # DOES take `legacy_path=`) the suite would have passed while measuring
+        # the wrong system.
+        _lmp = vi._LEGACY_MANIFEST_PATH
+        vi._manifest_path = lambda: str(bad_canonical)
+        vi._LEGACY_MANIFEST_PATH = str(legacy)
+        try:
+            live_names = sorted(vi._read_manifest())
+            r = hc.check_vault_manifest_integrity(
+                keychain_probe=_probe(["REAL"]), legacy_path=legacy)
+        finally:
+            vi._manifest_path = _mp
+            vi._LEGACY_MANIFEST_PATH = _lmp
+        check("PARITY: _read_manifest() itself falls through to the legacy names",
+              live_names == ["PHANTOM", "REAL"],
+              f"{live_names} — the premise of this case is wrong, fix the case")
+        check("malformed canonical + valid legacy -> probe reaches the keychain",
+              r["status"] == "warn", repr(r))
+        check("  ...names the phantom production still advertises",
+              "PHANTOM" in r["detail"], r["detail"])
+        check("  ...and does NOT claim discovery returns nothing",
+              "would return nothing" not in r["detail"], r["detail"])
+
+        # (vii) EVERY candidate unparseable. Now "returns nothing" IS the truth:
+        # `_read_manifest()` falls off its loop and returns {}. Without this the
+        # fix above could have been "never warn on a decode error", which would
+        # hide a genuinely undiscoverable vault.
+        bad_legacy = tmp / "malformed-legacy.json"
+        bad_legacy.write_text("]]]")
+        vi._manifest_path = lambda: str(bad_canonical)
+        vi._LEGACY_MANIFEST_PATH = str(bad_legacy)
+        try:
+            live_names = sorted(vi._read_manifest())
+            r = hc.check_vault_manifest_integrity(
+                keychain_probe=_probe(["REAL"]), legacy_path=bad_legacy)
+        finally:
+            vi._manifest_path = _mp
+            vi._LEGACY_MANIFEST_PATH = _lmp
+        check("PARITY: with both malformed, _read_manifest() really returns {}",
+              live_names == [], f"{live_names}")
+        check("both candidates unparseable -> warn", r["status"] == "warn", repr(r))
+        check("  ...and NOW says discovery returns nothing",
+              "would return nothing" in r["detail"], r["detail"])
+
         # --- the probe is registered, not just defined ---------------------
         src = (REPO / "src" / "health-check.py").read_text()
         check("registered in the check list",

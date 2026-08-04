@@ -5230,15 +5230,52 @@ def check_vault_manifest_integrity(
         legacy = Path(legacy_path) if legacy_path else Path(vault_intercept._LEGACY_MANIFEST_PATH)
         if legacy != candidates[0]:
             candidates.append(legacy)
-    path = next((c for c in candidates if c.exists()), None)
+    # PARSE per candidate and CONTINUE on failure — existence is not the selector.
+    # `_read_manifest()` catches FileNotFoundError AND JSONDecodeError inside its
+    # loop, so a malformed canonical file does not stop it reaching the legacy
+    # one. Selecting on `.exists()` and then returning on the first decode error
+    # diverges exactly there. qingyun-wu's activated control at db708178, with a
+    # malformed canonical beside a valid legacy holding REAL + PHANTOM:
+    #
+    #     list_vault_keys() -> ['PHANTOM', 'REAL']
+    #     health -> warn: manifest unreadable — list_vault_keys() would return nothing
+    #
+    # Both halves wrong: the detail is false, and the names production DOES
+    # advertise were never probed — on a pre-migration install, which is the
+    # population this check exists for. Same lesson as the resolution-order fix
+    # one round earlier: walking a different lookup path than the function under
+    # test measures a different system.
+    #
+    # A non-FileNotFound OSError (permissions, EIO) is NOT folded into the
+    # continue: production would let it propagate out of `list_vault_keys()`,
+    # which is a louder and different failure than "returns nothing", so it is
+    # reported rather than silently skipped past.
+    path = None
+    manifest = None
+    unreadable: "list[str]" = []
+    for cand in candidates:
+        try:
+            manifest = json.loads(cand.read_text())
+            path = cand
+            break
+        except FileNotFoundError:
+            continue
+        except json.JSONDecodeError:
+            unreadable.append(f"{cand} (JSONDecodeError)")
+            continue
+        except OSError as e:
+            return {"name": name, "status": "warn",
+                    "detail": (f"manifest at {cand} could not be read ({type(e).__name__}) — "
+                               f"list_vault_keys() raises rather than returning nothing")}
     if path is None:
+        if unreadable:
+            # Every candidate that existed failed to parse, so `_read_manifest()`
+            # falls off its loop and returns {} — discovery is silently empty.
+            return {"name": name, "status": "warn",
+                    "detail": (f"no readable vault manifest ({', '.join(unreadable)}) — "
+                               f"list_vault_keys() would return nothing")}
         return {"name": name, "status": "ok", "detail": "no vault manifest on this host"}
     via_legacy = len(candidates) > 1 and path == candidates[-1]
-    try:
-        manifest = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        return {"name": name, "status": "warn",
-                "detail": f"manifest unreadable ({type(e).__name__}) — list_vault_keys() would return nothing"}
     if not isinstance(manifest, dict):
         # Valid JSON, wrong shape. This is NOT benign: `_read_manifest()` returns
         # it verbatim and `list_vault_keys()` then calls `.keys()` on it, so the
