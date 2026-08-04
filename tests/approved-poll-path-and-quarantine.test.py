@@ -33,7 +33,9 @@ single-iteration driver that the handler under test cannot swallow.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -110,8 +112,12 @@ class _Sentinel(Exception):
     """Breaks the poll loop after exactly one pass."""
 
 
-def _run_one_pass(canonical: Path, sends: list, fail: bool = False):
-    """Drive one `poll_approved` iteration with both dirs redirected."""
+def _run_one_pass(canonical: Path, sends: list, fail: bool = False,
+                  log: "list | None" = None):
+    """Drive one `poll_approved` iteration with both dirs redirected.
+
+    `log` collects what the loop PRINTED. Needed for one property that has no
+    filesystem trace: see the `is_file()` control below."""
     db.ACCESS_FILE = canonical.parent / "access.json"
 
     class _Chan:
@@ -133,12 +139,17 @@ def _run_one_pass(canonical: Path, sends: list, fail: bool = False):
 
     _orig = db.asyncio.sleep
     db.asyncio.sleep = _sleep
+    _buf = io.StringIO()
     try:
-        asyncio.run(db.poll_approved())
+        with contextlib.redirect_stdout(_buf):
+            asyncio.run(db.poll_approved())
     except _Sentinel:
         pass
     finally:
         db.asyncio.sleep = _orig
+        if log is not None:
+            log.append(_buf.getvalue())
+        print(_buf.getvalue(), end="")
 
 
 def _dirs(tag: str):
@@ -216,6 +227,39 @@ def main() -> int:
     check("  ...body preserved", bool(kept) and kept[0].read_text() == "555000444",
           f"content changed: {kept[0].read_text() if kept else None!r}")
     check("  ...and no send was recorded", not sends, f"sends={sends}")
+
+    # --- QUARANTINE IS STABLE ACROSS PASSES --------------------------------
+    # @Sutando-Mini reviewing #2630: `if not f.is_file(): continue` is what keeps
+    # `undelivered/` out of the poll, so it is load-bearing for the quarantine
+    # claim — and NOTHING pinned it. They removed the guard and the suite stayed
+    # rc=0, 13/13, zero failures. A structural piece every other part of this fix
+    # has a control for.
+    #
+    # The discriminating case is the SECOND pass, not the first: the directory
+    # only exists once something has been quarantined. Without the guard,
+    # `undelivered` is read as a marker named "undelivered", `read_text()` raises
+    # IsADirectoryError, and the handler tries to rename the directory into
+    # itself — so the assertion is that the quarantined body is still exactly
+    # where the first pass left it, and that nothing was sent for it.
+    sends, log = [], []
+    _run_one_pass(canonical, sends, log=log)   # same box, undelivered/ now exists
+    still = canonical / "undelivered" / "9004"
+    check("a SECOND pass leaves the quarantined marker exactly where it was",
+          still.is_file() and still.read_text() == "555000444",
+          f"undelivered/ contents now: "
+          f"{[q.name for q in (canonical / 'undelivered').iterdir()] if (canonical / 'undelivered').exists() else '<gone>'}")
+    # ASSERT ON THE LOG, deliberately. My first version of this control checked
+    # the filesystem — that the quarantined body was untouched and no send
+    # happened — and it was VACUOUS: with the guard removed, `undelivered` is
+    # read as a marker, `read_text()` raises IsADirectoryError, the handler tries
+    # `undelivered.rename(undelivered/undelivered)`, the OS refuses, and the
+    # last-resort branch leaves everything exactly as it was. Identical
+    # filesystem, rc=0, 15/15. The ONLY trace is the log, because the defect IS
+    # log noise — every 3s, forever, for a directory that is not a marker.
+    check("  ...and undelivered/ is never TREATED as a marker",
+          "approval to undelivered" not in "".join(log),
+          "the quarantine dir entered the poll: " +
+          next((ln for ln in "".join(log).splitlines() if "undelivered:" in ln), "?"))
 
     # --- one bad entry must not abort the rest of the scan -----------------
     # The read used to sit in the OUTER try, so an unreadable entry ended the
