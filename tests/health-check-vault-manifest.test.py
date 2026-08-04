@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""`check_vault_manifest_integrity` — vault manifest vs Keychain divergence.
+
+HERMETIC BY CONSTRUCTION: every case passes an explicit `manifest_path` (tmp) and
+an injected `keychain_probe`, so no case can read the operator's real manifest or
+spawn `security`. The final case asserts that property instead of trusting it —
+it hashes the host's live manifest before and after the whole run.
+
+The case that carries the design is `test_zero_backed_is_inconclusive_not_alarm`.
+`security find-generic-password` exits 44 both for an absent key AND for a wrong
+`-a <account>` (measured on macOS 15), so a bad account name would otherwise make
+every key read phantom and produce a maximally alarming, entirely wrong report.
+The probe refuses to cry divergence when NOTHING resolves. Delete that guard and
+this case fails; that is the point.
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+_spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
+hc = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(hc)
+
+FAILURES: list[str] = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    if cond:
+        print(f"  ok   {name}")
+    else:
+        FAILURES.append(f"{name}{(' — ' + detail) if detail else ''}")
+        print(f"  FAIL {name} {detail}")
+
+
+def _manifest(tmp: Path, keys) -> Path:
+    p = tmp / "keys.json"
+    p.write_text(json.dumps({k: {"stored_at": "2026-01-01T00:00:00Z"} for k in keys}))
+    return p
+
+
+def _probe(present):
+    """Keychain stub: resolves only names in `present`, ignores the account."""
+    present = set(present)
+    return lambda _account, key: key in present
+
+
+def _live_manifest_hash() -> "str | None":
+    try:
+        import vault_intercept
+        p = Path(vault_intercept._manifest_path())
+        return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else "ABSENT"
+    except Exception:
+        return None
+
+
+def main() -> int:
+    print("vault-manifest integrity probe:")
+    live_before = _live_manifest_hash()
+
+    with tempfile.TemporaryDirectory(prefix="vault-manifest-test-") as td:
+        tmp = Path(td)
+
+        # --- divergence IS reported ---------------------------------------
+        m = _manifest(tmp, ["REAL_ONE", "GHOST_A", "GHOST_B"])
+        r = hc.check_vault_manifest_integrity(m, _probe(["REAL_ONE"]))
+        check("phantom keys -> warn", r["status"] == "warn", repr(r))
+        check("names the phantoms", "GHOST_A" in r["detail"] and "GHOST_B" in r["detail"], r["detail"])
+        check("does not name the backed key as phantom",
+              "GHOST_A" in r["detail"] and r["detail"].count("REAL_ONE") == 0, r["detail"])
+        check("states the ratio", "2/3" in r["detail"], r["detail"])
+
+        # --- the positive control: 0 backed means BROKEN CHECKER ----------
+        r = hc.check_vault_manifest_integrity(_manifest(tmp, ["A", "B"]), _probe([]))
+        check("test_zero_backed_is_inconclusive_not_alarm", r["status"] == "ok", repr(r))
+        check("  ...and says WHY it isn't asserting divergence",
+              "unverifiable" in r["detail"], r["detail"])
+
+        # --- clean vault ---------------------------------------------------
+        r = hc.check_vault_manifest_integrity(_manifest(tmp, ["K1", "K2"]), _probe(["K1", "K2"]))
+        check("all backed -> ok", r["status"] == "ok" and "resolve" in r["detail"], repr(r))
+
+        # --- degenerate inputs ---------------------------------------------
+        r = hc.check_vault_manifest_integrity(tmp / "nope.json", _probe([]))
+        check("absent manifest -> ok", r["status"] == "ok", repr(r))
+
+        r = hc.check_vault_manifest_integrity(_manifest(tmp, []), _probe([]))
+        check("empty manifest -> ok", r["status"] == "ok", repr(r))
+
+        bad = tmp / "bad.json"
+        bad.write_text("{not json")
+        r = hc.check_vault_manifest_integrity(bad, _probe([]))
+        check("malformed manifest -> warn", r["status"] == "warn", repr(r))
+
+        # --- truncation is DISCLOSED, never silent -------------------------
+        many = _manifest(tmp, [f"K{i}" for i in range(10)])
+        r = hc.check_vault_manifest_integrity(many, _probe(["K0"]), max_keys=4)
+        check("capped scan discloses the cap", "checked first 4 of 10" in r["detail"], r["detail"])
+
+        # --- the probe is registered, not just defined ---------------------
+        src = (REPO / "src" / "health-check.py").read_text()
+        check("registered in the check list",
+              "checks.append(check_vault_manifest_integrity())" in src,
+              "defined but never appended = a probe that can never fire")
+
+    live_after = _live_manifest_hash()
+    check("HERMETIC: host's live vault manifest untouched by this suite",
+          live_before == live_after, f"{live_before} -> {live_after}")
+
+    print()
+    if FAILURES:
+        print(f"FAILED ({len(FAILURES)}):")
+        for f in FAILURES:
+            print(f"  - {f}")
+        return 1
+    print("All vault-manifest probe checks passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -33,7 +33,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     import fcntl  # POSIX file locking for the recovery critical section
@@ -5176,6 +5176,93 @@ def _hook_command_targets(command: str, expected, owned_cmd: str, marker: str = 
     return _same_path(got[idx], want, want_real) and got[:idx] == owned[:idx]
 
 
+def check_vault_manifest_integrity(
+    manifest_path: Optional[Path] = None,
+    keychain_probe: Optional[Callable[[str, str], bool]] = None,
+    max_keys: int = 200,
+) -> dict:
+    """Does every name `list_vault_keys()` advertises actually exist in Keychain?
+
+    The vault splits its state in two: names live in the manifest
+    (`<workspace>/state/secret-vault/keys.json`), values live in macOS Keychain.
+    Nothing keeps the halves in step. A name can outlive its secret — a Keychain
+    entry deleted by hand, a machine restored from backup, or a manifest carried
+    forward by the legacy-path self-migration in `vault_intercept._read_manifest`.
+
+    The divergence is silent in the direction that matters. CLAUDE.md tells every
+    integration to discover keys via `list_vault_keys()` and then fetch with
+    `get_vault_key()`. A phantom name passes discovery and raises KeyError on
+    fetch, so the documented pattern points callers AT keys that cannot resolve —
+    strictly worse than the key simply being absent, because the list says it is
+    there. Observed on this host 2026-08-04: 15 advertised, 2 backed, 13 phantom.
+
+    POSITIVE CONTROL, deliberately (`security find-generic-password` exits 44 both
+    for "no such key" AND for a wrong `-a <account>`, measured). So a bad account
+    name, a locked keychain, or a missing binary would otherwise report EVERY key
+    phantom — a maximally alarming, entirely wrong answer. This probe therefore
+    refuses to report divergence unless at least one name resolves: zero-of-N is
+    treated as "the checker is broken", not "the vault is empty". The cost is
+    real (a genuinely 100%-phantom manifest reads inconclusive), and that is the
+    correct direction to fail — a false clean here is a nag nobody can act on,
+    while a false alarm would send the operator hunting a vault that is fine.
+    """
+    name = "vault-manifest"
+    try:
+        import vault_intercept  # noqa: PLC0415  (optional; absent in trimmed installs)
+    except Exception:
+        return {"name": name, "status": "ok",
+                "detail": "vault_intercept not importable — vault not in use here"}
+
+    path = Path(manifest_path) if manifest_path else Path(vault_intercept._manifest_path())
+    if not path.exists():
+        return {"name": name, "status": "ok", "detail": "no vault manifest on this host"}
+    try:
+        manifest = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return {"name": name, "status": "warn",
+                "detail": f"manifest unreadable ({type(e).__name__}) — list_vault_keys() would return nothing"}
+    names = sorted(manifest) if isinstance(manifest, dict) else []
+    if not names:
+        return {"name": name, "status": "ok", "detail": "manifest empty — nothing advertised"}
+
+    probe = keychain_probe
+    if probe is None:
+        if not shutil.which("security"):
+            return {"name": name, "status": "ok",
+                    "detail": f"{len(names)} key(s) advertised; no `security` binary — cannot verify, not asserting"}
+
+        def probe(account: str, key: str) -> bool:  # noqa: F811
+            return subprocess.run(
+                ["security", "find-generic-password", "-a", account, "-s", key],
+                capture_output=True,
+            ).returncode == 0
+
+    account = getattr(vault_intercept, "_ACCOUNT", "sutando")
+    checked = names[:max_keys]
+    backed = [k for k in checked if probe(account, k)]
+    phantom = [k for k in checked if k not in backed]
+
+    if not backed:
+        # The control failed: a wrong account / locked keychain looks exactly
+        # like a fully-phantom manifest. Say so instead of raising a false alarm.
+        return {"name": name, "status": "ok",
+                "detail": (f"{len(checked)} advertised key(s), 0 resolved against account "
+                           f"'{account}' — treating as an unverifiable keychain, not as divergence")}
+    if not phantom:
+        return {"name": name, "status": "ok",
+                "detail": f"all {len(backed)} advertised key(s) resolve in Keychain"}
+
+    shown = ", ".join(phantom[:6]) + (f", +{len(phantom) - 6} more" if len(phantom) > 6 else "")
+    truncated = f" (checked first {max_keys} of {len(names)})" if len(names) > max_keys else ""
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{len(phantom)}/{len(checked)} advertised key(s) have NO Keychain entry{truncated}, "
+                   f"so list_vault_keys() offers them and get_vault_key() raises KeyError: {shown}. "
+                   f"Prune {path} or re-store the secrets."),
+    }
+
+
 def check_claude_hook_registration(
     repo_dir: Optional[Path] = None,
 ) -> dict:
@@ -5411,6 +5498,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
+    # Vault name/secret divergence: list_vault_keys() advertising keys that
+    # get_vault_key() cannot resolve — silent until an integration calls both.
+    checks.append(check_vault_manifest_integrity())
     checks.append(check_claude_hook_registration())
     checks.append(check_cron_runner())
     checks.append(check_session_cron_registration())
