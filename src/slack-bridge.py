@@ -1480,10 +1480,17 @@ def result_watcher():
                     # (07-31, 08-01, 08-02, 08-03), each verified absent from the
                     # owner's DM history rather than inferred from the filename.
                     #
-                    # Not claiming is strictly better than claiming-and-releasing:
-                    # the poller globs `*.txt`, so a released `.sending` would sit
-                    # unread until a restart sweep. Leave the file alone and the
-                    # bridge that CAN deliver picks it up on its next 3s tick.
+                    # Why not claim-and-release. On `main` today there is no
+                    # release path at all, so a claimed `.sending` is invisible to
+                    # every poller's `*.txt` glob until the startup-only recovery
+                    # sweep. #2627 adds `release_claim()`, which renames it back
+                    # and IS re-polled — so once that lands the reason changes
+                    # rather than disappears: claiming a file you cannot deliver
+                    # buys a claim/release hot race and ~a second of hiding it
+                    # from the bridge that can. Not claiming avoids both.
+                    # (@john-the-dev corrected my first rationale here, which
+                    # described only main's behaviour while this PR's own merge
+                    # order puts #2627 first.)
                     try:
                         access_data = json.loads(ACCESS_FILE.read_text())
                     except Exception:

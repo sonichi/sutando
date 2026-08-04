@@ -13,10 +13,12 @@ deleting another bridge's mail, and Discord logged nothing because it never saw
 the file. Measured on Chis-MacBook-Pro 2026-08-04: 52 distinct files, including
 four morning briefings, each verified absent from the owner's DM history.
 
-WHY "DON'T CLAIM" RATHER THAN "CLAIM AND RELEASE". The poller globs `*.txt`
-(`:1443`), so a released `.sending` would sit unread until a restart sweep
-(`_recover_orphan_sending_files`, startup only). Leaving the file untouched is
-the only variant where the bridge that CAN deliver picks it up on its next tick.
+WHY "DON'T CLAIM" RATHER THAN "CLAIM AND RELEASE". On `main` there is no release
+path, so a claimed `.sending` is outside every poller's `*.txt` glob until the
+startup-only `_recover_orphan_sending_files` sweep. #2627 adds `release_claim()`,
+which renames it back and IS re-polled — so after that lands the reason changes
+rather than vanishes: claiming what you cannot deliver buys a claim/release hot
+race and ~a second of hiding the file from the bridge that can.
 
 The assertion is deliberately about the FILE, not the log line: a bridge that
 logs "skipping" while renaming has still taken the message out of Discord's
@@ -101,7 +103,8 @@ class _Tick(Exception):
     post-loop state correctly in both the fixed and the broken run."""
 
 
-def _one_pass(results: Path, access: dict | None):
+def _one_pass(results: Path, access: dict | None, owner: str | None = None,
+              sent: list | None = None):
     sb.RESULTS_DIR = results
     acc = results / "access.json"
     if access is None:
@@ -111,6 +114,16 @@ def _one_pass(results: Path, access: dict | None):
     sb.ACCESS_FILE = acc
     if hasattr(sb, "TASKS_DIR"):
         sb.TASKS_DIR = results
+
+    # Positive-control wiring. @john-the-dev mutated `if owner_id is None:` to
+    # `if True:` — disabling EVERY Slack proactive claim — and the suite still
+    # exited 0, because every case asserted only the no-owner side. A gate that
+    # cannot tell "correctly skipped" from "never runs at all" is not a gate.
+    if owner is not None:
+        sb.resolve_proactive_owner_id = lambda _d: owner
+        sb.app.client.conversations_open = lambda **kw: {"channel": {"id": "D_TEST_DM"}}
+        sb._send_reply = lambda ch, ts, text, **kw: (sent.append((ch, text)) if sent is not None else None)
+        sb.mark_proactive_delivered = lambda *a, **kw: None
 
     def _sleep(_s):
         raise _Tick()
@@ -144,6 +157,26 @@ def main() -> int:
     check("  ...and it was never renamed to .sending",
           not list(box.glob("*.sending")),
           f"found {[p.name for p in box.glob('*.sending')]} — out of the poller's *.txt glob")
+
+    # --- POSITIVE CONTROL: a CONFIGURED Slack must still claim and deliver ----
+    # Without this, an over-broad future gate (or a mutation to `if True:`)
+    # silently disables Slack proactive delivery and every assertion above still
+    # passes. This is the case that makes the gate discriminating rather than
+    # merely permissive.
+    box2 = Path(tempfile.mkdtemp(prefix="slack-owner-"))
+    msg2 = box2 / "proactive-pending-q-deliverme.txt"
+    msg2.write_text("a notification Slack CAN deliver")
+    sent: list = []
+    _one_pass(box2, access={"allowFrom": ["UOWNER"]}, owner="UOWNER", sent=sent)
+
+    check("configured owner -> the send actually happened", bool(sent),
+          "no send recorded — the gate is skipping when it should deliver")
+    if sent:
+        check("  ...to the opened DM channel with the body",
+              sent[0][0] == "D_TEST_DM" and "CAN deliver" in sent[0][1], repr(sent[0]))
+    check("  ...and the file was consumed after a successful send",
+          not msg2.exists() and not list(box2.glob("*.sending")),
+          f"left behind: {[p.name for p in box2.iterdir()]}")
 
     check("HERMETIC: operator's real results/ untouched",
           (sorted(p.name for p in _LIVE_RESULTS.iterdir()) if _LIVE_RESULTS.exists() else None)
