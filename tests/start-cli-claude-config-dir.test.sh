@@ -150,6 +150,9 @@ EOF
 
   if [ "$helper_present" = "yes" ]; then
     cp "$REAL_REPO/scripts/sutando-config.sh" "$REPO_FAKE/scripts/"
+    # sutando-config.sh sources this; without it the fake repo dies with
+    # "python-binary.sh: No such file or directory" (CI, #2599).
+    cp "$REAL_REPO/scripts/python-binary.sh" "$REPO_FAKE/scripts/"
     cp "$REAL_REPO/src/sutando_config.py" "$REPO_FAKE/src/"
     # Use absolute path so workspace resolves to $SANDBOX/workspace (the same
     # dir the mkdir above created), avoiding a mismatch with ${REPO_DIR}/workspace.
