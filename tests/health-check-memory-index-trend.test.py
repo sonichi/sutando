@@ -148,7 +148,13 @@ class DefensiveBranches(unittest.TestCase):
             idx.write_text("x")
             self.assertEqual(m._index_growth_note(idx, 100), "")
 
-    def test_a_commit_whose_blob_cannot_be_read_is_skipped(self):
+    def test_an_object_cat_file_reports_missing_is_skipped(self):
+        """`cat-file --batch-check` does NOT fail on a bad spec — it prints
+        "<spec> missing" and exits 0. So the skip has to be driven by parsing
+        the line, not by a return code. An earlier revision of this test stubbed
+        a non-zero exit instead; it still passed, because it hit the batch-level
+        early return rather than this branch — a test can keep passing while
+        silently ceasing to test the thing it names."""
         m = _hc()
         state = {"first": True}
 
@@ -156,7 +162,7 @@ class DefensiveBranches(unittest.TestCase):
             if state["first"]:
                 state["first"] = False
                 return self._Proc("aaa 1000\nbbb 2000\n")
-            return self._Proc(b"", 1)          # every `git show` fails
+            return self._Proc("aaa:./MEMORY.md missing\nbbb:./MEMORY.md missing\n", 0)
 
         m.subprocess = type("S", (), {
             "run": staticmethod(fake_run),
@@ -165,7 +171,26 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            # both blobs skipped -> 0 points -> ""
+            # both objects skipped -> 0 points -> ""
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+    def test_a_failing_batch_returns_empty(self):
+        m = _hc()
+        state = {"first": True}
+
+        def fake_run(argv, **kw):
+            if state["first"]:
+                state["first"] = False
+                return self._Proc("aaa 1000\nbbb 2000\n")
+            return self._Proc("", 1)           # the batch itself fails
+
+        m.subprocess = type("S", (), {
+            "run": staticmethod(fake_run),
+            "SubprocessError": Exception,
+        })
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x")
             self.assertEqual(m._index_growth_note(idx, 100), "")
 
     def test_git_unavailable_is_swallowed(self):

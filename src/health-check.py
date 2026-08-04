@@ -1531,18 +1531,35 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
         )
         if proc.returncode != 0 or not proc.stdout.strip():
             return ""
-        points: "list[tuple[int, int]]" = []
+        # One `cat-file --batch-check` instead of one `git show` per commit. The
+        # first draft spawned 1 + N processes (13 here) on a path that runs every
+        # proactive pass for as long as the warning stands, which Sutando-Pro
+        # measured at 658 ms on their host (122 ms on mine — the cost is
+        # host-dependent, the spawn count is not). `--batch-check` reads sizes
+        # without materialising a single blob, so it is cheaper than `show` even
+        # before the process saving.
+        stamps: "list[tuple[str, int]]" = []
         for line in proc.stdout.splitlines():
             sha, _, at = line.partition(" ")
             if not sha or not at.strip().isdigit():
                 continue
-            blob = subprocess.run(
-                git_argv("-C", str(repo), "show", f"{sha}:./{rel}"),
-                capture_output=True, timeout=10,
-            )
-            if blob.returncode != 0:
+            stamps.append((sha, int(at)))
+        if not stamps:
+            return ""
+        batch = subprocess.run(
+            git_argv("-C", str(repo), "cat-file", "--batch-check=%(objectsize)"),
+            input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps),
+            capture_output=True, text=True, timeout=10,
+        )
+        if batch.returncode != 0:
+            return ""
+        sizes = batch.stdout.splitlines()
+        points: "list[tuple[int, int]]" = []
+        for (sha, at), size in zip(stamps, sizes):
+            # a missing/ambiguous object prints "<spec> missing", not a number
+            if not size.strip().isdigit():
                 continue
-            points.append((int(at), len(blob.stdout)))
+            points.append((at, int(size)))
         if len(points) < 2:
             return ""
         points.sort()
