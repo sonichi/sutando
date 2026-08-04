@@ -141,6 +141,59 @@ def main() -> int:
     check("the report explains the DISABLES consequence, not just the arity",
           "DISABLES" in printed and "lambda *a, **kw" in printed)
 
+    # --- FALSE POSITIVES: a mandatory gate must not reject safe tests -------
+    # All three reported by @qingyun-wu on #2622 against the file-global alias
+    # set. They are the expensive direction for a required check: it blocks an
+    # unrelated safe test AND names the wrong line, so the author cannot act on
+    # it. Each is a distinct way the old model was wrong — wrong scope, wrong
+    # order, wrong reaching binding — not three spellings of one case.
+    def viols(src):
+        return lint.resolver_stub_violations(ast.parse(src))
+
+    check("scope: a sibling function's zero-arg lambda does not condemn this one",
+          viols("""
+def old_case():
+    _fake = lambda: tmp
+
+def fixed_case():
+    _fake = lambda *a, **kw: tmp
+    wd.resolve_workspace = _fake
+""") == [], "a binding in another scope must not reach here")
+
+    check("order: a LATER bad rebinding does not condemn an earlier safe assign",
+          viols("""
+_fake = lambda *a, **kw: tmp
+wd.resolve_workspace = _fake
+_fake = lambda: tmp
+""") == [], "statement order ignored — the assignment was safe when it ran")
+
+    check("reaching: the nearest preceding binding wins, not any binding",
+          viols("""
+_fake = lambda: tmp
+_fake = lambda *a, **kw: tmp
+wd.resolve_workspace = _fake
+""") == [], "the bad binding was superseded before the assignment")
+
+    # --- TRUE POSITIVES that the fix must not lose -------------------------
+    check("still flags the indirect loop form (#2619's actual shape)",
+          viols("""
+_fake = lambda: tmp
+for m in mods:
+    m.resolve_workspace = _fake
+""") != [], "this is the form a correct redirect fix takes; losing it guts the check")
+
+    check("still flags the direct form",
+          viols("wd.resolve_workspace = lambda: tmp") != [])
+
+    check("conservative on branches: unsafe on ANY path is unsafe",
+          viols("""
+if cond:
+    _fake = lambda: tmp
+else:
+    _fake = lambda *a: tmp
+wd.resolve_workspace = _fake
+""") != [], "control flow is unknown, so an unsafe path must still flag")
+
     # --- the grandfather list must not rot ---------------------------------
     for rel in sorted(lint.KNOWN_RESOLVER_STUBS):
         p = REPO / rel

@@ -1039,58 +1039,98 @@ def _assign_target_name(t: ast.expr) -> str | None:
     return None
 
 
+def _binding_state(value: ast.expr, env: "dict[str, bool]") -> "bool | None":
+    """Is `value` a non-absorbing stub? None when it says nothing about arity."""
+    if isinstance(value, ast.Lambda):
+        return not _lambda_absorbs_args(value)
+    if isinstance(value, ast.Name):
+        return env.get(value.id)
+    return None
+
+
+class _ScopeWalk:
+    """Reaching-binding walk over ONE lexical scope, in statement order.
+
+    `env` maps a local name to True when the binding that REACHES this point is
+    a zero-arg lambda. Nested scopes get a snapshot taken where they are defined,
+    so a sibling function's binding can never leak sideways. Branch bodies are
+    walked on copies and merged with OR — a name is unsafe if ANY path can leave
+    it unsafe, which keeps the check conservative where control flow is unknown
+    without letting an unrelated scope decide the verdict.
+    """
+
+    def __init__(self, env: "dict[str, bool]", out: "list[tuple[int, str]]") -> None:
+        self.env = dict(env)
+        self.out = out
+
+    def run(self, body: "list[ast.stmt]") -> None:
+        for stmt in body:
+            self.visit(stmt)
+
+    def visit(self, node: ast.stmt) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _ScopeWalk(self.env, self.out).run(node.body)   # snapshot, no write-back
+            return
+        if isinstance(node, ast.Assign):
+            self._assign(node)
+            return
+        branches = [b for b in (getattr(node, "body", None), getattr(node, "orelse", None),
+                                getattr(node, "finalbody", None)) if b]
+        branches += [h.body for h in getattr(node, "handlers", [])]
+        if not branches:
+            return
+        merged: "dict[str, bool]" = {}
+        for body in branches:
+            w = _ScopeWalk(self.env, self.out)
+            w.run(body)
+            for k, v in w.env.items():
+                merged[k] = merged.get(k, False) or v
+        self.env.update(merged)
+
+    def _assign(self, node: ast.Assign) -> None:
+        state = _binding_state(node.value, self.env)
+        for t in node.targets:                       # flag BEFORE rebinding
+            nm = _assign_target_name(t)
+            if nm in RESOLVER_NAMES and state:
+                self.out.append((node.lineno, nm))
+        for t in node.targets:
+            if isinstance(t, ast.Name) and t.id not in RESOLVER_NAMES:
+                self.env[t.id] = bool(state)
+
+
 def resolver_stub_violations(tree: ast.AST) -> list[tuple[int, str]]:
-    """(lineno, name) for every zero-arg lambda that reaches a resolver name.
+    """(lineno, name) for every zero-arg lambda that REACHES a resolver name.
 
-    TWO walks, because the direct form is not the one a correct fix produces.
+    Patching a resolver across an already-imported tree REQUIRES binding the stub
+    to a name first — `from workspace_default import resolve_workspace` copies the
+    function into each importer's namespace, so every holder must be reassigned:
 
-    Patching a resolver across an already-imported tree REQUIRES binding the
-    stub to a name first — `from workspace_default import resolve_workspace`
-    copies the function into each importer's namespace, so every holder must be
-    reassigned in a loop:
-
-        _fake = lambda: tmp                      # walk 1 records `_fake`
+        _fake = lambda: tmp
         for _mod in list(sys.modules.values()):
             if getattr(_mod, "resolve_workspace", None) is orig:
-                _mod.resolve_workspace = _fake   # walk 2 flags this
-        workspace_default.resolve_workspace = _fake
+                _mod.resolve_workspace = _fake       # flagged
+        workspace_default.resolve_workspace = _fake  # flagged
 
-    A single-walk check sees neither half: the lambda binds to `_fake` (not a
-    resolver name), and the resolver assignment's value is a `Name`, not a
-    `Lambda`. So the shape the check MISSED was exactly the shape the defect
-    takes whenever someone fixes the redirect properly — the common case, not
-    an exotic one. Found by Sutando-Pro reviewing #2622.
+    A check that only inspects the assignment's own value sees neither half, which
+    is why this tracks aliases at all (Sutando-Pro, #2622).
 
-    Walk 1 collects names bound to a non-absorbing lambda; walk 2 flags any
-    assignment to a resolver name whose value is a Lambda (direct) or one of
-    those names (indirect). Still per-file and syntactic — no caller analysis.
+    It tracks them per SCOPE and in STATEMENT ORDER. The first version collected
+    aliases into one file-global set via `ast.walk`, so any `_fake = lambda:` in
+    the file condemned every later `resolve_workspace = _fake` — including one in
+    a different function whose own `_fake` absorbs args, and including assignments
+    written BEFORE the offending rebinding. @qingyun-wu demonstrated all three:
+
+        cross_function_safe             -> [(7, 'resolve_workspace')]
+        order_safe_then_bad_later       -> [(3, 'resolve_workspace')]
+        same_scope_bad_then_safe_later  -> [(4, 'resolve_workspace')]
+
+    That is the expensive direction for a MANDATORY gate: a false positive blocks
+    an unrelated safe test and names the wrong line, so the author has no way to
+    act on it. Still per-file and syntactic — no cross-module or caller analysis.
     """
-    aliases: set[str] = set()
-    for n in ast.walk(tree):
-        if not isinstance(n, ast.Assign) or not isinstance(n.value, ast.Lambda):
-            continue
-        if _lambda_absorbs_args(n.value):
-            continue                      # `lambda *a, **kw:` is the fixed form
-        for t in n.targets:
-            nm = _assign_target_name(t)
-            if nm and nm not in RESOLVER_NAMES:
-                aliases.add(nm)
-
     out: list[tuple[int, str]] = []
-    for n in ast.walk(tree):
-        if not isinstance(n, ast.Assign):
-            continue
-        val = n.value
-        if isinstance(val, ast.Lambda):
-            if _lambda_absorbs_args(val):
-                continue
-        elif not (isinstance(val, ast.Name) and val.id in aliases):
-            continue
-        for t in n.targets:
-            if _assign_target_name(t) in RESOLVER_NAMES:
-                out.append((n.lineno, _assign_target_name(t)))
-    return out
-
+    _ScopeWalk({}, out).run(getattr(tree, "body", []))
+    return sorted(set(out))
 
 def scan_resolver_stubs(paths) -> dict[str, list[tuple[int, str]]]:
     """Resolver-stub violations per path. Scans EVERY tracked test, not just the
