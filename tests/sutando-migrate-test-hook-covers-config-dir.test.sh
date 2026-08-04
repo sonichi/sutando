@@ -35,8 +35,12 @@ mkdir -p "$TMP/dest" "$TMP/src/a" "$TMP/src/b" "$TMP/src/c" "$TMP/home"
 # FULL isolation of every source the script discovers, not just DEST.
 # @qingyun-wu on #2624: the first version created $TMP/src and never wired it in,
 # so `--commit` ran against the caller's REAL source discovery and REAL $HOME —
-# `B_PATH` defaults to "$HOME/.sutando/workspace" (:279) and the post-commit path
-# invokes `sutando-shell-setup.sh --import` against the real Claude config (:1650).
+# sutando-migrate.sh:279 defaults B_PATH to the legacy install-home workspace
+# under $HOME, and the post-commit path at :1650 invokes
+# `sutando-shell-setup.sh --import` against the real Claude config.
+# (Naming that default path literally here trips lint-sutando-home-path.sh, and
+# widening its ALLOWED list to quiet a comment would disarm the guard for a file
+# that owns no resolution. Cite the line instead.)
 # A test proving the migration does not touch real config must not itself scan,
 # copy, or adopt real config. Correct, and exactly the defect class this PR fixes.
 #
