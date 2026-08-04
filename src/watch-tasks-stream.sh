@@ -387,6 +387,7 @@ fallback_outstanding_handlers() {
       filename="$(basename "$task_path")"
       if claim_is_ours "$filename"; then
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+        echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
         printf 'TASK_FILE: %s\n' "$filename" || true
         release_task_claim "$filename" || true
       fi
@@ -407,6 +408,7 @@ fallback_outstanding_handlers() {
     [ -n "$task_path" ] || continue
     filename="$(basename "$task_path")"
     printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+    echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
     printf 'TASK_FILE: %s\n' "$filename" || true
     release_task_claim "$filename" || true
   done
