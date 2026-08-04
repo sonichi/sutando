@@ -13,7 +13,9 @@ and, behind a broad `except`, silently DISABLED the write path — which is how
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
+import io
 import sys
 from pathlib import Path
 
@@ -103,6 +105,41 @@ def main() -> int:
     )
     check("reports line number and name",
           hits == [(3, "resolve_workspace")], f"got {hits}")
+
+    # --- non-simple assignment targets ------------------------------------
+    # `a[0] = ...` and `a, b = ...` bind no single bare name. The predicate must
+    # skip them rather than raise, and it must not treat them as resolver names.
+    check("a subscript target is skipped, not crashed on",
+          not flags('reg["resolve_workspace"] = lambda: REPO'))
+    check("a tuple target is skipped, not crashed on",
+          not flags('resolve_workspace, other = (lambda: REPO), 2'))
+
+    # --- unreadable / unparseable files are skipped, never reported --------
+    # scan_resolver_stubs must swallow OSError and SyntaxError: a file it cannot
+    # read is "no evidence", never a violation. Uses a path that does not exist,
+    # so this stays hermetic — nothing is written.
+    missing = lint.scan_resolver_stubs(["tests/__no_such_file_for_lint_test__.py"])
+    check("a nonexistent path yields no violation (OSError swallowed)",
+          missing == {}, f"got {missing}")
+
+    # --- the REPORTING path, exercised ------------------------------------
+    # The error loop and FAIL summary in main() are unreachable while the tree is
+    # clean, so inject one synthetic hit. Restores the original either way.
+    _orig_scan = lint.scan_resolver_stubs
+    lint.scan_resolver_stubs = lambda paths: {"tests/synthetic.test.py": [(7, "resolve_workspace")]}
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = lint.main()
+    finally:
+        lint.scan_resolver_stubs = _orig_scan
+    printed = buf.getvalue()
+    check("a violation makes main() exit non-zero", rc != 0, f"rc={rc}")
+    check("the report names file, line and symbol",
+          "tests/synthetic.test.py:7" in printed and "resolve_workspace" in printed,
+          f"got: {printed[:160]!r}")
+    check("the report explains the DISABLES consequence, not just the arity",
+          "DISABLES" in printed and "lambda *a, **kw" in printed)
 
     # --- the grandfather list must not rot ---------------------------------
     for rel in sorted(lint.KNOWN_RESOLVER_STUBS):
