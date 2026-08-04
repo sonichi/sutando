@@ -212,6 +212,66 @@ def test_source_wires_checkpoint_update_into_handler():
     )
 
 
+def test_self_authored_dms_advance_the_checkpoint():
+    """The SELF-AUTHOR early return must advance the checkpoint before dropping.
+
+    `test_source_wires_checkpoint_update_into_handler` above greps the whole
+    handler body, so it passes as long as *any* call exists — and it did, while
+    this branch still returned without one. That is why this test is scoped to
+    the branch rather than the function.
+
+    Why it matters: `channel.history()` returns our own replies, and in a DM
+    channel with the owner most messages ARE ours. `if message.author ==
+    client.user: return` sits ABOVE the main checkpoint advance, so the
+    checkpoint froze at the last message we did not write and every reconnect
+    re-fetched the same window. Observed on two hosts as
+    `[dm-catchup] replayed N missed DM(s)` with an identical N across restarts.
+
+    The starvation this guards: catch-up fetches `limit=50, oldest_first=True`.
+    Once >50 messages sit after a frozen checkpoint, an owner DM at position 51+
+    is never fetched, and the checkpoint still cannot advance, so no later
+    restart reaches it — silent permanent loss of the exact message catch-up
+    exists to rescue.
+    """
+    # Parsed by INDENT, not regex. A non-greedy regex here silently over-matches
+    # past this branch's `return` and swallows the legitimate checkpoint advance
+    # further down the function — which makes the assertion pass on the very code
+    # it is supposed to reject. (That is not hypothetical: the first version of
+    # this test did exactly that and passed against the unfixed bridge.)
+    lines = (REPO / "src" / "discord-bridge.py").read_text().splitlines()
+    start = next(
+        (i for i, l in enumerate(lines)
+         if l.strip() == "if message.author == client.user:"),
+        None,
+    )
+    assert start is not None, "could not locate the self-author early-return branch"
+    if_indent = len(lines[start]) - len(lines[start].lstrip())
+    branch_lines = []
+    for l in lines[start + 1:]:
+        if not l.strip():
+            branch_lines.append(l)
+            continue
+        indent = len(l) - len(l.lstrip())
+        if indent <= if_indent:          # dedented out of the branch
+            break
+        branch_lines.append(l)
+        if l.strip() == "return":        # the branch's own exit — stop here
+            break
+    branch = "\n".join(branch_lines)
+    assert branch.rstrip().endswith("return"), (
+        f"branch extraction did not terminate on the early return; got:\n{branch}"
+    )
+    assert "_update_dm_checkpoint" in branch, (
+        "the self-authored-DM branch returns WITHOUT advancing the checkpoint — "
+        "our own replies then pin the checkpoint forever and catch-up re-fetches "
+        "the same window on every restart (see docstring for the starvation path)."
+    )
+    assert "DMChannel" in branch, (
+        "the self-author checkpoint advance must be gated on DMChannel — the "
+        "checkpoint is per-DM-channel and guild messages have no place in it."
+    )
+
+
 def main():
     failures = []
     for fn in (
@@ -225,6 +285,7 @@ def main():
         test_load_filters_malformed_entries,
         test_source_wires_catchup_into_on_ready,
         test_source_wires_checkpoint_update_into_handler,
+        test_self_authored_dms_advance_the_checkpoint,
     ):
         try:
             fn()
