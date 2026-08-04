@@ -97,95 +97,11 @@ class GateTests(unittest.TestCase):
         self.assertIn("HTTP 500", _gateway.degrade_reason(500))
 
 
-# ----- gateway() vault tier (sonichi#2638 parity) ----- #
-class GatewayVaultTierTests(EnvCase):
-    """gateway() consults the Keychain vault when the env has no token — so
-    `vault set REMOTE_TASK_TOKEN` finally arms room ops (it was a silent no-op).
-    Uses an injected vault_get; never touches a real Keychain."""
-
-    def test_vault_combined_token_arms_base_and_bearer(self):
-        vault = {"REMOTE_TASK_TOKEN": "https://gw.example/relay|s3cr3t"}
-        self.assertEqual(
-            _gateway._token_from_vault(vault_get=lambda k: vault.get(k)),
-            "https://gw.example/relay|s3cr3t")
-        # end-to-end: env empty (EnvCase cleared it), so gateway() falls to the
-        # vault and splits the combined value into base + bearer.
-        with mock.patch.object(_gateway, "_token_from_vault",
-                               return_value="https://gw.example/relay|s3cr3t"):
-            base, headers = _gateway.gateway()
-        self.assertEqual(base, "https://gw.example/relay")
-        self.assertEqual(headers.get("Authorization"), "Bearer s3cr3t")
-
-    def test_vault_legacy_alias(self):
-        vault = {"AG2_REMOTE_TOKEN": "legacy-secret"}
-        self.assertEqual(
-            _gateway._token_from_vault(vault_get=lambda k: vault.get(k)), "legacy-secret")
-
-    def test_vault_total_failure_safe(self):
-        self.assertEqual(_gateway._token_from_vault(vault_get=lambda k: None), "")
-
-        def boom(k):
-            raise RuntimeError("keychain locked")
-
-        self.assertEqual(_gateway._token_from_vault(vault_get=boom), "")
-
-    def test_env_token_wins_over_vault(self):
-        # A present env token must never be overridden by the vault (the #416
-        # hazard): gateway() must not even consult the vault.
-        os.environ["GATEWAY_TOKEN"] = "env-secret"
-        with mock.patch.object(_gateway, "_token_from_vault",
-                               return_value="vault-should-not-win") as m:
-            _base, headers = _gateway.gateway()
-        self.assertEqual(headers.get("Authorization"), "Bearer env-secret")
-        m.assert_not_called()
-
-    def test_degrades_when_core_absent(self):
-        # Standalone-ish: channel_token not locatable -> '' (no crash).
-        real = os.path.isfile
-        os.path.isfile = lambda p: False
-        try:
-            self.assertEqual(_gateway._token_from_vault(vault_get=lambda k: "x"), "")
-        finally:
-            os.path.isfile = real
-
-    def test_safe_on_broken_core_import(self):
-        broken = types.ModuleType("channel_token")   # lacks token_from_vault
-        saved = sys.modules.get("channel_token")
-        sys.modules["channel_token"] = broken
-        try:
-            self.assertEqual(_gateway._token_from_vault(vault_get=lambda k: "x"), "")
-        finally:
-            if saved is not None:
-                sys.modules["channel_token"] = saved
-            else:
-                sys.modules.pop("channel_token", None)
-
-    def test_gateway_empty_env_makes_zero_host_vault_calls(self):
-        # Hermeticity control (the fixture-default remedy @qingyun-air asked for):
-        # EnvCase clears every token var, so an empty env is THE default path for
-        # this whole file. gateway() must reach only the shadowed boundary, never
-        # the host Keychain — and with the shadow holding nothing, resolve no token.
-        _VAULT_CALLS.clear()
-        _VAULT_STORE.clear()
-        base, headers = _gateway.gateway()
-        self.assertIs(sys.modules["vault_intercept"], _FAKE_VI)   # host boundary replaced
-        self.assertIn("REMOTE_TASK_TOKEN", _VAULT_CALLS)          # seam WAS the shadow
-        self.assertEqual(base, "")
-        self.assertNotIn("Authorization", headers)
-
-    def test_gateway_resolves_a_stored_vault_token_through_the_shadow(self):
-        # Positive control: a combined token in the shadow is what gateway() serves
-        # when the env is empty — so shadowing fully determines the vault path,
-        # i.e. nothing reaches past it to the host Keychain.
-        _VAULT_CALLS.clear()
-        _VAULT_STORE.clear()
-        _VAULT_STORE["REMOTE_TASK_TOKEN"] = "https://gw.example/relay|from-vault"
-        try:
-            base, headers = _gateway.gateway()
-        finally:
-            _VAULT_STORE.clear()
-        self.assertEqual(base, "https://gw.example/relay")
-        self.assertEqual(headers.get("Authorization"), "Bearer from-vault")
+# The gateway() vault tier (sonichi#2638) is tested in
+# tests/room_ops_gateway_vault.test.py — the coverage gate discovers only
+# tests/*.test.py, so the _gateway.py changed lines are measured there. The
+# shadow installed at the top of this file keeps every OTHER gateway()-calling
+# test below off the real host Keychain.
 
 
 # ----- read ----- #
