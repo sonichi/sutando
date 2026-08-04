@@ -5168,6 +5168,54 @@ def check_notes_split_brain() -> "dict | None":
     }
 
 
+def _drop_launcher_parents(pids: list) -> list:
+    """Collapse a launcher+child pair to the child that is the real process.
+
+    `pgrep -f '<name>\\.py$'` matches the LAUNCHER as well as the bridge,
+    because the launcher's own argv ends with the same script path:
+
+        pid 27538  secret-vault.py env TELEGRAM_BOT_TOKEN -- python3 src/telegram-bridge.py
+        pid 27541  python3 src/telegram-bridge.py            <- ppid 27538
+
+    Both match, so the duplicate-process check reported "multiple processes
+    (2 PIDs)" for a perfectly healthy single bridge — every run, indefinitely.
+    The `\\.py$` anchor above was added to stop a different false positive and
+    cannot help here: the launcher's command line genuinely ends in the script.
+
+    A standing false warning is worse than no warning: it is the one the
+    operator learns to scroll past, and this probe exists to catch a REAL
+    duplicate (two pollers racing for the same Telegram `getUpdates` cursor,
+    which silently splits inbound messages between them).
+
+    Identify by PID SCOPE, not by pattern: drop any matched pid that is the
+    parent of another matched pid. Keeps the leaf — the process actually doing
+    the work — and is agnostic to which launcher is in use (vault, `env`, a
+    shell wrapper). A pid whose parent is NOT in the set is untouched, so two
+    genuinely independent bridges still both survive and still warn.
+    """
+    if len(pids) < 2:
+        return list(pids)
+    try:
+        out = subprocess.run(
+            ["/bin/ps", "-o", "pid=,ppid=", "-p", ",".join(pids)],
+            capture_output=True, text=True,
+        )
+    except Exception:
+        return list(pids)
+    if out.returncode != 0:
+        # Could not resolve parentage — return the input untouched rather than
+        # guessing. Over-reporting a duplicate is recoverable; silently
+        # dropping a real second poller is not.
+        return list(pids)
+    parents = set()
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] in pids:
+            parents.add(parts[1])
+    kept = [p for p in pids if p not in parents]
+    return kept or list(pids)
+
+
 def _should_skip_bridge(channel_name: str, env_path: Path) -> bool:
     """True if SKIP_<CHANNEL>=1 is set in the main .env or as an env var.
 
@@ -5873,6 +5921,9 @@ def run_all_checks() -> list[dict]:
             result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
             pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
             pids = [p for p in pids if p]
+            # A launcher's argv ends with the same script path, so it matches
+            # this pgrep too — see _drop_launcher_parents.
+            pids = _drop_launcher_parents(pids)
         except Exception:
             pids = []
 
