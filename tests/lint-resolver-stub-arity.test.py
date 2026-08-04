@@ -61,6 +61,28 @@ def main() -> int:
     check("**kwargs only",
           not flags('_wd.resolve_workspace = lambda **kw: REPO'))
 
+    # --- FLAG: the INDIRECT form, which is what a correct fix produces ------
+    # Regression for the gap Sutando-Pro found reviewing #2622. Patching a
+    # resolver across an already-imported tree REQUIRES an intermediate name,
+    # so this is the common shape, not an exotic one. The single-walk predicate
+    # saw neither half: the lambda binds to `_fake` (not a resolver name), and
+    # the resolver assignment's value is a Name, not a Lambda.
+    check("indirect: zero-arg lambda via an alias",
+          flags('_fake = lambda: tmp\nwd.resolve_workspace = _fake'))
+    check("indirect: the real sys.modules patch loop",
+          flags(
+              '_fake = lambda: tmp\n'
+              'for _mod in list(sys.modules.values()):\n'
+              '    if getattr(_mod, "resolve_workspace", None) is orig:\n'
+              '        _mod.resolve_workspace = _fake\n'
+              'wd.resolve_workspace = _fake\n'
+          ),
+          "the exact form in tests/discord-bridge-reply-directive.test.py")
+    check("indirect: an ABSORBING alias is still fine",
+          not flags('_fake = lambda *a, **kw: tmp\nwd.resolve_workspace = _fake'))
+    check("indirect: an alias that never reaches a resolver is ignored",
+          not flags('_fake = lambda: tmp\nwd.something_else = _fake'))
+
     # --- OUT OF SCOPE ------------------------------------------------------
     check("an unrelated zero-arg lambda is ignored",
           not flags('foo.something_else = lambda: REPO'))

@@ -1005,6 +1005,14 @@ RESOLVER_NAMES = frozenset({"resolve_workspace", "_resolve_workspace"})
 #: `_workspace_root()` guards with a NARROW `except ImportError`, so the
 #: TypeError propagates loudly rather than being swallowed. A tripwire, not a
 #: landmine; it fails on first contact if the call graph ever reaches it.
+#:
+#: DO NOT READ A SHORT LIST AS A CLEAN TREE. This list is biased toward exactly
+#: the harmless case, by construction: a tripwire announces itself (a red suite
+#: gets filed, then grandfathered here), while a LANDMINE -- a stub feeding a
+#: caller behind a broad `except` -- leaves the suite green and is never filed
+#: by anyone. So the severe cases are systematically the ones MISSING from this
+#: list. Its length measures what has been noticed, not what exists.
+#: (Sutando-Pro, reviewing #2622.)
 KNOWN_RESOLVER_STUBS = {
     "tests/telegram-bridge-access.test.py",
 }
@@ -1022,20 +1030,65 @@ def _lambda_absorbs_args(fn: ast.Lambda) -> bool:
     return bool(a.args or a.posonlyargs or a.kwonlyargs)
 
 
+def _assign_target_name(t: ast.expr) -> str | None:
+    """The bare name a single assignment target binds (`x` or `mod.x`)."""
+    if isinstance(t, ast.Attribute):
+        return t.attr
+    if isinstance(t, ast.Name):
+        return t.id
+    return None
+
+
 def resolver_stub_violations(tree: ast.AST) -> list[tuple[int, str]]:
-    """(lineno, name) for every zero-arg lambda bound to a resolver name."""
-    out: list[tuple[int, str]] = []
+    """(lineno, name) for every zero-arg lambda that reaches a resolver name.
+
+    TWO walks, because the direct form is not the one a correct fix produces.
+
+    Patching a resolver across an already-imported tree REQUIRES binding the
+    stub to a name first — `from workspace_default import resolve_workspace`
+    copies the function into each importer's namespace, so every holder must be
+    reassigned in a loop:
+
+        _fake = lambda: tmp                      # walk 1 records `_fake`
+        for _mod in list(sys.modules.values()):
+            if getattr(_mod, "resolve_workspace", None) is orig:
+                _mod.resolve_workspace = _fake   # walk 2 flags this
+        workspace_default.resolve_workspace = _fake
+
+    A single-walk check sees neither half: the lambda binds to `_fake` (not a
+    resolver name), and the resolver assignment's value is a `Name`, not a
+    `Lambda`. So the shape the check MISSED was exactly the shape the defect
+    takes whenever someone fixes the redirect properly — the common case, not
+    an exotic one. Found by Sutando-Pro reviewing #2622.
+
+    Walk 1 collects names bound to a non-absorbing lambda; walk 2 flags any
+    assignment to a resolver name whose value is a Lambda (direct) or one of
+    those names (indirect). Still per-file and syntactic — no caller analysis.
+    """
+    aliases: set[str] = set()
     for n in ast.walk(tree):
         if not isinstance(n, ast.Assign) or not isinstance(n.value, ast.Lambda):
             continue
+        if _lambda_absorbs_args(n.value):
+            continue                      # `lambda *a, **kw:` is the fixed form
         for t in n.targets:
-            nm = (
-                t.attr if isinstance(t, ast.Attribute)
-                else t.id if isinstance(t, ast.Name)
-                else None
-            )
-            if nm in RESOLVER_NAMES and not _lambda_absorbs_args(n.value):
-                out.append((n.lineno, nm))
+            nm = _assign_target_name(t)
+            if nm and nm not in RESOLVER_NAMES:
+                aliases.add(nm)
+
+    out: list[tuple[int, str]] = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Assign):
+            continue
+        val = n.value
+        if isinstance(val, ast.Lambda):
+            if _lambda_absorbs_args(val):
+                continue
+        elif not (isinstance(val, ast.Name) and val.id in aliases):
+            continue
+        for t in n.targets:
+            if _assign_target_name(t) in RESOLVER_NAMES:
+                out.append((n.lineno, _assign_target_name(t)))
     return out
 
 
