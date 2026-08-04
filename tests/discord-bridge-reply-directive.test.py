@@ -312,6 +312,33 @@ def case_c_directive_only_first_chunk():
     return fails
 
 
+def test_resolver_bindings_restored_after_the_context() -> int:
+    """Protect the late-import restore sweep with an activated assertion.
+
+    Raised on the sibling #2620 by john-the-dev and qingyun-wu: the sweep
+    works, but deleting it leaves the suite green while the lazily-imported
+    consumers stay bound to the throwaway stub and resolve into a REMOVED
+    temp tree. Same code shape here (`result_audit` and `event_log` are both
+    lazily imported), so the same assertion belongs here — added without
+    waiting to be told twice.
+    """
+    import workspace_default
+    bad = []
+    for name in ("outbox_log", "result_audit", "event_log"):
+        mod = sys.modules.get(name)
+        if mod is None:
+            continue
+        if getattr(mod, "resolve_workspace", None) is not workspace_default.resolve_workspace:
+            bad.append(name)
+    if bad:
+        print(f"  ✗ resolver binding NOT restored in: {', '.join(bad)} — later writes "
+              f"in this interpreter would land in a deleted throwaway tree", file=sys.stderr)
+        return 1
+    print("  ✓ resolver bindings restored after the context "
+          f"({len([n for n in ('outbox_log','result_audit','event_log') if n in sys.modules])} lazy consumers checked)")
+    return 0
+
+
 def _workspace_fingerprint(ws) -> dict:
     """(size, mtime) for EVERY file under the workspace.
 
@@ -426,6 +453,8 @@ def main():
             print(f"  ✓ observability event redirected into the throwaway tree "
                   f"({_events[0].name})")
 
+    if test_resolver_bindings_restored_after_the_context():
+        failures.append(("resolver-restored", "lazy consumer left bound to the stub"))
     if test_no_writes_reach_the_live_workspace(live_ws):
         failures.append(("live-workspace-untouched", "fixture escaped to the live workspace"))
 
