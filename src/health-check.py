@@ -1502,6 +1502,81 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     return {"name": name, "status": "fail", "detail": "; ".join(parts)}
 
 
+def _index_growth_note(index: Path, effective_bytes: int) -> str:
+    """A trend for the memory-index warning, or "" when it cannot be measured.
+
+    The level alone reads as scenery. This probe warned "approaching the session
+    read limit" for hours on 2026-08-04 and was correctly ignored by the agent it
+    was warning, because "approaching" says nothing about whether that is a week
+    away or an hour. The history says which:
+
+        08-03 14:04   24,988 B   headroom     12 B   <- survived by 12 bytes
+        08-03 17:36   23,567 B                       <- compacted back
+        08-03 22:07   24,238 B   headroom    762 B   <- climbing again
+
+    Two hosts write this file through the vault, so neither one's own edits
+    account for the curve. A warning that cannot say "it nearly truncated today"
+    is a warning that invites exactly the shrug it got.
+
+    Fail-open by construction: no git, not a repo, no history for the path, or
+    an unparsable blob all yield "" and leave the existing message untouched. A
+    trend is a nicety; suppressing the level would be a regression.
+    """
+    try:
+        rel = index.name
+        repo = index.parent
+        proc = subprocess.run(
+            git_argv("-C", str(repo), "log", "--format=%H %at", "-n", "12", "--", rel),
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return ""
+        points: "list[tuple[int, int]]" = []
+        for line in proc.stdout.splitlines():
+            sha, _, at = line.partition(" ")
+            if not sha or not at.strip().isdigit():
+                continue
+            blob = subprocess.run(
+                git_argv("-C", str(repo), "show", f"{sha}:./{rel}"),
+                capture_output=True, timeout=10,
+            )
+            if blob.returncode != 0:
+                continue
+            points.append((int(at), len(blob.stdout)))
+        if len(points) < 2:
+            return ""
+        points.sort()
+        # Closest the index has come to the cut in the recorded window. This is
+        # the number that makes the warning land, and no point reading has it.
+        peak = max(sz for _, sz in points)
+        oldest_at, oldest_sz = points[0]
+        newest_at, _ = points[-1]
+        hours = (newest_at - oldest_at) / 3600.0
+        grew = effective_bytes - oldest_sz
+        note = ""
+        if peak > MEMORY_INDEX_LOAD_BYTES:
+            # Not "nearly" — it was OVER, so the tail was genuinely unread for as
+            # long as that revision stood. The first draft of this note printed
+            # "came within -156 B of the cut", which is how a sign error ships as
+            # reassurance: the one history that proves real loss rendered as the
+            # calmest wording in the message.
+            note += (f"; it has ALREADY EXCEEDED the cut in this history, by "
+                     f"{peak - MEMORY_INDEX_LOAD_BYTES:,} B — entries were dropped then, "
+                     f"and only a compaction brought it back")
+        elif peak > MEMORY_INDEX_LOAD_BYTES * 0.97:
+            note += (f"; it came within {MEMORY_INDEX_LOAD_BYTES - peak:,} B of the cut "
+                     f"inside this history and was pulled back by a compaction, not by headroom")
+        if hours >= 0.5 and grew > 0:
+            rate = grew / hours
+            left = MEMORY_INDEX_LOAD_BYTES - effective_bytes
+            note += (f"; +{grew:,} B over the last {hours:.1f}h"
+                     + (f", which is ~{left / rate:.1f}h of remaining headroom at that rate"
+                        if rate > 0 and left > 0 else ""))
+        return note
+    except (GitUnavailable, OSError, subprocess.SubprocessError, ValueError):
+        return ""
+
+
 def check_memory_index_integrity() -> "dict | None":
     """Catch memories that exist on disk but will never load into a session.
 
@@ -1646,6 +1721,7 @@ def check_memory_index_integrity() -> "dict | None":
         parts.append(
             f"MEMORY.md is approaching the session read limit ({_size_note()})"
             + (" and is already truncated" if truncated else "")
+            + _index_growth_note(index, effective_bytes)
             + " — compact it now; entries past the cut are dropped silently while "
               "every memory file still looks fine on disk"
         )
