@@ -155,16 +155,64 @@ else
 fi
 
 # The startup message must not promise a skip the script does not perform.
-if grep -q 'will be skipped' "$REPO/src/startup.sh"; then
-  for svc in dashboard agent-api; do
-    if grep -qE "skipped \(no runnable python3\)" "$REPO/src/startup.sh"; then
-      ok "startup.sh actually skips $svc rather than only claiming to"
-      break
-    else
-      bad "startup.sh actually skips $svc" "promise without a skip branch"
-      break
-    fi
-  done
+# NOTE: the first version of this block asked `grep -q "skipped (no runnable
+# python3)"` ONCE and then `break`, so a single skip branch anywhere satisfied
+# it for every service in the list — vacuous. The two guards below replace it
+# with checks that are per-site and per-service.
+
+# ── 11. A guarded background launch must not be followed by an unconditional ✓.
+# CR #2599 (@qingyun-wu) P1: four sites read
+#
+#     [ -n "$PY" ] && "$PY" .../core_heartbeat.py > ... 2>&1 &
+#     echo "  ✓ core heartbeat"
+#
+# The guard suppresses the launch; the echo runs regardless. On a no-CLT Mac
+# startup then reports the heartbeat, services-status emitter, screen capture
+# and gateway bridge as started with no process behind any of them — and the
+# heartbeat/gateway pair are exactly the liveness + remote-control surfaces
+# other hosts trust. Enumerate the shape rather than the four known lines, so a
+# fifth site added later cannot reintroduce it silently.
+bg_guards=$(grep -nE '^\s*\[ -n "\$PY" \] &&.*&\s*$' "$REPO/src/startup.sh" || true)
+if [ -z "$bg_guards" ]; then
+  ok "no backgrounded launch uses the '&& cmd &' guard (all use if/else)"
+else
+  bad "no backgrounded launch uses the '&& cmd &' guard" \
+      "still present at lines: $(printf '%s' "$bg_guards" | cut -d: -f1 | tr '\n' ' ')"
+fi
+
+# ── 12. Every Python-backed service the reviewer named owns an explicit skip
+# branch. Counted per service, so covering one does not vouch for the rest.
+missing=""
+for svc in "core heartbeat" "services-status emitter" "screen capture" "gateway bridge"; do
+  grep -qF "⊘ $svc skipped — no runnable python3" "$REPO/src/startup.sh" || missing="${missing}[$svc] "
+done
+if [ -z "$missing" ]; then
+  ok "each Python-backed service prints an explicit ⊘ skip when \$PY is empty"
+else
+  bad "each Python-backed service prints an explicit ⊘ skip" "no skip branch for: $missing"
+fi
+
+# ── 13. `${PY:-<fallback>}` may only fall back to a command that is a safe
+# no-op. CR #2599 P2: `${PY:-cat} -c "import sys,json…"` ran `cat -c`, which is
+# not a valid invocation of cat on BSD or GNU. It fails, `|| echo ""` swallows
+# the error, and the operator gets a live ngrok tunnel with a stale
+# WEBHOOK_BASE_URL — Twilio keeps posting to the previous session's URL. Only
+# `false` is acceptable: it accepts any argv and exits non-zero.
+# Comment-aware and token-wise: the first draft scanned raw lines and flagged
+# the comment that *documents* the bug, and a line-wise filter would let a bad
+# fallback hide on the same line as a good one.
+badfb=$(awk '!/^[[:space:]]*#/ {
+  line = $0
+  while (match(line, /\$\{PY:-[^}]*\}/)) {
+    tok = substr(line, RSTART, RLENGTH)
+    if (tok != "${PY:-false}") print FNR ":" tok
+    line = substr(line, RSTART + RLENGTH)
+  }
+}' "$REPO/src/startup.sh")
+if [ -z "$badfb" ]; then
+  ok "every \${PY:-…} fallback is 'false' (accepts any argv, exits non-zero)"
+else
+  bad "every \${PY:-…} fallback is 'false'" "unsafe fallback(s): $(printf '%s' "$badfb" | tr '\n' ' ')"
 fi
 
 # --- 9. every fixture that materialises the REAL config script must also -----

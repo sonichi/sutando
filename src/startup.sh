@@ -655,8 +655,16 @@ fi
 # instance per host; gracefully cleans up its .alive file on SIGTERM.
 if ! pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
   echo "  Starting core heartbeat..."
-  [ -n "$PY" ] && "$PY" "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
-  echo "  ✓ core heartbeat"
+  # The ✓ must live INSIDE the guard. `[ -n "$PY" ] && cmd &` followed by an
+  # unconditional echo claims a start that never happened when no interpreter
+  # resolved — and this one is the per-host liveness signal, so a false ✓ makes
+  # the node look alive with nothing writing .alive.
+  if [ -n "$PY" ]; then
+    "$PY" "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
+    echo "  ✓ core heartbeat"
+  else
+    echo "  ⊘ core heartbeat skipped — no runnable python3"
+  fi
 else
   echo "  ✓ core heartbeat (already running)"
 fi
@@ -666,8 +674,12 @@ fi
 # Single instance per host; ~30s cadence; SIGTERM-clean like the heartbeat.
 if ! pgrep -f "$REPO/src/services_status.py" > /dev/null 2>&1; then
   echo "  Starting services-status emitter..."
-  [ -n "$PY" ] && "$PY" "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
-  echo "  ✓ services-status emitter"
+  if [ -n "$PY" ]; then
+    "$PY" "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
+    echo "  ✓ services-status emitter"
+  else
+    echo "  ⊘ services-status emitter skipped — no runnable python3"
+  fi
 else
   echo "  ✓ services-status emitter (already running)"
 fi
@@ -916,8 +928,12 @@ reap_wedged_listener 7845 screen-capture
 if ! lsof -i :7845 > /dev/null 2>&1; then
   if [ "$PERM_OK" -eq 1 ]; then
     echo "  Starting screen capture (port 7845)..."
-    [ -n "$PY" ] && "$PY" src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
-    echo "  ✓ screen capture"
+    if [ -n "$PY" ]; then
+      "$PY" src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
+      echo "  ✓ screen capture"
+    else
+      echo "  ⊘ screen capture skipped — no runnable python3"
+    fi
   else
     echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
   fi
@@ -1145,8 +1161,12 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
   # the redirect below); the bridge stamps launched_via into gateway-status
   # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-  [ -n "$PY" ] && SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
-  echo "  ✓ gateway bridge (self-defers if already running)"
+  if [ -n "$PY" ]; then
+    SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+    echo "  ✓ gateway bridge (self-defers if already running)"
+  else
+    echo "  ⊘ gateway bridge skipped — no runnable python3"
+  fi
 
   # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
   # the environment launches one extra bridge for that gateway (e.g.
@@ -1294,7 +1314,17 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
       ngrok http 3100 --log=stdout > /tmp/ngrok.log 2>&1 &
     fi
     sleep 3
-    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | ${PY:-cat} -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
+    # `${PY:-cat} -c` was not a fallback: with no interpreter it runs `cat -c`,
+    # which is not a valid cat invocation on either BSD or GNU. It fails, the
+    # `|| echo ""` swallows it, and the operator is left with a running ngrok
+    # tunnel and a stale WEBHOOK_BASE_URL — Twilio then posts to the previous
+    # session's URL. Skip explicitly and say why instead.
+    if [ -n "$PY" ]; then
+      NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | "$PY" -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
+    else
+      NGROK_URL=""
+      echo "  ⊘ ngrok URL not parsed — no runnable python3; set WEBHOOK_BASE_URL in .env manually"
+    fi
     if [ -n "$NGROK_URL" ]; then
       # Update WEBHOOK_BASE_URL in .env — portable in-place edit.
       # `sed -i ''` is BSD-only; on Macs with Homebrew gnu-sed in PATH it
