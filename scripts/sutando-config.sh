@@ -41,13 +41,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # bundled CLAUDE_CONFIG_DIR". Prefer, in order: an explicit SUTANDO_PY (set by
 # launch-sutando.sh), the bundle-vendored relocatable python next to the engine
 # copy (`<engine>/runtime/python`, i.e. REPO_ROOT/../runtime), then system python3.
-if [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
-  PY="$SUTANDO_PY"
-elif [ -x "$REPO_ROOT/../runtime/python/bin/python3" ]; then
-  PY="$REPO_ROOT/../runtime/python/bin/python3"
-else
-  PY="python3"
-fi
+# Single-sourced in scripts/python-binary.sh so this cascade cannot drift from
+# start-cli.sh / startup.sh. The `else PY="python3"` this replaced still shelled
+# the CLT stub when neither earlier tier existed, which is the dialog itself.
+. "$REPO_ROOT/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO_ROOT")"
 
 cmd="${1:-workspace}"
 

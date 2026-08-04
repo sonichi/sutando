@@ -28,13 +28,10 @@ cd "$REPO"
 # exists to prevent. Prefer SUTANDO_PY (set by launch-sutando.sh), else the
 # bundle-vendored relocatable python (`<engine>/runtime/python`, i.e. REPO/../runtime),
 # else system python3.
-if [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
-  PY="$SUTANDO_PY"
-elif [ -x "$REPO/../runtime/python/bin/python3" ]; then
-  PY="$REPO/../runtime/python/bin/python3"
-else
-  PY="python3"
-fi
+# Single-sourced in scripts/python-binary.sh (see there for why the bare-name
+# fallback this replaced was the CLT-dialog trigger).
+. "$REPO/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO")"
 
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.

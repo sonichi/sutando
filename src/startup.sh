@@ -5,6 +5,21 @@
 set -e
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Resolve python3 ONCE, refusing Apple's Xcode-CLT stub. On a Mac without the
+# developer tools `/usr/bin/python3` exists but raises a modal install dialog
+# when executed, and this script spawns python3 ~15 times — dashboard.py and
+# agent-api.py on a respawn backoff, so each retry re-raised it. Measured on a
+# clean macOS 26.5 VM against Sutando 0.5.0-rc.2.
+#
+# $PY is empty when nothing runnable exists; every call site below must skip
+# rather than fall back to the bare name (that IS the stub).
+. "$REPO/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO")"
+if [ -z "$PY" ]; then
+  echo "  ~ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
+  echo "    Python-backed services will be skipped rather than raising the CLT dialog."
+fi
 cd "$REPO"
 
 # Belt-and-suspenders startup log → always recoverable from /tmp (Lucy's Bug #5
@@ -211,7 +226,7 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
         # python3 -c is the most portable jq-free way to write a tiny JSON
         # without shell-quoting hazards on the token value. Env vars
         # prefixed to the command (not appended as args) per POSIX.
-        if _p="$_ccd/.credentials.json" _t="$_env_token" python3 -c "
+        if _p="$_ccd/.credentials.json" _t="$_env_token" ${PY:-false} -c "
 import json,os
 p=os.environ['_p']
 t=os.environ['_t']
@@ -221,7 +236,7 @@ json.dump({'claudeAiOauth':{'accessToken':t}}, open(p,'w'))
           echo "  ~ env-token-persist: wrote .credentials.json from \$$_env_var_used (mode 600)"
           # Sidecar provenance file (#1504) — never read by Claude Code.
           # Records how this credentials file was produced for audit/migration tools.
-          _p="$_ccd/.credentials.source.json" _v="$_env_var_used" python3 -c "
+          _p="$_ccd/.credentials.source.json" _v="$_env_var_used" ${PY:-false} -c "
 import json,os,datetime
 p=os.environ['_p']; v=os.environ['_v']
 json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),'persist_block_version':1},open(p,'w'))
@@ -272,7 +287,7 @@ git -C "$REPO" config --unset committer.email 2>/dev/null || true
 # so a kept local edit must be re-applied per host. The applier is idempotent +
 # fail-loud: it never force-applies and a stale/missing patch WARNs without
 # failing startup. See skills/plugin-patches/README.md.
-python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
+[ -n "$PY" ] && "$PY" "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
 
 # Load optional .env configuration BEFORE init.sh. Two reasons must both hold:
 #  1) init.sh resolves the workspace via `${SUTANDO_WORKSPACE/#~/$HOME}` with
@@ -406,7 +421,7 @@ fi
 # Note: the actual workspace path used below in `WORKSPACE=...` still comes
 # from the legacy resolver in this file. Wiring it to come from the loader
 # is a follow-up change — this banner is the early-warning layer.
-if ! python3 -m src.sutando_config >/dev/null; then
+if [ -n "$PY" ] && ! "$PY" -m src.sutando_config >/dev/null; then
   echo "  ✗ sutando.config.json is malformed — fix the parse error above."
   exit 1
 fi
@@ -627,14 +642,14 @@ fi
 # freshly-restarted task-bridge or discord-bridge poll loop sees a backlog
 # of long-dead result files and re-delivers them. Post-mortem:
 # notes/post-mortem-dm-flood-2026-04-15.md.
-python3 "$REPO/src/archive-stale-results.py" || true
+[ -n "$PY" ] && "$PY" "$REPO/src/archive-stale-results.py" || true
 
 # Core heartbeat — per-host alive signal under state/cores/<hostname>.alive.
 # Foundation for multi-core / cross-machine "who's running?" checks. Single
 # instance per host; gracefully cleans up its .alive file on SIGTERM.
 if ! pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
   echo "  Starting core heartbeat..."
-  python3 "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
+  [ -n "$PY" ] && "$PY" "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
   echo "  ✓ core heartbeat"
 else
   echo "  ✓ core heartbeat (already running)"
@@ -645,7 +660,7 @@ fi
 # Single instance per host; ~30s cadence; SIGTERM-clean like the heartbeat.
 if ! pgrep -f "$REPO/src/services_status.py" > /dev/null 2>&1; then
   echo "  Starting services-status emitter..."
-  python3 "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
+  [ -n "$PY" ] && "$PY" "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
   echo "  ✓ services-status emitter"
 else
   echo "  ✓ services-status emitter (already running)"
@@ -863,7 +878,7 @@ fi
 reap_wedged_listener 7844 dashboard
 if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
-  python3 src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
+  "$PY" src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
   echo "  ✓ dashboard"
 else
   echo "  ✓ dashboard (already running)"
@@ -873,7 +888,7 @@ fi
 reap_wedged_listener 7843 agent-api
 if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
-  python3 src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
+  "$PY" src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
   echo "  ✓ agent API"
 else
   echo "  ✓ agent API (already running)"
@@ -887,7 +902,7 @@ reap_wedged_listener 7845 screen-capture
 if ! lsof -i :7845 > /dev/null 2>&1; then
   if [ "$PERM_OK" -eq 1 ]; then
     echo "  Starting screen capture (port 7845)..."
-    python3 src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
+    "$PY" src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
     echo "  ✓ screen capture"
   else
     echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
@@ -1047,8 +1062,11 @@ elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
     # CERTIFICATE_VERIFY_FAILED — silently dropping all messages (cost us ~10h
     # on 2026-06-15, caught only by a stale-heartbeat health warning).
     _tg_tls_ok() { "$1" -c 'import urllib.request as u; u.urlopen("https://api.telegram.org",timeout=8)' >/dev/null 2>&1; }
-    TGPY="python3"
-    if ! _tg_tls_ok "$TGPY"; then
+    # Seed from the resolved interpreter, not the bare name: _tg_tls_ok EXECUTES
+    # its argument, so a bare "python3" here runs the CLT stub before the probe
+    # can judge anything.
+    TGPY="$PY"
+    if [ -n "$TGPY" ] && ! _tg_tls_ok "$TGPY"; then
       for _c in "$(pyenv which python3 2>/dev/null)" python3.12 python3.11; do
         [ -n "$_c" ] && command -v "$_c" >/dev/null 2>&1 && _tg_tls_ok "$_c" && TGPY="$_c" && break
       done
@@ -1109,7 +1127,7 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
   # the redirect below); the bridge stamps launched_via into gateway-status
   # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-  SUTANDO_SUPERVISED=1 python3 "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+  SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
   echo "  ✓ gateway bridge (self-defers if already running)"
 
   # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
@@ -1125,7 +1143,7 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
     _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
     SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
       REMOTE_PROACTIVE_ROOM= \
-      python3 "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+      "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
     echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
   done
 fi
@@ -1232,7 +1250,7 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
       ngrok http 3100 --log=stdout > /tmp/ngrok.log 2>&1 &
     fi
     sleep 3
-    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
+    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | "$PY" -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
     if [ -n "$NGROK_URL" ]; then
       # Update WEBHOOK_BASE_URL in .env — portable in-place edit.
       # `sed -i ''` is BSD-only; on Macs with Homebrew gnu-sed in PATH it
