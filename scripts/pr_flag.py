@@ -205,18 +205,117 @@ def state_hash(state: list) -> str:
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
 
 
-def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
+def fetch_argv(repo: str, owner_login: str) -> list:
+    """The exact `gh` command the fetch runs.
+
+    Extracted so `scope_descriptor()` can DERIVE the payload's coverage claim from
+    the real argv instead of restating it in prose. A hand-written scope string is
+    the thing it is describing plus a chance to be wrong: widen the fetch, forget
+    the string, and the payload now asserts a filter the code no longer applies.
+    """
     # SCOPE NOTE: `--author owner_login` means this only ever sees the owner's OWN
     # PRs (24 of 116 open on 2026-08-02). Peer PRs where the owner's approval is
     # the thing unblocking a merge are not fetched at all, so they cannot appear
     # in any digest built from this state. Left alone deliberately -- widening the
     # fetch is a scope decision, not a field-completeness fix, and belongs in its
-    # own change.
-    cmd = [
+    # own change (issue #2643).
+    return [
         "gh", "pr", "list", "--repo", repo, "--state", "open",
         "--author", owner_login, "--limit", "1000",
         "--json", "number,title,author,baseRefName,headRefOid,mergeable,reviewDecision,statusCheckRollup,isDraft,reviews",
     ]
+
+
+def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
+                     fetched_count: int = None) -> dict:
+    """Name the emitted population precisely, from the WHOLE pipeline.
+
+    Why this exists: the payload carries counts, per-PR CI, approvals and merge
+    state, and nothing in it marks the population as partial. A consumer that
+    builds a digest from it therefore reads "31 open" as a repository total. That
+    happened on 2026-08-04 -- the figure was the owner-authored subset of ~100
+    non-draft PRs, and the SCOPE NOTE explaining why lives in this file, which the
+    consumer never sees.
+
+    Three things narrow the population, and the descriptor is only honest if it
+    reports all three (@john-the-dev on #2645 -- the first version read ONLY the
+    `--author` flag, so with the filter removed it certified
+    `is_repo_total: true, excludes: "nothing"` while `raw_state()` still dropped
+    every draft and the fetch still capped at `--limit`. That is the same
+    completeness-metadata-disagrees-with-the-data-path defect this block exists
+    to remove, one level up):
+
+      1. `--author` on the fetch (may be absent)
+      2. `raw_state()` drops drafts UNCONDITIONALLY -- so the payload is NEVER a
+         repository total, with or without the author filter
+      3. `--limit` is a ceiling; at exactly the ceiling, complete and truncated
+         are indistinguishable
+
+    `is_repo_total` is gone rather than fixed: no value of it was ever true, so a
+    consumer keying on it would be reasoning about a population that cannot
+    exist. `population` names the real set and `complete` reports only what the
+    record count can actually certify.
+    """
+    argv = fetch_argv(repo, owner_login)
+    author = argv[argv.index("--author") + 1] if "--author" in argv else None
+    limit_s = argv[argv.index("--limit") + 1] if "--limit" in argv else None
+    try:
+        limit = int(limit_s) if limit_s is not None else None
+    except (TypeError, ValueError):
+        limit = None
+
+    excludes = ["draft PRs (dropped by raw_state, always)"]
+    if author:
+        excludes.append(
+            f"PRs not authored by {author!r} -- including peer PRs where the "
+            "owner's approval is the only thing blocking a merge"
+        )
+
+    # complete==True is a CERTIFICATION, so it is only ever granted on evidence:
+    # a count strictly below the ceiling. Unknown count -> None, never True.
+    #
+    # The count compared against the ceiling must be the PRE-filter FETCHED count
+    # (@john-the-dev's second blocker on #2645). The ceiling applies to
+    # `_fetch_prs()`; `raw_state()` then drops drafts, so the emitted count is
+    # strictly smaller. Certifying off the emitted count means one dropped draft
+    # at a truncated fetch reads as complete:
+    #
+    #     fetched=1000 (== ceiling, truncated)  ->  emitted=999  ->  "below the
+    #     1000 ceiling"  ->  complete=True, on a population GitHub had cut off.
+    #
+    # Exactly the defect this descriptor exists to remove, reintroduced by
+    # measuring the wrong side of the filter. `record_count` stays in the payload
+    # as the emitted size — it is what the consumer actually received — but it
+    # never decides completeness.
+    ceiling_count = fetched_count if fetched_count is not None else record_count
+    if ceiling_count is None or limit is None:
+        complete = None
+        why = "fetched count or fetch ceiling unknown — completeness not certified"
+    elif ceiling_count >= limit:
+        complete = False
+        why = (f"fetch returned {ceiling_count} at a {limit} ceiling — complete "
+               "and truncated are indistinguishable here")
+    else:
+        complete = True
+        why = f"fetch returned {ceiling_count}, below the {limit} ceiling"
+
+    return {
+        "filter": f"author:{author}" if author else "none",
+        "population": (
+            f"open, non-draft PRs authored by {author!r}"
+            if author else "open, non-draft PRs (all authors)"
+        ),
+        "excludes": excludes,
+        "complete": complete,
+        "complete_reason": why,
+        "record_count": record_count,
+        "fetched_count": ceiling_count,
+        "limit": limit,
+    }
+
+
+def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
+    cmd = fetch_argv(repo, owner_login)
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:
         print(f"pr-flag: gh failed: {res.stderr[:200]}", file=sys.stderr)
@@ -314,8 +413,10 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     ap.add_argument("--state-file", default=None)
     args = ap.parse_args()
 
-    state = raw_state(_attach_commits(args.repo, _fetch_prs(args.repo, args.owner)),
-                      args.owner, args.stand)
+    # Bound separately so the PRE-filter size is available to scope_descriptor:
+    # the `--limit` ceiling applies here, before raw_state() drops drafts.
+    fetched = _attach_commits(args.repo, _fetch_prs(args.repo, args.owner))
+    state = raw_state(fetched, args.owner, args.stand)
     h = state_hash(state)
 
     # dedup: resolve the stored-hash file the same way every reader does
@@ -339,7 +440,15 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
         return 0
 
     # emit the objective state for the AGENT to judge, then record the hash
-    print(json.dumps({"hash": h, "changed": True, "prs": state}, indent=2))
+    print(json.dumps({
+        "hash": h,
+        "changed": True,
+        # fetched_count is the PRE-filter size: the ceiling applies to the fetch,
+        # not to what survives raw_state(). See scope_descriptor().
+        "scope": scope_descriptor(args.repo, args.owner, record_count=len(state),
+                                  fetched_count=len(fetched)),
+        "prs": state,
+    }, indent=2))
     try:
         sf.parent.mkdir(parents=True, exist_ok=True)
         sf.write_text(json.dumps({"hash": h, "count": len(state)}))
