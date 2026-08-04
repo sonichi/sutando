@@ -2370,9 +2370,16 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     # Observed 2026-08-03 on this node: exactly ONE commit behind — far under the
     # threshold, so this probe reported ok — while the live `context-reconstruct`
     # still instructed writing `state/current-track.md`, the shared flat path
-    # whose two-writer collision had destroyed a peer's anchor hours earlier
+    # that delivers one host's anchor onto another host at the same local path
     # (#2567/#2568). The running skill and the merged skill disagreed, and both
     # looked correct from where anyone was standing.
+    #
+    # This sentence used to say that collision "had destroyed a peer's anchor".
+    # Nothing was destroyed — see the UNSAFE_TO_READD comment above, which is the
+    # authority: the vault uses per-host branches, so a host only ever merges a
+    # peer INTO its own branch. The example still lands, because it never needed
+    # the destruction to: the point is that the running skill and the merged one
+    # disagreed invisibly, and that is true of any content difference.
     stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
     if stale_skills:
         return {"name": name, "status": "warn",
