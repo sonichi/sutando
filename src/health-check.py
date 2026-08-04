@@ -51,6 +51,7 @@ from git_binary import GitUnavailable  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
+from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
@@ -999,6 +1000,40 @@ def check_session_cron_registration(
             "status": "warn",
             "detail": f"only {registered}/{expected} session cron(s) registered at last /schedule-crons",
         }
+
+    # CONFIG DRIFT. Everything above answers "was a registration completed for
+    # this boot?" — a count, and a count cannot see an entry whose PROMPT was
+    # edited after it was registered. That drift is silent by construction: the
+    # config is right, the script is right, and only the stale registration is
+    # wrong (#2653, where a `--stand` flag added four days into a session kept
+    # not firing, and the field it populates read null on all 27 PRs).
+    #
+    # #2653 makes /schedule-crons re-register rather than skip, so the drift
+    # self-heals on the next run. This makes an UNHEALED one visible in between,
+    # because until the next run the only other observation point is a fire.
+    #
+    # Restricted to `session_owned` names: an edit to a launchd- or codex-owned
+    # entry is not a session-cron problem and must not warn as one. A stamp
+    # written before this field existed simply skips the check — an old stamp
+    # must not manufacture a warning it has no data for.
+    stamped_digests = stamp.get("config_digests")
+    if isinstance(stamped_digests, dict):
+        session_names = [
+            e.get("name") for e in crons if isinstance(e, dict) and session_owned(e)
+        ]
+        moved = drifted(stamped_digests, digest_map(crons), names=session_names)
+        if moved:
+            shown = ", ".join(moved[:4]) + ("…" if len(moved) > 4 else "")
+            return {
+                "name": name,
+                "status": "warn",
+                "detail": (
+                    f"{len(moved)} session cron(s) edited in crons.json since they were "
+                    f"registered ({shown}) — the running job still fires the OLD prompt; "
+                    f"re-run /schedule-crons"
+                ),
+            }
+
     return {"name": name, "status": "ok", "detail": f"{expected} session cron(s) stamped registered this boot"}
 
 

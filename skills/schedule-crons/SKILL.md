@@ -63,9 +63,18 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    WS="$(bash scripts/sutando-config.sh workspace)"
    H="$(bash scripts/sutando-config.sh host-label)"
    mkdir -p "$WS/hosts/$H"
-   echo "{\"ts\": $(date +%s), \"registered\": <count>, \"config_total\": <total entries in crons.json>}" > "$WS/hosts/$H/schedule-crons-stamp.json"
+   DIGESTS="$(python3 "$(git -C . rev-parse --show-toplevel)/src/cron_entry_digest.py" "$WS/hosts/$H/crons.json")"
+   echo "{\"ts\": $(date +%s), \"registered\": <count>, \"config_total\": <total entries in crons.json>, \"config_digests\": $DIGESTS}" > "$WS/hosts/$H/schedule-crons-stamp.json"
    ```
    `health-check.py`'s `session-crons` probe compares this host-owned stamp against the same host's core heartbeat `started_at`: a stamp older than the boot means session crons died with a previous session and were never re-registered (the silent 2/18 failure observed on a peer instance 2026-07-23). Do not skip the stamp on re-runs — a fresh stamp is what keeps the guard quiet.
+
+   **`config_digests` is what makes an edit visible.** Everything else in the stamp is a COUNT, and a
+   count cannot see an entry whose prompt changed after it was registered. Stamp the digest map of
+   the `crons.json` you just registered from; the probe recomputes it and names any session-owned
+   entry whose digest moved. Write it in the SAME command as the counts — a digest map stamped
+   separately can be skipped, and a stamp with fresh counts and a stale digest map is worse than one
+   with no digest map at all. Omitting the field is safe (the probe skips the check); a WRONG map
+   would report drift that is not there.
 
 6. Confirm what was scheduled — note whether the proactive-loop fallback was triggered (informs operator that crons.json may need a persistent entry).
 
