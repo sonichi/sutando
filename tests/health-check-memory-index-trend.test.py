@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""`_index_growth_note` — the trend appended to the memory-index warning.
+
+The probe it feeds warned "approaching the session read limit" for hours on
+2026-08-04 and was read as scenery, correctly: a level that never moves carries
+no information about whether the cut is a week away or an hour. These cases pin
+the two things the level cannot say, and the two ways the note must stay quiet.
+
+The over-cap case is the one that matters most. The first draft computed
+`LOAD_BYTES - peak`, which goes NEGATIVE once peak exceeds the cap and printed
+"came within -156 B of the cut" — so the one history that proves real loss
+rendered as the calmest wording in the message. `test_over_cap_*` fails on that
+draft.
+"""
+from __future__ import annotations
+import importlib.util
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SRC = REPO / "src" / "health-check.py"
+
+
+def _hc():
+    spec = importlib.util.spec_from_file_location("hc_trend_test", SRC)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+
+
+def _repo_with_sizes(tmp: Path, sizes: "list[int]") -> Path:
+    """A git repo whose MEMORY.md is committed once per entry in `sizes`."""
+    repo = tmp / "vault"
+    repo.mkdir()
+    _git(repo.parent, "init", "-q", str(repo))
+    _git(repo, "config", "user.email", "t@e")
+    _git(repo, "config", "user.name", "t")
+    idx = repo / "MEMORY.md"
+    for i, n in enumerate(sizes):
+        idx.write_text("x" * n)
+        _git(repo, "add", "MEMORY.md")
+        # distinct, increasing author dates so the window spans real hours
+        env_date = f"2026-08-03T{i:02d}:00:00"
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", f"c{i}",
+             "--date", env_date],
+            check=True, capture_output=True,
+            env={**__import__("os").environ, "GIT_COMMITTER_DATE": env_date},
+        )
+    return idx
+
+
+class OverCapIsNamedAsLoss(unittest.TestCase):
+    def test_over_cap_says_already_exceeded_and_never_a_negative(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [cap - 300, cap + 156, cap - 500])
+            note = m._index_growth_note(idx, cap - 500)
+        self.assertIn("ALREADY EXCEEDED", note)
+        self.assertIn("156", note)
+        # the sign error this test exists for
+        self.assertNotIn("-156", note)
+        self.assertNotIn("came within -", note)
+
+    def test_near_but_under_cap_says_came_within(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [cap - 2000, cap - 12, cap - 900])
+            note = m._index_growth_note(idx, cap - 900)
+        self.assertIn("came within", note)
+        self.assertNotIn("ALREADY EXCEEDED", note)
+        self.assertNotIn("-", note.split("came within")[1][:12])
+
+
+class FailsOpen(unittest.TestCase):
+    """A trend is a nicety; suppressing the level would be a regression."""
+
+    def test_not_a_git_repo_returns_empty(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x" * 100)
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+    def test_single_commit_is_not_a_trend(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [1000])
+            self.assertEqual(m._index_growth_note(idx, 1000), "")
+
+    def test_missing_file_returns_empty(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(
+                m._index_growth_note(Path(td) / "nope" / "MEMORY.md", 100), "")
+
+
+class TheHelperCanActuallyFire(unittest.TestCase):
+    """Control. Every assertion above is about STRING CONTENT, so a helper that
+    returned "" unconditionally would satisfy the fail-open cases and give the
+    suite a green half. This is the case that must produce a non-empty note, so
+    the negatives above mean something."""
+
+    def test_a_real_history_produces_a_non_empty_note(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [cap - 3000, cap + 10, cap - 800])
+            note = m._index_growth_note(idx, cap - 800)
+        self.assertTrue(note.strip(), "the helper produced nothing on a real history")
+
+
+if __name__ == "__main__":
+    unittest.main()
