@@ -161,6 +161,104 @@ class ConfigDriftTest(unittest.TestCase):
             self.assertEqual(self._check(ws)["status"], "ok")
 
 
+class OwnershipTransitionTest(unittest.TestCase):
+    """A registered entry that LEAVES the session-owned set keeps firing.
+
+    Raised by @john-the-dev on #2654: `registered < expected` runs one way only.
+    Edit a registered entry to `launchd: true` and `expected` drops while the
+    session job registered under the old config stays live — counts read
+    registered=2 / expected=1, and `2 < 1` is false. The digest is blind here by
+    design (entry_digest ignores ownership fields so an entry that correctly
+    stopped being registered is not reported as *edited*), so the surplus itself
+    has to be the signal.
+    """
+
+    def _ws(self, root: Path, ents, stamp):
+        ws = root / "workspace"
+        cfg = ws / "hosts" / "test-host" / "crons.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(json.dumps(ents))
+        (ws / "state").mkdir(parents=True, exist_ok=True)
+        (cfg.parent / "schedule-crons-stamp.json").write_text(json.dumps(stamp))
+        (ws / "state" / "session-starts.log").write_text(
+            json.dumps({"host": "test-host", "session_started_at": BOOT}) + "\n")
+        return ws
+
+    def _check(self, ws):
+        with mock.patch.object(health, "_local_host_labels", return_value={"test-host"}):
+            return health.check_session_cron_registration(ws, host_label="test-host", runtime="claude")
+
+    def test_launchd_transition_warns(self):
+        registered = entries()
+        moved = [dict(e, launchd=True) if e["name"] == "pr-flag" else e for e in entries()]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), moved,
+                          {"ts": STAMPED, "registered": 2, "config_total": 2,
+                           "config_digests": digest_map(registered)})
+            check = self._check(ws)
+            self.assertEqual(check["status"], "warn")
+            self.assertIn("still live", check["detail"])
+
+    def test_codex_task_transition_warns(self):
+        registered = entries()
+        moved = [dict(e, execution="codex-task") if e["name"] == "pr-flag" else e
+                 for e in entries()]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), moved,
+                          {"ts": STAMPED, "registered": 2, "config_total": 2,
+                           "config_digests": digest_map(registered)})
+            self.assertEqual(self._check(ws)["status"], "warn")
+
+    def test_deleted_entry_whose_job_is_still_live_warns(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), entries()[:1],
+                          {"ts": STAMPED, "registered": 2, "config_total": 1,
+                           "config_digests": digest_map(entries())})
+            self.assertEqual(self._check(ws)["status"], "warn")
+
+    def test_the_matched_case_stays_quiet(self):
+        """Control: registered == expected must NOT warn, or every case above
+        is passing for the wrong reason."""
+        ents = entries()
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), ents,
+                          {"ts": STAMPED, "registered": 2, "config_total": 2,
+                           "config_digests": digest_map(ents)})
+            self.assertEqual(self._check(ws)["status"], "ok")
+
+    def test_bootstrap_fallback_surplus_warns_and_names_the_fallback(self):
+        """Step 4 registers /proactive-loop when the config lacks it, so
+        registered legitimately exceeds expected by one.
+
+        This case DELIBERATELY still warns. Subtracting one for the fallback was
+        the first attempt: from counts alone a benign fallback and a single real
+        transition are the same surplus, so the allowance absorbs exactly one
+        transition — an amnesty rather than a filter. Caught by the sibling test
+        below, which failed against that version. The message names the fallback
+        so the operator can tell which they are looking at."""
+        no_loop = [{"name": "pr-flag", "cron": "17 * * * *", "prompt": "run pr_flag"}]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), no_loop,
+                          {"ts": STAMPED, "registered": 2, "config_total": 1,
+                           "config_digests": digest_map(no_loop)})
+            check = self._check(ws)
+            self.assertEqual(check["status"], "warn")
+            self.assertIn("bootstrap", check["detail"])
+
+    def test_a_transition_ON_TOP_of_the_fallback_still_warns(self):
+        """With the fallback armed AND an entry moved out, the surplus is 2.
+        This is the case that killed the allowance approach."""
+        no_loop_moved = [
+            {"name": "pr-flag", "cron": "17 * * * *", "prompt": "run", "launchd": True},
+            {"name": "sync", "cron": "*/30 * * * *", "prompt": "sync"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), no_loop_moved,
+                          {"ts": STAMPED, "registered": 3, "config_total": 2,
+                           "config_digests": digest_map(no_loop_moved)})
+            self.assertEqual(self._check(ws)["status"], "warn")
+
+
 class DigestUnitTest(unittest.TestCase):
     def test_digest_is_stable_across_key_order(self):
         a = {"name": "x", "cron": "* * * * *", "prompt": "p"}

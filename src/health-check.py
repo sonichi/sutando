@@ -1001,6 +1001,51 @@ def check_session_cron_registration(
             "detail": f"only {registered}/{expected} session cron(s) registered at last /schedule-crons",
         }
 
+    # OWNERSHIP TRANSITION (@john-the-dev on #2654). The check above runs one
+    # way only, and the opposite inequality is a real failure it cannot see:
+    # edit a registered entry to `launchd: true` or `execution: codex-task` and
+    # it leaves `expected`, while the session job registered under the old
+    # config KEEPS FIRING. Counts then read registered=2, expected=1, and
+    # `2 < 1` is false — green. The digest cannot see it either, deliberately:
+    # entry_digest ignores the ownership fields precisely so that an entry which
+    # correctly stopped being registered is not reported as edited.
+    #
+    # So the signal is the surplus itself. It also covers an entry deleted from
+    # crons.json whose job is still live — same disruption, same remedy.
+    #
+    # There is deliberately NO allowance for step 4's bootstrap fallback (which
+    # registers /proactive-loop when the config lacks it, legitimately putting
+    # registered one above expected). Subtracting one for it was the first
+    # attempt and it is wrong: from counts alone a benign fallback and a single
+    # real transition are the SAME surplus, so the allowance silently absorbs
+    # exactly one transition — an amnesty, not a filter. A host whose crons.json
+    # carries no proactive-loop entry has a config gap worth surfacing anyway,
+    # so the honest move is to warn either way and name both causes.
+    surplus = registered - expected
+    if surplus > 0:
+        fallback_armed = not any(
+            isinstance(e, dict) and session_owned(e)
+            and (e.get("prompt_skill") == "proactive-loop"
+                 or "proactive-loop" in str(e.get("prompt") or ""))
+            for e in crons
+        )
+        note = (
+            " (crons.json carries no proactive-loop entry, so step 4's bootstrap "
+            "fallback plausibly accounts for one of these — add an explicit entry "
+            "to tell the two apart)"
+            if fallback_armed else ""
+        )
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"{registered} session cron(s) were registered but only {expected} are "
+                f"session-owned now — {surplus} moved to launchd/codex ownership, were "
+                f"parked, or were deleted since registration, and the job registered under "
+                f"the OLD config is still live; re-run /schedule-crons to clear it{note}"
+            ),
+        }
+
     # CONFIG DRIFT. Everything above answers "was a registration completed for
     # this boot?" — a count, and a count cannot see an entry whose PROMPT was
     # edited after it was registered. That drift is silent by construction: the
