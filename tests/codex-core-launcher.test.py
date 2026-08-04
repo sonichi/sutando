@@ -52,6 +52,9 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/workspace_default.py",
             "src/sutando_config.py",
             "scripts/sutando-config.sh",
+            # sutando-config.sh sources this; a fixture repo without it dies with
+            # "python-binary.sh: No such file or directory" (CI, #2599).
+            "scripts/python-binary.sh",
         ):
             target = self.root / rel
             target.parent.mkdir(parents=True, exist_ok=True)

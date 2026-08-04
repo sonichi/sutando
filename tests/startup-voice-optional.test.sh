@@ -60,6 +60,8 @@ BIN="$TMP/bin"
 mkdir -p "$BIN" "$TMP/repo/src" "$TMP/repo/scripts" "$TMP/repo/node_modules"
 cp "$REPO/src/verify-setup.sh" "$TMP/repo/src/"
 cp "$REPO/scripts/sutando-config.sh" "$TMP/repo/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$TMP/repo/scripts/"
 cp "$REPO/src/sutando_config.py" "$TMP/repo/src/"
 touch "$TMP/repo/src/__init__.py"
 printf '{"core":{"runtime":"codex"}}\n' > "$TMP/repo/sutando.config.json"
