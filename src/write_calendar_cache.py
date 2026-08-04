@@ -128,6 +128,51 @@ def _gws(args: list[str], run=None) -> object:
     return data
 
 
+def _gws_all_pages(argv: list[str], params: dict | None = None, run=None,
+                   max_pages: int = 50) -> list[dict]:
+    """Return the `items` of EVERY page of a Google list method.
+
+    Google marks an incomplete list response with `nextPageToken` and requires
+    the request be repeated with `pageToken` set. `calendarList` defaults to 100
+    entries per page and `events` to 250, so this is a supported response shape,
+    not a malformed one. Reading only the first page returns a silent subset —
+    which in this module is precisely the falsely-clear bug it exists to prevent,
+    because a truncated read still exits 0 and can certify `events: []`.
+    (@john-the-dev reproduced exactly that against this function on #2636.)
+
+    Deliberately NOT `gws --page-all`: that flag stops at `--page-limit`
+    (default 10), and against a real multi-page response I could not verify
+    whether a truncated run still reports `nextPageToken`. If it does not,
+    incompleteness becomes undetectable — the same failure wearing a bigger
+    number. Draining here makes the terminating condition ours: we stop only
+    when Google says there is no next page, and raise in every other case.
+
+    Any page erroring raises out of `_gws`, so a mid-drain failure is total
+    failure and no partial list is ever returned.
+    """
+    params = dict(params or {})
+    items: list[dict] = []
+    seen: set[str] = set()
+    for _ in range(max_pages):
+        args = list(argv)
+        if params:
+            args += ["--params", json.dumps(params)]
+        data = _gws(args, run=run)
+        if not isinstance(data, dict):
+            raise GwsUnavailable(f"gws {' '.join(argv[:2])} returned {type(data).__name__}, not an object")
+        items.extend(data.get("items") or [])
+        token = data.get("nextPageToken")
+        if not token:
+            return items
+        if token in seen:
+            raise GwsUnavailable(
+                f"gws {' '.join(argv[:2])} repeated a pageToken — refusing to loop on a partial read")
+        seen.add(token)
+        params["pageToken"] = token
+    raise GwsUnavailable(
+        f"gws {' '.join(argv[:2])} still had pages after {max_pages} — refusing to certify a partial read")
+
+
 def _fmt_time(iso: str) -> str:
     """`2026-08-04T07:30:00-07:00` -> `7:30am` (and `8:00` -> `8am`)."""
     t = datetime.fromisoformat(iso)
@@ -171,17 +216,18 @@ def events_from_gws(now: datetime | None = None, run=None) -> list[dict]:
     tz = f"{tz[:3]}:{tz[3:]}" if tz else "Z"
     lo, hi = f"{day}T00:00:00{tz}", f"{day}T23:59:59{tz}"
 
-    cal_list = _gws(["calendar", "calendarList", "list", "--format", "json"], run=run)
-    cals = [c for c in (cal_list.get("items") or []) if c.get("selected") and c.get("id")]
+    cal_items = _gws_all_pages(["calendar", "calendarList", "list", "--format", "json"], run=run)
+    cals = [c for c in cal_items if c.get("selected") and c.get("id")]
     if not cals:
         raise GwsUnavailable("gws returned no selected calendars — cannot certify a day")
 
     out: list[dict] = []
     for cal in cals:
-        params = json.dumps({"calendarId": cal["id"], "timeMin": lo, "timeMax": hi,
-                             "singleEvents": True, "orderBy": "startTime"})
-        data = _gws(["calendar", "events", "list", "--params", params, "--format", "json"], run=run)
-        for ev in (data.get("items") or []):
+        params = {"calendarId": cal["id"], "timeMin": lo, "timeMax": hi,
+                  "singleEvents": True, "orderBy": "startTime"}
+        ev_items = _gws_all_pages(["calendar", "events", "list", "--format", "json"],
+                                  params=params, run=run)
+        for ev in ev_items:
             if ev.get("status") == "cancelled":
                 continue
             out.append({"raw": event_to_raw(ev), "calendar": cal["id"],

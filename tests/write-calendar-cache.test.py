@@ -263,6 +263,73 @@ def test_from_gws_all_answered_zero_events_is_verified_empty():
            wcc.events_from_gws() == [])
 
 
+def _ev(summary, hh):
+    return {"summary": summary,
+            "start": {"dateTime": f"2026-08-04T{hh}:00:00-07:00"},
+            "end": {"dateTime": f"2026-08-04T{hh}:30:00-07:00"}}
+
+
+def test_from_gws_drains_calendar_list_pages():
+    """A second PAGE of calendars must not vanish.
+
+    `calendarList` returns 100 entries per page; beyond that Google sets
+    `nextPageToken` and the request must be repeated. Reading page 1 only drops
+    every later calendar silently — the day comes back short, exit 0, and gets
+    written as authoritative. This control FAILS on the unpaginated code, which
+    never issues the second calendarList request.
+    """
+    page1 = json.dumps({"items": [{"id": "a@x.com", "selected": True}], "nextPageToken": "CAL2"})
+    page2 = json.dumps({"items": [{"id": "b@x.com", "selected": True}]})
+    run, calls = _fake_gws([(0, page1), (0, page2),
+                            (0, json.dumps({"items": [_ev("standup", "09")]})),
+                            (0, json.dumps({"items": [_ev("retro", "14")]}))])
+    with unittest.mock.patch("subprocess.run", run):
+        got = wcc.events_from_gws()
+    cals = {e["calendar"] for e in got}
+    ok("a SECOND page of calendars is drained, not dropped",
+       len(got) == 2 and cals == {"a@x.com", "b@x.com"},
+       f"{len(got)} event(s) from {sorted(cals)} after {calls['n']} gws calls")
+
+
+def test_from_gws_drains_event_pages():
+    """Same for events: 250/page, then `nextPageToken`. FAILS unpaginated."""
+    cal = json.dumps({"items": [{"id": "a@x.com", "selected": True}]})
+    ev_page1 = json.dumps({"items": [_ev("standup", "09")], "nextPageToken": "EV2"})
+    ev_page2 = json.dumps({"items": [_ev("retro", "14")]})
+    run, _ = _fake_gws([(0, cal), (0, ev_page1), (0, ev_page2)])
+    with unittest.mock.patch("subprocess.run", run):
+        got = wcc.events_from_gws()
+    ok("a SECOND page of events is drained, not dropped",
+       len(got) == 2 and any("retro" in e["raw"] for e in got),
+       f"got {[e['raw'] for e in got]}")
+
+
+def test_from_gws_error_on_a_later_page_is_total_failure():
+    """Page 1 fine, page 2 errors -> raise. A truncated day must never be written."""
+    cal = json.dumps({"items": [{"id": "a@x.com", "selected": True}]})
+    ev_page1 = json.dumps({"items": [_ev("standup", "09")], "nextPageToken": "EV2"})
+    run, _ = _fake_gws([(0, cal), (0, ev_page1), (1, "page 2 exploded")])
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            got = wcc.events_from_gws()
+            ok("an error on page 2 raises", False,
+               f"returned {len(got)} survivor(s) — a partial day written as whole")
+        except wcc.GwsUnavailable:
+            ok("an error on a LATER page is total failure (no partial day)", True)
+
+
+def test_from_gws_repeated_page_token_refuses_to_loop():
+    """A server echoing the same token must terminate as a failure, not spin."""
+    page = json.dumps({"items": [{"id": "a@x.com", "selected": True}], "nextPageToken": "SAME"})
+    run, _ = _fake_gws([(0, page)] * 6)
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc.events_from_gws()
+            ok("a repeated pageToken raises", False, "drained forever or returned a partial list")
+        except wcc.GwsUnavailable:
+            ok("a repeated pageToken raises instead of looping", True)
+
+
 def test_from_gws_cli_failure_leaves_prior_cache_untouched():
     """The durability property: yesterday's cache must survive a failed fetch."""
     with tempfile.TemporaryDirectory() as td:
@@ -301,6 +368,10 @@ test_from_gws_nonzero_raises()
 test_from_gws_api_error_object_raises()
 test_from_gws_partial_failure_is_total_failure()
 test_from_gws_all_answered_zero_events_is_verified_empty()
+test_from_gws_drains_calendar_list_pages()
+test_from_gws_drains_event_pages()
+test_from_gws_error_on_a_later_page_is_total_failure()
+test_from_gws_repeated_page_token_refuses_to_loop()
 test_from_gws_cli_failure_leaves_prior_cache_untouched()
 test_event_to_raw_shapes()
 
