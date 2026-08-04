@@ -192,6 +192,66 @@ else
   bad "each Python-backed service prints an explicit ⊘ skip" "no skip branch for: $missing"
 fi
 
+# ── 12b. The named secondary gateways, on the ACTIVATED path.
+# CR #2599 (@qingyun-wu) found a fifth false-success site that guards 11 and 12
+# both waved through, each for its own reason:
+#   - guard 11 only rejects the old `&& cmd &` shape, and this loop had already
+#     been converted to `if [ -n "$PY" ]; then … fi` — with the ✓ left OUTSIDE
+#     the `fi`, which is the same defect wearing the fixed shape;
+#   - guard 12 greps per service NAME, and every named instance's label starts
+#     "gateway bridge", so the PRIMARY gateway's skip branch vouched for all of
+#     them.
+# A name-based scan cannot distinguish per-instance output, so run the loop
+# instead of reading it. The block is lifted out of src/startup.sh at test time
+# rather than copied here, so the test cannot drift from the source it pins.
+gw_block=$(awk '/for _gw_var in /{f=1} f{print} f&&/^[[:space:]]*done[[:space:]]*$/{exit}' "$REPO/src/startup.sh")
+if [ -z "$gw_block" ]; then
+  bad "named-gateway loop is extractable from startup.sh" "no 'for _gw_var in' block found"
+else
+  gw_out=$(env -i PATH="/usr/bin:/bin" AG2_REMOTE_TOKEN_DEV=tok-dev \
+    bash -c 'PY=""; REPO="'"$REPO"'"; LOGS_DIR="$(mktemp -d)"
+'"$gw_block"'' 2>&1)
+  # It must NOT claim a start, and it MUST name the instance it skipped.
+  if printf '%s' "$gw_out" | grep -q '✓ gateway bridge (dev'; then
+    bad "named gateway does not print ✓ when \$PY is empty" "printed: $gw_out"
+  else
+    ok "named gateway does not print ✓ when \$PY is empty"
+  fi
+  if printf '%s' "$gw_out" | grep -q '⊘ gateway bridge (dev'; then
+    ok "named gateway names the instance it skipped"
+  else
+    bad "named gateway names the instance it skipped" "got: ${gw_out:-<no output>}"
+  fi
+fi
+
+# ── 12c. General form of the same defect, so a SIXTH site cannot hide behind
+# the corrected shape: a `[ -n "$PY" ]` guard that wraps a "$PY" launch must not
+# be immediately followed by an unconditional success line. Depth-tracked so
+# nested ifs inside the guard do not close it early.
+stray=$(awk '
+  /^[[:space:]]*if \[ -n "\$PY" \][[:space:]]*;[[:space:]]*then/ && !ing { ing=1; d=1; py=0; next }
+  ing {
+    if ($0 ~ /^[[:space:]]*if /) d++
+    else if ($0 ~ /^[[:space:]]*fi[[:space:]]*$/) {
+      d--
+      if (d == 0) { ing=0; if (py) waiting=NR; next }
+    }
+    if ($0 ~ /"\$PY"/) py=1
+    next
+  }
+  waiting && $0 ~ /^[[:space:]]*$/ { next }
+  waiting && $0 ~ /^[[:space:]]*#/ { next }
+  waiting {
+    if ($0 ~ /echo .*✓/) print waiting ":" $0
+    waiting=0
+  }
+' "$REPO/src/startup.sh")
+if [ -z "$stray" ]; then
+  ok "no \$PY guard is followed by an unconditional ✓ (general form)"
+else
+  bad "no \$PY guard is followed by an unconditional ✓" "after fi at line(s): $(printf '%s' "$stray" | cut -d: -f1 | tr '\n' ' ')"
+fi
+
 # ── 13. `${PY:-<fallback>}` may only fall back to a command that is a safe
 # no-op. CR #2599 P2: `${PY:-cat} -c "import sys,json…"` ran `cat -c`, which is
 # not a valid invocation of cat on BSD or GNU. It fails, `|| echo ""` swallows

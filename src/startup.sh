@@ -1184,12 +1184,17 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
     # gateway launched without GATEWAY_INSTANCE / its own REMOTE_TASK_TOKEN /
     # the REMOTE_PROACTIVE_ROOM= scoping, collapsing onto the primary gateway's
     # credentials (CR #2599, @qingyun-wu).
+    # The ✓ belongs INSIDE the branch too. Fixing the guard shape here while
+    # leaving the success line outside it still reported a launch that never
+    # happened — per named instance, on a configured remote-control surface.
     if [ -n "$PY" ]; then
       SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
         REMOTE_PROACTIVE_ROOM= \
         "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+      echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
+    else
+      echo "  ⊘ gateway bridge ($_gw_inst) skipped — no runnable python3"
     fi
-    echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
   done
 fi
 
