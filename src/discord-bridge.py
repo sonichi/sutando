@@ -5017,10 +5017,18 @@ async def poll_proactive():
                         try:
                             _undeliv = f.parent / "undelivered"
                             _undeliv.mkdir(parents=True, exist_ok=True)
-                            f.rename(_undeliv / f.name)
+                            # Drop the `.sending` claim suffix on the way out.
+                            # By this point `f` is the CLAIMED name (:4835), and
+                            # a quarantined `*.sending` reads like an in-flight
+                            # file rather than a parked one — the restart-safety
+                            # sweep at :2470 exists precisely because that suffix
+                            # means "someone is mid-send". Restore `.txt` so what
+                            # lands in undelivered/ is what was written.
+                            _name = f.with_suffix(".txt").name if f.suffix == ".sending" else f.name
+                            f.rename(_undeliv / _name)
                             print(
                                 f"  [proactive] undelivered copy kept at "
-                                f"undelivered/{f.name} — NOT deleted",
+                                f"undelivered/{_name} — NOT deleted",
                                 flush=True,
                             )
                         except Exception as _mv_exc:

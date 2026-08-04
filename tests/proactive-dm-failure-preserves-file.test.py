@@ -12,13 +12,18 @@ That message is unrecoverable. The channel-redirect branch a few lines above
 already did the right thing — unlink only after a successful send, fall through
 otherwise — so the two halves of one function disagreed.
 
-WHY THIS IS STRUCTURAL AND NOT BEHAVIOURAL. Exercising the real loop means
-importing `src/discord-bridge.py`, which pulls discord.py and resolves the
-operator's config dir at import. `tests/bridge-marker-no-leak.test.py` tests this
-same file the same way and for the same reason. So this asserts on the source: it
-cannot prove the runtime behaviour, only that the unlink is no longer reachable
-from the failure path. Stated here rather than implied, so nobody reads a green
-run as end-to-end proof.
+WHY BOTH THIS AND A BEHAVIOURAL SIBLING. This file asserts on the SOURCE — that
+the unlink is unreachable from the failure path — which is cheap and survives
+refactors of the surrounding loop. `proactive-dm-failure-keeps-file-behaviour.test.py`
+drives one real iteration with a failing send and asserts the body survives.
+
+My first version of this docstring claimed a behavioural test was infeasible
+because importing the bridge pulls discord.py and resolves the operator's config
+dir. That was WRONG: several tests already exec this module
+(`bridge-audit-wiring`, `bridge-not-allowlisted-ack`, `bridge-timeout-guards`)
+via a stub-and-redirect pattern. The behavioural test then found something this
+one could not — the quarantined file kept its `.sending` claim suffix. A stated
+limitation nobody re-checks becomes a permanent excuse.
 """
 from __future__ import annotations
 
