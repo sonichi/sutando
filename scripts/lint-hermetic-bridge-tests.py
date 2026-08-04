@@ -965,6 +965,96 @@ def classify(path: Path) -> str | None:
     return MITIGATED if _mitigation_line(tree, exec_line, mod_var) is not None else VIOLATION
 
 
+
+# --- workspace-resolver stub arity (#2621) ----------------------------------
+#
+# The CCD checks above prove a test isolates CLAUDE_CONFIG_DIR. They say nothing
+# about the WORKSPACE: a test can be fully CCD-hermetic and still append to
+# `<workspace>/state/outbox.log`, because production reaches it through
+# `resolve_workspace()`, not through the config dir. Five tests did exactly that
+# (#2612 #2615 #2618 #2619 #2620), each fixed individually.
+#
+# This check covers the ONE form a per-file static predicate can prove: a stub
+# bound to a resolver name that CANNOT ABSORB the arguments production passes.
+# 25 call sites in 14 files pass `migrate=False` or `repo`. A zero-arg
+# `lambda: tmp` raises TypeError at every one of them — and where the caller sits
+# behind a broad `except`, that TypeError is swallowed, so the write path is
+# DISABLED rather than redirected and every other assertion stays green. That is
+# how #2619 survived three review rounds.
+#
+# TWO names, deliberately. `resolve_workspace` is the shared helper;
+# `_resolve_workspace` is a module-local wrapper (src/runtime-health.py,
+# src/workspace_lock.py x5). A name-exact sweep misses the second — that gap cost
+# two independent audits five call sites each.
+#
+# WHAT THIS CANNOT DO, stated so no reader assumes otherwise:
+#   * transitive reach. `dm-result-send-dm.test.py` contains no resolver token at
+#     all and still writes: test -> dm-result.py -> outbox_log -> resolve_workspace.
+#     A textual OR per-file-AST criterion cannot see a runtime reach. The
+#     complement is behavioural — run each test against a pinned throwaway
+#     workspace and diff. That found all five, including the transitive one.
+#   * exact caller-arity matching. `lambda *, migrate=False` passes here but would
+#     still reject a positional `repo`. This flags the ZERO-ARG case, which is the
+#     defect actually observed, not full signature agreement.
+
+RESOLVER_NAMES = frozenset({"resolve_workspace", "_resolve_workspace"})
+
+#: Resolver stubs that predate this check. Same contract as KNOWN_UNISOLATED:
+#: the list must SHRINK, never rot. Verified latent, not live, at the time of
+#: listing -- telegram-bridge-access.test.py reaches util_paths, whose
+#: `_workspace_root()` guards with a NARROW `except ImportError`, so the
+#: TypeError propagates loudly rather than being swallowed. A tripwire, not a
+#: landmine; it fails on first contact if the call graph ever reaches it.
+KNOWN_RESOLVER_STUBS = {
+    "tests/telegram-bridge-access.test.py",
+}
+
+
+def _lambda_absorbs_args(fn: ast.Lambda) -> bool:
+    """True when this lambda can accept at least one argument.
+
+    `*args`/`**kwargs` absorb anything; any declared parameter means the author
+    thought about arity. A bare `lambda:` is the failure mode this check exists for.
+    """
+    a = fn.args
+    if a.vararg or a.kwarg:
+        return True
+    return bool(a.args or a.posonlyargs or a.kwonlyargs)
+
+
+def resolver_stub_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """(lineno, name) for every zero-arg lambda bound to a resolver name."""
+    out: list[tuple[int, str]] = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Assign) or not isinstance(n.value, ast.Lambda):
+            continue
+        for t in n.targets:
+            nm = (
+                t.attr if isinstance(t, ast.Attribute)
+                else t.id if isinstance(t, ast.Name)
+                else None
+            )
+            if nm in RESOLVER_NAMES and not _lambda_absorbs_args(n.value):
+                out.append((n.lineno, nm))
+    return out
+
+
+def scan_resolver_stubs(paths) -> dict[str, list[tuple[int, str]]]:
+    """Resolver-stub violations per path. Scans EVERY tracked test, not just the
+    bridge-loading subset `classify()` covers -- a resolver stub is hazardous
+    wherever it appears."""
+    out: dict[str, list[tuple[int, str]]] = {}
+    for rel in paths:
+        try:
+            tree = ast.parse((REPO / rel).read_text(errors="ignore"))
+        except (OSError, SyntaxError):
+            continue
+        hits = resolver_stub_violations(tree)
+        if hits:
+            out[rel] = hits
+    return out
+
+
 def scan(paths) -> dict[str, str]:
     out = {}
     for p in paths:
@@ -1073,13 +1163,18 @@ def main() -> int:
         targets = tracked_tests()
 
     results = scan(targets)
+    stub_hits = scan_resolver_stubs(targets)
 
     if mode == "--list":
         for p, v in sorted(results.items()):
             print(f"{v:9} {p}")
+        for p, hits in sorted(stub_hits.items()):
+            for ln, nm in hits:
+                print(f"{'STUB':9} {p}:{ln} ({nm})")
         return 0
 
     new_violations = [p for p, v in results.items() if v == VIOLATION and p not in KNOWN_UNISOLATED]
+    new_stubs = {p: h for p, h in stub_hits.items() if p not in KNOWN_RESOLVER_STUBS}
     mitigated = [p for p, v in results.items() if v == MITIGATED]
 
     # The grandfather list must shrink, never rot: a listed file that now isolates
@@ -1089,6 +1184,16 @@ def main() -> int:
         for p in sorted(KNOWN_UNISOLATED):
             if not (REPO / p).exists() or results.get(p) != VIOLATION:
                 stale.append(p)
+
+    for p, hits in sorted(new_stubs.items()):
+        for ln, nm in hits:
+            print(
+                f"error: {p}:{ln} — `{nm}` stubbed with a ZERO-ARG lambda. "
+                f"25 production call sites pass `migrate=False` or `repo`; a zero-arg "
+                f"stub raises TypeError at each, and behind a broad `except` that "
+                f"DISABLES the write path instead of redirecting it. "
+                f"Use `lambda *a, **kw: <ws>`."
+            )
 
     for p in mitigated:
         print(f"note: {p} — import still resolves host config; destructive path rebound post-import")
@@ -1103,13 +1208,18 @@ def main() -> int:
         for p_ in stale:
             print(f"  {p_}")
 
-    if not new_violations:
+    if not new_violations and not new_stubs:
         print(
             f"lint-hermetic-bridge-tests: ok "
             f"({len(results)} bridge-importing tests scanned, "
-            f"{len(KNOWN_UNISOLATED)} grandfathered, {len(mitigated)} mitigated)"
+            f"{len(KNOWN_UNISOLATED)} grandfathered, {len(mitigated)} mitigated; "
+            f"{len(targets)} scanned for resolver stubs, "
+            f"{len(KNOWN_RESOLVER_STUBS)} grandfathered)"
         )
         return 0
+
+    if new_stubs:
+        print("\nlint-hermetic-bridge-tests: FAIL — zero-arg workspace-resolver stub\n")
 
     if new_violations:
         print("\nlint-hermetic-bridge-tests: FAIL — test imports a bridge without isolating CLAUDE_CONFIG_DIR\n")
