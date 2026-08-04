@@ -1833,7 +1833,30 @@ def _checkout_is_canonical(repo_dir) -> tuple:
     return (True, "clean + on main")
 
 
-def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None) -> list:
+def _notify_owner_locally(text: str, notify_cmd: Optional[list[str]] = None) -> bool:
+    """Fire an OS-level notification. Returns True if the command ran.
+
+    The fallback surface for an alert the remote sender could not deliver.
+    Deliberately the same mechanism `notify_for_failures` leans on for the
+    "all of Sutando is down" case: osascript runs at OS level and needs
+    neither a Sutando service nor Slack to be reachable.
+    """
+    # Same AppleScript escaping as notify_for_failures: drop double-quotes
+    # and backslashes so a bridge name or detail can't break the literal.
+    safe = text.replace('"', '').replace('\\', '')[:200]
+    cmd = notify_cmd or [
+        "osascript", "-e",
+        f'display notification "{safe}" with title "Sutando — bridge down"',
+    ]
+    try:
+        subprocess.run(cmd, check=False, timeout=10)
+        return True
+    except Exception:  # noqa: BLE001 — the fallback must never break the check
+        return False
+
+
+def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
+                     local_notify=None) -> list:
     """Restart or alert on configured-but-not-running channel bridges.
 
     A dead bridge reports status "warn" (optional channels don't page), which
@@ -1856,9 +1879,13 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None) -> l
 
     Alerts print to stdout (captured in the health-check log) AND are sent to
     the owner via `sender` (default `_default_slack_sender`, best-effort — a
-    missing sender never breaks the health check). Returns the list of bridge
-    names ACTUALLY (re)started (backward-compatible with the print loop in
-    main()).
+    missing sender never breaks the health check). A sender that does not
+    deliver falls back to an OS-level notification (`local_notify`, default
+    `_notify_owner_locally`), and the non-delivery is stated in the output:
+    for action="alert" reaching the owner is the entire feature, so a silent
+    no-op there is the failure mode, not a cosmetic gap. Returns the list of
+    bridge names ACTUALLY (re)started (backward-compatible with the print loop
+    in main()).
 
     Launch parity with startup.sh (per PR #1898 review): a naive
     `sys.executable src/<bridge>.py` skips the bootstrapping startup.sh does and
@@ -1879,13 +1906,33 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None) -> l
         return []
     send = sender or _default_slack_sender
     guard = guard or _checkout_is_canonical
+    notify_local = local_notify or _notify_owner_locally
 
-    def _alert(msg: str) -> None:
+    def _alert(msg: str) -> bool:
+        """Print the alert, then push it to the owner. True only on delivery.
+
+        `send` reports failure by RETURNING False far more often than by
+        raising: `_default_slack_sender` returns False when creds are absent
+        or any Slack API call comes back not-ok, and never raises. A bare
+        `send(msg)` therefore made an undelivered alert indistinguishable from
+        a delivered one — and under action="alert" delivery IS the whole
+        feature, since nothing is restarted. `notify_slack_for_failures` (the
+        same sender) already branches on the return value; this was the one
+        alert path that did not.
+
+        Still never propagates: a raising sender is a non-delivery, not an
+        error to leak (see case_v).
+        """
         print(f"  {msg}")
         try:
-            send(msg)
+            delivered = bool(send(msg))
         except Exception:  # noqa: BLE001 — alerting must never break the check
-            pass
+            delivered = False
+        if not delivered:
+            fell_back = notify_local(msg)
+            print("     ↳ owner alert NOT delivered by the sender; OS-level "
+                  f"fallback {'fired' if fell_back else 'ALSO failed'}.")
+        return delivered
 
     restarted = []
     for c in checks:

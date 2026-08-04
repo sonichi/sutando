@@ -47,8 +47,16 @@ def check(name: str, status: str, detail: str) -> dict:
 
 def run_with_popen_stub(checks: list, *, action="restart",
                         guard=lambda repo: (True, "test-clean"),
-                        sender=None) -> tuple[list, list]:
+                        sender=None, notified=None,
+                        local_notify=None) -> tuple[list, list]:
     """Call fix_down_bridges with Popen stubbed; return (restarted, spawn argvs).
+
+    `notified` is an optional caller-supplied list that receives every message
+    handed to the OS-level fallback. It is ALWAYS stubbed — even when a case
+    ignores it — because the fallback now fires on any non-delivery, and the
+    real one shells out to `osascript` (this file's own rule: never spam the
+    developer's notification center). Pass `local_notify` to control its
+    return value; the default fake reports success.
 
     Also stubs the interpreter probe and slack-env load so the test is
     hermetic: without these, fix_down_bridges would probe the host for
@@ -62,10 +70,15 @@ def run_with_popen_stub(checks: list, *, action="restart",
     a canonical checkout with a no-op sender.
     """
     spawned = []
+    sink = notified if notified is not None else []
 
     def fake_popen(argv, **kwargs):
         spawned.append(argv)
         return mock.MagicMock()
+
+    def fake_local_notify(msg):
+        sink.append(msg)
+        return True if local_notify is None else local_notify(msg)
 
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
@@ -75,6 +88,7 @@ def run_with_popen_stub(checks: list, *, action="restart",
             restarted = hc.fix_down_bridges(
                 checks, action=action, guard=guard,
                 sender=(sender if sender is not None else (lambda _m: True)),
+                local_notify=fake_local_notify,
             )
     return restarted, spawned
 
@@ -463,6 +477,123 @@ def case_v_alert_send_failure_is_swallowed() -> list[str]:
     return fails
 
 
+def case_w_sender_returning_false_is_a_non_delivery() -> list[str]:
+    """THE pin — fails on the parent, where `send(msg)` was a bare statement.
+
+    `_default_slack_sender` signals failure by RETURNING False (absent creds,
+    any not-ok Slack call) and never raises, so the parent's try/except caught
+    nothing and an undelivered alert printed exactly like a delivered one.
+    Under action="alert" nothing is restarted, so that alert was the entire
+    feature.
+
+    Deliberately calls fix_down_bridges through its PRE-EXISTING signature
+    (action/guard/sender only) and asserts on stdout. Routing this through the
+    new `local_notify` kwarg would make it fail on the parent with a TypeError
+    about the signature instead of about the behavior — a pin that proves the
+    API changed, not that the bug was real. `subprocess.run` is patched so the
+    fallback cannot reach the developer's real notification center.
+    """
+    fails = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+             mock.patch.object(hc.subprocess, "run", return_value=None), \
+             redirect_stdout(buf):
+            hc.fix_down_bridges(checks, action="alert",
+                                guard=lambda repo: (True, "test-clean"),
+                                sender=lambda _m: False)
+    out = buf.getvalue()
+    if "NOT delivered" not in out:
+        fails.append(f"w) non-delivery must be stated in the output, got: {out!r}")
+    return fails
+
+
+def case_w2_non_delivery_reaches_the_os_fallback() -> list[str]:
+    """The wiring half of case_w: the undelivered text is what gets handed to
+    the fallback (not a truncated or generic stand-in)."""
+    fails = []
+    notified = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert",
+                            sender=lambda _m: False, notified=notified)
+    if len(notified) != 1:
+        fails.append(f"w2) non-delivery must reach the OS fallback, got {notified!r}")
+    elif "discord-bridge is DOWN" not in notified[0]:
+        fails.append(f"w2) fallback got the wrong text: {notified[0]!r}")
+    return fails
+
+
+def case_x_delivered_alert_does_not_fall_back() -> list[str]:
+    """Control. Without this, case_w passes even if the fallback fired
+    unconditionally — which would double-notify on every healthy alert."""
+    fails = []
+    notified = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert",
+                            sender=lambda _m: True, notified=notified)
+    if notified:
+        fails.append(f"x) a delivered alert must not fall back, got {notified!r}")
+    if "NOT delivered" in buf.getvalue():
+        fails.append("x) a delivered alert must not be reported as undelivered")
+    return fails
+
+
+def case_y_raising_sender_is_also_a_non_delivery() -> list[str]:
+    """case_v pins that a raising sender never propagates; that stays true.
+    It is ALSO a non-delivery, so the owner must still get the fallback —
+    'slack unreachable' is precisely when the OS-level path matters."""
+    fails = []
+    notified = []
+
+    def boom(_m):
+        raise RuntimeError("slack unreachable")
+
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            run_with_popen_stub(checks, action="alert", sender=boom, notified=notified)
+    except Exception as e:  # pragma: no cover — a leak here IS the failure
+        return [f"y) a raising sender propagated out of fix_down_bridges: {e!r}"]
+    if len(notified) != 1:
+        fails.append(f"y) a raising sender must still reach the fallback, got {notified!r}")
+    return fails
+
+
+def case_z_local_notify_never_raises_and_is_escaped() -> list[str]:
+    """Cover `_notify_owner_locally` itself — the new module default.
+
+    It is the last hop of the alert path, so if IT raises, the check it was
+    protecting dies. Also pin the AppleScript escaping: a bridge detail
+    carrying a double-quote must not be able to break the command literal.
+    """
+    fails = []
+    seen = []
+    with mock.patch.object(hc.subprocess, "run",
+                           side_effect=lambda cmd, **k: seen.append(cmd)):
+        ok = hc._notify_owner_locally('bad " quote \\ back')
+    if not ok:
+        fails.append("z) a successful shell-out must return True")
+    if not seen or "osascript" not in seen[0][0]:
+        fails.append(f"z) expected an osascript argv, got {seen!r}")
+    elif '"' in seen[0][-1].split("display notification ", 1)[1].rsplit(" with title", 1)[0].strip('"'):
+        fails.append(f"z) unescaped quote survived into the literal: {seen[0][-1]!r}")
+
+    with mock.patch.object(hc.subprocess, "run",
+                           side_effect=OSError("no osascript")):
+        try:
+            if hc._notify_owner_locally("x"):
+                fails.append("z) a failed shell-out must return False")
+        except Exception as e:  # pragma: no cover
+            fails.append(f"z) the fallback must never raise, got {e!r}")
+    return fails
+
+
 def case_o_action_off_is_noop() -> list[str]:
     """down_bridge_action="off": never restart, never alert (return [])."""
     fails = []
@@ -606,7 +737,12 @@ def main() -> int:
                  case_s_checkout_is_canonical,
                  case_t_resolve_down_bridge_action,
                  case_u_defaults_from_config_and_module,
-                 case_v_alert_send_failure_is_swallowed):
+                 case_v_alert_send_failure_is_swallowed,
+                 case_w_sender_returning_false_is_a_non_delivery,
+                 case_w2_non_delivery_reaches_the_os_fallback,
+                 case_x_delivered_alert_does_not_fall_back,
+                 case_y_raising_sender_is_also_a_non_delivery,
+                 case_z_local_notify_never_raises_and_is_escaped):
         fails = case()
         status = "PASS" if not fails else "FAIL"
         print(f"  {status} {case.__name__}")
