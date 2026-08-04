@@ -60,6 +60,22 @@ import result_router  # noqa: E402  (shared empty-result bound)
 
 #: Consecutive polls each task's result file has been present-but-empty.
 _empty_result_polls: "dict[str, int]" = {}
+
+
+def _note_empty_result(task_id: str, result_file) -> None:
+    """Count a present-but-empty result and announce once past the bound.
+
+    Kept to ONE call at the guard so `continue` stays adjacent to
+    `if not reply_text:` — `tests/bridge-result-race-guard.test.py` reads a
+    120-char window after that `if` and asserts the `continue` is inside it.
+    My first version inlined eight lines there and pushed the `continue` out of
+    the window, failing the very test that exists to protect this guard.
+    """
+    n = _empty_result_polls.get(task_id, 0) + 1
+    _empty_result_polls[task_id] = n
+    notice = result_router.empty_result_notice(task_id, str(result_file), n)
+    if notice:
+        print(f"  {notice}", flush=True)
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
@@ -972,14 +988,7 @@ def main():  # pragma: no cover
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
                 if not reply_text:
-                    # See discord-bridge for the reasoning: the skip is a
-                    # partial-write guard and must stay, but it needs a bound.
-                    _n = _empty_result_polls.get(task_id, 0) + 1
-                    _empty_result_polls[task_id] = _n
-                    _notice = result_router.empty_result_notice(
-                        task_id, str(result_file), _n)
-                    if _notice:
-                        print(f"  {_notice}", flush=True)
+                    _note_empty_result(task_id, result_file)
                     continue
                 _empty_result_polls.pop(task_id, None)
                 chat_id = pending_replies.pop(task_id)

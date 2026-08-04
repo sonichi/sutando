@@ -204,6 +204,18 @@ class BehavioralRaceGuardTest(unittest.TestCase):
                 "_ResultFile": _ResultFile,
                 "result_file": _ResultFile(result_path),
                 "_REACHED_PAST_GUARD": [],
+                # The guard now calls the bridge's `_note_empty_result` to bound
+                # how long a present-but-empty result can stall silently (#2631).
+                # This harness execs the extracted region in an isolated
+                # namespace, so that name must be provided or the snippet raises
+                # NameError before the guard is exercised at all. A no-op stub is
+                # correct here: this file asserts the guard FIRES, and the
+                # announce-once policy has its own suites
+                # (`result-router-empty-result-bound`, behavioural coverage in
+                # `discord-bridge-empty-result-wiring`). Stubbing bookkeeping does
+                # not weaken the assertion this file exists to make.
+                "_note_empty_result": lambda *a, **k: None,
+                "task_id": "task-harness",
             }
             # `for _tick in [0]:` sits on the line immediately before the
             # snippet's true start; blank-line padding before it keeps the

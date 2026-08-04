@@ -110,6 +110,22 @@ import result_router  # noqa: E402  (Result Router §9.3 — owner-visible deliv
 #: Bridge-owned state; the THRESHOLD and the wording are policy and live in
 #: result_router, so both bridges cannot drift.
 _empty_result_polls: "dict[str, int]" = {}
+
+
+def _note_empty_result(task_id: str, result_file) -> None:
+    """Count a present-but-empty result and announce once past the bound.
+
+    Kept to ONE call at the guard so `continue` stays adjacent to
+    `if not reply_text:` — `tests/bridge-result-race-guard.test.py` reads a
+    120-char window after that `if` and asserts the `continue` is inside it.
+    My first version inlined eight lines there and pushed the `continue` out of
+    the window, failing the very test that exists to protect this guard.
+    """
+    n = _empty_result_polls.get(task_id, 0) + 1
+    _empty_result_polls[task_id] = n
+    notice = result_router.empty_result_notice(task_id, str(result_file), n)
+    if notice:
+        print(f"  {notice}", flush=True)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
@@ -4311,17 +4327,7 @@ async def poll_results():
                 import re
                 reply_text = result_file.read_text().strip()
                 if not reply_text:
-                    # The file is present but empty. Keep skipping — `>` in the
-                    # core's prescribed `cat > "<path>" << EOF` truncates at
-                    # open, so a normal result is briefly empty and delivering
-                    # here would send a blank reply. But BOUND it: without a
-                    # bound this loops silently until the 7-day age-out below.
-                    _n = _empty_result_polls.get(task_id, 0) + 1
-                    _empty_result_polls[task_id] = _n
-                    _notice = result_router.empty_result_notice(
-                        task_id, str(result_file), _n)
-                    if _notice:
-                        print(f"  {_notice}", flush=True)
+                    _note_empty_result(task_id, result_file)
                     continue
                 _empty_result_polls.pop(task_id, None)
                 channel = pending_replies.pop(task_id)
