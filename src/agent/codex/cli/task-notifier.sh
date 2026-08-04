@@ -11,6 +11,8 @@ else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
+TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
+TASK_HANDLER_FALLBACKS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-fallbacks"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -38,31 +40,6 @@ probe_optional_task_handler() {
   return "$rc"
 }
 
-start_optional_task_handler() {
-  local filename="$1"
-  mkdir -p "$event_dir/inflight"
-  : > "$event_dir/inflight/$filename"
-  (
-    if "$SUTANDO_TASK_EVENT_HANDLER" \
-        --runtime codex \
-        --workspace "$(dirname "$TASKS_DIR")" \
-        --task-file "$TASKS_DIR/$filename" \
-        --results-dir "$RESULTS_DIR" \
-        --repo "$REPO" >/dev/null; then
-      rc=0
-    else
-      rc=$?
-    fi
-    rm -f "$event_dir/inflight/$filename"
-    if [ "$rc" -ne 0 ]; then
-      echo "task-notifier: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-      if [ -p "$event_dir/events" ]; then
-        printf 'TASK_FILE: %s\n' "$filename" > "$event_dir/events"
-      fi
-    fi
-  ) &
-}
-
 stop_watcher() {
   [ -n "$watcher_pid" ] || return 0
   kill -TERM "-$watcher_pid" 2>/dev/null \
@@ -76,7 +53,6 @@ cleanup_notifier() {
   stop_watcher
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
-    rmdir "$event_dir/inflight" 2>/dev/null || true
     rmdir "$event_dir" 2>/dev/null || true
   fi
 }
@@ -86,7 +62,10 @@ trap 'exit 0' HUP INT TERM
 
 has_result() {
   local filename="$1" stem archive_dir
-  [ -f "$RESULTS_DIR/$filename" ] && return 0
+  if [ -f "$RESULTS_DIR/$filename" ]; then
+    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
+    return 0
+  fi
   stem="${filename%.txt}"
   # Local bridges archive as archive/YYYY-MM/<task>.txt. The remote gateway
   # archives as archive/<task>-<epoch>.txt. Startup retention uses sibling
@@ -95,6 +74,7 @@ has_result() {
       -mindepth 1 -maxdepth 2 -type f \
       \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
       | grep -q .; then
+    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
     return 0
   fi
   for archive_dir in "$RESULTS_DIR"/archive-*; do
@@ -102,6 +82,7 @@ has_result() {
     if find "$archive_dir" -mindepth 1 -maxdepth 1 -type f \
         \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
         | grep -q .; then
+      rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
       return 0
     fi
   done
@@ -164,11 +145,16 @@ next_pending_task() {
     case "$candidate" in
       ""|*/*|*..*) continue ;;
     esac
-    if ! has_result "$candidate" \
-        && { [ -z "$event_dir" ] || [ ! -e "$event_dir/inflight/$candidate" ]; }; then
-      printf '%s\n' "$candidate"
-      return 0
+    has_result "$candidate" && continue
+    [ -f "$TASK_HANDLER_CLAIMS_DIR/$candidate" ] && continue
+    if [ ! -f "$TASK_HANDLER_FALLBACKS_DIR/$candidate" ] \
+        && probe_optional_task_handler "$candidate"; then
+      # The watcher has not published its claim yet. Leave the file durable;
+      # its provider receipt or explicit fallback event will wake us.
+      continue
     fi
+    printf '%s\n' "$candidate"
+    return 0
   done < <(
     python3 - "$REPO/src" "$TASKS_DIR" <<'PY'
 import sys
@@ -195,25 +181,6 @@ submit_task() {
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
   has_result "$filename" && return 0
-  if [ "$wait_for_result" = "1" ]; then
-    if probe_optional_task_handler "$filename"; then
-      start_optional_task_handler "$filename"
-      return 0
-    else
-      handler_rc=$?
-      [ "$handler_rc" -eq 3 ] || return 0
-    fi
-  elif probe_optional_task_handler "$filename"; then
-    if "$SUTANDO_TASK_EVENT_HANDLER" \
-        --runtime codex \
-        --workspace "$(dirname "$TASKS_DIR")" \
-        --task-file "$TASKS_DIR/$filename" \
-        --results-dir "$RESULTS_DIR" \
-        --repo "$REPO" >/dev/null; then
-      return 0
-    fi
-    echo "task-notifier: optional task handler failed for $filename; falling back to live core (possible at-least-once retry)" >&2
-  fi
   prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
@@ -257,7 +224,7 @@ fi
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 python3 -c \
-  'import os, sys; os.setsid(); os.environ.pop("SUTANDO_TASK_EVENT_HANDLER", None); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
+  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
@@ -268,15 +235,10 @@ while IFS= read -r event; do
       # busy, keep every task durable on disk instead of typing into Codex's
       # non-durable interactive input. Once idle, re-scan the whole queue and
       # select urgent/normal/low priority with FIFO only inside each tier.
-      while next_pending_task >/dev/null; do
-        filename="$(next_pending_task)" || break
-        if probe_optional_task_handler "$filename"; then
-          start_optional_task_handler "$filename"
-          continue
-        fi
-        wait_for_core_idle || exit 1
-        submit_task "$filename" 1
-      done
+      next_pending_task >/dev/null || continue
+      wait_for_core_idle || exit 1
+      filename="$(next_pending_task)" || continue
+      submit_task "$filename" 1
       ;;
   esac
 done < "$event_dir/events"

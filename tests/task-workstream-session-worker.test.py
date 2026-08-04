@@ -317,6 +317,8 @@ def test_watcher_provider_failure_falls_back_without_leaking_stdout() -> None:
         assert result.stdout == "TASK_FILE: task-retry.txt\n"
         assert "poison handler stdout" not in result.stdout
         assert "possible at-least-once retry" in result.stderr
+        assert (workspace / "state" / "task-event-handler-fallbacks" / "task-retry.txt").is_file()
+        assert not (workspace / "state" / "task-event-handler-claims" / "task-retry.txt").exists()
 
 
 def test_slow_handler_does_not_block_the_next_task_event() -> None:
@@ -373,6 +375,254 @@ def test_slow_handler_does_not_block_the_next_task_event() -> None:
         finally:
             os.killpg(process.pid, signal.SIGTERM)
             process.communicate(timeout=2)
+
+
+def test_watcher_bounds_provider_backlog_and_drains_every_receipt_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        isolated = [f"task-{letter}-isolated.txt" for letter in "abcd"]
+        for name in [*isolated, "task-z-live.txt"]:
+            (tasks / name).write_text(f"task: {name}\n")
+        handler = _executable(
+            root / "handler",
+            """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+import time
+
+args = sys.argv[1:]
+task = pathlib.Path(args[args.index("--task-file") + 1]).name
+if "--probe" in args:
+    raise SystemExit(3 if task == "task-z-live.txt" else 0)
+
+root = pathlib.Path(os.environ["HANDLER_STATE"])
+lock = root / "lock"
+while True:
+    try:
+        lock.mkdir()
+        break
+    except FileExistsError:
+        time.sleep(0.005)
+active_path = root / "active"
+maximum_path = root / "maximum"
+active = int(active_path.read_text()) + 1 if active_path.exists() else 1
+maximum = int(maximum_path.read_text()) if maximum_path.exists() else 0
+active_path.write_text(str(active))
+maximum_path.write_text(str(max(active, maximum)))
+with (root / "calls").open("a") as log:
+    log.write(task + "\\n")
+lock.rmdir()
+
+deadline = time.monotonic() + 4
+while not (root / "release").exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+
+while True:
+    try:
+        lock.mkdir()
+        break
+    except FileExistsError:
+        time.sleep(0.005)
+active = int(active_path.read_text()) - 1
+active_path.write_text(str(active))
+lock.rmdir()
+""",
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 5\n")
+        state = root / "handler-state"
+        state.mkdir()
+        process = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(tasks)],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "HANDLER_STATE": str(state),
+                "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+                "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                "SUTANDO_CORE_RUNTIME": "claude",
+                "SUTANDO_RESULTS_DIR": str(results),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            started = time.monotonic()
+            assert process.stdout is not None
+            assert process.stdout.readline() == "TASK_FILE: task-z-live.txt\n"
+            assert time.monotonic() - started < 1.0
+            assert int((state / "maximum").read_text()) <= 2
+
+            (state / "release").touch()
+            calls = []
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                calls = (state / "calls").read_text().splitlines()
+                if len(calls) == len(isolated):
+                    break
+                time.sleep(0.01)
+            assert sorted(calls) == sorted(isolated)
+            assert int((state / "maximum").read_text()) <= 2
+        finally:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=2)
+
+
+def test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        task = tasks / "task-overlap.txt"
+        task.write_text("task: one provider owner only\n")
+        calls = root / "calls"
+        handler = _executable(
+            root / "handler",
+            "#!/bin/sh\n"
+            "probe=0\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  [ \"$1\" = --probe ] && probe=1\n"
+            "  shift\n"
+            "done\n"
+            "[ \"$probe\" = 1 ] && exit 0\n"
+            "printf 'provider\\n' >> \"$HANDLER_CALLS\"\n"
+            "sleep 10\n",
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 10\n")
+        env = {
+            **os.environ,
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "HANDLER_CALLS": str(calls),
+            "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+            "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+            "SUTANDO_CORE_RUNTIME": "claude",
+            "SUTANDO_RESULTS_DIR": str(results),
+        }
+
+        def start_watcher():
+            return subprocess.Popen(
+                ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(tasks)],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+
+        owner = start_watcher()
+        overlap = None
+        try:
+            claim = workspace / "state" / "task-event-handler-claims" / task.name
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                if claim.is_file() and calls.exists():
+                    break
+                time.sleep(0.01)
+            assert claim.is_file()
+            assert calls.read_text().splitlines() == ["provider"]
+
+            overlap = start_watcher()
+            time.sleep(0.3)
+            assert claim.is_file(), "overlap must preserve the live owner's atomic claim"
+            assert calls.read_text().splitlines() == ["provider"]
+
+            os.killpg(overlap.pid, signal.SIGTERM)
+            overlap.communicate(timeout=2)
+            overlap = None
+            assert claim.is_file(), "non-owner cleanup must not remove another watcher's claim"
+
+            os.killpg(owner.pid, signal.SIGTERM)
+            owner_stdout, _ = owner.communicate(timeout=2)
+            assert owner_stdout == "TASK_FILE: task-overlap.txt\n"
+            assert not claim.exists()
+            assert (
+                workspace / "state" / "task-event-handler-fallbacks" / task.name
+            ).is_file()
+        finally:
+            if overlap is not None and overlap.poll() is None:
+                os.killpg(overlap.pid, signal.SIGKILL)
+                overlap.communicate(timeout=2)
+            if owner.poll() is None:
+                os.killpg(owner.pid, signal.SIGKILL)
+                owner.communicate(timeout=2)
+
+
+def test_shutdown_settles_running_and_pending_receipts_exactly_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        names = [f"task-shutdown-{index}.txt" for index in range(4)]
+        for name in names:
+            (tasks / name).write_text(f"task: {name}\n")
+        calls = root / "calls"
+        handler = _executable(
+            root / "handler",
+            "#!/bin/sh\n"
+            "probe=0\ntask_file=\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  case \"$1\" in --probe) probe=1;; --task-file) shift; task_file=$1;; esac\n"
+            "  shift\n"
+            "done\n"
+            "[ \"$probe\" = 1 ] && exit 0\n"
+            "basename \"$task_file\" >> \"$HANDLER_CALLS\"\n"
+            "sleep 10\n",
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 10\n")
+        process = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(tasks)],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "HANDLER_CALLS": str(calls),
+                "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+                "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                "SUTANDO_CORE_RUNTIME": "claude",
+                "SUTANDO_RESULTS_DIR": str(results),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            claims = workspace / "state" / "task-event-handler-claims"
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and len(list(claims.glob("task-*.txt"))) < 4:
+                time.sleep(0.01)
+            assert sorted(path.name for path in claims.glob("task-*.txt")) == names
+
+            os.killpg(process.pid, signal.SIGTERM)
+            stdout, _ = process.communicate(timeout=2)
+            process = None
+            assert sorted(stdout.splitlines()) == sorted(f"TASK_FILE: {name}" for name in names)
+            assert not list(claims.glob("task-*.txt"))
+            fallbacks = workspace / "state" / "task-event-handler-fallbacks"
+            assert sorted(path.name for path in fallbacks.glob("task-*.txt")) == names
+            assert len(calls.read_text().splitlines()) <= 2
+        finally:
+            if process is not None and process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=2)
 
 
 def test_codex_notifier_dispatches_each_isolated_task_once_without_waiting() -> None:
@@ -436,6 +686,85 @@ def test_codex_notifier_dispatches_each_isolated_task_once_without_waiting() -> 
             process.communicate(timeout=2)
 
 
+def test_codex_notifier_never_submits_a_watcher_claim_to_live_core() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        state = workspace / "state"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        state.mkdir()
+        (state / "core-status.json").write_text('{"status":"idle"}\n')
+        # The unhandled file sorts first in the watcher sweep, while the
+        # not-yet-claimed isolated file has higher queue priority. This closes
+        # the event-before-claim race, not only the easy claim-first ordering.
+        (tasks / "task-a-live.txt").write_text("priority: normal\ntask: live\n")
+        (tasks / "task-z-isolated.txt").write_text("priority: urgent\ntask: isolated\n")
+        handler_log = root / "handler.log"
+        handler = _executable(
+            root / "handler",
+            "#!/bin/sh\n"
+            "probe=0\ntask_file=\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  case \"$1\" in --probe) probe=1;; --task-file) shift; task_file=$1;; esac\n"
+            "  shift\n"
+            "done\n"
+            "if [ \"$probe\" = 1 ]; then\n"
+            "  case \"$task_file\" in *task-z-isolated.txt) exit 0;; *) exit 3;; esac\n"
+            "fi\n"
+            "basename \"$task_file\" >> \"$HANDLER_LOG\"\n"
+            "sleep 5\n",
+        )
+        tmux_log = root / "tmux.log"
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 5\n")
+        _executable(
+            bin_dir / "tmux",
+            "#!/bin/sh\n"
+            "case \" $* \" in *\" capture-pane \"*) exit 0;; esac\n"
+            "printf '%s\\n' \"$*\" >> \"$TMUX_LOG\"\n"
+            "exit 0\n",
+        )
+        process = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh")],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "HANDLER_LOG": str(handler_log),
+                "TMUX_LOG": str(tmux_log),
+                "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+                "SUTANDO_TASKS_DIR": str(tasks),
+                "SUTANDO_RESULTS_DIR": str(results),
+                "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                "SUTANDO_NOTIFIER_POLL_INTERVAL": "0.02",
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 1.5
+            tmux_calls = ""
+            while time.monotonic() < deadline:
+                tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
+                if "task-a-live.txt" in tmux_calls:
+                    break
+                time.sleep(0.01)
+            assert "task-a-live.txt" in tmux_calls
+            assert "task-z-isolated.txt" not in tmux_calls
+            deadline = time.monotonic() + 1
+            while not handler_log.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert handler_log.read_text().splitlines() == ["task-z-isolated.txt"]
+        finally:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=2)
+
+
 def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
     watcher = (REPO / "src" / "watch-tasks-stream.sh").read_text()
     notifier = (REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh").read_text()
@@ -444,7 +773,11 @@ def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
     assert '${SUTANDO_TASK_EVENT_HANDLER:-}' in watcher
     assert "--probe" in watcher
     assert 'printf \'TASK_FILE: %s\\n\'' in watcher
+    assert "TASK_HANDLER_WORKERS=2" in watcher
     assert "probe_optional_task_handler" in notifier
+    assert 'os.environ.pop("SUTANDO_TASK_EVENT_HANDLER"' not in notifier
+    assert "TASK_HANDLER_CLAIMS_DIR" in notifier
+    assert "TASK_HANDLER_FALLBACKS_DIR" in notifier
     assert "skills/task-workstream-sessions/scripts/session-worker.py" in claude
     assert "skills/task-workstream-sessions/scripts/session-worker.py" in codex
     assert 'NOTIFIER_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=' in codex
@@ -462,6 +795,10 @@ if __name__ == "__main__":
     test_cli_main_delegates_parsed_paths()
     test_watcher_provider_failure_falls_back_without_leaking_stdout()
     test_slow_handler_does_not_block_the_next_task_event()
+    test_watcher_bounds_provider_backlog_and_drains_every_receipt_once()
+    test_overlapping_watcher_preserves_live_claim_and_owner_shutdown_falls_back()
+    test_shutdown_settles_running_and_pending_receipts_exactly_once()
     test_codex_notifier_dispatches_each_isolated_task_once_without_waiting()
+    test_codex_notifier_never_submits_a_watcher_claim_to_live_core()
     test_runtime_wiring_is_optional_and_adapter_injected()
     print("task workstream session worker tests passed")
