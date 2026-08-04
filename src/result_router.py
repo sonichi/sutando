@@ -135,3 +135,63 @@ def audit_line(task_id: str, disposition: str, surface: str, ts: str) -> str:
     ISO-8601 UTC string) — this module stays pure and does no clock reads.
     """
     return f"{ts}\t{task_id}\t{disposition}\t{surface}"
+
+
+# --------------------------------------------------------------------------
+# §9.3 corollary: a result file that is PRESENT but PERSISTENTLY EMPTY
+# --------------------------------------------------------------------------
+#: Consecutive empty observations before a stuck result is announced. The
+#: bridges poll every 3s, so this is ~1 minute — four orders of magnitude
+#: outside the partial-write window it must not fire on (see below), and four
+#: orders of magnitude inside the 7-day `pending_replies` age-out it exists to
+#: pre-empt.
+EMPTY_RESULT_POLL_THRESHOLD = 20
+
+
+def empty_result_notice(
+    task_id: str,
+    path: str,
+    consecutive: int,
+    threshold: int = EMPTY_RESULT_POLL_THRESHOLD,
+) -> "str | None":
+    """The notice for a result file stuck empty, or None if it is too early.
+
+    WHY A THRESHOLD AND NOT A LOG ON FIRST SIGHT. Both bridges already do
+
+        if result_file.exists():
+            reply_text = result_file.read_text().strip()
+            if not reply_text:
+                continue
+
+    and that `continue` is LOAD-BEARING, not a missing branch. CLAUDE.md tells
+    the core to write results as `cat > "<path>" << EOF`, and `>` truncates at
+    open — so **every normal result file is briefly present-and-empty** between
+    the redirect and the heredoc flush. Measured on this write path: 1 of 8
+    sub-millisecond observations caught it empty. Drop the `continue` and the
+    bridge delivers an empty reply on a routine race; log on first sight and
+    the line fires on nearly every delivery and is tuned out within a day.
+
+    So the defect was never the missing branch — it is the missing BOUND.
+    Nothing distinguished "empty for 2 ms because it is being written" from
+    "empty forever", and those are identical on any single poll. The one signal
+    that separates them is PERSISTENCE, which is what this counts.
+
+    Without it, an empty result leaves its task in `pending_replies`, re-read
+    every 3s, until the 7-day age-out logs `aged out N` without ever saying
+    why — so the owner waits up to a week for a reply that will never come and
+    nothing names it. (Found by @Sutando-Pro sweeping the silent-skip family;
+    the partial-write mechanism, which relocates the fix, by @Sutando-Mini.)
+
+    Fires EXACTLY ONCE per stuck task — at `== threshold`, not `>=` — because a
+    warning that repeats every 3s for seven days is the same silence in a
+    louder font.
+    """
+    if consecutive != threshold:
+        return None
+    return (
+        f"[result] {task_id}: result file has been PRESENT BUT EMPTY for "
+        f"{consecutive} consecutive polls ({path}). The reply is NOT being "
+        f"delivered and the task stays pending until the 7-day age-out. "
+        f"This is past any partial-write window — the writer likely died "
+        f"mid-write or produced no body."
+    )
