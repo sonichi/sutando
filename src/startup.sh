@@ -497,7 +497,13 @@ if [ "$BUNDLED_MODE" != "1" ]; then
   if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
 fi
 if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; missing=1; fi
-core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)"
+# sutando-config.sh REQUIRES python and exits 1 without it. Under `set -e` a
+# bare command substitution here aborted the whole startup — after we had
+# just printed that Python-backed services would be skipped (CR #2599,
+# @qingyun-wu). Tolerate the failure and fall back, so the skip actually
+# happens instead of being promised.
+core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || true)"
+[ -n "$core_runtime" ] || core_runtime="claude"
 if ! command -v "$core_runtime" > /dev/null 2>&1; then
   echo "  ✗ $core_runtime CLI not found — required by core.runtime"
   missing=1
@@ -1153,9 +1159,16 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # launch self-defer and exit, so always-spawn is safe and simpler.
   for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
     _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
-    SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
-      REMOTE_PROACTIVE_ROOM= \
-      [ -n "$PY" ] && "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+    # The guard must wrap the WHOLE command. `VAR=1 [ -n "$PY" ] && cmd` applies
+    # the assignments to `[` and runs cmd with NONE of them — so the named
+    # gateway launched without GATEWAY_INSTANCE / its own REMOTE_TASK_TOKEN /
+    # the REMOTE_PROACTIVE_ROOM= scoping, collapsing onto the primary gateway's
+    # credentials (CR #2599, @qingyun-wu).
+    if [ -n "$PY" ]; then
+      SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+        REMOTE_PROACTIVE_ROOM= \
+        "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+    fi
     echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
   done
 fi
@@ -1173,6 +1186,10 @@ if [ "${SKIP_DISCORD:-}" = "1" ]; then
 elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
   PYTHON_WITH_DISCORD=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+    # Same substitution as the slack loop below: probing EXECUTES the candidate,
+    # so a bare `python3` here is the CLT stub on a Mac without developer tools.
+    [ "$_p" = "python3" ] && _p="$PY"
+    [ -n "$_p" ] || continue
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import discord" 2>/dev/null; then
       PYTHON_WITH_DISCORD="$_p"
       break
@@ -1186,9 +1203,14 @@ elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
   # interpreter that would crash-loop on every boot. If THAT probe also
   # fails, keep the labeled skip with the pip-install hint (names the
   # missing dep + fix at the startup console).
-  if [ -z "$PYTHON_WITH_DISCORD" ] && command -v python3 >/dev/null 2>&1 && python3 -c "import discord" 2>/dev/null; then
-    PYTHON_WITH_DISCORD="python3"
-    echo "  ~ discord bridge using PATH python3 (no probed interp matched; PATH python3 has discord.py)"
+  # Probe the RESOLVED interpreter, never a bare `python3`. `command -v python3`
+  # succeeds against the Xcode-CLT stub and the `-c "import discord"` that
+  # follows EXECUTES it — raising the modal this PR exists to remove (CR #2599,
+  # @qingyun-wu). $PY is empty when nothing runnable exists, so the probe is
+  # skipped entirely rather than falling back to the stub.
+  if [ -z "$PYTHON_WITH_DISCORD" ] && [ -n "$PY" ] && "$PY" -c "import discord" 2>/dev/null; then
+    PYTHON_WITH_DISCORD="$PY"
+    echo "  ~ discord bridge using resolved python3 ($PY — no probed interp matched; it has discord.py)"
   fi
   if [ -z "$PYTHON_WITH_DISCORD" ]; then
     echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
@@ -1212,6 +1234,16 @@ if [ "${SKIP_SLACK:-}" = "1" ]; then
 elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
   PYTHON_WITH_SLACK=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+    # Substitute the RESOLVED interpreter for the bare `python3` candidate:
+    # probing a candidate EXECUTES it, and a bare `python3` on a Mac without
+    # developer tools is the CLT stub (CR #2599, @qingyun-wu). Empty $PY drops
+    # out of the list rather than degrading to the stub.
+    #
+    # Done inside the loop rather than in the `for` list so the pre-existing
+    # /opt/... literals stay on an UNCHANGED line — rewriting that line re-adds
+    # them as new, and REVIEW.md's path scan flags added /opt/ paths.
+    [ "$_p" = "python3" ] && _p="$PY"
+    [ -n "$_p" ] || continue
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
       PYTHON_WITH_SLACK="$_p"
       break

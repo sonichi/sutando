@@ -190,5 +190,66 @@ for tf in $(grep -rlE '(cp|copy2).*sutando-config\.sh' "$REPO/tests" 2>/dev/null
 done
 [ "$miss" -eq 0 ] && ok "every fixture copying the real config script also copies the helper"
 
+# --- 10. the empty-$PY contract at the ACTIVATED startup sites ---------------
+# Three P1s from CR #2599 (@qingyun-wu), each a different way the guard was
+# wrong at the seam rather than in the resolver.
+
+# 10a. A config call must not abort a startup that just promised to skip.
+#      `core_runtime="$(bash sutando-config.sh core-runtime)"` under `set -e`
+#      killed startup.sh outright, because sutando-config.sh now exits 1
+#      without python.
+if grep -qE 'core_runtime="\$\(bash "\$REPO/scripts/sutando-config\.sh" core-runtime\)"' "$REPO/src/startup.sh"; then
+  bad "startup.sh tolerates a failing core-runtime lookup" "bare command substitution still aborts under set -e"
+else
+  ok "startup.sh tolerates a failing core-runtime lookup"
+fi
+
+# 10b. A guard must not swallow the command's environment.
+#      `VAR=1 [ -n "$PY" ] && cmd` applies VAR to `[`, and runs cmd with NONE
+#      of it — the named gateway lost GATEWAY_INSTANCE / its own
+#      REMOTE_TASK_TOKEN / REMOTE_PROACTIVE_ROOM=.
+env_swallow=$(bash -c 'PY=/bin/echo; A=1 B=2 \
+  [ -n "$PY" ] && "$PY" "A=${A:-unset} B=${B:-unset}"' 2>/dev/null)
+case "$env_swallow" in
+  *"A=unset"*) ok "control: 'VAR=1 [ test ] && cmd' really does drop VAR (the bug shape)" ;;
+  *) bad "control: the env-swallow shape" "expected A=unset, got: $env_swallow" ;;
+esac
+if grep -qE '^\s+REMOTE_PROACTIVE_ROOM= \\$' "$REPO/src/startup.sh" \
+   && grep -A1 'REMOTE_PROACTIVE_ROOM= \\' "$REPO/src/startup.sh" | grep -qE '^\s+\[ -n'; then
+  bad "named gateway keeps its per-instance credentials" "guard is inside the assignment list"
+else
+  ok "named gateway keeps its per-instance credentials"
+fi
+
+# 10c. No probe may EXECUTE a bare python3 — probing runs it, and on a Mac
+#      without developer tools that is the stub.
+probes=$(grep -nE '(^|[^-[:alnum:]_/"$])python3 -c ' "$REPO/src/startup.sh" | grep -vE '^\s*[0-9]+:\s*#' || true)
+if [ -n "$probes" ]; then
+  bad "no startup probe executes a bare python3 (literal)" "$probes"
+else
+  ok "no startup probe executes a bare python3 (literal)"
+fi
+
+# A literal scan is not enough: both interpreter-probe loops iterate a list
+# ending in a bare `python3` and then run `"$_p" -c ...`, which executes the
+# stub without the literal `python3 -c ` ever appearing. The first version of
+# THIS check missed the discord loop for exactly that reason. So: every loop
+# offering a bare python3 candidate must neutralise it before probing.
+loops=0; unguarded=0
+while IFS= read -r ln; do
+  loops=$((loops+1))
+  n="${ln%%:*}"
+  # The substitution must appear before the loop body does anything with $_p.
+  # Window is generous (14 lines) because a rationale comment legitimately sits
+  # between; the binding check below is what makes that safe.
+  if ! sed -n "$((n+1)),$((n+14))p" "$REPO/src/startup.sh" | grep -q '_p="\$PY"'; then
+    unguarded=$((unguarded+1))
+    bad "probe loop neutralises its bare python3 candidate (line $n)" "no _p=\"\$PY\" substitution"
+  fi
+done < <(grep -nE 'for _p in .* python3; do' "$REPO/src/startup.sh" || true)
+if [ "$loops" -gt 0 ] && [ "$unguarded" -eq 0 ]; then
+  ok "all $loops interpreter-probe loop(s) neutralise their bare python3 candidate"
+fi
+
 printf "\npassed=%d failed=%d\n" "$pass" "$fail"
 [ "$fail" -eq 0 ]
