@@ -121,7 +121,15 @@ def resolve_channel_token(var: str, env_file: Path | None = None,
 
 
 def main(argv: list[str] | None = None) -> int:
-    """`--has VAR [--env-file PATH]` -> exit 0 if a usable token exists, else 1.
+    """`--has VAR [--env-file PATH]` -> 0 = usable token, 3 = definitively absent.
+
+    **3, not 1, and the choice is load-bearing.** Python exits 1 for a syntax
+    error and for any uncaught exception (measured), so a shell caller cannot
+    distinguish "I checked and there is no token" from "this script is broken".
+    `startup.sh` branches on exactly that difference: a definitive NO must refuse
+    to start the bridge, while an unrunnable resolver must degrade to the old
+    grep rather than take every bridge on the host down over a code bug. 3 is a
+    value the interpreter will not produce on its own. (@Sutando-Pro on #2638.)
 
     For `startup.sh`, whose per-bridge gate is `grep -q "<VAR>=" "$env"`. That
     grep is prefix-only and blind to the vault, so it both starts bridges with an
@@ -139,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         i = argv.index("--env-file")
         if i + 1 < len(argv):
             env_file = Path(argv[i + 1])
-    return 0 if resolve_channel_token(var, env_file=env_file) else 1
+    return 0 if resolve_channel_token(var, env_file=env_file) else 3
 
 
 if __name__ == "__main__":

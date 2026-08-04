@@ -109,10 +109,43 @@ def main() -> int:
         env.write_text("GATEVAR=\n")
         # No vault entry for this name -> the empty file value must not satisfy it.
         rc = ct.main(["--has", "GATEVAR", "--env-file", str(env)])
-        check("--has exits nonzero for `VAR=` with no value "
-              "(the exact state the grep gate passes)", rc != 0, f"rc={rc}")
-        check("--has with no VAR is a usage error, not a false 0",
+        check("--has exits 3 for `VAR=` with no value "
+              "(the exact state the grep gate passes)", rc == 3, f"rc={rc}")
+        check("--has with no VAR is a usage error (2 = cannot answer), not a false 0",
               ct.main(["--has"]) == 2)
+
+    # A DEFINITIVE no must be distinguishable from a BROKEN resolver, or
+    # startup.sh cannot decide whether to refuse the bridge or fall back to the
+    # old grep. Python exits 1 for a syntax error AND for any uncaught exception,
+    # so 1 can never mean "no". Measured, not assumed:
+    #     syntax error -> 1     missing file -> 2     answered no -> 3
+    # Falling back on a definitive no is what reinstates the empty-value pass
+    # this gate exists to close (@Sutando-Pro reproduced exactly that on #2638).
+    # Stub the vault tier: `main()` takes no injection hook, so calling it with a
+    # real name would consult the OPERATOR'S keychain — the very hermeticity this
+    # suite asserts two blocks down. Reading is milder than Pro's write, but a
+    # suite that exempts itself from its own rule is not hermetic.
+    _real_tfv = ct.token_from_vault
+    ct.token_from_vault = lambda var, vault_get=None: ""
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            empty = Path(td) / "empty.env"
+            empty.write_text("UNRELATED=x\n")
+            rc_no = ct.main(["--has", "NOT_A_REAL_TOKEN_XYZ", "--env-file", str(empty)])
+        check("a definitive NO is 3, a code Python will not emit on its own", rc_no == 3,
+              f"rc={rc_no}")
+        check("...and it is NOT 1, which a syntax error or uncaught raise produces",
+              rc_no != 1)
+    finally:
+        ct.token_from_vault = _real_tfv
+
+    # Both sides of the contract, or it only half exists: startup.sh must branch
+    # on 3 (refuse) and must NOT treat 1 (broken resolver) as an answer.
+    _startup = (REPO / "src" / "startup.sh").read_text()
+    check("all 3 startup gates branch on the definitive-no code",
+          _startup.count('_tok_rc" -eq 3') == 3, f"found {_startup.count(chr(95)+chr(116)+chr(111)+chr(107)+chr(95)+chr(114)+chr(99)+chr(34)+' -eq 3')}")
+    check("no startup gate treats 1 as a definitive no",
+          '_tok_rc" -eq 1' not in _startup)
 
     # --- HERMETIC ------------------------------------------------------------
     # If `token_from_vault` ever reaches the real reader, a test run could write
