@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import plistlib
 import shlex
 import shutil
 import tempfile
@@ -41,6 +42,13 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+# Kept as two lines on purpose: tests/git-binary-resolution.test.py:109 asserts
+# the literal `from git_binary import git_argv` to prove each call site imports
+# the resolver instead of hardcoding a git path. Merging these into one import
+# breaks that substring check — which guards 27 other call sites, so the import
+# bends here rather than the guard.
+from git_binary import git_argv  # noqa: E402
+from git_binary import GitUnavailable  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
@@ -92,6 +100,166 @@ def _default_memory_dir() -> str:
 # redirecting.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
+# How much of MEMORY.md a session actually loads. These are the RUNTIME's
+# documented numbers, not this repo's guess:
+#
+#   "Claude Code reads the first 200 lines or 25KB of a memory file, whichever
+#    comes first" — content BEYOND that point is dropped; the prefix still
+#    loads. YAML frontmatter and block-level HTML comments are stripped before
+#    those limits are measured.
+#   https://code.claude.com/docs/en/memory#how-it-works
+#
+# Earlier revisions of this check encoded a measured-by-eye ~24KB cutoff and
+# claimed the WHOLE index stops loading past it. Both were wrong (john-the-dev,
+# #2449): the limit is line-OR-byte, and truncation is a suffix drop, not total
+# loss. They are plain constants rather than env knobs on purpose — they mirror
+# a documented external contract, so a deployment that "tunes" them is just
+# lying to itself about what its runtime does. Undeclared env vars are also
+# forbidden by AGENTS.md (qingyun-wu, #2449).
+MEMORY_INDEX_LOAD_LINES = 200
+# 25 KB DECIMAL (25_000), not 25 KiB. The docs say "the first 25KB"; encoding it
+# as 25 * 1024 made this check 600 B more generous than the runtime, so a file
+# between 25_000 and 25_600 reports healthy while its tail is already dropped.
+#
+# The runtime settles it: its own over-limit warning prints the limit as
+# "24.4KB", and 25_000 / 1024 = 24.41 — a 25_600 limit would print "25.0KB".
+# Observed on this repo 2026-08-02, where MEMORY.md was truncated at session
+# start while this check called it under the limit.
+#
+# NB this is a UNITS fix, not a return to the "measured-by-eye ~24KB" cutoff
+# that #2449 rightly rejected — that guess also claimed the whole index stops
+# loading, which remains wrong: truncation is a suffix drop.
+MEMORY_INDEX_LOAD_BYTES = 25_000
+# Warn while there is still room to compact deliberately rather than in a panic.
+MEMORY_INDEX_NEAR_LIMIT = 0.9
+
+
+def _index_effective_text(text: str) -> str:
+    """Drop what the runtime strips BEFORE it measures the 200-line/25KB limits.
+
+    Counting raw bytes over-reports: a file whose bulk is frontmatter or a block
+    HTML comment measures large here but small to the runtime. That produced a
+    false `fail` on a 25.6KB fixture whose visible content was one line
+    (john-the-dev, #2449).
+    """
+    if text.startswith("---"):
+        m = re.match(r"^---\r?\n.*?\r?\n---[ \t]*\r?\n?", text, re.DOTALL)
+        if m:
+            text = text[m.end():]
+
+    # Block-level HTML comments only, and NOT inside a fenced code block: the
+    # runtime strips block comments but PRESERVES them inside code fences, so a
+    # regex that ignores fence state under-reports. A 28KB comment wrapped in
+    # ```html measured as 37 bytes here and returned a false `ok` while the
+    # entry after it was genuinely past the cut (john-the-dev, #2449).
+    #
+    # Line-oriented rather than one regex, because fence state and multi-line
+    # comment state both have to be tracked, and a regex cannot carry either.
+    out: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    in_comment = False
+    def _block_indent_ok(raw: str) -> bool:
+        # CommonMark bounds a block-level marker to at most THREE columns of
+        # indentation; at four the line is indented CODE, not a marker. This
+        # gates BOTH markers we track:
+        #   fence  — a 4-space ```html is not a fence, so the comment inside it
+        #            must be stripped, not preserved (false `fail`; qingyun-wu).
+        #   <!--   — a 4-space or TAB indented comment is code CONTENT and must
+        #            count toward the 25KB prefix, not be stripped (false `ok`
+        #            on a 30KB fixture that measured 18 bytes; qingyun-wu).
+        # Counted in COLUMNS, not characters: a bare lstrip(" ") ignored tabs, and
+        # one tab already reaches the 4-column stop. Applies to a fence closer
+        # too — an over-indented closer must not close a real fence.
+        n = 0
+        for ch in raw:
+            if ch == " ":
+                n += 1
+            elif ch == "\t":
+                n += 4 - (n % 4)          # advance to the next 4-column tab stop
+            else:
+                break
+            if n >= 4:
+                return False
+        return True
+
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        indent_ok = _block_indent_ok(line)
+        if in_fence:
+            out.append(line)
+            # CommonMark: a fence closes only on the SAME character, repeated at
+            # least as many times as the opener, alone on its line. Truncating the
+            # marker to three characters let an inner ``` line close a ````
+            # fence early — the comment after it then fell outside any fence, was
+            # stripped, and a 28KB file measured 39 bytes: false `ok`
+            # (rui-sutando-codex, #2449).
+            if (indent_ok and stripped[:1] == fence_char
+                    and re.fullmatch(re.escape(fence_char) + "{%d,}" % fence_len,
+                                     stripped.rstrip())):
+                in_fence = False
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        m = re.match(r"(`{3,}|~{3,})", stripped) if indent_ok else None
+        if m and m.group(1)[0] == "`" and "`" in stripped[m.end():]:
+            # CommonMark: a BACKTICK fence's info string may not contain a
+            # backtick (it would be ambiguous with inline code). ```bad`info is
+            # therefore an ordinary paragraph line, not an opener. Accepting it
+            # opened a phantom fence, so the block comment that followed was
+            # PRESERVED and a 31KB fixture measured 31KB: a false `fail` telling
+            # the operator to compact an index that loads fine (john-the-dev,
+            # #2449). Tilde fences have no such rule — ~~~a`b IS a valid opener.
+            out.append(line)
+            continue
+        if m:
+            in_fence = True
+            fence_char = m.group(1)[0]
+            fence_len = len(m.group(1))     # FULL length — see the close check above
+            out.append(line)
+            continue
+        if indent_ok and stripped.startswith("<!--"):
+            if "-->" not in line:
+                in_comment = True
+            continue                      # whole-line block comment: dropped
+        out.append(line)
+    return "".join(out)
+
+
+def _index_loaded_prefix(text: str) -> "tuple[str, int, int]":
+    """Return (prefix_that_loads, bytes_loaded, lines_loaded) per the contract.
+
+    Whichever of the two limits is reached first stops the read. A line that
+    would straddle the byte limit is treated as not loaded — the conservative
+    reading, and the one that matters here since a half-read index line cannot
+    be relied on to name its memory file.
+    """
+    kept: list[str] = []
+    total = 0
+    for i, line in enumerate(text.splitlines(keepends=True)):
+        if i >= MEMORY_INDEX_LOAD_LINES:
+            break
+        nbytes = len(line.encode("utf-8"))
+        if total + nbytes > MEMORY_INDEX_LOAD_BYTES:
+            # The limit is a BYTE prefix, not a line count — the session reads
+            # the bytes up to the cut, so a line that STARTS inside the budget
+            # is partially read. Dropping it whole marked an entry whose
+            # filename sat comfortably before the cut as unreadable, failing an
+            # index that loads fine (qingyun-wu, #2449). Keep the bytes that fit.
+            room = MEMORY_INDEX_LOAD_BYTES - total
+            if room > 0:
+                # errors="ignore" so a cut through a multi-byte character
+                # yields the readable prefix instead of raising.
+                kept.append(line.encode("utf-8")[:room].decode("utf-8", errors="ignore"))
+                total += room
+            break
+        kept.append(line)
+        total += nbytes
+    return "".join(kept), total, len(kept)
+
 
 def _resolve_dotenv() -> Path:
     """Resolve the `.env` path via the canonical resolver.
@@ -106,6 +274,37 @@ def _resolve_dotenv() -> Path:
 
 
 _VOICE_ENV_KEYS = ("SKIP_VOICE", "GEMINI_VOICE_API_KEY", "GEMINI_API_KEY")
+
+
+def managed_voice_credential_present(path: Optional[Path] = None) -> bool:
+    """True when the managed-credentials file carries a usable voice key.
+
+    Mirrors `_managed_voice_credential_present` in startup-runtime.sh, including
+    its fallback order (`CAPABILITY_FALLBACKS['gemini-voice']`) and its
+    malformed-file contract: an unreadable or malformed file SKIPS the tier
+    rather than raising, matching readManaged()'s try/catch.
+
+    Deliberately NOT fail-closed, unlike the dotenv parsing above. The two cases
+    differ: a malformed SKIP_VOICE means someone configured voice and we cannot
+    tell how, so hiding it would mask an outage. A malformed managed file means
+    the managed tier is unusable, so startup will not boot voice either — and
+    reporting "enabled" there would invent an outage that cannot exist. Match
+    the launcher, because the whole bug was the two disagreeing.
+    """
+    if path is None:
+        path = WORKSPACE_DIR / "state" / "auth" / "managed-credentials.json"
+    try:
+        caps = (json.loads(Path(path).read_text()) or {}).get("capabilities") or {}
+        if not isinstance(caps, dict):
+            return False
+    except Exception:
+        return False
+    for slot in ("gemini-voice", "gemini-text"):
+        entry = caps.get(slot)
+        key = entry.get("key") if isinstance(entry, dict) else None
+        if isinstance(key, str) and key:
+            return True
+    return False
 
 
 def resolve_voice_health_config(
@@ -169,9 +368,74 @@ def resolve_voice_health_config(
         return {"enabled": True, "detail": "Gemini voice credential configured"}
     if skip_voice not in ("", "0", "1"):
         return {"enabled": True, "error": f"invalid SKIP_VOICE={skip_voice!r}"}
+    # The MANAGED tier, checked in the same order startup-runtime.sh uses: BYO env
+    # first, then managed, and only then SKIP_VOICE. Without this the two disagree —
+    # startup-runtime.sh:52-58 boots voice on a managed credential while this
+    # returned "disabled", so all four voice checks reported `ok — disabled` over a
+    # running-and-broken voice agent. A health check that reports "disabled" about a
+    # service that is actually running is worse than no check: it converts an outage
+    # into a green light. (#2197 review blocker, john-the-dev 2026-07-30T01:53.)
+    #
+    # This check MUST sit above the SKIP_VOICE=1 return, not below it. Placing it
+    # below narrowed the bug without resolving it: the launcher *unsets* an inherited
+    # SKIP_VOICE when a managed credential exists, so the composition "managed key +
+    # inherited SKIP_VOICE=1" still had startup booting voice while health reported
+    # disabled. The managed-only test could not catch it because it omits SKIP_VOICE.
+    # (#2197 review blocker, john-the-dev 2026-07-31T05:37.)
+    if managed_voice_credential_present():
+        return {"enabled": True, "detail": "managed voice credential configured"}
     if skip_voice == "1":
         return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
+
+
+def resolve_web_client_port(
+    env: Optional[dict] = None,
+    env_path: Optional[Path] = None,
+) -> dict:
+    """Resolve CLIENT_PORT with the same sourced-dotenv precedence as startup."""
+    env = os.environ if env is None else env
+    env_path = _resolve_dotenv() if env_path is None else env_path
+    file_value: Optional[str] = None
+    file_has_value = False
+
+    if env_path.exists():
+        try:
+            lines = env_path.read_text().splitlines()
+        except OSError as exc:
+            return {"error": f"{env_path.name} unreadable ({exc})"}
+        for line_no, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            assignment = line
+            if assignment.startswith("export "):
+                assignment = assignment[len("export "):].lstrip()
+            if not assignment.startswith("CLIENT_PORT"):
+                continue
+            if "=" not in assignment:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT assignment"}
+            key, value = assignment.split("=", 1)
+            if key.strip() != "CLIENT_PORT":
+                continue
+            try:
+                parsed = shlex.split(value, comments=True, posix=True)
+            except ValueError as exc:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT value ({exc})"}
+            if len(parsed) > 1:
+                return {"error": f"{env_path.name}:{line_no} malformed CLIENT_PORT value"}
+            file_value = parsed[0] if parsed else ""
+            file_has_value = True
+
+    configured = file_value if file_has_value else env.get("CLIENT_PORT")
+    value = str(configured or "8080").strip()
+    try:
+        port = int(value)
+    except ValueError:
+        return {"error": f"invalid CLIENT_PORT={value!r}"}
+    if not 1 <= port <= 65535:
+        return {"error": f"invalid CLIENT_PORT={value!r}"}
+    return {"port": port}
 
 
 def check_voice_stack(
@@ -521,6 +785,94 @@ def check_cron_runner(
     }
 
 
+_MONTH_MAX_DAYS = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
+                   7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
+
+
+def _cron_field_values(field: str, lo: int, hi: int) -> "set[int] | None":
+    """Expand one numeric cron field to its value set, or None if not understood.
+
+    None means "do not reason about this expression" — every caller below treats
+    an unparseable field as schedulable, so a parser gap can never invent a
+    never-fires verdict.
+    """
+    out: "set[int]" = set()
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            return None
+        step = 1
+        if "/" in part:
+            part, _, raw_step = part.partition("/")
+            if not raw_step.isdigit() or int(raw_step) < 1:
+                return None
+            step = int(raw_step)
+        if part in ("*", "?"):
+            start, end = lo, hi
+        elif "-" in part.lstrip("-"):
+            start_s, _, end_s = part.partition("-")
+            if not (start_s.isdigit() and end_s.isdigit()):
+                return None
+            start, end = int(start_s), int(end_s)
+        elif part.isdigit():
+            start = end = int(part)
+        else:
+            return None  # names (JAN/MON), L, W, # — not our business
+        if start > end or start < lo or end > hi:
+            return None
+        out.update(range(start, end + 1, step))
+    return out or None
+
+
+def _cron_can_never_fire(expr: str) -> bool:
+    """True only when a 5-field cron's day-of-month/month pair is impossible.
+
+    A deliberately-parked entry is the real case: this host carries
+    `wire-newsroom-nightly-DISABLED-...` at `0 0 31 2 *` — February 31st, which
+    is syntactically valid and can never occur. /schedule-crons cannot register
+    it, so it was counted as expected-but-missing and the session-crons guard
+    warned on every run, permanently. A guard that always warns is a guard
+    nobody reads, and this one exists to catch a SILENT failure (a peer
+    instance registered 2/18 with no error) — so a standing false positive
+    disables exactly the signal it was built to raise.
+
+    Deliberately conservative: day-of-week must be unrestricted, because cron
+    ORs day-of-month with day-of-week — `0 0 31 2 MON` still fires on Mondays.
+    Anything unparseable returns False (schedulable).
+    """
+    parts = expr.split()
+    if len(parts) != 5:
+        return False
+    _, _, dom_f, month_f, dow_f = parts
+    if dow_f.strip() not in ("*", "?"):
+        return False  # OR-semantics with day-of-week — it can still fire
+    doms = _cron_field_values(dom_f, 1, 31)
+    months = _cron_field_values(month_f, 1, 12)
+    if doms is None or months is None:
+        return False
+    return not any(d <= _MONTH_MAX_DAYS[m] for m in months for d in doms)
+
+
+def _entry_marked_parked(entry: dict) -> bool:
+    """True when the entry carries an explicit "deliberately disabled" signal.
+
+    An impossible date alone must NOT qualify. `0 0 31 2 *` is equally the
+    signature of a parked job and of an active typo — someone meaning "the 31st,
+    monthly" and writing February. Excluding on the date alone would let a
+    mistyped ACTIVE schedule vanish from `expected`, so CronCreate silently
+    omits it and this guard reports green forever: the precise silent-miss class
+    the check exists to surface.
+
+    Two accepted signals: an explicit `disabled: true` field, and the
+    established convention of DISABLED in the entry name (used by this host's
+    `wire-newsroom-nightly-DISABLED-2026-06-09-...`, which also records why).
+    """
+    if entry.get("disabled") is True:
+        return True
+    name = entry.get("name")
+    return isinstance(name, str) and "DISABLED" in name
+
+
 def check_session_cron_registration(
     workspace_dir: Optional[Path] = None,
     host_label: Optional[str] = None,
@@ -558,7 +910,18 @@ def check_session_cron_registration(
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
             return False
-        if entry.get("loop") == "dynamic" or not entry.get("cron"):
+        cron_expr = entry.get("cron")
+        if entry.get("loop") == "dynamic" or not cron_expr:
+            return False
+        if (
+            _entry_marked_parked(entry)
+            and isinstance(cron_expr, str)
+            and _cron_can_never_fire(cron_expr)
+        ):
+            # BOTH signals required. Marked-disabled AND unregistrable (e.g.
+            # `0 0 31 2 *`): /schedule-crons cannot register it, so counting it
+            # as expected warns forever. An impossible date WITHOUT a disabled
+            # marker is an active typo and must still warn.
             return False
         return True
 
@@ -753,6 +1116,392 @@ def check_memory_dir_siblings() -> "dict | None":
     }
 
 
+def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
+    """EVERY existing concrete path a carrier-set entry matches.
+
+    Entries are gitignore-style and may be globs (`hosts/*/`), directories
+    (`notes/`) or plain files (`state/current-track.md`).
+
+    Deliberately ALL matches, not the first. Sampling one is sound for the stale
+    branch (which asks "is the entry this host configured actually in effect" —
+    one witness settles it), but not for judging whether a *local* rule covers a
+    *shipped* one: a narrower local rule can cover one child of a shipped
+    wildcard while leaving its siblings ignored, and a first-hit check that
+    happened to land on the covered child would report the vault healthy while a
+    whole host subtree went unbacked (qingyun-wu P1 on #2572).
+
+    Enumeration is bounded by construction: glob matches are the entry's own
+    direct matches (`hosts/*/` -> one path per host), never a recursive walk of
+    their contents.
+    """
+    rel = entry.strip().lstrip("/").rstrip("/")
+    if not rel:
+        return []
+    if any(ch in rel for ch in "*?["):
+        return sorted(workspace.glob(rel))
+    candidate = workspace / rel
+    return [candidate] if candidate.exists() else []
+
+
+def _carrier_probe_files(rep: "Path") -> "list[Path]":
+    """Every concrete file a materialized representative stands for.
+
+    A file represents itself; a DIRECTORY is represented by every file beneath
+    it, sorted for determinism.
+
+    Deliberately EXHAUSTIVE. The first cut sampled the first 25 and said so in a
+    comment — "past the cap the probe can UNDER-report" — which treated a stated
+    caveat as an acceptable conclusion rather than a defect. john-the-dev built
+    the obvious counterexample on that head: 26 files with only the 26th ignored
+    read `ok`, so a stale exclude left a real carrier file unbacked while health
+    certified the subtree. In a probe whose entire purpose is catching silent
+    non-backup, a sample is not proof of coverage.
+
+    Cost is bounded by asking git ONCE for the whole list (`check-ignore
+    --stdin`) rather than once per file, so exhaustiveness costs a filesystem
+    walk plus a single process — not N processes. See `_carrier_target_verdict`.
+    """
+    if rep.is_file():
+        return [rep]
+    if not rep.is_dir():
+        return []
+    return sorted(f for f in rep.rglob("*") if f.is_file())
+
+
+def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
+    """`"carried"` | `"dropped"` | `"unmeasured"` for ONE materialized path.
+
+    A DIRECTORY and the files inside it are different questions for git, and the
+    first cut asked the wrong one. `*` + `!hosts/` + `!hosts/*/` un-ignores the
+    directories while every file beneath stays ignored — `!hosts/**` is what
+    carries the contents. So `check-ignore` on `hosts/a` answered "not ignored"
+    while `hosts/a/current-track.md` was ignored and unbacked, and the probe
+    reported the vault healthy with the very file it exists to protect not being
+    backed up. Reproduced independently by john-the-dev and qingyun-wu on
+    a958d06f, and confirmed here before changing anything.
+
+    So a directory is probed through EVERY file beneath it, and any ignored one
+    condemns the entry. Exhaustive rather than sampled: a 26-file directory whose
+    26th file alone was ignored read `ok` under the old 25-file cap
+    (john-the-dev, #2572), which is the exact silent non-backup this exists for.
+
+    `--no-index` stays load-bearing and the instrument stays `check-ignore` for
+    a reason worth recording: the obvious alternative,
+    `ls-files --others --ignored`, is index-AWARE, so it calls a tracked file
+    carried. That silently reverses a documented behavior —
+    `test_a_TRACKED_file_with_a_stale_exclude_is_still_reported` exists because a
+    host that carried a file once and then let its exclude go stale read healthy
+    forever while nothing NEW under that entry was being carried. I wrote the
+    ls-files version first and that test failed; it was right and I was wrong.
+
+    Used by BOTH the stale and dropped branches. The stale branch probes a
+    directory representative too and had the same blindness; fixing only the
+    branch that was reported would have left the identical defect one step to
+    the left, which is how this class of bug has survived three rounds here.
+    """
+    targets = _carrier_probe_files(rep)
+    if not targets:
+        # A materialized directory with no files under it yet. Nothing to
+        # measure — treated as carried so an empty `hosts/<label>/` cannot
+        # manufacture a failure; the "nothing on disk" case is handled by the
+        # callers, which report an entry with no representatives at all.
+        return "carried"
+
+    # NUL-delimited, not newline. A filename may CONTAIN a newline, and
+    # `"\n".join(...)` then splits one real path into two bogus ones — both of
+    # which are typically un-ignored, so the genuinely ignored carrier file reads
+    # as carried. Reproduced on a real tree (john-the-dev, #2572):
+    #
+    #     notes/z\nx.md  check-ignore -q  -> 0  (IGNORED, not backed up)
+    #     split halves   notes/z, x.md    -> 1, 1 (both un-ignored)
+    #     newline-joined batch            -> 1  -> reads CARRIED, false green
+    #     NUL-joined with -z              -> 0  -> dropped, correct
+    #
+    # `-z` makes git read NUL-separated input, which is the only delimiter a
+    # POSIX filename cannot contain.
+    rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
+    try:
+        proc = subprocess.run(
+            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-z", "--stdin"),
+            input=rels, capture_output=True, text=True, timeout=60,
+        )
+    except (GitUnavailable, OSError, subprocess.SubprocessError):
+        return "unmeasured"
+    # check-ignore's contract, unchanged by --stdin: 0 = at least one path is
+    # ignored, 1 = none are, anything else = it failed. Folding "not 0" into
+    # healthy would count exit 128 as carried.
+    if proc.returncode == 0:
+        return "dropped"
+    if proc.returncode == 1:
+        return "carried"
+    return "unmeasured"
+
+
+def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
+    """One existing concrete path for a carrier-set entry, or None.
+
+    The single-witness form, kept for the stale branch: that branch asks whether
+    the entry THIS host configured is in effect, and one materialized path
+    answers it. An entry with nothing on disk yet is not evidence of anything,
+    so it is skipped rather than reported. Use `_carrier_representatives` when
+    the question is coverage of a *different* (shipped) entry — see its
+    docstring for why one witness is not enough there.
+    """
+    reps = _carrier_representatives(workspace, entry)
+    return reps[0] if reps else None
+
+
+def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
+    """A configured carrier-set entry that git still ignores is not being backed up.
+
+    `sync-workspace.sh:generate_exclude` REFUSES to rewrite an existing
+    `.git/info/exclude` that differs from the generated content (the #1445 guard
+    against clobbering operator-authored rules), and `_enforce_carrier_set_pre`
+    (`:613`) swallows that refusal so the tick continues. The sync then pushes and
+    reports success while the carrier set is silently stale — observed on two
+    hosts independently (65 refusals / 63 followed by `pushed to` on one, 4/4 on
+    the other; see #2565). Every existing check reads healthy: the config IS
+    correct, the checkout IS current, and only the generated artifact is stale.
+
+    Two distinct causes produce the identical symptom and need different remedies,
+    so they are reported separately rather than collapsed:
+
+      1. STALE EXCLUDE — the resolved config lists an entry that git still
+         ignores. Remedy: `bash scripts/sync-workspace.sh --force-gitignore`.
+      2. DROPPED BY OVERRIDE — a local `vault.sync.include` REPLACES the shipped
+         default rather than merging into it (#2531), so shipped entries added
+         later never reach this host. Remedy: add them to the local list. Here
+         the on-disk exclude legitimately MATCHES the resolved config, so cause 1
+         is dormant and a resolved-vs-disk comparison alone reads healthy.
+
+    Asking git directly (`check-ignore`) rather than regenerating the exclude and
+    diffing is deliberate: it tests the OUTCOME, cannot drift as the generator's
+    formatting changes, and is immune to the two legitimate no-diff branches
+    (`:562` no-op when already matching, `:570` safe legacy `hosts/<label>/` ->
+    `hosts/*/` widening) — after either, the paths ARE un-ignored, so there is
+    nothing to false-positive on.
+
+    Returns None when the workspace is not a git repo (vault never initialized),
+    which is a valid unconfigured state and not a defect.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    name = "carrier-set"
+    if not (workspace / ".git").exists():
+        return None
+
+    vault = _resolved_vault()
+    resolved = [e for e in (vault.get("sync") or {}).get("include") or [] if isinstance(e, str)]
+    if not resolved:
+        return None
+
+    stale: "list[str]" = []
+    unmeasured: "list[str]" = []
+    for entry in resolved:
+        # EVERY materialized match, not one. `_carrier_representative()` (singular)
+        # collapses `hosts/*/` to its first match, so a two-host workspace whose
+        # exclude carries host A but not host B reported `ok` while B's subtree
+        # was ignored and unbacked — the same false green the dropped branch was
+        # fixed for, on the OTHER axis.
+        #
+        # The previous round shared the directory-vs-file instrument across both
+        # branches and stopped there. Coverage has two independent axes — WHICH
+        # paths you probe, and WHAT you ask about each — and generalizing one of
+        # them left the other singular here. Both branches now enumerate.
+        # (john-the-dev and qingyun-wu, independently, on cf059ca8.)
+        reps = _carrier_representatives(workspace, entry)
+        if not reps:
+            continue
+        # `git_argv` rather than a bare "git": on macOS the stock /usr/bin/git is
+        # an Xcode-CLT shim that pops an install dialog when the tools are absent,
+        # and this probe runs from a BACKGROUND health check where nobody is there
+        # to dismiss it. The resolver refuses that shim instead of spawning it.
+        #
+        # `--no-index` is LOAD-BEARING on the file path (sync-workspace.sh says so
+        # at its own check-ignore call): without it, git reports an ALREADY-TRACKED
+        # file as not-ignored regardless of the rules, so a host whose file was
+        # carried once and whose exclude later went stale reads healthy forever.
+        # Caught by restoring this host's real pre-fix exclude and watching the
+        # probe still say OK. Both that and the directory/contents distinction now
+        # live in `_carrier_target_verdict` so the two branches cannot drift.
+        verdict = "carried"
+        for rep in reps:
+            got = _carrier_target_verdict(workspace, rep)
+            if got != "carried":
+                verdict = got
+                break
+        if verdict == "dropped":
+            stale.append(entry)
+        elif verdict == "unmeasured":
+            # Could not run the measurement at all. NOT the same as "carried".
+            unmeasured.append(entry)
+
+    # Read the SHIPPED file directly rather than through load_config(), which
+    # deep-merges the local override and would therefore return `resolved` —
+    # the very list we are testing against. There is no shipped-only public
+    # loader, and inventing one behind a broad `except` would make this branch a
+    # silent no-op the day the name was wrong.
+    dropped: "list[str]" = []
+    try:
+        shipped_cfg = json.loads((Path(REPO_DIR) / "sutando.config.json").read_text())
+        shipped = ((shipped_cfg.get("vault") or {}).get("sync") or {}).get("include")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        # The shipped config itself is unreadable, so there is no comparison to
+        # make. This except must stay narrow and must NOT wrap the measurement
+        # loop below: the first cut did, so one entry's git timeout jumped here
+        # and reset `dropped = []`, erasing findings already collected — a
+        # fail-OPEN that turned a failed measurement into a green report, three
+        # lines under a comment promising the opposite (qingyun-wu P1 on #2572).
+        shipped = None
+
+    if isinstance(shipped, list):
+        missing = [e for e in shipped if isinstance(e, str) and e not in resolved]
+        # String inequality is not absence of coverage. A local entry can be
+        # strictly BROADER than the shipped one it replaces — `hosts/` covers
+        # everything `hosts/*/` does — and the whole point of this probe is to
+        # judge by outcome, not by config text. The `stale` branch above already
+        # asks git; this branch used to revert to string equality, so it reported
+        # a fully-carried subtree as missing and advised "add them to the local
+        # list", i.e. told the operator to NARROW a config that was already
+        # correct (#2571, reported against #2566 by Sutando-Pro).
+        #
+        # EVERY materialized match must be covered, not one sampled witness. A
+        # narrower local rule (`hosts/a/`) covers one child of a shipped wildcard
+        # (`hosts/*/`) while its siblings stay ignored, and first-hit sampling
+        # that landed on the covered child reported the vault healthy with a host
+        # subtree silently unbacked.
+        #
+        # An entry with nothing materialized yet stays reported: there is no
+        # outcome to measure, but the divergence is real and becomes silent data
+        # loss the moment the first file lands under it.
+        for entry in missing:
+            reps = _carrier_representatives(workspace, entry)
+            if not reps:
+                dropped.append(entry)
+                continue
+            verdict = "covered"
+            for rep in reps:
+                # Same instrument as the stale branch, deliberately shared: a
+                # DIRECTORY representative and the files under it are different
+                # questions for git, and asking about the directory reported a
+                # subtree healthy while its carrier file was ignored.
+                got = _carrier_target_verdict(workspace, rep)
+                if got != "carried":
+                    verdict = got
+                    break
+            if verdict == "dropped":
+                dropped.append(entry)
+            elif verdict == "unmeasured":
+                unmeasured.append(entry)
+
+    # A shipped entry can be one this host must NOT carry. `state/current-track.md`
+    # is per-host state that #2534 added at a flat, SHARED vault path, so two cores
+    # write the same file and each host's sync resolves the resulting conflict in its
+    # own favour — a peer's anchor lands in your working copy, and neither side's
+    # merge keeps the other's.
+    #
+    # This comment previously said that "overwrote a peer's 1056-line anchor". It did
+    # not, and the correction matters because I wrote the original from a misread of
+    # the sync code rather than from the vault. The vault uses PER-HOST branches
+    # (`host/<host>/<wsid>`); a host only ever merges a peer INTO its own branch and
+    # never writes to the peer's. Checked afterwards: both branches were byte-identical
+    # and this host's index referenced 263 memory files against the discarded copy's
+    # 262 — a strict superset, nothing missing. Chi corrected the claim; Sutando-Pro
+    # independently confirmed it from `state/current-track.md`'s own two-commit history.
+    #
+    # The guidance is unchanged — do not re-add it — but the reason is cross-host
+    # CONTENT DELIVERY on a shared path, not data loss. Telling an operator to re-add
+    # walks them back into that, so the REMEDY is split rather than the entry hidden;
+    # silently filtering it would suppress a real divergence. Delete this list once the
+    # host-qualified migration (#2567/#2568) lands: the flat path stops being shipped
+    # and stops appearing here.
+    UNSAFE_TO_READD = ("state/current-track.md",)
+    unsafe = [e for e in dropped if e in UNSAFE_TO_READD]
+    safe = [e for e in dropped if e not in UNSAFE_TO_READD]
+
+    # The same carve-out has to reach the STALE branch, and there it inverts the
+    # verdict rather than just softening the wording. A path that must not be
+    # carried and is NOT being carried is in its CORRECT state — reporting that as
+    # a failure whose remedy is `--force-gitignore` would walk the operator into
+    # re-carrying it, which is the cross-host overwrite this carve-out exists to
+    # prevent. Found by running the merged probe on a live host that had
+    # deliberately un-carried the path: it said `fail` and named the exact command
+    # that resumes the incident.
+    stale_expected = [e for e in stale if e in UNSAFE_TO_READD]
+    stale = [e for e in stale if e not in UNSAFE_TO_READD]
+
+    if not stale and not dropped and not unmeasured:
+        if not stale_expected:
+            return {
+                "name": name,
+                "status": "ok",
+                "detail": f"all {len(resolved)} configured carrier path(s) un-ignored in the vault",
+            }
+        # NOT `ok`: this host is in the correct state, but it got there by DIVERGING
+        # from the shipped default, which still ships the flat path in
+        # `vault.sync.include` and still re-carries it on `--force-gitignore` or in a
+        # fresh workspace. Reporting `ok` would claim the default is safe when only
+        # this host is (qingyun-wu on #2570).
+        #
+        # `warn` + an EXPLICIT `alerting: False`. The first cut set `warn` alone and
+        # claimed in this comment that it "never alerts" because `main()` excludes
+        # warn from `issues` — which was simply false. `issues` is a local list used
+        # to print a summary; `--emit-task`, `--notify-on-fail` and `--notify-slack`
+        # each consume the FULL checks list and treat a plain warn as a failure, so
+        # this state still fired a task and a notification on first transition
+        # (qingyun-wu again, with a one-check witness). The claim was tested against
+        # the list I happened to have named rather than the surfaces that enforce.
+        #
+        # Suppression is right HERE specifically: the owner cannot act on it. Phase 2
+        # of #2567 is gated on migration evidence, so paging about it would repeat a
+        # non-actionable message until that lands, and this branch stops being
+        # reachable once the flat path leaves the shipped default.
+        return {
+            "name": name,
+            "status": "warn",
+            "alerting": False,
+            "detail": (
+                f"{len(resolved) - len(stale_expected)} configured carrier path(s) un-ignored; "
+                f"{', '.join(stale_expected)} correctly NOT carried on this host — but the shipped "
+                f"default still lists it in `vault.sync.include`, so a fresh workspace or "
+                f"`--force-gitignore` re-carries it at the flat, SHARED path and can resume the "
+                f"cross-host overwrite. This host is right and the default is not; do not "
+                f"`--force-gitignore` it back. Clears when phase 2 of #2567 drops the entry"
+            ),
+        }
+
+    parts = []
+    if unmeasured:
+        parts.append(
+            f"could NOT measure {len(unmeasured)} carrier path(s) "
+            f"({', '.join(unmeasured[:4])}{'…' if len(unmeasured) > 4 else ''}) — git was "
+            f"unavailable or check-ignore failed, so whether the vault is backing them up is "
+            f"UNKNOWN, not fine"
+        )
+    if stale:
+        parts.append(
+            f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
+            f"backing them up ({', '.join(stale[:4])}{'…' if len(stale) > 4 else ''}) — the exclude "
+            f"file is stale and sync refused to regenerate it; fix with "
+            f"`bash scripts/sync-workspace.sh --force-gitignore` (diff it first)"
+        )
+    if safe:
+        parts.append(
+            f"{len(safe)} shipped carrier path(s) are missing from this host's resolved include "
+            f"({', '.join(safe[:4])}{'…' if len(safe) > 4 else ''}) — a local "
+            f"`vault.sync.include` REPLACES the shipped default (#2531), so upstream additions never "
+            f"arrive; add them to the local list"
+        )
+    if unsafe:
+        parts.append(
+            f"{len(unsafe)} shipped carrier path(s) are missing here and must NOT be re-added "
+            f"({', '.join(unsafe)}) — per-host state carried at a flat, SHARED vault path, so "
+            f"re-adding puts two hosts on one file: a peer's copy lands in yours and each "
+            f"sync keeps its own side (#2567). Leave them out until the host-qualified "
+            f"migration lands"
+        )
+    return {"name": name, "status": "fail", "detail": "; ".join(parts)}
+
+
 def check_memory_index_integrity() -> "dict | None":
     """Catch memories that exist on disk but will never load into a session.
 
@@ -763,21 +1512,85 @@ def check_memory_index_integrity() -> "dict | None":
     ``*-BACKUP`` tree (created by scripts/sutando-migrate.sh) that never made it
     into the live index — so the rule it carried was written yet never recalled.
 
-    Warn (never fail) listing the orphaned/stranded files so the divergence is
-    visible instead of silently dropping the memory. Returns None on a clean
-    index or when the memory dir does not exist yet.
+    A third mode has the same consequence: the entry EXISTS but sits past the
+    point a session stops reading (200 lines or 25KB of post-strip content,
+    whichever comes first — see MEMORY_INDEX_LOAD_*). Truncation drops the
+    suffix, not the file, so this is measured by asking whether each memory is
+    named in the prefix that actually loads.
+
+    Not every absence from MEMORY.md is a loss, though: overflow entries live in
+    sibling HUB indexes (``MEMORY-reference.md``, ``MEMORY-wire.md``, …) which
+    MEMORY.md links to. Those are grep-reachable by design and are counted
+    separately — lumping them in produced a 1010-file warn on this host whose
+    real content was 906, and a warn nobody can read is a warn nobody reads.
+
+    Fails only when a memory is demonstrably lost that way; warns for orphaned/
+    stranded files and for an index merely approaching the limit. Returns None
+    on a clean index or when the memory dir does not exist yet.
     """
     if not MEMORY_DIR.exists():
         return None
     index = MEMORY_DIR / "MEMORY.md"
     index_text = index.read_text(errors="ignore") if index.exists() else ""
 
+    # What the session actually sees: strip what the runtime strips, then keep
+    # only the prefix that fits inside 200 lines / 25KB.
+    effective_text = _index_effective_text(index_text)
+    loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
+    truncated = len(loaded_text) < len(effective_text)
+
+    def _referenced_in(hay: str, name: str) -> bool:
+        return name in hay or name[:-3] in hay
+
+    # MEMORY.md is not the only index. Once a corpus outgrows the load budget the
+    # overflow moves to sibling HUB indexes (MEMORY-reference.md, MEMORY-wire.md,
+    # …). A hub entry deliberately does not auto-load — it only has to be findable
+    # — so it is not a loss.
+    #
+    # But a hub is only findable if the LOADED prefix of MEMORY.md links to it.
+    # Trusting every MEMORY*.md glob match instead lets an unlinked file (a stale
+    # copy, a backup, an ordinary memory that happens to match the glob) launder
+    # itself AND every filename it mentions into a false green — inside the one
+    # probe that exists to prevent silent loss. A hub linked only PAST the cut is
+    # equally unreachable, so `loaded_text` is the correct gate, not `index_text`.
+    # (john-the-dev, #2483: an earlier revision of this change trusted the glob
+    # and its test suite explicitly blessed the unlinked case.)
+    #
+    # An untrusted MEMORY*.md is therefore not an index at all: it falls through
+    # to the classification below and is reported like any other unindexed file.
+    index_names = {"MEMORY.md"}
+    hub_text = ""
+    for hub in sorted(MEMORY_DIR.glob("MEMORY*.md")):
+        if hub.name == "MEMORY.md" or not _referenced_in(loaded_text, hub.name):
+            continue
+        index_names.add(hub.name)
+        hub_text += "\n" + hub.read_text(errors="ignore")
+
     # (a) live memory files not referenced anywhere in MEMORY.md → won't load.
-    unindexed = [
-        p.name for p in sorted(MEMORY_DIR.glob("*.md"))
-        if p.name != "MEMORY.md"
-        and p.name not in index_text and p.name[:-3] not in index_text
-    ]
+    # (c) referenced, but ONLY beyond the load cut → equally won't load. Same
+    #     consequence, different cause, so they are found the same way: ask the
+    #     prefix that actually loads, not the whole file. Testing the whole file
+    #     reported an index entry parked on line 201 as healthy (john-the-dev,
+    #     #2449) because the bytes were on disk — just never read.
+    # (d) reachable only from a sibling hub index → by design, NOT a loss. Kept
+    #     separate so the genuinely-lost names stay readable: on this host 104
+    #     by-design entries were mixed into a single 1010-file warn, which is
+    #     unreadable and therefore unread — 8 truly dark memories sat inside it
+    #     for months while the probe "warned" about them on every run.
+    unindexed: list[str] = []
+    beyond_cut: list[str] = []
+    hub_only: list[str] = []
+    for p in sorted(MEMORY_DIR.glob("*.md")):
+        if p.name in index_names:  # an index is not a memory it indexes
+            continue
+        if _referenced_in(loaded_text, p.name):
+            continue
+        if _referenced_in(effective_text, p.name):
+            beyond_cut.append(p.name)
+        elif _referenced_in(hub_text, p.name):
+            hub_only.append(p.name)
+        else:
+            unindexed.append(p.name)
 
     # (b) memories stranded in a sibling *-BACKUP tree, absent from the live dir.
     stranded: list[str] = []
@@ -794,21 +1607,68 @@ def check_memory_index_integrity() -> "dict | None":
     except Exception:  # pragma: no cover — best-effort backup scan; never break the health check
         pass
 
-    if not unindexed and not stranded:
+    # (c) the index outgrowing what a session reads. Truncation is a SUFFIX
+    # drop, so the damage is exactly the entries past the cut — reported above
+    # as `beyond_cut`. What is left to say here is whether the index is close
+    # enough to the cut to be worth compacting before entries start falling off.
+    effective_bytes = len(effective_text.encode("utf-8"))
+    effective_lines = len(effective_text.splitlines())
+    near_limit = (
+        effective_bytes >= MEMORY_INDEX_LOAD_BYTES * MEMORY_INDEX_NEAR_LIMIT
+        or effective_lines >= MEMORY_INDEX_LOAD_LINES * MEMORY_INDEX_NEAR_LIMIT
+    )
+
+    def _size_note() -> str:
+        return (f"{effective_bytes / 1024:.1f}KB / {effective_lines} lines of loadable "
+                f"content vs the {MEMORY_INDEX_LOAD_BYTES / 1000:.0f}KB "
+                f"({MEMORY_INDEX_LOAD_BYTES:,} B) / "
+                f"{MEMORY_INDEX_LOAD_LINES}-line session read limit")
+
+    def _hub_note() -> str:
+        return (f"; {len(hub_only)} reachable via a sibling hub index "
+                f"({', '.join(sorted(index_names - {'MEMORY.md'}))}) — by design, not loaded"
+                if hub_only else "")
+
+    if not unindexed and not stranded and not beyond_cut and not near_limit:
         return {"name": "memory-index", "status": "ok",
-                "detail": "all memory files present in the MEMORY.md index"}
+                "detail": (f"all memory files reachable from the loaded MEMORY.md index"
+                           f"{_hub_note()} ({_size_note()})")}
     parts = []
+    if beyond_cut:
+        parts.append(
+            f"{len(beyond_cut)} memory file(s) ARE indexed but sit past the load cut "
+            f"(index stops at line {loaded_lines} / {loaded_bytes / 1024:.1f}KB), so the "
+            f"session never reads their entry: {', '.join(beyond_cut[:6])}"
+            f"{'…' if len(beyond_cut) > 6 else ''}. Compact the index — the prefix still "
+            f"loads, only the tail is dropped ({_size_note()})"
+        )
+    elif near_limit:
+        parts.append(
+            f"MEMORY.md is approaching the session read limit ({_size_note()})"
+            + (" and is already truncated" if truncated else "")
+            + " — compact it now; entries past the cut are dropped silently while "
+              "every memory file still looks fine on disk"
+        )
     if unindexed:
         parts.append(
-            f"{len(unindexed)} memory file(s) not in MEMORY.md (won't load): "
+            f"{len(unindexed)} memory file(s) in NO index — neither MEMORY.md nor any "
+            f"sibling hub — so they never load and cannot be found: "
             + ", ".join(unindexed[:6]) + ("…" if len(unindexed) > 6 else "")
+            + _hub_note()
         )
     if stranded:
         parts.append(
             f"{len(stranded)} memory file(s) stranded in a *-BACKUP tree, absent from the live dir: "
             + ", ".join(sorted(set(stranded))[:6]) + ("…" if len(set(stranded)) > 6 else "")
         )
-    return {"name": "memory-index", "status": "warn", "detail": "; ".join(parts)}
+    # `fail` only for demonstrated loss: named memory files whose index entry is
+    # past the cut and therefore never read. Everything else — orphans, strays,
+    # merely approaching the limit — is degradation, not loss, so it warns.
+    # (Earlier revisions failed on a raw-byte threshold, which fired on indexes
+    # that still loaded fine once frontmatter/comments were excluded.)
+    return {"name": "memory-index",
+            "status": "fail" if beyond_cut else "warn",
+            "detail": "; ".join(parts)}
 
 
 def check_memory_sync() -> dict:
@@ -1077,6 +1937,116 @@ def check_per_host_config_backup() -> dict:
     return {"name": name, "status": "ok", "detail": f"{checked} channel access.json backup(s) current"}
 
 
+# How far behind the expected branch before the checkout is worth nagging about.
+# Deliberately not 1: `main` on this repo moves several times a day, so warning on
+# any non-zero delta would fire constantly and train the reader to ignore it —
+# the failure mode that makes a health check worthless.
+_BEHIND_WARN_DEFAULT = 10
+
+
+def _behind_warn_threshold(repo: "Path") -> int:
+    """Positive commits-behind threshold from the durable core config.
+
+    Read through the SAME `core` config path as `expected_branch` below — no
+    ad-hoc env var (repo rule: config belongs in the declared config block, not
+    in an invented environment variable).
+
+    Read LAZILY and validated, because the first cut of this did neither: it
+    ran `int(os.environ[...])` at import time, so
+    `SUTANDO_CHECKOUT_BEHIND_WARN=not-a-number` raised ValueError before the
+    module finished loading and took down the ENTIRE health check — a probe
+    meant to reveal stale guards instead reporting no health at all. A zero
+    was equally bad: it warned on an exactly-current checkout. So every
+    invalid class — unreadable config, non-integer, zero, negative — falls
+    back to the default rather than crashing or crying wolf.
+    """
+    try:
+        from sutando_config import load_config  # noqa: PLC0415
+        raw = (load_config(repo_root=repo).get("core") or {}).get("checkout_behind_warn")
+    except Exception:
+        return _BEHIND_WARN_DEFAULT          # config unreadable/malformed
+    # `bool` is a subclass of `int`, so `int(True)` is 1 and a plausible config
+    # typo — `"checkout_behind_warn": true` — would silently warn on every
+    # one-commit drift. That is precisely the alert fatigue the default of 10
+    # exists to prevent, and the probe would train users to ignore it. Accept a
+    # REAL integer only; the schema declares this key as an integer, so every
+    # other type (bool, float, numeric string) is invalid config and falls back.
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return _BEHIND_WARN_DEFAULT          # absent, bool, or non-integer
+    return raw if raw > 0 else _BEHIND_WARN_DEFAULT   # zero/negative would false-alarm
+
+
+def _behind_commits_changing(repo: "Path", branch: str, prefix: str,
+                             git_bin: str = "git") -> "list[str]":
+    """Subjects of not-yet-pulled commits that EFFECTIVELY change ``prefix``.
+
+    Two different questions, and the first cut answered the wrong one. "Did a
+    not-yet-pulled commit TOUCH this path" is commit-path history; "would
+    pulling change any bytes here" is a tree diff. They diverge whenever history
+    is reversible: upstream adds `skills/demo/SKILL.md` and removes it in the
+    next commit, a clone sits two commits behind, and
+    `git log HEAD..origin/main -- skills/` lists both commits while
+    `git diff --name-only HEAD..origin/main -- skills/` is EMPTY. Pulling would
+    change no skill bytes, yet the probe warned — a false behavioral-staleness
+    alarm, which is precisely the alert fatigue this check argues against.
+    Reproduced independently by qingyun-wu and john-the-dev on #2573.
+
+    So the TREE DIFF is the gate and history is only the message: if nothing
+    under ``prefix`` differs, return nothing; only when it does differ, name the
+    commits so the warning is actionable.
+
+    Same last-fetched-ref, no-network contract as `_commits_behind`, and the
+    same honest consequence: a stale local ref makes this UNDER-report, never
+    cry wolf. Returns `[]` on any failure for the same reason — this is an
+    additional signal layered on a probe that must not become the thing that
+    breaks the health run.
+    """
+    try:
+        changed = subprocess.run(
+            [git_bin, "-C", str(repo), "diff", "--name-only",
+             f"HEAD..origin/{branch}", "--", prefix],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if changed.returncode != 0 or not changed.stdout.strip():
+        return []
+
+    try:
+        out = subprocess.run(
+            [git_bin, "-C", str(repo), "log", "--no-merges", "--format=%s",
+             f"HEAD..origin/{branch}", "--", prefix],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | None":
+    """Commits on origin/<branch> that HEAD lacks, or None if unanswerable.
+
+    Uses the LAST-FETCHED remote ref — deliberately does not fetch. A health
+    probe must stay fast and work offline, and a network call here would make
+    the whole run hang on a flaky link. The consequence is honest and stated in
+    the warning text: if the local ref is itself stale the count UNDERSTATES the
+    drift, so this can only under-report, never cry wolf.
+    """
+    try:
+        out = subprocess.run(
+            [git_bin, "-C", str(repo), "rev-list", "--count", f"HEAD..origin/{branch}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None          # no such remote ref (fresh clone, renamed remote)
+    raw = out.stdout.strip()
+    return int(raw) if raw.isdigit() else None
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -1110,9 +2080,37 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
         except Exception:
             expected = None  # config unreadable — fall through to the default
     expected = expected or "main"
+    # Resolve the git binary ONCE for both subprocesses in this probe.
+    #
+    # This used to be `git_bin = "git"` with a comment promising that #2469's
+    # resolver "replaces this line when it lands". That was a TODO wearing a
+    # design rationale: at the merged tree of both heads, `resolve_git` was
+    # imported at module scope and used elsewhere while this probe still shelled
+    # the literal — so the cumulative state kept the Xcode-CLT shim modal that
+    # #2469 exists to remove. A swap point nobody swaps is not a fix.
+    #
+    # Imported lazily and defensively so this composes in EITHER merge order:
+    # before #2469 lands the module is absent and we behave exactly as today;
+    # after it lands both calls go through the resolver with no further edit.
     try:
+        from git_binary import resolve_git  # noqa: PLC0415
+        git_bin = resolve_git()
+    except Exception:
+        git_bin = "git"
+    if git_bin is None:
+        # Resolver says there is no runnable git (CLT absent, only the stub).
+        # Degrade like the OSError path below rather than shelling the shim —
+        # that modal is the whole point of #2469.
+        return {"name": name, "status": "ok",
+                "detail": "no runnable git (resolver) — skipping"}
+    try:
+        # `git_bin` came from the resolver above, so it is never a bare `git`
+        # resolving through PATH — which on a Mac without developer tools lands
+        # on the Xcode-CLT stub, whose modal install dialog fires BEFORE the
+        # return-code check below can degrade. This check is registered
+        # unconditionally, so it ran on every health pass.
         out = subprocess.run(
-            ["git", "-C", str(repo), "branch", "--show-current"],
+            [git_bin, "-C", str(repo), "branch", "--show-current"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1133,7 +2131,57 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
                           "PR-branch checkout ships stale/unreviewed code (2026-07-29 "
                           "incident: 4 days on a Jul-25 PR branch). Author PRs in "
                           f"worktrees; switch back (git -C {repo} switch {expected})"}
-    return {"name": name, "status": "ok", "detail": f"live checkout on {expected!r}"}
+    # On the expected branch — but that is only half of "is this checkout current".
+    # A checkout can be on `main` and still be executing weeks-old code, and the
+    # branch-name comparison above returns ok for it. Observed 2026-08-01 on the
+    # 24/7 node: on `main`, 0 ahead, **15 commits behind**, and four merged guards
+    # were consequently not running — including the MEMORY.md load-limit warning
+    # (#2449), so the memory index silently truncated with nothing to report it.
+    # A peer node reproduced the same shape at 31 behind. Nothing anywhere
+    # surfaced either, because wrong-branch and stale-branch are different
+    # failure modes and only the first had a probe.
+    behind = _commits_behind(repo, expected, git_bin)
+    if behind is not None and behind >= _behind_warn_threshold(repo):
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on {expected!r} but {behind} commits behind "
+                          f"origin/{expected} — merged fixes are not running here, and a "
+                          "guard that never shipped to this machine reports nothing (so "
+                          "silence reads as health). Refresh with "
+                          f"`git -C {repo} pull --ff-only` + restart. Count is against the "
+                          "last-fetched ref; this probe does not fetch."}
+    # Count is the wrong instrument for BEHAVIORAL staleness, and the threshold
+    # above is deliberately 10 to avoid alert fatigue — correctly, since `main`
+    # moves several times a day. But one commit that rewrites a skill outranks
+    # nine that touch docs, and a count cannot tell them apart.
+    #
+    # Skills are the case with no other detector. `src/` needs a restart to take
+    # effect, so the `*-stale` probes catch it by comparing a running process
+    # against its source. A skill has no process: the agent reads the markdown
+    # from THIS checkout on every invocation, so a merged skill fix that has not
+    # been pulled is simply not in effect, with nothing anywhere to compare.
+    #
+    # Observed 2026-08-03 on this node: exactly ONE commit behind — far under the
+    # threshold, so this probe reported ok — while the live `context-reconstruct`
+    # still instructed writing `state/current-track.md`, the shared flat path
+    # whose two-writer collision had destroyed a peer's anchor hours earlier
+    # (#2567/#2568). The running skill and the merged skill disagreed, and both
+    # looked correct from where anyone was standing.
+    stale_skills = _behind_commits_changing(repo, expected, "skills/", git_bin)
+    if stale_skills:
+        return {"name": name, "status": "warn",
+                "detail": f"live checkout is on {expected!r} and only {behind} commit(s) behind "
+                          f"origin/{expected} — under the {_behind_warn_threshold(repo)}-commit "
+                          f"nag threshold — but {len(stale_skills)} of them change `skills/`, "
+                          "which the agent re-reads from this checkout on EVERY invocation. "
+                          "Those merged skill fixes are not in effect here, and no "
+                          "restart-staleness probe can see it: a skill has no running process "
+                          f"to compare against. ({'; '.join(stale_skills[:3])}"
+                          f"{'; …' if len(stale_skills) > 3 else ''}) Refresh with "
+                          f"`git -C {repo} pull --ff-only`. Measured against the last-fetched "
+                          "ref; this probe does not fetch, so it can only under-report."}
+    return {"name": name, "status": "ok",
+            "detail": f"live checkout on {expected!r}"
+                      + (f", {behind} commits behind" if behind else "")}
 
 
 def check_migrate_reader_contract() -> dict:
@@ -1228,14 +2276,45 @@ LAUNCHD_BACKED_CHECKS = {
 
 
 def fix_launchd(label: str) -> str:
-    """Try to reload a launchd job."""
+    """Try to reload a launchd job.
+
+    A missing plist is NOT an edge case for these two services, and saying
+    "no plist found" reads like a launchd failure when it is not one. The
+    voice-agent / web-client plists are generated by **Sutando.app's
+    installer** (see `_voice_log_path`); this repo ships installers only for
+    credential-proxy, cron-runner, health-check and the app itself. On a plain
+    checkout `src/startup.sh` launches both services directly instead —
+    `run_node_service voice-agent src/voice-agent.ts ... &` — precisely because
+    it checks `launchctl print` first and falls through when there is no job.
+
+    So on any host without Sutando.app installed, --fix reaches this function
+    for a stale voice-agent, prints one internal-sounding line, and can never
+    restart it. Observed on the 24/7 node 2026-08-03: `voice-agent: stale
+    (code is 2159 min newer than process)` survived repeated `--fix` runs,
+    each reporting `no plist found for com.sutando.voice-agent`.
+
+    Two distinct misses share one message, and only one of them is a bug:
+      * label absent from plist_map  -> a real "we don't know this job"
+      * label known, plist missing   -> the service is simply not launchd-
+        managed here, and the operator needs the command that DOES work
+    """
     plist_map = {
         "com.sutando.voice-agent": Path.home() / "Library/LaunchAgents/com.sutando.voice-agent.plist",
         "com.sutando.web-client": Path.home() / "Library/LaunchAgents/com.sutando.web-client.plist",
     }
     plist = plist_map.get(label)
-    if not plist or not plist.exists():
+    if not plist:
         return f"no plist found for {label}"
+    if not plist.exists():
+        # Deliberately names a runnable command. A --fix line that reports a
+        # miss without naming the remedy is indistinguishable, to whoever
+        # reads the log, from a fix that was attempted and failed.
+        return (
+            f"{label} is not launchd-managed on this host (no {plist.name} in "
+            f"~/Library/LaunchAgents — that plist comes from Sutando.app's installer). "
+            f"startup.sh launches this service directly instead, so --fix cannot "
+            f"restart it. Remedy: bash src/restart.sh"
+        )
 
     uid = subprocess.run(["/usr/bin/id", "-u"], capture_output=True, text=True).stdout.strip()
     # Try kickstart
@@ -1583,8 +2662,13 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
     deploys aren't hidden.
     """
     try:
+        # git_argv raises GitUnavailable (an OSError) when this host has no
+        # runnable git — caught below and treated as "can't tell", exactly like
+        # any other git error. Never invoke /usr/bin/git directly: on a Mac
+        # without developer tools that is the CLT shim and it raises a modal
+        # install dialog, which a health check must never be able to do.
         log = subprocess.run(
-            ["/usr/bin/git", "log", "-1", "--format=%ct", "HEAD", "--", str(src_file)],
+            git_argv("log", "-1", "--format=%ct", "HEAD", "--", str(src_file)),
             cwd=REPO_DIR, capture_output=True, text=True, timeout=5
         )
         if log.returncode != 0 or not log.stdout.strip():
@@ -1595,7 +2679,7 @@ def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
             return False
         # No commits since proc_start; check for uncommitted edits
         diff = subprocess.run(
-            ["/usr/bin/git", "diff", "--quiet", "HEAD", "--", str(src_file)],
+            git_argv("diff", "--quiet", "HEAD", "--", str(src_file)),
             cwd=REPO_DIR, capture_output=True, timeout=5
         )
         return diff.returncode == 0  # 0 = no diff
@@ -1839,6 +2923,370 @@ QUOTA_STATE_STALE_SEC = 6 * 60 * 60
 AGENT_ACTIVE_SEC = 30 * 60
 
 
+# Runtimes whose request path is NOT expected to traverse the Anthropic credential
+# proxy. A Codex pass refreshes the very same `core-status.json` this check reads for
+# activity, but produces no Anthropic quota headers — so "agent working + stale quota"
+# is a perfectly healthy shape there, and warning on it would train operators to ignore
+# the check this whole probe exists to make actionable (qingyun, #2445).
+NON_PROXY_RUNTIMES = {"codex"}
+
+# The two launch records are stamped by SEPARATE `date +%s` calls in the same
+# launcher — `src/agent/codex/cli/start-cli.sh:240` writes core-runtime.json and
+# :243 appends session-starts.log — so one launch can legitimately produce
+# started_at=N and session_started_at=N+1 if the second rolls between them. A
+# strict `<` then reads a CURRENT marker as stale and emits the exact false proxy
+# warning this check exists to suppress (qingyun, #2446).
+#
+# A few seconds of slack cannot mask a real previous-core marker: that marker is
+# separated from the next launch by the entire lifetime of the core that wrote it,
+# which is minutes at the very least. So the margin is generous on purpose — it
+# costs nothing on the true-positive side and closes the whole race, rather than
+# assuming the gap is exactly one second.
+LAUNCH_RECORD_SKEW_SEC = 5
+
+
+def _runtime_may_skip_proxy() -> bool:
+    """True when this core's runtime is not expected to produce Anthropic quota headers.
+
+    Read from `state/core-runtime.json`. Today the **Codex launcher is its only writer**
+    (`src/agent/codex/cli/start-cli.sh` writes it unconditionally once the workspace
+    resolves), so its ABSENCE positively excludes Codex rather than merely being
+    unknown — which is why absence is treated as proxy-routed instead of silencing the
+    check everywhere. An unreadable or malformed file cannot rule Codex out, so it is
+    treated as non-proxy and stays silent: a corrupted status file must not manufacture
+    a health warning.
+
+    A marker left by a PREVIOUS core is ignored. Today only the Codex launcher writes
+    this file and nothing resets it, so after a Codex -> Claude switch a stale
+    `{"runtime": "codex"}` sits there describing a core that is no longer running
+    (#2406 documents exactly that happening live on 2026-07-30). Trusting it would
+    silence this check on a host that IS proxy-routed — the mirror of the false
+    positive this function was added to fix. So a marker whose `started_at` predates
+    the running core's own start is treated as absent, i.e. proxy-routed.
+
+    When #2406 lands a Claude-side writer, tighten this to positive identification of
+    a proxy-routed runtime instead of inferring it from absence.
+    """
+    path = status_read_path("core-runtime.json", WORKSPACE_DIR)
+    try:
+        if not path.exists():
+            return False          # no Codex launcher ever ran here -> proxy-routed
+        marker = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return True               # cannot rule Codex out -> stay silent
+    # Valid JSON is not necessarily an OBJECT. `null`, `[]`, `"codex"` and `3` all
+    # decode fine and then raise AttributeError on `.get`, which the handler above
+    # does not catch — so a junk state file would crash the entire health run inside
+    # the very branch this check hardens (qingyun, #2446). A non-object marker is
+    # exactly as uninformative as malformed JSON, so it takes the same silent path.
+    if not isinstance(marker, dict):
+        return True               # cannot rule Codex out -> stay silent
+    runtime = marker.get("runtime")
+    # The FIELD has a schema too, not just the container. `{"runtime": []}` and
+    # `{"runtime": {}}` reach the membership test and raise TypeError (unhashable);
+    # `{"runtime": 3}`, `{"runtime": true}` and a marker with no `runtime` key at all
+    # don't crash but fall through to "proxy-routed" and manufacture the very warning
+    # this check exists to suppress. A field that isn't a string tells us nothing about
+    # the runtime, so it takes the same fail-silent path as malformed JSON
+    # (qingyun, #2446 — the same shape one level in from the container guard above).
+    if not isinstance(runtime, str):
+        return True               # cannot rule Codex out -> stay silent
+    if _marker_predates_running_core(marker):
+        return False              # belongs to a previous core -> no information
+    return runtime in NON_PROXY_RUNTIMES
+
+
+def _local_host_labels() -> "set[str]":
+    r"""Every label a launcher on THIS host could plausibly have persisted.
+
+    The reader and the writers do NOT share a host-label contract, and comparing
+    against only one of them discards this host's real launch records:
+
+      reader  `util_paths._host_label()`  -> SUTANDO_HOST_LABEL > scutil
+                                             LocalHostName > short hostname
+      writers `hostname | sed 's/\..*//'` -> short hostname, always
+              (src/agent/codex/cli/start-cli.sh:242,
+               src/agent/claude/cli/start-cli.sh:609)
+
+    On macOS those routinely differ — LocalHostName is the stable Bonjour name
+    while `hostname` follows DHCP — and with SUTANDO_HOST_LABEL set they differ by
+    construction. When they do, EVERY local line is skipped as foreign, the
+    boundary becomes None, and a stale `runtime:codex` marker stays trusted
+    forever: the stale-quota warning goes permanently silent. That is strictly
+    worse than the cross-host false positive the host filter was added to fix
+    (qingyun-wu + john-the-dev, #2446, independently reproduced).
+
+    This host is not hypothetical evidence: its own vault carries BOTH
+    `host/Chis-MacBook-Pro/…` and `host/Chis-MBP/…` branches, so the short name
+    has already drifted here at least once.
+
+    Accepting the union is deliberately the conservative direction. A foreign host
+    would have to share one of these exact labels to be mistaken for local, which
+    is the pre-existing collision risk; discarding local records, by contrast,
+    silences a real alert on every affected host.
+    """
+    labels = {_host_label()}
+    try:
+        labels.add(socket.gethostname().split(".")[0])
+    except Exception:  # pragma: no cover — gethostname failing is not a reason to go blind
+        pass
+    return {x for x in labels if x}
+
+
+def _last_core_launch_at() -> "tuple[float, str | None] | None":
+    """When the CURRENT core was launched, from `state/session-starts.log`.
+
+    Returns `(timestamp, runtime)`, where `runtime` is the identity the launcher
+    recorded for that launch — `"codex"` from the Codex launcher, and None from the
+    Claude launcher, which writes no such field
+    (`src/agent/claude/cli/start-cli.sh:608`). The identity is returned rather than
+    discarded because the skew tolerance below is only safe when the launch record
+    and the marker positively agree on the runtime; see
+    `_marker_predates_running_core`.
+
+    Both launchers append one line per launch — `src/agent/claude/cli/start-cli.sh:610`
+    and `src/agent/codex/cli/start-cli.sh:243` — and both stamp the `host` that launched.
+
+    Only THIS host's records are eligible. `session-starts.log` lives in a workspace that
+    is synced across hosts, so the newest line globally is not this host's boundary: a
+    later launch on host B would otherwise become host A's boundary and age host A's
+    perfectly current marker into a false `warn` — the exact false-positive class this
+    check exists to suppress (qingyun-wu + john-the-dev, #2446, independently reproduced:
+    local Codex marker at now-60 alone => ok; add a foreign Codex launch at now => warn).
+
+    Legacy policy, stated explicitly: a record whose `host` is absent, non-string, or
+    belongs to another host is SKIPPED, never treated as local. Pre-`host` lines cannot
+    be attributed, and guessing "probably local" reintroduces the same poisoning from
+    older synced logs. Skipping them can leave no boundary at all, which yields None —
+    and None already means "no evidence", never "stale", so the failure direction is
+    silence rather than a false alarm.
+
+    The heartbeat was the obvious candidate and is WRONG: `core_heartbeat.py` stamps
+    `_STARTED_AT` once at module load and both launch paths RETAIN an existing heartbeat
+    process, so `.alive.started_at` is the heartbeat process's age, not the session's.
+    After a Codex → Claude switch it can be far older than a freshly-written marker,
+    which made the staleness comparison silently useless (john-the-dev, #2446).
+
+    Every hop is validated rather than the one that last broke: unreadable file, a line
+    that isn't JSON, a decoded value that isn't an object, a missing key, a non-numeric
+    value. Anything uninformative yields None, and None means "no evidence", never
+    "stale".
+    """
+    try:
+        raw = (status_read_path("session-starts.log", WORKSPACE_DIR)).read_text()
+    except OSError:
+        return None
+    for line in reversed(raw.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue                      # a torn/partial line is not the boundary
+        if not isinstance(entry, dict):
+            continue
+        entry_host = entry.get("host")
+        if not isinstance(entry_host, str) or entry_host not in _local_host_labels():
+            continue                      # another host's launch, or unattributable
+        try:
+            ts = float(entry.get("session_started_at"))
+        except (TypeError, ValueError):
+            continue                      # keep looking further back
+        launch_runtime = entry.get("runtime")
+        if not isinstance(launch_runtime, str):
+            launch_runtime = None         # absent or wrong type -> no identity claim
+        return ts, launch_runtime
+    return None
+
+
+def _marker_predates_running_core(marker: dict) -> bool:
+    """True when `core-runtime.json` describes a core older than the one running now.
+
+    Compared against the newest `session-starts.log` entry — a real per-launch boundary
+    — not the heartbeat. Both timestamps must be present and comparable; if either is
+    missing the marker is taken at face value, because "no evidence of staleness" is not
+    evidence of staleness.
+
+    The skew tolerance is IDENTITY-AWARE, and only sound that way. It exists solely
+    because the Codex launcher stamps the marker and the session line with two separate
+    `date +%s` calls (`src/agent/codex/cli/start-cli.sh:240` and `:242`), so one real
+    launch can record `started_at=N` and `session_started_at=N+1`. That case always
+    carries `"runtime":"codex"` on BOTH records. Granting the same margin when the
+    runtimes do not positively agree would swallow the fast Codex -> Claude switch: a
+    stale Codex marker at N against a Claude launch at N+1 is a genuinely different core,
+    and Claude is proxy-routed, so silencing it there hides stale quota telemetry
+    indefinitely on the one runtime that needs the warning (qingyun-wu + john-the-dev,
+    independently reproduced on f887b2a7).
+
+    So the margin applies only on a positive runtime match; otherwise the comparison is
+    strict. A Claude launch record carries no `runtime` field at all, which is exactly
+    the ambiguity that must NOT earn the tolerance.
+    """
+    try:
+        started = float(marker.get("started_at"))
+    except (TypeError, ValueError):
+        return False
+    launch = _last_core_launch_at()
+    if launch is None:
+        return False
+    launched, launch_runtime = launch
+    same_runtime = (
+        launch_runtime is not None and launch_runtime == marker.get("runtime")
+    )
+    margin = LAUNCH_RECORD_SKEW_SEC if same_runtime else 0
+    return started < launched - margin
+
+
+def _local_core_socket(workspace: Optional[Path] = None) -> Optional[str]:
+    """This HOST's core tmux socket, or None if this host has no live heartbeat.
+
+    Deliberately NOT `_live_core_socket()`. That resolver globs every synced
+    `state/cores/*.alive` and takes the freshest, which the workspace contract
+    permits to be ANOTHER MACHINE's — the vault carries one heartbeat per host.
+    A reviewer reproduced it with two fresh records: the local one at mtime N-1
+    and a peer at N, and the probe targeted `/tmp/peer-core.sock`. That socket
+    does not exist locally, so the tri-state correctly degraded to None — which
+    silently suppresses the very warning this check exists to raise. Correct
+    behaviour, wrong target, false green.
+
+    Host matching uses `_local_host_labels()` rather than one label, because the
+    reader and the launchers do not share a host-label contract (see that
+    function). Returning None when this host has no fresh heartbeat is right:
+    "no local core is running" is not evidence that a core bypasses the proxy.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return None
+    labels = _local_host_labels()
+    now = time.time()
+    best_mtime, best_socket = None, None
+    for alive_file in cores_dir.glob("*.alive"):
+        if alive_file.stem not in labels:
+            continue                      # another machine's heartbeat
+        try:
+            mtime = alive_file.stat().st_mtime
+            if now - mtime >= 90.0:
+                continue                  # stale — not a live core
+            payload = json.loads(alive_file.read_text())
+            if not isinstance(payload, dict):
+                continue
+            sock = payload.get("socket")
+        except (OSError, ValueError):
+            continue
+        if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
+            best_mtime, best_socket = mtime, sock
+    return best_socket
+
+
+def core_env_has_proxy_url(
+    socket_path: Optional[str] = None,
+    session: str = "sutando-core",
+    tmux_runner=None,
+    ps_runner=None,
+) -> Optional[bool]:
+    """Whether the RUNNING core process carries ANTHROPIC_BASE_URL in its environment.
+
+    ``True``  -> the core is routed through the credential proxy.
+    ``False`` -> it demonstrably is NOT (its environment was read, and the var is absent).
+    ``None``  -> could not be determined. **Never collapse None into False**: an
+                 unreadable environment is not evidence of a bypass, and a warning
+                 manufactured from it would be the same defect this check is fixing,
+                 pointed the other way.
+
+    Why this exists: ``quota-state.json`` is written by the credential proxy, not by
+    the core, so a FRESH file only proves *something* routed through the proxy — not
+    that the core did. Measured on 2026-08-02: one throwaway ``claude -p`` run with
+    the variable set refreshed the file and flipped this check from a truthful
+    ``warn`` (18h stale) to ``ok`` for the whole 6h staleness window, while the
+    production core was exactly as unrouted as before. Freshness is a property of the
+    artifact; routing is a property of the process.
+
+    The pid comes from tmux rather than ``pgrep``: ``pgrep -f claude`` matches any argv
+    containing the string — including the shell running this check — and macOS
+    ``pgrep -a`` lists ancestors, not argv.
+
+    But a pane pid is only useful if it is the CORE's pane. The first version of this
+    helper targeted the session (``list-panes -t =sutando-core``), which tmux resolves
+    to that session's **current window** — and this repo deliberately keeps sibling
+    windows (gateway, monitor) in the same session, healing window-scoped precisely so
+    they survive (`src/agent/claude/cli/start-cli.sh`). A reviewer built the case and it
+    reproduced: with the ``gateway`` window active, the production command returned the
+    gateway's pid, so the helper would report on a sibling's environment — false green or
+    false warning, independent of the real core. Window NAME is no discriminator either;
+    on this host the core's window is auto-named ``2.1.220`` after the claude version.
+
+    So enumerate EVERY pane in the session (``list-panes -s``) and identify the core by
+    what it actually is: the process whose argv carries ``--name <session>``, which is
+    exactly how `start-cli.sh` launches it. Zero matches or more than one -> ``None``;
+    an ambiguous session is not evidence of a bypass.
+
+    Both subprocess calls are injectable so the contract is testable without a live
+    core; production passes neither.
+    """
+    tmux_runner = tmux_runner or (lambda sock, *a: _run_tmux(sock, *a))
+    if ps_runner is None:
+        def ps_runner(pid):
+            return subprocess.run(
+                ["ps", "eww", "-o", "command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=15,
+            )
+    sock = socket_path or _local_core_socket()
+    if not sock:
+        return None                       # no live LOCAL core -> unknown, not a bypass
+    # `-s` = every pane in the SESSION, not just the current window's.
+    panes = tmux_runner(sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
+    if panes is None or getattr(panes, "returncode", 1) != 0:
+        return None                       # no such session / tmux unavailable
+    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
+    if not pids:
+        return None
+    # Identify the core by argv, not by position: `--name <session>` is what
+    # start-cli.sh passes and no sibling window carries it.
+    #
+    # TOKEN equality, never substring. `f"--name {session}" in argv` also matches
+    # `--name sutando-core-watcher`, so a prefix-named sibling in the same session
+    # was accepted as the core (john-the-dev, reproduced on a sole pane: returned
+    # True where the contract is None). This is the SAME lookalike class as the
+    # `ANTHROPIC_BASE_URL_OLD` control already in the suite — I guarded the env-var
+    # axis and then introduced the identical hole on the session-name axis.
+    def _names_this_session(argv: str) -> bool:
+        toks = argv.split()
+        for i, t in enumerate(toks):
+            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
+                return True
+            if t == f"--name={session}":  # the =-joined spelling
+                return True
+        return False
+
+    matches = []
+    for pid in pids:
+        try:
+            proc = ps_runner(pid)
+        except Exception:                 # noqa: BLE001 — a probe failure is "unknown"
+            return None
+        if proc is None or getattr(proc, "returncode", 1) != 0:
+            continue                      # this pane vanished; keep looking
+        out = proc.stdout or ""
+        if _names_this_session(out):
+            matches.append(out)
+    # Zero matches: the core is not in this session (or ps could not read any pane).
+    # More than one: ambiguous, and an ambiguous session is not evidence of a bypass.
+    if len(matches) != 1:
+        return None
+    tokens = matches[0].split()
+    # `ps eww` prints argv THEN the environment. On a process whose env we are not
+    # permitted to read it prints argv alone, which contains no KEY=VALUE pairs — and
+    # "no pairs" is indistinguishable from "an empty environment". Requiring at least
+    # one pair is what keeps an unreadable env reporting None instead of False.
+    env_pairs = [t for t in tokens if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
+    if not env_pairs:
+        return None
+    return any(t.startswith("ANTHROPIC_BASE_URL=") for t in env_pairs)
+
+
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
 
@@ -1860,7 +3308,7 @@ def _agent_activity_age() -> "float | None":
         return None
 
 
-def check_quota_telemetry(proxy_status: str) -> dict:
+def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     """Warn when the credential proxy is up but producing no quota state.
 
     quota-state.json is written by the proxy from the quota headers on
@@ -1902,6 +3350,13 @@ def check_quota_telemetry(proxy_status: str) -> dict:
     it stays silent, and a host that never wired at all still takes the
     absent-file branch below.
     """
+    # `core_env_prober` is an injectable seam, defaulting to the real probe. It exists
+    # because the first version of this branch called `core_env_has_proxy_url()`
+    # unconditionally: the existing 39-case suite overrides WORKSPACE_DIR but had no way
+    # to override THAT, so its fixtures escaped into the developer's live tmux, observed
+    # the real (unrouted) core, and 3 of 39 flipped to `warn`. A required suite whose
+    # result depends on ambient host state is worse than the bug it guards -- and CI,
+    # having no live core, would have stayed green while developer hosts failed.
     check = {"name": "quota-telemetry", "status": "ok"}
     if proxy_status != "ok":
         check["detail"] = "credential proxy not running — quota telemetry not expected"
@@ -1912,14 +3367,48 @@ def check_quota_telemetry(proxy_status: str) -> dict:
             quota_age = time.time() - path.stat().st_mtime
             age_min = int(quota_age / 60)
             check["detail"] = f"quota state present (updated {age_min}m ago)"
+            # A FRESH file is not proof the CORE routed — the proxy writes this file
+            # for whatever talks to it. Only a demonstrated absence downgrades; None
+            # (env unreadable) leaves the fresh reading alone.
+            probe = core_env_prober or core_env_has_proxy_url
+            if quota_age <= QUOTA_STATE_STALE_SEC and not _runtime_may_skip_proxy() \
+                    and probe() is False:
+                check["status"] = "warn"
+                check["detail"] = (
+                    f"quota state is fresh ({age_min}m) but the RUNNING core has no "
+                    "ANTHROPIC_BASE_URL in its environment, so the core is not routed "
+                    "through the proxy — something else produced that file (a one-off "
+                    "`claude -p`, another core, a manual probe). Quota-based budgeting "
+                    "is reading numbers this core did not generate. Relaunch the core "
+                    "via src/agent/start-cli.sh with the proxy listening on 7846."
+                )
+                return check
         except OSError:
             # Degrade to the less precise detail rather than raising — and with
             # no age there is nothing to call stale, so never warn from here.
             check["detail"] = "quota state present"
             return check
         agent_age = _agent_activity_age()
+        skipped_for_runtime = _runtime_may_skip_proxy()
         if quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
-                and agent_age < AGENT_ACTIVE_SEC:
+                and agent_age < AGENT_ACTIVE_SEC and skipped_for_runtime \
+                and _last_core_launch_at() is None:
+            # Silenced by a runtime marker we could NOT date. `session-starts.log`
+            # only exists on checkouts carrying the launcher write-sites (first
+            # landed 17d094f4, 2026-07-13), and a pinned older node has no such
+            # file — a live counter-example on this fleet, not a hypothesis. The
+            # conservative reading is kept, because refusing to trust the marker
+            # would reinstate the false warn on every healthy pre-Jul-13 Codex
+            # host, which is the defect this check was opened to remove. But the
+            # no-op is stated rather than silent: an unqualified `ok` here would
+            # be indistinguishable from a check that actually verified something.
+            check["detail"] += (
+                " — runtime marker present but UNVERIFIABLE on this checkout "
+                "(no state/session-starts.log), so a stale marker cannot be "
+                "detected; staleness check inactive here"
+            )
+        elif quota_age > QUOTA_STATE_STALE_SEC and agent_age is not None \
+                and agent_age < AGENT_ACTIVE_SEC and not skipped_for_runtime:
             check["status"] = "warn"
             check["detail"] = (
                 f"quota state is {int(quota_age / 3600)}h stale while the agent is "
@@ -1938,6 +3427,173 @@ def check_quota_telemetry(proxy_status: str) -> dict:
         "Quota-based budgeting is blind on this host."
     )
     return check
+
+
+def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
+    """Mirror of credential-proxy.ts `scopedKeychainService`.
+
+    Empty/whitespace -> None, so the caller falls back to the vanilla item —
+    the same contract the proxy implements.
+    """
+    dir_ = (config_dir or "").strip()
+    if not dir_:
+        return None
+    digest = hashlib.sha256(dir_.encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{digest}"
+
+
+def _keychain_service_exists(service: str) -> bool:
+    try:
+        return subprocess.run(
+            ["security", "find-generic-password", "-s", service],
+            capture_output=True, timeout=5,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _resolved_credential_service(config_dir: Optional[str]) -> Optional[str]:
+    """First EXISTING item of [scoped(config_dir), vanilla] — the proxy's order."""
+    for service in (_scoped_keychain_service(config_dir), "Claude Code-credentials"):
+        if service and _keychain_service_exists(service):
+            return service
+    return None
+
+
+def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
+    """Does the proxy inject THIS core's login, or a different account's?
+
+    `check_quota_telemetry` above answers "is quota-state fresh, and does it
+    exist" — both are questions about WHEN, and neither can see the failure
+    this check exists for: a proxy that is up, routing, and writing a
+    seconds-old file **for someone else's account**.
+
+    Observed 2026-08-03. The owner's login showed 7% of the 7d window used
+    while every routed request billed a different account at 88%; the core
+    throttled itself to near-idle for an hour against a ceiling that was not
+    his. `quota-state.json` was never stale, so no existing branch fired.
+
+    Mechanism: the proxy picks its credential by preferring the keychain item
+    scoped to its own CLAUDE_CONFIG_DIR, falling back to vanilla. launchd does
+    not inherit the installing shell's environment, so if the plist omits
+    CLAUDE_CONFIG_DIR the proxy can only ever resolve the vanilla item — while
+    an interactive `/login` in a namespaced core writes the SCOPED one. It does
+    not self-heal: the proxy re-reads per request, but re-reads the wrong item
+    and refreshes that token back into itself.
+
+    Compares the item the CORE would resolve against the item the PROXY would,
+    reading only the plist and keychain ITEM NAMES. No token, and no secret
+    material of any kind, is read or logged.
+    """
+    name = "quota-account-identity"
+    if proxy_status != "ok":
+        return {"name": name, "status": "ok",
+                "detail": "credential proxy not up — nothing to compare"}
+
+    # Whose account only matters if THIS core's requests go through that proxy.
+    # A proxy can be up while the running core bypasses it entirely — a Codex or
+    # direct runtime, or a supervisor-launched core that never got
+    # ANTHROPIC_BASE_URL. Warning there would assert "requests bill that account"
+    # and "/login here will not reach the proxy", neither of which is true of a
+    # core that does not route. check_quota_telemetry needed the same gate for
+    # the same class, so reuse its runtime marker.
+    if _runtime_may_skip_proxy():
+        return {"name": name, "status": "ok",
+                "detail": "core runtime is not proxy-routed — its credential is not this proxy's"}
+    # Probe the RUNNING CORE's environment, not this process's.
+    #
+    # The first version of this gate read `os.environ` on the theory that
+    # health-check runs as a child of the core and inherits it. True on the
+    # proactive-loop path, and false on the app / fallback-launchd / manual
+    # paths, which this file already documents do not carry the core's env
+    # (see the launchd notes around line 1417). On those a routed core with a
+    # genuine account mismatch would read "comparison inactive" and stay
+    # silent — the check disabled exactly where nobody is watching.
+    #
+    # `core_env_has_proxy_url` is TRI-STATE and its contract is that None must
+    # never collapse into False. Applied here:
+    #   True  -> the core routes; the comparison below is meaningful.
+    #   False -> demonstrably NOT routed; the proxy's account is irrelevant to
+    #            it, so every clause of the warning would be false. Silent.
+    #   None  -> undeterminable (no tmux, ambiguous session, unreadable env).
+    #            Silent, and says so — an unprovable premise licenses nothing.
+    # `core_env_prober` is the same injectable seam check_quota_telemetry uses:
+    # without it a fixture escapes into the developer's live tmux and reports on
+    # the real core, which is how 3 of that suite's 39 cases once flipped.
+    probe = core_env_prober or core_env_has_proxy_url
+    routed = probe()
+    if routed is False:
+        return {"name": name, "status": "ok",
+                "detail": ("the running core has no ANTHROPIC_BASE_URL — it is not routed "
+                           "through this proxy, so whose login the proxy holds is moot")}
+    if routed is None:
+        return {"name": name, "status": "ok",
+                "detail": ("could not read the running core's environment — identity "
+                           "comparison inactive here (not evidence either way)")}
+
+    core_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not core_cfg:
+        return {"name": name, "status": "ok",
+                "detail": "core has no CLAUDE_CONFIG_DIR — both sides resolve the vanilla item"}
+
+    plist = Path.home() / "Library/LaunchAgents/com.sutando.credential-proxy.plist"
+    if not plist.is_file():
+        return {"name": name, "status": "ok",
+                "detail": "credential proxy is not launchd-managed on this host"}
+    try:
+        rendered = plistlib.loads(plist.read_bytes())
+    except (OSError, ValueError) as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"cannot read the credential-proxy plist ({exc})"}
+    # A plist can PARSE and still be the wrong shape — `EnvironmentVariables`
+    # encoded as a string, say. `.get` on that raises AttributeError, which is
+    # not caught above and would abort the whole health run, taking every later
+    # check with it. Validate both containers as mappings; a parseable file of
+    # the wrong shape is a warn, never an exception.
+    if not isinstance(rendered, dict):
+        return {"name": name, "status": "warn",
+                "detail": (f"credential-proxy plist parsed but its root is "
+                           f"{type(rendered).__name__}, not a dict — cannot read its environment")}
+    env_block = rendered.get("EnvironmentVariables")
+    if env_block is None:
+        env_block = {}
+    if not isinstance(env_block, dict):
+        return {"name": name, "status": "warn",
+                "detail": (f"credential-proxy plist has EnvironmentVariables as "
+                           f"{type(env_block).__name__}, not a dict — cannot read CLAUDE_CONFIG_DIR")}
+    proxy_cfg = env_block.get("CLAUDE_CONFIG_DIR")
+    if proxy_cfg is not None and not isinstance(proxy_cfg, str):
+        return {"name": name, "status": "warn",
+                "detail": (f"credential-proxy plist has CLAUDE_CONFIG_DIR as "
+                           f"{type(proxy_cfg).__name__}, not a string — cannot resolve its keychain item")}
+
+    core_service = _resolved_credential_service(core_cfg)
+    proxy_service = _resolved_credential_service(proxy_cfg)
+
+    if core_service is None or proxy_service is None:
+        # No readable credential on one side (locked keychain, fresh host).
+        # Say so rather than returning a bare ok that looks like agreement.
+        return {"name": name, "status": "ok",
+                "detail": "no readable credential on one side — comparison inactive here"}
+
+    if core_service == proxy_service:
+        return {"name": name, "status": "ok",
+                "detail": f"proxy injects this core's login ({core_service})"}
+
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (
+            f"the credential proxy injects a DIFFERENT login than this core's: proxy "
+            f"resolves '{proxy_service}', core would resolve '{core_service}'. Quota "
+            f"numbers describe the proxy's account, not yours, and requests bill it — "
+            f"a `/login` here will not reach the proxy. Cause is almost always the "
+            f"launchd plist omitting CLAUDE_CONFIG_DIR (launchd inherits no shell env): "
+            f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
+            f"Fix: pin CLAUDE_CONFIG_DIR in "
+            f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
+        ),
+    }
 
 
 def check_bodhi_dist() -> dict:
@@ -2275,11 +3931,59 @@ def check_core_supervisor() -> dict:
         detail = f"{state} — {str(prompt).splitlines()[0][:60]}"
     needs_user = {"blocked-human", "logged-out"}
     degraded = {"crashed", "hung", "gateway-down"}
+    # `gateway-down` means "core up, relay gateway not running". On a host with no
+    # gateway configured that is the DESIGNED state — startup.sh never launches the
+    # bridge and says so ("deliberately silent when unconfigured"), and the dedicated
+    # probe below returns None for exactly this case. Treating it as degraded here
+    # made every Sutando-only install carry a permanent warn it could not clear,
+    # which is how a status tool teaches its reader to skip the warn line.
+    if state == "gateway-down" and not _gateway_configured():
+        return {"name": name, "status": "ok",
+                "detail": "core up; ag2.space gateway not configured on this host"}
     if state in needs_user:
         return {"name": name, "status": "warn", "detail": f"core needs you: {detail}"}
     if state in degraded:
         return {"name": name, "status": "warn", "detail": f"core degraded: {detail}"}
     return {"name": name, "status": "ok", "detail": detail}
+
+
+def _gateway_configured() -> bool:
+    """Is the ag2.space mobile gateway configured on this host?
+
+    `startup.sh` is deliberately silent when it is not — "a Sutando-only user
+    never sees it" — so absence of the bridge is the EXPECTED state, not a fault.
+    Shared by the two probes that must agree about that; they did not, which is
+    the bug this helper exists to close.
+    """
+    try:
+        if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
+            return True
+        gw_env = claude_home_path("channels", "ag2space", ".env")
+        if gw_env.exists():
+            return any(
+                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
+                # errors="replace" is load-bearing, not cosmetic: without it a
+                # single non-UTF-8 byte raises, the except below swallows it, and a
+                # CONFIGURED gateway reads as unconfigured — which now also silences
+                # the gateway-down warn. Fail-open on a decode error is exactly the
+                # class this PR closes. (Caught in review by Sutando-Pro.)
+                for ln in gw_env.read_text(errors="replace").splitlines()
+            )
+    except OSError:
+        # EXPECTED failures only: the env file is unreadable / the path is bad.
+        # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.
+        #
+        # Deliberately NOT `except Exception`. A resolver contract bug (e.g.
+        # claude_home_path raising ValueError) would be swallowed into False,
+        # check_core_supervisor would then report a real `gateway-down` as OK,
+        # and check_gateway_bridge would vanish -- a CONFIGURED gateway's outage
+        # goes silent. That is the same fail-open direction this PR exists to
+        # close, one layer up. An unexpected exception propagates instead, which
+        # is loud; a programming error in a health probe should not be absorbed
+        # by the probe that is supposed to be reporting faults.
+        # (Caught in review by john-the-dev.)
+        pass
+    return False
 
 
 def check_gateway_bridge() -> "dict | None":
@@ -2297,16 +4001,7 @@ def check_gateway_bridge() -> "dict | None":
     nothing reported it, so mobile messages stranded in the cloud invisibly. This
     check makes that state visible on the dashboard.
     """
-    try:
-        gw_env = claude_home_path("channels", "ag2space", ".env")
-        configured = bool(os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"))
-        if not configured and gw_env.exists():
-            configured = any(
-                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
-                for ln in gw_env.read_text(errors="replace").splitlines()
-            )
-    except OSError:
-        configured = False
+    configured = _gateway_configured()
     if not configured:
         return None
     try:
@@ -3307,25 +5002,360 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
     return None
 
 
-def check_comm_sweep_freshness() -> dict:
+def _host_runs_comm_sweep(
+    workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
+) -> bool:
+    """True when THIS host has a comm-sweep driver wired, i.e. its own crons.json
+    schedules one.
+
+    Comm handling is a SINGLE-OWNER lane: exactly one host in the fleet runs the
+    sweep, because a second cron would duplicate sweeps over the owner's real
+    comms. So "no stamp here" is only a defect on the host that actually owns it.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    host = host_label or _host_label()
+    try:
+        crons = json.loads((workspace / "hosts" / host / "crons.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(crons, list):
+        return False
+    for entry in crons:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("prompt_skill") == "comm-sweep":
+            return True
+        # A prompt-body entry that invokes the skill or its script counts too —
+        # matching how the driver is actually scheduled, not one spelling of it.
+        if "comm-sweep" in f"{entry.get('name', '')} {entry.get('prompt', '')}":
+            return True
+    return False
+
+
+def _as_list(value) -> list:
+    """A settings file is hand-editable; anything not a list yields nothing to scan."""
+    return value if isinstance(value, list) else []
+
+
+#: `$(shq "…")` / `$(shq …)` — the installer shell-quotes its paths through a helper
+#: before writing them into settings.json. Reading HOOKS as literal source text means
+#: the substitution is still unevaluated, so the path is welded into a token like
+#: `$(shq` + `<path>)` and never compares equal to anything.
+_SHQ_CALL = re.compile(r"\$\(\s*shq\s+(\"[^\"]*\"|'[^']*'|[^)]*)\)")
+
+
+def _unwrap_installer_command(command: str) -> str:
+    """Reduce an installer HOOKS command template to the shape it actually WRITES.
+
+    The template is bash SOURCE, not the stored command. `bash $(shq "$REPO_DIR/x.sh")`
+    is written to settings.json as `bash /abs/path/x.sh`, so comparing against the raw
+    source can never match — which is exactly how every production hook slipped past
+    the positional check and into a permissive fallback.
+    """
+    # Re-quote rather than inline raw: `shq` IS shell-quoting, and a repo path
+    # containing a space would otherwise split across tokens and fail closed on a
+    # perfectly healthy host — which is the whole reason the installer uses shq.
+    out = _SHQ_CALL.sub(lambda m: shlex.quote(m.group(1).strip("\"'")), command)
+    # The array literal is itself quoted in shell, so inner quotes arrive escaped.
+    out = out.replace('\\"', '"').replace("\\$", "$")
+    # The HOOKS entry is a quoted shell string, so parsing it strips the entry's
+    # own closing quote and leaves the backslash that escaped it dangling. That
+    # makes shlex raise and drop us into the whitespace fallback, where a token
+    # keeps a stray opening quote and no comparison can match — it cost a GENUINE
+    # archive hook a false warning. The dangling backslash WAS that closing quote,
+    # so restore it rather than deleting it: deleting leaves the quote unbalanced,
+    # which is the same failure one step later.
+    if out.endswith("\\") and not out.endswith("\\\\"):
+        out = out[:-1] + '"'
+    return out
+
+
+def _shell_tokens(command: str) -> list:
+    """Shell-split, degrading to whitespace split on unbalanced quoting.
+
+    The fallback keeps surrounding quotes on each token, so tokens are normalized
+    either way — otherwise a comparison silently depends on WHICH split path ran.
+    """
+    try:
+        toks = shlex.split(command)
+    except ValueError:  # a hand-edited settings file can be unquotable
+        toks = command.split()
+    out = []
+    for tok in toks:
+        if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+            tok = tok[1:-1]
+        out.append(tok)
+    return out
+
+
+def _same_path(a: str, b_norm: str, b_real: str) -> bool:
+    a = os.path.expanduser(a)
+    if not os.path.isabs(a):
+        # Unresolvable without knowing the hook's cwd, so it never counts as a
+        # match: unprovable identity warns, like every other branch here.
+        return False
+    return os.path.normpath(a) == b_norm or os.path.realpath(a) == b_real
+
+
+def _hook_command_targets(command: str, expected, owned_cmd: str, marker: str = "") -> bool:
+    """Does this command INVOKE `expected` — not merely mention it, not merely contain it?
+
+    Two false-cleans this has to reject, both found in review, both of which let a
+    stale or replaced hook keep the probe green:
+
+    1. **Substring containment is not checkout identity.** `/tmp/sutando` is a
+       substring of `/tmp/sutando-old/src/check-pending-tasks.sh`, so `str(repo) in
+       command` certifies a sibling checkout as this one.
+    2. **A path in argument position is not an invocation.** Scanning every absolute
+       token accepts `echo <path>`, `printf "%s" <path>`, and
+       `bash /tmp/other.sh <path>` — the expected script appears as inert data while
+       something else entirely runs.
+
+    So the comparison is positional, against the command the INSTALLER itself writes
+    (the third field of its `HOOKS` entry). The installer stays the single source of
+    truth for the command shape exactly as it already is for the hook list: whatever
+    interpreter it uses, and whichever position it puts its script in, is what a
+    registered hook must match. Leading tokens must agree, so `echo` cannot stand in
+    for `bash`, and the script position must be the same path.
+    """
+    owned = _shell_tokens(_unwrap_installer_command(owned_cmd))
+    got = _shell_tokens(command)
+    if not owned or not got:
+        return False
+
+    # PROGRAM CHECK — applies to EVERY owned hook, not just repo-relative ones.
+    # This was previously skipped for markers that are not `src/` paths, on the
+    # reasoning that a non-repo path has no identity to compare. That conflated
+    # path identity with command-shape validation: the archive hook still has an
+    # installer-owned shape, and `echo` is not `cp`. With only the substring test,
+    # BOTH of these certified as a healthy archive hook:
+    #     echo sutando-conversations/
+    #     rm -rf sutando-conversations/
+    # The second is the one that settles it — a destructive command reported as a
+    # working archiver is the opposite of what this probe is for.
+    if got[0] != owned[0]:
+        return False
+
+    if expected is None:
+        # Marker is not repo-relative (the archive hook writes outside the repo),
+        # so there is no repo path to compare positionally. Program alone is NOT
+        # enough: `cp /tmp/other "$HOME/Desktop/sutando-conversations/x"` and
+        # `cp "$TRANSCRIPT_PATH" /tmp/sutando-conversations/y` both pass a program
+        # check while archiving the wrong thing, or to the wrong place.
+        #
+        # An earlier revision of this comment called that an intentional
+        # "compatibility boundary", on the reasoning that the installer preserves
+        # operator-customized archive hooks. That reasoning was WRONG, and it is
+        # worth recording why, because it read as principled: Phase 0 does skip
+        # sweeping a custom archiver (install-claude-hooks.sh:170-185), but Phase 1
+        # detects presence by EXACT command-string match — `index($cmd)` at :262 —
+        # so a custom `cp` never satisfies it and the installer ADDS its own
+        # command alongside. The two COEXIST. On any host where the installer has
+        # run, its own command is therefore present, and this probe should say so.
+        #
+        # Compared: the program, the SOURCE argument the installer writes, and the
+        # destination prefix up through the marker. Everything after the marker is
+        # free — that is where the installer's own $(date …) filename varies, so
+        # pinning it would warn on healthy hosts.
+        d_idx = next((i for i, tok in enumerate(owned) if marker and marker in tok), None)
+        if len(owned) < 2 or d_idx is None:
+            return False
+        # POSITION and ARITY, not "the prefix appears somewhere". Accepting the
+        # prefix in any token certified a three-operand
+        #     cp "$TRANSCRIPT_PATH" /tmp/not-the-archive ".../sutando-conversations/x"
+        # which cp treats as two SOURCES and a destination — and which fails at
+        # runtime unless that last path is a directory, so nothing is archived while
+        # the probe reports clean. The installer writes exactly program/source/dest
+        # and Phase 1 requires that exact string, so anything of a different arity
+        # is not the command it installs.
+        if len(got) != len(owned) or got[1] != owned[1]:
+            return False
+        prefix = owned[d_idx][: owned[d_idx].index(marker) + len(marker)]
+        return got[d_idx].startswith(prefix)
+
+    want = os.path.normpath(os.path.expanduser(str(expected)))
+    want_real = os.path.realpath(want)
+    idx = next((i for i, t in enumerate(owned) if _same_path(t, want, want_real)), None)
+    if idx is None:
+        # FAIL CLOSED. This branch used to accept the path anywhere in the first two
+        # tokens, which read as a safe fallback and was not: the real installer writes
+        # `bash $(shq "$REPO_DIR/x.sh")`, so before the unwrap above NO production hook
+        # resolved positionally and EVERY one landed here — making `echo <path>` count
+        # as registered on the only path that ships. A fallback that the real data
+        # always takes is not a fallback, it is the behaviour.
+        return False
+    if len(got) <= idx:
+        return False
+    return _same_path(got[idx], want, want_real) and got[:idx] == owned[:idx]
+
+
+def check_claude_hook_registration(
+    repo_dir: Optional[Path] = None,
+) -> dict:
+    """Are the Claude Code hooks `install-claude-hooks.sh` owns actually registered?
+
+    Nothing checked this before. On 2026-08-03 this host was found with **zero of
+    the four owned hooks** in the installer's own target — including both PreCompact
+    entries, so `session-state.md` was never regenerated on compaction and the
+    transcript archiver had never run at all. It had been that way for days, silently,
+    because no probe looks at hook registration. A peer host showed the same shape.
+
+    The owned list is READ FROM THE INSTALLER's `HOOKS=(...)` array rather than
+    duplicated here: a second copy would drift from the script that does the
+    installing, and a stale allow-list is how a probe starts lying. Same reason the
+    target file is read from its `SETTINGS=` line instead of being assumed.
+
+    Fails toward NOISE, never toward a false clean:
+      * installer absent          -> ok, not a sutando checkout (nothing to verify)
+      * HOOKS array unparseable   -> WARN. A parse that yields zero hooks would
+                                     otherwise report "all registered" over an empty
+                                     population, which is the exact shape of a probe
+                                     that cannot fail.
+      * settings.json absent      -> warn (installer has never run here)
+      * settings.json malformed   -> warn, never raise
+      * a hook registered but its command points at a DIFFERENT checkout -> warn.
+        This host had a SessionEnd entry aimed at a five-day-old `Desktop/sutando`
+        copy, so fixes to the live script never executed — present-but-wrong is the
+        failure that looks healthiest.
+    """
+    name = "claude-hooks"
+    repo = Path(repo_dir or REPO_DIR)
+    installer = repo / "src" / "install-claude-hooks.sh"
+    if not installer.is_file():
+        return {"name": name, "status": "ok", "detail": "no install-claude-hooks.sh — not a sutando checkout"}
+    try:
+        src = installer.read_text(errors="ignore")
+    except OSError as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot read installer ({exc})"}
+
+    m = re.search(r"^HOOKS=\((.*?)^\)", src, re.M | re.S)
+    owned = []
+    if m:
+        for line in m.group(1).split("\n"):
+            line = line.strip()
+            if not line.startswith('"'):
+                continue
+            parts = line.strip('"').split("|", 2)
+            if len(parts) == 3:
+                # third field is the command the installer WRITES — kept so the probe
+                # compares against the real command shape rather than guessing one.
+                owned.append((parts[0], parts[1], parts[2]))
+    if not owned:
+        return {"name": name, "status": "warn",
+                "detail": "could not parse HOOKS=(...) from install-claude-hooks.sh — "
+                          "cannot verify registration (reporting rather than assuming clean)"}
+
+    sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
+    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
+    if not settings.is_file():
+        return {"name": name, "status": "warn",
+                "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "
+                          f"{len(owned)} hook(s) unregistered"}
+    try:
+        conf = json.loads(settings.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "warn", "detail": f"{settings.name} unreadable ({exc})"}
+
+    # Parseable is not the same as well-shaped: `[]` is valid JSON, and `.get()` on it
+    # raises AttributeError, which would abort every remaining probe in run_all_checks().
+    # A malformed schema has to fail toward a warning like every other ambiguous branch.
+    if not isinstance(conf, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"{settings.name} top level is {type(conf).__name__}, not an object — "
+                          f"cannot verify {len(owned)} hook(s)"}
+    hooks = conf.get("hooks")
+    if hooks is None:
+        hooks = {}
+    elif not isinstance(hooks, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"{settings.name} \"hooks\" is {type(hooks).__name__}, not an object — "
+                          f"cannot verify {len(owned)} hook(s)"}
+
+    missing, foreign = [], []
+    for event, marker, owned_cmd in owned:
+        # Every container on this path is type-checked, at EVERY level. Validating
+        # only the top two left `{"hooks":{"Stop":7}}`, `{"hooks":{"Stop":[{"hooks":7}]}}`
+        # and a numeric `command` still raising TypeError straight out of the probe —
+        # and since this runs inside run_all_checks(), a raise aborts every later check.
+        # A malformed shape yields no commands, so the hook reads as unregistered: the
+        # promised warning, not a crash and not a false clean.
+        cmds = []
+        for g in _as_list(hooks.get(event)):
+            if not isinstance(g, dict):
+                continue
+            for h in _as_list(g.get("hooks")):
+                if not isinstance(h, dict):
+                    continue
+                c = h.get("command")
+                if isinstance(c, str):
+                    cmds.append(c)
+        hit = [c for c in cmds if marker in c]
+        if not hit:
+            missing.append(f"{event}:{marker}")
+        elif not any(
+            _hook_command_targets(
+                c,
+                (repo / marker) if marker.startswith("src/") else None,
+                owned_cmd.replace("$REPO_DIR", str(repo)),
+                marker,
+            )
+            for c in hit
+        ):
+            # Present, but not actually invoking this checkout's script — either aimed
+            # at another checkout or carrying the path as an inert argument.
+            foreign.append(f"{event}:{marker}")
+    if missing or foreign:
+        bits = []
+        if missing:
+            bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
+        if foreign:
+            bits.append(f"{len(foreign)} registered but NOT running the installer's command "
+                        f"— a different program, another checkout, or the path is "
+                        f"only an argument ({', '.join(foreign)})")
+        return {"name": name, "status": "warn",
+                "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+    return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
+
+
+def check_comm_sweep_freshness(
+    workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
+) -> dict:
     """Comm-handling liveness (P1 of the comm-handling overhaul).
 
     The comm-sweep driver stamps state/last-comm-sweep.json every run. A stale
     stamp means comm handling has silently STOPPED — the exact failure that let
     the inbox-score loop die 2026-07-21 and owner-comm sweeps lapse for days
     with nobody alerted (comm handling was a *discipline*, not a *mechanism*).
-    This probe makes that loud instead of silent: warn past ~2h, down past ~6h,
-    warn (not down) when the stamp is absent — a host that never wired the
-    driver isn't "broken", it just hasn't adopted P1 yet.
+    This probe makes that loud instead of silent: warn past ~2h, down past ~6h.
+
+    LANE-AWARENESS (2026-08-03). The absent-stamp branch used to warn on every
+    host, with the detail "driver not wired on this host yet (P1)". That wording
+    asserted a per-host adoption gap and was wrong twice over: comm handling is a
+    single-owner lane (the driver lives in sonichi/sutando-personal and runs on
+    ONE host by design — a second cron would duplicate sweeps over the owner's
+    comms), so a non-owning host has nothing to adopt and warns FOREVER. A
+    permanent warn is how a health output gets ignored, which would have cost the
+    very alarm this probe exists to raise. So absence is now judged against
+    whether this host actually schedules the driver.
+
+    Deliberately gated on the ABSENT branch ONLY: once a stamp exists, the age
+    thresholds apply unconditionally. Gating those on config too would mean
+    deleting the cron entry silently disarms a real stall — failing in the
+    dangerous direction.
 
     Age-checked (unlike quota-telemetry, which is absence-only): comm handling
     is expected to run on a fixed cadence, so a lengthening age IS the signal.
     """
-    path = status_read_path("last-comm-sweep.json", WORKSPACE_DIR)
+    path = status_read_path("last-comm-sweep.json", workspace_dir or WORKSPACE_DIR)
     name = "comm-sweep"
     if not path.exists():
+        if not _host_runs_comm_sweep(workspace_dir, host_label):
+            return {"name": name, "status": "ok",
+                    "detail": "comm-sweep not scheduled on this host — single-owner lane, "
+                              "probe N/A here"}
         return {"name": name, "status": "warn",
-                "detail": "no last-comm-sweep.json — comm-sweep driver not wired on this host yet (P1)"}
+                "detail": "comm-sweep is scheduled on this host but has never stamped "
+                          "last-comm-sweep.json — driver wired but not producing"}
     try:
         age_h = (time.time() - path.stat().st_mtime) / 3600
     except OSError as exc:
@@ -3346,7 +5376,15 @@ def run_all_checks() -> list[dict]:
     # Core services (required)
     checks.extend(check_voice_stack())
 
-    web_check = check_port(8080, "web-client", probe=True)
+    web_config = resolve_web_client_port()
+    if web_config.get("error"):
+        web_check = {
+            "name": "web-client",
+            "status": "down",
+            "detail": web_config["error"],
+        }
+    else:
+        web_check = check_port(web_config["port"], "web-client", probe=True)
     if web_check["status"] == "ok":
         mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
     checks.append(web_check)
@@ -3376,12 +5414,17 @@ def run_all_checks() -> list[dict]:
 
     # Quota telemetry — only meaningful when the proxy is actually up.
     checks.append(check_quota_telemetry(proxy_check["status"]))
+    # ...and WHOSE account those numbers describe. The check above answers
+    # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
+    # passes every branch above (observed 2026-08-03).
+    checks.append(check_quota_account_identity(proxy_check["status"]))
 
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.
     checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
+    checks.append(check_claude_hook_registration())
     checks.append(check_cron_runner())
     checks.append(check_session_cron_registration())
 
@@ -3414,6 +5457,10 @@ def run_all_checks() -> list[dict]:
     _mem_index = check_memory_index_integrity()
     if _mem_index:
         checks.append(_mem_index)
+
+    # Carrier-set enforcement — a stale exclude means the vault is silently not
+    # backing up paths the config says it carries (#2565).
+    checks.extend(c for c in (check_carrier_set_enforced(),) if c)
 
     # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
@@ -3770,6 +5817,29 @@ def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -
     return False
 
 
+def _alerts_suppressed(check: dict) -> bool:
+    """True when a check must NOT wake anyone, whatever its status says.
+
+    `main()` computes a local `issues` list, and it is tempting to treat that as
+    "what alerts". It is not. `--emit-task`, `--notify-on-fail` and
+    `--notify-slack` each consume the FULL `checks` list through their own
+    filters, and all three count a plain `warn` as a failure. A carve-out tested
+    only against `issues` therefore still fires a task and a macOS notification
+    on the first transition (qingyun-wu, #2570 — verified on the exact head with
+    a one-check witness: notification written, 1 Slack message, 1 task file).
+
+    So suppression has to be an explicit property of the CHECK, honored at every
+    surface that can wake someone, rather than a status the reader hopes is
+    benign. A probe sets `"alerting": False` when its result is genuinely
+    informational — visible on the dashboard, never a page.
+
+    Deliberately narrow: only an explicit `False` suppresses. A missing key
+    alerts, so no existing check changes behavior by omission, and a typo cannot
+    silence a real failure.
+    """
+    return check.get("alerting") is False
+
+
 def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
     """Emit a task file describing health-check failures so the proactive
     loop's CLI session sees them via the watcher and can decide what to do
@@ -3801,7 +5871,9 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     # watchdog catches the bug class that motivated this PR. Excluding
     # would have missed Mini's discord-bridge issue this morning. Per
     # her PR review note 2026-05-05.
-    failures = [c for c in checks if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")]
+    failures = [c for c in checks
+                if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")
+                and not _alerts_suppressed(c)]
     if not failures:
         return
 
@@ -3886,7 +5958,9 @@ def notify_for_failures(
     defaults to `osascript` driving `display notification`. Tests inject a
     fake to avoid spamming the developer's own notification center.
     """
-    failures = [c for c in checks if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")]
+    failures = [c for c in checks
+                if c["status"] in ("down", "missing", "not_loaded", "fail", "stale", "warn")
+                and not _alerts_suppressed(c)]
     if not failures:
         return
 
@@ -3951,9 +6025,12 @@ def _slack_failures(checks: list[dict]) -> list[dict]:
     out = []
     for c in checks:
         st = c["status"]
+        if _alerts_suppressed(c):
+            continue
         if st in ("down", "missing", "not_loaded", "fail", "stale"):
             out.append(c)
-        elif st == "warn" and "on-demand" not in (c.get("detail") or ""):
+        elif st == "warn" and "on-demand" not in (c.get("detail") or "") \
+                and not _alerts_suppressed(c):
             out.append(c)
     return out
 
@@ -4537,7 +6614,17 @@ def _live_core_socket(workspace: Optional[Path] = None) -> str:
             mtime = alive_file.stat().st_mtime
             if now - mtime >= 90.0:
                 continue  # stale heartbeat — not a live core
-            sock = json.loads(alive_file.read_text()).get("socket")
+            payload = json.loads(alive_file.read_text())
+            # A heartbeat that decodes to a NON-OBJECT (`null`, `[]`, `"x"`, `3`)
+            # raises AttributeError on `.get`, which this handler does not catch —
+            # so one junk file takes down the caller. That caller is
+            # `_rearm_core_crons()`, a RECOVERY path, so it fails exactly when
+            # something is already wrong. The writer is atomic (tmp + replace in
+            # core_heartbeat.py), but this globs `*.alive` for EVERY host, so the
+            # file may come from another machine running different code.
+            if not isinstance(payload, dict):
+                continue
+            sock = payload.get("socket")
         except (OSError, ValueError):
             continue
         if isinstance(sock, str) and sock and (best_mtime is None or mtime > best_mtime):
@@ -4755,6 +6842,39 @@ def community_support_line() -> str:
     return "  Stuck? Community support (real humans + community agents): https://discord.gg/uZHWXXmrCS"
 
 
+#: Statuses that are NOT problems. Everything else is, by the same rule the
+#: issue list uses: `issues = [c for c in checks if c["status"] not in ("ok", "warn")]`.
+#: `stale` is an issue but gets its own glyph because it names a specific remedy.
+_BENIGN_STATUSES = ("ok", "warn")
+
+
+def status_icon(status: str) -> str:
+    """Glyph for a probe status — unrecognized reads as a PROBLEM, not a shrug.
+
+    The human-readable listing used to enumerate `down`/`missing`/`not_loaded` as
+    severe and fall back to `~` for anything else. That put **`fail`** — the most
+    severe status any probe emits, and the one nine probes use — on the least
+    alarming glyph, sharing it with "status I don't recognize". `error` (5 probes)
+    and `wedged` landed there too.
+
+    It is a real miss, not a cosmetic one: a peer host filtered health-check output
+    with `grep -E "⚠|✗"` and the single `fail` line was the one the filter hid, so a
+    run with a genuine failure read as three routine warnings.
+
+    `--quiet` never had this bug — it renders every non-stale issue as `✗`. The two
+    output modes disagreed about the same status. This makes them agree by deriving
+    both from one predicate, and inverts the default so a status added later shows
+    up as a problem until someone deliberately classifies it as benign.
+    """
+    if status == "ok":
+        return "✓"
+    if status == "warn":
+        return "⚠"
+    if status == "stale":
+        return "♻"
+    return "✗"
+
+
 def summary_line(checks) -> str:
     """The no-failures summary. Warnings are deliberately NOT issues — they must
     not fail the exit code or wake the launchd notifier, and that is unchanged.
@@ -4852,7 +6972,7 @@ def main():
     if quiet:
         if issues:
             for c in issues:
-                icon = "♻" if c["status"] == "stale" else "✗"
+                icon = status_icon(c["status"])
                 print(f"{icon} {c['name']}: {c['status']} ({c['detail']})")
             if do_fix:
                 # Fall through to existing fix path below
@@ -4868,7 +6988,7 @@ def main():
         print("=" * 40)
 
         for c in checks:
-            icon = "✓" if c["status"] == "ok" else "⚠" if c["status"] == "warn" else "✗" if c["status"] in ("down", "missing", "not_loaded") else "♻" if c["status"] == "stale" else "~"
+            icon = status_icon(c["status"])
             print(f"  {icon} {c['name']:30s} {c['status']:12s} {c['detail']}")
 
         print()
