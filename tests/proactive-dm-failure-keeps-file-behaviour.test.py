@@ -162,8 +162,13 @@ def main() -> int:
         sent.append(a)
 
     _run_one_pass(box2, _ok)
-    check("a SUCCESSFUL send still removes the file", not list(box2.rglob("proactive-*.txt")),
-          "success path stopped cleaning up — every message would re-send forever")
+    # Glob EVERYTHING, not `*.txt`. The claim renames to `.sending` before the
+    # send, so a `*.txt` glob cannot tell "deleted" from "claimed and left" —
+    # it reported success against a mutation that removed the unlink entirely.
+    # (@john-the-dev's over-broad mutation on #2628 is what sent me looking.)
+    _left = [q.name for q in box2.rglob("proactive-*") if q.is_file()]
+    check("a SUCCESSFUL send still removes the file", not _left,
+          f"success path stopped cleaning up — left {_left}; every message would re-send forever")
     check("  ...and it really was sent", bool(sent), "no send recorded")
 
     # --- LAST RESORT: even the quarantine fails ----------------------------
