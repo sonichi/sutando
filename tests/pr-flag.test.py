@@ -359,6 +359,104 @@ def main() -> int:
     finally:
         pf._gh_stands_page = real_page
 
+    # ---- scope descriptor: the payload must state its own coverage ----------
+    # Why: the emitted state carries counts, CI, approvals and merge state with
+    # nothing marking the population as partial, so a consumer reads its length
+    # as a repo total. On 2026-08-04 a digest reported "31 open" for a repo with
+    # ~100 open non-draft PRs. Issue #2643.
+    sc = pf.scope_descriptor("o/n", "someowner", record_count=30)
+    assert sc["filter"] == "author:someowner", sc
+    assert "someowner" in sc["population"], sc
+    assert any("approval" in e for e in sc["excludes"]), sc
+    print("  ok  scope_descriptor names the author filter and the population")
+
+    # Draft exclusion is UNCONDITIONAL — raw_state() drops drafts whether or not
+    # the fetch is author-filtered, so it must appear in `excludes` either way.
+    assert any("draft" in e for e in sc["excludes"]), sc
+
+    real_argv = pf.fetch_argv
+    try:
+        pf.fetch_argv = lambda repo, owner: [
+            "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
+        ]
+        widened = pf.scope_descriptor("o/n", "someowner", record_count=30)
+        # The anti-drift property: removing --author must change the claim...
+        assert widened["filter"] == "none", widened
+        assert "all authors" in widened["population"], widened
+        # ...but it must NOT become a repository total. This is @john-the-dev's
+        # blocker on #2645: the first version certified `excludes: "nothing"` here
+        # while raw_state() still dropped every draft.
+        assert any("draft" in e for e in widened["excludes"]), widened
+        assert "is_repo_total" not in widened, "the field that could never be true is gone"
+        print("  ok  no-author argv widens the population but STILL excludes drafts")
+    finally:
+        pf.fetch_argv = real_argv
+
+    # Completeness is a certification, granted only on evidence.
+    at_ceiling = pf.scope_descriptor("o/n", "someowner", record_count=1000)
+    assert at_ceiling["complete"] is False, at_ceiling
+    assert "indistinguishable" in at_ceiling["complete_reason"], at_ceiling
+    below = pf.scope_descriptor("o/n", "someowner", record_count=999)
+    assert below["complete"] is True, below
+    unknown = pf.scope_descriptor("o/n", "someowner", record_count=None)
+    assert unknown["complete"] is None, unknown
+    print("  ok  complete: True below ceiling, False AT it, None when uncountable")
+
+    # @john-the-dev's SECOND blocker on #2645, as his own repro: the ceiling
+    # applies to the FETCH, and raw_state() then drops drafts, so certifying off
+    # the emitted count lets a truncated fetch read as complete. His numbers:
+    #   fetched=1000 (== ceiling) -> one draft dropped -> emitted=999 -> complete=True
+    at_ceiling_with_a_draft = pf.scope_descriptor(
+        "o/n", "someowner", record_count=999, fetched_count=1000)
+    assert at_ceiling_with_a_draft["complete"] is False, at_ceiling_with_a_draft
+    assert "1000" in at_ceiling_with_a_draft["complete_reason"], at_ceiling_with_a_draft
+    # ...and the emitted size is still reported, it just does not decide the certificate.
+    assert at_ceiling_with_a_draft["record_count"] == 999, at_ceiling_with_a_draft
+    assert at_ceiling_with_a_draft["fetched_count"] == 1000, at_ceiling_with_a_draft
+    print("  ok  a truncated FETCH is not certified complete by a smaller emitted count")
+
+    # The mirror case: a genuinely short fetch still certifies, so the fix is not
+    # just "always refuse" — that would be a gate that cannot go positive.
+    short = pf.scope_descriptor("o/n", "someowner", record_count=30, fetched_count=31)
+    assert short["complete"] is True, short
+    print("  ok  a fetch below the ceiling still certifies complete")
+
+    # Back-compat: callers that pass only record_count keep the old meaning
+    # rather than silently losing their certificate.
+    legacy = pf.scope_descriptor("o/n", "someowner", record_count=30)
+    assert legacy["complete"] is True, legacy
+    assert legacy["fetched_count"] == 30, legacy
+    print("  ok  record_count-only callers still resolve a ceiling")
+
+    # A non-numeric --limit must degrade to "ceiling unknown", never crash the
+    # digest. scope_descriptor parses whatever argv actually carries, so a
+    # future flag change (`--limit auto`, a templated value) reaches int() as a
+    # string. Certifying completeness against an unparseable ceiling would be
+    # the exact over-claim this descriptor exists to prevent, so the fallback
+    # has to be `limit=None` -> `complete=None`, not a guess.
+    real_argv = pf.fetch_argv
+    try:
+        pf.fetch_argv = lambda repo, owner: [
+            "gh", "pr", "list", "--repo", repo, "--state", "open",
+            "--author", owner, "--limit", "not-a-number",
+        ]
+        odd = pf.scope_descriptor("o/n", "someowner", record_count=30)
+        assert odd["limit"] is None, odd
+        assert odd["complete"] is None, odd
+        # and the rest of the descriptor still works — the author filter is
+        # unaffected by an unparseable limit.
+        assert odd["filter"] == "author:someowner", odd
+        print("  ok  an unparseable --limit yields complete=None, not a false certification")
+    finally:
+        pf.fetch_argv = real_argv
+
+    # And the fetch itself must actually use that argv, or the descriptor
+    # describes a command that isn't the one being run.
+    argv = pf.fetch_argv("o/n", "someowner")
+    assert argv[:5] == ["gh", "pr", "list", "--repo", "o/n"], argv
+    assert "--author" in argv and argv[argv.index("--author") + 1] == "someowner", argv
+    print("  ok  fetch_argv is the real gh command the descriptor reads")
+
     print("\nAll pr-flag core cases pass.")
     return 0
 
