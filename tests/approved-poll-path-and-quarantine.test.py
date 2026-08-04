@@ -273,6 +273,45 @@ def main() -> int:
           any(c == 555000666 for c, _ in sends),
           f"the good marker after it was never processed — sends={sends}")
 
+    # --- CI diff-coverage gaps, both named by @bassilkhilo-ag2 on #2630 ----
+    # They pulled the coverage-summary artifact rather than assuming, and the
+    # two uncovered regions are both real branches of THIS change, not incidental
+    # lines: the not-exists skip is what makes the legacy fallback safe on a host
+    # that has never run stock Claude, and the quarantine-failure handler is the
+    # last thing standing between a failed send and a lost obligation.
+
+    # (a) A candidate directory that does not exist is SKIPPED, not an error.
+    #     The legacy dir is absent on any host where stock Claude never ran, so
+    #     this is the common case there, not an edge one.
+    canonical, legacy = _dirs("nolegacy")
+    import shutil
+    shutil.rmtree(legacy)
+    assert not legacy.exists()
+    (canonical / "9007").write_text("555000777")
+    sends = []
+    _run_one_pass(canonical, sends)
+    check("an absent candidate dir is skipped, and the present one still delivers",
+          any(c == 555000777 for c, _ in sends), f"sends={sends}")
+
+    # (b) The quarantine itself fails. `undelivered` is created as a FILE, so
+    #     `mkdir(exist_ok=True)` raises FileExistsError — a plausible real state
+    #     (a stray file, a name collision), no monkeypatching. The whole
+    #     guarantee is "noise is recoverable, deletion is not", and this is the
+    #     branch that has to hold it up.
+    canonical, legacy = _dirs("noquar")
+    (canonical / "9008").write_text("555000888")
+    (canonical / "undelivered").write_text("not a directory")
+    sends, log = [], []
+    _run_one_pass(canonical, sends, fail=True, log=log)
+    check("quarantine ALSO fails -> the marker is still left in place",
+          (canonical / "9008").is_file(),
+          "deleted despite the whole point being not to delete")
+    check("  ...body intact on the last-resort path",
+          (canonical / "9008").read_text() == "555000888", "content lost")
+    check("  ...and it says it did not lose the file",
+          "leaving it in place rather than losing it" in "".join(log),
+          "the log does not distinguish kept-vs-dropped")
+
     # --- hermeticity, asserted rather than assumed -------------------------
     live_after = [sorted(p.iterdir()) if p.exists() else None for p in _LIVE]
     check("HERMETIC: operator's BOTH real approved dirs untouched",
