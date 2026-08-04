@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import os
 import stat
 import sys
@@ -91,8 +92,8 @@ class _FakeHandler(sc.Handler):
         pass
 
 
-def _run_auth(path: str, token_header: str | None, capture_token: str | None) -> tuple[int | None, bool]:
-    """Run do_GET() up to the auth gate and return (response_code, early_return).
+def _run_auth(path: str, token_header: str | None, capture_token: str | None):
+    """Run do_GET() up to the auth gate and return its captured response.
 
     Patches CAPTURE_TOKEN and stubs out everything past the auth check so we
     never attempt a real screencapture subprocess call.
@@ -107,7 +108,12 @@ def _run_auth(path: str, token_header: str | None, capture_token: str | None) ->
             handler.do_GET()
         except Exception:
             pass
-    return handler._response_code, handler._response_code == 403
+    return (
+        handler._response_code,
+        handler._response_code == 403,
+        handler._response_headers,
+        handler._buf.getvalue(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -115,35 +121,39 @@ def _run_auth(path: str, token_header: str | None, capture_token: str | None) ->
 # ---------------------------------------------------------------------------
 
 # 1. Missing header → 403
-code, is_403 = _run_auth("/capture", None, "secret-token")
+code, is_403, headers, body = _run_auth("/capture", None, "secret-token")
 ok("missing header → 403", is_403, f"got code={code}")
+ok("403 uses JSON response contract", headers.get("Content-Type") == "application/json",
+   f"got headers={headers}")
+ok("403 returns stable payload", json.loads(body) == {"status": "error", "error": "forbidden"},
+   f"got body={body!r}")
 
 # 2. Empty header → 403
-code, is_403 = _run_auth("/capture", "", "secret-token")
+code, is_403, _, _ = _run_auth("/capture", "", "secret-token")
 ok("empty header → 403", is_403, f"got code={code}")
 
 # 3. Wrong token → 403
-code, is_403 = _run_auth("/capture", "wrong-token", "secret-token")
+code, is_403, _, _ = _run_auth("/capture", "wrong-token", "secret-token")
 ok("wrong token → 403", is_403, f"got code={code}")
 
 # 4. Correct token → NOT 403 (auth passes, proceed to capture logic)
-code, is_403 = _run_auth("/capture", "secret-token", "secret-token")
+code, is_403, _, _ = _run_auth("/capture", "secret-token", "secret-token")
 ok("correct token → not 403", not is_403, f"got code={code}")
 
 # 5. No CAPTURE_TOKEN (None) → fail-closed, 403 (token-load failure must not open the gate)
-code, is_403 = _run_auth("/capture", None, None)
+code, is_403, _, _ = _run_auth("/capture", None, None)
 ok("CAPTURE_TOKEN=None → 403 (fail-closed)", is_403, f"got code={code}")
 
 # 6. Correct token with query params → still passes
-code, is_403 = _run_auth("/capture?display=1&format=jpeg", "secret-token", "secret-token")
+code, is_403, _, _ = _run_auth("/capture?display=1&format=jpeg", "secret-token", "secret-token")
 ok("correct token + query params → not 403", not is_403, f"got code={code}")
 
 # 7. Timing-safe comparison: partial prefix match is rejected
-code, is_403 = _run_auth("/capture", "secret-tok", "secret-token")
+code, is_403, _, _ = _run_auth("/capture", "secret-tok", "secret-token")
 ok("partial token prefix → 403", is_403, f"got code={code}")
 
 # 8. Non-capture paths don't hit the auth gate (e.g. /health)
-code, is_403 = _run_auth("/health", None, "secret-token")
+code, is_403, _, _ = _run_auth("/health", None, "secret-token")
 ok("non-/capture path → no 403", not is_403, f"got code={code}")
 
 # ---------------------------------------------------------------------------
