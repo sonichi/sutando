@@ -931,10 +931,25 @@ def check_session_cron_registration(
         return True
 
     expected = sum(1 for e in crons if isinstance(e, dict) and session_owned(e))
-    if runtime == "codex" or expected == 0:
+    if runtime == "codex":
         # codex has no session CronCreate surface (check_cron_runner owns that
-        # story); zero expected → nothing to verify.
+        # story), so nothing here applies regardless of the counts.
         return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
+
+    # `expected == 0` DELIBERATELY does not short-circuit here (@john-the-dev on
+    # #2654). It used to, and that made the complete 1→0 transition the one case
+    # the surplus check below could never see: move a host's last session cron to
+    # `launchd: true` / `execution: codex-task`, park it, or delete it, and
+    # `expected` reaches 0 while the job registered under the old config is still
+    # firing. The probe then said `ok — no session-owned schedules expected`,
+    # which is the WORST form of this failure: every session job can be stale and
+    # health explicitly reports that none is expected.
+    #
+    # Zero-expected is not by itself evidence of health; it is only healthy when
+    # nothing was registered either. That question is answered by the stamp, so
+    # the decision moves BELOW the stamp read — the never-had-session-crons host
+    # exits at the no-stamp branch, and a host that DID register something falls
+    # through to the surplus check like any other.
 
     # The SESSION boundary, not the heartbeat's age. `.alive.started_at` is
     # `core_heartbeat._STARTED_AT`, stamped once at module load, and both launch
@@ -963,6 +978,11 @@ def check_session_cron_registration(
     try:
         stamp = json.loads(stamp_file.read_text())
     except FileNotFoundError:
+        if expected == 0:
+            # THE genuine never-had-session-crons host: nothing expected AND
+            # nothing ever registered. This is the case the old `expected == 0`
+            # short-circuit was really protecting, and it still exits healthy.
+            return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
         return {
             "name": name,
             "status": "warn",
@@ -978,6 +998,12 @@ def check_session_cron_registration(
     if isinstance(stamp_ts, bool) or not isinstance(stamp_ts, (int, float)):
         return {"name": name, "status": "warn", "detail": "stamp malformed (missing numeric ts)"}
     if started_at is not None and stamp_ts < started_at:
+        if expected == 0:
+            # The stamp is from a PREVIOUS session, and session crons die with
+            # their session — so nothing it registered is still firing, and
+            # nothing is expected now. Telling the operator to re-run
+            # /schedule-crons here would be advice with no subject.
+            return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
         return {
             "name": name,
             "status": "warn",

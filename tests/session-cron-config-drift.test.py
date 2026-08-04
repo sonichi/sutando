@@ -259,6 +259,104 @@ class OwnershipTransitionTest(unittest.TestCase):
             self.assertEqual(self._check(ws)["status"], "warn")
 
 
+class ZeroExpectedBoundaryTest(unittest.TestCase):
+    """`expected == 0` is not by itself evidence of health.
+
+    @john-the-dev on #2654: the surplus check fixed 2→1 but `expected == 0`
+    short-circuited to `ok — no session-owned schedules expected` BEFORE the
+    stamp was read, so the complete 1→0 transition stayed invisible. That is the
+    worst form of the failure, because every session job can be stale while
+    health explicitly reports that none is expected.
+
+    Zero-expected is healthy only when nothing was REGISTERED either, and the
+    stamp is what answers that. Hence three cases, and the two negatives matter
+    as much as the positive: without them the fix could be "always warn at
+    zero", which would warn forever on every host that legitimately has no
+    session crons.
+    """
+
+    def _ws(self, root: Path, ents, stamp=None, started_at=BOOT):
+        ws = root / "workspace"
+        cfg = ws / "hosts" / "test-host" / "crons.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(json.dumps(ents))
+        (ws / "state").mkdir(parents=True, exist_ok=True)
+        if stamp is not None:
+            (cfg.parent / "schedule-crons-stamp.json").write_text(json.dumps(stamp))
+        (ws / "state" / "session-starts.log").write_text(
+            json.dumps({"host": "test-host", "session_started_at": started_at}) + "\n")
+        return ws
+
+    def _check(self, ws):
+        with mock.patch.object(health, "_local_host_labels", return_value={"test-host"}):
+            return health.check_session_cron_registration(ws, host_label="test-host", runtime="claude")
+
+    # --- the positive: the LAST session cron moves out -----------------------
+    def test_one_to_zero_transition_warns(self):
+        """The boundary john named. One session cron, moved to launchd; the job
+        registered under the old config is still firing."""
+        moved = [{"name": "pr-flag", "cron": "17 * * * *", "prompt": "run", "launchd": True}]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), moved,
+                          {"ts": STAMPED, "registered": 1, "config_total": 1,
+                           "config_digests": digest_map(moved)})
+            check = self._check(ws)
+            self.assertEqual(check["status"], "warn")
+            self.assertIn("still live", check["detail"])
+
+    def test_one_to_zero_by_deletion_warns(self):
+        """Same boundary, reached by deleting the entry rather than re-owning it."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), [],
+                          {"ts": STAMPED, "registered": 1, "config_total": 1,
+                           "config_digests": {}})
+            self.assertEqual(self._check(ws)["status"], "warn")
+
+    # --- the negatives that stop the fix becoming "always warn at zero" ------
+    def test_never_had_session_crons_is_healthy(self):
+        """No session-owned entries AND no stamp — the case the old
+        short-circuit actually existed to protect. Must stay ok, or every host
+        without session crons warns forever."""
+        launchd_only = [{"name": "daily", "cron": "7 9 * * *", "prompt": "x", "launchd": True}]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), launchd_only, stamp=None)
+            check = self._check(ws)
+            self.assertEqual(check["status"], "ok")
+            self.assertIn("no session-owned schedules expected", check["detail"])
+
+    def test_zero_expected_with_a_stamp_registering_zero_is_healthy(self):
+        """Stamped, but nothing was registered — nothing can be stale."""
+        launchd_only = [{"name": "daily", "cron": "7 9 * * *", "prompt": "x", "launchd": True}]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), launchd_only,
+                          {"ts": STAMPED, "registered": 0, "config_total": 1,
+                           "config_digests": digest_map(launchd_only)})
+            self.assertEqual(self._check(ws)["status"], "ok")
+
+    def test_zero_expected_with_a_PREVIOUS_session_stamp_is_healthy(self):
+        """Session crons die with their session, so a stamp that predates this
+        launch registered nothing that is still firing. Warning here would be
+        advice with no subject — there is nothing to re-register."""
+        launchd_only = [{"name": "daily", "cron": "7 9 * * *", "prompt": "x", "launchd": True}]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), launchd_only,
+                          {"ts": BOOT - 5000, "registered": 3, "config_total": 1,
+                           "config_digests": {}})
+            self.assertEqual(self._check(ws)["status"], "ok")
+
+    def test_codex_runtime_still_short_circuits(self):
+        """codex has no session CronCreate surface, so none of this applies."""
+        moved = [{"name": "pr-flag", "cron": "17 * * * *", "prompt": "run", "launchd": True}]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), moved,
+                          {"ts": STAMPED, "registered": 1, "config_total": 1,
+                           "config_digests": digest_map(moved)})
+            with mock.patch.object(health, "_local_host_labels", return_value={"test-host"}):
+                check = health.check_session_cron_registration(
+                    ws, host_label="test-host", runtime="codex")
+            self.assertEqual(check["status"], "ok")
+
+
 class DigestUnitTest(unittest.TestCase):
     def test_digest_is_stable_across_key_order(self):
         a = {"name": "x", "cron": "* * * * *", "prompt": "p"}
