@@ -118,5 +118,68 @@ class TheHelperCanActuallyFire(unittest.TestCase):
         self.assertTrue(note.strip(), "the helper produced nothing on a real history")
 
 
+class DefensiveBranches(unittest.TestCase):
+    """The skip/except paths. They are REACHABLE — a rewritten history, a gc'd
+    object, a git that is not installed — so covering them with a stub is honest
+    where `pragma: no cover` would only be evading the gate."""
+
+    class _Proc:
+        def __init__(self, out="", rc=0):
+            self.stdout = out
+            self.returncode = rc
+
+    def test_unparsable_log_line_is_skipped(self):
+        m = _hc()
+        calls = {"n": 0}
+
+        def fake_run(argv, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # one malformed line (no epoch), one good line -> <2 points -> ""
+                return self._Proc("deadbeef notanumber\n")
+            return self._Proc("", 0)
+
+        m.subprocess = type("S", (), {
+            "run": staticmethod(fake_run),
+            "SubprocessError": Exception,
+        })
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x")
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+    def test_a_commit_whose_blob_cannot_be_read_is_skipped(self):
+        m = _hc()
+        state = {"first": True}
+
+        def fake_run(argv, **kw):
+            if state["first"]:
+                state["first"] = False
+                return self._Proc("aaa 1000\nbbb 2000\n")
+            return self._Proc(b"", 1)          # every `git show` fails
+
+        m.subprocess = type("S", (), {
+            "run": staticmethod(fake_run),
+            "SubprocessError": Exception,
+        })
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x")
+            # both blobs skipped -> 0 points -> ""
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+    def test_git_unavailable_is_swallowed(self):
+        m = _hc()
+
+        def boom(*a, **k):
+            raise m.GitUnavailable("no git here")
+
+        m.git_argv = boom
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"
+            idx.write_text("x")
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
+
 if __name__ == "__main__":
     unittest.main()
