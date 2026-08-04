@@ -358,8 +358,16 @@ def _active_task_rows() -> list[dict]:
         task_line, source_line = _task_display_fields(content)
         result_file = RESULT_DIR / task_file.name
         existing = task_history.get(task_id, {})
-        # Results are checked in priority order: live file, prior history, then
-        # archive. The archive fallback survives bridge cleanup across polls.
+        # Results are checked in priority order: (1) live file, (2) prior
+        # in-memory history — which is what covers the bridge having already
+        # archived the file within this process run — then (3) archive.
+        #
+        # (3) is what survives an agent-api RESTART: history is empty then, and
+        # without it every prior task renders "working" with an empty body.
+        # Naming the wrong reason here is expensive, because (3) globs
+        # results/archive/*/ per task per poll — a reader who believes it is
+        # redundant with (2) has a documented reason to delete it, and the
+        # breakage only appears after a restart.
         archived_file = None
         for month_dir in (RESULT_DIR / "archive").glob("*/"):
             candidate = month_dir / task_file.name
@@ -414,7 +422,11 @@ def _active_task_rows() -> list[dict]:
     recent = sorted(
         task_history.items(), key=lambda item: item[1].get("time", 0), reverse=True
     )[:10]
-    return [{"id": task_id, **task_data} for task_id, task_data in recent]
+    rows = [{"id": task_id, **task_data} for task_id, task_data in recent]
+    # Join inferred workstream metadata onto the rows (#2586). This is the
+    # second half of that feature — the classifier filter above is the first —
+    # and both lived inside the inline block this function replaced.
+    return task_workstreams.enrich_task_rows(WORKSPACE_DIR, rows)
 
 
 def _pending_question_rows() -> list[dict]:
