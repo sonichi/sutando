@@ -136,11 +136,19 @@ def main() -> int:
 
         # (iii) the real Keychain probe answers False for an absent key and does
         # not raise. Read-only: `find-generic-password` never creates anything.
+        #
+        # PLATFORM-DEPENDENT, and my first version pinned the macOS wording and
+        # went red on Linux CI. There are TWO honest ways to be unable to answer
+        # here — macOS reaches the keychain and resolves nothing ("unverifiable"),
+        # Linux has no `security` binary at all ("cannot verify") — and the
+        # invariant under test is neither string: it is that the check DECLINED to
+        # assert divergence and said why. Assert the property, not the platform.
         real = hc.check_vault_manifest_integrity(_manifest(tmp, ["ZZ_NO_SUCH_KEY_88131"]))
         check("real keychain probe runs without raising",
               real["status"] == "ok", repr(real))
-        check("  ...and 0-resolved is reported as unverifiable, not divergence",
-              "unverifiable" in real["detail"], real["detail"])
+        check("  ...and declines to assert divergence, with a reason",
+              ("unverifiable" in real["detail"]) or ("cannot verify" in real["detail"]),
+              real["detail"])
 
         # (iv) valid JSON, WRONG SHAPE. This case previously asserted "ok, no
         # crash" — pinning the wrong behaviour, which is worse than not testing
