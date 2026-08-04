@@ -14,6 +14,30 @@ import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# Shadow the vault boundary before any gateway() call can reach it. gateway() now
+# resolves the token from the Keychain when the env has none — and this file's
+# EnvCase fixture clears every token var in setUp, so "no token in env" is the
+# DEFAULT state for every test here. Without this shadow, any gateway() call under
+# that fixture would read the operator's REAL macOS Keychain — the fixture-default
+# analogue of #2646's import-time Keychain read (@john-the-dev / @qingyun-air). The
+# real channel_token.token_from_vault policy stays under test; only the host
+# boundary is replaced. Installed before `import _gateway` so no path can slip past.
+_VAULT_STORE: dict = {}
+_VAULT_CALLS: list = []
+
+
+def _fake_get_vault_key(var):
+    _VAULT_CALLS.append(var)
+    if var in _VAULT_STORE:
+        return _VAULT_STORE[var]
+    raise KeyError(var)
+
+
+_FAKE_VI = types.ModuleType("vault_intercept")
+_FAKE_VI.get_vault_key = _fake_get_vault_key
+sys.modules["vault_intercept"] = _FAKE_VI
+
 import _gateway  # noqa: E402
 import read as rd  # noqa: E402
 import media as md  # noqa: E402
@@ -135,6 +159,33 @@ class GatewayVaultTierTests(EnvCase):
                 sys.modules["channel_token"] = saved
             else:
                 sys.modules.pop("channel_token", None)
+
+    def test_gateway_empty_env_makes_zero_host_vault_calls(self):
+        # Hermeticity control (the fixture-default remedy @qingyun-air asked for):
+        # EnvCase clears every token var, so an empty env is THE default path for
+        # this whole file. gateway() must reach only the shadowed boundary, never
+        # the host Keychain — and with the shadow holding nothing, resolve no token.
+        _VAULT_CALLS.clear()
+        _VAULT_STORE.clear()
+        base, headers = _gateway.gateway()
+        self.assertIs(sys.modules["vault_intercept"], _FAKE_VI)   # host boundary replaced
+        self.assertIn("REMOTE_TASK_TOKEN", _VAULT_CALLS)          # seam WAS the shadow
+        self.assertEqual(base, "")
+        self.assertNotIn("Authorization", headers)
+
+    def test_gateway_resolves_a_stored_vault_token_through_the_shadow(self):
+        # Positive control: a combined token in the shadow is what gateway() serves
+        # when the env is empty — so shadowing fully determines the vault path,
+        # i.e. nothing reaches past it to the host Keychain.
+        _VAULT_CALLS.clear()
+        _VAULT_STORE.clear()
+        _VAULT_STORE["REMOTE_TASK_TOKEN"] = "https://gw.example/relay|from-vault"
+        try:
+            base, headers = _gateway.gateway()
+        finally:
+            _VAULT_STORE.clear()
+        self.assertEqual(base, "https://gw.example/relay")
+        self.assertEqual(headers.get("Authorization"), "Bearer from-vault")
 
 
 # ----- read ----- #
