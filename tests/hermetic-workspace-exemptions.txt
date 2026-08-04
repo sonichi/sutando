@@ -1,0 +1,15 @@
+# Tests permitted to write named paths inside the resolved workspace.
+#
+# Format:  <test-file-basename>  <workspace-relative-path>   # why
+#
+# Two rules, both enforced by scripts/hermetic-workspace-guard.py:
+#
+#   1. An exemption NAMES THE PATH. Never a bare per-file flag — the same
+#      token-specific discipline REVIEW.md requires of hardcoded-path fixture
+#      exclusions, so one entry cannot quietly cover a second real violation.
+#   2. An exemption whose path is NOT written FAILS. An unused exemption is a
+#      stale exemption, and stale exemptions are what make the next real one
+#      invisible. Delete rather than keep "just in case".
+#
+# Empty on purpose: every test currently isolates, or should. Adding a line
+# here is a claim that a live-workspace write is genuinely required — say why.
