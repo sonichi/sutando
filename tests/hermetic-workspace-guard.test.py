@@ -139,7 +139,8 @@ def main() -> int:
         # stay red. This PR's first cut measured 31.9% for exactly that reason.
         # These calls re-exercise the same paths in THIS interpreter, so the gate
         # sees them. [[reference_coverage_gate_needs_inprocess_tests]]
-        import contextlib, io
+        import contextlib
+        import io
 
         # resolved_workspace(): reads the loader, so point it at our fixture repo
         _saved = sys.path[:]
@@ -159,8 +160,7 @@ def main() -> int:
         finally:
             sys.path[:] = _saved
 
-        # exemptions_for(): both branches — file present, and name-not-matched
-        _ex = REPO / "tests" / "hermetic-workspace-exemptions.txt"
+        # exemptions_for(): the no-entry branch
         check("exemptions_for() returns [] for a file with no entry, in-process",
               hwg.exemptions_for("no-such-file.test.py") == [])
 
