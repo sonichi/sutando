@@ -270,7 +270,7 @@ for _is_fwd in (True, False):
 
 # The bridge itself is not unit-importable, so assert the call site by source:
 # the guard must WRAP the fetch, not sit beside it.
-import re as _re, pathlib as _pl
+import pathlib as _pl
 _bridge = (_pl.Path(__file__).resolve().parent.parent / "src" / "discord-bridge.py").read_text()
 _guard_i = _bridge.find("should_fetch_reply_context(\n")
 _fetch_i = _bridge.find("await message.channel.fetch_message(message.reference.message_id)")
