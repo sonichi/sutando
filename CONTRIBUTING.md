@@ -91,7 +91,7 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 
   The obvious way — `git checkout <branch>` in the running checkout, restart, capture, switch back — puts your live service on a branch and leaves the checkout dirty if anything interrupts you. It also weakens the evidence: a reviewer cannot tell from the log which commit actually ran.
 
-  Run the service from a **detached worktree at the PR head** instead, with the workspace pinned to the real one. `discord-bridge.py` (and the other `src/` entry points) resolve their modules via `Path(__file__).resolve().parent`, so the worktree's `src/` is genuinely what executes.
+  Run the service from a **detached worktree at the PR head** instead, with the workspace pinned to the real one. **The same applies to any ad-hoc command you run in a worktree to measure the parent commit** — the before/after evidence bullet above sends you there routinely, and a workspace-reading probe run in an unpinned worktree answers about an empty directory. No service need be involved for this to bite. `discord-bridge.py` (and the other `src/` entry points) resolve their modules via `Path(__file__).resolve().parent`, so the worktree's `src/` is genuinely what executes.
 
   ```bash
   OID=$(gh pr view <N> --json headRefOid --jq .headRefOid)
@@ -119,7 +119,7 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 
   Then capture the log lines showing the same input shape before and after. Quote the task file, not just the log, when the discriminator is a field: a task file records `reply_to_author_id`, `access_tier`, `channel_id`, so it proves *which* case you exercised rather than asserting it.
 
-  Restore the service from the normal checkout when you are done, and say in the PR that you did.
+  Restore the service from the normal checkout when you are done, remove the worktree (`git worktree remove /tmp/wt-pr<N>`, then `git worktree prune` — `rm -rf` leaves it registered and the next `git worktree add` at that path fails), and say in the PR that you restored it.
   </details>
 - **Stacked PR?** Name the parent PR and intended merge order. Keep each layer to one concern, and after a parent lands, rebase/update the child and rerun its full checks before asking reviewers to treat it as merge-ready.
 - **Hardcoded-path check.** Scan added lines for host-specific paths (`/Users/<name>`, `/home/<name>`, clone-specific absolute paths, and inline home/config fallbacks). Production code must use the repo's path helpers; test fixtures must be clearly scoped as fixtures rather than silently exempting an entire line from review.
