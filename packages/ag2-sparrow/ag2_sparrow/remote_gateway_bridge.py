@@ -433,11 +433,63 @@ def _token_from_ag2space_env():
     return "", "", ""
 
 
+def _token_from_vault_ag2space(vault_get=None):
+    """Vault tier for the ag2space onboarding token — parity with the channel
+    bridges (#2638).
+
+    Before this, sparrow resolved its token from the process env and the channel
+    `.env`, but NEVER the Keychain vault (`get_vault_key` occurrences in this
+    module: 0). So `vault set REMOTE_TASK_TOKEN <value>` stored the secret
+    correctly and changed nothing for ag2space — the operator spent the secret
+    and saw no effect, exactly the failure #2638 fixed for discord/slack/telegram
+    (@qingyun-air's 2026-08-04 bridge-parity finding). This closes that gap.
+
+    Reuses the shared core policy `channel_token.token_from_vault` rather than
+    copying it (the read is total-failure-safe and never surfaces the value).
+    sparrow ships standalone (`pyproject.toml`), so the monorepo `src/` may be
+    absent; when `channel_token` can't be located/imported we degrade to the
+    pre-#2638 behavior — no vault tier — rather than crash a bridge at startup.
+    Tries the current name, then the legacy `AG2_REMOTE_TOKEN` alias. Returns ''
+    on any failure. `vault_get` is injectable so the tier is testable hermetically
+    without touching a real Keychain.
+    """
+    try:
+        cur = os.path.dirname(os.path.abspath(__file__))
+        src = ""
+        while True:
+            if os.path.isfile(os.path.join(cur, "src", "channel_token.py")):
+                src = os.path.join(cur, "src")
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        if not src:
+            return ""
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from channel_token import token_from_vault
+    except Exception:
+        return ""
+    tok = (token_from_vault("REMOTE_TASK_TOKEN", vault_get=vault_get)
+           or token_from_vault("AG2_REMOTE_TOKEN", vault_get=vault_get))
+    if tok:
+        # Name the source — which layer supplied the token is load-bearing for
+        # diagnosis. Never print the value.
+        print("[remote-gateway-bridge] token not in env or .env; loaded from vault",
+              file=sys.stderr, flush=True)
+    return tok
+
+
 _RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
 _URL_FALLBACK = ""
 _TOKEN_FILE_FALLBACK = ""
 if not _RAW:
     _RAW, _URL_FALLBACK, _TOKEN_FILE_FALLBACK = _token_from_ag2space_env()
+if not _RAW:
+    # Last resort: the Keychain vault — parity with the channel bridges (#2638).
+    # Without this, `vault set REMOTE_TASK_TOKEN` was a no-op for ag2space.
+    _RAW = _token_from_vault_ag2space()
 _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")

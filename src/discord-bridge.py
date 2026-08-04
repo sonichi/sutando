@@ -2796,6 +2796,34 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
 
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
+        # Advance the DM checkpoint for our OWN messages before dropping them.
+        #
+        # The checkpoint's contract is "REST catch-up should not re-fetch this
+        # id", which is about having SEEN the message, not about processing it.
+        # The main advance below already says so explicitly and applies it to
+        # out-of-allowlist / out-of-tier DMs — but this return sits above it, so
+        # self-authored DMs were the one class that never advanced it.
+        #
+        # `channel.history()` returns our own replies, and in a DM channel with
+        # the owner most messages ARE ours. So the checkpoint freezes at the last
+        # message we did not write, and every reconnect re-fetches the same
+        # window. Observed on two hosts: `[dm-catchup] replayed N missed DM(s)`
+        # logging an identical N across consecutive restarts — 27 on
+        # Chis-Mac-mini, and 4 here with all 4 self-authored, checkpoint stuck at
+        # 10:22:32 while the channel had moved to 12:03:21.
+        #
+        # Latent today (the return means nothing is re-processed and no duplicate
+        # task or DM is produced), but it is a real starvation path: the catch-up
+        # fetch is `limit=50, oldest_first=True`. Once more than 50 messages sit
+        # after a frozen checkpoint, an owner DM at position 51+ is never fetched
+        # — and since the checkpoint still cannot advance, no later restart
+        # reaches it either. That is silent, permanent loss of exactly the
+        # message this catch-up exists to rescue.
+        if isinstance(message.channel, discord.DMChannel) and hasattr(message, "id"):
+            try:
+                _update_dm_checkpoint(message.channel.id, message.id)
+            except Exception as e:
+                print(f"  [dm-checkpoint] self-message update failed: {e}", flush=True)
         return
     # Auto-mod LLM-judge observation hook (per-guild opt-in via access.json
     # `mod_active`). Pure observe — never blocks the rest of the function.
