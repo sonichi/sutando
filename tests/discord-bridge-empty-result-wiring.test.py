@@ -202,7 +202,7 @@ def main() -> int:
     # archived, and the owner-notification path is actually entered.
     check("TERMINAL: the task is dropped from pending_replies",
           "task-STUCK" not in db.pending_replies,
-          "still pending — it will be re-read every 3s until the 7-day age-out, "
+          "still pending — it will be re-read every 1s until the 7-day age-out, "
           "which is the defect, now with a log line")
     check("  ...the result file is archived, not left to re-poll",
           not (box / "task-STUCK.txt").exists(),

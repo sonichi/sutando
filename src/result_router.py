@@ -141,10 +141,20 @@ def audit_line(task_id: str, disposition: str, surface: str, ts: str) -> str:
 # §9.3 corollary: a result file that is PRESENT but PERSISTENTLY EMPTY
 # --------------------------------------------------------------------------
 #: Consecutive empty observations before a stuck result is announced. The
-#: bridges poll every 3s, so this is ~1 minute — four orders of magnitude
-#: outside the partial-write window it must not fire on (see below), and four
-#: orders of magnitude inside the 7-day `pending_replies` age-out it exists to
-#: pre-empt.
+#: counter increments once per `poll_results()` iteration, and that loop ends in
+#: `await asyncio.sleep(1)` (`discord-bridge.py`), so this is **~20 seconds** —
+#: three orders of magnitude outside the partial-write window it must not fire
+#: on (see below), and four orders of magnitude inside the 7-day
+#: `pending_replies` age-out it exists to pre-empt.
+#:
+#: Corrected from "every 3s, so ~1 minute" (@Sutando-Mini on #2631, who chased
+#: the claim to a number rather than accepting "not seven days"). The 3s came
+#: from NEIGHBOURING loops in the same file — 4111, 4915, 5139 all sleep 3 —
+#: and I carried it across to this one without checking which loop the counter
+#: actually lives in. It lives in `poll_results`, which sleeps 1.
+#:
+#: The distinction is not academic: it is the difference between "the live-path
+#: evidence is a 20-second exercise" and a reader assuming it needs a wait.
 EMPTY_RESULT_POLL_THRESHOLD = 20
 
 
@@ -177,13 +187,13 @@ def empty_result_notice(
     that separates them is PERSISTENCE, which is what this counts.
 
     Without it, an empty result leaves its task in `pending_replies`, re-read
-    every 3s, until the 7-day age-out logs `aged out N` without ever saying
+    every 1s, until the 7-day age-out logs `aged out N` without ever saying
     why — so the owner waits up to a week for a reply that will never come and
     nothing names it. (Found by @Sutando-Pro sweeping the silent-skip family;
     the partial-write mechanism, which relocates the fix, by @Sutando-Mini.)
 
     Fires EXACTLY ONCE per stuck task — at `== threshold`, not `>=` — because a
-    warning that repeats every 3s for seven days is the same silence in a
+    warning that repeats every 1s for seven days is the same silence in a
     louder font.
     """
     if consecutive != threshold:

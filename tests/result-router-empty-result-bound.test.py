@@ -3,7 +3,7 @@
 
 THE DEFECT. Both bridges skip an empty result file with a bare `continue`
 (`discord-bridge.py:4308`, `telegram-bridge.py:970`) and `pending_replies.pop()`
-happens AFTER it, so the task stays pending, re-read every 3s, until the 7-day
+happens AFTER it, so the task stays pending, re-read every 1s, until the 7-day
 age-out at `discord-bridge.py:4261` logs `aged out N` without a reason. The owner
 waits up to a week for a reply that never comes and nothing names it.
 
@@ -77,7 +77,7 @@ def main() -> int:
           at is not None and "7-day" in at, repr(at))
 
     # --- and NEVER again --------------------------------------------------
-    # `== threshold`, not `>=`. A warning that repeats every 3s for seven days
+    # `== threshold`, not `>=`. A warning that repeats every 1s for seven days
     # is the same silence in a louder font.
     repeats = [n for n in range(T + 1, T + 40) if empty_result_notice("task-1", P, n) is not None]
     check("NEVER repeats after the threshold", not repeats,
