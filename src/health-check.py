@@ -887,10 +887,15 @@ def check_session_cron_registration(
     2026-07-23 on a peer instance as 2/18 registered. The script-visible signal:
     /schedule-crons writes
     `hosts/<hostname>/schedule-crons-stamp.json` when it finishes; if that
-    host-owned stamp predates the running core's `started_at` (from the
-    heartbeat payload), the current session never completed registration.
-    Stamp AGE alone is deliberately not used — long-lived sessions would
-    false-warn.
+    host-owned stamp predates the CURRENT SESSION'S LAUNCH
+    (`_last_core_launch_at`, from `state/session-starts.log`), the current
+    session never completed registration. Stamp AGE alone is deliberately not
+    used — long-lived sessions would false-warn.
+
+    The boundary is deliberately NOT `.alive.started_at`: that field tracks the
+    heartbeat writer, which is retained across launches, so restarting the
+    heartbeat under a live session made this probe report every still-registered
+    cron as gone. Same field, same mistake, same fix as #2446.
     """
     workspace = Path(workspace_dir or WORKSPACE_DIR)
     host = host_label or _host_label()
@@ -931,14 +936,28 @@ def check_session_cron_registration(
         # story); zero expected → nothing to verify.
         return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
 
-    alive_file = workspace / "state" / "cores" / f"{host}.alive"
-    started_at = None
-    try:
-        alive = json.loads(alive_file.read_text())
-        if isinstance(alive, dict):
-            started_at = float(alive.get("started_at"))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass  # no heartbeat → can't anchor to a boot; fall through to stamp-only
+    # The SESSION boundary, not the heartbeat's age. `.alive.started_at` is
+    # `core_heartbeat._STARTED_AT`, stamped once at module load, and both launch
+    # paths RETAIN an existing heartbeat process — so it tracks the heartbeat
+    # writer, not the session that owns the crons. #2446 established exactly that
+    # for `_marker_predates_running_core`, and `_last_core_launch_at` is the
+    # boundary it introduced; this probe was still comparing against the field
+    # that PR ruled out, for the same staleness question.
+    #
+    # Observed on Chis-Mac-mini 2026-08-04T03:0xZ, all nine expected crons live:
+    #     core      pid 30961  started 11:32:30   <- .alive "pid" (the core)
+    #     heartbeat pid 72981  started 16:13:56   <- .alive "heartbeat_pid"
+    #     .alive started_at    16:13:56           <- tracks the WRITER
+    #     stamp ts             11:37:21           <- 5 min after the core booted
+    # The stamp was written for this very boot and got reported as predating it
+    # by 16595s, telling the operator to re-run /schedule-crons against a session
+    # whose crons were all present.
+    #
+    # None keeps its meaning from #2446: "no evidence", never "stale" — so a host
+    # with no session-starts.log falls through to the stamp-only checks below
+    # rather than warning.
+    launch = _last_core_launch_at(workspace)
+    started_at = launch[0] if launch else None
 
     stamp_file = workspace / "hosts" / host / "schedule-crons-stamp.json"
     try:
@@ -963,7 +982,7 @@ def check_session_cron_registration(
             "name": name,
             "status": "warn",
             "detail": (
-                f"stamp predates this core boot ({int(started_at - stamp_ts)}s older) — "
+                f"stamp predates this session's launch ({int(started_at - stamp_ts)}s older) — "
                 f"session crons are gone with the old session; re-run /schedule-crons"
             ),
         }
@@ -3107,7 +3126,7 @@ def _local_host_labels() -> "set[str]":
     return {x for x in labels if x}
 
 
-def _last_core_launch_at() -> "tuple[float, str | None] | None":
+def _last_core_launch_at(workspace_dir: Optional[Path] = None) -> "tuple[float, str | None] | None":
     """When the CURRENT core was launched, from `state/session-starts.log`.
 
     Returns `(timestamp, runtime)`, where `runtime` is the identity the launcher
@@ -3147,7 +3166,7 @@ def _last_core_launch_at() -> "tuple[float, str | None] | None":
     "stale".
     """
     try:
-        raw = (status_read_path("session-starts.log", WORKSPACE_DIR)).read_text()
+        raw = (status_read_path("session-starts.log", workspace_dir or WORKSPACE_DIR)).read_text()
     except OSError:
         return None
     for line in reversed(raw.splitlines()):
