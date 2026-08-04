@@ -7,8 +7,10 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import tempfile
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -71,6 +73,8 @@ def test_resolution_is_owner_only_and_fail_open() -> None:
         assert worker.resolve_workstream(workspace, owner) == "workstream-a"
         assert worker.resolve_workstream(workspace, team) is None
         assert worker.resolve_workstream(workspace, _task(workspace, "task-ungrouped")) is None
+        assert worker.probe("claude", workspace, owner) == 0
+        assert worker.probe("claude", workspace, team) == worker.UNHANDLED
 
 
 def test_claude_creates_then_resumes_the_same_durable_session() -> None:
@@ -288,7 +292,9 @@ def test_watcher_provider_failure_falls_back_without_leaking_stdout() -> None:
         (tasks / "task-retry.txt").write_text("task: retry me\n")
         handler = _executable(
             root / "handler",
-            "#!/bin/sh\nprintf 'poison handler stdout\\n'\nexit 1\n",
+            "#!/bin/sh\n"
+            "case \" $* \" in *\" --probe \"*) exit 0;; esac\n"
+            "printf 'poison handler stdout\\n'\nexit 1\n",
         )
         bin_dir = root / "bin"
         bin_dir.mkdir()
@@ -313,15 +319,132 @@ def test_watcher_provider_failure_falls_back_without_leaking_stdout() -> None:
         assert "possible at-least-once retry" in result.stderr
 
 
+def test_slow_handler_does_not_block_the_next_task_event() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        (tasks / "task-a-slow.txt").write_text("task: slow isolated work\n")
+        (tasks / "task-b-live.txt").write_text("task: live-core work\n")
+        handler = _executable(
+            root / "handler",
+            "#!/bin/sh\n"
+            "probe=0\ntask_file=\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  case \"$1\" in\n"
+            "    --probe) probe=1;;\n"
+            "    --task-file) shift; task_file=$1;;\n"
+            "  esac\n"
+            "  shift\n"
+            "done\n"
+            "if [ \"$probe\" = 1 ]; then\n"
+            "  case \"$task_file\" in *task-a-slow.txt) exit 0;; *) exit 3;; esac\n"
+            "fi\n"
+            "sleep 5\n",
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 5\n")
+        process = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(tasks)],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+                "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                "SUTANDO_CORE_RUNTIME": "claude",
+                "SUTANDO_RESULTS_DIR": str(results),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            started = time.monotonic()
+            assert process.stdout is not None
+            line = process.stdout.readline()
+            elapsed = time.monotonic() - started
+            assert line == "TASK_FILE: task-b-live.txt\n"
+            assert elapsed < 1.0, f"second task event was blocked for {elapsed:.2f}s"
+        finally:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=2)
+
+
+def test_codex_notifier_dispatches_each_isolated_task_once_without_waiting() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        workspace = root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        state = workspace / "state"
+        tasks.mkdir(parents=True)
+        results.mkdir()
+        state.mkdir()
+        for name in ("task-one.txt", "task-two.txt"):
+            (tasks / name).write_text(f"priority: normal\ntask: {name}\n")
+        log = root / "handler.log"
+        handler = _executable(
+            root / "handler",
+            "#!/bin/sh\n"
+            "probe=0\ntask_file=\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  case \"$1\" in --probe) probe=1;; --task-file) shift; task_file=$1;; esac\n"
+            "  shift\n"
+            "done\n"
+            "[ \"$probe\" = 1 ] && exit 0\n"
+            "basename \"$task_file\" >> \"$HANDLER_LOG\"\n"
+            "sleep 5\n",
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _executable(bin_dir / "fswatch", "#!/bin/sh\nsleep 5\n")
+        _executable(bin_dir / "tmux", "#!/bin/sh\nexit 0\n")
+        process = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh")],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "HANDLER_LOG": str(log),
+                "SUTANDO_DEFAULT_WORKSPACE": str(workspace),
+                "SUTANDO_TASKS_DIR": str(tasks),
+                "SUTANDO_RESULTS_DIR": str(results),
+                "SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                "SUTANDO_NOTIFIER_POLL_INTERVAL": "0.02",
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            started = time.monotonic()
+            calls = []
+            while time.monotonic() - started < 1.0:
+                calls = log.read_text().splitlines() if log.exists() else []
+                if len(calls) == 2:
+                    break
+                time.sleep(0.01)
+            assert sorted(calls) == ["task-one.txt", "task-two.txt"]
+            assert time.monotonic() - started < 1.0
+        finally:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=2)
+
+
 def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
     watcher = (REPO / "src" / "watch-tasks-stream.sh").read_text()
     notifier = (REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh").read_text()
     claude = (REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh").read_text()
     codex = (REPO / "src" / "agent" / "codex" / "cli" / "start-cli.sh").read_text()
     assert '${SUTANDO_TASK_EVENT_HANDLER:-}' in watcher
-    assert "return 3" in watcher
+    assert "--probe" in watcher
     assert 'printf \'TASK_FILE: %s\\n\'' in watcher
-    assert "run_optional_task_handler" in notifier
+    assert "probe_optional_task_handler" in notifier
     assert "skills/task-workstream-sessions/scripts/session-worker.py" in claude
     assert "skills/task-workstream-sessions/scripts/session-worker.py" in codex
     assert 'NOTIFIER_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=' in codex
@@ -338,5 +461,7 @@ if __name__ == "__main__":
     test_codex_failures_and_empty_provider_results_are_retryable()
     test_cli_main_delegates_parsed_paths()
     test_watcher_provider_failure_falls_back_without_leaking_stdout()
+    test_slow_handler_does_not_block_the_next_task_event()
+    test_codex_notifier_dispatches_each_isolated_task_once_without_waiting()
     test_runtime_wiring_is_optional_and_adapter_injected()
     print("task workstream session worker tests passed")

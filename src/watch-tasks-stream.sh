@@ -51,27 +51,50 @@ TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 WORKSPACE_DIR="$(dirname "$TASKS_DIR_ABS")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
-# Optional task handlers are injected by runtime adapters.  Exit 0 means the
-# handler durably completed the task; exit 3 means use the byte-for-byte legacy
-# TASK_FILE event below.  Any other status also falls back to the live core so
-# the durable task cannot remain stranded; the warning calls out the possible
-# at-least-once retry when a provider failed after making external changes.
-run_optional_task_handler() {
+# Optional task handlers are injected by runtime adapters.  Probe is a bounded
+# sidecar/task-header read: unhandled work keeps the byte-for-byte TASK_FILE
+# path. Eligible work runs in the background so a long provider session cannot
+# block startup catch-up or the fswatch event loop. A failed worker emits the
+# legacy event asynchronously, preserving the existing at-least-once fallback.
+dispatch_task() {
   local task_path="$1" rc
-  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || return 3
-  [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
+  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || [ ! -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
+    printf 'TASK_FILE: %s\n' "$(basename "$task_path")" || exit 0
+    return
+  fi
   "$SUTANDO_TASK_EVENT_HANDLER" \
     --runtime "${SUTANDO_CORE_RUNTIME:-}" \
     --workspace "$WORKSPACE_DIR" \
     --task-file "$task_path" \
     --results-dir "$RESULTS_DIR" \
-    --repo "$__REPO_ROOT" >/dev/null
+    --repo "$__REPO_ROOT" \
+    --probe >/dev/null
   rc=$?
-  if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
-    echo "watch-tasks-stream: optional task handler failed for $(basename "$task_path") (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-    return 3
+  if [ "$rc" -eq 3 ]; then
+    printf 'TASK_FILE: %s\n' "$(basename "$task_path")" || exit 0
+    return
   fi
-  return "$rc"
+  if [ "$rc" -ne 0 ]; then
+    echo "watch-tasks-stream: optional task handler probe failed for $(basename "$task_path") (exit $rc); falling back to live core" >&2
+    printf 'TASK_FILE: %s\n' "$(basename "$task_path")" || exit 0
+    return
+  fi
+  (
+    if "$SUTANDO_TASK_EVENT_HANDLER" \
+        --runtime "${SUTANDO_CORE_RUNTIME:-}" \
+        --workspace "$WORKSPACE_DIR" \
+        --task-file "$task_path" \
+        --results-dir "$RESULTS_DIR" \
+        --repo "$__REPO_ROOT" >/dev/null; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+      echo "watch-tasks-stream: optional task handler failed for $(basename "$task_path") (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+      printf 'TASK_FILE: %s\n' "$(basename "$task_path")" || exit 0
+    fi
+  ) &
 }
 
 # PID file for the Stop-hook cleanup path (see .claude/settings.json Stop
@@ -130,13 +153,7 @@ _tmux_wake() {
 # restart gap.
 shopt -s nullglob
 for f in "$TASKS_DIR"/*.txt; do
-  if run_optional_task_handler "$f"; then
-    continue
-  else
-    _handler_rc=$?
-    [ "$_handler_rc" -eq 3 ] || continue
-  fi
-  printf 'TASK_FILE: %s\n' "$(basename "$f")" || exit 0
+  dispatch_task "$f"
 done
 shopt -u nullglob
 
@@ -201,13 +218,7 @@ fswatch \
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        if run_optional_task_handler "$path"; then
-          continue
-        else
-          _handler_rc=$?
-          [ "$_handler_rc" -eq 3 ] || continue
-        fi
-        printf 'TASK_FILE: %s\n' "$(basename "$path")" || exit 0
+        dispatch_task "$path"
       fi
       ;;
   esac

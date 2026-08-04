@@ -19,7 +19,7 @@ CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core
 watcher_pid=""
 event_dir=""
 
-run_optional_task_handler() {
+probe_optional_task_handler() {
   local filename="$1" rc
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || return 3
   [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
@@ -28,13 +28,39 @@ run_optional_task_handler() {
     --workspace "$(dirname "$TASKS_DIR")" \
     --task-file "$TASKS_DIR/$filename" \
     --results-dir "$RESULTS_DIR" \
-    --repo "$REPO" >/dev/null
+    --repo "$REPO" \
+    --probe >/dev/null
   rc=$?
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
-    echo "task-notifier: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+    echo "task-notifier: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
     return 3
   fi
   return "$rc"
+}
+
+start_optional_task_handler() {
+  local filename="$1"
+  mkdir -p "$event_dir/inflight"
+  : > "$event_dir/inflight/$filename"
+  (
+    if "$SUTANDO_TASK_EVENT_HANDLER" \
+        --runtime codex \
+        --workspace "$(dirname "$TASKS_DIR")" \
+        --task-file "$TASKS_DIR/$filename" \
+        --results-dir "$RESULTS_DIR" \
+        --repo "$REPO" >/dev/null; then
+      rc=0
+    else
+      rc=$?
+    fi
+    rm -f "$event_dir/inflight/$filename"
+    if [ "$rc" -ne 0 ]; then
+      echo "task-notifier: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+      if [ -p "$event_dir/events" ]; then
+        printf 'TASK_FILE: %s\n' "$filename" > "$event_dir/events"
+      fi
+    fi
+  ) &
 }
 
 stop_watcher() {
@@ -50,6 +76,7 @@ cleanup_notifier() {
   stop_watcher
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
+    rmdir "$event_dir/inflight" 2>/dev/null || true
     rmdir "$event_dir" 2>/dev/null || true
   fi
 }
@@ -137,7 +164,8 @@ next_pending_task() {
     case "$candidate" in
       ""|*/*|*..*) continue ;;
     esac
-    if ! has_result "$candidate"; then
+    if ! has_result "$candidate" \
+        && { [ -z "$event_dir" ] || [ ! -e "$event_dir/inflight/$candidate" ]; }; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -167,11 +195,24 @@ submit_task() {
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
   has_result "$filename" && return 0
-  if run_optional_task_handler "$filename"; then
-    return 0
-  else
-    handler_rc=$?
-    [ "$handler_rc" -eq 3 ] || return 0
+  if [ "$wait_for_result" = "1" ]; then
+    if probe_optional_task_handler "$filename"; then
+      start_optional_task_handler "$filename"
+      return 0
+    else
+      handler_rc=$?
+      [ "$handler_rc" -eq 3 ] || return 0
+    fi
+  elif probe_optional_task_handler "$filename"; then
+    if "$SUTANDO_TASK_EVENT_HANDLER" \
+        --runtime codex \
+        --workspace "$(dirname "$TASKS_DIR")" \
+        --task-file "$TASKS_DIR/$filename" \
+        --results-dir "$RESULTS_DIR" \
+        --repo "$REPO" >/dev/null; then
+      return 0
+    fi
+    echo "task-notifier: optional task handler failed for $filename; falling back to live core (possible at-least-once retry)" >&2
   fi
   prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
@@ -227,10 +268,15 @@ while IFS= read -r event; do
       # busy, keep every task durable on disk instead of typing into Codex's
       # non-durable interactive input. Once idle, re-scan the whole queue and
       # select urgent/normal/low priority with FIFO only inside each tier.
-      next_pending_task >/dev/null || continue
-      wait_for_core_idle || exit 1
-      filename="$(next_pending_task)" || continue
-      submit_task "$filename" 1
+      while next_pending_task >/dev/null; do
+        filename="$(next_pending_task)" || break
+        if probe_optional_task_handler "$filename"; then
+          start_optional_task_handler "$filename"
+          continue
+        fi
+        wait_for_core_idle || exit 1
+        submit_task "$filename" 1
+      done
       ;;
   esac
 done < "$event_dir/events"

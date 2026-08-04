@@ -27,6 +27,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 
 UNHANDLED = 3
@@ -131,7 +132,7 @@ def _headers(task_file: Path) -> dict[str, str]:
     return headers
 
 
-def resolve_workstream(workspace: Path, task_file: Path) -> str | None:
+def resolve_workstream(workspace: Path, task_file: Path) -> Optional[str]:
     """Return a valid assigned owner workstream, otherwise fail open."""
     headers = _headers(task_file)
     # Pre-tier task files retain the repository's legacy owner default.
@@ -222,7 +223,7 @@ def _claude_command(session_id: str, resume: bool, prompt: str, repo: Path) -> l
 
 
 def _codex_command(
-    session_id: str | None,
+    session_id: Optional[str],
     prompt: str,
     repo: Path,
     output_file: Path,
@@ -308,7 +309,8 @@ def _run_codex(workspace: Path, workstream_id: str, prompt: str, repo: Path) -> 
         output_file.unlink(missing_ok=True)
 
 
-def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, repo: Path) -> int:
+def probe(runtime: str, workspace: Path, task_file: Path) -> int:
+    """Quickly decide whether this task belongs to an isolated session."""
     if runtime not in {"claude", "codex"}:
         return UNHANDLED
     try:
@@ -321,6 +323,15 @@ def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, re
     workstream_id = resolve_workstream(workspace, task_file)
     if not workstream_id:
         return UNHANDLED
+    return 0
+
+
+def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, repo: Path) -> int:
+    if probe(runtime, workspace, task_file) != 0:
+        return UNHANDLED
+    task_file = task_file.resolve()
+    workstream_id = resolve_workstream(workspace, task_file)
+    assert workstream_id is not None
     result_path = results_dir / task_file.name
     if _completed_result_exists(results_dir, task_file.name):
         return 0
@@ -350,7 +361,10 @@ def main() -> int:
     parser.add_argument("--task-file", required=True, type=Path)
     parser.add_argument("--results-dir", required=True, type=Path)
     parser.add_argument("--repo", required=True, type=Path)
+    parser.add_argument("--probe", action="store_true")
     args = parser.parse_args()
+    if args.probe:
+        return probe(args.runtime, args.workspace, args.task_file)
     return handle(args.runtime, args.workspace, args.task_file, args.results_dir, args.repo)
 
 
