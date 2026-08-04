@@ -580,6 +580,12 @@ def _task_source_state(
     directories = _source_directories(workspace, state, discover=discover)
     signatures: list[tuple] = []
     for relative in directories:
+        # Direct children of the mutable roots are enumerated below, so their
+        # directory mtimes add no information. Omitting them also means the
+        # classifier's own excluded maintenance file cannot invalidate the
+        # token merely by being atomically renamed into tasks/.
+        if relative in {"tasks", "tasks/processed", "results"}:
+            continue
         path = workspace / relative
         try:
             stat = path.stat()
@@ -593,6 +599,11 @@ def _task_source_state(
             with os.scandir(root) as entries:
                 for entry in entries:
                     if not entry.name.startswith("task-") or not entry.name.endswith(".txt"):
+                        continue
+                    if entry.name.startswith((
+                        CLASSIFIER_TASK_PREFIX,
+                        LEGACY_CLASSIFIER_TASK_PREFIX,
+                    )):
                         continue
                     try:
                         stat = entry.stat(follow_symlinks=False)
@@ -657,10 +668,21 @@ def classifier_status(
                 str(state.get("task_id") or ""), source_state,
             )
 
+    # Discover archive directories immediately before the expensive scan, then
+    # verify the exact same source generation afterwards. Without this guard, a
+    # task arriving during a multi-second mature-workspace scan could be absent
+    # from ``rows`` yet included in the persisted token, suppressing all future
+    # scans until some unrelated task changed the filesystem again.
+    source_state = _task_source_state(workspace, state, discover=True)
     rows = scan_task_history(workspace)
     snapshot = build_classifier_snapshot(workspace, limit=limit, rows=rows)
     snapshot_hash = snapshot["snapshot_hash"]
-    source_state = _task_source_state(workspace, state, discover=True)
+    refreshed_source_state = _task_source_state(workspace, state, discover=True)
+    if refreshed_source_state[0] != source_state[0]:
+        return _queue_result(
+            True, False, "source-changed", snapshot_hash, "", refreshed_source_state,
+        )
+    source_state = refreshed_source_state
     if not snapshot["tasks"]:
         return _queue_result(False, False, "complete", snapshot_hash, "", source_state)
 
@@ -757,9 +779,13 @@ def _maybe_enqueue_classifier_task_locked(
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
-    source_token, source_directories = _task_source_state(
-        workspace, previous_state, discover=True,
-    )
+    # The readiness token describes the exact stable generation that produced
+    # this snapshot. Classifier maintenance files are excluded from source
+    # tokens, so keep that token instead of sampling again after enqueue: an
+    # unrelated task racing with this write must remain visible as a mismatch
+    # on the next maintenance tick.
+    source_token = readiness.source_token
+    source_directories = readiness.source_directories
     _atomic_json(state_path, {
         "snapshot_hash": snapshot_hash,
         "task_id": task_id,
