@@ -109,6 +109,21 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
   EOF
   ```
 
+  **Pinning `workspace.path` is not always enough, and the failure is silent.** Some probes derive
+  their path from the *repo slug*, not the workspace — `MEMORY_DIR` resolves to
+  `<workspace>/.claude-sutando/projects/<slug-of-cwd>/memory`, so from a worktree it becomes
+  `projects/-private-tmp-…-wt-name/memory`, which does not exist. The check then returns `None` and
+  emits **no line at all** — and an empty grep is indistinguishable from "the change didn't fire".
+  Pin `SUTANDO_MEMORY_DIR` as well when the thing under test reads memory:
+
+  ```bash
+  SUTANDO_MEMORY_DIR="$LIVE_WS/.claude-sutando/projects/<real-slug>/memory" \
+    python3 src/health-check.py
+  ```
+
+  The general rule: **before trusting an empty result, print the path the code resolved.** Two of my
+  before/after runs on #2610 were empty for this reason and neither was measuring what I thought.
+
   Preflight **before** stopping the running service, because a bridge restart takes down the owner's live path:
 
   - `rev-parse` equals `headRefOid` (above) — otherwise you are testing a stale ref;
