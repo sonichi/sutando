@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -102,6 +103,49 @@ class DropLauncherParentsTest(unittest.TestCase):
         restart of a healthy bridge via fix_down_bridges()."""
         kept = self._run(["10", "20"], {"10": "20", "20": "10"})
         self.assertTrue(kept)
+
+    def _run_telegram_health_check(self, pgrep_pids, ps_mapping):
+        """Exercise the production call site, not only the helper contract."""
+        original_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[:2] == ["/usr/bin/pgrep", "-f"] and "telegram-bridge" in cmd[2]:
+                return mock.Mock(returncode=0, stdout="\n".join(pgrep_pids) + "\n", stderr="")
+            if cmd[:3] == ["/bin/ps", "-o", "pid=,ppid="]:
+                return _ps(ps_mapping)
+            return original_run(cmd, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            channels = Path(tmp) / "channels"
+            telegram = channels / "telegram"
+            telegram.mkdir(parents=True)
+            (telegram / "access.json").write_text("{}\n")
+
+            original_home_path = health.claude_home_path
+
+            def fake_home_path(*parts):
+                if parts and parts[0] == "channels":
+                    return Path(tmp).joinpath(*parts)
+                return original_home_path(*parts)
+
+            with mock.patch.object(health, "claude_home_path", side_effect=fake_home_path), \
+                 mock.patch.object(health, "_should_skip_bridge", side_effect=lambda channel, _env: channel != "telegram"), \
+                 mock.patch.object(subprocess, "run", side_effect=fake_run):
+                checks = health.run_all_checks()
+        return next(check for check in checks if check["name"] == "telegram-bridge")
+
+    def test_run_all_checks_collapses_launcher_child_pair(self):
+        check = self._run_telegram_health_check(
+            ["27538", "27541"], {"27538": "1", "27541": "27538"}
+        )
+        self.assertNotIn("multiple processes", check["detail"])
+
+    def test_run_all_checks_preserves_real_duplicate_warning(self):
+        check = self._run_telegram_health_check(
+            ["100", "200"], {"100": "1", "200": "1"}
+        )
+        self.assertEqual(check["status"], "warn")
+        self.assertEqual(check["detail"], "multiple processes (2 PIDs: 100,200)")
 
 
 if __name__ == "__main__":
