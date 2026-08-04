@@ -33,6 +33,8 @@ setup_fixture() {
     mkdir -p "$FIXTURE_REPO/scripts" "$FIXTURE_REPO/src"
     cp "$REPO/scripts/sync-workspace.sh" "$FIXTURE_REPO/scripts/"
     cp "$REPO/scripts/sutando-config.sh" "$FIXTURE_REPO/scripts/"
+    # sutando-config.sh sources this helper (#2599)
+    cp "$REPO/scripts/python-binary.sh" "$FIXTURE_REPO/scripts/"
     cp "$REPO/src/sutando_config.py" "$FIXTURE_REPO/src/"
     touch "$FIXTURE_REPO/CLAUDE.md"
     mkdir -p "$FIXTURE_REPO/skills"
