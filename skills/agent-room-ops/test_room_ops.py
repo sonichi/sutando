@@ -8,11 +8,36 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# Shadow the vault boundary before any gateway() call can reach it. gateway() now
+# resolves the token from the Keychain when the env has none — and this file's
+# EnvCase fixture clears every token var in setUp, so "no token in env" is the
+# DEFAULT state for every test here. Without this shadow, any gateway() call under
+# that fixture would read the operator's REAL macOS Keychain — the fixture-default
+# analogue of #2646's import-time Keychain read (@john-the-dev / @qingyun-air). The
+# real channel_token.token_from_vault policy stays under test; only the host
+# boundary is replaced. Installed before `import _gateway` so no path can slip past.
+_VAULT_STORE: dict = {}
+_VAULT_CALLS: list = []
+
+
+def _fake_get_vault_key(var):
+    _VAULT_CALLS.append(var)
+    if var in _VAULT_STORE:
+        return _VAULT_STORE[var]
+    raise KeyError(var)
+
+
+_FAKE_VI = types.ModuleType("vault_intercept")
+_FAKE_VI.get_vault_key = _fake_get_vault_key
+sys.modules["vault_intercept"] = _FAKE_VI
+
 import _gateway  # noqa: E402
 import read as rd  # noqa: E402
 import media as md  # noqa: E402
@@ -70,6 +95,13 @@ class GateTests(unittest.TestCase):
         self.assertIn("unimplemented", _gateway.degrade_reason(404))
         self.assertIn("not a joined member", _gateway.degrade_reason(403))
         self.assertIn("HTTP 500", _gateway.degrade_reason(500))
+
+
+# The gateway() vault tier (sonichi#2638) is tested in
+# tests/room_ops_gateway_vault.test.py — the coverage gate discovers only
+# tests/*.test.py, so the _gateway.py changed lines are measured there. The
+# shadow installed at the top of this file keeps every OTHER gateway()-calling
+# test below off the real host Keychain.
 
 
 # ----- read ----- #
