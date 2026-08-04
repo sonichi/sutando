@@ -40,7 +40,7 @@ rgb.LOCAL_TIER = "owner"
 
 def _write_map(m):
     ACCESS.write_text(json.dumps({"allowFrom": ["@qingyun:ag2.space"], "tierMap": m}))
-    rgb._TIER_MAP_CACHE["ident"] = None  # force re-read (mtime granularity is coarse)
+    rgb._TIER_MAP_CACHE["ident"] = None  # force re-read (cache keys on mtime_ns+size+inode)
 
 
 # 1. named teammate is down-tiered by user_id
