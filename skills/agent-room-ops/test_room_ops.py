@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 import urllib.error
 from unittest import mock
@@ -70,6 +71,70 @@ class GateTests(unittest.TestCase):
         self.assertIn("unimplemented", _gateway.degrade_reason(404))
         self.assertIn("not a joined member", _gateway.degrade_reason(403))
         self.assertIn("HTTP 500", _gateway.degrade_reason(500))
+
+
+# ----- gateway() vault tier (sonichi#2638 parity) ----- #
+class GatewayVaultTierTests(EnvCase):
+    """gateway() consults the Keychain vault when the env has no token — so
+    `vault set REMOTE_TASK_TOKEN` finally arms room ops (it was a silent no-op).
+    Uses an injected vault_get; never touches a real Keychain."""
+
+    def test_vault_combined_token_arms_base_and_bearer(self):
+        vault = {"REMOTE_TASK_TOKEN": "https://gw.example/relay|s3cr3t"}
+        self.assertEqual(
+            _gateway._token_from_vault(vault_get=lambda k: vault.get(k)),
+            "https://gw.example/relay|s3cr3t")
+        # end-to-end: env empty (EnvCase cleared it), so gateway() falls to the
+        # vault and splits the combined value into base + bearer.
+        with mock.patch.object(_gateway, "_token_from_vault",
+                               return_value="https://gw.example/relay|s3cr3t"):
+            base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example/relay")
+        self.assertEqual(headers.get("Authorization"), "Bearer s3cr3t")
+
+    def test_vault_legacy_alias(self):
+        vault = {"AG2_REMOTE_TOKEN": "legacy-secret"}
+        self.assertEqual(
+            _gateway._token_from_vault(vault_get=lambda k: vault.get(k)), "legacy-secret")
+
+    def test_vault_total_failure_safe(self):
+        self.assertEqual(_gateway._token_from_vault(vault_get=lambda k: None), "")
+
+        def boom(k):
+            raise RuntimeError("keychain locked")
+
+        self.assertEqual(_gateway._token_from_vault(vault_get=boom), "")
+
+    def test_env_token_wins_over_vault(self):
+        # A present env token must never be overridden by the vault (the #416
+        # hazard): gateway() must not even consult the vault.
+        os.environ["GATEWAY_TOKEN"] = "env-secret"
+        with mock.patch.object(_gateway, "_token_from_vault",
+                               return_value="vault-should-not-win") as m:
+            _base, headers = _gateway.gateway()
+        self.assertEqual(headers.get("Authorization"), "Bearer env-secret")
+        m.assert_not_called()
+
+    def test_degrades_when_core_absent(self):
+        # Standalone-ish: channel_token not locatable -> '' (no crash).
+        real = os.path.isfile
+        os.path.isfile = lambda p: False
+        try:
+            self.assertEqual(_gateway._token_from_vault(vault_get=lambda k: "x"), "")
+        finally:
+            os.path.isfile = real
+
+    def test_safe_on_broken_core_import(self):
+        broken = types.ModuleType("channel_token")   # lacks token_from_vault
+        saved = sys.modules.get("channel_token")
+        sys.modules["channel_token"] = broken
+        try:
+            self.assertEqual(_gateway._token_from_vault(vault_get=lambda k: "x"), "")
+        finally:
+            if saved is not None:
+                sys.modules["channel_token"] = saved
+            else:
+                sys.modules.pop("channel_token", None)
 
 
 # ----- read ----- #
