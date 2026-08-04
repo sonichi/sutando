@@ -185,6 +185,49 @@ for m in mods:
     check("still flags the direct form",
           viols("wd.resolve_workspace = lambda: tmp") != [])
 
+    # --- FALSE NEGATIVES: a path that may not run is still a path -----------
+    # @john-the-dev on #2622. The first reaching-binding walk merged only the
+    # branch bodies, so a safe rebinding INSIDE a conditional overwrote an
+    # unsafe binding that still reached the assignment when the branch did not
+    # run. The PR claimed "unsafe on any path is unsafe"; it did not hold.
+    check("if with NO else: the fallthrough path still reaches the assignment",
+          viols("""
+_fake = lambda: tmp
+if cond:
+    _fake = lambda *a, **kw: tmp
+wd.resolve_workspace = _fake
+""") != [], "cond False leaves the zero-arg lambda live")
+
+    check("a loop body may run ZERO times",
+          viols("""
+_fake = lambda: tmp
+for x in xs:
+    _fake = lambda *a, **kw: tmp
+wd.resolve_workspace = _fake
+""") != [], "an empty iterable leaves the zero-arg lambda live")
+
+    check("nested scope reads a LATE-bound global (resolved at call time)",
+          viols("""
+def patch():
+    wd.resolve_workspace = _fake
+_fake = lambda: tmp
+patch()
+""") != [], "the def precedes the binding, but the body runs after it")
+
+    # The discriminating counter-case: if/else covers every path, so a safe
+    # rebinding in BOTH branches really does supersede. Without this, the fix
+    # above could be 'flag whenever any unsafe binding exists in the scope',
+    # which passes all three checks above and re-breaks the false positives.
+    check("if/else safe in BOTH branches is NOT flagged",
+          viols("""
+_fake = lambda: tmp
+if cond:
+    _fake = lambda *a: tmp
+else:
+    _fake = lambda *a: tmp
+wd.resolve_workspace = _fake
+""") == [], "every path rebinds safely; flagging here is the old false positive")
+
     check("conservative on branches: unsafe on ANY path is unsafe",
           viols("""
 if cond:

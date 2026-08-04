@@ -1048,6 +1048,31 @@ def _binding_state(value: ast.expr, env: "dict[str, bool]") -> "bool | None":
     return None
 
 
+def _unsafe_names_in_scope(body: "list[ast.stmt]") -> "set[str]":
+    """Names this scope EVER binds to a zero-arg lambda, at any statement depth.
+
+    Does not descend into nested `def`/`class` — those are their own scopes.
+    Used only for the late-binding case: a nested function reads a global when
+    it RUNS, so ordering inside the enclosing scope tells you nothing.
+    """
+    found: "set[str]" = set()
+    stack = list(body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Lambda):
+            if not _lambda_absorbs_args(n.value):
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        found.add(t.id)
+        for f in ("body", "orelse", "finalbody", "handlers"):
+            sub = getattr(n, f, None)
+            if isinstance(sub, list):
+                stack.extend(x for x in sub if isinstance(x, ast.stmt) or hasattr(x, "body"))
+    return found
+
+
 class _ScopeWalk:
     """Reaching-binding walk over ONE lexical scope, in statement order.
 
@@ -1062,14 +1087,23 @@ class _ScopeWalk:
     def __init__(self, env: "dict[str, bool]", out: "list[tuple[int, str]]") -> None:
         self.env = dict(env)
         self.out = out
+        self.ever_unsafe: "set[str]" = set()
 
     def run(self, body: "list[ast.stmt]") -> None:
+        self.ever_unsafe |= _unsafe_names_in_scope(body)
         for stmt in body:
             self.visit(stmt)
 
     def visit(self, node: ast.stmt) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            _ScopeWalk(self.env, self.out).run(node.body)   # snapshot, no write-back
+            # A nested scope's body runs LATER, so a global it reads resolves at
+            # CALL time — a binding written after the `def` still reaches it.
+            # Snapshotting the env here would miss that, so any name bound to a
+            # zero-arg lambda ANYWHERE in this scope is unsafe inside the nest.
+            inner = dict(self.env)
+            for nm in self.ever_unsafe:
+                inner[nm] = True
+            _ScopeWalk(inner, self.out).run(node.body)
             return
         if isinstance(node, ast.Assign):
             self._assign(node)
@@ -1080,6 +1114,17 @@ class _ScopeWalk:
         if not branches:
             return
         merged: "dict[str, bool]" = {}
+        # A statement whose body may not run at all leaves the PRE-STATE live:
+        # `if` with no `else`, a loop over an empty iterable, a `try` that raised
+        # before finishing. That path is a real path, so it joins the merge —
+        # otherwise a safe rebinding inside the branch silently overwrites an
+        # unsafe binding that still reaches the assignment. `if/else` and `with`
+        # cover every path, so they merge branches only.
+        covers_all = (isinstance(node, ast.If) and node.orelse) or isinstance(
+            node, (ast.With, ast.AsyncWith)
+        )
+        if not covers_all:
+            merged.update(self.env)
         for body in branches:
             w = _ScopeWalk(self.env, self.out)
             w.run(body)
