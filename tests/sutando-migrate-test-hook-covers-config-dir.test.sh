@@ -93,6 +93,41 @@ else
     echo "  skip operator settings.json mtime (no settings.json at ${CCD:-<unresolved>})"
 fi
 
+# --- POSITIVE CONTROL: WITHOUT the test hook the bridges must STILL RUN --------
+# Self-audit after @john-the-dev's review of #2628: he disabled a gate entirely
+# and the suite still passed. Same mutation here — dropping the
+# `[ -n "${SUTANDO_MIGRATE_DEST:-}" ]` condition so both bridges skip
+# UNCONDITIONALLY, even in a real migration — passed all five assertions above.
+# A skip-gate whose test only ever exercises the skip cannot tell "correctly
+# skipped" from "never runs at all", and an over-broad future edit would silently
+# disable hook + channel bridging for real users while this file stayed green.
+#
+# Fully isolated: its own repo, workspace, HOME and SRC_{A,B,C}, so "no test hook"
+# never means "the caller's real config".
+PC="$(mktemp -d -t migrate-positive-control-XXXXXX)"
+mkdir -p "$PC/repo/scripts" "$PC/repo/src" "$PC/ws/state" "$PC/home" "$PC/src/a" "$PC/src/b" "$PC/src/c"
+cp "$REPO/scripts/sutando-migrate.sh" "$PC/repo/scripts/"
+cp "$REPO/scripts/sutando-config.sh" "$PC/repo/scripts/"
+cp "$REPO/src/sutando_config.py"     "$PC/repo/src/"
+cp "$REPO/sutando.config.json"       "$PC/repo/"
+touch "$PC/repo/CLAUDE.md"
+printf '{"workspace": {"path": "%s"}}\n' "$PC/ws" > "$PC/repo/sutando.config.local.json"
+PC_OUT="$(HOME="$PC/home" \
+    SUTANDO_MIGRATE_SRC_A="$PC/src/a" \
+    SUTANDO_MIGRATE_SRC_B="$PC/src/b" \
+    SUTANDO_MIGRATE_SRC_C="$PC/src/c" \
+    bash "$PC/repo/scripts/sutando-migrate.sh" --commit --no-confirm --no-claude-import 2>&1)"
+
+! grep -q "hook bridge: skipped (SUTANDO_MIGRATE_DEST set" <<<"$PC_OUT"
+check "no test hook -> the hook bridge is NOT skipped for that reason" $? \
+    "the skip fired without SUTANDO_MIGRATE_DEST — the gate is unconditional"
+
+! grep -q "channel bridge: skipped (SUTANDO_MIGRATE_DEST set" <<<"$PC_OUT"
+check "no test hook -> the channel bridge is NOT skipped for that reason" $? \
+    "the skip fired without SUTANDO_MIGRATE_DEST — the gate is unconditional"
+
+rm -rf "$PC"
+
 echo
 if [ "$FAILURES" -ne 0 ]; then echo "FAILED ($FAILURES)"; exit 1; fi
 echo "All test-hook coverage checks passed."
