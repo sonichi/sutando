@@ -341,13 +341,32 @@ def test_no_writes_reach_the_live_workspace(live_ws) -> int:
     """
     now = _workspace_fingerprint(live_ws)
     before = _LIVE_BASELINE
-    changed = sorted(k for k in now if before.get(k) != now[k])
-    if changed:
-        print(f"  \u2717 live workspace was written to \u2014 {len(changed)} path(s):", file=sys.stderr)
-        for c in changed[:8]:
-            print(f"      {c}", file=sys.stderr)
+
+    # Compare the UNION of keys. Iterating `now` alone cannot see a DELETION:
+    # a path in `before` and absent from `now` never comes up, so the loop
+    # finds nothing and the guard certifies "untouched".
+    #
+    # john-the-dev reproduced exactly that on #2619 \u2014 seed
+    # results/test-task-{a,b,c}.txt, drop RESULTS_DIR from the rebind, run:
+    # exit 0 and "live workspace untouched (0 paths compared)" while all three
+    # files were GONE. The `0` was the tell; it counted `now`, which was empty
+    # precisely BECAUSE everything had been deleted.
+    #
+    # Deletion of the owner's staged results is the worst case this guard
+    # exists for, so it is reported as its own category rather than folded in.
+    deleted = sorted(k for k in before if k not in now)
+    added = sorted(k for k in now if k not in before)
+    modified = sorted(k for k in (set(before) & set(now)) if before[k] != now[k])
+
+    if deleted or added or modified:
+        print(f"  \u2717 live workspace was written to \u2014 {len(deleted)} deleted, "
+              f"{len(modified)} modified, {len(added)} added:", file=sys.stderr)
+        for label, group in (("DELETED", deleted), ("MODIFIED", modified), ("ADDED", added)):
+            for c in group[:5]:
+                print(f"      {label}: {c}", file=sys.stderr)
         return 1
-    print(f"  \u2713 live workspace untouched ({len(now)} paths compared, whole tree)")
+    print(f"  \u2713 live workspace untouched "
+          f"({len(set(before) | set(now))} paths compared, union of before+after)")
     return 0
 
 
