@@ -253,11 +253,36 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
     assert "$task-workstream-grouping" in task_file.read_text()
     assert original.read_bytes() == before
 
-    second = workstreams.maybe_enqueue_classifier_task(workspace)
+    with mock.patch.object(
+        workstreams,
+        "scan_task_history",
+        side_effect=AssertionError("unchanged inflight state must not scan history"),
+    ):
+        second = workstreams.maybe_enqueue_classifier_task(workspace)
     assert second.pending and not second.enqueued and second.reason == "already-queued"
     workstreams.mark_classifier_complete(workspace, first.snapshot_hash)
-    settled = workstreams.maybe_enqueue_classifier_task(workspace)
+    with mock.patch.object(
+        workstreams,
+        "scan_task_history",
+        side_effect=AssertionError("unchanged complete state must not scan history"),
+    ):
+        settled = workstreams.maybe_enqueue_classifier_task(workspace)
     assert not settled.pending and not settled.enqueued and settled.reason == "complete"
+
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "task-new.txt",
+        "task-new",
+        "2026-08-03T13:00:00Z",
+        "a newly archived task",
+    )
+    with mock.patch.object(
+        workstreams,
+        "scan_task_history",
+        wraps=workstreams.scan_task_history,
+    ) as changed_scan:
+        changed = workstreams.classifier_status(workspace)
+    assert changed.reason == "ready"
+    assert changed_scan.call_count == 1
 
     manual = fixture_workspace()
     manual_snapshot = workstreams.build_classifier_snapshot(manual)
@@ -296,6 +321,23 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
         "continue active work",
     )
     assert workstreams.classifier_status(active).reason == "active-user-task"
+
+
+def test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open() -> None:
+    missing = Path(tempfile.mkdtemp()) / "missing-workspace"
+    directories = workstreams._source_directories(
+        missing,
+        {
+            "source_directories": [
+                None,
+                "../outside",
+                "results/archive-2026-08-03",
+            ],
+        },
+        discover=True,
+    )
+    assert "../outside" not in directories
+    assert "results/archive-2026-08-03" in directories
 
 
 def test_stale_classifier_is_archived_before_replacement() -> None:
@@ -383,6 +425,7 @@ def main() -> None:
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
+        test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,
         test_stale_classifier_is_archived_before_replacement,
         test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,
         test_concurrent_inheritance_keeps_every_assignment,
