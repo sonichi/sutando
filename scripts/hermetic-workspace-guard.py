@@ -59,7 +59,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
 
 EXEMPTIONS = REPO / "tests" / "hermetic-workspace-exemptions.txt"
