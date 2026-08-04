@@ -14,7 +14,9 @@ Run: python3 tests/discord-bridge-reply-directive.test.py
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import importlib.util
+import shutil
 import sys
 import tempfile
 import types
@@ -90,6 +92,60 @@ def load_bridge():
 
 bridge = load_bridge()
 
+# Set by main() before any case runs; read by the live-workspace regression.
+_LIVE_BASELINE = (None, [])
+
+
+@contextlib.contextmanager
+def _bridge_writes_redirected():
+    """Point every filesystem write this fixture triggers at a throwaway tree.
+
+    Three separate escapes, all to the OWNER's live workspace, and the old
+    comment at `_run_one_poll_iteration` ("RESULTS_DIR is shared with prod")
+    treated the first as acceptable rather than as the defect it is:
+
+      1. the staged result files             -> <workspace>/results/
+      2. `archive_file()` moving them        -> <workspace>/results/archive/<ym>/
+      3. `poll_results` -> outbox_log.append -> <workspace>/state/outbox.log
+
+    (3) is the one that matters most: `state/outbox.log` is the delivery audit
+    log the dashboard's Outbox card shows the owner. Measured on this host
+    before the fix, the fixtures had been landing in the real log since
+    2026-05-28 — `discord_channel` rows whose `recipient` is `111222333` /
+    `444555666` / `777888999` rather than a Discord snowflake.
+
+    `outbox_log._outbox_path` is swapped rather than `resolve_workspace`
+    because `append()` re-resolves per call; the sibling fix in #2615 had to
+    rebind a constant instead because that one was bound at import. Which seam
+    works is a property of the module, so the regression proves it by exercise.
+
+    Restores in a `finally` so a mid-run assertion cannot leave the globals
+    patched for whatever runs next in the same interpreter (#2614).
+    """
+    import outbox_log
+
+    orig_results = bridge.RESULTS_DIR
+    orig_archive = bridge.ARCHIVE_RESULTS_DIR
+    orig_path = outbox_log._outbox_path
+    tmp = Path(tempfile.mkdtemp(prefix="reply-directive-test-"))
+    redirected = tmp / "state" / "outbox.log"
+    redirected.parent.mkdir(parents=True, exist_ok=True)
+    bridge.RESULTS_DIR = tmp / "results"
+    bridge.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # `archive_file()` does NOT derive from RESULTS_DIR — `ARCHIVE_RESULTS_DIR`
+    # is its own module constant (discord-bridge.py:248), so redirecting only
+    # RESULTS_DIR moves the staging write and leaves the ARCHIVE write in the
+    # owner's tree. Caught by the regression below, not by reading the code.
+    bridge.ARCHIVE_RESULTS_DIR = tmp / "results" / "archive"
+    outbox_log._outbox_path = lambda: redirected
+    try:
+        yield tmp, redirected
+    finally:
+        bridge.RESULTS_DIR = orig_results
+        bridge.ARCHIVE_RESULTS_DIR = orig_archive
+        outbox_log._outbox_path = orig_path
+        shutil.rmtree(tmp, ignore_errors=True)
+
 
 # ---------------------------------------------------------------------------
 # Mock channel that captures send() calls
@@ -127,7 +183,8 @@ async def _run_one_poll_iteration(task_id, channel, result_text):
     bridge.client.is_ready = lambda: True
     # Stub save_pending_replies so we don't write to disk during tests
     bridge.save_pending_replies = lambda: None
-    # archive_file uses real fs; let it run — RESULTS_DIR is shared with prod
+    # archive_file uses real fs; RESULTS_DIR is redirected to a throwaway tree by
+    # `_bridge_writes_redirected`, so this no longer touches the owner's results/.
     # but the file we wrote is fully synthetic and gets archived
 
     # Run poll_results with a tight timeout — we only need 1 iteration
@@ -204,22 +261,68 @@ def case_c_directive_only_first_chunk():
     return fails
 
 
+def test_no_writes_reach_the_live_workspace(live_ws) -> int:
+    """THE regression: a run must not touch the owner's results/ or outbox log.
+
+    Baseline is taken by `main()` BEFORE any case runs, not here — taking it
+    here would only cover this function's own activity, so removing the
+    redirect from the cases would still pass.
+
+    Asserts on the RESOLVED live workspace rather than a fixture path, because
+    the defect was precisely that the fixture escaped to wherever that resolves.
+    """
+    outbox = live_ws / "state" / "outbox.log"
+    results = live_ws / "results"
+    now_outbox = outbox.stat().st_size if outbox.is_file() else None
+    now_results = sorted(str(p) for p in results.rglob("*")) if results.is_dir() else []
+    before_outbox, before_results = _LIVE_BASELINE
+    bad = []
+    if now_outbox != before_outbox:
+        bad.append(f"outbox.log size {before_outbox} -> {now_outbox}")
+    new_files = set(now_results) - set(before_results)
+    if new_files:
+        bad.append(f"{len(new_files)} new file(s) under results/: {sorted(new_files)[:3]}")
+    if bad:
+        print("  \u2717 live workspace was written to: " + "; ".join(bad), file=sys.stderr)
+        return 1
+    print("  \u2713 live workspace untouched (results/ and state/outbox.log)")
+    return 0
+
+
 def main():
+    # Baseline BEFORE any case runs, so the final check covers every write this
+    # file triggers — not just the ones the regression itself makes.
+    from workspace_default import resolve_workspace
+
+    global _LIVE_BASELINE
+    live_ws = resolve_workspace()
+    _outbox = live_ws / "state" / "outbox.log"
+    _results = live_ws / "results"
+    _LIVE_BASELINE = (
+        _outbox.stat().st_size if _outbox.is_file() else None,
+        sorted(str(p) for p in _results.rglob("*")) if _results.is_dir() else [],
+    )
+
     cases = [
         ("a-directive-present-constructs-reference", case_a_directive_present_constructs_reference),
         ("b-no-directive-no-reference", case_b_no_directive_no_reference),
         ("c-directive-only-first-chunk", case_c_directive_only_first_chunk),
     ]
     failures = []
-    for label, fn in cases:
-        fs = fn()
-        if fs:
-            failures.extend([(label, msg) for msg in fs])
-            print(f"  ✗ case {label}")
-            for f in fs:
-                print(f"      {f}")
-        else:
-            print(f"  ✓ case {label}")
+    with _bridge_writes_redirected():
+        for label, fn in cases:
+            fs = fn()
+            if fs:
+                failures.extend([(label, msg) for msg in fs])
+                print(f"  ✗ case {label}")
+                for f in fs:
+                    print(f"      {f}")
+            else:
+                print(f"  ✓ case {label}")
+
+    if test_no_writes_reach_the_live_workspace(live_ws):
+        failures.append(("live-workspace-untouched", "fixture escaped to the live workspace"))
+
     if failures:
         print(f"\n{len(failures)} failure(s)")
         return 1
