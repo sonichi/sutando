@@ -242,6 +242,27 @@ class P:
         wd.resolve_workspace = _fake
 """) == [], "the method's unqualified _fake resolves the SAFE module global")
 
+    # A class namespace encloses NOTHING nested in it — not just methods. An
+    # inner class does not see the outer class's attributes either
+    # (@john-the-dev, #2622, the surface after the method one).
+    check("a nested class does not inherit the outer class namespace",
+          viols("""
+_fake = lambda *a, **kw: tmp
+class Outer:
+    _fake = lambda: tmp
+    class Inner:
+        wd.resolve_workspace = _fake
+""") == [], "Inner resolves the SAFE module global, not Outer._fake")
+
+    check("a method inside a NESTED class still gets module late-binding",
+          viols("""
+class Outer:
+    class Inner:
+        def patch(self):
+            wd.resolve_workspace = _fake
+_fake = lambda: tmp
+""") != [], "deferred body + module binding must still flag through two class layers")
+
     # ...and the counter-case that stops the cheap fix. Simply excluding ClassDef
     # from late-binding would also lose it for METHODS, whose bodies ARE deferred.
     check("a METHOD inside a class is still late-bound",
