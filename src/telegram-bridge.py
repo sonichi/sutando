@@ -462,6 +462,28 @@ def _recover_orphan_sending_files() -> int:
 # swallowed so the real result still delivers.
 _progress_msgs: dict = {}        # task_id -> {message_id, chat_id, first, last_edit, last_text} | {"expired": True}
 pending_task_tiers: dict = {}    # task_id -> access_tier; in-memory ONLY → fail-closed on restart
+pending_task_private: dict = {}  # task_id -> chat audience is private; in-memory ONLY → fail-closed on restart
+
+
+def _render_progress_text(elapsed: float, task_id: str) -> str:
+    """Render the placeholder body for ``task_id``'s chat.
+
+    The owner tier gate (`should_stream_task`) answers WHO SENT the task; it
+    says nothing about WHO CAN SEE the chat. A Telegram allowlist entry is a
+    USER id, but that user can address the bot from a group/supergroup/channel,
+    and every member of it would then read the core's live ``step`` verbatim —
+    the same disclosure this PR closes for Discord guild channels.
+
+    So the step text is gated on the recorded chat audience, and the default
+    when the audience is unknown is NOT-private: a bridge restart drops
+    `pending_task_private`, and an in-flight task recovered afterwards must
+    degrade to a contentless placeholder rather than assume a DM. Everywhere
+    else still gets the liveness signal, just without the step.
+    """
+    if not progress_stream.step_visible_in(pending_task_private.get(task_id, False)):
+        return progress_stream.format_progress(None, elapsed)
+    step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
+    return progress_stream.format_progress(step, elapsed)
 
 
 def _clear_progress(task_id: str) -> None:
@@ -469,6 +491,7 @@ def _clear_progress(task_id: str) -> None:
     Called when the result is delivered/skipped/given-up so the placeholder
     doesn't linger next to the real reply."""
     pending_task_tiers.pop(task_id, None)
+    pending_task_private.pop(task_id, None)
     info = _progress_msgs.pop(task_id, None)
     if info and info.get("message_id") and info.get("chat_id") is not None:
         try:
@@ -502,8 +525,7 @@ def poll_progress(pending_replies: dict) -> None:
                 _progress_msgs[task_id] = {"expired": True}  # terminal — never re-post
                 continue
             if progress_stream.should_edit(now, info["last_edit"]):
-                step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
-                text = progress_stream.format_progress(step, elapsed)
+                text = _render_progress_text(elapsed, task_id)
                 if text != info.get("last_text"):
                     try:
                         api("editMessageText", chat_id=chat_id, message_id=info["message_id"], text=text)
@@ -524,8 +546,7 @@ def poll_progress(pending_replies: dict) -> None:
         except (ValueError, IndexError):
             created = now
         if progress_stream.should_post_placeholder(now - created):
-            step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
-            text = progress_stream.format_progress(step, now - created)
+            text = _render_progress_text(now - created, task_id)
             resp = api("sendMessage", chat_id=chat_id, text=text)
             mid = (resp or {}).get("result", {}).get("message_id")
             if mid:
@@ -546,6 +567,9 @@ def poll_progress(pending_replies: dict) -> None:
     for tid in list(pending_task_tiers.keys()):
         if tid not in pending_replies:
             pending_task_tiers.pop(tid, None)
+    for tid in list(pending_task_private.keys()):
+        if tid not in pending_replies:
+            pending_task_private.pop(tid, None)
 
 
 def main():  # pragma: no cover
@@ -626,6 +650,11 @@ def main():  # pragma: no cover
                 sender_id = str(msg["from"]["id"])
                 username = msg["from"].get("username", sender_id)
                 chat_id = msg["chat"]["id"]
+                # Telegram's allowlist gates the SENDER, but that sender can
+                # address the bot from a group/supergroup/channel. Capture the
+                # chat audience here so the progress placeholder can withhold
+                # the core's live step anywhere but a 1:1 DM.
+                chat_is_private = msg["chat"].get("type") == "private"
                 text = msg.get("text", "")
 
                 # Reload access list periodically
@@ -843,6 +872,7 @@ def main():  # pragma: no cover
                 )
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
+                pending_task_private[task_id] = chat_is_private  # audience, not sender: gates the step text
                 # Observability: one inbound accepted-message event. Source the
                 # tier from the bridge's own assignment above (single source of
                 # truth) rather than re-asserting a literal here.
