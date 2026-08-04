@@ -132,6 +132,14 @@ and retain only provider-specific delivery. For example,
 crash, while Discord, Slack, and Telegram decide how the recovered result is
 sent. Copying the filesystem state machine into each adapter is not permitted.
 
+### HTTP transport handlers
+
+HTTP handlers are transport adapters, not the owner of feature policy. Repeated
+authentication gates, status/header emission, and JSON serialization belong in
+small handler helpers so every route uses one wire contract. Route branches retain
+endpoint-specific orchestration and payload construction. Refactors must preserve
+status codes, headers, and payload shapes with direct contract tests.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known
