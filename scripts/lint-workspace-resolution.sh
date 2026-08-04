@@ -74,13 +74,21 @@ PATTERN_DOC_ENV_PATH='\$SUTANDO_WORKSPACE/'
 # __file__ when git is unavailable. Listed here rather than reworded to
 # `parents[1]`, per the note above — dodging the regex would defeat the lint.
 #
+# scripts/hermetic-workspace-guard.py is the same category once more, and the
+# distinction is worth stating because the file's NAME suggests otherwise: it
+# resolves the REPO root only to locate `tests/hermetic-workspace-exemptions.txt`
+# and to put `src/` on sys.path. The workspace it actually cares about is obtained
+# THROUGH the loader (`from workspace_default import resolve_workspace`) — which is
+# the contract this lint exists to enforce, so the guard already complies where it
+# counts. Listed here rather than reworded to `parents[1]`, per the note above.
+#
 # scripts/gen-src-map.py uses PATTERN_REPO_WALK to resolve the REPO ROOT
 # (to read tracked files under src/ and write docs/), NOT a workspace — same
 # category as scripts/check-utc-z-strftime.py and scripts/dedup-conversation-store.py,
 # which predate this --diff lint and are grandfathered. A repo-tooling script has
 # no workspace to go through the wrapper for; the wrapper resolves the workspace,
 # which is the wrong directory here.
-ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|scripts/check-python39-compat\.py|scripts/review-preflight\.py|tests/[^/]+\.(test\.)?(py|ts|sh)|packages/ag2-sparrow/.*\.py)$'
+ALLOWED='^(src/sutando_config\.(py|ts)|src/workspace_default\.(py|ts)|src/util_paths\.py|src/startup\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/install-git-hooks\.sh|scripts/sutando-config\.sh|scripts/sync-memory\.sh|scripts/sutando-migrate\.sh|scripts/sweep-stranded-claims\.sh|scripts/gen-src-map\.py|scripts/check-python39-compat\.py|scripts/review-preflight\.py|scripts/hermetic-workspace-guard\.py|tests/[^/]+\.(test\.)?(py|ts|sh)|packages/ag2-sparrow/.*\.py)$'
 
 # Allowed .md files — legitimate uses of `$SUTANDO_WORKSPACE/path` in
 # prose, e.g. the workspace contract docs that DESCRIBE the legacy form
