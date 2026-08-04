@@ -122,7 +122,19 @@ def _one_pass(results: Path, access: dict | None, owner: str | None = None,
     if owner is not None:
         sb.resolve_proactive_owner_id = lambda _d: owner
         sb.app.client.conversations_open = lambda **kw: {"channel": {"id": "D_TEST_DM"}}
-        sb._send_reply = lambda ch, ts, text, **kw: (sent.append((ch, text)) if sent is not None else None)
+        def _stub_send(ch, _ts, text, **_kw):
+            # MUST return truthy. #2627 changes `_send_reply` from `-> None` to
+            # `-> bool` (delivered?) and gates cleanup on it. `list.append()`
+            # returns None, so the original stub read as "Slack refused" on the
+            # COMBINED tree: the claim was released instead of consumed and this
+            # suite failed while passing on either PR alone.
+            # @Sutando-Mini found it by running both suites on the merged tree;
+            # a clean `git merge` cannot see it, because the contract and the
+            # fixture live in different files.
+            if sent is not None:
+                sent.append((ch, text))
+            return True
+        sb._send_reply = _stub_send
         sb.mark_proactive_delivered = lambda *a, **kw: None
 
     def _sleep(_s):
