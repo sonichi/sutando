@@ -105,5 +105,41 @@ for f in src/startup.sh scripts/sutando-config.sh src/agent/claude/cli/start-cli
   fi
 done
 
+
+# --- 8. CALLER-LEVEL: no caller may degrade into `"" -c ...` ----------------
+# Resolver unit coverage is not enough (CR #2599, @john-the-dev): the advertised
+# "returns empty, callers skip" contract has to hold at the ACTIVATED entry
+# points. Before this, sutando-config.sh exited 127 with the shell's opaque
+#   scripts/sutando-config.sh: line 56: : command not found
+# once per call site, and startup.sh promised services "will be skipped" while
+# actually aborting.
+noclt=$(mktemp -d)
+printf '#!/bin/sh\nexit 2\n' > "$noclt/xcode-select"; chmod +x "$noclt/xcode-select"
+
+out=$(env -u SUTANDO_PY PATH="$noclt:/usr/bin:/bin" /bin/bash "$REPO/scripts/sutando-config.sh" workspace 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "sutando-config.sh: succeeds when a python IS resolvable"
+else
+  case "$out" in
+    *"command not found"*) bad "sutando-config.sh fails ACTIONABLY, not with ': command not found'" "$out" ;;
+    *"no runnable python3"*) ok "sutando-config.sh fails once, actionably (exit $rc)" ;;
+    *) bad "sutando-config.sh fails actionably" "unexpected: $out" ;;
+  esac
+fi
+
+# The startup message must not promise a skip the script does not perform.
+if grep -q 'will be skipped' "$REPO/src/startup.sh"; then
+  for svc in dashboard agent-api; do
+    if grep -qE "skipped \(no runnable python3\)" "$REPO/src/startup.sh"; then
+      ok "startup.sh actually skips $svc rather than only claiming to"
+      break
+    else
+      bad "startup.sh actually skips $svc" "promise without a skip branch"
+      break
+    fi
+  done
+fi
+
 printf "\npassed=%d failed=%d\n" "$pass" "$fail"
 [ "$fail" -eq 0 ]

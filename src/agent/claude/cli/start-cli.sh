@@ -31,7 +31,10 @@ cd "$REPO"
 # Single-sourced in scripts/python-binary.sh (see there for why the bare-name
 # fallback this replaced was the CLT-dialog trigger).
 . "$REPO/scripts/python-binary.sh"
-PY="$(resolve_python "$REPO")"
+# The core launcher needs Python for onboarding-state, the input watcher and the
+# supervisor relay. Fail once with a fix rather than letting three unguarded
+# call sites emit `: command not found` (CR #2599, @john-the-dev).
+PY="$(require_python "$REPO" "launch the Sutando core")" || exit 1
 
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.

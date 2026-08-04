@@ -98,3 +98,28 @@ resolve_python() {
 	fi
 	return 0
 }
+
+# Echo a runnable python3 or FAIL LOUDLY, once, with a fix. For callers where
+# Python is genuinely required (config resolution, the core launcher) — there
+# the empty result must not silently become `"" -c ...`, which the shell reports
+# as the useless `: command not found` and repeats per call site.
+#
+# $1 = repo root. $2 = what the caller was trying to do (used in the message).
+require_python() {
+	_rp="$(resolve_python "${1:-.}")"
+	if [ -n "$_rp" ]; then
+		printf '%s' "$_rp"
+		return 0
+	fi
+	{
+		printf 'sutando: no runnable python3 — cannot %s\n' "${2:-continue}"
+		printf '  Tried: $SUTANDO_PY, %s/../runtime/python/bin/python3, then PATH.\n' "${1:-.}"
+		printf '  On macOS a PATH python3 is only used when the developer tools are\n'
+		printf '  installed, because the system python3 is otherwise the Xcode-CLT\n'
+		printf '  stub (one inode hardlinked across 78 names, incl. git and swiftc)\n'
+		printf '  and merely running it raises the install dialog.\n'
+		printf '  Fix: install python3 (brew install python), or set SUTANDO_PY to an\n'
+		printf '  interpreter, or run xcode-select --install.\n'
+	} >&2
+	return 1
+}

@@ -45,7 +45,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # start-cli.sh / startup.sh. The `else PY="python3"` this replaced still shelled
 # the CLT stub when neither earlier tier existed, which is the dialog itself.
 . "$REPO_ROOT/scripts/python-binary.sh"
-PY="$(resolve_python "$REPO_ROOT")"
+# Python is REQUIRED here — this script's whole job is running it. Fail once,
+# with a fix, instead of letting every `"$PY" -c` below degrade into the shell's
+# opaque `: command not found` (17 call sites; CR #2599, @john-the-dev).
+PY="$(require_python "$REPO_ROOT" "resolve Sutando configuration")" || exit 1
 
 cmd="${1:-workspace}"
 

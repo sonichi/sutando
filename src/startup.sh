@@ -878,8 +878,12 @@ fi
 reap_wedged_listener 7844 dashboard
 if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
-  "$PY" src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
-  echo "  ✓ dashboard"
+  if [ -n "$PY" ]; then
+    "$PY" src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
+    echo "  ✓ dashboard"
+  else
+    echo "  ~ dashboard skipped (no runnable python3)"
+  fi
 else
   echo "  ✓ dashboard (already running)"
 fi
@@ -888,8 +892,12 @@ fi
 reap_wedged_listener 7843 agent-api
 if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
-  "$PY" src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
-  echo "  ✓ agent API"
+  if [ -n "$PY" ]; then
+    "$PY" src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
+    echo "  ✓ agent API"
+  else
+    echo "  ~ agent API skipped (no runnable python3)"
+  fi
 else
   echo "  ✓ agent API (already running)"
 fi
@@ -902,7 +910,7 @@ reap_wedged_listener 7845 screen-capture
 if ! lsof -i :7845 > /dev/null 2>&1; then
   if [ "$PERM_OK" -eq 1 ]; then
     echo "  Starting screen capture (port 7845)..."
-    "$PY" src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
+    [ -n "$PY" ] && "$PY" src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
     echo "  ✓ screen capture"
   else
     echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
@@ -1071,9 +1079,13 @@ elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
         [ -n "$_c" ] && command -v "$_c" >/dev/null 2>&1 && _tg_tls_ok "$_c" && TGPY="$_c" && break
       done
     fi
-    "$TGPY" src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
-    echo "  ✓ telegram bridge ($TGPY)"
-    _vault_scanner_check "$TGPY" "telegram bridge"
+    if [ -n "$TGPY" ]; then
+      "$TGPY" src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
+      echo "  ✓ telegram bridge ($TGPY)"
+      _vault_scanner_check "$TGPY" "telegram bridge"
+    else
+      echo "  ~ telegram bridge skipped (no runnable python3)"
+    fi
   else
     echo "  ✓ telegram bridge (already running)"
   fi
@@ -1127,7 +1139,7 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
   # the redirect below); the bridge stamps launched_via into gateway-status
   # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-  SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+  [ -n "$PY" ] && SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
   echo "  ✓ gateway bridge (self-defers if already running)"
 
   # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
@@ -1143,7 +1155,7 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
     _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
     SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
       REMOTE_PROACTIVE_ROOM= \
-      "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+      [ -n "$PY" ] && "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
     echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
   done
 fi
@@ -1250,7 +1262,7 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
       ngrok http 3100 --log=stdout > /tmp/ngrok.log 2>&1 &
     fi
     sleep 3
-    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | "$PY" -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
+    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | ${PY:-cat} -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
     if [ -n "$NGROK_URL" ]; then
       # Update WEBHOOK_BASE_URL in .env — portable in-place edit.
       # `sed -i ''` is BSD-only; on Macs with Homebrew gnu-sed in PATH it
