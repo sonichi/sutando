@@ -369,7 +369,11 @@ def _outbox_redirected():
     tmp = Path(tempfile.mkdtemp(prefix="multipart-outbox-test-"))
     (tmp / "state").mkdir(parents=True, exist_ok=True)
     orig = workspace_default.resolve_workspace
-    fake = lambda: tmp
+    # Accept and IGNORE any args — observability calls
+    # `resolve_workspace(migrate=False)`, and a zero-arg stub raises TypeError
+    # there, which the best-effort facade swallows: that DISABLES the write path
+    # instead of redirecting it (qingyun-wu, #2619).
+    fake = lambda *a, **kw: tmp
     patched = [m for m in list(sys.modules.values())
                if getattr(m, "resolve_workspace", None) is orig]
     for m in patched:
@@ -381,6 +385,14 @@ def _outbox_redirected():
         workspace_default.resolve_workspace = orig
         for m in patched:
             m.resolve_workspace = orig
+        # ALSO restore modules that bound `fake` DURING the context. `patched` is
+        # built before the body runs, and this fixture imports `outbox_log`
+        # LAZILY inside `dm.send_dm()` — so it binds `fake` afterwards and was
+        # never restored, leaving `_outbox_path()` pointed at a deleted temp dir
+        # for the rest of the interpreter (qingyun-wu, #2620).
+        for m in list(sys.modules.values()):
+            if getattr(m, "resolve_workspace", None) is fake:
+                m.resolve_workspace = orig
         shutil.rmtree(tmp, ignore_errors=True)
 
 
