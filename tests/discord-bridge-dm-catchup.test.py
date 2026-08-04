@@ -272,6 +272,90 @@ def test_self_authored_dms_advance_the_checkpoint():
     )
 
 
+# --- behavioural: the fix must EXECUTE, not merely be present in the source ---
+# The two tests above parse the source. They fail correctly against the unfixed
+# bridge, but they never run the branch, so they cannot catch a wiring change
+# that leaves the call textually intact — and diff-coverage reported the fix at
+# 0%, which is that gap stated as a number. These drive the real handler.
+
+
+class _FakeDM(sys.modules["discord"].DMChannel):
+    """A real subclass, so `isinstance(ch, discord.DMChannel)` is genuinely true
+    rather than patched true."""
+
+    def __init__(self, cid):
+        self.id = cid
+
+
+def _drive_self_authored(channel, msg_id=99999):
+    """Run _handle_discord_message on a message the bot itself wrote."""
+    import asyncio
+    me = object()
+    fake_client = type("_C", (), {"user": me})()
+    msg = types.SimpleNamespace(author=me, channel=channel, id=msg_id)
+    real_client = getattr(bridge, "client", None)
+    bridge.client = fake_client
+    try:
+        asyncio.run(bridge._handle_discord_message(msg))
+    finally:
+        bridge.client = real_client
+
+
+def _read_checkpoint() -> dict:
+    """Checkpoint contents, or {} when the file was never written.
+
+    Deliberately not `read_text()` directly: in the BROKEN state no file exists
+    at all, and letting that surface as FileNotFoundError aborts the whole run
+    (main() only catches AssertionError) so the diagnostic below never prints.
+    A missing file is a legitimate outcome to assert against, not a crash.
+    """
+    f = bridge.DM_CHECKPOINT_FILE
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text())
+    except (ValueError, OSError):
+        return {}
+
+
+def test_self_authored_dm_actually_advances_the_checkpoint():
+    """The starvation fix, exercised end-to-end through the handler."""
+    _clear_checkpoint()
+    _drive_self_authored(_FakeDM(4242), msg_id=99999)
+    data = _read_checkpoint()
+    assert data.get("4242") == "99999", (
+        f"a self-authored DM must advance the checkpoint; got {data!r}. "
+        "Without this the catch-up fetch (limit=50, oldest_first) permanently "
+        "strands an owner DM once 50 messages sit past the frozen checkpoint."
+    )
+
+
+def test_self_authored_guild_message_leaves_checkpoint_untouched():
+    """Same path, non-DM channel: the checkpoint is per-DM-channel."""
+    _clear_checkpoint()
+    _drive_self_authored(type("_Guild", (), {"id": 4242})(), msg_id=99999)
+    assert _read_checkpoint() == {}, (
+        "a guild message must not write into the DM checkpoint; got "
+        f"{_read_checkpoint()!r}"
+    )
+
+
+def test_checkpoint_write_failure_does_not_break_the_handler():
+    """The update is best-effort: a failing write must not raise out of the
+    handler, or a checkpoint problem becomes a message-handling outage."""
+    _clear_checkpoint()
+    orig = bridge._update_dm_checkpoint
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    bridge._update_dm_checkpoint = boom
+    try:
+        _drive_self_authored(_FakeDM(4242), msg_id=99999)  # must not raise
+    finally:
+        bridge._update_dm_checkpoint = orig
+
+
 def main():
     failures = []
     for fn in (
@@ -286,6 +370,9 @@ def main():
         test_source_wires_catchup_into_on_ready,
         test_source_wires_checkpoint_update_into_handler,
         test_self_authored_dms_advance_the_checkpoint,
+        test_self_authored_dm_actually_advances_the_checkpoint,
+        test_self_authored_guild_message_leaves_checkpoint_untouched,
+        test_checkpoint_write_failure_does_not_break_the_handler,
     ):
         try:
             fn()
