@@ -21,9 +21,12 @@ included — so the test can assert on the actual envelope shape that
 goes over the wire.
 """
 
+import contextlib
+import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -315,19 +318,152 @@ def test_filename_crlf_quote_sanitized_in_header():
         bad_name_path.unlink(missing_ok=True)
 
 
+
+# --- live-workspace isolation -------------------------------------------------
+_LIVE_BASELINE: dict = {}
+
+
+def _workspace_fingerprint(ws) -> dict:
+    """(size, mtime) per file; CONTENT HASH under results/.
+
+    Whole-tree rather than an enumerated list of the paths this fixture is known
+    to touch — an assertion only catches what it looks at. Union-compared below
+    so a DELETION is visible too (#2619 shipped both lessons the hard way).
+    """
+    out = {}
+    if not ws.is_dir():
+        return out
+    for f in ws.rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            if "results" in f.parts:
+                out[str(f)] = ("sha", hashlib.sha256(f.read_bytes()).hexdigest())
+            else:
+                st = f.stat()
+                out[str(f)] = (st.st_size, st.st_mtime)
+        except OSError:
+            pass
+    return out
+
+
+@contextlib.contextmanager
+def _outbox_redirected():
+    """Send `outbox_log.append()` to a throwaway file for the duration.
+
+    `dm-result.py` late-imports `outbox_log` and appends after every successful
+    send, and `_outbox_path()` resolves `resolve_workspace()/state/outbox.log`
+    at CALL time — so untouched, this suite writes real rows into the owner's
+    live delivery audit log, the file the dashboard's Outbox card reads.
+
+    Patches the name in EVERY module holding it, not just where it is defined:
+    `from workspace_default import resolve_workspace` binds into the IMPORTER's
+    namespace, so patching only the source module leaves consumers pointing at
+    the original (#2619).
+
+    Restores in a `finally` so a mid-run failure cannot leave globals patched
+    for whatever runs next in the same interpreter (#2614).
+    """
+    import workspace_default
+
+    tmp = Path(tempfile.mkdtemp(prefix="multipart-outbox-test-"))
+    (tmp / "state").mkdir(parents=True, exist_ok=True)
+    orig = workspace_default.resolve_workspace
+    # Accept and IGNORE any args — observability calls
+    # `resolve_workspace(migrate=False)`, and a zero-arg stub raises TypeError
+    # there, which the best-effort facade swallows: that DISABLES the write path
+    # instead of redirecting it (qingyun-wu, #2619).
+    fake = lambda *a, **kw: tmp
+    patched = [m for m in list(sys.modules.values())
+               if getattr(m, "resolve_workspace", None) is orig]
+    for m in patched:
+        m.resolve_workspace = fake
+    workspace_default.resolve_workspace = fake
+    try:
+        yield tmp
+    finally:
+        workspace_default.resolve_workspace = orig
+        for m in patched:
+            m.resolve_workspace = orig
+        # ALSO restore modules that bound `fake` DURING the context. `patched` is
+        # built before the body runs, and this fixture imports `outbox_log`
+        # LAZILY inside `dm.send_dm()` — so it binds `fake` afterwards and was
+        # never restored, leaving `_outbox_path()` pointed at a deleted temp dir
+        # for the rest of the interpreter (qingyun-wu, #2620).
+        for m in list(sys.modules.values()):
+            if getattr(m, "resolve_workspace", None) is fake:
+                m.resolve_workspace = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_resolver_bindings_restored_after_the_context(tmp_root_prefix="multipart-outbox-test-") -> None:
+    """The fix for the lazy-import restore leak must itself be protected.
+
+    Both reviewers made the same point on #2620 and they were right: deleting
+    the late-import sweep left the whole suite GREEN while
+    `outbox_log.resolve_workspace` stayed bound to the throwaway stub and
+    `_outbox_path()` still pointed into the REMOVED temp tree. A fix with no
+    activated assertion can regress silently — which is exactly the standard I
+    apply to other people's guards.
+
+    Asserts BOTH halves they asked for: identity restored, and the resolved
+    path is outside the deleted temp root.
+    """
+    import outbox_log
+    import workspace_default
+
+    assert outbox_log.resolve_workspace is workspace_default.resolve_workspace, (
+        "outbox_log.resolve_workspace was NOT restored after _outbox_redirected() — "
+        "it is still bound to the throwaway stub, so later same-interpreter writes "
+        "land in a deleted directory"
+    )
+    resolved = str(outbox_log._outbox_path())
+    assert tmp_root_prefix not in resolved, (
+        f"_outbox_path() still points into the removed throwaway tree: {resolved}"
+    )
+    print("  ✓ resolver bindings restored after the context "
+          f"(outbox_log -> {resolved})")
+
+
+def test_no_writes_reach_the_live_workspace(live_ws) -> None:
+    """The baseline is taken by main() BEFORE any case runs, so this covers
+    every write the file triggers rather than only its own."""
+    now = _workspace_fingerprint(live_ws)
+    before = _LIVE_BASELINE
+    deleted = sorted(k for k in before if k not in now)
+    added = sorted(k for k in now if k not in before)
+    modified = sorted(k for k in (set(before) & set(now)) if before[k] != now[k])
+    assert not (deleted or added or modified), (
+        f"fixture escaped to the live workspace at {live_ws}: "
+        f"{len(deleted)} deleted, {len(modified)} modified, {len(added)} added — "
+        f"{(deleted + modified + added)[:4]}"
+    )
+    print(f"  ✓ live workspace untouched "
+          f"({len(set(before) | set(now))} paths compared, union of before+after)")
+
+
 def main():
-    test_allowlisted_file_uploaded_via_multipart()
-    print("  ✓ test_allowlisted_file_uploaded_via_multipart")
-    test_non_allowlisted_file_rejected_not_uploaded()
-    print("  ✓ test_non_allowlisted_file_rejected_not_uploaded")
-    test_file_only_message_with_empty_text()
-    print("  ✓ test_file_only_message_with_empty_text")
-    test_eleven_files_split_into_two_batches()
-    print("  ✓ test_eleven_files_split_into_two_batches")
-    test_filename_crlf_quote_sanitized_in_header()
-    print("  ✓ test_filename_crlf_quote_sanitized_in_header")
+    from workspace_default import resolve_workspace
+
+    global _LIVE_BASELINE
+    live_ws = resolve_workspace()
+    _LIVE_BASELINE = _workspace_fingerprint(live_ws)
+
+    with _outbox_redirected():
+        test_allowlisted_file_uploaded_via_multipart()
+        print("  ✓ test_allowlisted_file_uploaded_via_multipart")
+        test_non_allowlisted_file_rejected_not_uploaded()
+        print("  ✓ test_non_allowlisted_file_rejected_not_uploaded")
+        test_file_only_message_with_empty_text()
+        print("  ✓ test_file_only_message_with_empty_text")
+        test_eleven_files_split_into_two_batches()
+        print("  ✓ test_eleven_files_split_into_two_batches")
+        test_filename_crlf_quote_sanitized_in_header()
+        print("  ✓ test_filename_crlf_quote_sanitized_in_header")
+    test_resolver_bindings_restored_after_the_context()
+    test_no_writes_reach_the_live_workspace(live_ws)
     print("All dm-result multipart-upload tests passed.")
 
 
 if __name__ == "__main__":
-    main()
+        main()
