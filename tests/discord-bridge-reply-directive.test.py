@@ -140,7 +140,14 @@ def _bridge_writes_redirected():
     # RESULTS_DIR + outbox only, and `state/result-audit.log`,
     # `state/discord-bridge.heartbeat` and `logs/events-*.jsonl` still escaped.
     orig_resolve = workspace_default.resolve_workspace
-    _fake = lambda: tmp
+    # Accept and IGNORE any args: `observability.config.load_observability_config()`
+    # and `observability.sink.JsonlFileSink.write()` call
+    # `resolve_workspace(migrate=False)`. A zero-arg stub raises TypeError there,
+    # and the best-effort observability facade SWALLOWS it — so the redirect
+    # silently DISABLED the write path instead of redirecting it, and the suite
+    # stayed green while `_emit_channel` was never exercised (qingyun-wu, #2619).
+    # Preserving the resolver's signature is what keeps this a redirect.
+    _fake = lambda *a, **kw: tmp
 
     # Patch the name in EVERY module that holds it, not just where it is defined.
     # `from workspace_default import resolve_workspace` binds the function into
@@ -177,6 +184,15 @@ def _bridge_writes_redirected():
         workspace_default.resolve_workspace = orig_resolve
         for _mod in _patched:
             _mod.resolve_workspace = orig_resolve
+        # ALSO restore anything that bound `_fake` DURING the context. `_patched`
+        # is built before the body runs, so a module imported lazily inside it
+        # (outbox_log, result_audit, event_log all are) picks up `_fake` and was
+        # never in the list — leaving it pointed at a deleted temp dir for the
+        # rest of the interpreter. qingyun-wu found this on the sibling #2620;
+        # it is the same code shape here, so it is fixed in both.
+        for _m in list(sys.modules.values()):
+            if getattr(_m, "resolve_workspace", None) is _fake:
+                _m.resolve_workspace = orig_resolve
         for name, val in saved.items():
             setattr(bridge, name, val)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -385,7 +401,7 @@ def main():
         ("c-directive-only-first-chunk", case_c_directive_only_first_chunk),
     ]
     failures = []
-    with _bridge_writes_redirected():
+    with _bridge_writes_redirected() as (_tmp, _redirected):
         for label, fn in cases:
             fs = fn()
             if fs:
@@ -395,6 +411,20 @@ def main():
                     print(f"      {f}")
             else:
                 print(f"  ✓ case {label}")
+
+        # POSITIVE CONTROL for the redirect itself: an outbound observability
+        # event must actually LAND inside the throwaway tree. Without this, a
+        # redirect that DISABLES the write path (the zero-arg-lambda TypeError
+        # qingyun-wu found) looks identical to one that redirects it — the
+        # facade swallows the error and every other assertion still passes.
+        _events = sorted((_tmp / "logs").glob("events-*.jsonl")) if (_tmp / "logs").is_dir() else []
+        if not _events or not any(f.stat().st_size for f in _events):
+            print("  ✗ no observability event landed in the throwaway tree — the "
+                  "redirect is disabling the write path, not redirecting it", file=sys.stderr)
+            failures.append(("observability-redirected", "no events-*.jsonl in tmp/logs"))
+        else:
+            print(f"  ✓ observability event redirected into the throwaway tree "
+                  f"({_events[0].name})")
 
     if test_no_writes_reach_the_live_workspace(live_ws):
         failures.append(("live-workspace-untouched", "fixture escaped to the live workspace"))
