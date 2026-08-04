@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
+import { presenterModeActive } from './presenter-mode.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -22,7 +23,11 @@ const WORKSPACE_DIR = resolveWorkspace();
 
 // Gate slide-control + fullscreen on presenter-mode.sentinel.
 // Issue #1171: registering these globally causes Gemini to fire them on greetings.
-const _presenterActive = existsSync(join(WORKSPACE_DIR, 'state', 'presenter-mode.sentinel'));
+// Expiry-aware (#2501 policy twin): bare existsSync re-activated the gate
+// forever after a talk window lapsed without `presenter-mode.sh stop`, because
+// a naturally-expired sentinel stays on disk. Still evaluated once at module
+// load — the per-session registration semantics are unchanged.
+const _presenterActive = presenterModeActive(WORKSPACE_DIR);
 
 // Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
 // workspace. Compute REPO_ROOT from this file's URL so the resolution
