@@ -1154,7 +1154,19 @@ class _ScopeWalk:
         if not covers_all:
             merged.update(self.env)
         for body in branches:
-            w = _ScopeWalk(self.env, self.out)
+            # A control-flow block is the SAME scope, not a nested one, so the
+            # sub-walk carries EVERYTHING forward. A bare
+            # `_ScopeWalk(self.env, self.out)` dropped `ever_unsafe`, so a `def`
+            # inside an `if`/loop/`try`/`with` lost the module's late bindings
+            # and went unflagged while the identical top-level `def` was caught
+            # (@john-the-dev, #2622). `class_body` and the `func_*` pair ride
+            # along too — otherwise a branch inside a class body would re-leak
+            # the class namespace into its methods, the defect fixed one round
+            # earlier.
+            w = _ScopeWalk(self.env, self.out, self.ever_unsafe,
+                           class_body=self.class_body)
+            w.func_env = dict(self.func_env)
+            w.func_unsafe = set(self.func_unsafe)
             w.run(body)
             for k, v in w.env.items():
                 merged[k] = merged.get(k, False) or v

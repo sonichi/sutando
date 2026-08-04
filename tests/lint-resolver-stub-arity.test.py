@@ -242,6 +242,53 @@ class P:
         wd.resolve_workspace = _fake
 """) == [], "the method's unqualified _fake resolves the SAFE module global")
 
+    # --- a control-flow block is the SAME scope ------------------------------
+    # @john-the-dev, #2622. The branch walker built a bare `_ScopeWalk(env, out)`
+    # and dropped `ever_unsafe`, so a `def` nested under control flow lost the
+    # module's late bindings — unflagged, while the identical top-level `def`
+    # was caught. Real runtime semantics: when the branch executes, the function
+    # reads `_fake` at CALL time, after the zero-arg binding.
+    _nested = """
+%s
+    def patch():
+        wd.resolve_workspace = _fake
+_fake = lambda: tmp
+patch()
+"""
+    for _lead in ("if cond:", "for x in xs:", "while cond:", "with open(f) as g:"):
+        check(f"deferred scope under `{_lead}` still sees module late-binding",
+              viols(_nested % _lead) != [], "control-flow block is the same scope")
+
+    check("deferred scope under try/except still sees it",
+          viols("""
+try:
+    def patch():
+        wd.resolve_workspace = _fake
+except Exception:
+    pass
+_fake = lambda: tmp
+""") != [])
+
+    # Counter-cases: the fix must not flag a safe binding, and must not re-leak
+    # the class namespace through the branch path (the round-5 defect).
+    check("SAFE: absorbing lambda under a branch is not flagged",
+          viols("""
+if cond:
+    def patch():
+        wd.resolve_workspace = _fake
+_fake = lambda *a, **kw: tmp
+""") == [])
+
+    check("SAFE: a class attr inside a branch still does not reach its method",
+          viols("""
+_fake = lambda *a, **kw: tmp
+if cond:
+    class P:
+        _fake = lambda: tmp
+        def patch(self):
+            wd.resolve_workspace = _fake
+""") == [], "branch path must not re-leak the class namespace")
+
     # A class namespace encloses NOTHING nested in it — not just methods. An
     # inner class does not see the outer class's attributes either
     # (@john-the-dev, #2622, the surface after the method one).
