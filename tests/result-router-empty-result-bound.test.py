@@ -36,6 +36,27 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+# MODULE LEVEL, and before any bridge import: the bridges resolve channel config
+# during exec_module, so a test that inherits the developer's CLAUDE_CONFIG_DIR
+# reads their real per-user channel allowlist. Plain assignment, not setdefault —
+# setdefault is a no-op precisely on the operator box where it matters. Enforced
+# by scripts/lint-hermetic-bridge-tests.py, which this file tripped when the
+# execution block below was first added with only a token env var set.
+_CCD = tempfile.mkdtemp(prefix="ccd-empty-result-bound-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CCD
+os.environ["TELEGRAM_BOT_TOKEN"] = "test-token-not-real"
+
+# Pointing CLAUDE_CONFIG_DIR at an EMPTY dir is not isolation: channel_access_path()
+# falls back to the legacy real-home ~/.claude/channels/<ch>/access.json when the
+# canonical file is missing, so the operator's allowlist is still what gets read.
+# Seed both channels this file names — the lint detects `discord` too, from the
+# source-grep loop below. Written out rather than looped so the seed is a plain
+# module-level write.
+(pathlib.Path(_CCD) / "channels" / "telegram").mkdir(parents=True, exist_ok=True)
+(pathlib.Path(_CCD) / "channels" / "telegram" / "access.json").write_text('{"allowFrom": []}')
+(pathlib.Path(_CCD) / "channels" / "discord").mkdir(parents=True, exist_ok=True)
+(pathlib.Path(_CCD) / "channels" / "discord" / "access.json").write_text('{"allowFrom": []}')
+
 from result_router import (  # noqa: E402
     EMPTY_RESULT_POLL_THRESHOLD,
     empty_result_notice,
@@ -127,11 +148,15 @@ def main() -> int:
     #
     # (This comment used to add "the telegram copy could not be covered by
     # execution — the repo's convention is to assert on telegram-bridge at
-    # source level, not import it." That was wrong on both halves:
-    # tests/telegram-bridge-progress-stream.test.py imports it via importlib,
-    # and the execution block at the end of this file now does the same. A
-    # rationale for NOT testing something has to be re-checked before it is
-    # inherited, or it quietly licenses the gap it describes.)
+    # source level, not import it." I first called that simply wrong, on the
+    # grounds that telegram-bridge-progress-stream.test.py imports it. Half
+    # right: importing IS allowed, but only with CLAUDE_CONFIG_DIR isolated at
+    # module level, and lint-hermetic-bridge-tests.py enforces exactly that —
+    # this file failed it the moment the execution block went in with only a
+    # token env var. So the old comment pointed at a real constraint while
+    # naming the wrong reason for it. Both errors are the same shape: I checked
+    # whether other tests import the bridge, and not whether a gate forbids it
+    # unisolated. The isolation now sits at the top of this file.)
     counters: dict = {}
     fired = [note_empty_result(counters, "t", P) for _ in range(T + 5)]
     announced = [f for f in fired if f is not None]
@@ -177,7 +202,6 @@ def main() -> int:
     import importlib.util
     import io
 
-    os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
     _spec = importlib.util.spec_from_file_location(
         "tgbridge_empty", REPO / "src" / "telegram-bridge.py")
     _tg = importlib.util.module_from_spec(_spec)
