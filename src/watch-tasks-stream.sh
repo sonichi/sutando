@@ -461,22 +461,24 @@ fallback_outstanding_handlers() {
 }
 
 cleanup() {
-  [ "$CLEANING_UP" -eq 0 ] || return
+  [ "${CLEANING_UP:-0}" -eq 0 ] || return
   CLEANING_UP=1
   # EXIT and signal traps share this function. Disarm EXIT before spawning
   # cleanup helpers so a subshell cannot recursively re-enter the trap.
   trap - EXIT
   trap '' TERM HUP INT
   rm -f "$PID_FILE"
-  if [ -n "$FSWATCH_PID" ]; then
+  if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi
-  fallback_outstanding_handlers
-  if [ -n "$WATCH_RUNTIME_DIR" ]; then
+  if declare -F fallback_outstanding_handlers >/dev/null; then
+    fallback_outstanding_handlers
+  fi
+  if [ -n "${WATCH_RUNTIME_DIR:-}" ]; then
     rm -f "$WATCH_RUNTIME_DIR/events"
     rmdir "$WATCH_RUNTIME_DIR" 2>/dev/null || true
   fi
-  if [ "$GROUP_TERM_SENT" -eq 0 ]; then
+  if [ "${GROUP_TERM_SENT:-0}" -eq 0 ]; then
     kill -TERM 0 2>/dev/null || true
   fi
 }
