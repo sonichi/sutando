@@ -21,9 +21,12 @@ included — so the test can assert on the actual envelope shape that
 goes over the wire.
 """
 
+import contextlib
+import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -315,19 +318,110 @@ def test_filename_crlf_quote_sanitized_in_header():
         bad_name_path.unlink(missing_ok=True)
 
 
+
+# --- live-workspace isolation -------------------------------------------------
+_LIVE_BASELINE: dict = {}
+
+
+def _workspace_fingerprint(ws) -> dict:
+    """(size, mtime) per file; CONTENT HASH under results/.
+
+    Whole-tree rather than an enumerated list of the paths this fixture is known
+    to touch — an assertion only catches what it looks at. Union-compared below
+    so a DELETION is visible too (#2619 shipped both lessons the hard way).
+    """
+    out = {}
+    if not ws.is_dir():
+        return out
+    for f in ws.rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            if "results" in f.parts:
+                out[str(f)] = ("sha", hashlib.sha256(f.read_bytes()).hexdigest())
+            else:
+                st = f.stat()
+                out[str(f)] = (st.st_size, st.st_mtime)
+        except OSError:
+            pass
+    return out
+
+
+@contextlib.contextmanager
+def _outbox_redirected():
+    """Send `outbox_log.append()` to a throwaway file for the duration.
+
+    `dm-result.py` late-imports `outbox_log` and appends after every successful
+    send, and `_outbox_path()` resolves `resolve_workspace()/state/outbox.log`
+    at CALL time — so untouched, this suite writes real rows into the owner's
+    live delivery audit log, the file the dashboard's Outbox card reads.
+
+    Patches the name in EVERY module holding it, not just where it is defined:
+    `from workspace_default import resolve_workspace` binds into the IMPORTER's
+    namespace, so patching only the source module leaves consumers pointing at
+    the original (#2619).
+
+    Restores in a `finally` so a mid-run failure cannot leave globals patched
+    for whatever runs next in the same interpreter (#2614).
+    """
+    import workspace_default
+
+    tmp = Path(tempfile.mkdtemp(prefix="multipart-outbox-test-"))
+    (tmp / "state").mkdir(parents=True, exist_ok=True)
+    orig = workspace_default.resolve_workspace
+    fake = lambda: tmp
+    patched = [m for m in list(sys.modules.values())
+               if getattr(m, "resolve_workspace", None) is orig]
+    for m in patched:
+        m.resolve_workspace = fake
+    workspace_default.resolve_workspace = fake
+    try:
+        yield tmp
+    finally:
+        workspace_default.resolve_workspace = orig
+        for m in patched:
+            m.resolve_workspace = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_no_writes_reach_the_live_workspace(live_ws) -> None:
+    """The baseline is taken by main() BEFORE any case runs, so this covers
+    every write the file triggers rather than only its own."""
+    now = _workspace_fingerprint(live_ws)
+    before = _LIVE_BASELINE
+    deleted = sorted(k for k in before if k not in now)
+    added = sorted(k for k in now if k not in before)
+    modified = sorted(k for k in (set(before) & set(now)) if before[k] != now[k])
+    assert not (deleted or added or modified), (
+        f"fixture escaped to the live workspace at {live_ws}: "
+        f"{len(deleted)} deleted, {len(modified)} modified, {len(added)} added — "
+        f"{(deleted + modified + added)[:4]}"
+    )
+    print(f"  ✓ live workspace untouched "
+          f"({len(set(before) | set(now))} paths compared, union of before+after)")
+
+
 def main():
-    test_allowlisted_file_uploaded_via_multipart()
-    print("  ✓ test_allowlisted_file_uploaded_via_multipart")
-    test_non_allowlisted_file_rejected_not_uploaded()
-    print("  ✓ test_non_allowlisted_file_rejected_not_uploaded")
-    test_file_only_message_with_empty_text()
-    print("  ✓ test_file_only_message_with_empty_text")
-    test_eleven_files_split_into_two_batches()
-    print("  ✓ test_eleven_files_split_into_two_batches")
-    test_filename_crlf_quote_sanitized_in_header()
-    print("  ✓ test_filename_crlf_quote_sanitized_in_header")
+    from workspace_default import resolve_workspace
+
+    global _LIVE_BASELINE
+    live_ws = resolve_workspace()
+    _LIVE_BASELINE = _workspace_fingerprint(live_ws)
+
+    with _outbox_redirected():
+        test_allowlisted_file_uploaded_via_multipart()
+        print("  ✓ test_allowlisted_file_uploaded_via_multipart")
+        test_non_allowlisted_file_rejected_not_uploaded()
+        print("  ✓ test_non_allowlisted_file_rejected_not_uploaded")
+        test_file_only_message_with_empty_text()
+        print("  ✓ test_file_only_message_with_empty_text")
+        test_eleven_files_split_into_two_batches()
+        print("  ✓ test_eleven_files_split_into_two_batches")
+        test_filename_crlf_quote_sanitized_in_header()
+        print("  ✓ test_filename_crlf_quote_sanitized_in_header")
+    test_no_writes_reach_the_live_workspace(live_ws)
     print("All dm-result multipart-upload tests passed.")
 
 
 if __name__ == "__main__":
-    main()
+        main()
