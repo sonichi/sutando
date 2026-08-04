@@ -22,10 +22,13 @@ are you waiting for".
 Labelled rather than inlined, matching how forwards are handled two functions up:
 attributing a quoted message to the replier is its own misreading.
 """
+import contextlib
 import importlib.util
+import io
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "discord-read.py"
@@ -97,6 +100,71 @@ class ReplyContext(unittest.TestCase):
                    "message_snapshots": [{"message": {"content": "the forwarded substance"}}]}}
         ctx = dr._reply_context(msg)
         self.assertIn("the forwarded substance", ctx)
+
+
+class ReplyContextReachesStdout(unittest.TestCase):
+    """End-to-end through `main()` — the render loop, not just the helper.
+
+    The helper tests above prove `_reply_context` returns the right string.
+    They would ALL still pass against a reader whose print loop never called
+    it, which is precisely the shape of the bug this PR fixes: the production
+    failure was a missing line in the loop, not a wrong helper. Mirrors the
+    same end-to-end block in `discord-read-forwarded.test.py`, which exists
+    for that identical reason.
+    """
+
+    REPLY = {
+        "id": "2", "timestamp": "2026-08-04T01:24:28.000000+00:00",
+        "author": {"username": "sonichi"}, "content": "2 merge",
+        "referenced_message": {"author": {"username": "Sutando-Mini"},
+                               "content": "**2 — holding, and here's why.**"},
+    }
+    PLAIN = {
+        "id": "1", "timestamp": "2026-08-04T01:20:00.000000+00:00",
+        "author": {"username": "sonichi"}, "content": "an ordinary message",
+    }
+
+    @contextlib.contextmanager
+    def _run(self, messages):
+        buf = io.StringIO()
+        with mock.patch.object(dr, "_load_token", lambda env: "test-token"), \
+             mock.patch.object(dr, "_fetch",
+                               lambda extra, channel_id, page, headers: list(messages)), \
+             contextlib.redirect_stdout(buf):
+            rc = dr.main(["1507725277630042122"])
+        yield rc, buf.getvalue()
+
+    def test_the_reply_line_reaches_stdout(self):
+        """THE pin for the CLI print branch. A reader that builds the context
+        and never prints it is indistinguishable from one that has no context
+        at all — from the caller's side, which is the side that matters."""
+        with self._run([self.REPLY, self.PLAIN]) as (rc, out):
+            self.assertEqual(rc, 0, out)
+            self.assertIn("replying to Sutando-Mini", out)
+            self.assertIn("holding", out)
+
+    def test_the_context_is_indented_under_its_own_message(self):
+        """Shape, not just presence: the context must be the indented line
+        directly beneath the message it belongs to. With two messages in the
+        page, a context attached to the wrong one still contains the right
+        text — so asserting only `in out` cannot catch a misplacement."""
+        with self._run([self.REPLY, self.PLAIN]) as (rc, out):
+            lines = [l for l in out.splitlines() if l.strip()]
+        idx = next(i for i, l in enumerate(lines) if "2 merge" in l)
+        self.assertGreater(len(lines), idx + 1, f"no line follows the reply: {lines!r}")
+        ctx_line = lines[idx + 1]
+        self.assertTrue(ctx_line.startswith("    "),
+                        f"context line is not indented: {ctx_line!r}")
+        self.assertIn("replying to", ctx_line)
+
+    def test_an_ordinary_message_gets_no_extra_line(self):
+        """The FALSE side of the same branch. Without this, the branch is only
+        half-exercised and the common case could grow a stray blank line that
+        no test would notice."""
+        with self._run([self.PLAIN]) as (rc, out):
+            lines = [l for l in out.splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1, f"expected exactly one line, got {lines!r}")
+        self.assertNotIn("replying to", out)
 
 
 if __name__ == "__main__":
