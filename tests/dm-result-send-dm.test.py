@@ -31,11 +31,30 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Isolate the channel config BEFORE importing the bridge, and SEED it.
+#
+# This file used to write a fake DISCORD_BOT_TOKEN into the operator's real
+# `~/.claude/channels/discord/.env` whenever that file was absent. On a machine
+# that has the file the write is a no-op, which is why it survived — the damage
+# lands only on a host that has LOST its token, which is the host you least want
+# a fake one planted on. A fake token also satisfies startup.sh's
+# `grep -q "DISCORD_BOT_TOKEN="` and defeats the #2638 vault fallback, which
+# fires only when no `.env` value exists.
+#
+# Seeding matters as much as redirecting: `channel_access_path()` falls back to
+# the legacy real-home `access.json` when the canonical path is missing, so an
+# EMPTY temp config dir still reads the operator's live allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-dm-result-send-dm-")
+_ccd_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd_discord.mkdir(parents=True, exist_ok=True)
+(_ccd_discord / "access.json").write_text('{"allowFrom": []}')
+(_ccd_discord / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
+
 REPO = Path(__file__).resolve().parent.parent
 
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 
-_channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
+_channels_env = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / ".env"
 if not _channels_env.exists():
     _channels_env.parent.mkdir(parents=True, exist_ok=True)
     _channels_env.write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
