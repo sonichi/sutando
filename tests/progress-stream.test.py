@@ -330,6 +330,26 @@ with tempfile.TemporaryDirectory() as d:
     (ws / "tasks").mkdir()
     _db.STATE_DIR = ws / "state"
     _db.TASKS_DIR = ws / "tasks"
+
+    # ---- the 2026-08-04 step leak -------------------------------------------
+    # poll_progress renders core-status.json's `step` VERBATIM into whatever
+    # channel the owner's task arrived on. That gate asked who SENT the task
+    # (owner tier) and never who could READ the channel. An owner task in a
+    # third party's guild published
+    #   "⏳ Loop pass: draining queue, then #2596 re-review state (22s)"
+    # to everyone in it; the owner's reply was "Wrong channel" / "Not mine".
+    check("step_visible_in: DM yes", ps.step_visible_in(True) is True)
+    check("step_visible_in: guild no", ps.step_visible_in(False) is False)
+    _leak = "reading Chi's calendar for the Aug 6 dinner"
+    _priv = ps.format_progress(_leak if ps.step_visible_in(True) else None, 12)
+    _shar = ps.format_progress(_leak if ps.step_visible_in(False) else None, 12)
+    check("DM still shows the live step", _leak in _priv)
+    check("shared channel leaks NO fragment of the step",
+          _leak not in _shar and "calendar" not in _shar and "Chi" not in _shar)
+    # ...and the placeholder must STILL post — liveness is the whole feature, so
+    # this must not quietly become "no placeholder outside DMs".
+    check("shared channel still gets a contentless placeholder",
+          _shar.startswith("⏳") and "12s" in _shar)
     now = time.time()
 
     # _newest_alive_mtime
@@ -353,8 +373,16 @@ with tempfile.TemporaryDirectory() as d:
     # _render_progress_content — live core → normal progress copy
     (ws / "state" / "core-status.json").write_text(
         json.dumps({"status": "running", "step": "building", "ts": now - 10}))
-    out_live = _db._render_progress_content(now, 42)
+    # A DM may carry the live step...
+    out_live = _db._render_progress_content(now, 42, True)
     check("bridge: live core renders progress copy", out_live.startswith("⏳") and "building" in out_live and "(42s)" in out_live)
+    # ...and the DEFAULT is fail-closed. A caller that has not established the
+    # channel's audience gets a placeholder with no step in it. This is the
+    # 2026-08-04 leak: the step reached a third party's guild because the gate
+    # asked who SENT the task, never who could READ the channel.
+    out_shared = _db._render_progress_content(now, 42)
+    check("bridge: step suppressed when audience unknown",
+          out_shared.startswith("⏳") and "building" not in out_shared and "(42s)" in out_shared)
 
     # _render_progress_content — frozen status + only-stale heartbeats → outage copy
     (ws / "state" / "core-status.json").write_text(

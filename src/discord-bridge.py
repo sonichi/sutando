@@ -4644,16 +4644,27 @@ def _queued_task_count():
         return 0
 
 
-def _render_progress_content(now, elapsed):
+def _render_progress_content(now, elapsed, channel_is_private=False):
     """Placeholder body for poll_progress: the live core step normally, or the
     honest outage copy (frozen status + stale heartbeat + queue depth) when the
     core looks dead (sonichi#2398 — the 2026-07-30 'restart in flight (1625s)'
-    class: never narrate progress the core is not making)."""
+    class: never narrate progress the core is not making).
+
+    `channel_is_private` decides whether the STEP TEXT may be published here.
+    It DEFAULTS TO FALSE — fail-closed: a caller that has not established the
+    channel's audience must not publish the step. See
+    progress_stream.step_visible_in: the step is written for the owner, but this
+    placeholder goes to whatever channel his task arrived on — which may be a
+    shared guild owned by someone else. Outside a DM we still post the
+    placeholder (liveness is the point) with no step text."""
     status = progress_stream.read_core_status(STATE_DIR)
     if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):
         return progress_stream.format_outage(
             progress_stream.status_age_s(status, now), _queued_task_count())
-    return progress_stream.format_progress(progress_stream.current_step(status), elapsed)
+    step = progress_stream.current_step(status)
+    if not progress_stream.step_visible_in(channel_is_private):
+        step = None
+    return progress_stream.format_progress(step, elapsed)
 
 
 async def poll_progress():
@@ -4715,7 +4726,7 @@ async def poll_progress():
                     if progress_stream.should_edit(now, info["last_edit"]):
                         try:
                             await info["msg"].edit(
-                                content=_render_progress_content(now, elapsed)
+                                content=_render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                             )
                             info["last_edit"] = now
                         except Exception:
@@ -4745,7 +4756,7 @@ async def poll_progress():
                 if progress_stream.should_post_placeholder(elapsed):
                     try:
                         msg = await channel.send(
-                            _render_progress_content(now, elapsed)
+                            _render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                         )
                         _progress_msgs[task_id] = {
                             "msg": msg,
