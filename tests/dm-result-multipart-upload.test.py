@@ -409,7 +409,8 @@ def test_resolver_bindings_restored_after_the_context(tmp_root_prefix="multipart
     Asserts BOTH halves they asked for: identity restored, and the resolved
     path is outside the deleted temp root.
     """
-    import workspace_default, outbox_log
+    import outbox_log
+    import workspace_default
 
     assert outbox_log.resolve_workspace is workspace_default.resolve_workspace, (
         "outbox_log.resolve_workspace was NOT restored after _outbox_redirected() — "
