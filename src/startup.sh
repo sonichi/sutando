@@ -1075,6 +1075,11 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
    { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
    || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
   [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  # Tell the bridge where the durable token lives so auth-rejection recovery
+  # (revoked/expired key) can re-read it after the connect flow rewrites it —
+  # hot-swap instead of a supervisor crash-loop. Only when the file exists:
+  # env-only onboarding has no file to watch and keeps the FATAL-exit path.
+  [ -f "$_RELAY_ENV" ] && export REMOTE_TASK_TOKEN_FILE="$_RELAY_ENV"
   # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
   # legacy token may be the combined "url|secret" form, which the bridge splits.
   REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
@@ -1094,15 +1099,35 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # REMOTE_MEDIA_MARKER (e.g. from the channel .env) still wins.
   REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
-  if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
-    # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
-    # the redirect below); the bridge stamps launched_via into gateway-status
-    # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-    SUTANDO_SUPERVISED=1 python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
-    echo "  ✓ gateway bridge"
-  else
-    echo "  ✓ gateway bridge (already running)"
-  fi
+  # Always spawn; the bridge's own unsuffixed singleton lock self-defers a
+  # duplicate. The previous `pgrep -f remote-gateway-bridge` guard was a P1
+  # (john, PR review 2026-08-02): every named-instance bridge shares the SAME
+  # argv, so a live secondary satisfied the pgrep and suppressed restart of a
+  # DEAD primary indefinitely. Instance identity lives only in env, which
+  # pgrep cannot see — the lock (role `gateway-bridge`, per-instance suffixed)
+  # is the only process-identity source that can arbitrate this.
+  # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
+  # the redirect below); the bridge stamps launched_via into gateway-status
+  # and skips its own bare-launch file log. See remote_gateway_bridge._log.
+  SUTANDO_SUPERVISED=1 python3 "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+  echo "  ✓ gateway bridge (self-defers if already running)"
+
+  # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
+  # the environment launches one extra bridge for that gateway (e.g.
+  # AG2_REMOTE_TOKEN_DEV → instance "dev" against the dev homeserver). Each
+  # instance gets its own lock role + state files via GATEWAY_INSTANCE, and
+  # deliberately inherits NO REMOTE_PROACTIVE_ROOM — proactive nudges stay with
+  # the primary (owner-DM) gateway only.
+  # No pgrep dedupe here (env vars are invisible to pgrep -f): the bridge's own
+  # per-instance singleton lock (role gateway-bridge.<inst>) makes a duplicate
+  # launch self-defer and exit, so always-spawn is safe and simpler.
+  for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
+    _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
+    SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+      REMOTE_PROACTIVE_ROOM= \
+      python3 "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+    echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
+  done
 fi
 
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
