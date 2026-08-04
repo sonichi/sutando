@@ -32,6 +32,7 @@ Run manually:
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 import tempfile
@@ -74,6 +75,11 @@ BRIDGES = {
 # ---------------------------------------------------------------------------
 # Layer 1: structural checks (source-shape smoke check)
 # ---------------------------------------------------------------------------
+
+async def _async_noop(*a, **k):
+    """Awaitable no-op: the guard may await its bookkeeping (#2631)."""
+    return None
+
 
 class StructuralGuardTest(unittest.TestCase):
     def _check(self, name: str, path: Path) -> None:
@@ -214,20 +220,28 @@ class BehavioralRaceGuardTest(unittest.TestCase):
                 # (`result-router-empty-result-bound`, behavioural coverage in
                 # `discord-bridge-empty-result-wiring`). Stubbing bookkeeping does
                 # not weaken the assertion this file exists to make.
-                "_note_empty_result": lambda *a, **k: None,
+                "_note_empty_result": _async_noop,
                 "task_id": "task-harness",
             }
             # `for _tick in [0]:` sits on the line immediately before the
             # snippet's true start; blank-line padding before it keeps the
             # snippet's own lines aligned to their real file line numbers.
+            # ASYNC-CAPABLE WRAPPER. The guard may `await` (discord's bound
+            # calls an async handler that DMs the owner and drains the task —
+            # #2631), and `await` inside a plain `for` block is a SyntaxError.
+            # Wrapping in `async def` and driving it with asyncio.run keeps the
+            # snippet's own lines at their true file line numbers, which is what
+            # lets coverage.py credit this run to the real source.
             wrapped = (
-                "\n" * (start_line - 2)
-                + "for _tick in [0]:\n"
-                + "\n".join("    " + l for l in snippet.splitlines())
+                "\n" * (start_line - 3)
+                + "async def _snippet():\n"
+                + " for _tick in [0]:\n"
+                + "\n".join("  " + l for l in snippet.splitlines())
                 + "\n"
             )
             code = compile(wrapped, str(path), "exec")
             exec(code, ns)  # noqa: S102 — trusted, in-repo source only
+            asyncio.run(ns["_snippet"]())
             return bool(ns["_REACHED_PAST_GUARD"])
         finally:
             Path(result_path).unlink(missing_ok=True)
