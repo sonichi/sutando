@@ -248,6 +248,56 @@ def main() -> int:
         check("  ...and NOW says discovery returns nothing",
               "would return nothing" in r["detail"], r["detail"])
 
+        # (viii) A non-FileNotFound OSError is REPORTED, not skipped past. The
+        # loop continues on FileNotFoundError and JSONDecodeError to mirror
+        # `_read_manifest()`; anything else (permissions, EIO, a directory where
+        # a file should be) is a DIFFERENT failure — production would let it
+        # propagate out of `list_vault_keys()`, which is louder than "returns
+        # nothing" — so it must not be folded into the continue.
+        # A directory is the cheapest honest way to raise one: `read_text()`
+        # gives IsADirectoryError, an OSError that is neither of the two caught
+        # above. No monkeypatching, and a real state (a stray dir at the path).
+        # Flagged by CI diff-coverage as lines 5266-5267.
+        as_dir = tmp / "manifest-is-a-directory.json"
+        as_dir.mkdir()
+        r = hc.check_vault_manifest_integrity(as_dir, _probe(["K1"]))
+        check("a non-FileNotFound OSError is reported, not silently skipped",
+              r["status"] == "warn", repr(r))
+        check("  ...and says production RAISES rather than returning nothing",
+              "raises rather than returning nothing" in r["detail"], r["detail"])
+
+        # (ix) THE REAL KEYCHAIN CLOSURE, on any platform. Case (iii) exercises
+        # it only where `security` exists, so on Linux CI the closure body was
+        # never reached — CI diff-coverage flagged 5297-5298 for exactly that.
+        # The platform gap is the same one that made an earlier version of this
+        # file pin macOS wording and go red on Linux; here it hid a branch
+        # instead of failing one.
+        # Stub BOTH `shutil.which` (so the binary check passes) and
+        # `subprocess.run` (so nothing is executed), then assert the closure's
+        # returncode contract: 0 means the key resolves.
+        _which, _run = hc.shutil.which, hc.subprocess.run
+        calls = []
+
+        class _CP:
+            def __init__(self, rc): self.returncode = rc
+
+        def _fake_run(argv, **kw):
+            calls.append(argv)
+            return _CP(0 if argv[-1] == "BACKED" else 44)
+
+        hc.shutil.which = lambda n: "/usr/bin/security" if n == "security" else _which(n)
+        hc.subprocess.run = _fake_run
+        try:
+            r = hc.check_vault_manifest_integrity(_manifest(tmp, ["BACKED", "PHANTOM"]))
+        finally:
+            hc.shutil.which, hc.subprocess.run = _which, _run
+        check("the real keychain closure runs and shells out per key",
+              len(calls) >= 2 and calls[0][:2] == ["security", "find-generic-password"],
+              f"calls={calls[:2]}")
+        check("  ...returncode 0 means backed, non-zero means phantom",
+              r["status"] == "warn" and "PHANTOM" in r["detail"] and "1/2" in r["detail"],
+              repr(r))
+
         # --- the probe is registered, not just defined ---------------------
         src = (REPO / "src" / "health-check.py").read_text()
         check("registered in the check list",
