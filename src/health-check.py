@@ -1531,13 +1531,23 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
         )
         if proc.returncode != 0 or not proc.stdout.strip():
             return ""
-        # One `cat-file --batch-check` instead of one `git show` per commit. The
-        # first draft spawned 1 + N processes (13 here) on a path that runs every
-        # proactive pass for as long as the warning stands, which Sutando-Pro
-        # measured at 658 ms on their host (122 ms on mine — the cost is
-        # host-dependent, the spawn count is not). `--batch-check` reads sizes
-        # without materialising a single blob, so it is cheaper than `show` even
-        # before the process saving.
+        # One `cat-file --batch` instead of a `git show` per commit. The first
+        # draft spawned 1 + N processes (13 here) on a path that runs EVERY
+        # proactive pass for as long as the warning stands — 658 ms on
+        # Sutando-Pro's host, 122 ms on mine (wall time is host-dependent, the
+        # spawn count is not).
+        #
+        # `--batch`, not `--batch-check`: the sizes have to be measured in the
+        # SAME units as the live level, and that means having the CONTENT.
+        # `effective_bytes` comes from `_index_effective_text`, which strips
+        # frontmatter and whole-line HTML comments before the runtime measures
+        # its limit. Comparing a raw blob length against it is a unit mismatch:
+        # a revision whose bulk sits inside `<!-- ... -->` is huge raw and tiny
+        # effective, and the first draft of this helper reported
+        # "ALREADY EXCEEDED ... entries were dropped then" for exactly that
+        # shape — a FALSE claim of proven loss, in a note whose entire purpose
+        # is that the reported number describes the artifact.
+        # (john-the-dev and qingyun-wu each reproduced it independently on #2610.)
         stamps: "list[tuple[str, int]]" = []
         for line in proc.stdout.splitlines():
             sha, _, at = line.partition(" ")
@@ -1547,19 +1557,30 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
         if not stamps:
             return ""
         batch = subprocess.run(
-            git_argv("-C", str(repo), "cat-file", "--batch-check=%(objectsize)"),
-            input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps),
-            capture_output=True, text=True, timeout=10,
+            git_argv("-C", str(repo), "cat-file", "--batch"),
+            input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode(),
+            capture_output=True, timeout=20,
         )
         if batch.returncode != 0:
             return ""
-        sizes = batch.stdout.splitlines()
         points: "list[tuple[int, int]]" = []
-        for (sha, at), size in zip(stamps, sizes):
-            # a missing/ambiguous object prints "<spec> missing", not a number
-            if not size.strip().isdigit():
+        buf, idx = batch.stdout, 0
+        for sha, at in stamps:
+            nl = buf.find(b"\n", idx)
+            if nl < 0:
+                break
+            header = buf[idx:nl].decode("utf-8", "ignore").split()
+            idx = nl + 1
+            # a bad spec prints "<spec> missing" and no body
+            if len(header) < 3 or not header[-1].isdigit():
                 continue
-            points.append((at, int(size)))
+            size = int(header[-1])
+            body, idx = buf[idx:idx + size], idx + size + 1   # +1 trailing \n
+            # SAME decode + strip the live path uses (read_text(errors="ignore")
+            # then _index_effective_text), then encoded bytes — so peak and rate
+            # are in the units the cap is defined on.
+            eff = _index_effective_text(body.decode("utf-8", "ignore"))
+            points.append((at, len(eff.encode("utf-8"))))
         if len(points) < 2:
             return ""
         points.sort()

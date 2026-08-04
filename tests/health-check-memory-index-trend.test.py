@@ -148,6 +148,24 @@ class DefensiveBranches(unittest.TestCase):
             idx.write_text("x")
             self.assertEqual(m._index_growth_note(idx, 100), "")
 
+    def test_a_truncated_batch_stream_stops_cleanly(self):
+        """`--batch` output that ends mid-record (a killed git, a short pipe).
+        The walker must stop rather than index past the buffer."""
+        m = _hc()
+        state = {"first": True}
+
+        def fake_run(argv, **kw):
+            if state["first"]:
+                state["first"] = False
+                return self._Proc("aaa 1000\nbbb 2000\n")
+            return self._Proc(b"", 0)          # header never arrives
+
+        m.subprocess = type("S", (), {"run": staticmethod(fake_run),
+                                      "SubprocessError": Exception})
+        with tempfile.TemporaryDirectory() as td:
+            idx = Path(td) / "MEMORY.md"; idx.write_text("x")
+            self.assertEqual(m._index_growth_note(idx, 100), "")
+
     def test_an_object_cat_file_reports_missing_is_skipped(self):
         """`cat-file --batch-check` does NOT fail on a bad spec — it prints
         "<spec> missing" and exits 0. So the skip has to be driven by parsing
@@ -162,7 +180,7 @@ class DefensiveBranches(unittest.TestCase):
             if state["first"]:
                 state["first"] = False
                 return self._Proc("aaa 1000\nbbb 2000\n")
-            return self._Proc("aaa:./MEMORY.md missing\nbbb:./MEMORY.md missing\n", 0)
+            return self._Proc(b"aaa:./MEMORY.md missing\nbbb:./MEMORY.md missing\n", 0)
 
         m.subprocess = type("S", (), {
             "run": staticmethod(fake_run),
@@ -204,6 +222,50 @@ class DefensiveBranches(unittest.TestCase):
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
             self.assertEqual(m._index_growth_note(idx, 100), "")
+
+
+class HistoricalBytesUseTheSAMEUnitsAsTheLimit(unittest.TestCase):
+    """The blocker john-the-dev and qingyun-wu each reproduced independently.
+
+    `effective_bytes` — the live level — comes from `_index_effective_text`,
+    which strips frontmatter and whole-line HTML comments BEFORE the runtime
+    measures its 25KB cap. An earlier revision of the helper measured historical
+    revisions as RAW blob length, so a revision whose bulk sits inside
+    `<!-- ... -->` read as far over the cap while being tiny to the runtime, and
+    the note claimed "ALREADY EXCEEDED ... entries were dropped then".
+
+    A false claim of proven loss, in a note whose whole purpose is that the
+    reported number describes the artifact. This case fails on that revision.
+    """
+
+    def test_a_comment_only_over_cap_revision_is_not_reported_as_loss(self):
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        # raw: way over cap. effective: seven bytes.
+        fat = "<!--\n" + ("x" * (cap + 5000)) + "\n-->\n# live\n"
+        lean = "# live\n"
+        self.assertGreater(len(fat.encode()), cap)
+        self.assertLess(len(m._index_effective_text(fat).encode()), 200)
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "vault"; repo.mkdir()
+            _git(repo.parent, "init", "-q", str(repo))
+            _git(repo, "config", "user.email", "t@e"); _git(repo, "config", "user.name", "t")
+            idx = repo / "MEMORY.md"
+            import os
+            for i, text in enumerate((fat, lean)):
+                idx.write_text(text)
+                _git(repo, "add", "MEMORY.md")
+                d = f"2026-08-03T{i:02d}:00:00"
+                subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", f"c{i}", "--date", d],
+                               check=True, capture_output=True,
+                               env={**os.environ, "GIT_COMMITTER_DATE": d})
+            note = m._index_growth_note(idx, len(m._index_effective_text(lean).encode()))
+
+        self.assertNotIn("ALREADY EXCEEDED", note,
+                         "a comment-only revision is tiny to the runtime; claiming entries "
+                         "were dropped there is a false claim of proven loss")
+        self.assertNotIn("came within", note)
 
 
 if __name__ == "__main__":
