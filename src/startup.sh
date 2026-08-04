@@ -12,13 +12,34 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # agent-api.py on a respawn backoff, so each retry re-raised it. Measured on a
 # clean macOS 26.5 VM against Sutando 0.5.0-rc.2.
 #
-# $PY is empty when nothing runnable exists; every call site below must skip
-# rather than fall back to the bare name (that IS the stub).
+# $PY is empty when nothing runnable exists; no call site below may fall back to
+# the bare name (that IS the stub).
+#
+# This used to promise "Python-backed services will be skipped" and continue.
+# That promise could never be kept (CR #2599, @qingyun-wu): startup resolves the
+# WORKSPACE at :586 via `sutando-config.sh workspace`, which is Python, and every
+# Python-backed launch is downstream of it. So a no-interpreter run could not
+# reach a single one of those skip branches — under `set -e` it died at the first
+# required config lookup having just claimed it would carry on. Sutando has no
+# meaningful degraded mode without an interpreter: the workspace, host label,
+# core runtime and CLAUDE_CONFIG_DIR are all resolved through it.
+#
+# So fail once, here, with the fix — which still achieves this PR's actual goal.
+# The goal was never "start anyway"; it was "never execute the stub", because
+# executing it raises a ~19 GB modal that no exit-code check or 2>/dev/null can
+# suppress. An actionable message beats that dialog.
 . "$REPO/scripts/python-binary.sh"
 PY="$(resolve_python "$REPO")"
 if [ -z "$PY" ]; then
-  echo "  ~ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
-  echo "    Python-backed services will be skipped rather than raising the CLT dialog."
+  {
+    echo "✗ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
+    echo "  Sutando cannot start: the workspace, host label and core runtime are"
+    echo "  all resolved through Python. Not falling back to /usr/bin/python3 —"
+    echo "  on a Mac without the developer tools that is the Xcode-CLT stub, and"
+    echo "  running it raises the install dialog instead of an error."
+    echo "  Fix: brew install python — or set \$SUTANDO_PY to an interpreter."
+  } >&2
+  exit 1
 fi
 cd "$REPO"
 

@@ -157,8 +157,72 @@ fi
 # The startup message must not promise a skip the script does not perform.
 # NOTE: the first version of this block asked `grep -q "skipped (no runnable
 # python3)"` ONCE and then `break`, so a single skip branch anywhere satisfied
-# it for every service in the list — vacuous. The two guards below replace it
+# it for every service in the list — vacuous. The guards below replace it
 # with checks that are per-site and per-service.
+
+# ── 10c. ACTIVATED: what a clean Mac actually gets from `bash src/startup.sh`.
+# Every guard in this file above reads source. None of them drove startup
+# through its own config seams, which is how the contradiction below survived
+# three review rounds (CR #2599, @qingyun-wu):
+#
+#   startup.sh:57  _APP_NODE_DIR="$(bash scripts/sutando-config.sh app-node-dir)"
+#   startup.sh:586 WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
+#
+# Under `set -e` either one exiting non-zero terminates startup — at :57, right
+# after it printed that services "will be skipped". So run the real script under
+# a no-interpreter fixture and pin the OUTCOME, not the source.
+#
+# The fixture puts a fake `xcode-select` (exit 2 = no developer tools) ahead of
+# a real /usr/bin on PATH, so `command -v python3` finds the genuine system
+# python3 and the resolver must refuse it as the stub. `$HOME` is redirected so
+# the run cannot touch the developer's real state.
+startup_home=$(mktemp -d)
+startup_out=$(cd "$REPO" && env -u SUTANDO_PY -u VIRTUAL_ENV -u CONDA_PREFIX \
+  PATH="$noclt:/usr/bin:/bin" OSTYPE=darwin24 HOME="$startup_home" \
+  bash src/startup.sh 2>&1); startup_rc=$?
+
+if [ "$startup_rc" -ne 0 ]; then
+  ok "startup exits non-zero when no interpreter resolves (rc=$startup_rc)"
+else
+  bad "startup exits non-zero when no interpreter resolves" "rc=0 — it claimed success"
+fi
+
+# It must not die with the shell's opaque error, nor claim it will continue.
+case "$startup_out" in
+  *"command not found"*)
+    bad "startup fails with an actionable message" "opaque: $startup_out" ;;
+  *"will be skipped"*)
+    bad "startup does not promise to continue" "still promises a skip it cannot perform" ;;
+  *"no runnable python3"*)
+    ok "startup fails with an actionable message, not the shell's opaque error" ;;
+  *)
+    bad "startup fails with an actionable message" "unexpected: ${startup_out:-<empty>}" ;;
+esac
+
+# It must fail ONCE. The eager `require_python` fired this message per config
+# lookup; the point of failing at the top is that the operator sees one line.
+msg_count=$(printf '%s\n' "$startup_out" | grep -c "no runnable python3" || true)
+if [ "$msg_count" -eq 1 ]; then
+  ok "startup reports the missing interpreter exactly once"
+else
+  bad "startup reports the missing interpreter exactly once" "saw it $msg_count times"
+fi
+
+# And it must not have claimed ANY service started.
+if printf '%s' "$startup_out" | grep -q '✓'; then
+  bad "startup claims no service started" "printed: $(printf '%s' "$startup_out" | grep '✓' | tr '\n' ' ')"
+else
+  ok "startup claims no service started"
+fi
+
+# NOTE — a counting-the-execs case was drafted here and deliberately dropped: it
+# is unfalsifiable on a machine that HAS the developer tools. To make the
+# resolver see the system stub the fixture must put a real /usr/bin ahead of the
+# shim on PATH, which shadows the shim, so it can never be reached and the case
+# could only ever report zero. The exec invariant is already covered where it
+# CAN fail — the resolver cases above run against `mklab`'s logging stand-in and
+# have a working positive control ("a NON-system python is used even without
+# developer tools" proves that lab python does get executed when it should).
 
 # ── 11. A guarded background launch must not be followed by an unconditional ✓.
 # CR #2599 (@qingyun-wu) P1: four sites read
