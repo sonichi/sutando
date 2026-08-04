@@ -226,7 +226,8 @@ def fetch_argv(repo: str, owner_login: str) -> list:
     ]
 
 
-def scope_descriptor(repo: str, owner_login: str, record_count: int = None) -> dict:
+def scope_descriptor(repo: str, owner_login: str, record_count: int = None,
+                     fetched_count: int = None) -> dict:
     """Name the emitted population precisely, from the WHOLE pipeline.
 
     Why this exists: the payload carries counts, per-PR CI, approvals and merge
@@ -272,16 +273,31 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None) -> d
 
     # complete==True is a CERTIFICATION, so it is only ever granted on evidence:
     # a count strictly below the ceiling. Unknown count -> None, never True.
-    if record_count is None or limit is None:
+    #
+    # The count compared against the ceiling must be the PRE-filter FETCHED count
+    # (@john-the-dev's second blocker on #2645). The ceiling applies to
+    # `_fetch_prs()`; `raw_state()` then drops drafts, so the emitted count is
+    # strictly smaller. Certifying off the emitted count means one dropped draft
+    # at a truncated fetch reads as complete:
+    #
+    #     fetched=1000 (== ceiling, truncated)  ->  emitted=999  ->  "below the
+    #     1000 ceiling"  ->  complete=True, on a population GitHub had cut off.
+    #
+    # Exactly the defect this descriptor exists to remove, reintroduced by
+    # measuring the wrong side of the filter. `record_count` stays in the payload
+    # as the emitted size — it is what the consumer actually received — but it
+    # never decides completeness.
+    ceiling_count = fetched_count if fetched_count is not None else record_count
+    if ceiling_count is None or limit is None:
         complete = None
-        why = "record count or fetch ceiling unknown — completeness not certified"
-    elif record_count >= limit:
+        why = "fetched count or fetch ceiling unknown — completeness not certified"
+    elif ceiling_count >= limit:
         complete = False
-        why = (f"{record_count} records at a {limit} ceiling — complete and "
-               "truncated are indistinguishable here")
+        why = (f"fetch returned {ceiling_count} at a {limit} ceiling — complete "
+               "and truncated are indistinguishable here")
     else:
         complete = True
-        why = f"{record_count} records is below the {limit} fetch ceiling"
+        why = f"fetch returned {ceiling_count}, below the {limit} ceiling"
 
     return {
         "filter": f"author:{author}" if author else "none",
@@ -293,6 +309,7 @@ def scope_descriptor(repo: str, owner_login: str, record_count: int = None) -> d
         "complete": complete,
         "complete_reason": why,
         "record_count": record_count,
+        "fetched_count": ceiling_count,
         "limit": limit,
     }
 
@@ -396,8 +413,10 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     ap.add_argument("--state-file", default=None)
     args = ap.parse_args()
 
-    state = raw_state(_attach_commits(args.repo, _fetch_prs(args.repo, args.owner)),
-                      args.owner, args.stand)
+    # Bound separately so the PRE-filter size is available to scope_descriptor:
+    # the `--limit` ceiling applies here, before raw_state() drops drafts.
+    fetched = _attach_commits(args.repo, _fetch_prs(args.repo, args.owner))
+    state = raw_state(fetched, args.owner, args.stand)
     h = state_hash(state)
 
     # dedup: resolve the stored-hash file the same way every reader does
@@ -424,7 +443,10 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     print(json.dumps({
         "hash": h,
         "changed": True,
-        "scope": scope_descriptor(args.repo, args.owner, record_count=len(state)),
+        # fetched_count is the PRE-filter size: the ceiling applies to the fetch,
+        # not to what survives raw_state(). See scope_descriptor().
+        "scope": scope_descriptor(args.repo, args.owner, record_count=len(state),
+                                  fetched_count=len(fetched)),
         "prs": state,
     }, indent=2))
     try:

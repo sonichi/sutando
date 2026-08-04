@@ -402,6 +402,32 @@ def main() -> int:
     assert unknown["complete"] is None, unknown
     print("  ok  complete: True below ceiling, False AT it, None when uncountable")
 
+    # @john-the-dev's SECOND blocker on #2645, as his own repro: the ceiling
+    # applies to the FETCH, and raw_state() then drops drafts, so certifying off
+    # the emitted count lets a truncated fetch read as complete. His numbers:
+    #   fetched=1000 (== ceiling) -> one draft dropped -> emitted=999 -> complete=True
+    at_ceiling_with_a_draft = pf.scope_descriptor(
+        "o/n", "someowner", record_count=999, fetched_count=1000)
+    assert at_ceiling_with_a_draft["complete"] is False, at_ceiling_with_a_draft
+    assert "1000" in at_ceiling_with_a_draft["complete_reason"], at_ceiling_with_a_draft
+    # ...and the emitted size is still reported, it just does not decide the certificate.
+    assert at_ceiling_with_a_draft["record_count"] == 999, at_ceiling_with_a_draft
+    assert at_ceiling_with_a_draft["fetched_count"] == 1000, at_ceiling_with_a_draft
+    print("  ok  a truncated FETCH is not certified complete by a smaller emitted count")
+
+    # The mirror case: a genuinely short fetch still certifies, so the fix is not
+    # just "always refuse" — that would be a gate that cannot go positive.
+    short = pf.scope_descriptor("o/n", "someowner", record_count=30, fetched_count=31)
+    assert short["complete"] is True, short
+    print("  ok  a fetch below the ceiling still certifies complete")
+
+    # Back-compat: callers that pass only record_count keep the old meaning
+    # rather than silently losing their certificate.
+    legacy = pf.scope_descriptor("o/n", "someowner", record_count=30)
+    assert legacy["complete"] is True, legacy
+    assert legacy["fetched_count"] == 30, legacy
+    print("  ok  record_count-only callers still resolve a ceiling")
+
     # A non-numeric --limit must degrade to "ceiling unknown", never crash the
     # digest. scope_descriptor parses whatever argv actually carries, so a
     # future flag change (`--limit auto`, a templated value) reaches int() as a
