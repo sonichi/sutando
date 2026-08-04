@@ -28,6 +28,7 @@ comment there for why the racing version had to go.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 import tempfile
@@ -121,10 +122,16 @@ def main() -> int:
 
     # --- the COUNTER, which is policy and therefore shared -----------------
     # Counting lives in result_router rather than in each bridge: two verbatim
-    # copies of a five-line helper is still copied policy (CLAUDE.md), and the
-    # telegram copy could not be covered by execution — the repo's convention is
-    # to assert on telegram-bridge at source level, not import it. One
-    # implementation is covered once, here, for both.
+    # copies of a five-line helper is still copied policy (CLAUDE.md). One
+    # implementation, covered once here, for both.
+    #
+    # (This comment used to add "the telegram copy could not be covered by
+    # execution — the repo's convention is to assert on telegram-bridge at
+    # source level, not import it." That was wrong on both halves:
+    # tests/telegram-bridge-progress-stream.test.py imports it via importlib,
+    # and the execution block at the end of this file now does the same. A
+    # rationale for NOT testing something has to be re-checked before it is
+    # inherited, or it quietly licenses the gap it describes.)
     counters: dict = {}
     fired = [note_empty_result(counters, "t", P) for _ in range(T + 5)]
     announced = [f for f in fired if f is not None]
@@ -160,6 +167,47 @@ def main() -> int:
         check(f"  ...{bridge} still SKIPS rather than delivering the empty body",
               "if not reply_text:" in src and src.count("continue") > 0,
               "the partial-write guard was removed")
+
+    # --- EXECUTION: the delegation checks above are source greps ------------
+    # They prove the call is written; they never run it. diff-coverage put the
+    # telegram wrapper at 50% for exactly that reason, and a wrapper that
+    # delegates correctly but drops the notice on the floor would pass every
+    # assertion above while printing nothing an operator can see.
+    import contextlib
+    import importlib.util
+    import io
+
+    os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
+    _spec = importlib.util.spec_from_file_location(
+        "tgbridge_empty", REPO / "src" / "telegram-bridge.py")
+    _tg = importlib.util.module_from_spec(_spec)
+    try:
+        _spec.loader.exec_module(_tg)
+    except Exception as e:                                # pragma: no cover
+        check("telegram-bridge imports for the wrapper check", False, repr(e))
+        _tg = None
+
+    if _tg is not None:
+        _tg._empty_result_polls.clear()
+        # Below threshold the shared policy returns None -> nothing printed.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _tg._note_empty_result("task-cov", REPO / "nonexistent-result.txt")
+        check("wrapper stays silent while the policy is still counting",
+              buf.getvalue().strip() == "",
+              f"printed {buf.getvalue()!r} before the threshold")
+
+        # Drive it to the threshold: the policy returns a notice, and the
+        # wrapper's whole job is to surface that string.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            for _ in range(EMPTY_RESULT_POLL_THRESHOLD + 2):
+                _tg._note_empty_result("task-cov", REPO / "nonexistent-result.txt")
+        out = buf.getvalue()
+        check("wrapper PRINTS the notice the shared policy returns",
+              "task-cov" in out,
+              f"policy fired but the operator sees nothing; captured {out!r}")
+        _tg._empty_result_polls.clear()
 
     print()
     if FAILURES:
