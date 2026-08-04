@@ -238,7 +238,14 @@ if not TOKEN and channels_env.exists():
             TOKEN = line.split("=", 1)[1].strip()
 
 if not TOKEN:
-    print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env")
+    # Last resort: the Keychain vault. Before this, no bridge read it, so
+    # `vault set DISCORD_BOT_TOKEN` stored the value and changed nothing.
+    from channel_token import token_from_vault  # noqa: E402
+    TOKEN = token_from_vault("DISCORD_BOT_TOKEN")
+
+if not TOKEN:
+    print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env "
+          "and not in the vault (`vault set DISCORD_BOT_TOKEN`)")
     exit(1)
 
 TASKS_DIR = REPO / "tasks"
