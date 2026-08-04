@@ -64,7 +64,11 @@ def _install_mocks():
     b2b.load_token = lambda: "tok"
     b2b.load_access = lambda: ACCESS
     b2b.get_self_id = lambda token: MEMBER_SELF  # this bot is a channel member
-    b2b.post = lambda ch, txt, tok: _posted.update(channel=ch, text=txt) or {"id": "1"}
+    # `**kw` absorbs optional keyword args the real `post()` grows (e.g. the
+    # `overhead` hint the length guard passes). A fixed-arity mock turns any
+    # such addition into a TypeError in the TEST while production is fine —
+    # this exact stub broke that way when `overhead=` was added.
+    b2b.post = lambda ch, txt, tok, **kw: _posted.update(channel=ch, text=txt) or {"id": "1"}
 
 
 def _restore():
