@@ -226,8 +226,8 @@ def fetch_argv(repo: str, owner_login: str) -> list:
     ]
 
 
-def scope_descriptor(repo: str, owner_login: str) -> dict:
-    """What the emitted state DOES and does NOT cover, read off the real argv.
+def scope_descriptor(repo: str, owner_login: str, record_count: int = None) -> dict:
+    """Name the emitted population precisely, from the WHOLE pipeline.
 
     Why this exists: the payload carries counts, per-PR CI, approvals and merge
     state, and nothing in it marks the population as partial. A consumer that
@@ -236,23 +236,63 @@ def scope_descriptor(repo: str, owner_login: str) -> dict:
     non-draft PRs, and the SCOPE NOTE explaining why lives in this file, which the
     consumer never sees.
 
-    So the bound travels WITH the data. Derived from `fetch_argv()`, so removing
-    the filter changes this automatically rather than leaving a stale claim.
+    Three things narrow the population, and the descriptor is only honest if it
+    reports all three (@john-the-dev on #2645 -- the first version read ONLY the
+    `--author` flag, so with the filter removed it certified
+    `is_repo_total: true, excludes: "nothing"` while `raw_state()` still dropped
+    every draft and the fetch still capped at `--limit`. That is the same
+    completeness-metadata-disagrees-with-the-data-path defect this block exists
+    to remove, one level up):
+
+      1. `--author` on the fetch (may be absent)
+      2. `raw_state()` drops drafts UNCONDITIONALLY -- so the payload is NEVER a
+         repository total, with or without the author filter
+      3. `--limit` is a ceiling; at exactly the ceiling, complete and truncated
+         are indistinguishable
+
+    `is_repo_total` is gone rather than fixed: no value of it was ever true, so a
+    consumer keying on it would be reasoning about a population that cannot
+    exist. `population` names the real set and `complete` reports only what the
+    record count can actually certify.
     """
     argv = fetch_argv(repo, owner_login)
     author = argv[argv.index("--author") + 1] if "--author" in argv else None
-    limit = argv[argv.index("--limit") + 1] if "--limit" in argv else None
+    limit_s = argv[argv.index("--limit") + 1] if "--limit" in argv else None
+    try:
+        limit = int(limit_s) if limit_s is not None else None
+    except (TypeError, ValueError):
+        limit = None
+
+    excludes = ["draft PRs (dropped by raw_state, always)"]
+    if author:
+        excludes.append(
+            f"PRs not authored by {author!r} -- including peer PRs where the "
+            "owner's approval is the only thing blocking a merge"
+        )
+
+    # complete==True is a CERTIFICATION, so it is only ever granted on evidence:
+    # a count strictly below the ceiling. Unknown count -> None, never True.
+    if record_count is None or limit is None:
+        complete = None
+        why = "record count or fetch ceiling unknown — completeness not certified"
+    elif record_count >= limit:
+        complete = False
+        why = (f"{record_count} records at a {limit} ceiling — complete and "
+               "truncated are indistinguishable here")
+    else:
+        complete = True
+        why = f"{record_count} records is below the {limit} fetch ceiling"
+
     return {
         "filter": f"author:{author}" if author else "none",
-        "covers": (
-            f"open non-draft PRs authored by {author!r} only"
-            if author else "all open PRs in the repo"
+        "population": (
+            f"open, non-draft PRs authored by {author!r}"
+            if author else "open, non-draft PRs (all authors)"
         ),
-        "excludes": (
-            "PRs authored by anyone else -- including peer PRs where the owner's "
-            "approval is the only thing blocking a merge"
-        ) if author else "nothing",
-        "is_repo_total": author is None,
+        "excludes": excludes,
+        "complete": complete,
+        "complete_reason": why,
+        "record_count": record_count,
         "limit": limit,
     }
 
@@ -384,7 +424,7 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
     print(json.dumps({
         "hash": h,
         "changed": True,
-        "scope": scope_descriptor(args.repo, args.owner),
+        "scope": scope_descriptor(args.repo, args.owner, record_count=len(state)),
         "prs": state,
     }, indent=2))
     try:

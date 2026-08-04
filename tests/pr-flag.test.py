@@ -364,28 +364,43 @@ def main() -> int:
     # nothing marking the population as partial, so a consumer reads its length
     # as a repo total. On 2026-08-04 a digest reported "31 open" for a repo with
     # ~100 open non-draft PRs. Issue #2643.
-    sc = pf.scope_descriptor("o/n", "someowner")
+    sc = pf.scope_descriptor("o/n", "someowner", record_count=30)
     assert sc["filter"] == "author:someowner", sc
-    assert sc["is_repo_total"] is False, sc
-    assert "someowner" in sc["covers"], sc
-    assert "approval" in sc["excludes"], sc
-    print("  ok  scope_descriptor names the author filter and denies repo-total")
+    assert "someowner" in sc["population"], sc
+    assert any("approval" in e for e in sc["excludes"]), sc
+    print("  ok  scope_descriptor names the author filter and the population")
 
-    # The anti-drift property, and the reason this is derived rather than written:
-    # a hand-maintained string would keep claiming author-scoping after someone
-    # widens the fetch. Drop --author from the argv and the descriptor must FLIP.
+    # Draft exclusion is UNCONDITIONAL — raw_state() drops drafts whether or not
+    # the fetch is author-filtered, so it must appear in `excludes` either way.
+    assert any("draft" in e for e in sc["excludes"]), sc
+
     real_argv = pf.fetch_argv
     try:
         pf.fetch_argv = lambda repo, owner: [
             "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
         ]
-        widened = pf.scope_descriptor("o/n", "someowner")
-        assert widened["is_repo_total"] is True, widened
+        widened = pf.scope_descriptor("o/n", "someowner", record_count=30)
+        # The anti-drift property: removing --author must change the claim...
         assert widened["filter"] == "none", widened
-        assert widened["excludes"] == "nothing", widened
-        print("  ok  descriptor FOLLOWS the argv — removing --author flips it to repo-total")
+        assert "all authors" in widened["population"], widened
+        # ...but it must NOT become a repository total. This is @john-the-dev's
+        # blocker on #2645: the first version certified `excludes: "nothing"` here
+        # while raw_state() still dropped every draft.
+        assert any("draft" in e for e in widened["excludes"]), widened
+        assert "is_repo_total" not in widened, "the field that could never be true is gone"
+        print("  ok  no-author argv widens the population but STILL excludes drafts")
     finally:
         pf.fetch_argv = real_argv
+
+    # Completeness is a certification, granted only on evidence.
+    at_ceiling = pf.scope_descriptor("o/n", "someowner", record_count=1000)
+    assert at_ceiling["complete"] is False, at_ceiling
+    assert "indistinguishable" in at_ceiling["complete_reason"], at_ceiling
+    below = pf.scope_descriptor("o/n", "someowner", record_count=999)
+    assert below["complete"] is True, below
+    unknown = pf.scope_descriptor("o/n", "someowner", record_count=None)
+    assert unknown["complete"] is None, unknown
+    print("  ok  complete: True below ceiling, False AT it, None when uncountable")
 
     # And the fetch itself must actually use that argv, or the descriptor
     # describes a command that isn't the one being run.
