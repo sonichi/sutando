@@ -214,8 +214,21 @@ class TestUnrecognizedValueFailsClosed(unittest.TestCase):
         self.assertNotIn(value, result.text)
         self.assertEqual(result.stored, [])
         self.assertEqual(result.failed, ["PR_TRIAGE_ACTIVITY_SECRET"])
-        self.assertIn("unrecognized value", result.text)
-        self.assertIn("resend quoted", result.text.lower())
+        # Assert the PROPERTIES the refusal must carry, not its exact wording —
+        # the previous version pinned the literal phrases "unrecognized value"
+        # and "resend quoted", so any rewording broke the test without any
+        # behaviour changing, which is a test that guards prose instead of
+        # contract. What must never regress is that the owner is told all three
+        # of: it was not stored, the value is GONE, and quoting is the fix.
+        low = result.text.lower()
+        self.assertIn("not stored", low, "must say it was not stored")
+        self.assertTrue(
+            any(w in low for w in ("discard", "gone", "not kept", "gone anywhere")),
+            f"must say the VALUE IS GONE — the destructive half. Without it the "
+            f"refusal reads as a harmless no-op and the owner does not know they "
+            f"have to fetch the secret again. Got: {result.text!r}",
+        )
+        self.assertIn("quot", low, "must tell the owner that quoting is the fix")
 
     def test_pa_prefixed_key_not_leaked(self):
         value = "pa-1234567890abcdefghijklmnopqrstuvwx"
