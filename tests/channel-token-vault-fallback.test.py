@@ -28,6 +28,29 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+# Isolate the channel config BEFORE any bridge is imported. `channel_access_path()`
+# falls back to the LEGACY real-home `~/.claude/channels/<ch>/access.json` when the
+# canonical path is missing, so clearing the token env var alone is NOT isolation —
+# the bridge still reads the operator's real allowlist. Caught here by
+# `scripts/lint-hermetic-bridge-tests.py`: an earlier revision of this file set
+# CLAUDE_CONFIG_DIR inside the loader function, which is invisible to the lint AND
+# left the legacy fallback reachable (the run printed the [util_paths] DEPRECATION
+# banner naming the operator's real path — the hole announcing itself).
+# Seeded with LITERAL channel names, not a loop: the lint resolves path segments
+# statically, and a loop variable is not a literal it can prove. Writing the file
+# matters as much as setting the var — an EMPTY temp config dir still sends
+# `channel_access_path()` down the legacy fallback.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-vault-fallback-")
+_cfg_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_cfg_discord.mkdir(parents=True, exist_ok=True)
+(_cfg_discord / "access.json").write_text('{"allowFrom": []}')
+_cfg_slack = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_cfg_slack.mkdir(parents=True, exist_ok=True)
+(_cfg_slack / "access.json").write_text('{"allowFrom": []}')
+_cfg_telegram = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
+_cfg_telegram.mkdir(parents=True, exist_ok=True)
+(_cfg_telegram / "access.json").write_text('{"allowFrom": []}')
+
 ct = importlib.import_module("channel_token")
 
 FAILURES: list[str] = []
@@ -63,8 +86,10 @@ def _load_bridge_starved(filename: str, mod_name: str, wants: list[str], stubs: 
         asked.append(var) or (f"vault-{var}" if vault_value is None else vault_value))
 
     saved_mods = {k: sys.modules.get(k) for k in ("channel_token", *stubs)}
-    saved_env = {k: os.environ.get(k) for k in (*wants, "CLAUDE_CONFIG_DIR", "SUTANDO_TEST_MODE")}
-    tmp = tempfile.mkdtemp(prefix="starved-")
+    saved_env = {k: os.environ.get(k) for k in (*wants, "SUTANDO_TEST_MODE")}
+    # CLAUDE_CONFIG_DIR is isolated at MODULE level (see the top of this file) —
+    # deliberately not re-pointed per call: the lint only recognises module-level
+    # isolation, and one temp root that is seeded once is easier to reason about.
     try:
         sys.modules["channel_token"] = fake_ct
         for s in stubs:
@@ -99,7 +124,6 @@ def _load_bridge_starved(filename: str, mod_name: str, wants: list[str], stubs: 
                 sys.modules["slack_bolt.adapter.socket_mode"] = sm
         for v in wants:
             os.environ.pop(v, None)
-        os.environ["CLAUDE_CONFIG_DIR"] = tmp
         os.environ["SUTANDO_TEST_MODE"] = "1"
         spec = importlib.util.spec_from_file_location(mod_name, REPO / "src" / filename)
         mod = importlib.util.module_from_spec(spec)
