@@ -270,7 +270,12 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
 
     other = fixture_workspace()
     (other / "state" / "core-status.json").write_text('{"status":"running"}\n')
-    blocked = workstreams.maybe_enqueue_classifier_task(other)
+    with mock.patch.object(
+        workstreams,
+        "build_classifier_snapshot",
+        side_effect=AssertionError("busy maintenance must not scan task history"),
+    ):
+        blocked = workstreams.maybe_enqueue_classifier_task(other)
     assert blocked.pending and not blocked.enqueued and blocked.reason == "core-busy"
     assert not list((other / "tasks").glob("task-workstream-grouping-*.txt"))
 

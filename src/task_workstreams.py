@@ -619,6 +619,11 @@ def classifier_status(
 ) -> ClassifierQueueResult:
     """Report whether the current snapshot needs classification without writing."""
     workspace = Path(workspace)
+    # The agent-api maintenance loop calls this every 30 seconds.  Core status
+    # is one small JSON read; archive reconstruction can take seconds on a
+    # mature workspace, so never pay that cost while the core is already busy.
+    if not core_is_idle(workspace):
+        return ClassifierQueueResult(True, False, "core-busy")
     snapshot = build_classifier_snapshot(workspace, limit=limit)
     snapshot_hash = snapshot["snapshot_hash"]
     if not snapshot["tasks"]:
@@ -636,8 +641,6 @@ def classifier_status(
             return ClassifierQueueResult(
                 True, False, "already-queued", snapshot_hash, str(state.get("task_id") or "")
             )
-    if not core_is_idle(workspace):
-        return ClassifierQueueResult(True, False, "core-busy", snapshot_hash)
     if _has_active_user_task(workspace):
         return ClassifierQueueResult(True, False, "active-user-task", snapshot_hash)
     return ClassifierQueueResult(True, False, "ready", snapshot_hash)
