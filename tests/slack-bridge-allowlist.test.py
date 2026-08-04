@@ -108,7 +108,14 @@ def main() -> int:
     is_path_sendable = mod._is_path_sendable
     workspace = Path(mod.REPO)
 
-    # Set up test fixtures inside the temp workspace
+    # Fixtures go in the LIVE workspace, because that is where the allowlist
+    # roots are: `_is_path_sendable` resolves against `resolve_workspace()`, so a
+    # file under a tmpdir is not sendable and the "allowed" cases cannot be tested
+    # at all. Given that, the fixture NAMES must be unique — a fixed `ok.md` both
+    # collides with any real owner file of that name and makes cleanup a deletion
+    # hazard (john-the-dev, #2614: pre-seeding `notes/ok.md` with owner bytes and
+    # running main() destroyed it). `mkstemp` gives a name nothing else can hold,
+    # so there is no owner state to overwrite and none to restore.
     notes_dir = workspace / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
     docs_dir = workspace / "docs"
@@ -117,10 +124,24 @@ def main() -> int:
     results_dir.mkdir(parents=True, exist_ok=True)
     inbox_dir = workspace / "slack-inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
-    allowed_file = notes_dir / "ok.md"
+
+    _fd, _p = tempfile.mkstemp(prefix="allowlist-test-", suffix=".md", dir=str(notes_dir))
+    os.close(_fd)
+    allowed_file = Path(_p)
     allowed_file.write_text("ok")
-    inbox_file = inbox_dir / "downloaded.png"
+    _fd, _p = tempfile.mkstemp(prefix="allowlist-test-", suffix=".png", dir=str(inbox_dir))
+    os.close(_fd)
+    inbox_file = Path(_p)
     inbox_file.write_text("binary")
+
+    # Regression for the deletion hazard: whatever lives at the two names the
+    # old fixtures hard-coded must be byte-identical when this test finishes —
+    # including the case where the owner genuinely has a file there. Recorded
+    # BEFORE the run, asserted after; nothing is created, so an absent path
+    # must stay absent.
+    _guarded = {}
+    for _name in (notes_dir / "ok.md", inbox_dir / "downloaded.png"):
+        _guarded[_name] = _name.read_bytes() if _name.is_file() else None
 
     # /tmp/sutando-* allowed-prefix fixture. dir="/tmp" forces real /tmp
     # — without it macOS tempfile uses $TMPDIR (/var/folders/...), which
@@ -173,6 +194,32 @@ def main() -> int:
                 symlink_path.unlink()
             except FileNotFoundError:
                 pass
+
+    # Remove OUR OWN fixtures — unique mkstemp names, so this can only ever
+    # delete files this run created. `notes/` is a carrier path, so leaving them
+    # would let the next `sync-workspace` commit test artifacts into the vault.
+    # The symlink case above already unlinks in a `finally`; this is the same
+    # discipline for the two fixtures that were missing it.
+    for _leftover in (allowed_file, inbox_file):
+        try:
+            _leftover.unlink()
+        except FileNotFoundError:
+            pass
+
+    # …and prove we touched nothing the owner had at the hard-coded names.
+    for _name, _orig in _guarded.items():
+        _now = _name.read_bytes() if _name.is_file() else None
+        if _now != _orig:
+            print(
+                f"FAIL: pre-existing owner file changed: {_name} "
+                f"({'absent' if _orig is None else f'{len(_orig)} B'} -> "
+                f"{'absent' if _now is None else f'{len(_now)} B'})",
+                file=sys.stderr,
+            )
+            failed += 1
+        else:
+            print(f"  OK: left {_name.name} untouched "
+                  f"({'absent' if _orig is None else 'pre-existing, byte-identical'})")
 
     if failed:
         print(f"\nFAIL: {failed} case(s) failed", file=sys.stderr)
