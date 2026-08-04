@@ -1084,10 +1084,14 @@ class _ScopeWalk:
     without letting an unrelated scope decide the verdict.
     """
 
-    def __init__(self, env: "dict[str, bool]", out: "list[tuple[int, str]]") -> None:
+    def __init__(self, env: "dict[str, bool]", out: "list[tuple[int, str]]",
+                 inherited: "set[str] | None" = None) -> None:
         self.env = dict(env)
         self.out = out
-        self.ever_unsafe: "set[str]" = set()
+        # Names an ENCLOSING scope ever binds unsafely. Carried down so a method
+        # defined inside a class still gets late-binding treatment, even though
+        # the class body itself does not.
+        self.ever_unsafe: "set[str]" = set(inherited or ())
 
     def run(self, body: "list[ast.stmt]") -> None:
         self.ever_unsafe |= _unsafe_names_in_scope(body)
@@ -1095,15 +1099,23 @@ class _ScopeWalk:
             self.visit(stmt)
 
     def visit(self, node: ast.stmt) -> None:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            # A nested scope's body runs LATER, so a global it reads resolves at
-            # CALL time — a binding written after the `def` still reaches it.
-            # Snapshotting the env here would miss that, so any name bound to a
-            # zero-arg lambda ANYWHERE in this scope is unsafe inside the nest.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A function body runs LATER, so a global it reads resolves at CALL
+            # time — a binding written after the `def` still reaches it. No
+            # definition-point snapshot can see that, so any name this scope
+            # ever binds to a zero-arg lambda is unsafe inside the nest.
             inner = dict(self.env)
             for nm in self.ever_unsafe:
                 inner[nm] = True
-            _ScopeWalk(inner, self.out).run(node.body)
+            _ScopeWalk(inner, self.out, self.ever_unsafe).run(node.body)
+            return
+        if isinstance(node, ast.ClassDef):
+            # A class body executes IMMEDIATELY, at this statement — it is not
+            # deferred like a function body, so definition-point state is exact
+            # and the late-binding widening above would be a false positive
+            # (@john-the-dev, #2622). Methods defined inside it are still
+            # deferred, so `ever_unsafe` is carried down for them.
+            _ScopeWalk(self.env, self.out, self.ever_unsafe).run(node.body)
             return
         if isinstance(node, ast.Assign):
             self._assign(node)

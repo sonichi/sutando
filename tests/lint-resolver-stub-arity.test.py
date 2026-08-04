@@ -214,6 +214,28 @@ _fake = lambda: tmp
 patch()
 """) != [], "the def precedes the binding, but the body runs after it")
 
+    # --- a class body is NOT deferred ---------------------------------------
+    # @john-the-dev on #2622: the late-binding rule was applied to ClassDef too,
+    # but a class body executes IMMEDIATELY at its statement, so definition-point
+    # state is exact there and widening it is a false positive.
+    check("a class body executes NOW, so a later outer binding cannot reach it",
+          viols("""
+_fake = lambda *a, **kw: tmp
+class Patch:
+    wd.resolve_workspace = _fake
+_fake = lambda: tmp
+""") == [], "the assignment was safe when it ran")
+
+    # ...and the counter-case that stops the cheap fix. Simply excluding ClassDef
+    # from late-binding would also lose it for METHODS, whose bodies ARE deferred.
+    check("a METHOD inside a class is still late-bound",
+          viols("""
+class P:
+    def patch(self):
+        wd.resolve_workspace = _fake
+_fake = lambda: tmp
+""") != [], "the method body runs after the outer binding, so it must flag")
+
     # The discriminating counter-case: if/else covers every path, so a safe
     # rebinding in BOTH branches really does supersede. Without this, the fix
     # above could be 'flag whenever any unsafe binding exists in the scope',
