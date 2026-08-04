@@ -51,7 +51,15 @@ _CFG = tempfile.mkdtemp(prefix="slack-claim-gate-ccd-")
 os.environ["CLAUDE_CONFIG_DIR"] = _CFG
 os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
 os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-not-real")
-(Path(_CFG) / "channels" / "slack").mkdir(parents=True, exist_ok=True)
+_slack_cfg = Path(_CFG) / "channels" / "slack"
+_slack_cfg.mkdir(parents=True, exist_ok=True)
+# Seed the canonical access.json BEFORE the import. Creating the directory is not
+# enough: `channel_access_path()` falls back to the real home when the canonical
+# file is absent, so an env override alone still reads the developer's live
+# allowlist. `lint-hermetic-bridge-tests` requires both, and it caught exactly
+# this omission on the first CI run of this PR — the anti-pollution lint catching
+# an anti-pollution test, which is the system working.
+(_slack_cfg / "access.json").write_text(json.dumps({"allowFrom": []}))
 
 for name in ("slack_bolt", "slack_bolt.adapter", "slack_bolt.adapter.socket_mode",
              "slack_sdk", "slack_sdk.errors"):
