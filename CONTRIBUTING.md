@@ -193,6 +193,32 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    - **Bot verify (tests)**: the test you ran (or added) + the pass/fail outcome, ideally **fails-before / passes-after** for bug-fixes. ("`pytest tests/foo.py::test_repro` fails at `2e79ec7` and passes at HEAD.")
    The reviewer should not have to re-derive that your change works.
 2. Check the CLA status — CLA-Assistant runs on PR open and flags any commits whose author email isn't mapped to a CLA-signed GitHub account. **A failing CLA check blocks merge**, no matter how green everything else is. Fix with `git config user.email YOUR_GH_MAPPED_EMAIL && git commit --amend --reset-author --no-edit && git push --force-with-lease`. (`git log -1 --format='%ae'` to check what's there now.)
+
+   **`license/cla` FAILING and `license/cla` ABSENT are different problems with different fixes.** The remedy above is for a check that ran and said no. Sometimes the check never posts at all — and because it is a *required* context, "never posted" reads as pending forever and the PR sits at `BLOCKED` with every other check green and both approvals in place. It is easy to misread as a review problem. Tell them apart by asking for the commit statuses directly, since an absent context simply does not appear in the PR's check list:
+
+   ```bash
+   gh pr view <N> --json headRefOid --jq .headRefOid \
+     | xargs -I{} gh api repos/<owner>/<repo>/commits/{}/status \
+         --jq '"state=\(.state) total=\(.total_count) contexts=" + ([.statuses[]?|.context]|join(","))'
+   # absent : state=pending total=0 contexts=
+   # present: state=success total=1 contexts=license/cla
+   ```
+
+   **If it is absent, close and reopen the PR.** Reopening fires `pull_request.reopened`, which CLA-Assistant does act on. Reviews are not dismissed — reopening is not a push — but it *does* re-trigger the full CI run, so expect a few minutes of pending checks afterward.
+
+   **Give it a minute or two before concluding it failed.** The status is posted asynchronously: on one PR it was still `total=0` immediately after reopening and `license/cla=success` on the next check. Re-running the command above is the way to tell; an immediate zero means nothing yet.
+
+   Note the corollary of the status being SHA-bound: **pushing to the branch after this drops the status again.** If you reopen to fix the CLA and then push a review fix, expect to be back where you started.
+
+   **When to expect it.** `license/cla` is a *commit status*, so it binds to one SHA. **Every push gives the PR a new head SHA that carries no CLA status**, which is what [`.github/workflows/cla-recheck-on-push.yml`](.github/workflows/cla-recheck-on-push.yml) exists to repair — it comments the `@cla-assistant check` trigger on each `synchronize`. That repair is not reliable, so a PR you have pushed to can end up permanently short of a required check.
+
+   **The model the evidence supports: the status is SHA-bound, and its delivery can fail on `opened` just as it can on the `synchronize` repair.** A push guarantees you need a *fresh* delivery, so pushed PRs are over-represented among the missing — but a push is not required for the status to be absent, and **close+reopen is a retry of a flaky delivery, not a push-specific fix.**
+
+   Three PRs on 2026-08-04 — `#2605`, `#2606`, `#2607` — were opened directly on their final head, had no push before the status went missing, and still had no `license/cla`. `#2607` is the sharpest case and is easy to measure wrong: it *was* pushed later, at `05:07`, but its close+reopen recovery happened at `04:50`, so the absence pre-dated any push. Comparing the head commit's date to the PR's creation date reports it as "pushed after open" and hides that entirely — read the issue **timeline** (`committed` / `closed` / `reopened` events in order), not the current head.
+
+   **Do not rely on the `@cla-assistant check` comment**, even though it is the documented recheck trigger. Of the 99 open non-draft PRs on 2026-08-04, **91 had the status and 8 did not**; all 8 had been pushed since opening, and they span eight days (2026-07-27 to 2026-08-04), so this is not a time window. Read that 8 as a *snapshot of what was still broken*, not as a population of causes: PRs recovered earlier the same day had already left the set, and those are exactly the ones that show `opened`-side failure.
+
+   The practical consequence is the same either way: the trigger comment is neither sufficient nor necessary, and the check below is what tells you where you actually stand. A manual trigger comment on `#2605` did not restore it; close+reopen did, and its two approvals survived. Four PRs were recovered this way across two authors.
 3. Address every substantive review-thread comment before merge: fixed in a subsequent commit, replied with rationale for declining, or explicitly deferred to a follow-up issue.
 4. **If the PR ended up large, split it post-hoc.** If during review it becomes clear the diff covers more than one concern (a fix + a refactor, two unrelated features, etc.), close this PR and re-open it as N smaller PRs rather than negotiating reviewer patience. Easier than rebasing later; easier to revert one piece at a time.
 
