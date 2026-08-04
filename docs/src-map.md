@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-189 modules indexed.
+192 modules indexed.
 
 ## `src/`
 
@@ -37,6 +37,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
+- **`credential-resolver.ts`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
@@ -80,6 +81,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
+- **`proactive_recovery.py`** — Restart recovery for proactively delivered result files.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
@@ -227,6 +229,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 
 ## `src/runtime-api/`
 
+- **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
 - **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.

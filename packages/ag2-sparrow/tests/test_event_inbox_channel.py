@@ -195,6 +195,48 @@ def test_channel_stream_drop_is_retryable():
           "channel: a mid-stream drop is retryable")
 
 
+def test_channel_auth_retry_survives_401():
+    # auth_retry=True (bridge has token-rotation recovery armed): 401/403 is a
+    # recovery WINDOW — retryable, health=auth_failed — so a rotated bearer in
+    # the SHARED header dict is picked up on a later reconnect instead of the
+    # channel dying before the rotation lands. 404 stays fatal either way.
+    import urllib.error
+    inbox = EventInbox(_tmpdb())
+    headers = {"Authorization": "Bearer stale"}
+    ch = ec.EventChannel(inbox, "https://gw", headers, auth_retry=True)
+    orig = ec.urllib.request.urlopen
+    ec.urllib.request.urlopen = lambda req, timeout=None: (_ for _ in ()).throw(
+        urllib.error.HTTPError("https://gw", 401, "unauthorized", None, None))
+    try:
+        retry = ch._consume_once()
+    finally:
+        ec.urllib.request.urlopen = orig
+    check(retry is True and ch.health["status"] == "auth_failed",
+          "channel: 401 is retryable when auth_retry is armed")
+    # The reconnect reads the SHARED dict — a bridge-side rotation is visible.
+    headers["Authorization"] = "Bearer rotated"
+    seen = {}
+    def _capture(req, timeout=None):
+        seen["auth"] = req.get_header("Authorization")
+        raise urllib.error.HTTPError("https://gw", 401, "unauthorized", None, None)
+    ec.urllib.request.urlopen = _capture
+    try:
+        ch._consume_once()
+    finally:
+        ec.urllib.request.urlopen = orig
+    check(seen.get("auth") == "Bearer rotated",
+          "channel: reconnect carries the rotated bearer from the shared dict")
+    # 404 remains fatal even with auth_retry (rotation cannot add a route).
+    ch404 = ec.EventChannel(inbox, "https://gw", {}, auth_retry=True)
+    ec.urllib.request.urlopen = lambda req, timeout=None: (_ for _ in ()).throw(
+        urllib.error.HTTPError("https://gw", 404, "nope", None, None))
+    try:
+        retry404 = ch404._consume_once()
+    finally:
+        ec.urllib.request.urlopen = orig
+    check(retry404 is False, "channel: 404 stays fatal with auth_retry")
+
+
 def test_channel_run_loop_reconnects_then_stops():
     inbox = EventInbox(_tmpdb())
     ch = ec.EventChannel(inbox, "https://gw", {}, max_backoff=0.01)

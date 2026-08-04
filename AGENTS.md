@@ -20,6 +20,7 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 - **Inline tools** are only for tools that need instant response from Gemini. Prefer skill scripts for complex logic. Only promote to inline if the user says the skill approach is too slow.
 - **Skill config goes in the skill's `manifest.json` `config` block — not ad-hoc env vars.** See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the convention — declaration, the `CLI > env > manifest > config-file > state` read-precedence, and config-only manifests. Don't invent an undocumented env var (Chi 2026-06-16).
 - **Optional capability discovery stays at the adapter edge.** Shared runners may standardize provider-neutral execution behavior, but adapters must inject script or capability paths. Core helpers must not name, locate, or import a concrete skill. Add direct contract tests for the runner and wiring tests for every adapter that delegates to it.
+- **Shared result-file lifecycle policy has one implementation.** Claim, recovery, collision, and retry rules for the common task/result protocol belong in dependency-light `src/` helpers. Adapters bind their resolved directories and retain provider-specific delivery only; do not copy filesystem state machines between bridges. Pin both the shared contract and every adapter's delegation in tests.
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 
 ### Where does new code belong? (decision guide — issue #222)
@@ -35,6 +36,10 @@ Walk this list top-to-bottom and stop at the first match:
 If two layers seem to fit, prefer the more specific one (skill > core). If you're patching a bug, keep the patch in the layer where the bug lives — don't smuggle a refactor into a fix commit.
 
 **Destructive/legacy schema migrations live apart from the live writer.** `conversation-store.ts` owns current schema initialization and live write APIs. Destructive or legacy SQLite transformations belong in `conversation-store-migrations.ts`, are idempotent, transaction-tested and invoked before views/statements are prepared. Do not place migration SQL in a live record function. Enforced by `tests/conversation-store-migration-delegation.test.ts`.
+
+**Transport does not own authorization or durable state.** `src/runtime-api/server.py` owns Unix-socket transport and daemon composition; JSON-RPC method dispatch, approval/elicitation policy, governed-capability authorization, idempotency and durable request transitions belong in `src/runtime-api/dispatcher.py`. Actor identity is resolved daemon-side and passed to the dispatcher explicitly — a client parameter must never override it. Do not reimplement approval or capability behavior in a transport.
+
+**Complex skill diagnostics separate analysis from IO and presentation.** Pure analysis policy must not live in a loader, CLI or renderer. Call-diagnostics detection, categorization and repair policy lives in `skills/call-diagnostics/scripts/analysis.py`; loaders and renderers consume it and must not carry copied detection rules. The policy stays inside the skill — do not promote it into `src/`. Enforced by `tests/call-diagnostics-analysis.test.py`.
 
 **Presentation modules don't own domain/storage policy.** Dashboard HTTP handlers and rendering code must delegate schedule parsing, validation and atomic `crons.json` mutation to `src/dashboard_schedules.py`. Schedule mutations must remain locked read-modify-write operations; do not rebuild cron validation or persistence inside a route. The adapter resolves the path (`_crons_path()` — workspace + host label); the domain module receives it. Enforced by `tests/dashboard-schedule-delegation.test.py`. See [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md) "Presentation adapters vs domain/storage".
 
@@ -100,6 +105,8 @@ If `PERSONAL_CLAUDE.md` exists, read and follow it. It contains user-specific ru
 
 ## Work Status
 
+> **Core-only — guests skip this (full rationale in [Chat-path task tracking](#chat-path-task-tracking-issue-585) below).** If you are a scheduled/one-shot/review automation that merely opened this repo (a `codex exec`/headless run, a PR-review or branch-hygiene cron, or any agent that auto-loaded this file by virtue of the repo being your cwd), you are a **guest in this checkout, not the live core**: do NOT write `core-status.json` or any `state/` liveness. Status/heartbeat/liveness writes belong to the single live Sutando core. The "applies to all work" note below scopes the core's *own* activities — it does not enlist guests.
+
 Signal your work status to the workspace `core-status.json` so the web UI and `health-check.py` can display it. Write the **absolute** workspace path: the session cwd is the repo, so a bare `state/core-status.json` lands in `<repo>/state/` — where no reader looks. Readers resolve `<workspace>/state/core-status.json` via `status_read_path` (`src/workspace_default.py`), where `<workspace>` = the M0 canonical (`<repo>/workspace/` by default; env-overridable as the legacy escape).
 
 ```bash
@@ -111,6 +118,8 @@ echo '{"status":"idle","ts":<epoch>}' > "$CORE_STATUS"                          
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
 ## Chat-path task tracking (issue #585)
+
+> **Core-only — automation/one-shot agents MUST skip this and every other runtime-operational section below** (task/result writing, the task watcher, the proactive loop, status/heartbeat/liveness writes). These mechanics belong to the *single live Sutando core* that owns this checkout. If you are instead a scheduled or one-shot agent that merely opened this repo — a Codex/Claude **review** automation, a `codex exec`/headless run, a PR-review or branch-hygiene cron, or any agent that auto-loaded this file by virtue of the repo being your cwd — you are a **guest in this checkout, not the core**: do NOT write `task-*` / `task-chat-*` / `results/` files, do NOT start the watcher, do NOT run the proactive loop, do NOT write `state/` liveness. Doing so injects fake tasks into the core's queue that it will process as real owner requests. (2026-07-11 incident: a Codex automation with `cwds=[this repo]` auto-loaded AGENTS.md and self-wrote a `task-chat` every 10 min; the core swallowed each one. Fix: run such automations in an isolated `/private/tmp` worktree with no repo cwd, per the safe pattern.)
 
 When you accept a non-trivial commitment from the user via **chat** (direct text input, not through voice/Discord/Telegram bridges), write a task file so the dashboard can track it.
 

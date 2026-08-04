@@ -305,6 +305,10 @@ def gateway_alive(app_data, state_dir=None):
     # detail string; here it is elevated to its own state, so it stays local.
     if app_data:
         return _pgrep(os.path.join(app_data, "engine", "runtime", "python"))
+    # KNOWINGLY PRIMARY-ONLY (#2503): identity-blind pgrep — a live named
+    # GATEWAY_INSTANCE secondary matches this pattern and can mask a dead
+    # primary. Same reasoning as startup.sh's launcher P1; instance-aware
+    # probing tracked separately.
     return _pgrep("remote-gateway-bridge")
 
 

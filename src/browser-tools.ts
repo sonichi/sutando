@@ -4,6 +4,7 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
+import { resolveCredential } from './credential-resolver.js';
 import { writeFileSync, unlinkSync, readFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -362,7 +363,7 @@ export const openUrlTool: ToolDefinition = {
 async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
 	// Prefer free-tier voice key (gemini-3.1-flash-lite-preview is free-tier eligible on REST
 	// generateContent — verified 2026-05-14). Falls back to paid GEMINI_API_KEY if voice key absent.
-	const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
 		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
@@ -536,7 +537,7 @@ export const pointAtTool: ToolDefinition = {
 		const { query } = args as { query: string };
 		// Free-tier eligible voice key preferred (the POC proved gemini-3-flash-preview
 		// works on it); falls back to the paid key. Same precedence as describe_screen.
-		const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+		const apiKey = resolveCredential('gemini-voice').key;
 		if (!apiKey) return { error: 'point_at unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)' };
 		if (!query?.trim()) return { error: 'point_at needs a query (what to point at)' };
 		try {

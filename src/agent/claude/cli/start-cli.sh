@@ -610,7 +610,7 @@ if tmux_session_exists; then
   echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
   apply_tmux_defaults
   CORE_CMD=(claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} -- "/schedule-crons")
+    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} -- "/startup")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
   # nonzero index, and selecting a hardcoded :0 would activate the WRONG window
@@ -654,7 +654,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] && cd "$SUTANDO_CLAUDE_WORKING_DIR"
   exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
-    -- "/schedule-crons"
+    -- "/startup"
 fi
 
 # Explicit -S socket path so Sutando.app (which runs under a different
@@ -685,12 +685,12 @@ if [ -t 1 ]; then
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
-    -- "/schedule-crons"
+    -- "/startup"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
-    -- "/schedule-crons"
+    -- "/startup"
   # Verify the core actually came up before reporting success. Without this a
   # failed launch (tmux server refusal, claude crash-on-start, a bad flag) still
   # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
