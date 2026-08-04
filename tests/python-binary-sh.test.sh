@@ -60,19 +60,28 @@ check "a non-executable \$SUTANDO_PY is ignored" "$out" "$lab2/bin/python3"
 # --- 4. the real contract: system dir + no CLT -> EMPTY ----------------------
 # Uses the genuine system path, with only xcode-select faked to fail. This is
 # the case the whole change exists for.
+#
+# OSTYPE is PINNED to darwin because this asserts a macOS-only contract. Without
+# the pin the case ran against the HOST platform and failed on the Linux CI
+# runner -- "expected [], got [/usr/bin/python3]" -- where returning the system
+# interpreter is correct. A platform-specific assertion has to fix the platform,
+# exactly like the code it tests.
 lab3=$(mktemp -d)
 printf '#!/bin/sh\nexit 2\n' > "$lab3/xcode-select"; chmod +x "$lab3/xcode-select"
-out=$(PATH="$lab3:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
-check "system python + NO developer tools -> refuses (empty)" "$out" ""
+out=$(OSTYPE=darwin25 PATH="$lab3:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
+check "macOS + system python + NO developer tools -> refuses (empty)" "$out" ""
 
 # --- 5. ...and with the tools present it IS returned -------------------------
-if xcode-select -p >/dev/null 2>&1; then
-  out=$(PATH="/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
-  if [ -n "$out" ]; then ok "system python + developer tools -> returned"
-  else bad "system python + developer tools -> returned" "got empty"; fi
-else
-  printf "  skip developer tools absent on this host — case 5 not exercised\n"
-fi
+# Both halves faked (OSTYPE + a SUCCEEDING xcode-select) so this runs
+# everywhere. It used to gate on the host's real xcode-select and printed
+# "skip" on the Linux runner, meaning the tools-present branch — half the
+# contract — was never exercised in CI. A skip that only ever fires on the
+# machine that matters is not coverage.
+lab5a=$(mktemp -d)
+printf '#!/bin/sh\nexit 0\n' > "$lab5a/xcode-select"; chmod +x "$lab5a/xcode-select"
+out=$(OSTYPE=darwin25 PATH="$lab5a:/usr/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$REPO'")
+if [ -n "$out" ]; then ok "macOS + system python + developer tools -> returned"
+else bad "macOS + system python + developer tools -> returned" "got empty"; fi
 
 # --- 5b. NON-Darwin: the stub rule must not apply --------------------------
 # The rule is a macOS artifact. On Linux /usr/bin/python3 is an ordinary
