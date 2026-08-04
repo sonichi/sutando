@@ -5019,6 +5019,291 @@ def _host_runs_comm_sweep(
     return False
 
 
+def _as_list(value) -> list:
+    """A settings file is hand-editable; anything not a list yields nothing to scan."""
+    return value if isinstance(value, list) else []
+
+
+#: `$(shq "…")` / `$(shq …)` — the installer shell-quotes its paths through a helper
+#: before writing them into settings.json. Reading HOOKS as literal source text means
+#: the substitution is still unevaluated, so the path is welded into a token like
+#: `$(shq` + `<path>)` and never compares equal to anything.
+_SHQ_CALL = re.compile(r"\$\(\s*shq\s+(\"[^\"]*\"|'[^']*'|[^)]*)\)")
+
+
+def _unwrap_installer_command(command: str) -> str:
+    """Reduce an installer HOOKS command template to the shape it actually WRITES.
+
+    The template is bash SOURCE, not the stored command. `bash $(shq "$REPO_DIR/x.sh")`
+    is written to settings.json as `bash /abs/path/x.sh`, so comparing against the raw
+    source can never match — which is exactly how every production hook slipped past
+    the positional check and into a permissive fallback.
+    """
+    # Re-quote rather than inline raw: `shq` IS shell-quoting, and a repo path
+    # containing a space would otherwise split across tokens and fail closed on a
+    # perfectly healthy host — which is the whole reason the installer uses shq.
+    out = _SHQ_CALL.sub(lambda m: shlex.quote(m.group(1).strip("\"'")), command)
+    # The array literal is itself quoted in shell, so inner quotes arrive escaped.
+    out = out.replace('\\"', '"').replace("\\$", "$")
+    # The HOOKS entry is a quoted shell string, so parsing it strips the entry's
+    # own closing quote and leaves the backslash that escaped it dangling. That
+    # makes shlex raise and drop us into the whitespace fallback, where a token
+    # keeps a stray opening quote and no comparison can match — it cost a GENUINE
+    # archive hook a false warning. The dangling backslash WAS that closing quote,
+    # so restore it rather than deleting it: deleting leaves the quote unbalanced,
+    # which is the same failure one step later.
+    if out.endswith("\\") and not out.endswith("\\\\"):
+        out = out[:-1] + '"'
+    return out
+
+
+def _shell_tokens(command: str) -> list:
+    """Shell-split, degrading to whitespace split on unbalanced quoting.
+
+    The fallback keeps surrounding quotes on each token, so tokens are normalized
+    either way — otherwise a comparison silently depends on WHICH split path ran.
+    """
+    try:
+        toks = shlex.split(command)
+    except ValueError:  # a hand-edited settings file can be unquotable
+        toks = command.split()
+    out = []
+    for tok in toks:
+        if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+            tok = tok[1:-1]
+        out.append(tok)
+    return out
+
+
+def _same_path(a: str, b_norm: str, b_real: str) -> bool:
+    a = os.path.expanduser(a)
+    if not os.path.isabs(a):
+        # Unresolvable without knowing the hook's cwd, so it never counts as a
+        # match: unprovable identity warns, like every other branch here.
+        return False
+    return os.path.normpath(a) == b_norm or os.path.realpath(a) == b_real
+
+
+def _hook_command_targets(command: str, expected, owned_cmd: str, marker: str = "") -> bool:
+    """Does this command INVOKE `expected` — not merely mention it, not merely contain it?
+
+    Two false-cleans this has to reject, both found in review, both of which let a
+    stale or replaced hook keep the probe green:
+
+    1. **Substring containment is not checkout identity.** `/tmp/sutando` is a
+       substring of `/tmp/sutando-old/src/check-pending-tasks.sh`, so `str(repo) in
+       command` certifies a sibling checkout as this one.
+    2. **A path in argument position is not an invocation.** Scanning every absolute
+       token accepts `echo <path>`, `printf "%s" <path>`, and
+       `bash /tmp/other.sh <path>` — the expected script appears as inert data while
+       something else entirely runs.
+
+    So the comparison is positional, against the command the INSTALLER itself writes
+    (the third field of its `HOOKS` entry). The installer stays the single source of
+    truth for the command shape exactly as it already is for the hook list: whatever
+    interpreter it uses, and whichever position it puts its script in, is what a
+    registered hook must match. Leading tokens must agree, so `echo` cannot stand in
+    for `bash`, and the script position must be the same path.
+    """
+    owned = _shell_tokens(_unwrap_installer_command(owned_cmd))
+    got = _shell_tokens(command)
+    if not owned or not got:
+        return False
+
+    # PROGRAM CHECK — applies to EVERY owned hook, not just repo-relative ones.
+    # This was previously skipped for markers that are not `src/` paths, on the
+    # reasoning that a non-repo path has no identity to compare. That conflated
+    # path identity with command-shape validation: the archive hook still has an
+    # installer-owned shape, and `echo` is not `cp`. With only the substring test,
+    # BOTH of these certified as a healthy archive hook:
+    #     echo sutando-conversations/
+    #     rm -rf sutando-conversations/
+    # The second is the one that settles it — a destructive command reported as a
+    # working archiver is the opposite of what this probe is for.
+    if got[0] != owned[0]:
+        return False
+
+    if expected is None:
+        # Marker is not repo-relative (the archive hook writes outside the repo),
+        # so there is no repo path to compare positionally. Program alone is NOT
+        # enough: `cp /tmp/other "$HOME/Desktop/sutando-conversations/x"` and
+        # `cp "$TRANSCRIPT_PATH" /tmp/sutando-conversations/y` both pass a program
+        # check while archiving the wrong thing, or to the wrong place.
+        #
+        # An earlier revision of this comment called that an intentional
+        # "compatibility boundary", on the reasoning that the installer preserves
+        # operator-customized archive hooks. That reasoning was WRONG, and it is
+        # worth recording why, because it read as principled: Phase 0 does skip
+        # sweeping a custom archiver (install-claude-hooks.sh:170-185), but Phase 1
+        # detects presence by EXACT command-string match — `index($cmd)` at :262 —
+        # so a custom `cp` never satisfies it and the installer ADDS its own
+        # command alongside. The two COEXIST. On any host where the installer has
+        # run, its own command is therefore present, and this probe should say so.
+        #
+        # Compared: the program, the SOURCE argument the installer writes, and the
+        # destination prefix up through the marker. Everything after the marker is
+        # free — that is where the installer's own $(date …) filename varies, so
+        # pinning it would warn on healthy hosts.
+        d_idx = next((i for i, tok in enumerate(owned) if marker and marker in tok), None)
+        if len(owned) < 2 or d_idx is None:
+            return False
+        # POSITION and ARITY, not "the prefix appears somewhere". Accepting the
+        # prefix in any token certified a three-operand
+        #     cp "$TRANSCRIPT_PATH" /tmp/not-the-archive ".../sutando-conversations/x"
+        # which cp treats as two SOURCES and a destination — and which fails at
+        # runtime unless that last path is a directory, so nothing is archived while
+        # the probe reports clean. The installer writes exactly program/source/dest
+        # and Phase 1 requires that exact string, so anything of a different arity
+        # is not the command it installs.
+        if len(got) != len(owned) or got[1] != owned[1]:
+            return False
+        prefix = owned[d_idx][: owned[d_idx].index(marker) + len(marker)]
+        return got[d_idx].startswith(prefix)
+
+    want = os.path.normpath(os.path.expanduser(str(expected)))
+    want_real = os.path.realpath(want)
+    idx = next((i for i, t in enumerate(owned) if _same_path(t, want, want_real)), None)
+    if idx is None:
+        # FAIL CLOSED. This branch used to accept the path anywhere in the first two
+        # tokens, which read as a safe fallback and was not: the real installer writes
+        # `bash $(shq "$REPO_DIR/x.sh")`, so before the unwrap above NO production hook
+        # resolved positionally and EVERY one landed here — making `echo <path>` count
+        # as registered on the only path that ships. A fallback that the real data
+        # always takes is not a fallback, it is the behaviour.
+        return False
+    if len(got) <= idx:
+        return False
+    return _same_path(got[idx], want, want_real) and got[:idx] == owned[:idx]
+
+
+def check_claude_hook_registration(
+    repo_dir: Optional[Path] = None,
+) -> dict:
+    """Are the Claude Code hooks `install-claude-hooks.sh` owns actually registered?
+
+    Nothing checked this before. On 2026-08-03 this host was found with **zero of
+    the four owned hooks** in the installer's own target — including both PreCompact
+    entries, so `session-state.md` was never regenerated on compaction and the
+    transcript archiver had never run at all. It had been that way for days, silently,
+    because no probe looks at hook registration. A peer host showed the same shape.
+
+    The owned list is READ FROM THE INSTALLER's `HOOKS=(...)` array rather than
+    duplicated here: a second copy would drift from the script that does the
+    installing, and a stale allow-list is how a probe starts lying. Same reason the
+    target file is read from its `SETTINGS=` line instead of being assumed.
+
+    Fails toward NOISE, never toward a false clean:
+      * installer absent          -> ok, not a sutando checkout (nothing to verify)
+      * HOOKS array unparseable   -> WARN. A parse that yields zero hooks would
+                                     otherwise report "all registered" over an empty
+                                     population, which is the exact shape of a probe
+                                     that cannot fail.
+      * settings.json absent      -> warn (installer has never run here)
+      * settings.json malformed   -> warn, never raise
+      * a hook registered but its command points at a DIFFERENT checkout -> warn.
+        This host had a SessionEnd entry aimed at a five-day-old `Desktop/sutando`
+        copy, so fixes to the live script never executed — present-but-wrong is the
+        failure that looks healthiest.
+    """
+    name = "claude-hooks"
+    repo = Path(repo_dir or REPO_DIR)
+    installer = repo / "src" / "install-claude-hooks.sh"
+    if not installer.is_file():
+        return {"name": name, "status": "ok", "detail": "no install-claude-hooks.sh — not a sutando checkout"}
+    try:
+        src = installer.read_text(errors="ignore")
+    except OSError as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot read installer ({exc})"}
+
+    m = re.search(r"^HOOKS=\((.*?)^\)", src, re.M | re.S)
+    owned = []
+    if m:
+        for line in m.group(1).split("\n"):
+            line = line.strip()
+            if not line.startswith('"'):
+                continue
+            parts = line.strip('"').split("|", 2)
+            if len(parts) == 3:
+                # third field is the command the installer WRITES — kept so the probe
+                # compares against the real command shape rather than guessing one.
+                owned.append((parts[0], parts[1], parts[2]))
+    if not owned:
+        return {"name": name, "status": "warn",
+                "detail": "could not parse HOOKS=(...) from install-claude-hooks.sh — "
+                          "cannot verify registration (reporting rather than assuming clean)"}
+
+    sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
+    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
+    if not settings.is_file():
+        return {"name": name, "status": "warn",
+                "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "
+                          f"{len(owned)} hook(s) unregistered"}
+    try:
+        conf = json.loads(settings.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": name, "status": "warn", "detail": f"{settings.name} unreadable ({exc})"}
+
+    # Parseable is not the same as well-shaped: `[]` is valid JSON, and `.get()` on it
+    # raises AttributeError, which would abort every remaining probe in run_all_checks().
+    # A malformed schema has to fail toward a warning like every other ambiguous branch.
+    if not isinstance(conf, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"{settings.name} top level is {type(conf).__name__}, not an object — "
+                          f"cannot verify {len(owned)} hook(s)"}
+    hooks = conf.get("hooks")
+    if hooks is None:
+        hooks = {}
+    elif not isinstance(hooks, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"{settings.name} \"hooks\" is {type(hooks).__name__}, not an object — "
+                          f"cannot verify {len(owned)} hook(s)"}
+
+    missing, foreign = [], []
+    for event, marker, owned_cmd in owned:
+        # Every container on this path is type-checked, at EVERY level. Validating
+        # only the top two left `{"hooks":{"Stop":7}}`, `{"hooks":{"Stop":[{"hooks":7}]}}`
+        # and a numeric `command` still raising TypeError straight out of the probe —
+        # and since this runs inside run_all_checks(), a raise aborts every later check.
+        # A malformed shape yields no commands, so the hook reads as unregistered: the
+        # promised warning, not a crash and not a false clean.
+        cmds = []
+        for g in _as_list(hooks.get(event)):
+            if not isinstance(g, dict):
+                continue
+            for h in _as_list(g.get("hooks")):
+                if not isinstance(h, dict):
+                    continue
+                c = h.get("command")
+                if isinstance(c, str):
+                    cmds.append(c)
+        hit = [c for c in cmds if marker in c]
+        if not hit:
+            missing.append(f"{event}:{marker}")
+        elif not any(
+            _hook_command_targets(
+                c,
+                (repo / marker) if marker.startswith("src/") else None,
+                owned_cmd.replace("$REPO_DIR", str(repo)),
+                marker,
+            )
+            for c in hit
+        ):
+            # Present, but not actually invoking this checkout's script — either aimed
+            # at another checkout or carrying the path as an inert argument.
+            foreign.append(f"{event}:{marker}")
+    if missing or foreign:
+        bits = []
+        if missing:
+            bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
+        if foreign:
+            bits.append(f"{len(foreign)} registered but NOT running the installer's command "
+                        f"— a different program, another checkout, or the path is "
+                        f"only an argument ({', '.join(foreign)})")
+        return {"name": name, "status": "warn",
+                "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+    return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
+
+
 def check_comm_sweep_freshness(
     workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
 ) -> dict:
@@ -5126,6 +5411,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
+    checks.append(check_claude_hook_registration())
     checks.append(check_cron_runner())
     checks.append(check_session_cron_registration())
 
