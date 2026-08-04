@@ -47,8 +47,12 @@ ENV = {**os.environ, "CLAUDE_CONFIG_DIR": str(WS / ".claude-sutando"),
 ENV.pop("SUTANDO_SKIP_FILE_MARKER_GUARD", None)
 
 
-def run(payload, env=None):
-    p = subprocess.run([sys.executable, HOOK], input=json.dumps(payload),
+REPO = str(Path(__file__).resolve().parent.parent)
+
+
+def run(payload, env=None, repo=REPO, argv=True):
+    cmd = [sys.executable, HOOK] + (["--repo", repo] if argv and repo else [])
+    p = subprocess.run(cmd, input=json.dumps(payload),
                        capture_output=True, text=True, env=env or ENV)
     assert p.returncode == 0, f"hook must always exit 0, got {p.returncode}: {p.stderr}"
     if not p.stdout.strip():
@@ -116,13 +120,72 @@ assert p.returncode == 0 and not p.stdout.strip(), \
 
 # 11. The denial must be ACTIONABLE — naming the file and the fix. A deny the
 #     author can't act on just moves the babysitting one step earlier.
-out = subprocess.run([sys.executable, HOOK], input=json.dumps(write_call(RESULT, BAD_BODY)),
+out = subprocess.run([sys.executable, HOOK, "--repo", REPO],
+                     input=json.dumps(write_call(RESULT, BAD_BODY)),
                      capture_output=True, text=True, env=ENV).stdout
 reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
 assert UNSENDABLE.name in reason, "the denial must name the offending file"
 assert "results/" in reason, "the denial must point at the fix (stage into an allowed root)"
 
+# ---------------------------------------------------------------- regressions
+# 12. THE DEPLOYED-COPY BLOCKER (bassilkhilo-ag2 + qingyun-wu, PR #2596).
+#     v1 discovered the repo by walking up from __file__, so once copied to
+#     ~/.claude/hooks/ it resolved to the deploy dir, found no src/, and exited
+#     0 on EVERY write — inert in its own documented deployment, silently.
+#     Run the hook from a copy OUTSIDE any repo layout, with no --repo and no
+#     $SUTANDO_REPO_ROOT, and assert it says so on stderr instead of passing mute.
+import shutil
+fake_home = Path(tempfile.mkdtemp()) / ".claude" / "hooks"
+fake_home.mkdir(parents=True)
+copied = fake_home / "result-file-marker-guard.py"
+shutil.copy(HOOK, copied)
+env_nore = {k: v for k, v in ENV.items() if k != "SUTANDO_REPO_ROOT"}
+p = subprocess.run([sys.executable, str(copied)], input=json.dumps(write_call(RESULT, BAD_BODY)),
+                   capture_output=True, text=True, env=env_nore)
+assert p.returncode == 0 and not p.stdout.strip(), "unresolvable repo must fail open"
+assert "INERT" in p.stderr, \
+    f"an unresolvable repo root must be LOUD, not silent — stderr was {p.stderr!r}"
+
+# 13. The same copied hook, given --repo, must WORK. Without this, #12 could be
+#     passing because the copy is broken in some other way.
+p = subprocess.run([sys.executable, str(copied), "--repo", REPO],
+                   input=json.dumps(write_call(RESULT, BAD_BODY)),
+                   capture_output=True, text=True, env=env_nore)
+assert json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny", \
+    "a copied hook with --repo must enforce"
+
+# 14. $SUTANDO_REPO_ROOT is the other configured route.
+p = subprocess.run([sys.executable, str(copied)], input=json.dumps(write_call(RESULT, BAD_BODY)),
+                   capture_output=True, text=True, env={**env_nore, "SUTANDO_REPO_ROOT": REPO})
+assert json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny", \
+    "$SUTANDO_REPO_ROOT must configure the repo root"
+
+# 15. SLACK ADAPTER ROOT (qingyun-wu, PR #2596). Slack extends the canonical
+#     allowlist with <workspace>/slack-inbox/ so an uploaded file can be echoed
+#     back. Judging a Slack result against the Discord/Telegram policy denies a
+#     currently-supported reply path. The destination comes from the task's
+#     `source:` field, so this must be allowed for slack and DENIED for discord —
+#     the pair is the point: a global slack-inbox root would pass both.
+inbox = WS / "slack-inbox"; inbox.mkdir(parents=True, exist_ok=True)
+upload = inbox / "echo-me.png"; upload.write_bytes(b"\x00" * 16)
+tasks = WS / "tasks"; tasks.mkdir(parents=True, exist_ok=True)
+(tasks / "task-slack1.txt").write_text("id: task-slack1\nsource: slack\n")
+(tasks / "task-disc1.txt").write_text("id: task-disc1\nsource: discord\n")
+slack_body = f"echo\n\n[file: {upload}]\n"
+assert run(write_call(RESULTS / "task-slack1.txt", slack_body)) is None, \
+    "a slack-inbox upload must be sendable for a SLACK-sourced result"
+assert run(write_call(RESULTS / "task-disc1.txt", slack_body)) == "deny", \
+    "the same slack-inbox path must NOT be sendable for a DISCORD-sourced result"
+
+# 16. Unknown destination falls back to the UNION, never the strictest — a false
+#     deny for a destination nobody can name is unsatisfiable for the author.
+assert run(write_call(RESULTS / "task-nosuchtask.txt", slack_body)) is None, \
+    "an unresolvable destination must use the union of adapter roots"
+
 print("PASS: result-file-marker-guard — denies an EXISTING file outside the allowlist "
       "(the 2026-08-04 incident) with a positive control on the same body, gates all three "
       "marker spellings + Edit, scopes to results/ only, honours the escape hatch, "
-      "fails open on bad input, and emits an actionable reason")
+      "fails open on bad input, emits an actionable reason, is LOUD (not silent) when the "
+      "repo root is unconfigured in a deployed copy, enforces once given --repo or "
+      "$SUTANDO_REPO_ROOT, and applies the SLACK adapter's extra root only to "
+      "slack-sourced results")

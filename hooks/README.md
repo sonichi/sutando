@@ -140,19 +140,35 @@ Test: `python3 tests/gmail-write-guard.test.py`.
 ## `result-file-marker-guard.py`
 
 Denies a **Write/Edit into `<workspace>/results/`** whose body carries a
-`[file:|send:|attach:]` marker pointing at a path the bridge will refuse to send
-(policy: `src/send_allowlist.py`). Parsing and the verdict both come from the
-modules the delivery path itself uses (`result_markers` + `send_allowlist`), so
+`[file:|send:|attach:]` marker pointing at a path the delivering bridge will refuse
+to send (policy: `src/send_allowlist.py`). Parsing and the verdict both come from
+the modules the delivery path itself uses (`result_markers` + `send_allowlist`), so
 the guard cannot drift from what it enforces.
 
 Why: on 2026-08-04 a finished video was attached from `skill-repos/`, which is not
-on the allowlist. The bridge posted a literal `(file not allowed: …)` into the
-owner's channel and the task archived as delivered — the file existed, the marker
+on the allowlist. The bridge posted a literal `(file not allowed: ...)` into the
+owner's channel and the task archived as delivered -- the file existed, the marker
 parsed, the write succeeded, nothing errored. Every signal available to the author
 said "sent". The owner found it: *"Can't see this file. And I don't want to
 babysit."* The check therefore has to run where the marker is **authored**.
 
-Denies rather than warns — a warning still puts a broken message in the owner's
+**Destination-aware.** The allowlist is not global: Slack extends it with its
+adapter-local `<workspace>/slack-inbox/` so an uploaded file can be echoed back
+(`src/slack-bridge.py:153-158`). The guard resolves the destination from the task
+the result answers (`results/task-<id>.txt` -> `tasks/task-<id>.txt` -> `source:`)
+and applies that adapter's policy. When the destination can't be established it uses
+the **union** of adapter roots -- a false deny for a destination nobody can name is
+unsatisfiable for the author.
+
+**The repo root is CONFIGURED, never discovered.** The hook needs `src/` on
+`sys.path`, and it must not find it by walking up from `__file__`: deploying copies
+the file out of the checkout, and that pattern is banned repo-wide
+(`scripts/lint-workspace-resolution.sh`) because it breaks under symlinked/bundled
+layouts. Pass `--repo <path>` (the snippet below does) or set `$SUTANDO_REPO_ROOT`.
+If neither resolves, the hook prints `INERT: repo root not configured` **to stderr**
+and allows -- an unresolvable root must never be indistinguishable from a clean pass.
+
+Denies rather than warns -- a warning still puts a broken message in the owner's
 channel. The reason names the offending path and the allowed roots, so the fix
 (re-encode or copy into `results/`, then point the marker there) is one step.
 
@@ -165,12 +181,16 @@ Escape hatch: `SUTANDO_SKIP_FILE_MARKER_GUARD=1`.
 
 ### Deploy (per node)
 
+Registration embeds this node's checkout path, so it is correct per host and the
+hook never has to guess:
+
 ```bash
+REPO="$(git rev-parse --show-toplevel)"
 cp hooks/result-file-marker-guard.py ~/.claude/hooks/
-python3 - <<'PY'
+REPO="$REPO" python3 - <<'PY'
 import json, os
 sp = os.path.expanduser("~/.claude/settings.json"); s = json.load(open(sp))
-cmd = "python3 ~/.claude/hooks/result-file-marker-guard.py"
+cmd = f"python3 ~/.claude/hooks/result-file-marker-guard.py --repo {os.environ['REPO']}"
 pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])
 for m in ("Write", "Edit", "MultiEdit"):
     blk = next((b for b in pre if b.get("matcher") == m), None)
@@ -178,6 +198,16 @@ for m in ("Write", "Edit", "MultiEdit"):
     elif cmd not in [h.get("command") for h in blk["hooks"]]: blk["hooks"].append({"type": "command", "command": cmd})
 json.dump(s, open(sp, "w"), indent=2)
 PY
+```
+
+**Verify it is not inert after deploying.** An unconfigured hook only complains on
+stderr, so confirm it actually denies:
+
+```bash
+WS="$(bash scripts/sutando-config.sh workspace)"
+printf '{"tool_name":"Write","tool_input":{"file_path":"%s/results/task-probe.txt","content":"x [file: /etc/hosts]"}}' "$WS" \
+  | python3 ~/.claude/hooks/result-file-marker-guard.py --repo "$REPO"
+# expect a JSON object with "permissionDecision": "deny"
 ```
 
 Tests: `python3 tests/result-file-marker-guard.test.py`

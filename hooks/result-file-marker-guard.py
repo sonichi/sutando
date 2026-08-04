@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """result-file-marker-guard — PreToolUse hook that DENIES writing a result body
-whose ``[file:|send:|attach:]`` marker points outside the send allowlist.
+whose ``[file:|send:|attach:]`` marker points outside the send allowlist **for
+the adapter that will actually deliver it**.
 
 Why (owner incident 2026-08-04, #susan): the agent finished a 6-minute video,
 wrote ``[file: …/skill-repos/video-production/…/talk.mp4]`` into a result, and
@@ -12,33 +13,46 @@ nothing. The owner found it, not the agent:
     "Can't see this file. And I don't want to babysit. Can you improve"
 
 **The failure reports success in every cheap way available to the author.** The
-file exists on disk, the path is absolute and correct, the marker regex matches,
-the Write succeeds, the result file lands, and the bridge consumes it and
-archives the task — so every signal the agent normally checks says delivered.
-The allowlist is enforced at the *far* end, after the last point the agent
-looks. Only opening the channel shows the failure, which is precisely the
-"babysitting" the owner objected to.
+file exists, the path is absolute and correct, the marker regex matches, the
+Write succeeds, the result file lands, and the bridge consumes it and archives
+the task — so every signal the agent normally checks says delivered. The
+allowlist is enforced at the *far* end, after the last point the agent looks.
 
-So the check belongs at the moment the marker is AUTHORED, not at send time, and
-it must be a mechanism rather than a discipline
-(``feedback_guarantee_is_structural_not_disciplinary``): a remembered
-"validate before writing" step is exactly what was missing.
+So the check belongs at the moment the marker is AUTHORED, and it must be a
+mechanism rather than a discipline
+(``feedback_guarantee_is_structural_not_disciplinary``).
 
 Scope — deliberately narrow:
   * Only Write/Edit/MultiEdit whose target resolves under ``<workspace>/results/``.
-    Notes, docs, scratch files and source edits pass through untouched.
-  * Only bodies containing an attachment marker. A result with no marker is
-    never inspected.
-  * Uses the SAME two modules the delivery path uses — ``result_markers`` for
-    parsing and ``send_allowlist.is_path_sendable`` for the verdict — so the
-    guard cannot drift from the policy it enforces. That is the whole point:
-    a re-implemented copy would eventually accept what the bridge rejects, and
-    the resulting false PASS is worse than no guard at all.
+  * Only bodies containing an attachment marker.
+  * Parsing and the verdict come from the SAME modules the delivery path uses
+    (``result_markers`` + ``send_allowlist``), so the guard cannot drift from
+    the policy it enforces. A re-implemented copy would eventually accept what
+    the bridge rejects, and that false PASS is worse than no guard.
 
-Denial is the right call over a warning: a warning still produces a broken
-message in the owner's channel. Denied, the agent stages the file into an
-allowed root (``results/`` is the usual answer) and re-writes — which takes one
-extra command and always works.
+ADAPTER CONTEXT (qingyun-wu, PR #2596 review). The allowlist is not global:
+Slack deliberately extends it with its adapter-local ``<workspace>/slack-inbox/``
+so an uploaded file can be echoed back (``src/slack-bridge.py:153-158``).
+Judging every result against the canonical Discord/Telegram policy would deny a
+currently-supported Slack reply. So the guard resolves the DESTINATION first —
+``results/task-<id>.txt`` names the task, and the task file's ``source:`` field
+names the adapter — and applies that adapter's policy. When the source cannot be
+determined (proactive bodies, a task already archived out from under us), it
+falls back to the UNION of every adapter's roots: refusing to attach something
+some adapter could legitimately send is a worse error than letting the bridge
+report it.
+
+REPO ROOT (bassilkhilo-ag2 + qingyun-wu, PR #2596 review). This file needs
+``src/`` on ``sys.path``. It must NOT discover that by walking up from
+``__file__``: the deploy step copies the hook out of the checkout, so the walk
+resolves to the deploy dir, and the repo bans that pattern outright
+(``scripts/lint-workspace-resolution.sh`` — it breaks under symlinked/bundled
+layouts). The location is therefore CONFIGURED, not guessed: ``--repo <path>``
+(written by the registration snippet in hooks/README.md) or
+``$SUTANDO_REPO_ROOT``. If neither resolves, the hook says so **loudly on
+stderr** and allows — the v1 of this hook exited silently, which made an
+unresolvable root indistinguishable from a clean pass, i.e. exactly the
+"reports success in every cheap way" defect it exists to prevent.
 
 Escape hatch: ``SUTANDO_SKIP_FILE_MARKER_GUARD=1``.
 
@@ -53,22 +67,34 @@ Registration: manual per-node deploy — see hooks/README.md.
 """
 import json
 import os
+import re
 import sys
-from pathlib import Path
 
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
+# Adapter -> extra roots beyond the canonical allowlist, relative to the
+# workspace. Mirrors what each bridge passes to is_path_sendable(extra_roots=…).
+# Keep in step with the bridges; a bridge that adds a root and not an entry here
+# gets a FALSE DENY, which the tests below are meant to make loud.
+ADAPTER_EXTRA_ROOTS = {
+    "slack": ("slack-inbox",),          # src/slack-bridge.py:153-158
+    "discord": (),
+    "telegram": (),
+}
 
-def _repo_root():
-    """This file lives at <repo>/hooks/, whether run from the repo or a copy
-    deployed into ~/.claude/hooks/. Prefer the real repo when reachable."""
-    here = Path(__file__).resolve().parent.parent
-    if (here / "src" / "send_allowlist.py").is_file():
-        return here
-    for cand in (Path.home() / "stando-ui" / "sutando",):
-        if (cand / "src" / "send_allowlist.py").is_file():
-            return cand
-    return None
+
+def _warn(msg):
+    print(f"[result-file-marker-guard] {msg}", file=sys.stderr)
+
+
+def _repo_root(argv):
+    """CONFIGURED, never guessed — see the module docstring."""
+    for i, a in enumerate(argv):
+        if a == "--repo" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--repo="):
+            return a.split("=", 1)[1]
+    return os.environ.get("SUTANDO_REPO_ROOT") or None
 
 
 def _body_from(tool_name, ti):
@@ -84,6 +110,29 @@ def _body_from(tool_name, ti):
     return ""
 
 
+def _adapter_for(result_path, workspace):
+    """The bridge that will deliver this result, from the task it answers.
+
+    `results/task-<id>.txt` -> `tasks/task-<id>.txt` (or its archive) -> `source:`.
+    Returns None when it can't be established, which the caller treats as
+    "use the union", never as "use the strictest".
+    """
+    m = re.match(r"^(?:[^.]+\.)?task-(.+)\.txt$", os.path.basename(result_path))
+    if not m:
+        return None
+    tid = m.group(1)
+    for rel in (f"tasks/task-{tid}.txt", f"tasks/archive/task-{tid}.txt"):
+        p = os.path.join(str(workspace), rel)
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("source:"):
+                        return line.split(":", 1)[1].strip().lower()
+        except OSError:
+            continue
+    return None
+
+
 def _deny(reason):
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -93,7 +142,7 @@ def _deny(reason):
     sys.exit(0)
 
 
-def main():
+def main(argv):
     if os.environ.get("SUTANDO_SKIP_FILE_MARKER_GUARD") == "1":
         sys.exit(0)
 
@@ -112,37 +161,53 @@ def main():
     if not any(k in body for k in ("[file:", "[send:", "[attach:")):
         sys.exit(0)
 
-    repo = _repo_root()
-    if repo is None:
-        sys.exit(0)  # can't resolve policy -> fail open
-    sys.path.insert(0, str(repo / "src"))
+    repo = _repo_root(argv)
+    if not repo or not os.path.isfile(os.path.join(repo, "src", "send_allowlist.py")):
+        _warn("INERT: repo root not configured (pass --repo <path> in the hook "
+              "registration, or set $SUTANDO_REPO_ROOT). Attachment markers are "
+              "NOT being checked — see hooks/README.md.")
+        sys.exit(0)
+    sys.path.insert(0, os.path.join(repo, "src"))
     from workspace_default import resolve_workspace
     from send_allowlist import is_path_sendable, SEND_ALLOWED_ROOTS, SEND_ALLOWED_PREFIXES
     from result_markers import parse_markers
 
-    results_dir = os.path.realpath(resolve_workspace() / "results")
+    workspace = resolve_workspace()
+    results_dir = os.path.realpath(os.path.join(str(workspace), "results"))
     real_target = os.path.realpath(os.path.expanduser(target))
     if not real_target.startswith(results_dir + os.sep):
         sys.exit(0)  # not a deliverable result body
+
+    adapter = _adapter_for(real_target, workspace)
+    if adapter in ADAPTER_EXTRA_ROOTS:
+        extra = tuple(str(workspace / r) for r in ADAPTER_EXTRA_ROOTS[adapter])
+        scope = f"the {adapter} adapter"
+    else:
+        # Unknown destination -> the UNION. A false deny on a path some adapter
+        # could send is worse than letting the bridge report it: the author has
+        # no way to satisfy a policy for a destination nobody can name.
+        extra = tuple(str(workspace / r)
+                      for roots in ADAPTER_EXTRA_ROOTS.values() for r in roots)
+        scope = "any configured adapter"
 
     bad = []
     for act in parse_markers(body).actions:
         if act.kind != "attach":
             continue
         p = os.path.expanduser(act.value.strip())
-        if not is_path_sendable(p):
+        if not is_path_sendable(p, extra_roots=extra):
             bad.append((p, "no such file" if not os.path.isfile(p) else "outside the allowlist"))
     if not bad:
         sys.exit(0)
 
-    roots = "\n".join(f"    {r}" for r in (*SEND_ALLOWED_ROOTS, *SEND_ALLOWED_PREFIXES))
+    roots = "\n".join(f"    {r}" for r in (*SEND_ALLOWED_ROOTS, *extra, *SEND_ALLOWED_PREFIXES))
     listed = "\n".join(f"    {p}  ({why})" for p, why in bad)
     _deny(
         "RESULT FILE-MARKER GUARD: this result body attaches a file the bridge will "
         "REFUSE to send, so the owner would receive a literal "
         "'(file not allowed: …)' line and no attachment — while the task still "
         "archives as delivered.\n\n"
-        f"Unsendable:\n{listed}\n\n"
+        f"Unsendable for {scope}:\n{listed}\n\n"
         f"Deliverable roots/prefixes (src/send_allowlist.py):\n{roots}\n\n"
         "Fix: stage the file into an allowed root first (copy or re-encode it "
         "directly into <workspace>/results/), then point the marker at that copy. "
@@ -152,9 +217,9 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        main(sys.argv[1:])
     except SystemExit:
         raise
     except Exception as e:  # fail-open: never wedge the core on a guard bug
-        print(f"[result-file-marker-guard] non-fatal error, allowing: {e}", file=sys.stderr)
+        _warn(f"non-fatal error, allowing: {e}")
         sys.exit(0)
