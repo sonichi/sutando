@@ -359,6 +359,86 @@ def test_suite_never_appends_to_the_live_outbox_log(live, before):
     print("  OK: live outbox.log untouched; audit rows went to the redirect")
 
 
+def test_blocked_attachment_is_announced_to_the_recipient():
+    """A file that EXISTS but sits outside the allowlist must produce a
+    user-visible notice, not stderr alone.
+
+    dm-result is the REST FALLBACK — it runs when the live bridge is down — and
+    it used to log the rejection only, so the attachment silently never arrived:
+    body delivered, task archived, nothing telling the recipient a file was
+    meant to be there. discord-bridge.py has always sent
+    `(file not allowed: <path>)` into the channel; the comment here claimed
+    parity with it and did not have it.
+
+    The fixture file is REAL (tempfile), so a pass can only come from the
+    allowlist decision and never from "no such file" — which is the separate
+    branch asserted below.
+    """
+    import tempfile
+    fd, real_but_blocked = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        transport = _FakeTransport({
+            ("POST", "/users/@me/channels"): {"id": "dm-6"},
+            ("POST", "/channels/dm-6/messages"): {"id": "msg-6"},
+        })
+        original_urlopen = dm.urllib.request.urlopen
+
+        def run():
+            _install_transport(transport)
+            try:
+                ok = dm.send_dm(f"Here you go: [file: {real_but_blocked}]")
+            finally:
+                _restore_transport(original_urlopen)
+            assert ok is True
+            msg_calls = [c for c in transport.calls if "/messages" in c["url"]]
+            assert len(msg_calls) == 1
+            body = msg_calls[0]["body"]["content"]
+            assert "not sent" in body, (
+                f"a blocked attachment must be announced; body was {body!r}")
+            assert "Here you go:" in body, "the real body must survive"
+            assert real_but_blocked not in body, (
+                "the rejected path must NOT be echoed back to the recipient")
+
+        _with_access_json(
+            {"allowFrom": ["human-id"], "tierMap": {"human-id": "owner"}}, run)
+    finally:
+        os.unlink(real_but_blocked)
+
+
+def test_missing_path_stays_silent_like_discord_bridge():
+    """The OTHER half of the parity, and the reason the notice is split.
+
+    A `[file:/path]` substring inside prose (a quoted example) resolves to no
+    file. discord-bridge logs those and deliberately does not surface them
+    (`elif not os.path.isfile(fpath)`), because a notice would then fire on
+    ordinary text that merely mentions a path. Without this case the fix would
+    look correct while making every prose mention of a path produce a spurious
+    "attachment not sent" line.
+    """
+    transport = _FakeTransport({
+        ("POST", "/users/@me/channels"): {"id": "dm-7"},
+        ("POST", "/channels/dm-7/messages"): {"id": "msg-7"},
+    })
+    original_urlopen = dm.urllib.request.urlopen
+
+    def run():
+        _install_transport(transport)
+        try:
+            ok = dm.send_dm("Use the marker like [file: /tmp/sutando-nope.png] to attach.")
+        finally:
+            _restore_transport(original_urlopen)
+        assert ok is True
+        msg_calls = [c for c in transport.calls if "/messages" in c["url"]]
+        assert len(msg_calls) == 1
+        body = msg_calls[0]["body"]["content"]
+        assert "not sent" not in body, (
+            f"a non-existent path is a prose quotation — no notice; got {body!r}")
+
+    _with_access_json(
+        {"allowFrom": ["human-id"], "tierMap": {"human-id": "owner"}}, run)
+
+
 def main():
     # Baseline taken before ANY test runs, so the final assertion covers every
     # send in this file — not just the ones the regression itself makes.
@@ -371,6 +451,8 @@ def main():
         test_file_markers_stripped_from_body()
         test_empty_body_after_marker_strip_does_not_post_messages()
         test_env_override_skips_access_json_entirely()
+        test_blocked_attachment_is_announced_to_the_recipient()
+        test_missing_path_stays_silent_like_discord_bridge()
 
     test_suite_never_appends_to_the_live_outbox_log(live, before)
     print("All send_dm integration tests passed.")
