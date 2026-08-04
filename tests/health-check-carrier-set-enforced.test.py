@@ -46,7 +46,14 @@ def _load():
     return m
 
 
-def _mkworkspace(tmp: Path, carrier_lines: list[str], files: list[str]) -> Path:
+def _mkworkspace(tmp: Path, carrier_lines: list[str], files: list[str],
+                 extra_lines: "list[str] | None" = None,
+                 nested_ignores: "dict[str, str] | None" = None) -> Path:
+    """`extra_lines` are appended to `.git/info/exclude` VERBATIM (no `!`), which
+    is how the generator emits `vault.sync.exclude` carve-outs and the hard-deny
+    block. `nested_ignores` writes `.gitignore` files INSIDE the tree, the way a
+    vendored project committed under `notes/` carries its own rules.
+    """
     ws = tmp / "workspace"
     ws.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(ws)], check=True, capture_output=True)
@@ -54,9 +61,17 @@ def _mkworkspace(tmp: Path, carrier_lines: list[str], files: list[str]) -> Path:
         f = ws / rel
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text("x\n")
+    for rel, body in (nested_ignores or {}).items():
+        f = ws / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(body)
     info = ws / ".git" / "info"
     info.mkdir(parents=True, exist_ok=True)
-    (info / "exclude").write_text(EXCLUDE_HEAD + "".join(f"!{l}\n" for l in carrier_lines))
+    (info / "exclude").write_text(
+        EXCLUDE_HEAD
+        + "".join(f"!{l}\n" for l in carrier_lines)
+        + "".join(f"{l}\n" for l in (extra_lines or []))
+    )
     return ws
 
 
@@ -69,8 +84,10 @@ class CarrierSetProbe(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _patch_resolved(self, include: list[str]):
-        self.hc._resolved_vault = lambda: {"sync": {"include": include}}
+    def _patch_resolved(self, include: list[str], exclude: "list[str] | None" = None):
+        self.hc._resolved_vault = lambda: {
+            "sync": {"include": include, "exclude": exclude or []}
+        }
 
     def _patch_shipped(self, include: list[str]):
         root = self.tmp / "repo"
@@ -79,6 +96,105 @@ class CarrierSetProbe(unittest.TestCase):
             json.dumps({"vault": {"sync": {"include": include}}})
         )
         self.hc.REPO_DIR = root
+
+    # ---- carve-outs are DELIBERATE, not evidence of a broken backup --------
+    #
+    # The probe condemned an entry when ANY file beneath it was ignored. But
+    # `vault.sync.exclude` exists precisely to ignore files inside a carried
+    # parent, so on a real workspace it fires constantly:
+    #
+    #     notes/  9970 of 11369 files ignored (*.mp4, .DS_Store, node_modules/)
+    #     hosts/     9 of    67 files ignored (data/)
+    #
+    # Both read `dropped` while the vault was demonstrably carrying them —
+    # 1400 and 58 files tracked, synced minutes earlier, zero diff vs HEAD. The
+    # remedy it printed made the failure permanent: `--force-gitignore`
+    # regenerates a byte-identical file (eight consecutive syncs logged
+    # `existing exclude matches; no-op`), so obeying it changed nothing.
+    #
+    # It looked like it discriminated because the ONE entry with no carve-out
+    # beneath it — `.claude-sutando/projects/*/memory/`, 1322 files, 0 ignored —
+    # passed. A probe with exactly one passing case is not a validated probe.
+
+    def test_a_carve_out_file_does_not_condemn_the_entry_carrying_it(self):
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "notes/talk.mp4"],
+                          extra_lines=["*.mp4"])
+        self._patch_resolved(["notes/"], exclude=["*.mp4"])
+        self._patch_shipped(["notes/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", f"carve-out read as data loss: {r['detail']}")
+
+    def test_a_carve_out_DIRECTORY_does_not_condemn_the_entry(self):
+        # `data/` emits `data/` AND `data/**` — the shape that condemned
+        # `hosts/` on the reporting host via `hosts/<h>/data/*.jsonl`.
+        ws = _mkworkspace(self.tmp, ["hosts/", "hosts/**"],
+                          ["hosts/h/pending-questions.md", "hosts/h/data/voice.jsonl"],
+                          extra_lines=["data/", "data/**"])
+        self._patch_resolved(["hosts/"], exclude=["data/"])
+        self._patch_shipped(["hosts/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", f"carve-out dir read as data loss: {r['detail']}")
+
+    def test_a_hard_denied_credential_does_not_condemn_the_entry(self):
+        # The hard-deny block is unconditional ("regardless of carrier set"), so
+        # a key under a carried path is correctly not backed up — and must not be
+        # reported as the carrier set failing.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "notes/id_rsa"],
+                          extra_lines=["id_rsa"])
+        self._patch_resolved(["notes/"], exclude=[])
+        self._patch_shipped(["notes/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", f"hard-deny read as data loss: {r['detail']}")
+
+    def test_a_nested_gitignore_inside_a_carried_tree_does_not_condemn_it(self):
+        # A vendored project committed under `notes/` ignoring its own build
+        # output. Real instance: a Remotion app whose `.gitignore` names `out/`.
+        # That is git working normally, not the vault carrier failing — and
+        # condemning on it would make every vendored project a permanent FAIL.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "notes/app/out/bundle.js"],
+                          nested_ignores={"notes/app/.gitignore": "out/\n"})
+        self._patch_resolved(["notes/"], exclude=[])
+        self._patch_shipped(["notes/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", f"nested .gitignore read as data loss: {r['detail']}")
+
+    def test_an_operator_added_rule_in_the_exclude_STILL_condemns(self):
+        # The other direction, and the reason this cannot just skip every
+        # non-`*` pattern. `generate_exclude` refuses to overwrite an
+        # operator-edited exclude and `_enforce_carrier_set_pre` swallows the
+        # refusal, so a hand-added rule blocking a carried file survives
+        # silently. It is not in `vault.sync.exclude`, so it must still fail.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/a.md", "notes/secret.md"],
+                          extra_lines=["notes/secret.md"])
+        self._patch_resolved(["notes/"], exclude=["*.mp4"])
+        self._patch_shipped(["notes/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "fail",
+                         "an operator-authored block must still be reported")
+        self.assertIn("--force-gitignore", r["detail"])
+
+    def test_carve_out_tolerance_does_not_mask_a_genuinely_stale_exclude(self):
+        # The guard against fixing a false alarm by making the probe agreeable:
+        # carve-outs present AND the carrier rule missing must still be `fail`.
+        # `!notes/` alone un-ignores the directory but not its contents.
+        ws = _mkworkspace(self.tmp, ["notes/"],
+                          ["notes/a.md", "notes/talk.mp4"],
+                          extra_lines=["*.mp4"])
+        self._patch_resolved(["notes/"], exclude=["*.mp4"])
+        self._patch_shipped(["notes/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "fail",
+                         "a stale carrier rule must still be caught when carve-outs exist")
 
     def test_a_configured_path_that_git_still_ignores_is_REPORTED(self):
         # THE REGRESSION. Config lists state/current-track.md; the on-disk
@@ -232,8 +348,11 @@ class CarrierSetProbe(unittest.TestCase):
         self._patch_shipped(["notes/", "state/current-track.md"])
         class R:
             returncode = 128
-            stdout = b""
-            stderr = b"fatal: not a git repository"
+            # str, not bytes: the probe runs git with text=True. These stubs said
+            # bytes and passed only because nothing read stdout until the probe
+            # started parsing `check-ignore -v` output.
+            stdout = ""
+            stderr = "fatal: not a git repository"
         self._with_run(lambda *a, **k: R())
         r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
         self.assertIsNotNone(r)
@@ -252,8 +371,8 @@ class CarrierSetProbe(unittest.TestCase):
         seen = []
         class R:
             returncode = 1
-            stdout = b""
-            stderr = b""
+            stdout = ""     # text=True — see the note on the stub above
+            stderr = ""
         def spy(argv, *a, **k):
             seen.append(list(argv))
             return R()
