@@ -24,6 +24,7 @@ import io
 import json
 import sys
 import tempfile
+import types
 import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -114,6 +115,63 @@ if HAVE_OPENPYXL:
     check("xlsx: exact aggregate from emitted CSV (4+14+8=26)", total == 26, f"total={total}")
 else:
     print("skip xlsx cases (openpyxl not importable) — refusal case below still runs")
+
+# 3b. Host-independent coverage of the openpyxl load_workbook path (ingest.py
+# 788-793). The happy-path test above SKIPS when openpyxl is not importable —
+# which is exactly the hosted diff-coverage env — leaving 788-793 uncovered
+# (qingyun CR #2434). Inject a stub openpyxl so the load_workbook -> per-sheet
+# iteration path executes regardless of whether the real dep is installed.
+stub_xlsx = tmp / "stub.xlsx"
+with zipfile.ZipFile(stub_xlsx, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr("xl/workbook.xml", b"<x/>")  # valid small zip, uncompressed well under budget
+
+
+class _StubWS:
+    def __init__(self, title, rows):
+        self.title = title
+        self._rows = rows
+
+    def iter_rows(self, values_only=True):  # noqa: ARG002
+        return iter(self._rows)
+
+
+class _StubWB:
+    def __init__(self, sheets):
+        self.worksheets = sheets
+
+
+def _stub_load_workbook(path, read_only=True, data_only=True):  # noqa: ARG001
+    return _StubWB(
+        [
+            _StubWS("Steam", [("config", "wheels"), ("0-4-0", 4), ("2-8-4", 14), ("4-4-0", 8)]),
+            _StubWS("Diesel", [("unit", "hp"), ("GP7", 1500)]),
+        ]
+    )
+
+
+stub_openpyxl = types.ModuleType("openpyxl")
+stub_openpyxl.load_workbook = _stub_load_workbook  # type: ignore[attr-defined]
+_saved_openpyxl = sys.modules.get("openpyxl")
+sys.modules["openpyxl"] = stub_openpyxl
+try:
+    stub_out = ingest.extract_table_csv(stub_xlsx)
+    check(
+        "xlsx (stub openpyxl): per-sheet markers — covers load_workbook path",
+        "=== sheet: Steam ===" in stub_out and "=== sheet: Diesel ===" in stub_out,
+        stub_out[:160],
+    )
+    _steam = stub_out.split("=== sheet: Steam ===")[1].split("=== sheet:")[0].strip()
+    _rows = list(csv.reader(io.StringIO(_steam)))
+    check(
+        "xlsx (stub openpyxl): exact aggregate over emitted CSV (4+14+8=26)",
+        sum(int(r[1]) for r in _rows[1:]) == 26,
+        _steam,
+    )
+finally:
+    if _saved_openpyxl is not None:
+        sys.modules["openpyxl"] = _saved_openpyxl
+    else:
+        sys.modules.pop("openpyxl", None)
 
 # 4. xlsx without openpyxl → clear refusal, never the approximate fallback
 xlsx_path = tmp / "any.xlsx"
