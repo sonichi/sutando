@@ -15,10 +15,10 @@ record of it; the message was only recoverable via manual REST fetch.
 ## The fix
 
 Track the last DM message ID we successfully observed per channel in
-`state/discord-dm-checkpoint.json`. On every `on_ready` (full
-reconnect after gateway IDENTIFY), call `_catchup_missed_dms()`
-which REST-fetches messages with `after=<last_seen_id>` from each
-checkpointed channel and replays them through `_handle_discord_message`.
+`state/discord-dm-checkpoint.json`. Reconcile immediately on every
+`on_ready` and periodically while the gateway remains ready, REST-fetching
+messages with `after=<last_seen_id>` and replaying them through
+`_dispatch_discord_message`.
 Discord message IDs are Snowflake-monotonic so `after=<id>` is
 reliable.
 
@@ -30,6 +30,7 @@ mocking which is more involved — we exercise the pure parts directly
 and source-grep-assert the wiring.
 """
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -192,6 +193,124 @@ def test_source_wires_catchup_into_on_ready():
     )
 
 
+def test_source_wires_periodic_reconciliation_once():
+    """Start reconciliation inside the once-only long-lived-loop guard."""
+    src = (REPO / "src" / "discord-bridge.py").read_text()
+    import re
+    on_ready_block = re.search(
+        r"async def on_ready\(\):(.*?)(?=^(?:async )?def )",
+        src, re.MULTILINE | re.DOTALL,
+    )
+    assert on_ready_block, "could not locate on_ready in discord-bridge.py"
+    body = on_ready_block.group(1)
+    guard_pos = body.index("if not _poll_loops_started:")
+    loop_pos = body.index("create_task(_dm_reconciliation_loop())")
+    assert loop_pos > guard_pos, (
+        "periodic DM reconciliation must start inside the once-only poll-loop "
+        "guard, or reconnects will accumulate duplicate loops"
+    )
+
+
+def test_ready_bridge_runs_reconciliation_without_reconnect():
+    """A protocol-ready bridge performs catch-up on the periodic path."""
+    calls = []
+    real_client = bridge.client
+    real_catchup = bridge._catchup_missed_dms
+    bridge.client = type("_ReadyClient", (), {"is_ready": lambda self: True})()
+
+    async def fake_catchup():
+        calls.append("catchup")
+
+    bridge._catchup_missed_dms = fake_catchup
+    try:
+        result = asyncio.run(bridge._reconcile_missed_dms_if_ready())
+    finally:
+        bridge.client = real_client
+        bridge._catchup_missed_dms = real_catchup
+    assert result is True
+    assert calls == ["catchup"]
+
+    bridge.client = type("_NotReadyClient", (), {"is_ready": lambda self: False})()
+    try:
+        result = asyncio.run(bridge._reconcile_missed_dms_if_ready())
+    finally:
+        bridge.client = real_client
+    assert result is False
+    assert calls == ["catchup"]
+
+
+def test_catchup_passes_are_serialized():
+    """Reconnect and periodic reconciliation must share one async lock."""
+    src = (REPO / "src" / "discord-bridge.py").read_text()
+    assert "_dm_catchup_lock = asyncio.Lock()" in src
+    assert "async with _dm_catchup_lock:" in src
+
+
+def test_gateway_and_rest_race_is_claimed_exactly_once():
+    """Concurrent gateway/REST discovery dispatches one handler body only."""
+    bridge.seen_message_ids.clear()
+    bridge._inflight_discord_message_ids.clear()
+    calls = []
+    real_handler = bridge._handle_discord_message
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_handler(message, force=False):
+            calls.append(message.id)
+            started.set()
+            await release.wait()
+
+        bridge._handle_discord_message = fake_handler
+        msg = types.SimpleNamespace(id=987654, author="owner")
+        first = asyncio.create_task(bridge._dispatch_discord_message(msg))
+        await started.wait()
+        second = asyncio.create_task(bridge._dispatch_discord_message(msg))
+        await second
+        release.set()
+        await first
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        bridge._handle_discord_message = real_handler
+        bridge.seen_message_ids.clear()
+        bridge._inflight_discord_message_ids.clear()
+    assert calls == [987654], (
+        f"gateway + REST must dispatch one handler body, got {calls!r}"
+    )
+
+
+def test_failed_claim_is_released_for_retry():
+    """A handler exception must not poison in-memory dedup for this process."""
+    bridge.seen_message_ids.clear()
+    bridge._inflight_discord_message_ids.clear()
+    calls = []
+    real_handler = bridge._handle_discord_message
+
+    async def flaky_handler(message, force=False):
+        calls.append(message.id)
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+
+    bridge._handle_discord_message = flaky_handler
+    msg = types.SimpleNamespace(id=24680, author="owner")
+    try:
+        try:
+            asyncio.run(bridge._dispatch_discord_message(msg))
+        except RuntimeError:
+            pass
+        asyncio.run(bridge._dispatch_discord_message(msg))
+    finally:
+        bridge._handle_discord_message = real_handler
+        bridge.seen_message_ids.clear()
+        bridge._inflight_discord_message_ids.clear()
+    assert calls == [24680, 24680], (
+        f"a failed claim must be retriable, got calls {calls!r}"
+    )
+
+
 def test_source_wires_checkpoint_update_into_handler():
     """Architectural: `_handle_discord_message` must call
     `_update_dm_checkpoint` for DMs. Without this, the checkpoint
@@ -293,6 +412,8 @@ def _drive_self_authored(channel, msg_id=99999):
     me = object()
     fake_client = type("_C", (), {"user": me})()
     msg = types.SimpleNamespace(author=me, channel=channel, id=msg_id)
+    bridge.seen_message_ids.discard(msg_id)
+    bridge._inflight_discord_message_ids.discard(msg_id)
     real_client = getattr(bridge, "client", None)
     bridge.client = fake_client
     try:
@@ -368,6 +489,11 @@ def main():
         test_update_handles_string_message_id,
         test_load_filters_malformed_entries,
         test_source_wires_catchup_into_on_ready,
+        test_source_wires_periodic_reconciliation_once,
+        test_ready_bridge_runs_reconciliation_without_reconnect,
+        test_catchup_passes_are_serialized,
+        test_gateway_and_rest_race_is_claimed_exactly_once,
+        test_failed_claim_is_released_for_retry,
         test_source_wires_checkpoint_update_into_handler,
         test_self_authored_dms_advance_the_checkpoint,
         test_self_authored_dm_actually_advances_the_checkpoint,
