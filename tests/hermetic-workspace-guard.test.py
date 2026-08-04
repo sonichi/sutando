@@ -164,6 +164,67 @@ def main() -> int:
         check("exemptions_for() returns [] for a file with no entry, in-process",
               hwg.exemptions_for("no-such-file.test.py") == [])
 
+        # ...and the PARSE body, which the call above never reaches: the repo's
+        # own exemptions file is currently all comments, so the loop `continue`s
+        # on every line. Only the subprocess controls above ever parsed a real
+        # entry, and the gate cannot see a child interpreter — so those lines
+        # read as untested. Pin the constant instead of relying on repo content,
+        # which would make this coverage hostage to an unrelated file's edits.
+        _real_ex = hwg.EXEMPTIONS
+        try:
+            hwg.EXEMPTIONS = tmp / "no-such-exemptions.txt"
+            check("exemptions_for() returns [] when the file is ABSENT, in-process",
+                  hwg.exemptions_for("anything.test.py") == [])
+
+            ex = tmp / "ex.txt"
+            ex.write_text(
+                "# a comment\n"
+                "\n"
+                "mine.test.py state/mine.log   # trailing comment\n"
+                "mine.test.py state/second.log\n"
+                "other.test.py state/theirs.log\n"
+                "single-token-line\n"
+            )
+            hwg.EXEMPTIONS = ex
+            check("exemptions_for() collects EVERY entry naming this file",
+                  hwg.exemptions_for("mine.test.py") == ["state/mine.log", "state/second.log"],
+                  str(hwg.exemptions_for("mine.test.py")))
+            check("...and another file's entries do not leak in",
+                  hwg.exemptions_for("other.test.py") == ["state/theirs.log"],
+                  str(hwg.exemptions_for("other.test.py")))
+            check("...and a malformed single-token line is ignored, not crashed on",
+                  hwg.exemptions_for("single-token-line") == [])
+        finally:
+            hwg.EXEMPTIONS = _real_ex
+
+        # snapshot(): the vanished-mid-walk branch. The race is not reproducible,
+        # so it is forced — is_file() says yes, the stat() that follows raises.
+        # Patching stat ALONE would not do it: pathlib swallows OSError inside
+        # is_file() and returns False, so the file would be skipped one line
+        # earlier and the except branch would stay unexecuted while the
+        # assertion below still passed. That is the shape of a test that proves
+        # nothing. [[feedback_a_control_that_returns_a_plausible_number_is_not_a_validated_control]]
+        (ws / "state" / "vanishing.json").write_text("{}")
+        _real_stat, _real_is_file = Path.stat, Path.is_file
+        Path.is_file = lambda self, *a, **k: (
+            True if self.name == "vanishing.json" else _real_is_file(self, *a, **k))
+
+        def _stat_racing(self, *a, **k):
+            if self.name == "vanishing.json":
+                raise OSError(2, "vanished mid-walk")
+            return _real_stat(self, *a, **k)
+
+        Path.stat = _stat_racing
+        try:
+            snap_race = hwg.snapshot(ws)
+        finally:
+            Path.stat, Path.is_file = _real_stat, _real_is_file
+        check("snapshot() SKIPS a file that vanishes mid-walk instead of crashing",
+              "state/vanishing.json" not in snap_race)
+        check("...and still records the files that did NOT vanish",
+              "state/preexisting.json" in snap_race, str(sorted(snap_race))[:140])
+        (ws / "state" / "vanishing.json").unlink()
+
         # diff(): created / changed / removed, in-process
         check("diff() reports created, changed and removed paths",
               hwg.diff({"a": (1, 1), "b": (1, 1)}, {"a": (2, 2), "c": (1, 1)})
@@ -192,6 +253,26 @@ def main() -> int:
             out2 = buf2.getvalue()
             check("main() FAILS a polluting test and NAMES the path, in-process",
                   rc_viol != 0 and "state/leaked.log" in out2, f"rc={rc_viol} {out2[-160:]}")
+
+            # The stale-exemption report, in-process. A clean test plus an
+            # exemption for a path it never writes: rc must go non-zero on the
+            # exemption alone, with no violation anywhere in the run.
+            _real_ex2 = hwg.EXEMPTIONS
+            stale_ex = tmp / "stale-ex.txt"
+            stale_ex.write_text(f"{clean.name} state/never-written.log\n")
+            hwg.EXEMPTIONS = stale_ex
+            try:
+                buf3 = io.StringIO()
+                with contextlib.redirect_stdout(buf3), contextlib.redirect_stderr(buf3):
+                    rc_stale = hwg.main(["run", str(clean)])
+                out3 = buf3.getvalue()
+            finally:
+                hwg.EXEMPTIONS = _real_ex2
+            check("main() FAILS on a STALE exemption and names the path, in-process",
+                  rc_stale != 0 and "STALE" in out3 and "state/never-written.log" in out3,
+                  f"rc={rc_stale} {out3[-160:]}")
+            check("...on the exemption alone — the run itself wrote nothing",
+                  "wrote into the LIVE workspace" not in out3, out3[-160:])
         finally:
             hwg.resolved_workspace = _real_rw
 
