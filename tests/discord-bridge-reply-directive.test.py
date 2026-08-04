@@ -93,57 +93,91 @@ def load_bridge():
 bridge = load_bridge()
 
 # Set by main() before any case runs; read by the live-workspace regression.
-_LIVE_BASELINE = (None, [])
+_LIVE_BASELINE = {}
 
 
 @contextlib.contextmanager
 def _bridge_writes_redirected():
     """Point every filesystem write this fixture triggers at a throwaway tree.
 
-    Three separate escapes, all to the OWNER's live workspace, and the old
-    comment at `_run_one_poll_iteration` ("RESULTS_DIR is shared with prod")
-    treated the first as acceptable rather than as the defect it is:
+    SIX escapes, all to the OWNER's live workspace, and the old comment at
+    `_run_one_poll_iteration` ("RESULTS_DIR is shared with prod") signed off on
+    the first as acceptable rather than treating it as the defect it is:
 
-      1. the staged result files             -> <workspace>/results/
-      2. `archive_file()` moving them        -> <workspace>/results/archive/<ym>/
-      3. `poll_results` -> outbox_log.append -> <workspace>/state/outbox.log
+      results/…                      staged result files
+      results/archive/<ym>/…         archive_file() moving them
+      state/outbox.log               poll_results -> outbox_log.append
+      state/result-audit.log         result_audit
+      state/discord-bridge.heartbeat the bridge's own heartbeat
+      logs/events-<date>.jsonl       event_log
 
-    (3) is the one that matters most: `state/outbox.log` is the delivery audit
-    log the dashboard's Outbox card shows the owner. Measured on this host
-    before the fix, the fixtures had been landing in the real log since
-    2026-05-28 — `discord_channel` rows whose `recipient` is `111222333` /
-    `444555666` / `777888999` rather than a Discord snowflake.
+    `state/outbox.log` is the one that matters most — the delivery audit log the
+    dashboard's Outbox card shows the owner. Measured on this host before the
+    fix, fixtures had been landing in the real log since 2026-05-28:
+    `discord_channel` rows whose `recipient` is `111222333` / `444555666` /
+    `777888999` rather than a Discord snowflake.
 
-    `outbox_log._outbox_path` is swapped rather than `resolve_workspace`
-    because `append()` re-resolves per call; the sibling fix in #2615 had to
-    rebind a constant instead because that one was bound at import. Which seam
-    works is a property of the module, so the regression proves it by exercise.
+    I found three of the six by fixing and re-measuring, not by reading — each
+    round the whole-tree regression named what the previous fix had missed.
+    That is why the redirect is now structural (patch the resolver everywhere it
+    is BOUND, plus the import-time constants) rather than an enumerated list of
+    the paths I happened to know about.
 
     Restores in a `finally` so a mid-run assertion cannot leave the globals
     patched for whatever runs next in the same interpreter (#2614).
     """
-    import outbox_log
+    import workspace_default
 
-    orig_results = bridge.RESULTS_DIR
-    orig_archive = bridge.ARCHIVE_RESULTS_DIR
-    orig_path = outbox_log._outbox_path
     tmp = Path(tempfile.mkdtemp(prefix="reply-directive-test-"))
-    redirected = tmp / "state" / "outbox.log"
-    redirected.parent.mkdir(parents=True, exist_ok=True)
-    bridge.RESULTS_DIR = tmp / "results"
-    bridge.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    # `archive_file()` does NOT derive from RESULTS_DIR — `ARCHIVE_RESULTS_DIR`
-    # is its own module constant (discord-bridge.py:248), so redirecting only
-    # RESULTS_DIR moves the staging write and leaves the ARCHIVE write in the
-    # owner's tree. Caught by the regression below, not by reading the code.
-    bridge.ARCHIVE_RESULTS_DIR = tmp / "results" / "archive"
-    outbox_log._outbox_path = lambda: redirected
+    for sub in ("results", "state", "tasks", "logs"):
+        (tmp / sub).mkdir(parents=True, exist_ok=True)
+
+    # ONE patch covers every helper that resolves at CALL time — outbox_log,
+    # result_audit and event_log all call `resolve_workspace()` per write, so
+    # patching the resolver redirects all three and any future sibling. Chasing
+    # them individually is what let two of them slip: my first pass redirected
+    # RESULTS_DIR + outbox only, and `state/result-audit.log`,
+    # `state/discord-bridge.heartbeat` and `logs/events-*.jsonl` still escaped.
+    orig_resolve = workspace_default.resolve_workspace
+    _fake = lambda: tmp
+
+    # Patch the name in EVERY module that holds it, not just where it is defined.
+    # `from workspace_default import resolve_workspace` binds the function into
+    # the IMPORTER's namespace, so replacing `workspace_default.resolve_workspace`
+    # alone leaves every already-imported consumer pointing at the original.
+    # Measured: with only the source module patched, `state/result-audit.log` and
+    # `logs/events-*.jsonl` still escaped, because `result_audit` and `event_log`
+    # each hold their own binding. The whole-tree regression caught it; the
+    # enumerated one had not.
+    _patched = []
+    for _mod in list(sys.modules.values()):
+        if getattr(_mod, "resolve_workspace", None) is orig_resolve:
+            _patched.append(_mod)
+            _mod.resolve_workspace = _fake
+    workspace_default.resolve_workspace = _fake
+
+    # The bridge's own constants are computed AT IMPORT from `REPO`
+    # (discord-bridge.py:244-248, 3991, 4099, 4214), so patching the resolver
+    # cannot reach them — they must be rebound explicitly. This is the same
+    # import-time-vs-call-time split as #2615 vs #2618, in one file.
+    _consts = ("REPO", "TASKS_DIR", "RESULTS_DIR", "STATE_DIR",
+               "ARCHIVE_TASKS_DIR", "ARCHIVE_RESULTS_DIR",
+               "DM_CHECKPOINT_FILE", "DELIVERED_DIR", "PENDING_REPLIES_FILE")
+    saved = {}
+    for name in _consts:
+        if hasattr(bridge, name):
+            saved[name] = getattr(bridge, name)
+            rel = Path(str(saved[name])).relative_to(orig_resolve()) \
+                if str(saved[name]).startswith(str(orig_resolve())) else None
+            setattr(bridge, name, tmp / rel if rel is not None else tmp)
     try:
-        yield tmp, redirected
+        yield tmp, tmp / "state" / "outbox.log"
     finally:
-        bridge.RESULTS_DIR = orig_results
-        bridge.ARCHIVE_RESULTS_DIR = orig_archive
-        outbox_log._outbox_path = orig_path
+        workspace_default.resolve_workspace = orig_resolve
+        for _mod in _patched:
+            _mod.resolve_workspace = orig_resolve
+        for name, val in saved.items():
+            setattr(bridge, name, val)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -261,6 +295,29 @@ def case_c_directive_only_first_chunk():
     return fails
 
 
+def _workspace_fingerprint(ws) -> dict:
+    """(size, mtime) for EVERY file under the workspace.
+
+    Deliberately whole-tree rather than an enumerated list of the directories
+    this fixture is known to touch. The first version of this regression
+    checked only `results/` and `state/outbox.log`, PASSED, and three writes
+    escaped anyway — `state/result-audit.log`, `state/discord-bridge.heartbeat`
+    and `logs/events-*.jsonl`. An assertion only catches what it looks at, so
+    it must look at everything.
+    """
+    out = {}
+    if not ws.is_dir():
+        return out
+    for f in ws.rglob("*"):
+        if f.is_file():
+            try:
+                st = f.stat()
+                out[str(f)] = (st.st_size, st.st_mtime)
+            except OSError:
+                pass
+    return out
+
+
 def test_no_writes_reach_the_live_workspace(live_ws) -> int:
     """THE regression: a run must not touch the owner's results/ or outbox log.
 
@@ -271,21 +328,15 @@ def test_no_writes_reach_the_live_workspace(live_ws) -> int:
     Asserts on the RESOLVED live workspace rather than a fixture path, because
     the defect was precisely that the fixture escaped to wherever that resolves.
     """
-    outbox = live_ws / "state" / "outbox.log"
-    results = live_ws / "results"
-    now_outbox = outbox.stat().st_size if outbox.is_file() else None
-    now_results = sorted(str(p) for p in results.rglob("*")) if results.is_dir() else []
-    before_outbox, before_results = _LIVE_BASELINE
-    bad = []
-    if now_outbox != before_outbox:
-        bad.append(f"outbox.log size {before_outbox} -> {now_outbox}")
-    new_files = set(now_results) - set(before_results)
-    if new_files:
-        bad.append(f"{len(new_files)} new file(s) under results/: {sorted(new_files)[:3]}")
-    if bad:
-        print("  \u2717 live workspace was written to: " + "; ".join(bad), file=sys.stderr)
+    now = _workspace_fingerprint(live_ws)
+    before = _LIVE_BASELINE
+    changed = sorted(k for k in now if before.get(k) != now[k])
+    if changed:
+        print(f"  \u2717 live workspace was written to \u2014 {len(changed)} path(s):", file=sys.stderr)
+        for c in changed[:8]:
+            print(f"      {c}", file=sys.stderr)
         return 1
-    print("  \u2713 live workspace untouched (results/ and state/outbox.log)")
+    print(f"  \u2713 live workspace untouched ({len(now)} paths compared, whole tree)")
     return 0
 
 
@@ -296,12 +347,7 @@ def main():
 
     global _LIVE_BASELINE
     live_ws = resolve_workspace()
-    _outbox = live_ws / "state" / "outbox.log"
-    _results = live_ws / "results"
-    _LIVE_BASELINE = (
-        _outbox.stat().st_size if _outbox.is_file() else None,
-        sorted(str(p) for p in _results.rglob("*")) if _results.is_dir() else [],
-    )
+    _LIVE_BASELINE = _workspace_fingerprint(live_ws)
 
     cases = [
         ("a-directive-present-constructs-reference", case_a_directive_present_constructs_reference),
