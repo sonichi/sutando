@@ -114,7 +114,6 @@ tests/discord-bridge-delivery-sentinel.test.py
 tests/discord-bridge-discord-state-detection.test.py
 tests/discord-bridge-dm-catchup.test.py
 tests/discord-bridge-dm-fallback-source-guard.test.py
-tests/discord-bridge-file-markers.test.py
 tests/discord-bridge-mod-judge-actions.test.py
 tests/discord-bridge-mod-judge-buffer.test.py
 tests/discord-bridge-mod-judge-codex.test.py
