@@ -13,10 +13,23 @@
 #   round 2  IDLE(3s)       mtime same        round 2  TEST  MTIME CHANGED
 #   round 3  IDLE(3s)       mtime same        round 3  TEST  MTIME CHANGED
 #
-# Content was IDENTICAL every time, because the hook install is idempotent. A
-# content-hash comparison therefore reads "unchanged" and clears the test
-# falsely; only mtime discriminates. That is why this file asserts on the skip
-# message (deterministic, side-effect-free) AND keeps an mtime guard behind it.
+# Content was IDENTICAL every time, because the hook install is idempotent, so a
+# content-hash comparison reads "unchanged" and clears falsely. That is the
+# measurement note the rounds above exist to record — mtime was the only thing
+# that discriminated WHEN OBSERVING THE LIVE FILE.
+#
+# This file no longer observes it. The mtime guard was removed at b189b1ad
+# (@john-the-dev): it could only fire AFTER a write, so it was a post-mortem
+# rather than a guard, and obtaining it put live operator state inside the blast
+# radius of the regression under test. On a detached worktree it silently
+# SKIPPED, so it could not fire where it ran and could only do harm where it
+# would.
+#
+# What the file asserts NOW, both directions, entirely side-effect-free:
+#   * with the test hook set    -> both bridges announce the skip and do not run
+#   * with NO test hook         -> neither bridge is skipped for that reason
+# Mutation confirms the pair is sufficient: making the gate unconditional fails
+# 2 named assertions, making it never fire fails 3, 6 of 6 running in both.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
