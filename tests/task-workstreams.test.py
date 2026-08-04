@@ -7,7 +7,9 @@ import json
 import multiprocessing
 import sys
 import tempfile
+import threading
 from pathlib import Path
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -291,6 +293,49 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
     assert workstreams.classifier_status(active).reason == "active-user-task"
 
 
+def test_stale_classifier_is_archived_before_replacement() -> None:
+    workspace = fixture_workspace()
+    first = workstreams.maybe_enqueue_classifier_task(workspace)
+    first_path = workspace / "tasks" / f"{first.task_id}.txt"
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    state["enqueued_at"] = 0
+    state_path.write_text(json.dumps(state))
+
+    replacement = workstreams.maybe_enqueue_classifier_task(workspace)
+
+    assert replacement.enqueued and replacement.task_id != first.task_id
+    assert not first_path.exists()
+    archived = list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*.txt"))
+    assert len(archived) == 1
+    live = list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
+    assert live == [workspace / "tasks" / f"{replacement.task_id}.txt"]
+
+
+def test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors() -> None:
+    workspace = fixture_workspace()
+    stop = threading.Event()
+    calls = []
+
+    def probe(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            raise RuntimeError("transient classifier failure")
+        stop.set()
+
+    with mock.patch.object(workstreams, "maybe_enqueue_classifier_task", side_effect=probe):
+        workstreams.run_classifier_maintenance(
+            workspace,
+            skill_file=REPO / "skills" / "task-workstream-grouping" / "SKILL.md",
+            stop_event=stop,
+            interval_seconds=0.01,
+        )
+
+    assert len(calls) == 2
+    assert calls[0][0] == (workspace,)
+    assert calls[0][1]["skill_file"].name == "SKILL.md"
+
+
 def test_concurrent_inheritance_keeps_every_assignment() -> None:
     workspace = fixture_workspace()
     snapshot = workstreams.build_classifier_snapshot(workspace)
@@ -326,6 +371,8 @@ def main() -> None:
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
+        test_stale_classifier_is_archived_before_replacement,
+        test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,
         test_concurrent_inheritance_keeps_every_assignment,
     ]
     for test in tests:

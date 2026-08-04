@@ -1,10 +1,10 @@
 """Durable inferred-workstream index and archive-backed task history.
 
-Task files stay immutable execution/audit records.  Semantic workstream metadata
+Existing task-file contents are never rewritten.  Semantic workstream metadata
 lives in ``<workspace>/data/task-workstreams.json`` and is joined at read time.
-The selected Sutando core performs inference through the optional
-``task-workstream-grouping`` skill; this module only prepares inert snapshots,
-validates the model's proposal, and applies it atomically.
+The selected Sutando core performs inference through a newly enqueued, low-priority
+maintenance task for the optional ``task-workstream-grouping`` skill; this module
+prepares inert snapshots, validates the model's proposal, and applies it atomically.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ CLASSIFIER_TASK_PREFIX = "task-workstream-grouping-"
 LEGACY_CLASSIFIER_TASK_PREFIX = "task-project-grouping-"
 MIN_CONFIDENCE = 0.65
 MAX_RESULT_CHARS = 4_000
+CLASSIFIER_POLL_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -568,6 +569,15 @@ def _maybe_enqueue_classifier_task_locked(
     state_path = _classifier_state_path(workspace)
     now = time.time()
 
+    # A stale or superseded classifier task must not remain live when its
+    # replacement is queued.  Keep the immutable audit record by moving the
+    # unclaimed file into the normal monthly archive.  A claimed file is left
+    # alone: core-busy normally gates that case, and racing the active worker
+    # would be worse than allowing one harmless duplicate proposal.
+    previous_state = _read_json(state_path, {})
+    if isinstance(previous_state, dict) and previous_state.get("status") == "inflight":
+        _archive_superseded_classifier_task(workspace, previous_state)
+
     task_id = f"{CLASSIFIER_TASK_PREFIX}{int(now * 1000)}"
     task_path = workspace / "tasks" / f"{task_id}.txt"
     task_path.parent.mkdir(parents=True, exist_ok=True)
@@ -601,6 +611,48 @@ def _maybe_enqueue_classifier_task_locked(
         "status": "inflight",
     })
     return ClassifierQueueResult(True, True, "enqueued", snapshot_hash, task_id)
+
+
+def _archive_superseded_classifier_task(workspace: Path, state: dict) -> bool:
+    """Recoverably retire an unclaimed classifier file before replacing it."""
+    task_id = str(state.get("task_id") or "")
+    if not task_id.startswith((CLASSIFIER_TASK_PREFIX, LEGACY_CLASSIFIER_TASK_PREFIX)):
+        return False
+    if not re.fullmatch(r"task-[a-zA-Z0-9_.-]+", task_id):
+        return False
+    task_path = Path(workspace) / "tasks" / f"{task_id}.txt"
+    if not task_path.is_file():
+        return False
+    archive_dir = task_path.parent / "archive" / datetime.now(timezone.utc).strftime("%Y-%m")
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / task_path.name
+    if archive_path.exists():
+        archive_path = archive_dir / f"{task_id}.superseded-{int(time.time() * 1000)}.txt"
+    try:
+        os.replace(task_path, archive_path)
+        return True
+    except OSError:
+        # The watcher may have claimed the task between the readiness check
+        # and this move.  Classification remains fail-open in that race.
+        return False
+
+
+def run_classifier_maintenance(
+    workspace: Path,
+    *,
+    skill_file: Path,
+    stop_event,
+    interval_seconds: float = CLASSIFIER_POLL_SECONDS,
+) -> None:
+    """Continuously enqueue idle classifier work without a dashboard client."""
+    interval = max(0.01, float(interval_seconds))
+    while not stop_event.is_set():
+        try:
+            maybe_enqueue_classifier_task(workspace, skill_file=skill_file)
+        except Exception:
+            # Optional semantic grouping must never take down agent-api.
+            pass
+        stop_event.wait(interval)
 
 
 def mark_classifier_complete(workspace: Path, snapshot_hash: str) -> None:

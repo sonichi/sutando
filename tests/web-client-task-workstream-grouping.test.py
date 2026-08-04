@@ -120,11 +120,11 @@ def test_all_three_display_paths_share_order_and_history_is_quiet() -> None:
     assert "esc(displayText)" in visible
 
     # History hydration seeds knownTaskIds before merging, so old tasks cannot
-    # trigger the active poll's "Context received" toast. It retries only when
-    # the API says workstream inference is still pending.
+    # trigger the active poll's "Context received" toast. It never triggers
+    # inference itself: the always-on agent API owns that maintenance loop.
     hydrate = SOURCE[SOURCE.index("async function hydrateTaskHistory"):SOURCE.index("// ─── Poll agent API")]
     assert "fetch('/api/task-history')" in hydrate
-    assert "fetch('/api/task-workstreams/infer', { method: 'POST' })" in hydrate
+    assert "fetch('/api/task-workstreams/infer'" not in hydrate
     assert hydrate.index("knownTaskIds.add(row.id)") < hydrate.index("taskMap[row.id] = mergeTaskRow")
     assert "data.inference && data.inference.pending" in hydrate
     assert "scheduleTaskHistoryHydration(10000)" in hydrate

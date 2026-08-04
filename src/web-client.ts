@@ -1622,10 +1622,11 @@ function showToast(msg) {
 }
 const knownTaskIds = new Set(Object.keys(taskMap));
 
-// Hydrate durable history once at startup. While the server is still
-// backfilling inferred workstreams, re-read the snapshot so tasks move into their
-// canonical groups without a reload. Historical rows are marked known before
-// merging, so the live poll never announces them as newly received work.
+// Hydrate durable history once at startup. The always-on agent API performs
+// inference independently of this page; while it is still backfilling inferred
+// workstreams, re-read the snapshot so tasks move into their canonical groups
+// without a reload. Historical rows are marked known before merging, so the live
+// poll never announces them as newly received work.
 let taskHistoryRetryTimer = null;
 let taskHistoryHydrating = false;
 let taskHistoryInitialLoadComplete = false;
@@ -1667,13 +1668,7 @@ async function hydrateTaskHistory() {
     updateDynamicRegion();
     taskHistoryInitialLoadComplete = true;
     if (data.inference && data.inference.pending) {
-      try {
-        const inferResp = await fetch('/api/task-workstreams/infer', { method: 'POST' });
-        const infer = inferResp.ok ? await inferResp.json() : { pending: true };
-        if (infer.pending) scheduleTaskHistoryHydration(10000);
-      } catch {
-        scheduleTaskHistoryHydration(10000);
-      }
+      scheduleTaskHistoryHydration(10000);
     }
   } catch {
     scheduleTaskHistoryHydration(30000);

@@ -28,6 +28,7 @@ def _load_agent_api():
 
 
 api = _load_agent_api()
+API_SOURCE = (REPO / "src" / "agent-api.py").read_text()
 
 
 def _write_task(path: Path, task_id: str, text: str, timestamp: str) -> None:
@@ -215,6 +216,16 @@ def test_history_and_active_routes_expose_workstreams() -> None:
     assert denied[0][0] == 403
 
 
+def test_agent_api_starts_always_on_workstream_maintenance() -> None:
+    main = API_SOURCE[API_SOURCE.index('if __name__ == "__main__":'):]
+    assert "target=task_workstreams.run_classifier_maintenance" in main
+    assert 'name="task-workstream-maintenance"' in main
+    assert "workstream_maintenance.start()" in main
+    assert "workstream_maintenance_stop.set()" in main
+    assert "workstream_maintenance.join(timeout=1)" in main
+
+
 if __name__ == "__main__":
     test_history_and_active_routes_expose_workstreams()
+    test_agent_api_starts_always_on_workstream_maintenance()
     print("agent-api task workstream tests passed")

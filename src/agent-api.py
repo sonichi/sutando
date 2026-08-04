@@ -9,7 +9,7 @@ Endpoints:
   POST /task              — submit a task (JSON: {from, task, priority?, callback_url?})
   GET  /result/<id>       — poll for task result
   GET  /tasks/history     — authenticated archive-backed task history
-  POST /tasks/workstreams/infer — authenticated idle workstream-classifier trigger
+  POST /tasks/workstreams/infer — authenticated manual workstream-classifier trigger
   GET  /status            — current health + capabilities
   GET  /ping              — alive check
   POST /twilio/voice      — inbound call webhook (Twilio)
@@ -1376,6 +1376,18 @@ if __name__ == "__main__":
     # lsof guard, so nothing restarted it (2026-07-04 incident; same fix as
     # dashboard, #1709).
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
+    workstream_maintenance_stop = threading.Event()
+    workstream_maintenance = threading.Thread(
+        target=task_workstreams.run_classifier_maintenance,
+        kwargs={
+            "workspace": WORKSPACE_DIR,
+            "skill_file": TASK_WORKSTREAM_GROUPING_SKILL,
+            "stop_event": workstream_maintenance_stop,
+        },
+        name="task-workstream-maintenance",
+        daemon=True,
+    )
+    workstream_maintenance.start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print("  POST /task  — submit a task")
@@ -1387,3 +1399,7 @@ if __name__ == "__main__":
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nDone.")
+    finally:
+        workstream_maintenance_stop.set()
+        workstream_maintenance.join(timeout=1)
+        server.server_close()
