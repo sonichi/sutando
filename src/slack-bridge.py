@@ -141,6 +141,13 @@ if (not BOT_TOKEN or not APP_TOKEN) and channels_env.exists():
         elif line.startswith("SLACK_APP_TOKEN=") and not APP_TOKEN:
             APP_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
 if not BOT_TOKEN or not APP_TOKEN:
+    # Last resort: the Keychain vault, per token independently — a host may have
+    # one in the .env and the other only vaulted.
+    from channel_token import token_from_vault  # noqa: E402
+    BOT_TOKEN = BOT_TOKEN or token_from_vault("SLACK_BOT_TOKEN")
+    APP_TOKEN = APP_TOKEN or token_from_vault("SLACK_APP_TOKEN")
+
+if not BOT_TOKEN or not APP_TOKEN:
     print("SLACK_BOT_TOKEN and/or SLACK_APP_TOKEN not set", file=sys.stderr)
     sys.exit(1)
 

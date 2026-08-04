@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-194 modules indexed.
+196 modules indexed.
 
 ## `src/`
 
@@ -24,6 +24,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
+- **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
 - **`chat-ui.ts`** — Sutando Chat UI — clean full-page chat experience.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Check pending questions and notify if unanswered.
@@ -123,6 +124,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
 - **`task_priority.py`** — Task priority taxonomy + readers.
+- **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
