@@ -330,6 +330,92 @@ def test_from_gws_repeated_page_token_refuses_to_loop():
             ok("a repeated pageToken raises instead of looping", True)
 
 
+def test_gws_strips_a_keyring_banner_before_the_json():
+    """Some hosts print a keyring banner ahead of the payload; the parser must skip it.
+
+    Both halves: a banner followed by JSON is recoverable, a banner with NO JSON at all
+    is not and must raise rather than return an empty day.
+    """
+    run, _ = _fake_gws([(0, 'Unlocking keyring...\n{"items": []}')])
+    with unittest.mock.patch("subprocess.run", run):
+        ok("a keyring banner before the JSON is stripped",
+           wcc._gws(["calendar", "calendarList", "list"]) == {"items": []})
+    run, _ = _fake_gws([(0, "Unlocking keyring... no payload at all")])
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc._gws(["calendar", "x"]); ok("banner with NO json raises", False)
+        except wcc.GwsUnavailable:
+            ok("a banner with NO json at all raises (never an empty day)", True)
+
+
+def test_gws_unparseable_json_raises():
+    run, _ = _fake_gws([(0, "{not: valid json,,,")])
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc._gws(["calendar", "x"]); ok("unparseable JSON raises", False)
+        except wcc.GwsUnavailable:
+            ok("unparseable JSON raises rather than yielding no events", True)
+
+
+def test_paging_rejects_a_non_object_page_and_an_endless_pager():
+    """Two ways a pager can be wrong that are NOT an error response."""
+    run, _ = _fake_gws([(0, "[1, 2, 3]")])          # a LIST where an object is required
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc._gws_all_pages(["calendar", "events", "list"]); ok("non-object page raises", False)
+        except wcc.GwsUnavailable:
+            ok("a non-object page raises instead of being treated as zero items", True)
+    endless = json.dumps({"items": [], "nextPageToken": "T"})
+    run, _ = _fake_gws([(0, endless)] * 60)
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc._gws_all_pages(["calendar", "events", "list"], max_pages=3)
+            ok("an endless pager raises", False)
+        except wcc.GwsUnavailable:
+            ok("an endless pager stops at max_pages and REFUSES a partial read", True)
+
+
+def test_no_selected_calendars_refuses_to_certify():
+    run, _ = _fake_gws([(0, json.dumps({"items": [{"id": "a@x.com", "selected": False}]}))])
+    with unittest.mock.patch("subprocess.run", run):
+        try:
+            wcc.events_from_gws(); ok("zero SELECTED calendars raises", False)
+        except wcc.GwsUnavailable:
+            ok("zero SELECTED calendars raises — an unread day is not an empty one", True)
+
+
+def test_cancelled_events_are_dropped_and_location_is_rendered():
+    cal = json.dumps({"items": [{"id": "a@x.com", "selected": True}]})
+    evs = json.dumps({"items": [
+        dict(_ev("standup", "09"), location="Room 4\nBuilding B"),
+        dict(_ev("ghost", "10"), status="cancelled"),
+    ]})
+    run, _ = _fake_gws([(0, cal), (0, evs)])
+    with unittest.mock.patch("subprocess.run", run):
+        got = wcc.events_from_gws()
+    ok("a cancelled event is dropped", len(got) == 1, f"{[e['raw'] for e in got]}")
+    ok("a location renders on ONE line (a multi-line address must not break the raw)",
+       got and "@ Room 4" in got[0]["raw"] and "\n" not in got[0]["raw"], got[0]["raw"] if got else "")
+
+
+def test_from_gws_success_path_writes_the_cache_and_exits_zero():
+    """The happy path of `main --from-gws` — previously only its failure path ran."""
+    cal = json.dumps({"items": [{"id": "a@x.com", "selected": True}]})
+    evs = json.dumps({"items": [_ev("standup", "09")]})
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "calendar-today.json"
+        run, _ = _fake_gws([(0, cal), (0, evs)])
+        with unittest.mock.patch("subprocess.run", run), \
+             unittest.mock.patch.object(wcc, "cache_path", lambda: cache):
+            rc = wcc.main(["--from-gws"])
+        ok("--from-gws succeeds and exits 0", rc == 0, f"rc={rc}")
+        ok("--from-gws actually wrote the cache", cache.exists())
+        if cache.exists():
+            d = json.loads(cache.read_text())
+            ok("the written cache carries the event and today's date",
+               len(d.get("events", [])) == 1 and d.get("date"), str(d)[:90])
+
+
 def test_from_gws_cli_failure_leaves_prior_cache_untouched():
     """The durability property: yesterday's cache must survive a failed fetch."""
     with tempfile.TemporaryDirectory() as td:
@@ -372,6 +458,12 @@ test_from_gws_drains_calendar_list_pages()
 test_from_gws_drains_event_pages()
 test_from_gws_error_on_a_later_page_is_total_failure()
 test_from_gws_repeated_page_token_refuses_to_loop()
+test_gws_strips_a_keyring_banner_before_the_json()
+test_gws_unparseable_json_raises()
+test_paging_rejects_a_non_object_page_and_an_endless_pager()
+test_no_selected_calendars_refuses_to_certify()
+test_cancelled_events_are_dropped_and_location_is_rendered()
+test_from_gws_success_path_writes_the_cache_and_exits_zero()
 test_from_gws_cli_failure_leaves_prior_cache_untouched()
 test_event_to_raw_shapes()
 
