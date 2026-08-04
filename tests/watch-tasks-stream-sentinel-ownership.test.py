@@ -57,11 +57,66 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
+def make_stub_fswatch(bin_dir: Path) -> None:
+    """A controllable `fswatch` so Linux runs the SAME interaction as macOS.
+
+    The watcher only needs fswatch to hold its stdout open — this test drives
+    `cleanup()` by killing that child so the read hits EOF, never by delivering
+    a real filesystem event. A stub that blocks forever therefore reproduces the
+    exact two-watcher EOF/EXIT interaction on a host with no fswatch installed,
+    which is what makes this a REQUIRED-CI regression rather than a macOS-only
+    one (@john-the-dev: "a green skip is not regression coverage").
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "fswatch"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "# Test stub: hold stdout open, emit nothing, and be ONE process.\n"
+        "#\n"
+        "# `exec sleep` (not `cat`, not a `while` loop) for two reasons the first\n"
+        "# draft got wrong:\n"
+        "#   * `exec cat` returns EOF immediately when stdin is not a live pipe,\n"
+        "#     so the stub died at once and took the watcher with it — fix and\n"
+        "#     control then failed IDENTICALLY, which is the signature of a\n"
+        "#     broken instrument rather than a caught bug.\n"
+        "#   * a `while :; do sleep; done` loop leaves an orphaned `sleep`\n"
+        "#     holding the inherited stdout when the shell is killed, so the\n"
+        "#     watcher never sees EOF.\n"
+        "# One process, holding the fd, whose death closes it. That is exactly\n"
+        "# what the EOF path needs.\n"
+        "exec sleep 100000\n"
+    )
+    stub.chmod(0o755)
+
+
+def resolved_workspace(workspace: Path, env: dict) -> str:
+    """What the watcher WILL resolve, asked the same way the script asks it."""
+    r = subprocess.run(["bash", "scripts/sutando-config.sh", "workspace"],
+                       cwd=str(REPO), env=env, capture_output=True, text=True)
+    return r.stdout.strip()
+
+
 class Watcher:
     """One watcher in its OWN session, so its `kill 0` cannot reach us."""
 
-    def __init__(self, workspace: Path):
-        env = dict(os.environ, SUTANDO_WORKSPACE=str(workspace), SUTANDO_TEST_MODE="1")
+    def __init__(self, workspace: Path, bin_dir: Path):
+        env = dict(os.environ,
+                   SUTANDO_WORKSPACE=str(workspace), SUTANDO_TEST_MODE="1",
+                   PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH','')}")
+        # ASSERT THE RESOLVED PATH BEFORE SPAWNING (@john-the-dev). The script
+        # takes STATE_DIR from `sutando-config.sh workspace`, NOT from the
+        # positional arg, so if that resolution ever stops honouring the test
+        # workspace this child would write the OPERATOR'S REAL sentinel — and a
+        # developer running this from the live checkout would clobber the live
+        # watcher's pid file. Refuse to spawn rather than trust it.
+        got = resolved_workspace(workspace, env)
+        if Path(got).resolve() != workspace.resolve():
+            raise SystemExit(
+                "REFUSING TO SPAWN: the watcher would resolve\n"
+                f"    {got}\n  but this test declared\n    {workspace}\n"
+                "  Spawning would write the operator's real sentinel. Fix the\n"
+                "  isolation before running this test."
+            )
         self.proc = subprocess.Popen(
             ["bash", "src/watch-tasks-stream.sh"], cwd=str(REPO), env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -108,29 +163,19 @@ def wait_for(pred, timeout: float = 8.0, step: float = 0.25) -> bool:
 def main() -> int:
     print("watch-tasks-stream sentinel ownership:")
 
-    # PREREQUISITE, checked explicitly so its absence is a SKIP and not four
-    # misleading failures. The script writes the sentinel at :65 and only
-    # invokes fswatch at :189, so on a host without fswatch it writes the file,
-    # dies immediately, and cleanup() removes it — the sentinel "never appears"
-    # to a poller, every assertion that needs a LIVE watcher fails, and the two
-    # that merely need one to EXIT pass. That is exactly what this test did on
-    # CI (ubuntu, no fswatch) before this guard: 4 FAIL / 3 ok, none of which
-    # said anything about the ownership guard.
-    if shutil.which("fswatch") is None:
-        print("  SKIP — fswatch is not installed; this test drives the real")
-        print("         watcher, which exits immediately without it.")
-        print("         Coverage here is LOCAL-ONLY (macOS dev hosts). CI does")
-        print("         not exercise the sentinel-ownership guard.")
-        return 0
-
+    # No fswatch prerequisite any more: a controllable stub goes on the child's
+    # PATH, so Linux runs the SAME two-watcher EOF/EXIT interaction as macOS and
+    # this is genuine required-CI regression coverage rather than a green skip.
     box = Path(tempfile.mkdtemp(prefix="sentinel-own-"))
     ws = box / "workspace"
     for d in ("tasks", "results", "state"):
         (ws / d).mkdir(parents=True, exist_ok=True)
     sentinel = ws / "state" / "watch-tasks-stream.pid"
+    bin_dir = box / "bin"
+    make_stub_fswatch(bin_dir)
     a = b = None
     try:
-        a = Watcher(ws)
+        a = Watcher(ws, bin_dir)
         # A watcher that exits on startup makes every assertion below either
         # fail for the wrong reason or pass vacuously, so establish liveness
         # FIRST and bail with a diagnosis rather than a cascade.
@@ -138,18 +183,19 @@ def main() -> int:
             print("  SKIP — watcher neither wrote a sentinel nor exited; "
                   "environment cannot run this test")
             return 0
+        check("the watcher STAYS UP after startup (stub fswatch on PATH)",
+              a.alive(),
+              "it exited during startup — with the stub on PATH this is a real "
+              "failure, not a missing dependency; every assertion below would "
+              "otherwise pass or fail for the wrong reason")
         if not a.alive():
-            print("  SKIP — the watcher exited during startup, so there is no "
-                  "live watcher to test ownership against.")
-            print("         Most likely an unmet runtime dependency (fswatch). "
-                  "Not a failure of the guard under test.")
-            return 0
+            return 1
         check("a watcher writes the sentinel",
               wait_for(lambda: sentinel.exists() and sentinel.read_text().strip() != ""),
               "sentinel never appeared")
         pid_a = sentinel.read_text().strip() if sentinel.exists() else ""
 
-        b = Watcher(ws)
+        b = Watcher(ws, bin_dir)
         check("a SECOND watcher takes ownership of the sentinel",
               wait_for(lambda: sentinel.exists() and sentinel.read_text().strip() not in ("", pid_a)),
               f"sentinel still reads {pid_a!r}")
