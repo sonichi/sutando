@@ -43,7 +43,25 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 3. For each job in the config:
    - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
    - **Skip any entry with `"launchd": true`** — it is owned by the OS-level cron-runner (see "Reliable OS-level crons" below), which emits its task independently. Registering it here too would double-fire (duplicate deliveries — the exact noise class the launchd path was built to avoid).
-   - Skip if a job with matching prompt/name already exists
+   - **If a job for this entry already exists, RE-REGISTER it rather than skipping** — `CronDelete`
+     the existing job, then `CronCreate` from the current `crons.json` text, and confirm the
+     replacement in `CronList`. A session cron is a **snapshot of the prompt taken at registration
+     time**; editing `crons.json` afterwards does not reach it. The former rule here was "skip if a
+     job with matching prompt/name already exists", which made that snapshot permanent for the life
+     of the session: a long-lived core kept firing a prompt its own config had already superseded,
+     and every cheap check agreed the config was right.
+     Observed on a long-lived core: it booted 2026-07-30, the `pr-flag` entry gained
+     `--stand "<stand>"` on 2026-08-03, and the registered job kept firing the pre-edit text for two
+     days. That flag is what makes `pr_flag.py` populate `is_mine` (it is deliberately `null`
+     without one), so the cron's own instruction — "judge from `ci/mergeable/review/approvals/
+     is_mine`" — was reading a field that was structurally always null, with a correct script *and*
+     a correct config file. Re-registering fixed it: `is_mine` went from null on all 27 PRs to
+     20 true / 5 false.
+     **Do not "compare the prompt and only re-register on a mismatch": `CronList` truncates the
+     prompt**, so the differing tail is exactly what a comparison cannot see — the `--stand` drift
+     above sat past the truncation point. Unconditional re-registration is the only reliable form.
+     This does not risk the inline-fire failure described at the end of this step: `CronCreate`
+     schedules the next fire time and never runs the prompt on registration.
    - Call `CronCreate` with the cron expression and prompt:
      - If `prompt_skill` is set, pass `prompt: "/skill-name"` (the leading slash makes the scheduled cron fire the skill as a slash command at its scheduled time).
      - Otherwise pass `prompt: <prompt-string-from-config>`.
