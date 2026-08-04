@@ -183,9 +183,15 @@ def main() -> int:
 
     check("configured owner -> the send actually happened", bool(sent),
           "no send recorded — the gate is skipping when it should deliver")
-    if sent:
-        check("  ...to the opened DM channel with the body",
-              sent[0][0] == "D_TEST_DM" and "CAN deliver" in sent[0][1], repr(sent[0]))
+    # Unconditional. Nesting this under `if sent:` meant that when the send did
+    # NOT happen the assertion silently vanished instead of failing — 6 of 7
+    # checks ran under the over-broad mutation, and the missing one was never
+    # reported as missing. @Sutando-Mini's sharpening of the mutation rule: a
+    # suite must survive long enough to name EVERY property it lost, and a
+    # conditional assertion is a quieter version of aborting.
+    check("  ...to the opened DM channel with the body",
+          bool(sent) and sent[0][0] == "D_TEST_DM" and "CAN deliver" in sent[0][1],
+          repr(sent[0]) if sent else "no send recorded at all")
     check("  ...and the file was consumed after a successful send",
           not msg2.exists() and not list(box2.glob("*.sending")),
           f"left behind: {[p.name for p in box2.iterdir()]}")
