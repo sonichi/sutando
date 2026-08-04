@@ -90,7 +90,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
-from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
 # depth 0). Only the immediate parent is inlined, so beyond this there is no
@@ -238,7 +238,14 @@ if not TOKEN and channels_env.exists():
             TOKEN = line.split("=", 1)[1].strip()
 
 if not TOKEN:
-    print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env")
+    # Last resort: the Keychain vault. Before this, no bridge read it, so
+    # `vault set DISCORD_BOT_TOKEN` stored the value and changed nothing.
+    from channel_token import token_from_vault  # noqa: E402
+    TOKEN = token_from_vault("DISCORD_BOT_TOKEN")
+
+if not TOKEN:
+    print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env "
+          "and not in the vault (`vault set DISCORD_BOT_TOKEN`)")
     exit(1)
 
 TASKS_DIR = REPO / "tasks"
@@ -2789,6 +2796,34 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
 
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
+        # Advance the DM checkpoint for our OWN messages before dropping them.
+        #
+        # The checkpoint's contract is "REST catch-up should not re-fetch this
+        # id", which is about having SEEN the message, not about processing it.
+        # The main advance below already says so explicitly and applies it to
+        # out-of-allowlist / out-of-tier DMs — but this return sits above it, so
+        # self-authored DMs were the one class that never advanced it.
+        #
+        # `channel.history()` returns our own replies, and in a DM channel with
+        # the owner most messages ARE ours. So the checkpoint freezes at the last
+        # message we did not write, and every reconnect re-fetches the same
+        # window. Observed on two hosts: `[dm-catchup] replayed N missed DM(s)`
+        # logging an identical N across consecutive restarts — 27 on
+        # Chis-Mac-mini, and 4 here with all 4 self-authored, checkpoint stuck at
+        # 10:22:32 while the channel had moved to 12:03:21.
+        #
+        # Latent today (the return means nothing is re-processed and no duplicate
+        # task or DM is produced), but it is a real starvation path: the catch-up
+        # fetch is `limit=50, oldest_first=True`. Once more than 50 messages sit
+        # after a frozen checkpoint, an owner DM at position 51+ is never fetched
+        # — and since the checkpoint still cannot advance, no later restart
+        # reaches it either. That is silent, permanent loss of exactly the
+        # message this catch-up exists to rescue.
+        if isinstance(message.channel, discord.DMChannel) and hasattr(message, "id"):
+            try:
+                _update_dm_checkpoint(message.channel.id, message.id)
+            except Exception as e:
+                print(f"  [dm-checkpoint] self-message update failed: {e}", flush=True)
         return
     # Auto-mod LLM-judge observation hook (per-guild opt-in via access.json
     # `mod_active`). Pure observe — never blocks the rest of the function.
@@ -3315,7 +3350,15 @@ async def _handle_discord_message(message, force=False):
     # bot sees only the new reply text in isolation.
     reply_context = ""
     reply_chain_ids_line = ""   # `reply_chain_ids:` metadata (root-first) for thread reconstruction
-    if message.reference and message.reference.message_id:
+    # A forward sets `reference` too, and its target is in the SOURCE channel —
+    # fetching it here is a guaranteed 404 plus a misleading log line. The
+    # forward's body is not lost: the snapshot handler above already extracted
+    # it. (#2633 review: the first version gated only the header.)
+    if should_fetch_reply_context(
+        has_reference=bool(message.reference),
+        has_message_id=bool(message.reference and message.reference.message_id),
+        is_forward=bool(getattr(message, "message_snapshots", None)),
+    ):
         try:
             ref_msg = message.reference.resolved
             if ref_msg is None:
@@ -3794,14 +3837,20 @@ async def _handle_discord_message(message, force=False):
     # line into the task file's k:v shape (per qingyun review on #1077).
     channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
     guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
-    # When this message is a reply, emit the parent's id so the core agent can
+    # When this message is a REPLY, emit the parent's id so the core agent can
     # re-fetch the full original on demand rather than relying on the lossy
     # 400-char `[Replying to ...]` snippet. Mirrors how the official Claude
-    # Discord plugin works (reference by message_id + fetch).
-    parent_msg_line = (
-        f"parent_message_id: {message.reference.message_id}\n"
-        if getattr(message, "reference", None) and message.reference.message_id
-        else ""
+    # Discord plugin works (reference by message_id + fetch). A FORWARD also
+    # carries a reference — pointing into its SOURCE channel — so it is keyed
+    # separately; see `format_parent_reference`.
+    _ref = getattr(message, "reference", None)
+    parent_msg_line = format_parent_reference(
+        getattr(_ref, "message_id", None) if _ref else None,
+        # A forward sets `reference` too, so the key must not be decided by the
+        # reference alone. The snapshot IS the forward — same signal the
+        # forward-handler above already extracts the body from.
+        is_forward=bool(getattr(message, "message_snapshots", None)),
+        source_channel_id=getattr(_ref, "channel_id", None) if _ref else None,
     )
     # Full walked ancestor id spine (root-first) for thread reconstruction —
     # handles to re-fetch any ancestor the inlined chain clipped/dropped past
