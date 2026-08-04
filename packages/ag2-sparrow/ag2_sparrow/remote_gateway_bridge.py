@@ -535,7 +535,36 @@ def _ag2space_access_path():
     return os.path.join(base, "channels", "ag2space", "access.json")
 
 
-_TIER_MAP_CACHE = {"mtime": None, "map": {}}
+# Known tier vocabulary. Also an ordering (higher == more privileged); kept for
+# validating a mapped value. It no longer CLAMPS — see _tier_for.
+_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
+
+_TIER_MAP_CACHE = {"ident": None, "map": {}}
+
+
+def _has_above_local(cached) -> bool:
+    """True if the cached map grants anyone a tier ABOVE this node's LOCAL_TIER."""
+    local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
+    return any(_TIER_RANK.get(v, 0) > local_rank for v in cached.values())
+
+
+def _stale_safe(cached):
+    """Project a STALE cached map onto the fail-closed side in BOTH directions.
+
+    The cache is deliberately preserved across a read error so a transient
+    mid-write cannot fail-OPEN a down-tiered sender back to LOCAL_TIER. That
+    reasoning holds only for entries at or below LOCAL_TIER. Once the map can
+    also grant a tier ABOVE LOCAL_TIER, replaying the cache verbatim keeps an
+    ESCALATION alive on a file the owner may have just deleted to revoke it —
+    so deleting access.json would not actually revoke anything.
+
+    Drop the above-LOCAL_TIER entries (those senders fall back to LOCAL_TIER)
+    and keep the rest. A legitimately-granted sender is briefly demoted while
+    the file is unreadable and is restored on the next successful read; an
+    unrevoked escalation is not left standing. Transient demotion is the safe
+    direction — the module already fails closed to "team" on a bad LOCAL_TIER."""
+    local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
+    return {k: v for k, v in cached.items() if _TIER_RANK.get(v, 0) <= local_rank}
 
 
 def _load_tier_map():
@@ -552,11 +581,22 @@ def _load_tier_map():
     tradeoff — the map floor never drops on a transient fault)."""
     path = _ag2space_access_path()
     try:
-        mt = os.path.getmtime(path)
+        st = os.stat(path)
     except OSError:
         # Absent/unstattable → keep last-known-good (initially {} before any load).
-        return _TIER_MAP_CACHE["map"]
-    if mt == _TIER_MAP_CACHE["mtime"]:
+        return _stale_safe(_TIER_MAP_CACHE["map"])
+    # Cache identity is (mtime_ns, size, inode), NOT float mtime. A float mtime
+    # collides under a same-second rewrite and can be restored outright with
+    # os.utime, which would serve a REVOKED grant from cache — reproduced on
+    # #2584 (rewrite to {"tierMap":{}}, restore st_mtime_ns, still resolved owner).
+    ident = (st.st_mtime_ns, st.st_size, st.st_ino)
+    # Belt-and-braces: never serve an ABOVE-LOCAL grant from cache without a fresh
+    # read. Identity can still be forged deliberately; a revoked escalation must not
+    # survive that. Costs one small read per call only while an escalation is
+    # cached — discord's loader has no cache at all and re-reads every message.
+    if ident == _TIER_MAP_CACHE["ident"] and not _has_above_local(_TIER_MAP_CACHE["map"]):
+        # File present and UNCHANGED — this cache is current, not stale. Return it
+        # verbatim: projecting here would drop a legitimate up-tier on every call.
         return _TIER_MAP_CACHE["map"]
     try:
         with open(path) as f:
@@ -569,31 +609,46 @@ def _load_tier_map():
     except Exception:
         # Malformed / mid-write → keep last-known-good; don't advance mtime so a
         # later successful read of the fixed file is still picked up.
-        return _TIER_MAP_CACHE["map"]
-    _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = mt, tm
+        return _stale_safe(_TIER_MAP_CACHE["map"])
+    _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = ident, tm
     return tm
-
-
-# Privilege ordering — a higher rank is MORE privileged. Used to clamp a mapped
-# tier so the owner file can only ever DOWN-tier (never escalate above the node's
-# own default), keeping the "map only down-tiers named senders" safety invariant
-# true in code rather than only in the comment.
-_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
 
 
 def _tier_for(user_id):
     """Resolve the access_tier for a task's broker-attested sender.
 
-    A listed sender gets their mapped tier, CLAMPED to <= LOCAL_TIER: the map can
-    down-tier a sender below this node's default but never raise them above it, so
-    a compromised/misconfigured access.json can never ESCALATE. Everyone else
-    (unlisted / no user_id) gets LOCAL_TIER."""
+    An EXPLICITLY LISTED sender gets exactly the tier the owner mapped them to —
+    including a tier ABOVE this node's LOCAL_TIER. That is the point: it lets a
+    SHARED gateway run a least-privilege default (REMOTE_TASK_TIER=team) and name
+    the one sender who is the owner, instead of the only previously-available
+    shape — a blanket `owner` default that every unlisted sender inherits.
+
+    This mirrors the discord and slack bridges, which have always resolved
+    `access_tier = tierMap[sender_id]` with no clamp. The map is LOCAL,
+    owner-owned config with the same trust standing as REMOTE_TASK_TIER itself,
+    and the lookup key is the BROKER-ATTESTED user_id, never a task-body
+    self-claim — so the WIRE still cannot escalate anyone. Only the owner's own
+    local file can, and only for a sender they named explicitly.
+
+    Everyone else (unlisted / no user_id) gets LOCAL_TIER, unchanged: no existing
+    install is silently demoted, and an unknown sender never gains privilege.
+
+    ⚠ CONTRACT — `user_id` MUST stay broker-attested (cold-review note, #2584).
+    The removed clamp used to be a backstop: even if `user_id` had become
+    body-influenced, a mapped tier was still bounded by LOCAL_TIER. With the
+    clamp gone, "`user_id` is the broker-written Matrix sender, never a
+    task-body self-claim" is SOLELY load-bearing for the no-wire-escalation
+    property. It holds today because `user_id` is a broker-writer-side entry in
+    _TASK_FIELDS, serialized beside room_name/sender_name. Any future change
+    that lets a task body influence `user_id` reintroduces wire-controlled
+    escalation — re-add a bound here if that contract is ever weakened.
+    (Deliberately a contract note, not an assert: provenance cannot be checked
+    at runtime — the value is an ordinary string whichever path produced it.)"""
     uid = (user_id or "").strip()
     if uid:
         mapped = _load_tier_map().get(uid)
         if mapped in _TIER_RANK:
-            local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
-            return mapped if _TIER_RANK[mapped] <= local_rank else LOCAL_TIER
+            return mapped
     return LOCAL_TIER
 
 
@@ -1257,6 +1312,11 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     supervisor escalation target). `sender_tier` is passed in by `_write_task` so
     the task tier and this gate share a SINGLE resolution (no divergence, no
     double tierMap read); a direct caller can omit it and we resolve here. For an
+    Since the map may now grant a tier ABOVE LOCAL_TIER, the mirror case also
+    holds: a sender explicitly mapped to owner on a least-privilege node DOES
+    register owner presence — that is the point of naming them owner. Tests 23/24
+    pin both directions, because a refactor that regated this on LOCAL_TIER would
+    silently stop recording the real owner's activity. For an
     unlisted sender `_tier_for` returns LOCAL_TIER, so the single-owner case is
     unchanged. Never trusts the gateway's own claim (it is outside the trust
     boundary) — only the broker-attested user_id keyed against the owner's LOCAL
@@ -1265,6 +1325,7 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     as discord-bridge.write_owner_activity so the proactive-loop reader is
     transport-agnostic. Best-effort — never blocks task intake."""
     if sender_tier is None:
+        # user_id is broker-attested here — see the CONTRACT note in _tier_for.
         sender_tier = _tier_for(task.get("user_id"))
     if sender_tier != "owner":
         return
@@ -1428,6 +1489,7 @@ def _write_task(task: dict) -> str | None:
     # Resolve ONCE and reuse for both the task tier AND the owner-activity gate
     # below, so the two decisions can never diverge (a single source of truth,
     # no double read of the tierMap).
+    # user_id is broker-attested here — see the CONTRACT note in _tier_for.
     sender_tier = _tier_for(task.get("user_id"))
     lines.append(f"access_tier: {sender_tier}")
     # #2267 parity, second half: the other bridges append the in-band security
