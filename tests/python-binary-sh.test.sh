@@ -158,5 +158,28 @@ if grep -q 'will be skipped' "$REPO/src/startup.sh"; then
   done
 fi
 
+# --- 9. every fixture that materialises the REAL config script must also -----
+#        materialise the helper it sources.
+# This failure mode has recurred three times (codex-core-launcher,
+# startup-voice-managed-gate, daily-insight-stand-attribution), each time via a
+# copy idiom the previous grep missed: a quoted list entry, `cp` in shell, then
+# shutil.copy2. So this scans for the OUTCOME, not the idiom.
+#
+# COUNTS, not presence: the first draft of this guard asked "does the file
+# mention python-binary.sh anywhere?" — and sync-workspace.test.sh has SIX
+# config copies, so deleting one helper copy still left five and the guard
+# passed. Caught by its own negative control, not by review.
+miss=0
+for tf in $(grep -rlE '(cp|copy2).*sutando-config\.sh' "$REPO/tests" 2>/dev/null); do
+  n_cfg=$(grep -cE '(cp|copy2).*sutando-config\.sh' "$tf" 2>/dev/null || echo 0)
+  n_help=$(grep -cE '(cp|copy2).*python-binary\.sh' "$tf" 2>/dev/null || echo 0)
+  if [ "$n_help" -lt "$n_cfg" ]; then
+    bad "fixture copies the real config script without the helper: $(basename "$tf")" \
+        "config copies=$n_cfg helper copies=$n_help"
+    miss=$((miss+1))
+  fi
+done
+[ "$miss" -eq 0 ] && ok "every fixture copying the real config script also copies the helper"
+
 printf "\npassed=%d failed=%d\n" "$pass" "$fail"
 [ "$fail" -eq 0 ]
