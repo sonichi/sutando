@@ -849,6 +849,68 @@ exit 0
         self.assertFalse(Path(context_path.read_text()).exists())
         self.assertTrue(all(path.read_bytes() == body for path, body in before.items()))
 
+    def test_unassigned_notifier_task_bypasses_slow_history_scan(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        (tasks / "task-unassigned.txt").write_text(
+            "id: task-unassigned\n"
+            "timestamp: 2026-08-03T11:00:00Z\n"
+            "source: discord\n"
+            "access_tier: owner\n"
+            "priority: normal\n"
+            "task: Deliver without archive latency\n"
+        )
+        (workspace / "state" / "core-status.json").write_text(
+            '{"status":"idle","ts":1}\n'
+        )
+        module = self.root / "src" / "task_workstreams.py"
+        source = module.read_text()
+        needle = "def scan_task_history(workspace: Path) -> list[TaskRecord]:\n"
+        self.assertIn(needle, source)
+        module.write_text(source.replace(
+            needle,
+            needle + "    import time as _slow_history\n    _slow_history.sleep(2)\n",
+            1,
+        ))
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-unassigned.txt\\n'\n")
+        watcher.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
+  touch "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
+fi
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        started = time.monotonic()
+        result = subprocess.run(
+            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=3
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertLess(elapsed, 1.0, f"unassigned delivery took {elapsed:.2f}s")
+        calls = self.log.read_text()
+        self.assertIn("task-unassigned.txt", calls)
+        self.assertNotIn("Related prior workstream context", calls)
+
     def test_managed_notifier_waits_for_each_result_before_next_task(self):
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"

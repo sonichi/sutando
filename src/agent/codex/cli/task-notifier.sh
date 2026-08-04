@@ -55,10 +55,14 @@ prepare_workstream_context() {
   [ -f "$WORKSTREAM_CONTEXT_SCRIPT" ] || return 0
   candidate="$(mktemp "${TMPDIR:-/tmp}/sutando-workstream-context.XXXXXX")" || return 0
   chmod 600 "$candidate" 2>/dev/null || true
-  if python3 "$WORKSTREAM_CONTEXT_SCRIPT" context "$filename" > "$candidate" 2>/dev/null \
-      && [ -s "$candidate" ]; then
-    workstream_context_file="$candidate"
+  if python3 "$WORKSTREAM_CONTEXT_SCRIPT" context "$filename" > "$candidate" 2>/dev/null; then
+    if [ -s "$candidate" ]; then
+      workstream_context_file="$candidate"
+    else
+      rm -f "$candidate"
+    fi
   else
+    echo "task-notifier: workstream context lookup failed for $filename; continuing without context" >&2
     rm -f "$candidate"
   fi
 }
