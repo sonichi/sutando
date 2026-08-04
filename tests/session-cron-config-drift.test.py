@@ -184,6 +184,28 @@ class DigestUnitTest(unittest.TestCase):
     def test_unnamed_entries_are_skipped(self):
         self.assertEqual(digest_map([{"cron": "* * * * *", "prompt": "p"}]), {})
 
+    def test_a_non_list_config_yields_no_digests(self):
+        """`crons.json` is a list by contract, but the probe hands us whatever
+        parsed. Returning {} means the drift check finds no shared names and
+        stays silent — a malformed config must not be reported as drift, which
+        is a different (and already-covered) failure."""
+        for junk in ({"not": "a list"}, "a string", None, 7):
+            with self.subTest(junk=junk):
+                self.assertEqual(digest_map(junk), {})
+
+    def test_non_dict_entries_are_skipped_without_killing_the_rest(self):
+        """One malformed row must not cost the digests of its neighbours — a
+        raised exception here would take out the whole probe, turning a
+        cosmetic config error into a dead health check."""
+        got = digest_map([
+            {"name": "good", "cron": "* * * * *", "prompt": "p"},
+            "junk",
+            None,
+            42,
+            {"name": "also-good", "cron": "0 * * * *", "prompt": "q"},
+        ])
+        self.assertEqual(sorted(got), ["also-good", "good"])
+
     def test_drifted_ignores_names_present_in_only_one_map(self):
         self.assertEqual(drifted({"a": "1"}, {"b": "2"}), [])
 
