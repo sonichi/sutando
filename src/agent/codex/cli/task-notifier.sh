@@ -19,6 +19,24 @@ CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core
 watcher_pid=""
 event_dir=""
 
+run_optional_task_handler() {
+  local filename="$1" rc
+  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || return 3
+  [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
+  "$SUTANDO_TASK_EVENT_HANDLER" \
+    --runtime codex \
+    --workspace "$(dirname "$TASKS_DIR")" \
+    --task-file "$TASKS_DIR/$filename" \
+    --results-dir "$RESULTS_DIR" \
+    --repo "$REPO" >/dev/null
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+    echo "task-notifier: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
+    return 3
+  fi
+  return "$rc"
+}
+
 stop_watcher() {
   [ -n "$watcher_pid" ] || return 0
   kill -TERM "-$watcher_pid" 2>/dev/null \
@@ -149,6 +167,12 @@ submit_task() {
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
   has_result "$filename" && return 0
+  if run_optional_task_handler "$filename"; then
+    return 0
+  else
+    handler_rc=$?
+    [ "$handler_rc" -eq 3 ] || return 0
+  fi
   prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
@@ -192,7 +216,7 @@ fi
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 python3 -c \
-  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
+  'import os, sys; os.setsid(); os.environ.pop("SUTANDO_TASK_EVENT_HANDLER", None); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
