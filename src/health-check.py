@@ -23,7 +23,6 @@ import hashlib
 import json
 import os
 import re
-import plistlib
 import shlex
 import shutil
 import tempfile
@@ -3754,6 +3753,31 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     if not plist.is_file():
         return {"name": name, "status": "ok",
                 "detail": "credential proxy is not launchd-managed on this host"}
+    # Imported HERE, not at module scope, and this placement is the whole point.
+    # `plistlib` pulls in `xml.parsers.expat` -> the `pyexpat` C extension, which
+    # is the single most fragile import in the stdlib: it dlopens libexpat, so a
+    # Python whose pyexpat was built against a different libexpat than the one it
+    # finds at runtime raises ImportError. Measured on a live host 2026-08-03,
+    # same file, same commit, two interpreters:
+    #
+    #   /opt/homebrew/bin/python3 3.14.5 -> ImportError: dlopen pyexpat, symbol
+    #                                       _XML_SetAllocTrackerActivationThreshold
+    #                                       not found in /usr/lib/libexpat.1.dylib
+    #                                       ->  0 of 39 checks ran
+    #   /usr/bin/python3          3.9.6  -> 39 of 39 checks ran
+    #
+    # At module scope that ImportError is unreachable by any handler and kills
+    # the process before a single check runs — one optional probe on one platform
+    # silently taking down the whole health check, which is the one tool whose
+    # job is to notice things being down. Lazy, it costs this probe only. See
+    # PR #2582 for the installer-side half (choosing an interpreter that works).
+    try:
+        import plistlib
+    except ImportError as exc:
+        return {"name": name, "status": "warn",
+                "detail": (f"cannot parse the credential-proxy plist — this Python "
+                           f"cannot import plistlib ({exc.__class__.__name__}: {exc}). "
+                           f"Every other check is unaffected.")}
     try:
         rendered = plistlib.loads(plist.read_bytes())
     except (OSError, ValueError) as exc:
