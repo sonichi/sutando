@@ -93,6 +93,8 @@ class TestStandValueResolution(unittest.TestCase):
         (repo / "scripts").mkdir()
         shutil.copy2(ROOT / "src" / "sutando_config.py", repo / "src")
         shutil.copy2(ROOT / "scripts" / "sutando-config.sh", repo / "scripts")
+        # sutando-config.sh sources this helper (#2599)
+        shutil.copy2(ROOT / "scripts" / "python-binary.sh", repo / "scripts")
         (repo / "sutando.config.json").write_text("{}\n")
         (repo / "sutando.config.local.json").write_text(
             '{"stand":"Echo Act IV Mini"}\n'
