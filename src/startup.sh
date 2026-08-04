@@ -1108,7 +1108,7 @@ _vault_scanner_check() {
 # 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN, skip with SKIP_TELEGRAM=1)
 if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
   echo "  ~ telegram bridge (skipped via SKIP_TELEGRAM)"
-elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/telegram/.env)"; _tok_rc=0; python3 "$REPO/src/channel_token.py" --has TELEGRAM_BOT_TOKEN --env-file "$_TG_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_TG_ENV" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$_TG_ENV" 2>/dev/null; fi; then
+elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/telegram/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has TELEGRAM_BOT_TOKEN --env-file "$_TG_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_TG_ENV" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$_TG_ENV" 2>/dev/null; fi; then
   if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
     # Pick an interpreter that can actually verify TLS. A cert-less framework
@@ -1233,7 +1233,7 @@ fi
 # wins. Same probe is also what's used in the bridge's rescue fallback.
 if [ "${SKIP_DISCORD:-}" = "1" ]; then
   echo "  ~ discord bridge (skipped via SKIP_DISCORD)"
-elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; _tok_rc=0; python3 "$REPO/src/channel_token.py" --has DISCORD_BOT_TOKEN --env-file "$_DC_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; fi; then
+elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has DISCORD_BOT_TOKEN --env-file "$_DC_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; fi; then
   PYTHON_WITH_DISCORD=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     # Same substitution as the slack loop below: probing EXECUTES the candidate,
@@ -1281,7 +1281,7 @@ fi
 # fresh-install miniconda env doesn't silently miss slack_bolt.
 if [ "${SKIP_SLACK:-}" = "1" ]; then
   echo "  ~ slack bridge (skipped via SKIP_SLACK)"
-elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; _tok_rc=0; python3 "$REPO/src/channel_token.py" --has SLACK_BOT_TOKEN --env-file "$_SL_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; fi; then
+elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has SLACK_BOT_TOKEN --env-file "$_SL_ENV" 2>/dev/null || _tok_rc=$?; _tok_rc2=0; "$PY" "$REPO/src/channel_token.py" --has SLACK_APP_TOKEN --env-file "$_SL_ENV" 2>/dev/null || _tok_rc2=$?; [ "$_tok_rc" -eq 0 ] && [ "$_tok_rc2" -ne 0 ] && _tok_rc=3; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; fi; then
   PYTHON_WITH_SLACK=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
     # Substitute the RESOLVED interpreter for the bare `python3` candidate:
@@ -1304,7 +1304,12 @@ elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
   elif ! pgrep -f "slack-bridge" > /dev/null 2>&1; then
     echo "  Starting Slack bridge with $PYTHON_WITH_SLACK..."
     # Source the env file so SLACK_BOT_TOKEN / SLACK_APP_TOKEN reach the child.
-    set -a; . "$_SL_ENV"; set +a
+    # The gate can now pass on a vault-only token, so this file need not exist.
+    # Sourcing a missing path under the top-level `set -e` aborts ALL of startup
+    # — every service after this line — to launch an OPTIONAL bridge. Guarded
+    # with if/then/fi, not `&&`: a failing `&&` chain is itself non-zero and
+    # would abort identically. (@john-the-dev on #2638.)
+    if [ -f "$_SL_ENV" ]; then set -a; . "$_SL_ENV"; set +a; fi
     "$PYTHON_WITH_SLACK" src/slack-bridge.py > "$LOGS_DIR/slack-bridge.log" 2>&1 &
     echo "  ✓ slack bridge"
     _vault_scanner_check "$PYTHON_WITH_SLACK" "slack bridge"
