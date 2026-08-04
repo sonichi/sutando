@@ -64,6 +64,8 @@ class ClassifierQueueResult:
     reason: str
     snapshot_hash: str = ""
     task_id: str = ""
+    source_token: str = ""
+    source_directories: tuple[str, ...] = ()
 
 
 def _store_path(workspace: Path) -> Path:
@@ -318,12 +320,12 @@ def enrich_task_rows(workspace: Path, rows: list[dict]) -> list[dict]:
     return enriched
 
 
-def _candidate_rows(workspace: Path) -> list[TaskRecord]:
+def _candidate_rows(workspace: Path, rows: Optional[list[TaskRecord]] = None) -> list[TaskRecord]:
     store = load_workstream_store(Path(workspace))
     assigned = store["assignments"]
     reviewed = store["reviews"]
     return [
-        row for row in scan_task_history(Path(workspace))
+        row for row in (rows if rows is not None else scan_task_history(Path(workspace)))
         if row.access_tier == "owner"
         and row.id not in assigned
         and not (
@@ -333,11 +335,15 @@ def _candidate_rows(workspace: Path) -> list[TaskRecord]:
     ]
 
 
-def build_classifier_snapshot(workspace: Path, limit: int = 100) -> dict:
+def build_classifier_snapshot(
+    workspace: Path,
+    limit: int = 100,
+    rows: Optional[list[TaskRecord]] = None,
+) -> dict:
     """Build inert JSON for the model; task text is data, never instructions."""
     workspace = Path(workspace)
     store = load_workstream_store(workspace)
-    candidates = _candidate_rows(workspace)[:max(1, int(limit))]
+    candidates = _candidate_rows(workspace, rows)[:max(1, int(limit))]
     # Present oldest-first so follow-up continuity is visible to the model.
     task_rows = [{
         "id": row.id,
@@ -510,8 +516,113 @@ def core_is_idle(workspace: Path) -> bool:
     return isinstance(status, dict) and status.get("status") == "idle"
 
 
-def _has_active_user_task(workspace: Path) -> bool:
-    return any(row.status != "done" for row in scan_task_history(Path(workspace)))
+def _source_directories(workspace: Path, state: dict, *, discover: bool) -> tuple[str, ...]:
+    """Return archive directories whose mtimes cheaply represent immutable files."""
+    workspace = Path(workspace)
+    directories = {"tasks", "tasks/processed", "tasks/archive", "results"}
+    if isinstance(state, dict):
+        saved = state.get("source_directories", [])
+        if isinstance(saved, list):
+            for value in saved:
+                if not isinstance(value, str):
+                    continue
+                path = Path(value)
+                if path.is_absolute() or ".." in path.parts:
+                    continue
+                if value.startswith(("tasks/archive/", "results/archive")):
+                    directories.add(value)
+    if not discover:
+        return tuple(sorted(directories))
+
+    task_archive = workspace / "tasks" / "archive"
+    try:
+        with os.scandir(task_archive) as entries:
+            for entry in entries:
+                if re.fullmatch(r"\d{4}-\d{2}", entry.name) and entry.is_dir():
+                    directories.add(f"tasks/archive/{entry.name}")
+    except OSError:
+        pass
+
+    results_dir = workspace / "results"
+    try:
+        archive_roots = [
+            Path(entry.path) for entry in os.scandir(results_dir)
+            if entry.name.startswith("archive") and entry.is_dir()
+        ]
+    except OSError:
+        archive_roots = []
+    for archive_root in archive_roots:
+        for root, child_dirs, _files in os.walk(archive_root):
+            try:
+                directories.add(str(Path(root).relative_to(workspace)))
+            except ValueError:
+                continue
+            # Symlinked directories are not part of the result archive contract.
+            child_dirs[:] = [
+                name for name in child_dirs if not (Path(root) / name).is_symlink()
+            ]
+    return tuple(sorted(directories))
+
+
+def _task_source_state(
+    workspace: Path,
+    state: dict,
+    *,
+    discover: bool = False,
+) -> tuple[str, tuple[str, ...]]:
+    """Fingerprint mutable task sources without enumerating archive files.
+
+    Live task/result files are statted directly because they may be updated in
+    place. Archived files are immutable, so the cached archive-directory mtimes
+    detect additions and removals in constant work per known directory.
+    """
+    workspace = Path(workspace)
+    directories = _source_directories(workspace, state, discover=discover)
+    signatures: list[tuple] = []
+    for relative in directories:
+        path = workspace / relative
+        try:
+            stat = path.stat()
+            signatures.append(("dir", relative, stat.st_mtime_ns))
+        except OSError:
+            signatures.append(("dir", relative, None))
+
+    for relative in ("tasks", "tasks/processed", "results"):
+        root = workspace / relative
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if not entry.name.startswith("task-") or not entry.name.endswith(".txt"):
+                        continue
+                    try:
+                        stat = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    signatures.append((
+                        "file", f"{relative}/{entry.name}", stat.st_mtime_ns, stat.st_size,
+                    ))
+        except OSError:
+            pass
+    token = hashlib.sha256(
+        json.dumps(sorted(signatures), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return token, directories
+
+
+def _queue_result(
+    pending: bool,
+    enqueued: bool,
+    reason: str,
+    snapshot_hash: str,
+    task_id: str,
+    source_state: tuple[str, tuple[str, ...]],
+) -> ClassifierQueueResult:
+    return ClassifierQueueResult(
+        pending, enqueued, reason, snapshot_hash, task_id,
+        source_state[0], source_state[1],
+    )
 
 
 def classifier_status(
@@ -526,26 +637,50 @@ def classifier_status(
     # mature workspace, so never pay that cost while the core is already busy.
     if not core_is_idle(workspace):
         return ClassifierQueueResult(True, False, "core-busy")
-    snapshot = build_classifier_snapshot(workspace, limit=limit)
-    snapshot_hash = snapshot["snapshot_hash"]
-    if not snapshot["tasks"]:
-        return ClassifierQueueResult(False, False, "complete", snapshot_hash)
-
     state = _read_json(_classifier_state_path(workspace), {})
-    if isinstance(state, dict) and state.get("snapshot_hash") == snapshot_hash:
+    if not isinstance(state, dict):
+        state = {}
+    source_state = _task_source_state(workspace, state)
+    if state.get("source_token") == source_state[0]:
+        snapshot_hash = str(state.get("snapshot_hash") or "")
         if state.get("status") == "complete":
-            return ClassifierQueueResult(False, False, "complete", snapshot_hash)
+            return _queue_result(
+                False, False, "complete", snapshot_hash, "", source_state,
+            )
         try:
             age = time.time() - float(state.get("enqueued_at", 0))
         except (ValueError, TypeError):
             age = ttl_seconds + 1
         if state.get("status") == "inflight" and age < ttl_seconds:
-            return ClassifierQueueResult(
-                True, False, "already-queued", snapshot_hash, str(state.get("task_id") or "")
+            return _queue_result(
+                True, False, "already-queued", snapshot_hash,
+                str(state.get("task_id") or ""), source_state,
             )
-    if _has_active_user_task(workspace):
-        return ClassifierQueueResult(True, False, "active-user-task", snapshot_hash)
-    return ClassifierQueueResult(True, False, "ready", snapshot_hash)
+
+    rows = scan_task_history(workspace)
+    snapshot = build_classifier_snapshot(workspace, limit=limit, rows=rows)
+    snapshot_hash = snapshot["snapshot_hash"]
+    source_state = _task_source_state(workspace, state, discover=True)
+    if not snapshot["tasks"]:
+        return _queue_result(False, False, "complete", snapshot_hash, "", source_state)
+
+    if state.get("snapshot_hash") == snapshot_hash:
+        if state.get("status") == "complete":
+            return _queue_result(False, False, "complete", snapshot_hash, "", source_state)
+        try:
+            age = time.time() - float(state.get("enqueued_at", 0))
+        except (ValueError, TypeError):
+            age = ttl_seconds + 1
+        if state.get("status") == "inflight" and age < ttl_seconds:
+            return _queue_result(
+                True, False, "already-queued", snapshot_hash,
+                str(state.get("task_id") or ""), source_state,
+            )
+    if any(row.status != "done" for row in rows):
+        return _queue_result(
+            True, False, "active-user-task", snapshot_hash, "", source_state,
+        )
+    return _queue_result(True, False, "ready", snapshot_hash, "", source_state)
 
 
 def maybe_enqueue_classifier_task(
@@ -569,6 +704,19 @@ def _maybe_enqueue_classifier_task_locked(
     workspace = Path(workspace)
     readiness = classifier_status(workspace, ttl_seconds=ttl_seconds, limit=limit)
     if readiness.reason != "ready":
+        if readiness.reason in {"complete", "already-queued"} and readiness.source_token:
+            state_path = _classifier_state_path(workspace)
+            state = _read_json(state_path, {})
+            if not isinstance(state, dict):
+                state = {}
+            state.update({
+                "snapshot_hash": readiness.snapshot_hash,
+                "source_token": readiness.source_token,
+                "source_directories": list(readiness.source_directories),
+            })
+            if readiness.reason == "complete":
+                state["status"] = "complete"
+            _atomic_json(state_path, state)
         return readiness
     snapshot_hash = readiness.snapshot_hash
     state_path = _classifier_state_path(workspace)
@@ -609,13 +757,21 @@ def _maybe_enqueue_classifier_task_locked(
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
+    source_token, source_directories = _task_source_state(
+        workspace, previous_state, discover=True,
+    )
     _atomic_json(state_path, {
         "snapshot_hash": snapshot_hash,
         "task_id": task_id,
         "enqueued_at": now,
         "status": "inflight",
+        "source_token": source_token,
+        "source_directories": list(source_directories),
     })
-    return ClassifierQueueResult(True, True, "enqueued", snapshot_hash, task_id)
+    return ClassifierQueueResult(
+        True, True, "enqueued", snapshot_hash, task_id,
+        source_token, source_directories,
+    )
 
 
 def _archive_superseded_classifier_task(workspace: Path, state: dict) -> bool:
