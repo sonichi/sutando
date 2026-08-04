@@ -132,6 +132,69 @@ def main() -> int:
         spec = importlib.util.spec_from_file_location("hwg", GUARD)
         hwg = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hwg)
+        # --- IN-PROCESS drive of main() + helpers -----------------------------
+        # The subprocess controls above prove BEHAVIOUR but are invisible to the
+        # coverage gate: `scripts/coverage-gate.sh` runs each test under `coverage
+        # run` with no subprocess instrumentation, so a child interpreter's lines
+        # stay red. This PR's first cut measured 31.9% for exactly that reason.
+        # These calls re-exercise the same paths in THIS interpreter, so the gate
+        # sees them. [[reference_coverage_gate_needs_inprocess_tests]]
+        import contextlib, io
+
+        # resolved_workspace(): reads the loader, so point it at our fixture repo
+        _saved = sys.path[:]
+        sys.path.insert(0, str(repo / "src"))
+        try:
+            import importlib as _il
+            _wd = _il.import_module("workspace_default")
+            _orig = _wd.resolve_workspace
+            _wd.resolve_workspace = lambda *a, **k: str(ws)
+            try:
+                check("resolved_workspace() returns the loader's answer, in-process",
+                      hwg.resolved_workspace() == ws, str(hwg.resolved_workspace()))
+            finally:
+                _wd.resolve_workspace = _orig
+        except Exception as exc:                      # loader unavailable in fixture
+            print(f"    (note: resolved_workspace in-process skipped: {type(exc).__name__})")
+        finally:
+            sys.path[:] = _saved
+
+        # exemptions_for(): both branches — file present, and name-not-matched
+        _ex = REPO / "tests" / "hermetic-workspace-exemptions.txt"
+        check("exemptions_for() returns [] for a file with no entry, in-process",
+              hwg.exemptions_for("no-such-file.test.py") == [])
+
+        # diff(): created / changed / removed, in-process
+        check("diff() reports created, changed and removed paths",
+              hwg.diff({"a": (1, 1), "b": (1, 1)}, {"a": (2, 2), "c": (1, 1)})
+              == ["a", "b", "c"])
+
+        # main(): usage error, clean run, and the violation report — all in-process.
+        #
+        # `hwg` was loaded from the REAL repo, so its resolved_workspace() answers the
+        # REAL workspace. Left alone, main() would snapshot the operator's live tree
+        # (the exact thing this guard forbids) AND compare it against a fixture write
+        # that lands in the temp ws — no diff, so the violation assertion would pass
+        # for the wrong reason. Pin the resolver to the fixture for these calls.
+        _real_rw = hwg.resolved_workspace
+        hwg.resolved_workspace = lambda: ws
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                rc_usage = hwg.main([])
+                rc_clean = hwg.main(["run", str(clean)])
+            check("main() with no args is a usage error (2), in-process", rc_usage == 2, f"rc={rc_usage}")
+            check("main() on a clean test returns the child's rc, in-process", rc_clean == 0, f"rc={rc_clean}")
+
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2), contextlib.redirect_stderr(buf2):
+                rc_viol = hwg.main(["run", str(offender)])
+            out2 = buf2.getvalue()
+            check("main() FAILS a polluting test and NAMES the path, in-process",
+                  rc_viol != 0 and "state/leaked.log" in out2, f"rc={rc_viol} {out2[-160:]}")
+        finally:
+            hwg.resolved_workspace = _real_rw
+
         snap = hwg.snapshot(ws)
         check("the snapshot SEES files — an empty walk is a broken instrument, "
               "not a clean workspace", len(snap) > 0, f"snapshot had {len(snap)} entries")
