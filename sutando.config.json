@@ -28,8 +28,7 @@
       "include": [
         "notes/",
         "hosts/*/",
-        ".claude-sutando/projects/*/memory/",
-        "state/current-track.md"
+        ".claude-sutando/projects/*/memory/"
       ],
       "exclude": [
         "tasks/",

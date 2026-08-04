@@ -886,10 +886,15 @@ def check_session_cron_registration(
     2026-07-23 on a peer instance as 2/18 registered. The script-visible signal:
     /schedule-crons writes
     `hosts/<hostname>/schedule-crons-stamp.json` when it finishes; if that
-    host-owned stamp predates the running core's `started_at` (from the
-    heartbeat payload), the current session never completed registration.
-    Stamp AGE alone is deliberately not used — long-lived sessions would
-    false-warn.
+    host-owned stamp predates the CURRENT SESSION'S LAUNCH
+    (`_last_core_launch_at`, from `state/session-starts.log`), the current
+    session never completed registration. Stamp AGE alone is deliberately not
+    used — long-lived sessions would false-warn.
+
+    The boundary is deliberately NOT `.alive.started_at`: that field tracks the
+    heartbeat writer, which is retained across launches, so restarting the
+    heartbeat under a live session made this probe report every still-registered
+    cron as gone. Same field, same mistake, same fix as #2446.
     """
     workspace = Path(workspace_dir or WORKSPACE_DIR)
     host = host_label or _host_label()
@@ -930,14 +935,28 @@ def check_session_cron_registration(
         # story); zero expected → nothing to verify.
         return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
 
-    alive_file = workspace / "state" / "cores" / f"{host}.alive"
-    started_at = None
-    try:
-        alive = json.loads(alive_file.read_text())
-        if isinstance(alive, dict):
-            started_at = float(alive.get("started_at"))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass  # no heartbeat → can't anchor to a boot; fall through to stamp-only
+    # The SESSION boundary, not the heartbeat's age. `.alive.started_at` is
+    # `core_heartbeat._STARTED_AT`, stamped once at module load, and both launch
+    # paths RETAIN an existing heartbeat process — so it tracks the heartbeat
+    # writer, not the session that owns the crons. #2446 established exactly that
+    # for `_marker_predates_running_core`, and `_last_core_launch_at` is the
+    # boundary it introduced; this probe was still comparing against the field
+    # that PR ruled out, for the same staleness question.
+    #
+    # Observed on Chis-Mac-mini 2026-08-04T03:0xZ, all nine expected crons live:
+    #     core      pid 30961  started 11:32:30   <- .alive "pid" (the core)
+    #     heartbeat pid 72981  started 16:13:56   <- .alive "heartbeat_pid"
+    #     .alive started_at    16:13:56           <- tracks the WRITER
+    #     stamp ts             11:37:21           <- 5 min after the core booted
+    # The stamp was written for this very boot and got reported as predating it
+    # by 16595s, telling the operator to re-run /schedule-crons against a session
+    # whose crons were all present.
+    #
+    # None keeps its meaning from #2446: "no evidence", never "stale" — so a host
+    # with no session-starts.log falls through to the stamp-only checks below
+    # rather than warning.
+    launch = _last_core_launch_at(workspace)
+    started_at = launch[0] if launch else None
 
     stamp_file = workspace / "hosts" / host / "schedule-crons-stamp.json"
     try:
@@ -962,7 +981,7 @@ def check_session_cron_registration(
             "name": name,
             "status": "warn",
             "detail": (
-                f"stamp predates this core boot ({int(started_at - stamp_ts)}s older) — "
+                f"stamp predates this session's launch ({int(started_at - stamp_ts)}s older) — "
                 f"session crons are gone with the old session; re-run /schedule-crons"
             ),
         }
@@ -1167,6 +1186,47 @@ def _carrier_probe_files(rep: "Path") -> "list[Path]":
     return sorted(f for f in rep.rglob("*") if f.is_file())
 
 
+# The one rule file the carrier set is written to. `check-ignore -v` reports
+# the deciding rule's SOURCE, and only rules from here speak to whether the
+# vault is carrying a path.
+CARRIER_EXCLUDE_SOURCE = ".git/info/exclude"
+
+
+def _carrier_carveout_patterns() -> "set[str]":
+    """Every gitignore pattern the generator emits that is SUPPOSED to ignore a
+    file inside a carried parent.
+
+    Two sources, both from `sync-workspace.sh:_compose_exclude_content`:
+
+      * `vault.sync.exclude` -> `_emit_exclude_lines` (`:371`): a trailing-slash
+        entry emits `path/` AND `path/**`; anything else is emitted verbatim.
+      * the unconditional hard-deny block (`:461-482`) — credentials, transient
+        state and secret material are denied "regardless of carrier set", so a
+        file caught by one of those is correctly not backed up.
+
+    Mirrored rather than parsed out of the live `.git/info/exclude`, because the
+    file on disk is the very artifact under test: reading the rules from it
+    would make any stale or hand-edited rule self-justifying, which is the
+    failure mode #2566 was opened for.
+    """
+    patterns = {
+        # Hard-deny block — keep in step with sync-workspace.sh:461-482.
+        ".env*", "*.heartbeat", "*.alive", "*.sentinel", "*.pid",
+        "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+        "*.pem", "*.key", "*.p12", "*.pfx", "*.ppk", "*.keystore", "*.jks",
+    }
+    for entry in ((_resolved_vault().get("sync") or {}).get("exclude") or []):
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        e = entry.strip()
+        if e.endswith("/"):
+            patterns.add(e)
+            patterns.add(e + "**")
+        else:
+            patterns.add(e)
+    return patterns
+
+
 def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
     """`"carried"` | `"dropped"` | `"unmeasured"` for ONE materialized path.
 
@@ -1221,19 +1281,65 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
     rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
     try:
         proc = subprocess.run(
-            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-z", "--stdin"),
+            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
             input=rels, capture_output=True, text=True, timeout=60,
         )
     except (GitUnavailable, OSError, subprocess.SubprocessError):
         return "unmeasured"
-    # check-ignore's contract, unchanged by --stdin: 0 = at least one path is
-    # ignored, 1 = none are, anything else = it failed. Folding "not 0" into
-    # healthy would count exit 128 as carried.
-    if proc.returncode == 0:
+    # `-v` names the RULE that decided each path, and that is the whole point:
+    # "some file under here is ignored" is NOT the same question as "is this
+    # entry being carried". `vault.sync.exclude` deliberately ignores files
+    # INSIDE an included parent (`_emit_exclude_lines`, sync-workspace.sh:371),
+    # so on any real workspace the carve-outs fire constantly:
+    #
+    #     notes/    9970 of 11369 files ignored  (*.mp4, .DS_Store, node_modules/)
+    #     hosts/       9 of    67 files ignored  (data/)
+    #
+    # The pre-`-v` version condemned an entry when ANY file beneath it was
+    # ignored, so both read `dropped` while the vault was demonstrably backing
+    # them up (1400 and 58 files tracked, synced minutes earlier, zero diff).
+    # It survived because the one entry with no carve-out beneath it —
+    # `.claude-sutando/projects/*/memory/`, 1322 files, 0 ignored — passed, so
+    # the probe looked like it discriminated. The prescribed remedy made it
+    # permanent: `--force-gitignore` regenerates a byte-identical file (eight
+    # consecutive syncs logged `existing exclude matches; no-op`), so the
+    # failure could never clear no matter how often it was obeyed.
+    #
+    # NOTE `-v` also CHANGES THE EXIT-CODE CONTRACT the old code relied on: a
+    # path matching a negation (`!notes/**`, i.e. carried) is still reported and
+    # still exits 0. Verified before depending on it:
+    #
+    #     notes/a.md   -> !notes/**  exit 0   (NOT ignored)
+    #     notes/b.mp4  -> *.mp4      exit 0   (ignored, deliberately)
+    #     other/c.txt  -> *          exit 0   (ignored — genuinely dropped)
+    #
+    # So the verdict now comes from the parsed patterns; only a hard failure
+    # (neither 0 nor 1) is still read off the exit code.
+    if proc.returncode not in (0, 1):
+        return "unmeasured"
+    allowed = _carrier_carveout_patterns()
+    fields = proc.stdout.split("\0")
+    # Records are 4 NUL-separated fields: source, linenum, pattern, pathname.
+    for i in range(0, len(fields) - 3, 4):
+        source, pattern = fields[i], fields[i + 2]
+        if pattern.startswith("!"):
+            continue          # un-ignored by the carrier rule — carried
+        if source != CARRIER_EXCLUDE_SOURCE:
+            # A nested `.gitignore` committed inside a carried tree, or a global
+            # core.excludesFile. Not the vault carrier mechanism, so not this
+            # probe's question — and condemning on it would make every vendored
+            # project a permanent failure. Real instance: a Remotion app under
+            # `notes/` ignores its own `out/` build dir, which is correct.
+            continue
+        if pattern in allowed:
+            continue          # a configured carve-out — deliberate, not a defect
+        # Ignored by `.git/info/exclude` via something that is NOT a carve-out:
+        # either the whitelist catch-all `*` (this entry's un-ignore never took
+        # effect) or an operator-authored rule that `generate_exclude`'s refusal
+        # guard left standing because `_enforce_carrier_set_pre` swallows the
+        # refusal. Both mean the entry is genuinely not being backed up.
         return "dropped"
-    if proc.returncode == 1:
-        return "carried"
-    return "unmeasured"
+    return "carried"
 
 
 def _carrier_representative(workspace: Path, entry: str) -> "Path | None":
@@ -3019,7 +3125,7 @@ def _local_host_labels() -> "set[str]":
     return {x for x in labels if x}
 
 
-def _last_core_launch_at() -> "tuple[float, str | None] | None":
+def _last_core_launch_at(workspace_dir: Optional[Path] = None) -> "tuple[float, str | None] | None":
     """When the CURRENT core was launched, from `state/session-starts.log`.
 
     Returns `(timestamp, runtime)`, where `runtime` is the identity the launcher
@@ -3059,7 +3165,7 @@ def _last_core_launch_at() -> "tuple[float, str | None] | None":
     "stale".
     """
     try:
-        raw = (status_read_path("session-starts.log", WORKSPACE_DIR)).read_text()
+        raw = (status_read_path("session-starts.log", workspace_dir or WORKSPACE_DIR)).read_text()
     except OSError:
         return None
     for line in reversed(raw.splitlines()):
