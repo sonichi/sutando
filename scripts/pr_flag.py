@@ -205,18 +205,60 @@ def state_hash(state: list) -> str:
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
 
 
-def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
+def fetch_argv(repo: str, owner_login: str) -> list:
+    """The exact `gh` command the fetch runs.
+
+    Extracted so `scope_descriptor()` can DERIVE the payload's coverage claim from
+    the real argv instead of restating it in prose. A hand-written scope string is
+    the thing it is describing plus a chance to be wrong: widen the fetch, forget
+    the string, and the payload now asserts a filter the code no longer applies.
+    """
     # SCOPE NOTE: `--author owner_login` means this only ever sees the owner's OWN
     # PRs (24 of 116 open on 2026-08-02). Peer PRs where the owner's approval is
     # the thing unblocking a merge are not fetched at all, so they cannot appear
     # in any digest built from this state. Left alone deliberately -- widening the
     # fetch is a scope decision, not a field-completeness fix, and belongs in its
-    # own change.
-    cmd = [
+    # own change (issue #2643).
+    return [
         "gh", "pr", "list", "--repo", repo, "--state", "open",
         "--author", owner_login, "--limit", "1000",
         "--json", "number,title,author,baseRefName,headRefOid,mergeable,reviewDecision,statusCheckRollup,isDraft,reviews",
     ]
+
+
+def scope_descriptor(repo: str, owner_login: str) -> dict:
+    """What the emitted state DOES and does NOT cover, read off the real argv.
+
+    Why this exists: the payload carries counts, per-PR CI, approvals and merge
+    state, and nothing in it marks the population as partial. A consumer that
+    builds a digest from it therefore reads "31 open" as a repository total. That
+    happened on 2026-08-04 -- the figure was the owner-authored subset of ~100
+    non-draft PRs, and the SCOPE NOTE explaining why lives in this file, which the
+    consumer never sees.
+
+    So the bound travels WITH the data. Derived from `fetch_argv()`, so removing
+    the filter changes this automatically rather than leaving a stale claim.
+    """
+    argv = fetch_argv(repo, owner_login)
+    author = argv[argv.index("--author") + 1] if "--author" in argv else None
+    limit = argv[argv.index("--limit") + 1] if "--limit" in argv else None
+    return {
+        "filter": f"author:{author}" if author else "none",
+        "covers": (
+            f"open non-draft PRs authored by {author!r} only"
+            if author else "all open PRs in the repo"
+        ),
+        "excludes": (
+            "PRs authored by anyone else -- including peer PRs where the owner's "
+            "approval is the only thing blocking a merge"
+        ) if author else "nothing",
+        "is_repo_total": author is None,
+        "limit": limit,
+    }
+
+
+def _fetch_prs(repo: str, owner_login: str) -> list:  # pragma: no cover — subprocess/gh glue
+    cmd = fetch_argv(repo, owner_login)
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:
         print(f"pr-flag: gh failed: {res.stderr[:200]}", file=sys.stderr)
@@ -339,7 +381,12 @@ def main() -> int:  # pragma: no cover — CLI + gh/state I/O glue; pure logic c
         return 0
 
     # emit the objective state for the AGENT to judge, then record the hash
-    print(json.dumps({"hash": h, "changed": True, "prs": state}, indent=2))
+    print(json.dumps({
+        "hash": h,
+        "changed": True,
+        "scope": scope_descriptor(args.repo, args.owner),
+        "prs": state,
+    }, indent=2))
     try:
         sf.parent.mkdir(parents=True, exist_ok=True)
         sf.write_text(json.dumps({"hash": h, "count": len(state)}))

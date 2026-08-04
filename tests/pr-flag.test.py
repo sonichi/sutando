@@ -359,6 +359,41 @@ def main() -> int:
     finally:
         pf._gh_stands_page = real_page
 
+    # ---- scope descriptor: the payload must state its own coverage ----------
+    # Why: the emitted state carries counts, CI, approvals and merge state with
+    # nothing marking the population as partial, so a consumer reads its length
+    # as a repo total. On 2026-08-04 a digest reported "31 open" for a repo with
+    # ~100 open non-draft PRs. Issue #2643.
+    sc = pf.scope_descriptor("o/n", "someowner")
+    assert sc["filter"] == "author:someowner", sc
+    assert sc["is_repo_total"] is False, sc
+    assert "someowner" in sc["covers"], sc
+    assert "approval" in sc["excludes"], sc
+    print("  ok  scope_descriptor names the author filter and denies repo-total")
+
+    # The anti-drift property, and the reason this is derived rather than written:
+    # a hand-maintained string would keep claiming author-scoping after someone
+    # widens the fetch. Drop --author from the argv and the descriptor must FLIP.
+    real_argv = pf.fetch_argv
+    try:
+        pf.fetch_argv = lambda repo, owner: [
+            "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
+        ]
+        widened = pf.scope_descriptor("o/n", "someowner")
+        assert widened["is_repo_total"] is True, widened
+        assert widened["filter"] == "none", widened
+        assert widened["excludes"] == "nothing", widened
+        print("  ok  descriptor FOLLOWS the argv — removing --author flips it to repo-total")
+    finally:
+        pf.fetch_argv = real_argv
+
+    # And the fetch itself must actually use that argv, or the descriptor
+    # describes a command that isn't the one being run.
+    argv = pf.fetch_argv("o/n", "someowner")
+    assert argv[:5] == ["gh", "pr", "list", "--repo", "o/n"], argv
+    assert "--author" in argv and argv[argv.index("--author") + 1] == "someowner", argv
+    print("  ok  fetch_argv is the real gh command the descriptor reads")
+
     print("\nAll pr-flag core cases pass.")
     return 0
 
