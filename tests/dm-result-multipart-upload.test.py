@@ -396,6 +396,34 @@ def _outbox_redirected():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_resolver_bindings_restored_after_the_context(tmp_root_prefix="multipart-outbox-test-") -> None:
+    """The fix for the lazy-import restore leak must itself be protected.
+
+    Both reviewers made the same point on #2620 and they were right: deleting
+    the late-import sweep left the whole suite GREEN while
+    `outbox_log.resolve_workspace` stayed bound to the throwaway stub and
+    `_outbox_path()` still pointed into the REMOVED temp tree. A fix with no
+    activated assertion can regress silently — which is exactly the standard I
+    apply to other people's guards.
+
+    Asserts BOTH halves they asked for: identity restored, and the resolved
+    path is outside the deleted temp root.
+    """
+    import workspace_default, outbox_log
+
+    assert outbox_log.resolve_workspace is workspace_default.resolve_workspace, (
+        "outbox_log.resolve_workspace was NOT restored after _outbox_redirected() — "
+        "it is still bound to the throwaway stub, so later same-interpreter writes "
+        "land in a deleted directory"
+    )
+    resolved = str(outbox_log._outbox_path())
+    assert tmp_root_prefix not in resolved, (
+        f"_outbox_path() still points into the removed throwaway tree: {resolved}"
+    )
+    print("  ✓ resolver bindings restored after the context "
+          f"(outbox_log -> {resolved})")
+
+
 def test_no_writes_reach_the_live_workspace(live_ws) -> None:
     """The baseline is taken by main() BEFORE any case runs, so this covers
     every write the file triggers rather than only its own."""
@@ -431,6 +459,7 @@ def main():
         print("  ✓ test_eleven_files_split_into_two_batches")
         test_filename_crlf_quote_sanitized_in_header()
         print("  ✓ test_filename_crlf_quote_sanitized_in_header")
+    test_resolver_bindings_restored_after_the_context()
     test_no_writes_reach_the_live_workspace(live_ws)
     print("All dm-result multipart-upload tests passed.")
 
