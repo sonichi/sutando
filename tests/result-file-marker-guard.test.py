@@ -204,7 +204,8 @@ assert run(write_call(RESULTS / "proactive-1785811070.txt", GOOD_BODY)) is None,
 #     split before _repo_root() sees it, and the hook goes silently INERT — the
 #     very failure this PR closes, reintroduced through the deploy snippet.
 #     Execute the stored command through a real shell, exactly as Claude Code does.
-import shlex, shutil
+import shlex
+import shutil
 spaced = Path(tempfile.mkdtemp()) / "sutando repo with spaces"
 shutil.copytree(REPO, spaced, symlinks=True,
                 ignore=shutil.ignore_patterns(".git", "node_modules", "workspace"))
