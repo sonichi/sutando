@@ -66,6 +66,31 @@ def format_reply_chain_ids(ids: Sequence) -> str:
     return "reply_chain_ids: " + ",".join(reversed(clean)) + "\n"
 
 
+def should_fetch_reply_context(has_reference: bool, has_message_id: bool,
+                               is_forward: bool) -> bool:
+    """Whether the bridge should fetch the referenced message for reply context.
+
+    A FORWARD sets ``message.reference`` too, but the referenced message lives in
+    the SOURCE channel, so ``channel.fetch_message(reference.message_id)`` on the
+    receiving channel is guaranteed to 404 — one wasted network round trip and an
+    alarming ``[reply-context] fetch failed: 404 ... Unknown Message`` on every
+    forward the owner sends.
+
+    The forward's own body is NOT reply context and is not lost by skipping this:
+    it lives in ``message.message_snapshots`` and is extracted by the dedicated
+    forward handler earlier in the same path. Reply context answers "which
+    earlier message in THIS channel is being replied to", which a forward has no
+    answer to.
+
+    Split out as a predicate because the bridge is not unit-importable, so the
+    only way to prove the activated path is gated is to test the condition it
+    branches on (john-the-dev + bassilkhilo-ag2 on #2633: the first version
+    re-keyed the header and left this fetch executing, so the reported 404 was
+    still live).
+    """
+    return bool(has_reference and has_message_id and not is_forward)
+
+
 def format_parent_reference(message_id, is_forward: bool, source_channel_id=None) -> str:
     """Format the reference header for a message that carries a ``reference``.
 

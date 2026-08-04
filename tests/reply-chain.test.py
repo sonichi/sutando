@@ -243,6 +243,42 @@ for _lbl, _out in (("reply", rc.format_parent_reference(1, is_forward=False)),
     check(f"{_lbl}: every line is k:v", all(": " in l for l in _lines))
     check(f"{_lbl}: newline terminated", _out.endswith("\n"))
 
+# --- the ACTIVATED fetch path, not just the header --------------------------
+# @john-the-dev and @bassilkhilo-ag2 both blocked the first version of #2633:
+# it re-keyed the task-file header while `discord-bridge.py` still entered the
+# reply-context block for every `message.reference` and called
+# `channel.fetch_message()`. For a forward that target lives in the SOURCE
+# channel, so the 404 and the wasted round trip — the two symptoms the PR body
+# described — were still live. The header was relabelled; the behaviour was not.
+check("a forward does NOT trigger a reply-context fetch",
+      rc.should_fetch_reply_context(has_reference=True, has_message_id=True, is_forward=True) is False)
+check("a genuine reply DOES trigger the fetch (the capability is not lost)",
+      rc.should_fetch_reply_context(has_reference=True, has_message_id=True, is_forward=False) is True)
+check("no reference -> no fetch",
+      rc.should_fetch_reply_context(has_reference=False, has_message_id=False, is_forward=False) is False)
+check("reference without a message_id -> no fetch",
+      rc.should_fetch_reply_context(has_reference=True, has_message_id=False, is_forward=False) is False)
+
+# The two keying decisions must agree: whatever is re-keyed as a forward must
+# also be the thing that skips the fetch. A build where they disagree reintroduces
+# exactly the reviewed defect from the other side.
+for _is_fwd in (True, False):
+    _hdr_is_forward = "forwarded_from_message_id" in rc.format_parent_reference(1, is_forward=_is_fwd)
+    _skips_fetch = not rc.should_fetch_reply_context(True, True, _is_fwd)
+    check(f"header re-key and fetch gate agree (is_forward={_is_fwd})",
+          _hdr_is_forward == _skips_fetch)
+
+# The bridge itself is not unit-importable, so assert the call site by source:
+# the guard must WRAP the fetch, not sit beside it.
+import re as _re, pathlib as _pl
+_bridge = (_pl.Path(__file__).resolve().parent.parent / "src" / "discord-bridge.py").read_text()
+_guard_i = _bridge.find("should_fetch_reply_context(\n")
+_fetch_i = _bridge.find("await message.channel.fetch_message(message.reference.message_id)")
+check("the bridge calls the gate", _guard_i > 0)
+check("the gate precedes the reply-context fetch it protects", 0 < _guard_i < _fetch_i)
+check("no ungated `if message.reference and message.reference.message_id:` fetch remains",
+      "if message.reference and message.reference.message_id:\n        try:" not in _bridge)
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
