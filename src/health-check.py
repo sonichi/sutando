@@ -5180,6 +5180,7 @@ def check_vault_manifest_integrity(
     manifest_path: Optional[Path] = None,
     keychain_probe: Optional[Callable[[str, str], bool]] = None,
     max_keys: int = 200,
+    legacy_path: Optional[Path] = None,
 ) -> dict:
     """Does every name `list_vault_keys()` advertises actually exist in Keychain?
 
@@ -5205,6 +5206,14 @@ def check_vault_manifest_integrity(
     real (a genuinely 100%-phantom manifest reads inconclusive), and that is the
     correct direction to fail — a false clean here is a nag nobody can act on,
     while a false alarm would send the operator hunting a vault that is fine.
+
+    RESOLUTION MUST MIRROR `_read_manifest()`, canonical-first THEN legacy. The
+    first version read only `_manifest_path()` and returned "no vault manifest on
+    this host" when the canonical file was absent — while `list_vault_keys()`,
+    reading through `_read_manifest()`, still returned the legacy manifest's keys.
+    That is a false clean on a pre-migration install, i.e. on exactly the
+    population this check exists to diagnose. A probe that does not walk the same
+    lookup path as the function it validates is checking a different system.
     """
     name = "vault-manifest"
     try:
@@ -5213,15 +5222,32 @@ def check_vault_manifest_integrity(
         return {"name": name, "status": "ok",
                 "detail": "vault_intercept not importable — vault not in use here"}
 
-    path = Path(manifest_path) if manifest_path else Path(vault_intercept._manifest_path())
-    if not path.exists():
+    if manifest_path is not None:
+        candidates = [Path(manifest_path)]
+    else:
+        # Same order, and the same fallback, as vault_intercept._read_manifest().
+        candidates = [Path(vault_intercept._manifest_path())]
+        legacy = Path(legacy_path) if legacy_path else Path(vault_intercept._LEGACY_MANIFEST_PATH)
+        if legacy != candidates[0]:
+            candidates.append(legacy)
+    path = next((c for c in candidates if c.exists()), None)
+    if path is None:
         return {"name": name, "status": "ok", "detail": "no vault manifest on this host"}
+    via_legacy = len(candidates) > 1 and path == candidates[-1]
     try:
         manifest = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as e:
         return {"name": name, "status": "warn",
                 "detail": f"manifest unreadable ({type(e).__name__}) — list_vault_keys() would return nothing"}
-    names = sorted(manifest) if isinstance(manifest, dict) else []
+    if not isinstance(manifest, dict):
+        # Valid JSON, wrong shape. This is NOT benign: `_read_manifest()` returns
+        # it verbatim and `list_vault_keys()` then calls `.keys()` on it, so the
+        # documented discovery call raises AttributeError. Reporting "empty" here
+        # would be a clean bill of health for a vault nobody can enumerate.
+        return {"name": name, "status": "warn",
+                "detail": (f"manifest at {path} is valid JSON but a {type(manifest).__name__}, not an object — "
+                           f"list_vault_keys() raises AttributeError on it, so discovery is broken, not empty")}
+    names = sorted(manifest)
     if not names:
         return {"name": name, "status": "ok", "detail": "manifest empty — nothing advertised"}
 
@@ -5248,16 +5274,17 @@ def check_vault_manifest_integrity(
         return {"name": name, "status": "ok",
                 "detail": (f"{len(checked)} advertised key(s), 0 resolved against account "
                            f"'{account}' — treating as an unverifiable keychain, not as divergence")}
+    src = " (read via the LEGACY fallback — canonical manifest absent)" if via_legacy else ""
     if not phantom:
         return {"name": name, "status": "ok",
-                "detail": f"all {len(backed)} advertised key(s) resolve in Keychain"}
+                "detail": f"all {len(backed)} advertised key(s) resolve in Keychain{src}"}
 
     shown = ", ".join(phantom[:6]) + (f", +{len(phantom) - 6} more" if len(phantom) > 6 else "")
     truncated = f" (checked first {max_keys} of {len(names)})" if len(names) > max_keys else ""
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"{len(phantom)}/{len(checked)} advertised key(s) have NO Keychain entry{truncated}, "
+        "detail": (f"{len(phantom)}/{len(checked)} advertised key(s) have NO Keychain entry{truncated}{src}, "
                    f"so list_vault_keys() offers them and get_vault_key() raises KeyError: {shown}. "
                    f"Prune {path} or re-store the secrets."),
     }

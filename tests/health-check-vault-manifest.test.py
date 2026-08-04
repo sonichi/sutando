@@ -29,6 +29,8 @@ _spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "h
 hc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hc)
 
+import vault_intercept as vi  # noqa: E402  (resolution path under test)
+
 FAILURES: list[str] = []
 
 
@@ -140,11 +142,44 @@ def main() -> int:
         check("  ...and 0-resolved is reported as unverifiable, not divergence",
               "unverifiable" in real["detail"], real["detail"])
 
-        # (iv) a manifest that is valid JSON but not an object must not crash.
-        arr = tmp / "arr.json"
-        arr.write_text('["K1", "K2"]')
-        r = hc.check_vault_manifest_integrity(arr, _probe([]))
-        check("non-object manifest -> ok, no crash", r["status"] == "ok", repr(r))
+        # (iv) valid JSON, WRONG SHAPE. This case previously asserted "ok, no
+        # crash" — pinning the wrong behaviour, which is worse than not testing
+        # it. `_read_manifest()` returns the value verbatim and
+        # `list_vault_keys()` calls `.keys()` on it, so discovery raises
+        # AttributeError. "Empty" would be a clean bill of health for a vault
+        # nobody can enumerate. (qingyun-wu, #2623)
+        for blob, label in (('["K1","K2"]', "list"), ('"A"', "str"), ("123", "int")):
+            wrong = tmp / f"wrong-{label}.json"
+            wrong.write_text(blob)
+            r = hc.check_vault_manifest_integrity(wrong, _probe([]))
+            check(f"wrong-shape manifest ({label}) -> warn, not ok",
+                  r["status"] == "warn", repr(r))
+        check("  ...and says discovery is broken, not empty",
+              "AttributeError" in r["detail"], r["detail"])
+
+        # (v) THE FALSE-CLEAN BOTH REVIEWERS FOUND: canonical absent, legacy
+        # present. Production `list_vault_keys()` reads through `_read_manifest()`,
+        # which falls back to the legacy home-dir manifest — so a probe that only
+        # consults `_manifest_path()` reports "no vault manifest on this host"
+        # for a pre-migration install that is still advertising keys. That is a
+        # false clean on exactly the population this check exists to diagnose.
+        legacy = tmp / "legacy-keys.json"
+        legacy.write_text(json.dumps({"REAL": {}, "PHANTOM": {}}))
+        absent_canonical = tmp / "no-such-canonical.json"
+        assert not absent_canonical.exists()
+        _mp = vi._manifest_path
+        vi._manifest_path = lambda: str(absent_canonical)
+        try:
+            r = hc.check_vault_manifest_integrity(
+                keychain_probe=_probe(["REAL"]), legacy_path=legacy)
+        finally:
+            vi._manifest_path = _mp
+        check("canonical absent + legacy present -> reaches the keychain probe",
+              r["status"] == "warn", repr(r))
+        check("  ...names the phantom from the LEGACY manifest",
+              "PHANTOM" in r["detail"], r["detail"])
+        check("  ...and discloses it read the legacy fallback",
+              "LEGACY" in r["detail"], r["detail"])
 
         # --- the probe is registered, not just defined ---------------------
         src = (REPO / "src" / "health-check.py").read_text()
