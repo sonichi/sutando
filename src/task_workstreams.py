@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -33,6 +34,7 @@ LEGACY_CLASSIFIER_TASK_PREFIX = "task-project-grouping-"
 MIN_CONFIDENCE = 0.65
 MAX_RESULT_CHARS = 4_000
 CLASSIFIER_POLL_SECONDS = 30
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -649,9 +651,9 @@ def run_classifier_maintenance(
     while not stop_event.is_set():
         try:
             maybe_enqueue_classifier_task(workspace, skill_file=skill_file)
-        except Exception:
+        except Exception as exc:
             # Optional semantic grouping must never take down agent-api.
-            pass
+            LOGGER.warning("task workstream classifier maintenance failed: %s", exc)
         stop_event.wait(interval)
 
 

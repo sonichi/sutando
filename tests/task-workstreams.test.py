@@ -323,7 +323,10 @@ def test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors() -
             raise RuntimeError("transient classifier failure")
         stop.set()
 
-    with mock.patch.object(workstreams, "maybe_enqueue_classifier_task", side_effect=probe):
+    with (
+        mock.patch.object(workstreams, "maybe_enqueue_classifier_task", side_effect=probe),
+        mock.patch.object(workstreams.LOGGER, "warning") as warning,
+    ):
         workstreams.run_classifier_maintenance(
             workspace,
             skill_file=REPO / "skills" / "task-workstream-grouping" / "SKILL.md",
@@ -334,6 +337,10 @@ def test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors() -
     assert len(calls) == 2
     assert calls[0][0] == (workspace,)
     assert calls[0][1]["skill_file"].name == "SKILL.md"
+    warning.assert_called_once_with(
+        "task workstream classifier maintenance failed: %s",
+        mock.ANY,
+    )
 
 
 def test_concurrent_inheritance_keeps_every_assignment() -> None:
