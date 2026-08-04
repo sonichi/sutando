@@ -26,6 +26,9 @@ MAX_PAGES = 200
 # Ordinary messages are clipped so a long scroll stays scannable; FORWARDS are
 # exempt (see _render) because a forward is usually the substance, not chatter.
 CLIP = 200
+# Reply targets are clipped harder than bodies: the point is to identify WHICH
+# message is being answered, not to re-read it.
+REPLY_CLIP = 110
 
 
 def _load_token(env):
@@ -45,6 +48,33 @@ def _fetch(extra, channel_id, page, headers):
     # request_json honors 429 Retry-After + retries transient 5xx, so a rate
     # limit mid-pagination no longer aborts the read (2026-07-24 truncation fix).
     return request_json(req, timeout=10)
+
+
+def _reply_context(msg):
+    """The message this one is REPLYING to, or None.
+
+    A terse reply is uninterpretable without its target. Measured 2026-08-04 in
+    the owner channel: `2 merge` and `2y\n3 I didn't delete it.` are both
+    replies, and both rendered here as bare text with nothing indicating what
+    they answered. Read from the channel alone they are unreadable; they only
+    parsed because the task file happened to carry a `[Replying to ...]` block,
+    which exists only when a message becomes a task.
+
+    That matters because this is the reader `context-reconstruct` runs on every
+    pass — the same reason the forward bug above was worth fixing. A peer hit
+    the consequence directly: it re-asked an owner the same question twice after
+    missing that a bare `2` was the answer to an enumerated question.
+
+    LABELLED, never inlined — for the same reason forwards are labelled:
+    attributing a quoted message to the replier is its own misreading.
+    """
+    ref = msg.get("referenced_message")
+    if not isinstance(ref, dict):
+        return None
+    author = (ref.get("author") or {}).get("username", "?")
+    body = " ".join((_render(ref) or "").split())
+    return f"\u21b3 replying to {author}: {body[:REPLY_CLIP]}" if body else \
+           f"\u21b3 replying to {author}: (no readable body)"
 
 
 def _render(msg):
@@ -149,6 +179,9 @@ def main(argv=None):
         author = msg.get("author", {}).get("username", "?")
         ts = msg.get("timestamp", "")[:19]
         print(f"[{ts}] {author}: {_render(msg)}")
+        ctx = _reply_context(msg)
+        if ctx:
+            print(f"    {ctx}")
     return 0
 
 
