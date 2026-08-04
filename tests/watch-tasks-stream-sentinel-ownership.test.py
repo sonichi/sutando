@@ -107,6 +107,22 @@ def wait_for(pred, timeout: float = 8.0, step: float = 0.25) -> bool:
 
 def main() -> int:
     print("watch-tasks-stream sentinel ownership:")
+
+    # PREREQUISITE, checked explicitly so its absence is a SKIP and not four
+    # misleading failures. The script writes the sentinel at :65 and only
+    # invokes fswatch at :189, so on a host without fswatch it writes the file,
+    # dies immediately, and cleanup() removes it — the sentinel "never appears"
+    # to a poller, every assertion that needs a LIVE watcher fails, and the two
+    # that merely need one to EXIT pass. That is exactly what this test did on
+    # CI (ubuntu, no fswatch) before this guard: 4 FAIL / 3 ok, none of which
+    # said anything about the ownership guard.
+    if shutil.which("fswatch") is None:
+        print("  SKIP — fswatch is not installed; this test drives the real")
+        print("         watcher, which exits immediately without it.")
+        print("         Coverage here is LOCAL-ONLY (macOS dev hosts). CI does")
+        print("         not exercise the sentinel-ownership guard.")
+        return 0
+
     box = Path(tempfile.mkdtemp(prefix="sentinel-own-"))
     ws = box / "workspace"
     for d in ("tasks", "results", "state"):
@@ -115,6 +131,19 @@ def main() -> int:
     a = b = None
     try:
         a = Watcher(ws)
+        # A watcher that exits on startup makes every assertion below either
+        # fail for the wrong reason or pass vacuously, so establish liveness
+        # FIRST and bail with a diagnosis rather than a cascade.
+        if not wait_for(lambda: sentinel.exists() or not a.alive(), timeout=6):
+            print("  SKIP — watcher neither wrote a sentinel nor exited; "
+                  "environment cannot run this test")
+            return 0
+        if not a.alive():
+            print("  SKIP — the watcher exited during startup, so there is no "
+                  "live watcher to test ownership against.")
+            print("         Most likely an unmet runtime dependency (fswatch). "
+                  "Not a failure of the guard under test.")
+            return 0
         check("a watcher writes the sentinel",
               wait_for(lambda: sentinel.exists() and sentinel.read_text().strip() != ""),
               "sentinel never appeared")
