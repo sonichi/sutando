@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO / "src"))
 from result_router import (  # noqa: E402
     EMPTY_RESULT_POLL_THRESHOLD,
     empty_result_notice,
+    note_empty_result,
 )
 
 FAILURES: list[str] = []
@@ -118,20 +119,44 @@ def main() -> int:
     check("  ...and the completed write is non-empty, so the skip is transient",
           target.stat().st_size > 0, f"size {target.stat().st_size}")
 
+    # --- the COUNTER, which is policy and therefore shared -----------------
+    # Counting lives in result_router rather than in each bridge: two verbatim
+    # copies of a five-line helper is still copied policy (CLAUDE.md), and the
+    # telegram copy could not be covered by execution — the repo's convention is
+    # to assert on telegram-bridge at source level, not import it. One
+    # implementation is covered once, here, for both.
+    counters: dict = {}
+    fired = [note_empty_result(counters, "t", P) for _ in range(T + 5)]
+    announced = [f for f in fired if f is not None]
+    check("the shared counter reaches the bound and announces once",
+          counters["t"] == T + 5 and len(announced) == 1,
+          f"counter={counters.get('t')} announced={len(announced)}")
+    check("  ...and per-task, not global",
+          note_empty_result(counters, "other-task", P) is None,
+          "a second task inherited the first task's count")
+
     # --- WIRING: a policy with no caller is the defect it fixes ------------
     # CLAUDE.md: "Pin both the shared contract and every adapter's delegation
     # in tests." Landing the bound with nothing calling it would be the same
     # latent no-op this PR exists to remove, so assert BOTH bridges delegate.
     for bridge in ("discord-bridge.py", "telegram-bridge.py"):
         src = (REPO / "src" / bridge).read_text()
-        check(f"{bridge} calls the shared policy",
-              "result_router.empty_result_notice(" in src,
-              "does not delegate — policy would be a no-op here")
-        check(f"  ...{bridge} keeps its own counter and CLEARS it on success",
-              "_empty_result_polls[task_id]" in src
-              and "_empty_result_polls.pop(task_id, None)" in src,
-              "a counter that never clears reports a stuck task after any "
-              "transient empty read")
+        # These four assertions fired when I moved the counting into
+        # result_router — correctly. They were pinned to the OLD call spelling,
+        # which is what an assertion on a contract is FOR: it notices when the
+        # contract moves. Re-pointed at the real one rather than loosened.
+        check(f"{bridge} delegates counting to the shared policy",
+              "result_router.note_empty_result(" in src,
+              "does not delegate — the policy would be a no-op here, and two "
+              "bridges would drift")
+        check(f"  ...{bridge} does NOT re-implement the counting itself",
+              "counters.get(task_id, 0) + 1" not in src
+              and "_empty_result_polls.get(task_id, 0) + 1" not in src,
+              "copied policy — CLAUDE.md: do not copy policy between bridges")
+        check(f"  ...{bridge} CLEARS its counter on a successful delivery",
+              "_empty_result_polls.pop(task_id, None)" in src,
+              "a counter that never clears announces a healthy task after a "
+              "few transient empty reads")
         check(f"  ...{bridge} still SKIPS rather than delivering the empty body",
               "if not reply_text:" in src and src.count("continue") > 0,
               "the partial-write guard was removed")

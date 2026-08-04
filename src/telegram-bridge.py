@@ -63,17 +63,17 @@ _empty_result_polls: "dict[str, int]" = {}
 
 
 def _note_empty_result(task_id: str, result_file) -> None:
-    """Count a present-but-empty result and announce once past the bound.
+    """Provider-side half: print what the shared policy decided to announce.
 
-    Kept to ONE call at the guard so `continue` stays adjacent to
-    `if not reply_text:` — `tests/bridge-result-race-guard.test.py` reads a
-    120-char window after that `if` and asserts the `continue` is inside it.
-    My first version inlined eight lines there and pushed the `continue` out of
-    the window, failing the very test that exists to protect this guard.
+    Counting + threshold + wording live in `result_router.note_empty_result` so
+    both bridges cannot drift; only the print is per-bridge. Kept to ONE call at
+    the guard so `continue` stays adjacent to `if not reply_text:` —
+    `tests/bridge-result-race-guard.test.py` reads a 120-char window after that
+    `if`, and my first version inlined eight lines and pushed the `continue`
+    out of it, failing the very test that protects this guard.
     """
-    n = _empty_result_polls.get(task_id, 0) + 1
-    _empty_result_polls[task_id] = n
-    notice = result_router.empty_result_notice(task_id, str(result_file), n)
+    notice = result_router.note_empty_result(
+        _empty_result_polls, task_id, str(result_file))
     if notice:
         print(f"  {notice}", flush=True)
 from task_body_guard import confine_user_content  # noqa: E402

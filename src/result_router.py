@@ -195,3 +195,28 @@ def empty_result_notice(
         f"This is past any partial-write window — the writer likely died "
         f"mid-write or produced no body."
     )
+
+
+def note_empty_result(
+    counters: dict,
+    task_id: str,
+    path: str,
+    threshold: int = EMPTY_RESULT_POLL_THRESHOLD,
+) -> "str | None":
+    """Record one empty observation for `task_id`; return the notice or None.
+
+    Counting lives HERE, not in each bridge, for the reason CLAUDE.md gives:
+    "do not copy policy code between bridges". The first cut had this five-line
+    helper duplicated verbatim in both, which is copied policy however small —
+    and it left the telegram copy uncovered, because the repo's own convention
+    (see `tests/bridge-marker-no-leak.test.py`) is to assert on telegram-bridge
+    at SOURCE level rather than import it, its import having side effects. One
+    implementation is covered once and cannot drift.
+
+    `counters` is bridge-owned mutable state passed in, so this module keeps its
+    no-I/O, no-global contract; the caller does the printing, which is the
+    provider-side half.
+    """
+    n = counters.get(task_id, 0) + 1
+    counters[task_id] = n
+    return empty_result_notice(task_id, path, n, threshold)
