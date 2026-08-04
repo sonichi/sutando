@@ -28,12 +28,17 @@ cd "$REPO"
 # exists to prevent. Prefer SUTANDO_PY (set by launch-sutando.sh), else the
 # bundle-vendored relocatable python (`<engine>/runtime/python`, i.e. REPO/../runtime),
 # else system python3.
-if [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
-  PY="$SUTANDO_PY"
-elif [ -x "$REPO/../runtime/python/bin/python3" ]; then
-  PY="$REPO/../runtime/python/bin/python3"
-else
-  PY="python3"
+# Single-sourced in scripts/python-binary.sh (see there for why the bare-name
+# fallback this replaced was the CLT-dialog trigger).
+# Source OPTIONALLY. tests/start-cli-claude-config-dir.test.sh pins a contract
+# older than this change: a checkout without the M0 helper must still spawn
+# claude ("helper missing -> silent fallback"). A hard exit here broke that, so
+# the guard lives at each call site instead — which is what CR #2599 actually
+# needs (no `"" -c ...`), without turning a missing helper into a launch failure.
+PY=""
+if [ -r "$REPO/scripts/python-binary.sh" ]; then
+  . "$REPO/scripts/python-binary.sh"
+  PY="$(resolve_python "$REPO")"
 fi
 
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
@@ -190,7 +195,7 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # This is the single launch chokepoint (Sutando.app's launchCore, the
     # terminal-server Core CLI pane, and src/startup.sh all exec this script),
     # so seeding here covers every path.
-    if "$PY" -c 'import sys' > /dev/null 2>&1; then
+    if [ -n "$PY" ] && "$PY" -c 'import sys' > /dev/null 2>&1; then
       _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
@@ -529,7 +534,7 @@ ensure_core_monitor() {
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
   # Monitor (PR #2100): launch unless one for this exact socket+out is running.
-  if ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
+  if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" > /dev/null 2>&1; then
     "$PY" "$REPO/src/core-input-watch.py" \
       --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
       > /tmp/core-input-watch.log 2>&1 &
@@ -550,7 +555,7 @@ ensure_core_monitor() {
     # caller that captures start-cli.sh's output (e.g. tests/start-cli-*.test.py)
     # blocks on the pipe until this infinite loop closes it (never) and times out.
     # Mirrors the monitor launch above, which redirects to /tmp/core-input-watch.log.
-    ( while true; do
+    [ -n "$PY" ] && ( while true; do
         "$PY" "$REPO/src/core-supervisor-relay.py" \
           --signal "$mon_out" --state-file "$relay_state" \
           --active-from "$ws/state/last-owner-activity.json"

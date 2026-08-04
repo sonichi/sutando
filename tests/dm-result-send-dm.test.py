@@ -22,9 +22,11 @@ Three real bugs are covered as regression guards:
     to /messages (Discord 400, error code 50006).
 """
 
+import contextlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -269,12 +271,108 @@ def test_env_override_skips_access_json_entirely():
     )
 
 
+@contextlib.contextmanager
+def _outbox_redirected():
+    """Send audit-log appends to a throwaway file for the duration.
+
+    `dm-result.py` late-imports `outbox_log` and calls `append()` after every
+    successful send. `outbox_log._outbox_path()` resolves
+    `resolve_workspace()/state/outbox.log` AT CALL TIME, and nothing in this
+    suite rebound it — so each run appended real rows to the owner's live
+    delivery audit log. Measured on the live workspace before this fix: running
+    the suite changed `state/outbox.log` (2,025,726 B) every time.
+
+    Patching `_outbox_path` rather than `resolve_workspace` is deliberate: the
+    former is what `append()` actually calls, and re-resolving is done per call,
+    so a function swap is sufficient here. That is NOT a general rule — the
+    sibling fix in #2615 had to rebind a constant because it was bound at
+    IMPORT time. Which seam works is a property of the module, so it is checked
+    by exercise below, not assumed.
+
+    Restore is in a `finally` so an assertion failure mid-suite cannot leave the
+    global patched for whatever runs next in the same interpreter (#2614).
+    """
+    import outbox_log
+
+    original = outbox_log._outbox_path
+    tmpdir = Path(tempfile.mkdtemp(prefix="sutando-outbox-test-"))
+    redirected = tmpdir / "outbox.log"
+    outbox_log._outbox_path = lambda: redirected
+    try:
+        yield redirected
+    finally:
+        outbox_log._outbox_path = original
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _live_outbox():
+    from workspace_default import resolve_workspace
+
+    return resolve_workspace() / "state" / "outbox.log"
+
+
+def test_suite_never_appends_to_the_live_outbox_log(live, before):
+    """THE regression: a test run must not write to the owner's audit log.
+
+    Asserts on the RESOLVED live path — whatever `resolve_workspace()` returns
+    in this environment — rather than on a fixture path, because the defect was
+    precisely that the suite escaped to wherever that resolves.
+
+    `before` is captured by `main()` BEFORE any test runs, and deliberately not
+    here. Taking the baseline inside this function would only cover this
+    function's own sends: if the redirect around the other five tests were
+    removed, their rows would already be in `before` and this would still pass.
+    A regression that cannot fail for the mutation it exists to catch is
+    decoration. Verified by mutation, both ways — see the PR body.
+
+    Also proves the redirect is live rather than vacuous: the throwaway file
+    must have GROWN. Without that half, simply deleting the `append()` call
+    would turn this green.
+    """
+    with _outbox_redirected() as redirected:
+        transport = _FakeTransport({
+            ("POST", "/users/@me/channels"): {"id": "dm-channel-audit"},
+            ("POST", "/channels/dm-channel-audit/messages"): {"id": "msg-audit"},
+        })
+        original_urlopen = _install_transport(transport)
+        try:
+            _with_access_json(
+                {"allowFrom": ["555"], "tierMap": {"555": "owner"}},
+                lambda: dm.send_dm("audit-path probe"),
+            )
+        finally:
+            _restore_transport(original_urlopen)
+
+        wrote = redirected.is_file() and redirected.stat().st_size > 0
+        assert wrote, (
+            "redirect target is empty — the suite either stopped calling "
+            "outbox_log.append() or the patched seam is not the one append() uses, "
+            "so this regression would pass without proving anything"
+        )
+
+    after = live.read_bytes() if live.is_file() else None
+    assert after == before, (
+        f"the suite appended to the LIVE outbox log at {live} "
+        f"({'absent' if before is None else f'{len(before)} B'} -> "
+        f"{'absent' if after is None else f'{len(after)} B'})"
+    )
+    print("  OK: live outbox.log untouched; audit rows went to the redirect")
+
+
 def main():
-    test_tier_map_resolution_skips_bot_lookup()
-    test_bot_filter_fallback_still_works_without_tier_map()
-    test_file_markers_stripped_from_body()
-    test_empty_body_after_marker_strip_does_not_post_messages()
-    test_env_override_skips_access_json_entirely()
+    # Baseline taken before ANY test runs, so the final assertion covers every
+    # send in this file — not just the ones the regression itself makes.
+    live = _live_outbox()
+    before = live.read_bytes() if live.is_file() else None
+
+    with _outbox_redirected():
+        test_tier_map_resolution_skips_bot_lookup()
+        test_bot_filter_fallback_still_works_without_tier_map()
+        test_file_markers_stripped_from_body()
+        test_empty_body_after_marker_strip_does_not_post_messages()
+        test_env_override_skips_access_json_entirely()
+
+    test_suite_never_appends_to_the_live_outbox_log(live, before)
     print("All send_dm integration tests passed.")
 
 
