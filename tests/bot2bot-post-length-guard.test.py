@@ -127,7 +127,16 @@ def main() -> int:
 
         # POSITIVE CONTROL for the stub itself: a normal message must reach it,
         # otherwise `calls == []` above would pass even with a mis-wired recorder.
-        post_mod.post("chan", "short and fine", "tok", overhead=9)
+        #
+        # Wrapped, because `post()` exits the PROCESS on refusal. Against an
+        # over-broad guard (one that refuses everything) this call would abort
+        # the run before the summary — reporting one symptom and hiding the
+        # rest. Catching it turns "the suite died" into "this assertion failed".
+        try:
+            post_mod.post("chan", "short and fine", "tok", overhead=9)
+        except SystemExit as e:
+            check("POSITIVE CONTROL — a normal message is NOT refused",
+                  False, f"guard refused a legitimate message: {str(e)[:80]}")
         check("POSITIVE CONTROL — a normal message DOES reach the network",
               len(calls) == 1, f"calls={calls}")
     finally:
