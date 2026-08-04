@@ -112,20 +112,39 @@ import result_router  # noqa: E402  (Result Router §9.3 — owner-visible deliv
 _empty_result_polls: "dict[str, int]" = {}
 
 
-def _note_empty_result(task_id: str, result_file) -> None:
-    """Provider-side half: print what the shared policy decided to announce.
+class EmptyResultError(Exception):
+    """A result file that stayed empty past the bound — never delivered."""
 
-    Counting + threshold + wording live in `result_router.note_empty_result` so
-    both bridges cannot drift; only the print is per-bridge. Kept to ONE call at
-    the guard so `continue` stays adjacent to `if not reply_text:` —
-    `tests/bridge-result-race-guard.test.py` reads a 120-char window after that
-    `if`, and my first version inlined eight lines and pushed the `continue`
-    out of it, failing the very test that protects this guard.
+
+async def _note_empty_result(task_id: str, result_file) -> None:
+    """Bound a present-but-empty result, then make it OWNER-VISIBLE and TERMINAL.
+
+    The first cut only printed the notice to bridge stdout and fell through to
+    `continue`. @john-the-dev's blocker on 175173c3: that converts a SILENT stall
+    into a LOGGED one and changes nothing the owner experiences — `pending_replies`
+    is untouched, no DM is sent, the result is never archived, and the reply is
+    still owed forever. It also contradicts this module's own rule zero and §9.3,
+    which require an owner DM plus a `failed` audit row for any delivery failure.
+
+    So at the bound this now does what §9.3 says: reuse `_report_delivery_failure`
+    (owner DM + audit row), drain `pending_replies`, and archive the result so the
+    task cannot stay pending. Below the bound it is still a no-op — that is the
+    partial-write window, where doing anything at all is the bug.
     """
     notice = result_router.note_empty_result(
         _empty_result_polls, task_id, str(result_file))
-    if notice:
-        print(f"  {notice}", flush=True)
+    if not notice:
+        return                                    # still inside the write window
+    print(f"  {notice}", flush=True)
+    _empty_result_polls.pop(task_id, None)
+    channel = pending_replies.pop(task_id, None)  # TERMINAL: stop re-polling it
+    _atomic_write_pending_replies(
+        {k: str(getattr(v, "id", v)) for k, v in pending_replies.items()})
+    tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
+    archive_file(result_file, "results", task_id)
+
+
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
@@ -4327,7 +4346,7 @@ async def poll_results():
                 import re
                 reply_text = result_file.read_text().strip()
                 if not reply_text:
-                    _note_empty_result(task_id, result_file)
+                    await _note_empty_result(task_id, result_file)
                     continue
                 _empty_result_polls.pop(task_id, None)
                 channel = pending_replies.pop(task_id)
