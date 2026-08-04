@@ -166,6 +166,27 @@ def main() -> int:
           "success path stopped cleaning up — every message would re-send forever")
     check("  ...and it really was sent", bool(sent), "no send recorded")
 
+    # --- LAST RESORT: even the quarantine fails ----------------------------
+    # The whole guarantee is "noise is recoverable, deletion is not", and this
+    # is the branch that has to hold it up. `undelivered` is created as a FILE,
+    # so `mkdir(exist_ok=True)` raises FileExistsError — no monkeypatching, and
+    # a plausible real state (a stray file, a name collision).
+    # CI found these two lines uncovered (diff coverage 77.8%, missing 5034 and
+    # 5038): the successful-quarantine case does not reach the handler.
+    box3 = Path(tempfile.mkdtemp(prefix="proactive-noquar-"))
+    (box3 / "proactive-pending-q-stuck.txt").write_text("must not vanish")
+    (box3 / "undelivered").write_text("not a directory")
+
+    _run_one_pass(box3, _raise)
+
+    survivors = [p for p in box3.iterdir()
+                 if p.is_file() and p.name.startswith("proactive-pending-q-stuck")]
+    check("quarantine ALSO fails -> the file is still left in place",
+          bool(survivors), "deleted despite the whole point being not to delete")
+    if survivors:
+        check("  ...body intact even on the last-resort path",
+              survivors[0].read_text() == "must not vanish", "content lost")
+
     # --- hermeticity, asserted rather than assumed -------------------------
     live_after = sorted(p.name for p in _LIVE_RESULTS.iterdir()) if _LIVE_RESULTS.exists() else None
     check("HERMETIC: operator's real results/ untouched", live_after == _live_before,
