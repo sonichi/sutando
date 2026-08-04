@@ -177,10 +177,52 @@ assert run(write_call(RESULTS / "task-slack1.txt", slack_body)) is None, \
 assert run(write_call(RESULTS / "task-disc1.txt", slack_body)) == "deny", \
     "the same slack-inbox path must NOT be sendable for a DISCORD-sourced result"
 
-# 16. Unknown destination falls back to the UNION, never the strictest — a false
-#     deny for a destination nobody can name is unsatisfiable for the author.
-assert run(write_call(RESULTS / "task-nosuchtask.txt", slack_body)) is None, \
-    "an unresolvable destination must use the union of adapter roots"
+# 16. UNRESOLVABLE destination -> CANONICAL roots only, never the union.
+#     v2 used the union here; john-the-dev (PR #2596) reproduced why that is
+#     wrong. Verified in the delivery code rather than assumed: discord and
+#     telegram gate their proactive claim on
+#     proactive_routing.should_claim_proactive, but slack-bridge.py:1443 claims
+#     proactive files by RACE-RENAME. Three claimants, no deterministic winner,
+#     so a provider-local root can never be safely authorized for a body whose
+#     destination is unknown.
+assert run(write_call(RESULTS / "task-nosuchtask.txt", slack_body)) == "deny", \
+    "an unresolvable destination must use CANONICAL roots only, not the union"
+
+# 17. THE PROACTIVE CASE john-the-dev actually reproduced: results/proactive-*.txt
+#     has no task to name a source, and the union silently authorized Slack's
+#     inbox for a file Discord/Telegram would refuse — the incident shape with a
+#     clean guard pass in front of it.
+assert run(write_call(RESULTS / "proactive-1785811070.txt", slack_body)) == "deny", \
+    "a proactive body must not get Slack's adapter-local root"
+#     ...while the canonical roots still pass for the same proactive body, so
+#     #17 cannot be passing merely because proactive files are blanket-denied.
+assert run(write_call(RESULTS / "proactive-1785811070.txt", GOOD_BODY)) is None, \
+    "a proactive body attaching a canonical-root file must still pass"
+
+# 18. QINGYUN-WU's P1: the REGISTERED COMMAND is stored as a shell string and
+#     reparsed when the hook fires. An unquoted repo path containing a space is
+#     split before _repo_root() sees it, and the hook goes silently INERT — the
+#     very failure this PR closes, reintroduced through the deploy snippet.
+#     Execute the stored command through a real shell, exactly as Claude Code does.
+import shlex, shutil
+spaced = Path(tempfile.mkdtemp()) / "sutando repo with spaces"
+shutil.copytree(REPO, spaced, symlinks=True,
+                ignore=shutil.ignore_patterns(".git", "node_modules", "workspace"))
+stored = f"{shlex.quote(sys.executable)} {shlex.quote(HOOK)} --repo {shlex.quote(str(spaced))}"
+p = subprocess.run(["/bin/sh", "-c", stored], input=json.dumps(write_call(RESULT, BAD_BODY)),
+                   capture_output=True, text=True, env=ENV)
+assert p.returncode == 0, f"stored command must run: {p.stderr[:300]}"
+assert "INERT" not in p.stderr, \
+    f"a QUOTED spaced repo path must resolve, not go inert — stderr {p.stderr!r}"
+assert json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny", \
+    "a quoted spaced repo path must still enforce"
+#     ...and the UNQUOTED form must visibly fail, so #18 proves quoting is what
+#     fixes it rather than passing for some unrelated reason.
+unquoted = f"{shlex.quote(sys.executable)} {shlex.quote(HOOK)} --repo {spaced}"
+p2 = subprocess.run(["/bin/sh", "-c", unquoted], input=json.dumps(write_call(RESULT, BAD_BODY)),
+                    capture_output=True, text=True, env=ENV)
+assert "INERT" in p2.stderr, \
+    f"the UNQUOTED spaced path must go inert (that is the bug) — stderr {p2.stderr!r}"
 
 print("PASS: result-file-marker-guard — denies an EXISTING file outside the allowlist "
       "(the 2026-08-04 incident) with a positive control on the same body, gates all three "
@@ -188,4 +230,5 @@ print("PASS: result-file-marker-guard — denies an EXISTING file outside the al
       "fails open on bad input, emits an actionable reason, is LOUD (not silent) when the "
       "repo root is unconfigured in a deployed copy, enforces once given --repo or "
       "$SUTANDO_REPO_ROOT, and applies the SLACK adapter's extra root only to "
-      "slack-sourced results")
+      "slack-sourced results, uses CANONICAL-ONLY for an unresolvable/proactive destination, "
+      "and survives a shell-reparsed registration whose repo path contains a space")

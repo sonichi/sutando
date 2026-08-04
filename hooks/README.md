@@ -188,9 +188,15 @@ hook never has to guess:
 REPO="$(git rev-parse --show-toplevel)"
 cp hooks/result-file-marker-guard.py ~/.claude/hooks/
 REPO="$REPO" python3 - <<'PY'
-import json, os
+import json, os, shlex
 sp = os.path.expanduser("~/.claude/settings.json"); s = json.load(open(sp))
-cmd = f"python3 ~/.claude/hooks/result-file-marker-guard.py --repo {os.environ['REPO']}"
+# SHELL-QUOTE BOTH PATHS. Claude Code stores `command` as a shell string and
+# reparses it when the hook fires, so an unquoted path containing a space --
+# e.g. the app install shape ~/Library/Application Support/.../sutando -- is
+# split before _repo_root() ever sees it, and the hook goes silently INERT.
+# Same class the repo already guards in src/install-claude-hooks.sh.
+hook = shlex.quote(os.path.expanduser("~/.claude/hooks/result-file-marker-guard.py"))
+cmd = f"python3 {hook} --repo {shlex.quote(os.environ['REPO'])}"
 pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])
 for m in ("Write", "Edit", "MultiEdit"):
     blk = next((b for b in pre if b.get("matcher") == m), None)

@@ -36,11 +36,11 @@ so an uploaded file can be echoed back (``src/slack-bridge.py:153-158``).
 Judging every result against the canonical Discord/Telegram policy would deny a
 currently-supported Slack reply. So the guard resolves the DESTINATION first —
 ``results/task-<id>.txt`` names the task, and the task file's ``source:`` field
-names the adapter — and applies that adapter's policy. When the source cannot be
-determined (proactive bodies, a task already archived out from under us), it
-falls back to the UNION of every adapter's roots: refusing to attach something
-some adapter could legitimately send is a worse error than letting the bridge
-report it.
+names the adapter — and applies that adapter's policy. When the destination
+cannot be established (a proactive body, or a task archived out from under us)
+it falls back to the CANONICAL roots only, never the union — see the comment at
+that branch for why the union was unsound and why the routing state cannot
+recover the answer.
 
 REPO ROOT (bassilkhilo-ag2 + qingyun-wu, PR #2596 review). This file needs
 ``src/`` on ``sys.path``. It must NOT discover that by walking up from
@@ -114,8 +114,8 @@ def _adapter_for(result_path, workspace):
     """The bridge that will deliver this result, from the task it answers.
 
     `results/task-<id>.txt` -> `tasks/task-<id>.txt` (or its archive) -> `source:`.
-    Returns None when it can't be established, which the caller treats as
-    "use the union", never as "use the strictest".
+    Returns None when it can't be established; the caller then uses the
+    CANONICAL roots only (see that branch), never a union of provider-local ones.
     """
     m = re.match(r"^(?:[^.]+\.)?task-(.+)\.txt$", os.path.basename(result_path))
     if not m:
@@ -183,12 +183,33 @@ def main(argv):
         extra = tuple(str(workspace / r) for r in ADAPTER_EXTRA_ROOTS[adapter])
         scope = f"the {adapter} adapter"
     else:
-        # Unknown destination -> the UNION. A false deny on a path some adapter
-        # could send is worse than letting the bridge report it: the author has
-        # no way to satisfy a policy for a destination nobody can name.
-        extra = tuple(str(workspace / r)
-                      for roots in ADAPTER_EXTRA_ROOTS.values() for r in roots)
-        scope = "any configured adapter"
+        # Destination NOT established -> canonical roots ONLY, never the union.
+        #
+        # v2 of this hook used the union here, reasoning that a false deny for
+        # an unnameable destination is unsatisfiable. john-the-dev reproduced
+        # why that is wrong: `results/proactive-*.txt` has no task to name a
+        # source, so the union authorized Slack's `slack-inbox/` for a file
+        # that Discord or Telegram would then refuse — recreating the exact
+        # silent-failure this guard exists to prevent, with a clean pass in
+        # front of it.
+        #
+        # Nor is the destination recoverable from `state/last-owner-activity.json`
+        # as the review suggested, and I checked the delivery code rather than
+        # assuming: discord and telegram gate their claim on
+        # `proactive_routing.should_claim_proactive`, but slack-bridge.py:1443
+        # claims proactive files by RACE-RENAME, skipping only bodies carrying a
+        # Discord `[channel:]` marker. Three claimants, no deterministic winner —
+        # so for a proactive body "which adapter delivers this" has no answer at
+        # authoring time.
+        #
+        # The union is therefore unsound and the routing state cannot fix it.
+        # Canonical-only is: every adapter accepts these roots, so an allow here
+        # is an allow everywhere. It costs one deny — a provider-local path in a
+        # proactive body — and that deny is trivially satisfiable by staging into
+        # `results/`, which the reason text says.
+        extra = ()
+        scope = ("an unresolved destination (proactive/non-task result; canonical "
+                 "roots only, since any adapter may claim it)")
 
     bad = []
     for act in parse_markers(body).actions:
