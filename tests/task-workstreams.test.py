@@ -284,6 +284,35 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
     assert changed.reason == "ready"
     assert changed_scan.call_count == 1
 
+    real_scan = workstreams.scan_task_history
+
+    def scan_while_another_task_arrives(target: Path):
+        rows = real_scan(target)
+        write_task(
+            target / "tasks" / "archive" / "2026-08" / "task-raced.txt",
+            "task-raced",
+            "2026-08-03T13:01:00Z",
+            "arrived during the classifier scan",
+        )
+        write_result(target, "task-raced")
+        return rows
+
+    with mock.patch.object(
+        workstreams,
+        "scan_task_history",
+        side_effect=scan_while_another_task_arrives,
+    ):
+        raced = workstreams.classifier_status(workspace)
+    assert raced.pending and not raced.enqueued and raced.reason == "source-changed"
+    with mock.patch.object(
+        workstreams,
+        "scan_task_history",
+        wraps=real_scan,
+    ) as retry_scan:
+        retried = workstreams.classifier_status(workspace)
+    assert retried.reason == "ready"
+    assert retry_scan.call_count == 1
+
     manual = fixture_workspace()
     manual_snapshot = workstreams.build_classifier_snapshot(manual)
     workstreams.apply_inference(manual, {
@@ -306,10 +335,15 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
 
     invalid_age = fixture_workspace()
     invalid_snapshot = workstreams.build_classifier_snapshot(invalid_age)
+    invalid_source_token, invalid_source_directories = workstreams._task_source_state(
+        invalid_age, {}, discover=True,
+    )
     (invalid_age / "state" / "task-workstream-classifier.json").write_text(json.dumps({
         "snapshot_hash": invalid_snapshot["snapshot_hash"],
         "status": "inflight",
         "enqueued_at": "not-a-number",
+        "source_token": invalid_source_token,
+        "source_directories": list(invalid_source_directories),
     }))
     assert workstreams.classifier_status(invalid_age).reason == "ready"
 
