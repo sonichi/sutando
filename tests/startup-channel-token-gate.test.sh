@@ -15,7 +15,20 @@
 # Run: bash tests/startup-channel-token-gate.test.sh
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PY="${PY:-/usr/bin/python3}"
+
+# Resolve the interpreter the way startup.sh does (`startup.sh:32`), NOT a
+# hardcoded /usr/bin/python3. On a Mac without Command Line Tools that path is
+# the developer-tool STUB — verified on this host, where it shares an inode and
+# link count with /usr/bin/git — and executing it raises a modal no exit-code
+# check can suppress. A test that exists to forbid the bare interpreter must not
+# invoke the stub itself. (@john-the-dev on #2638: "the green scanner is not
+# evidence that the added absolute tool path is safe.")
+. "$REPO/scripts/python-binary.sh"
+PY="${PY:-$(resolve_python "$REPO")}"
+if [ -z "$PY" ]; then
+  echo "  SKIP no safe interpreter resolved — install CLT or set PY=<path>" >&2
+  exit 0
+fi
 fails=0
 
 ok()   { printf '  ok   %s\n' "$1"; }
@@ -100,6 +113,25 @@ check "$([ "${n_py:-0}" -ge 3 ] && echo 0 || echo 1)" \
       "all three gates use the resolved \$PY" "found $n_py"
 check "$(grep -q -- '--has SLACK_APP_TOKEN' "$S" && echo 0 || echo 1)" \
       "the Slack gate requires the APP token too (bot token alone cannot connect)"
+
+# --- and this file must hold itself to the rule it enforces -----------------
+# A guard that forbids the bare/stub interpreter while invoking it is not a
+# guard. Asserted, not commented: the previous revision defaulted PY to
+# /usr/bin/python3, which on a CLT-less Mac is the stub that raises the modal.
+check "$(grep -qE ':-[/]usr/bin/python3' "${BASH_SOURCE[0]}" && echo 1 || echo 0)" \
+      "PY does not DEFAULT to the hardcoded interpreter path (the reviewed defect)"
+if [ -e /usr/bin/git ] && [ -e /usr/bin/python3 ]; then
+  _i1="$(stat -f %i /usr/bin/python3 2>/dev/null || stat -c %i /usr/bin/python3 2>/dev/null)"
+  _i2="$(stat -f %i /usr/bin/git 2>/dev/null || stat -c %i /usr/bin/git 2>/dev/null)"
+  _ipy="$(stat -f %i "$PY" 2>/dev/null || stat -c %i "$PY" 2>/dev/null)"
+  if [ "$_i1" = "$_i2" ]; then
+    check "$([ "$_ipy" != "$_i1" ] && echo 0 || echo 1)" \
+          "the resolved \$PY is not the CLT shim (shares an inode with /usr/bin/git here)" \
+          "PY=$PY resolves to the shim"
+  else
+    ok "/usr/bin/python3 is not a shim on this host (nothing to avoid)"
+  fi
+fi
 
 echo
 if [ "$fails" -ne 0 ]; then
