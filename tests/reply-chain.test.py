@@ -201,6 +201,48 @@ chain, _, _ = asyncio.run(rc.walk_reply_chain(
 check("mention stripped from walked content", chain[0]["content"] == " hello")
 check("missing created_at renders as empty ts", chain[0]["ts"] == "")
 
+# --- format_parent_reference: a forward's reference is NOT a reply parent -----
+# A forward sets `message.reference` pointing at the original in its SOURCE
+# channel. Emitted under `parent_message_id` it claimed a relationship that does
+# not exist and produced an id that 404s from the channel the task was written
+# in (observed 2026-08-04 on a real owner forward into #echo).
+check("reply keeps parent_message_id",
+      rc.format_parent_reference(111, is_forward=False) == "parent_message_id: 111\n")
+check("forward is re-keyed",
+      rc.format_parent_reference(111, is_forward=True) == "forwarded_from_message_id: 111\n")
+
+# NEGATIVE CONTROLS — an unconditional swap in either direction passes one of
+# the two cases above, so each key must be asserted ABSENT from the other shape.
+check("a reply never emits forwarded_from_message_id",
+      "forwarded_from" not in rc.format_parent_reference(111, is_forward=False))
+check("a forward never emits parent_message_id",
+      "parent_message_id" not in rc.format_parent_reference(111, is_forward=True))
+
+# The channel is what makes the kept provenance usable: an id alone is not a
+# handle, since the message lives in a channel the consumer was not reading.
+_fwd = rc.format_parent_reference(111, is_forward=True, source_channel_id=222)
+check("forward carries its source channel",
+      _fwd == "forwarded_from_message_id: 111\nforwarded_from_channel_id: 222\n")
+check("forward with no known channel omits the channel line",
+      rc.format_parent_reference(111, is_forward=True, source_channel_id=None)
+      == "forwarded_from_message_id: 111\n")
+check("a reply never emits a channel line even when one is known",
+      rc.format_parent_reference(111, is_forward=False, source_channel_id=222)
+      == "parent_message_id: 111\n")
+
+check("no id -> '' (reply)", rc.format_parent_reference(None, is_forward=False) == "")
+check("no id -> '' (forward)", rc.format_parent_reference(None, is_forward=True) == "")
+check("no id -> '' even with a channel",
+      rc.format_parent_reference(None, is_forward=True, source_channel_id=222) == "")
+
+# Task-file header contract: every emitted line is `key: value` and newline
+# terminated, or the k:v parse of the task file breaks.
+for _lbl, _out in (("reply", rc.format_parent_reference(1, is_forward=False)),
+                   ("forward", _fwd)):
+    _lines = [l for l in _out.split("\n") if l]
+    check(f"{_lbl}: every line is k:v", all(": " in l for l in _lines))
+    check(f"{_lbl}: newline terminated", _out.endswith("\n"))
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
