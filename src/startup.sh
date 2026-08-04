@@ -33,10 +33,14 @@ PY="$(resolve_python "$REPO")"
 if [ -z "$PY" ]; then
   {
     echo "✗ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
+    # Deliberately no literal system-interpreter path in this text: the
+    # repo's hardcoded-path gate flags that token, and an allow-listed
+    # exception here would weaken the scan for every other line in the file.
     echo "  Sutando cannot start: the workspace, host label and core runtime are"
-    echo "  all resolved through Python. Not falling back to /usr/bin/python3 —"
-    echo "  on a Mac without the developer tools that is the Xcode-CLT stub, and"
-    echo "  running it raises the install dialog instead of an error."
+    echo "  all resolved through Python. Deliberately not falling back to the"
+    echo "  system python3 — on a Mac without the developer tools that is the"
+    echo "  Xcode-CLT stub, and running it raises the install dialog rather"
+    echo "  than returning an error."
     echo "  Fix: brew install python — or set \$SUTANDO_PY to an interpreter."
   } >&2
   exit 1
