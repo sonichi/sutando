@@ -148,7 +148,18 @@ def main() -> int:
     # other marker in the body — and poll_proactive() passes raw result text,
     # leaking [dm-only]/[channel:] to the owner. send_reply() now derives
     # attachments from parse_markers() actions, so Telegram is in scope.
-    consumers = ("src/discord-bridge.py", "src/dm-result.py", "src/telegram-bridge.py")
+    #
+    # Slack was omitted from this tuple while src/slack-bridge.py still carried
+    # a dead module-scope FILE_MARKER_RE. Delivery already went through
+    # parse_markers(), so nothing misbehaved — but the guard stayed green over a
+    # live drift artifact that a future edit could revive. Regex removed and
+    # Slack added here, so all four delivery consumers are enforced.
+    consumers = (
+        "src/discord-bridge.py",
+        "src/dm-result.py",
+        "src/telegram-bridge.py",
+        "src/slack-bridge.py",
+    )
     for rel in consumers:
         src = (REPO / rel).read_text()
         if "_FILE_MARKER_RE" in src:
