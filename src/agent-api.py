@@ -8,6 +8,8 @@ for processing by the cron loop.
 Endpoints:
   POST /task              — submit a task (JSON: {from, task, priority?, callback_url?})
   GET  /result/<id>       — poll for task result
+  GET  /tasks/history     — authenticated archive-backed task history
+  POST /tasks/workstreams/infer — authenticated manual workstream-classifier trigger
   GET  /status            — current health + capabilities
   GET  /ping              — alive check
   POST /twilio/voice      — inbound call webhook (Twilio)
@@ -104,15 +106,18 @@ sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 import local_task_protocol  # noqa: E402
+import task_workstreams  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
+TASK_WORKSTREAM_GROUPING_SKILL = REPO_DIR / "skills" / "task-workstream-grouping" / "SKILL.md"
 PORT = 7843
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
+from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 
 
@@ -216,7 +221,6 @@ def _remember_done_result_file(result_file: Path) -> None:
 # **Status:** markers) while the writer still required a **Status:**/**Options:**
 # line, so every free-form question was listed but unanswerable — POST /answer
 # 404'd on every id. Both paths stay on this function.
-PQ_ARCHIVE_RE = re.compile(r'^#\s+Resolved\b', re.MULTILINE)
 PQ_SECTION_RE = re.compile(r'^## ', re.MULTILINE)
 PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', re.IGNORECASE)
 PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')
@@ -247,8 +251,7 @@ def parse_pending_questions(content: str) -> list[dict]:
     Sections below the `# Resolved` divider are the audit trail, not open
     questions (same cut as check-pending-questions.py:95).
     """
-    archive = PQ_ARCHIVE_RE.search(content)
-    active = content[:archive.start()] if archive else content
+    active = active_region(content)
     starts = [m.start() for m in PQ_SECTION_RE.finditer(active)]
     questions: list[dict] = []
     for n, start in enumerate(starts):
@@ -616,6 +619,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def send_private_json(self, status: int, data: dict):
+        """JSON for owner-history routes: no cross-origin read permission."""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def check_private_history_auth(self) -> bool:
+        """Fail closed for browsers and non-loopback clients without a token."""
+        import hmac as _hmac
+
+        if API_TOKEN:
+            token = self.headers.get("Authorization", "").replace("Bearer ", "")
+            if _hmac.compare_digest(token, API_TOKEN):
+                return True
+            self.send_private_json(401, {"error": "unauthorized"})
+            return False
+        try:
+            loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            loopback = False
+        # The same-origin web-client proxy and local CLI callers send no
+        # Origin. A browser page always does for cross-origin fetches, so this
+        # also blocks hostile sites from reading localhost history.
+        if loopback and not self.headers.get("Origin"):
+            return True
+        self.send_private_json(403, {"error": "task history requires a local proxy or API token"})
+        return False
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -643,6 +676,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
             self.send_json(200, get_status())
+        elif path == "/tasks/history":
+            if not self.check_private_history_auth():
+                return
+            # Reconstruct durable history from immutable live + archived task
+            # records, then join inferred workstream metadata from its sidecar.
+            # This GET is read-only; inference has a separate authenticated
+            # POST trigger used by the same-origin dashboard proxy.
+            payload = task_workstreams.task_history_payload(WORKSPACE_DIR, limit=500)
+            try:
+                inference = task_workstreams.classifier_status(WORKSPACE_DIR)
+            except Exception:
+                # Workstream inference is optional maintenance. History stays
+                # useful when classifier state is temporarily unavailable.
+                inference = task_workstreams.ClassifierQueueResult(
+                    pending=True, enqueued=False, reason="classifier-unavailable"
+                )
+            payload["inference"] = {
+                "pending": inference.pending,
+                "enqueued": inference.enqueued,
+                "reason": inference.reason,
+                "snapshot_hash": inference.snapshot_hash,
+            }
+            self.send_private_json(200, payload)
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
             watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
@@ -659,7 +715,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 claude_ok = False
             # Scan disk for active tasks, update history (preserve existing text)
-            for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
+            live_task_files = [
+                f for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if not f.stem.startswith((
+                    task_workstreams.CLASSIFIER_TASK_PREFIX,
+                    task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
+                ))
+            ][:10]
+            for f in live_task_files:
                 task_id = f.stem
                 content = f.read_text()
                 # Capture the first `source:` and first `task:` regardless of
@@ -716,6 +779,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Return most recent 10 from history
             sorted_tasks = sorted(task_history.items(), key=lambda x: x[1].get("time", 0), reverse=True)[:10]
             tasks = [{"id": tid, **tdata} for tid, tdata in sorted_tasks]
+            tasks = task_workstreams.enrich_task_rows(WORKSPACE_DIR, tasks)
             # Parse pending questions. `start`/`end` are the writer's splice
             # offsets — internal, not part of the wire format.
             questions = []
@@ -1140,6 +1204,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(400, {"error": str(e)})
             return
 
+        if path == "/tasks/workstreams/infer":
+            if not self.check_private_history_auth():
+                return
+            try:
+                queued = task_workstreams.maybe_enqueue_classifier_task(
+                    WORKSPACE_DIR, skill_file=TASK_WORKSTREAM_GROUPING_SKILL
+                )
+                self.send_private_json(200, {
+                    "pending": queued.pending,
+                    "enqueued": queued.enqueued,
+                    "reason": queued.reason,
+                    "snapshot_hash": queued.snapshot_hash,
+                })
+            except Exception:
+                self.send_private_json(503, {"error": "task workstream classifier unavailable"})
+            return
+
         if path != "/task":
             self.send_json(404, {"error": "not found"})
             return
@@ -1210,6 +1291,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
         _emit_task_processed(task_content)
+
+        # Dashboard replies name their parent task explicitly. Give those
+        # follow-ups the same workstream immediately; unrelated new tasks remain
+        # ungrouped until the idle classifier can inspect them.
+        parent_match = re.fullmatch(r"web-reply:(task-[a-zA-Z0-9_.-]+)", from_agent)
+        if parent_match:
+            task_workstreams.inherit_assignment(WORKSPACE_DIR, task_id, parent_match.group(1))
 
         # Register webhook callback if provided
         if callback_url:
@@ -1288,6 +1376,18 @@ if __name__ == "__main__":
     # lsof guard, so nothing restarted it (2026-07-04 incident; same fix as
     # dashboard, #1709).
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
+    workstream_maintenance_stop = threading.Event()
+    workstream_maintenance = threading.Thread(
+        target=task_workstreams.run_classifier_maintenance,
+        kwargs={
+            "workspace": WORKSPACE_DIR,
+            "skill_file": TASK_WORKSTREAM_GROUPING_SKILL,
+            "stop_event": workstream_maintenance_stop,
+        },
+        name="task-workstream-maintenance",
+        daemon=True,
+    )
+    workstream_maintenance.start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print("  POST /task  — submit a task")
@@ -1299,3 +1399,7 @@ if __name__ == "__main__":
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nDone.")
+    finally:
+        workstream_maintenance_stop.set()
+        workstream_maintenance.join(timeout=1)
+        server.server_close()

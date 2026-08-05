@@ -46,6 +46,13 @@ echo "── runtime load smoke (each artifact must evaluate its module graph cl
 # by catching them and continuing; those are logged warnings, the service still
 # starts, and treating them as fatal false-fails a working bundle.
 LOAD_ERR='Dynamic require of| is not supported|ERR_UNKNOWN_BUILTIN_MODULE|SyntaxError|ReferenceError: (require|__dirname|__filename|import)|Cannot use import statement'
+# Artifacts that are LIBRARIES, not services. They are built for the browser and
+# loaded by a <script> tag, so "exited with no output" is correct behaviour for
+# them, not the entrypoint-guard bug the rc=0-with-no-output check exists to
+# catch. They still get the parse check above and the load-error check below —
+# only the must-start assertion is skipped.
+NON_SERVICE='^web-voice-transport\.browser\.js$'
+
 fail=0
 for f in dist/*.js; do
   name="$(basename "$f")"
@@ -65,6 +72,10 @@ for f in dist/*.js; do
   # output means it fell straight through without binding/logging — the exact
   # class of the isMain-mismatch bug (entrypoint guard matches .ts, not the
   # bundled .js). A real startup or config-gate always prints something.
+  if printf '%s' "$name" | grep -qE "$NON_SERVICE"; then
+    echo "  ✓ load $name (browser library — parse + load checked, not expected to start)"
+    continue
+  fi
   if [ "$rc" != 124 ] && [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
     echo "  ✗ SMOKE FAIL: $name — exited (rc=$rc) with NO output: loaded but did not start."
     echo "    Likely an entrypoint guard that matches .ts but not the bundled .js."

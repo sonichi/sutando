@@ -230,6 +230,13 @@ def service_registry() -> list[dict]:
     return [
         {"id": "core", "name": "Sutando Core",
          "probe": ("alive_file", CORES_DIR / f"{host}.alive")},
+        # KNOWINGLY PRIMARY-ONLY (#2503): named GATEWAY_INSTANCE bridges publish
+        # SUFFIXED sidecars this probe does not read, and the pgrep fallback is
+        # identity-blind (instance identity lives only in env — the launcher's
+        # P1). With a live named secondary, a dead primary's stale sidecar falls
+        # through to pgrep and the secondary's process reads as "running".
+        # Instance-aware probing is tracked separately; until then this row
+        # reports the PRIMARY bridge only.
         {"id": "gateway", "name": "AG2 Gateway",
          "probe": ("gateway", GATEWAY_STATUS_PATH, r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",

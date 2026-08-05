@@ -124,7 +124,33 @@ shopt -u nullglob
 #   plain signal (only `kill -9` stops it). Ignoring the signals we're about
 #   to re-send to ourselves closes that window; the process is exiting
 #   either way so nothing downstream needs to observe them again.
-cleanup() { rm -f "$PID_FILE"; trap '' TERM HUP INT; kill 0 2>/dev/null; }
+# The sentinel removal is OWNERSHIP-GUARDED. `rm -f "$PID_FILE"` unconditionally
+# is wrong whenever more than one watcher has existed: the file records ONE pid,
+# and a second watcher overwrites it at startup (:65). If the FIRST then exits —
+# which is exactly what stopping a stale duplicate looks like — it deletes a
+# sentinel that now names the LIVE watcher. Downstream that reads as a dead
+# watcher and breeds another one:
+#
+#   health-check `task-watcher`  -> "orphaned watcher(s) running with no PID sentinel"
+#   /proactive-loop step 9       -> sentinel missing => start a watcher   -> duplicate
+#   /schedule-crons step 5       -> same PID-check, same conclusion
+#
+# Observed on this host 2026-08-04: stopping a duplicate deleted the live
+# watcher's sentinel, health immediately reported the live one as orphaned, and
+# the documented recovery would have spawned a third. Compare the recorded pid
+# with our own before removing; a watcher that no longer owns the file leaves it
+# alone. `2>/dev/null` on the read is safe here — an absent/unreadable file
+# yields "" which cannot equal "$$", so the guard fails CLOSED (leaves it).
+# An `if` rather than `[ … ] && rm`: the && form returns non-zero when the guard
+# declines, which is harmless under the current `set -u` but would abort the rest
+# of cleanup (signal disarm + group kill) the day anyone adds `set -e`.
+cleanup() {
+  if [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$PID_FILE"
+  fi
+  trap '' TERM HUP INT
+  kill 0 2>/dev/null
+}
 trap cleanup EXIT
 # HUP/INT/TERM must explicitly exit after cleanup — a trap only overrides the
 # signal's default disposition, it doesn't terminate the process on its own.

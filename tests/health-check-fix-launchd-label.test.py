@@ -101,14 +101,32 @@ def main() -> int:
             check(out2 == "bootstrapped com.sutando.web-client" and bool(boots),
                   f"kickstart failure falls back to bootstrap (got {out2!r})")
 
-        # missing plist → graceful string, no subprocess calls needed
+        # A KNOWN service whose plist is absent is not launchd-managed here —
+        # startup.sh launches it directly. The old assertion accepted "no plist
+        # found for com.sutando.voice-agent", which reads like a launchd failure
+        # and names nothing the operator can run; a stale voice-agent survived
+        # repeated --fix runs behind exactly that line.
         with tempfile.TemporaryDirectory() as tmp2:
             hc.Path.home = staticmethod(lambda: Path(tmp2))  # type: ignore[assignment]
             with_fake_home(tmp2, make_plists=False)
-            hc.subprocess.run = _Recorder()
+            rec3 = _Recorder()
+            hc.subprocess.run = rec3
             out3 = hc.fix_launchd("com.sutando.voice-agent")
-            check(out3.startswith("no plist found"),
-                  "missing plist reported gracefully")
+            check("not launchd-managed" in out3,
+                  f"known service, no plist → says it is not launchd-managed (got {out3!r})")
+            check("bash src/restart.sh" in out3,
+                  f"...and names a runnable remedy (got {out3!r})")
+            # The remedy must exist, or this message rots into a second dead end.
+            check((REPO / "src" / "restart.sh").is_file(),
+                  "the remedy the message names actually exists in the repo")
+            check(not rec3.calls,
+                  f"no launchctl call is attempted for an unmanaged service (got {rec3.calls})")
+
+            # The genuinely-unknown label keeps the old wording: there is no
+            # remedy to name because we do not know the job at all.
+            out4 = hc.fix_launchd("com.sutando.not-a-real-job")
+            check(out4 == "no plist found for com.sutando.not-a-real-job",
+                  f"unknown label still reports plainly (got {out4!r})")
     finally:
         hc.Path.home = saved_home
         hc.subprocess.run = saved_run

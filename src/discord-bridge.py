@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import time
+import weakref
 from pathlib import Path
 
 # startup.sh redirects stdout to a log file, which makes CPython block-buffer
@@ -77,6 +78,7 @@ from util_paths import channel_access_path, claude_home_path, personal_path, sha
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -88,7 +90,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
-from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
 # depth 0). Only the immediate parent is inlined, so beyond this there is no
@@ -236,7 +238,14 @@ if not TOKEN and channels_env.exists():
             TOKEN = line.split("=", 1)[1].strip()
 
 if not TOKEN:
-    print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env")
+    # Last resort: the Keychain vault. Before this, no bridge read it, so
+    # `vault set DISCORD_BOT_TOKEN` stored the value and changed nothing.
+    from channel_token import token_from_vault  # noqa: E402
+    TOKEN = token_from_vault("DISCORD_BOT_TOKEN")
+
+if not TOKEN:
+    print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env "
+          "and not in the vault (`vault set DISCORD_BOT_TOKEN`)")
     exit(1)
 
 TASKS_DIR = REPO / "tasks"
@@ -430,7 +439,7 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     Optional — if the skill is absent the caller falls back to [File attached:].
     Errors are swallowed; transcription failure must never block task delivery.
     """
-    skill_script = Path(__file__).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
+    skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
     return _run_optional_script_shared(
         skill_script,
         [local_path],
@@ -2420,52 +2429,8 @@ async def list_channel_members(channel_id: int) -> list[dict]:
 
 
 def _recover_orphan_sending_files() -> int:
-    """Restart-safety: rename any orphan `results/proactive-*.sending`
-    files back to `*.txt` so they get re-claimed on the next poll.
-    Returns the number of files recovered.
-
-    Atomic-claim-by-rename (`proactive-*.txt` → `.sending`) prevents
-    same-tick double-deliveries between concurrent poll iterations.
-    But if the bridge crashes BETWEEN the rename and the delivery,
-    the `.sending` file sits orphaned in `results/` — no poll
-    iteration ever looks at `.sending` suffixes, so the owner
-    notification is silently dropped until next manual intervention.
-
-    This function runs on startup to bring orphans back into the
-    polling stream. Idempotent: a second call sees no `.sending`
-    files and is a no-op. Fail-open: any per-file error is logged
-    but doesn't block the bridge from starting.
-    """
-    if not RESULTS_DIR.exists():
-        return 0
-    recovered = 0
-    for f in RESULTS_DIR.iterdir():
-        if not (f.name.startswith("proactive-") and f.suffix == ".sending"):
-            continue
-        target = f.with_suffix(".txt")
-        try:
-            # Don't clobber a same-named .txt that somehow re-appeared
-            # (e.g. an operator manually re-dropped the file). The
-            # atomic-claim invariant guarantees they don't normally
-            # coexist, but be defensive on startup.
-            if target.exists():
-                print(
-                    f"  [startup] skipping orphan recovery: {target.name} "
-                    f"already exists (collision with {f.name})",
-                    flush=True,
-                )
-                continue
-            f.rename(target)
-            recovered += 1
-            print(f"  [startup] recovered orphan {f.name} → {target.name}", flush=True)
-        except FileNotFoundError:
-            # Lost the race to another process; that's fine.
-            pass
-        except Exception as e:
-            print(f"  [startup] failed to recover {f.name}: {e}", flush=True)
-    if recovered:
-        print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
-    return recovered
+    """Recover this adapter's stranded proactive delivery claims."""
+    return recover_orphan_sending_files(RESULTS_DIR)
 
 
 # Guards the once-only startup of the long-lived poll loops below. `on_ready`
@@ -2558,28 +2523,128 @@ def _message_mentions_bot(message):
 # on the allowlist, the message is dropped by the access-control gate below.
 # Historically that drop was silent, so the sender had no idea their message
 # wasn't received (owner ask 2026-07-15). Send a one-line automated ack instead,
-# rate-limited per sender so a repeat-sender (or an abusive one) can't turn the
-# bridge into an echo. In-memory cooldown: fine to reset on bridge restart.
-_NOT_ALLOWLISTED_ACK_COOLDOWN_S = 3600
+# rate-limited per (channel, sender) so one sender cannot repeat the notice while
+# a distinct new sender still gets told why their addressed message was dropped.
+# Persist the seven-day cooldown so bridge restarts and upgrades do not reset it
+# (owner ask 2026-07-23).
+_NOT_ALLOWLISTED_ACK_COOLDOWN_S = 7 * 24 * 60 * 60
 _not_allowlisted_ack_at: dict[str, float] = {}
+_not_allowlisted_ack_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_NOT_ALLOWLISTED_ACK_STATE_FILE = STATE_DIR / "discord-not-allowlisted-ack.json"
 _NOT_ALLOWLISTED_ACK_TEXT = (
     "👋 I got your message, but you're not on this Sutando's allowlist yet, so I "
     "can't act on it. Ask the owner to add you. _(automated notice)_"
 )
 
 
-async def _ack_not_allowlisted(channel, sender_id: str, username: str = "") -> None:
-    """One-line 'you're not on the allowlist' reply so an addressed-but-dropped
-    message isn't silent. Rate-limited per sender (``_NOT_ALLOWLISTED_ACK_COOLDOWN_S``)."""
-    now = time.time()
-    if now - _not_allowlisted_ack_at.get(sender_id, 0.0) < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
-        return  # already acked this sender recently — don't spam / echo
-    _not_allowlisted_ack_at[sender_id] = now
+def _not_allowlisted_ack_lock() -> asyncio.Lock:
+    """Return a serializer bound to the current event loop.
+
+    Production Discord delivery runs on one loop, so all handlers share one
+    lock. Keeping locks per loop also supports the macOS Python 3.9 runtime and
+    focused callers that invoke the helper through separate ``asyncio.run``
+    loops; an asyncio primitive bound by contention on one loop cannot be
+    awaited safely from another.
+    """
+    loop = asyncio.get_running_loop()
+    lock = _not_allowlisted_ack_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _not_allowlisted_ack_locks[loop] = lock
+    return lock
+
+
+def _not_allowlisted_ack_state() -> dict[str, float]:
+    """Read valid per-(channel, sender) send timestamps; malformed state fails open."""
     try:
-        await channel.send(_NOT_ALLOWLISTED_ACK_TEXT)
-        print(f"  [not-allowlisted-ack] sent to @{username or sender_id}", flush=True)
-    except Exception as e:
-        print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
+        raw = json.loads(_NOT_ALLOWLISTED_ACK_STATE_FILE.read_text())
+        if not isinstance(raw, dict):
+            return {}
+        entries = raw.get("sent_at_by_key", {})
+        if not isinstance(entries, dict):
+            return {}
+        return {
+            str(key): float(sent_at)
+            for key, sent_at in entries.items()
+            if isinstance(sent_at, (int, float))
+        }
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _save_not_allowlisted_ack_state(entries: dict[str, float], now: float) -> None:
+    """Atomically persist live cooldown entries; delivery never depends on it."""
+    live = {
+        key: sent_at
+        for key, sent_at in entries.items()
+        if now - sent_at < _NOT_ALLOWLISTED_ACK_COOLDOWN_S
+    }
+    temp = _NOT_ALLOWLISTED_ACK_STATE_FILE.with_name(
+        f".{_NOT_ALLOWLISTED_ACK_STATE_FILE.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        temp.write_text(json.dumps({
+            "schema_version": 2,
+            "sent_at_by_key": live,
+        }, sort_keys=True))
+        os.replace(temp, _NOT_ALLOWLISTED_ACK_STATE_FILE)
+    except OSError as e:
+        print(f"  [not-allowlisted-ack] state write failed: {e}", flush=True)
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+
+async def _ack_not_allowlisted(
+    channel, sender_id: str, username: str = "", message=None
+) -> None:
+    """One-line 'you're not on the allowlist' reply so an addressed-but-dropped
+    message isn't silent. Rate-limited per (channel, sender) across bridge
+    restarts and posted as a reply when the triggering message is available."""
+    async with _not_allowlisted_ack_lock():
+        now = time.time()
+        channel_id = str(getattr(channel, "id", "") or "dm")
+        cooldown_key = f"{channel_id}:{sender_id}"
+        persisted = _not_allowlisted_ack_state()
+        last_sent = max(
+            _not_allowlisted_ack_at.get(cooldown_key, 0.0),
+            persisted.get(cooldown_key, 0.0),
+        )
+        if now - last_sent < _NOT_ALLOWLISTED_ACK_COOLDOWN_S:
+            return  # this sender already received the notice here recently
+        try:
+            ref = (
+                discord.MessageReference(
+                    message_id=message.id,
+                    channel_id=channel.id,
+                    fail_if_not_exists=False,
+                )
+                if message is not None
+                else None
+            )
+            try:
+                await channel.send(_NOT_ALLOWLISTED_ACK_TEXT, reference=ref)
+            except Exception as e:
+                # Reply anchors can be rejected for deleted/system messages.
+                # The notice matters more than preserving the quote context.
+                http_exc = getattr(discord, "HTTPException", None)
+                if ref is None or http_exc is None or not isinstance(e, http_exc):
+                    raise
+                print(
+                    f"  [not-allowlisted-ack] reference send failed ({e}); "
+                    "retrying without reference",
+                    flush=True,
+                )
+                await channel.send(_NOT_ALLOWLISTED_ACK_TEXT)
+            _not_allowlisted_ack_at[cooldown_key] = now
+            persisted[cooldown_key] = now
+            _save_not_allowlisted_ack_state(persisted, now)
+            print(f"  [not-allowlisted-ack] sent to @{username or sender_id}", flush=True)
+        except Exception as e:
+            print(f"  [not-allowlisted-ack] send failed: {e}", flush=True)
 
 
 @client.event
@@ -2731,6 +2796,34 @@ async def _handle_restart_command(message, text, access_tier, username, workspac
 
 async def _handle_discord_message(message, force=False):
     if message.author == client.user:
+        # Advance the DM checkpoint for our OWN messages before dropping them.
+        #
+        # The checkpoint's contract is "REST catch-up should not re-fetch this
+        # id", which is about having SEEN the message, not about processing it.
+        # The main advance below already says so explicitly and applies it to
+        # out-of-allowlist / out-of-tier DMs — but this return sits above it, so
+        # self-authored DMs were the one class that never advanced it.
+        #
+        # `channel.history()` returns our own replies, and in a DM channel with
+        # the owner most messages ARE ours. So the checkpoint freezes at the last
+        # message we did not write, and every reconnect re-fetches the same
+        # window. Observed on two hosts: `[dm-catchup] replayed N missed DM(s)`
+        # logging an identical N across consecutive restarts — 27 on
+        # Chis-Mac-mini, and 4 here with all 4 self-authored, checkpoint stuck at
+        # 10:22:32 while the channel had moved to 12:03:21.
+        #
+        # Latent today (the return means nothing is re-processed and no duplicate
+        # task or DM is produced), but it is a real starvation path: the catch-up
+        # fetch is `limit=50, oldest_first=True`. Once more than 50 messages sit
+        # after a frozen checkpoint, an owner DM at position 51+ is never fetched
+        # — and since the checkpoint still cannot advance, no later restart
+        # reaches it either. That is silent, permanent loss of exactly the
+        # message this catch-up exists to rescue.
+        if isinstance(message.channel, discord.DMChannel) and hasattr(message, "id"):
+            try:
+                _update_dm_checkpoint(message.channel.id, message.id)
+            except Exception as e:
+                print(f"  [dm-checkpoint] self-message update failed: {e}", flush=True)
         return
     # Auto-mod LLM-judge observation hook (per-guild opt-in via access.json
     # `mod_active`). Pure observe — never blocks the rest of the function.
@@ -3052,7 +3145,9 @@ async def _handle_discord_message(message, force=False):
     if is_dm:
         if policy == "allowlist" and sender_id not in allowed:
             # A DM always addresses the bot → ack the non-allowlisted sender.
-            await _ack_not_allowlisted(message.channel, sender_id, username)
+            await _ack_not_allowlisted(
+                message.channel, sender_id, username, message=message
+            )
             return
     else:
         # Channel access control
@@ -3077,7 +3172,9 @@ async def _handle_discord_message(message, force=False):
                     # Ack only when the bot was explicitly addressed (@mention /
                     # role) — never auto-reply to every unrelated channel message.
                     if bot_mentioned or role_mentioned:
-                        await _ack_not_allowlisted(message.channel, sender_id, username)
+                        await _ack_not_allowlisted(
+                            message.channel, sender_id, username, message=message
+                        )
                     return
             else:
                 # sender is in ch_allowed (or ch_allowed is empty + requireMention)
@@ -3087,7 +3184,9 @@ async def _handle_discord_message(message, force=False):
             if allowed and sender_id not in allowed:
                 print(f"  [skip] @{username} not in global allowlist", flush=True)
                 if bot_mentioned or role_mentioned:
-                    await _ack_not_allowlisted(message.channel, sender_id, username)
+                    await _ack_not_allowlisted(
+                        message.channel, sender_id, username, message=message
+                    )
                 return
 
     if policy == "pairing" and sender_id not in allowed and not channel_authorized:
@@ -3251,7 +3350,15 @@ async def _handle_discord_message(message, force=False):
     # bot sees only the new reply text in isolation.
     reply_context = ""
     reply_chain_ids_line = ""   # `reply_chain_ids:` metadata (root-first) for thread reconstruction
-    if message.reference and message.reference.message_id:
+    # A forward sets `reference` too, and its target is in the SOURCE channel —
+    # fetching it here is a guaranteed 404 plus a misleading log line. The
+    # forward's body is not lost: the snapshot handler above already extracted
+    # it. (#2633 review: the first version gated only the header.)
+    if should_fetch_reply_context(
+        has_reference=bool(message.reference),
+        has_message_id=bool(message.reference and message.reference.message_id),
+        is_forward=bool(getattr(message, "message_snapshots", None)),
+    ):
         try:
             ref_msg = message.reference.resolved
             if ref_msg is None:
@@ -3730,14 +3837,20 @@ async def _handle_discord_message(message, force=False):
     # line into the task file's k:v shape (per qingyun review on #1077).
     channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
     guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
-    # When this message is a reply, emit the parent's id so the core agent can
+    # When this message is a REPLY, emit the parent's id so the core agent can
     # re-fetch the full original on demand rather than relying on the lossy
     # 400-char `[Replying to ...]` snippet. Mirrors how the official Claude
-    # Discord plugin works (reference by message_id + fetch).
-    parent_msg_line = (
-        f"parent_message_id: {message.reference.message_id}\n"
-        if getattr(message, "reference", None) and message.reference.message_id
-        else ""
+    # Discord plugin works (reference by message_id + fetch). A FORWARD also
+    # carries a reference — pointing into its SOURCE channel — so it is keyed
+    # separately; see `format_parent_reference`.
+    _ref = getattr(message, "reference", None)
+    parent_msg_line = format_parent_reference(
+        getattr(_ref, "message_id", None) if _ref else None,
+        # A forward sets `reference` too, so the key must not be decided by the
+        # reference alone. The snapshot IS the forward — same signal the
+        # forward-handler above already extracts the body from.
+        is_forward=bool(getattr(message, "message_snapshots", None)),
+        source_channel_id=getattr(_ref, "channel_id", None) if _ref else None,
     )
     # Full walked ancestor id spine (root-first) for thread reconstruction —
     # handles to re-fetch any ancestor the inlined chain clipped/dropped past
@@ -3892,21 +4005,106 @@ async def _handle_discord_message(message, force=False):
         await asyncio.sleep(0.5)
 
 
+def _approved_dirs() -> "list[Path]":
+    """Every directory an approval marker can legitimately arrive in.
+
+    The producer and the consumer disagreed on the path. The official plugin's
+    `access` skill hardcodes the vanilla home —
+    `claude-plugins-official/discord/0.0.4/skills/access/SKILL.md:73` mkdir's
+    the STOCK Claude home — while this bridge resolves through
+    `$CLAUDE_CONFIG_DIR`. They coincide on a default install and diverge on
+    every Sutando install that relocates the config dir, so the two sides look
+    at different directories with the same trailing shape.
+
+    so the confirmation was never sent. The user IS granted access (access.json
+    is a separate write) — they are simply never told, which reads to them as
+    still waiting. Reported by @Sutando-Mini as sonichi#2629.
+
+    Canonical first, legacy second, per CLAUDE.md's "Migration transition window
+    (30-day reader-fallback)". The bridge is not the wrong side here — reading
+    `$CLAUDE_CONFIG_DIR` is correct — but the plugin is upstream and pinned, so a
+    cross-repo fix has an unbounded landing time while this bug is live on every
+    relocated-config install. Ordering matters: a stale marker left in the vanilla
+    home must never shadow a fresh one in the canonical dir.
+    """
+    dirs = [ACCESS_FILE.parent / "approved"]
+    legacy = claude_home_path("channels", "discord", "approved", vanilla=True)
+    if legacy != dirs[0]:
+        dirs.append(legacy)
+    return dirs
+
+
 async def poll_approved():
-    """Poll approved/ dir and send 'you're in' confirmations."""
-    approved_dir = ACCESS_FILE.parent / "approved"
+    """Poll approved/ dirs and send 'you're in' confirmations."""
+    _legacy_warned = False
     while True:
         try:
-            if approved_dir.exists():
+            # One confirmation per SENDER per pass, not per file. The marker's
+            # filename IS the sender id, so the same id appearing in both the
+            # canonical and the legacy dir is one obligation recorded twice --
+            # a stale copy left in the vanilla home by an earlier grant. Sending
+            # from both DMs the user "You're in!" twice, the second time via a
+            # chat_id that is by then usually wrong. Canonical wins because it is
+            # first in `_approved_dirs()`.
+            _done: "set[str]" = set()
+            for _i, approved_dir in enumerate(_approved_dirs()):
+                if not approved_dir.exists():
+                    continue
                 for f in approved_dir.iterdir():
+                    if not f.is_file():
+                        continue
                     sender_id = f.name
-                    chat_id = f.read_text().strip()
+                    if sender_id in _done:
+                        # Consume the shadowed duplicate so it cannot resurface.
+                        f.unlink(missing_ok=True)
+                        continue
+                    # Per-entry try. The read used to sit in the OUTER try, so a
+                    # single unreadable entry aborted the scan of every remaining
+                    # marker in the directory and the loop just slept.
                     try:
+                        chat_id = f.read_text().strip()
                         channel = await client.fetch_channel(int(chat_id))
-                        await channel.send(f"You're in! Access approved.")
+                        await channel.send("You're in! Access approved.")
                         print(f"  Sent approval confirmation to {sender_id} in {chat_id}")
+                        if _i > 0 and not _legacy_warned:
+                            _legacy_warned = True
+                            print(
+                                f"  [approved] read from the LEGACY path {approved_dir} — "
+                                f"the official plugin still writes the stock Claude home; "
+                                f"canonical is {ACCESS_FILE.parent / 'approved'}",
+                                file=sys.stderr, flush=True,
+                            )
                     except Exception as e:
+                        # QUARANTINE, never delete. This marker file is the SOLE
+                        # record that a confirmation is owed — unlike
+                        # `poll_proactive`, where the file carries a message,
+                        # here the file IS the obligation. Deleting it on failure
+                        # loses the obligation, not merely the attempt.
+                        #
+                        # Quarantining rather than leaving it also avoids the 3s
+                        # hot loop: a permanently-invalid chat_id never becomes
+                        # valid, so an un-deleted marker would re-fail forever and
+                        # bury the log. Same resolution as sonichi#2626.
                         print(f"  Failed to send approval to {sender_id}: {e}")
+                        try:
+                            _undeliv = f.parent / "undelivered"
+                            _undeliv.mkdir(parents=True, exist_ok=True)
+                            f.rename(_undeliv / f.name)
+                            print(
+                                f"  [approved] kept at undelivered/{f.name} — "
+                                f"NOT deleted; a confirmation is still owed",
+                                flush=True,
+                            )
+                        except Exception as _mv_exc:
+                            # Leaving it in place is noisy; noise is recoverable
+                            # and deletion is not.
+                            print(
+                                f"  [approved] could not quarantine {f.name}: "
+                                f"{_mv_exc} — leaving it in place rather than losing it",
+                                flush=True,
+                            )
+                        continue
+                    _done.add(sender_id)
                     f.unlink(missing_ok=True)
         except Exception as e:
             print(f"  Approved poll error: {e}")
