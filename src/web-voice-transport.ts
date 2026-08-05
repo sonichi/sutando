@@ -39,6 +39,11 @@
  * R10/R12/S6/W5/X6/Z6):
  *   - every `connect()` is one ATTEMPT with a generation token; stale socket
  *     callbacks and stale post-`await` continuations are silently discarded;
+ *   - attempt concluded ⇒ generation invalidated: EVERY path that concludes
+ *     an attempt (timeout, mic failure, pre-open error, every close branch,
+ *     upstream-failed, disconnect(), a superseding connect()) bumps the
+ *     generation, so a continuation parked in an `await` (getUserMedia
+ *     prompt, AudioContext.resume) can never resume a dead attempt;
  *   - a connect attempt that does not reach `onopen` within CONNECT_TIMEOUT_MS
  *     fails with a latched terminal `error`;
  *   - terminal failures LATCH: the close they trigger never overwrites the
@@ -310,8 +315,10 @@ export interface VoiceTransportEvents {
   /**
    * Connection lifecycle. `detail` is a human string for the status line.
    * `close` is present when the transition was decoded from a WS close frame:
-   * always for `status === 'closed'`, and for the close-derived terminal
-   * states (`'error'` on 4409/pre-open closes, `'superseded'` on 4410).
+   * every `'closed'` decoded from a WS close frame carries it, as do the
+   * close-derived terminal states (`'error'` on 4409/pre-open closes,
+   * `'superseded'` on 4410). A user-initiated `disconnect()` emits `'closed'`
+   * WITHOUT close info — no WS close frame is involved in that transition.
    */
   onStatus?(status: VoiceStatus, detail?: string, close?: VoiceCloseInfo): void;
   /**
@@ -422,8 +429,10 @@ export class VoiceTransport {
 
   // ── Attempt state (impl plan Step 18) ──
   // One `connect()` = one attempt. The generation token invalidates every
-  // stale socket callback and stale post-`await` continuation (R10); the
-  // terminal latch keeps a failed attempt's `error` from being overwritten by
+  // stale socket callback and stale post-`await` continuation (R10) — and the
+  // invariant is uniform: attempt concluded ⇒ generation invalidated, i.e.
+  // every concluding path bumps `attemptGen` (see handleClose). The terminal
+  // latch keeps a failed attempt's `error` from being overwritten by
   // its own self-inflicted close; `attemptActive` guarantees exactly one
   // final status per attempt (S6); `failureEmitted` guarantees exactly one
   // onConnectFailure per attempt.
@@ -505,6 +514,11 @@ export class VoiceTransport {
     }
     this.stopMic();
     this.stopStats();
+    // A direct connect() over a still-live session (no disconnect() between)
+    // must not let the old session's scheduled playback keep speaking into
+    // the new attempt — and nextPlayTime must restart from the new clock
+    // instead of continuing the old session's schedule.
+    this.flushPlayback();
 
     this.status('connecting', 'Connecting…');
 
@@ -663,8 +677,10 @@ export class VoiceTransport {
     if (gen !== this.attemptGen || this.terminal) return;
     const detail = 'Connection timed out';
     this.debug('Connect timeout after ' + this.connectTimeoutMs + 'ms', 'err');
-    // Terminal latch BEFORE closing: the self-inflicted onclose must see
-    // terminal=true and suppress its status emission.
+    // Attempt concluded ⇒ generation invalidated: the bump fences out the
+    // self-inflicted onclose and any stale continuation of this attempt; the
+    // terminal latch (set BEFORE closing) stays as the second line of defense.
+    this.attemptGen++;
     this.terminal = true;
     this.attemptActive = false;
     this.teardownAudio();
@@ -709,13 +725,23 @@ export class VoiceTransport {
       const kind: VoiceConnectFailureKind =
         code === 'permission' ? 'mic-permission' : code === 'device' ? 'mic-device' : 'mic-other';
       this.debug('Mic error: ' + (err?.name ? err.name + ': ' : '') + err?.message, 'err');
-      // Terminal for this attempt: the close we trigger below must not
-      // overwrite the error, and a hard mic failure must not auto-reconnect.
+      // Attempt concluded ⇒ generation invalidated: the bump fences out the
+      // self-inflicted onclose below and any continuation of this attempt
+      // still parked in an await; the terminal latch keeps the error from
+      // being overwritten, and a hard mic failure must not auto-reconnect.
+      // That same fencing means no trailing handleClose will clean up for
+      // this attempt — so tear the audio graph down HERE (startMic can have
+      // captured a stream before throwing, e.g. a resume() failure after
+      // getUserMedia was already granted).
+      this.attemptGen++;
       this.terminal = true;
       this.attemptActive = false;
+      this.clearLegacyTimer();
+      this.teardownAudio();
       this.status('error', 'Mic error');
       this.ev.onMicError?.(name, err?.message ?? '', friendly);
       this.emitFailure({ kind, detail: friendly, remediation: VOICE_FAILURE_REMEDIATION[kind] });
+      if (this.ws === ws) this.ws = null;
       try {
         ws.close();
       } catch {
@@ -730,9 +756,12 @@ export class VoiceTransport {
     if (!this.opened) {
       // Pre-open failure. The browser exposes no errno/TLS/DNS detail here
       // (Z6) — just a generic error followed by close 1006 — so this is the
-      // one browser-observable pre-open kind: 'connect-error'. Latch now so
-      // the trailing onclose can't overwrite the error with 'closed'.
+      // one browser-observable pre-open kind: 'connect-error'. Attempt
+      // concluded ⇒ generation invalidated: the bump fences the trailing
+      // 1006 close out at the closure; the terminal latch stays as the
+      // second line of defense against a 'closed' overwrite.
       const detail = 'Connection failed';
+      this.attemptGen++;
       this.terminal = true;
       this.attemptActive = false;
       this.clearConnectTimer();
@@ -764,11 +793,24 @@ export class VoiceTransport {
     this.debug('WS closed: code=' + code + ' reason=' + reason);
     this.clearConnectTimer();
     this.clearLegacyTimer();
+    // Attempt concluded ⇒ generation invalidated. Every branch below
+    // concludes the attempt, and the gen fence in connect()'s onclose closure
+    // guarantees this method only ever runs for the CURRENT attempt — so one
+    // unconditional bump covers them all. Without it, a continuation parked
+    // in startMic's getUserMedia/resume() await would sail past its gen fence
+    // once the prompt resolved: the dead attempt's status('live') would
+    // overwrite the close-derived status emitted below, the just-granted mic
+    // stream would stay captured, and the statsTimer would leak.
+    this.attemptGen++;
     if (this.terminal) {
       // Latched terminal attempt (timeout / mic / pre-open error /
       // upstream-failed / client-busy / superseded): the self-inflicted or
       // trailing close still tears the audio graph down, but must NOT
       // overwrite the latched status (design 1e terminal-state latching).
+      // Defense in depth: every latching path now bumps the generation
+      // itself, fencing its trailing close out at the closure before it
+      // reaches here — this branch stays as the net for any future
+      // terminal-setter that forgets.
       this.teardownAudio();
       return;
     }

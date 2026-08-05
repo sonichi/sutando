@@ -623,6 +623,136 @@ describe('attempt-generation fencing (Step 18 / R10)', () => {
 	});
 });
 
+describe('attempt conclusion invalidates the generation (fix round — server-close-while-parked repro)', () => {
+	/** Park getUserMedia behind a gate and capture every granted stream. */
+	function parkGum() {
+		let release!: () => void;
+		const gate = new Promise<void>((res) => (release = res));
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const stream = new FakeMediaStream();
+			streams.push(stream);
+			await gate;
+			return stream;
+		};
+		return { release: () => release(), streams };
+	}
+
+	it('server close (1006) while getUserMedia is parked → closed stays final, grant stopped, no stats leak', async () => {
+		const gum = parkGum();
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.open();
+		await delay(5); // attempt parked in the permission prompt
+		s.serverClose(1006, 'dropped'); // the server drops while the prompt is up
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'closed');
+		assert.equal(h.statuses[h.statuses.length - 1].close?.code, 1006);
+
+		gum.release(); // the user then grants the mic — for a dead attempt
+		await delay(5);
+		assert.equal(
+			h.statuses[h.statuses.length - 1].status,
+			'closed',
+			'the close-derived final status stays — the dead attempt must not resume',
+		);
+		assert.ok(
+			!h.statuses.some((x) => x.detail === 'Live — speak now'),
+			'the dead attempt never reports live',
+		);
+		assert.equal(h.statuses.filter((x) => x.status === 'closed').length, 1, 'exactly one final status');
+		assert.equal(gum.streams.length, 1);
+		assert.equal(gum.streams[0].tracks[0].stopped, true, 'granted tracks stopped — no capture leak');
+		assert.equal((h.t as any).micStream, null, 'no stream captured for the dead attempt');
+		assert.equal((h.t as any).statsTimer, null, 'no statsTimer keeps the runner alive');
+	});
+
+	it('close 4409 while getUserMedia is parked → latched client-busy error survives the late grant', async () => {
+		const gum = parkGum();
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.open();
+		await delay(5); // attempt parked in the permission prompt
+		s.serverClose(CLOSE_CODE_CLIENT_BUSY, 'client-busy'); // another surface owns the call
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'error');
+		assert.equal(h.failures.length, 1);
+		assert.equal(h.failures[0].kind, 'client-busy');
+
+		gum.release();
+		await delay(5);
+		assert.equal(
+			h.statuses[h.statuses.length - 1].status,
+			'error',
+			'latched client-busy error survives — never overwritten by live',
+		);
+		assert.ok(!h.statuses.some((x) => x.detail === 'Live — speak now'));
+		assert.ok(!h.statuses.some((x) => x.status === 'closed'), 'terminal latch holds');
+		assert.equal(h.failures.length, 1, 'exactly one failure per attempt');
+		assert.equal(gum.streams[0].tracks[0].stopped, true, 'granted tracks stopped');
+		assert.equal((h.t as any).statsTimer, null, 'no stats leak');
+	});
+
+	it('R10: disconnect during startMic\'s INTERNAL resume() await — grant stopped, newer attempt untouched', async () => {
+		const streams: FakeMediaStream[] = [];
+		gumImpl = async () => {
+			const stream = new FakeMediaStream();
+			streams.push(stream);
+			return stream;
+		};
+		let release!: () => void;
+		const h = harness();
+		await h.t.connect('ws://fake:9900/'); // ctx born 'running' → no connect-side resume
+		h.sock().open(); // handleOpen → startMic parks at the getUserMedia microtask
+		// Suspend the context BEFORE getUserMedia resolves so the await the
+		// attempt parks in is startMic's OWN resume() (post-capture), not
+		// connect()'s — the R10 fence at that await is otherwise uncovered.
+		FakeAudioContext.created[0].state = 'suspended';
+		FakeAudioContext.resumeHook = () => new Promise((res) => (release = res));
+		await delay(5); // getUserMedia resolved → stream captured → parked in resume()
+		assert.equal(streams.length, 1);
+		assert.equal((h.t as any).micStream, streams[0], 'precondition: captured before the resume await');
+
+		h.t.disconnect(); // while parked in resume()
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'closed');
+
+		FakeAudioContext.resumeHook = null; // the newer attempt must not park
+		await h.t.connect('ws://fake:9900/'); // newer attempt while attempt 1 is still parked
+		h.sock().open();
+		await delay(5);
+		assert.equal(streams.length, 2, 'newer attempt captured its own stream');
+		assert.equal((h.t as any).micStream, streams[1], 'newer attempt owns the mic');
+
+		release(); // attempt 1's parked resume finally resolves
+		await delay(5);
+		assert.equal(streams[0].tracks[0].stopped, true, 'attempt-1 grant stopped, not leaked');
+		assert.equal(streams[1].tracks[0].stopped, false, 'stale continuation must not stop the newer mic');
+		assert.equal((h.t as any).micStream, streams[1], 'stale continuation must not clobber micStream');
+		assert.equal(h.statuses.filter((x) => x.status === 'closed').length, 1, 'exactly one closed emitted');
+		assert.equal(
+			h.statuses.filter((x) => x.detail === 'Live — speak now').length,
+			1,
+			'only the newer attempt reports live',
+		);
+		h.t.disconnect();
+	});
+
+	it('a direct second connect() over live flushes the old session\'s scheduled playback', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.binary(new Int16Array([1000, -1000, 500]).buffer);
+		assert.ok(((h.t as any).activeSources as unknown[]).length > 0, 'precondition: audio scheduled');
+		await h.t.connect('ws://fake:9900/'); // no disconnect() in between
+		assert.equal(
+			((h.t as any).activeSources as unknown[]).length,
+			0,
+			'old session audio is stopped, not carried into the new attempt',
+		);
+		assert.equal((h.t as any).nextPlayTime, 0, 'playback clock restarts for the new attempt');
+		h.t.disconnect();
+	});
+});
+
 describe('user disconnect() (Step 18 / S6)', () => {
 	it('while connecting: synchronous single closed, socket close, timer cleared', async () => {
 		const h = harness();
