@@ -35,7 +35,9 @@ Exit: 0 on pass, 1 on fail.
 Python 3.9 compatible (CI floor).
 """
 from __future__ import annotations
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -45,6 +47,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 _SCRIPT = REPO / "skills" / "quota-tracker" / "scripts" / "read-quota.py"
@@ -265,6 +268,62 @@ class TestV1HistoryWarmUp(BindingWindowBase):
         self.assertNotIn("no window runs out", out)
         self.assertIn("INCOMPLETE", out)
         self.assertIn("7d", out.split("Est. passes left:")[-1])
+
+
+class TestHumanOutputBranches(BindingWindowBase):
+    """All three `Est. passes left:` renderings, in-process.
+
+    The subprocess test above is the honest end-to-end proof — it asserts on
+    exactly the bytes a human reads — but a subprocess is invisible to the
+    parent's coverage run, so `main()`'s print branches counted as untested and
+    CI's diff-coverage gate failed at 88.1% (missing 288-299). Both forms earn
+    their place: the subprocess one proves the real path, these prove each
+    branch. Deleting either would leave a gap the other does not cover.
+    """
+
+    def render(self, burn):
+        """Run main()'s output path with a stubbed burn result, capture stdout."""
+        (self.tmp / "state" / "quota-state.json").write_text(json.dumps({"headers": {
+            "anthropic-ratelimit-unified-status": "allowed",
+            "anthropic-ratelimit-unified-5h-utilization": "0.10",
+            "anthropic-ratelimit-unified-7d-utilization": "0.73",
+        }}))
+        buf = io.StringIO()
+        with patch.object(self.mod, "_update_burn_rate", return_value=burn), \
+                patch.object(sys, "argv", ["read-quota.py"]), \
+                contextlib.redirect_stdout(buf):
+            self.mod.main()
+        return buf.getvalue()
+
+    BASE = {"burn_rate_pct_per_pass": 0.5, "burn_samples": 99}
+
+    def test_binding_window_renders_the_number(self):
+        out = self.render(dict(self.BASE, binding_window="7d", estimated_passes_left=19.3,
+                               estimated_minutes_left=96, unforecast_windows=[]))
+        self.assertIn("19.3", out)
+        self.assertIn("7d window binds", out)
+        self.assertNotIn("INCOMPLETE", out)
+
+    def test_binding_window_still_carries_the_caveat(self):
+        # The second instance of the bug: a number is only the minimum over the
+        # windows measured, so it may not be stated bare while one is unforecast.
+        out = self.render(dict(self.BASE, binding_window="5h", estimated_passes_left=161.0,
+                               estimated_minutes_left=805, unforecast_windows=["7d"]))
+        self.assertIn("161.0", out)
+        self.assertIn("INCOMPLETE", out)
+        self.assertIn("7d", out)
+
+    def test_incomplete_with_no_binding_window(self):
+        out = self.render(dict(self.BASE, binding_window=None, estimated_passes_left=None,
+                               estimated_minutes_left=None, unforecast_windows=["7d"]))
+        self.assertIn("INCOMPLETE", out)
+        self.assertNotIn("no window runs out", out)
+
+    def test_all_measured_and_nothing_binds_is_the_only_all_clear(self):
+        out = self.render(dict(self.BASE, binding_window=None, estimated_passes_left=None,
+                               estimated_minutes_left=None, unforecast_windows=[]))
+        self.assertIn("no window runs out before its own reset", out)
+        self.assertNotIn("INCOMPLETE", out)
 
 
 class TestBackCompat(BindingWindowBase):
