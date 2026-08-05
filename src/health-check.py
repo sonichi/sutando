@@ -4569,13 +4569,31 @@ def fix_skill_symlinks(check: dict) -> dict:
     return {"name": "skill-symlinks", "status": "ok" if not errors else "warn", "detail": result}
 
 
-def apply_skill_symlink_fixes(checks: list) -> None:
+def apply_skill_symlink_fixes(checks: list, stream=None) -> None:
     """--fix dispatch for skill-symlinks: warn-level (excluded from the issues
-    loop) but auto-fixable, so it is handled by its own pass over checks."""
+    loop) but auto-fixable, so it is handled by its own pass over checks.
+
+    `stream` is where the repair line goes, default stdout. A caller that emits
+    a machine-readable payload on stdout MUST pass `sys.stderr` — this helper
+    prints prose, and prose ahead of the payload makes `json.loads(stdout)` fail
+    at line 1.
+
+    On a successful repair the check dict is updated IN PLACE, so every
+    downstream reader — the JSON payload, the human listing, the summary — sees
+    the post-fix state instead of the warning this call just cleared. Reporting
+    the pre-fix warning after repairing it hands consumers a payload that
+    contradicts the action they asked for. The `_unlinked`/`_broken` keys are
+    cleared with it so a second pass cannot re-fix an already-repaired check.
+    """
+    out = stream if stream is not None else sys.stdout
     for c in checks:
         if c["name"] == "skill-symlinks" and (c.get("_unlinked") or c.get("_broken")):
             result = fix_skill_symlinks(c)
-            print(f"  {c['name']}: {result['detail']}")
+            print(f"  {c['name']}: {result['detail']}", file=out)
+            c["status"] = result["status"]
+            c["detail"] = result["detail"]
+            c.pop("_unlinked", None)
+            c.pop("_broken", None)
 
 
 def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> list[Path]:
@@ -7388,8 +7406,11 @@ def main():
     # case this fixer exists for — `--fix` printed nothing and repaired nothing;
     # it worked only when some UNRELATED check happened to be failing too.
     # Prints only when it actually repairs something, so a healthy run is silent.
+    # Under --json the repair line goes to STDERR: stdout carries the payload,
+    # and prose ahead of it makes json.loads() fail at line 1 (caught in review
+    # of #2663 — the first version of this hoist printed to stdout regardless).
     if do_fix:
-        apply_skill_symlink_fixes(checks)
+        apply_skill_symlink_fixes(checks, stream=sys.stderr if as_json else sys.stdout)
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
