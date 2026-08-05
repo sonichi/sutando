@@ -81,7 +81,7 @@ def _require_credentials():
     )
 
 
-def _build_account():
+def _build_account():  # pragma: no cover  (live Graph calls; not unit-testable)
     """Construct an O365 Account with a filesystem-backed token cache."""
     client_id, client_secret, tenant_id = _require_credentials()
 
@@ -112,7 +112,7 @@ def _ensure_authenticated(account):
 # ---------------------------------------------------------------------------
 # Subcommand handlers
 # ---------------------------------------------------------------------------
-def cmd_auth(_args):
+def cmd_auth(_args):  # pragma: no cover  (live Graph calls; not unit-testable)
     account = _build_account()
     # Runs the console consent flow: prints an authorization URL and prompts
     # for the redirected URL, then caches the token. Returns True on success.
@@ -128,7 +128,7 @@ def cmd_auth(_args):
     return 1
 
 
-def cmd_onedrive_list(args):
+def cmd_onedrive_list(args):  # pragma: no cover  (live Graph calls; not unit-testable)
     account = _build_account()
     _ensure_authenticated(account)
     storage = account.storage()
@@ -143,7 +143,7 @@ def cmd_onedrive_list(args):
     return 0
 
 
-def cmd_onedrive_get(args):
+def cmd_onedrive_get(args):  # pragma: no cover  (live Graph calls; not unit-testable)
     account = _build_account()
     _ensure_authenticated(account)
     storage = account.storage()
@@ -160,7 +160,7 @@ def cmd_onedrive_get(args):
     return 0
 
 
-def cmd_outlook_list(args):
+def cmd_outlook_list(args):  # pragma: no cover  (live Graph calls; not unit-testable)
     account = _build_account()
     _ensure_authenticated(account)
     mailbox = account.mailbox()
@@ -171,7 +171,7 @@ def cmd_outlook_list(args):
     return 0
 
 
-def cmd_outlook_send(args):
+def cmd_outlook_send(args):  # pragma: no cover  (live Graph calls; not unit-testable)
     account = _build_account()
     _ensure_authenticated(account)
     mailbox = account.mailbox()
@@ -187,7 +187,7 @@ def cmd_outlook_send(args):
     return 0
 
 
-def cmd_calendar_list(args):
+def cmd_calendar_list(args):  # pragma: no cover  (live Graph calls; not unit-testable)
     account = _build_account()
     _ensure_authenticated(account)
     schedule = account.schedule()
@@ -208,7 +208,7 @@ def cmd_calendar_list(args):
     return 0
 
 
-def cmd_teams_post(args):
+def cmd_teams_post(args):  # pragma: no cover  (live Graph calls; not unit-testable)
     account = _build_account()
     _ensure_authenticated(account)
     teams = account.teams()
