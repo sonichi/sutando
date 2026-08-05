@@ -23,6 +23,7 @@ from __future__ import annotations
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -133,6 +134,29 @@ def _update_burn_rate(current_util_5h: float) -> dict | None:
     return result
 
 
+# --- Fable open/close reminder ----------------------------------------------
+# Thresholds are the one thing to tune to taste — the reminder is quota-driven by
+# default. It ONLY reminds (prints a line); it never switches the model. The core
+# model is toggled by the owner via `/model`.
+_FABLE_REMIND_HIGH = 0.80   # 5h util at/above, while NOT on Fable → suggest opening Fable
+_FABLE_REMIND_LOW = 0.40    # 5h util below, while ON Fable → suggest closing it
+
+
+def fable_reminder(result: dict) -> str:
+    """One-line reminder to toggle Fable, or '' if none. Never switches the model."""
+    if result.get("stale"):
+        return ""  # never advise on stale numbers
+    util = result.get("utilization_5h", 0)
+    pct = int(util * 100)
+    if not result.get("on_fable") and util >= _FABLE_REMIND_HIGH:
+        return (f"⚡ 5h budget {pct}% used — if you're deep in something, consider "
+                f"Fable 5 for the heavy lifting: `/model claude-fable-5`.")
+    if result.get("on_fable") and util < _FABLE_REMIND_LOW:
+        return (f"5h budget back to {pct}% — past the hard part? switch back off Fable: "
+                f"`/model <your main model>`.")
+    return ""
+
+
 def main():
     data = json.loads(QUOTA_FILE.read_text())
     headers = data.get("headers", {})
@@ -150,6 +174,13 @@ def main():
     reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
     reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
 
+    # The rate-limit budget is UNIFIED (one pool across Claude models), so this is
+    # not a separate Fable meter — it's an ATTRIBUTION: which model was active when
+    # this reading was taken. Tag by the running core model so a `fable` line shows
+    # how much of the unified budget was burned while on Fable 5.
+    core_model = os.environ.get("SUTANDO_CORE_MODEL", "")
+    on_fable = "fable" in core_model.lower()
+
     result = {
         "status": status,
         "available": status == "allowed",
@@ -159,6 +190,8 @@ def main():
         "remaining_7d_pct": round((1 - util_7d) * 100),
         "state_age_seconds": int(age_s),
         "stale": stale,
+        "core_model": core_model,
+        "on_fable": on_fable,
     }
 
     if reset_5h:
@@ -170,6 +203,12 @@ def main():
         burn = _update_burn_rate(util_5h)
         if burn:
             result["burn"] = burn
+
+    if "--fable-remind" in sys.argv:
+        # Print the toggle reminder (empty if none) so a caller (e.g. the
+        # proactive loop) can notify the owner. No model switch happens here.
+        print(fable_reminder(result))
+        return
 
     if "--json" in sys.argv:
         print(json.dumps(result, indent=2))
@@ -193,6 +232,12 @@ def main():
         b = result["burn"]
         print(f"Burn rate: {b['burn_rate_pct_per_pass']}%/pass ({b['burn_samples']} samples)")
         print(f"Est. passes left: {b['estimated_passes_left']} (~{b['estimated_minutes_left']}m)")
+    if result.get("core_model"):
+        tag = "  — Fable (budget above reflects Fable usage)" if result["on_fable"] else ""
+        print(f"Core model: {result['core_model']}{tag}")
+    _remind = fable_reminder(result)
+    if _remind:
+        print(_remind)
 
 
 if __name__ == "__main__":
