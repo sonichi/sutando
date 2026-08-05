@@ -29,6 +29,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 SESSION = "sutando-core"
@@ -270,8 +271,8 @@ def _ag2space_app_running():
     return rc == 0
 
 
-def _station_available(timeout=1.5):
-    """Tri-state reachability of the Station connector gateway.
+def _probe_station(timeout=1.5):
+    """BLOCKING tri-state reachability probe of the Station connector gateway.
 
     Station connectors are served over `sutando.ag2.space`, so probe THAT
     directly rather than inferring availability from a process match (which
@@ -281,6 +282,10 @@ def _station_available(timeout=1.5):
     None when it cannot be determined at all — a DNS/resolver or socket error,
     which may be a transient or local-network problem, so it is UNKNOWN rather
     than a positive "unavailable" (same tri-state discipline as _run).
+
+    This does real network I/O (an unbounded getaddrinfo plus up to one connect
+    timeout per resolved address) and so must NEVER be called on derive()'s hot
+    path — go through _station_available(), which runs it off-loop. See #2680.
     """
     try:
         addrs = socket.getaddrinfo(_STATION_GATEWAY_HOST, 443, type=socket.SOCK_STREAM)
@@ -297,6 +302,59 @@ def _station_available(timeout=1.5):
         finally:
             s.close()
     return False
+
+
+# Station reachability is refreshed OFF the hot path. derive() runs every ~3s
+# (core-input-watch.py), and a network probe — an unbounded getaddrinfo plus a
+# connect timeout per address — must never stall that core-liveness supervisor
+# loop (qingyun CR #2680: "an informational remote availability signal can
+# stall the local core-liveness supervisor it is meant to inform"). So
+# _station_available() NEVER blocks: it returns the last cached verdict
+# immediately and kicks a single background refresh when the cache is stale.
+# Until the first probe lands the verdict is None (unknown) — the correct
+# tri-state default. A probe that hangs is superseded after _STATION_PROBE_MAX
+# so the cache can never freeze permanently.
+_STATION_TTL = 30.0          # re-probe at most this often (vs. the ~3s loop)
+_STATION_PROBE_MAX = 10.0    # presume a probe hung after this; allow a new one
+_station_cache = {"value": None, "ts": None}   # ts=None => never probed
+_station_inflight = {"since": None}            # when the running probe started
+_station_guard = threading.Lock()              # guards the dicts only — no I/O
+
+
+def _station_refresh(timeout=1.5):
+    """Run the blocking probe and publish the verdict to the cache. Best-effort:
+    any unexpected error yields None (unknown), never a spurious False."""
+    try:
+        val = _probe_station(timeout)
+    except Exception:
+        val = None
+    with _station_guard:
+        _station_cache["value"] = val
+        _station_cache["ts"] = time.monotonic()
+        _station_inflight["since"] = None
+    return val
+
+
+def _station_available(timeout=1.5, ttl=_STATION_TTL, now=None):
+    """Non-blocking, TTL-cached Station reachability (tri-state True/False/None).
+
+    Returns the last cached verdict IMMEDIATELY — it never does network I/O on
+    the caller's thread — and spawns at most one background refresh when the
+    cache is stale (older than `ttl`) or cold. `now` is injectable for tests.
+    """
+    t = now if now is not None else time.monotonic()
+    with _station_guard:
+        value = _station_cache["value"]
+        ts = _station_cache["ts"]
+        since = _station_inflight["since"]
+        fresh = ts is not None and (t - ts) < ttl
+        probing = since is not None and (t - since) < _STATION_PROBE_MAX
+        start = not fresh and not probing
+        if start:
+            _station_inflight["since"] = t
+    if start:
+        threading.Thread(target=_station_refresh, args=(timeout,), daemon=True).start()
+    return value
 
 
 def _pane_text():

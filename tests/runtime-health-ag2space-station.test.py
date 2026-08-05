@@ -8,6 +8,8 @@ Run: python3 tests/runtime-health-ag2space-station.test.py  (exit 0 pass / 1 fai
 """
 import importlib.util
 import sys
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -44,6 +46,16 @@ def _fake_socket(*, resolve=True, connect="ok"):
     return ns
 
 
+class _SyncThread:
+    """threading.Thread stand-in that runs its target synchronously on start(),
+    so a spawned _station_refresh completes deterministically inside the test."""
+    def __init__(self, target, args=(), daemon=None):
+        self._t, self._a = target, args
+
+    def start(self):
+        self._t(*self._a)
+
+
 class TestAg2SpaceStationSignals(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
@@ -69,24 +81,77 @@ class TestAg2SpaceStationSignals(unittest.TestCase):
         self.mod._run = lambda cmd: (None, "")
         self.assertIsNone(self.mod._ag2space_app_running())
 
-    # ---- station_available: real reachability, tri-state ----
-    def test_station_true_when_gateway_connects(self):
+    # ---- _probe_station: the BLOCKING reachability logic, tri-state ----
+    def test_probe_true_when_gateway_connects(self):
         self.mod.socket = _fake_socket(resolve=True, connect="ok")
-        self.assertTrue(self.mod._station_available())
+        self.assertTrue(self.mod._probe_station())
 
-    def test_station_false_when_resolves_but_refused(self):
+    def test_probe_false_when_resolves_but_refused(self):
         self.mod.socket = _fake_socket(resolve=True, connect="refuse")
-        self.assertFalse(self.mod._station_available())
+        self.assertFalse(self.mod._probe_station())
 
-    def test_station_unknown_on_dns_failure(self):
+    def test_probe_unknown_on_dns_failure(self):
         # DNS/resolver failure is UNKNOWN (could be transient/local), not "unavailable".
         self.mod.socket = _fake_socket(resolve=False)
-        self.assertIsNone(self.mod._station_available())
+        self.assertIsNone(self.mod._probe_station())
+
+    # ---- _station_available: non-blocking, TTL-cached (qingyun CR #2680) ----
+    def test_station_available_never_blocks_on_a_slow_probe(self):
+        # derive() calls this every ~3s; a hanging network probe must NOT stall
+        # that core-liveness loop. A 2s probe must still return instantly.
+        def slow_probe(timeout=1.5):
+            time.sleep(2.0)
+            return True
+        self.mod._probe_station = slow_probe
+        start = time.monotonic()
+        result = self.mod._station_available()          # cold cache
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 0.5, f"blocked for {elapsed:.2f}s")
+        self.assertIsNone(result)                       # unknown until the probe lands
+
+    def test_station_available_serves_fresh_cache_without_probing(self):
+        self.mod._station_cache.update(value=True, ts=100.0)
+        self.mod._station_inflight["since"] = None
+        called = {"n": 0}
+        self.mod._probe_station = lambda timeout=1.5: called.__setitem__("n", called["n"] + 1) or True
+        self.assertTrue(self.mod._station_available(ttl=30.0, now=110.0))  # 10s < 30s -> fresh
+        self.assertEqual(called["n"], 0)                          # no probe
+        self.assertIsNone(self.mod._station_inflight["since"])    # no refresh spawned
+
+    def test_station_available_reprobes_after_ttl(self):
+        self.mod._station_cache.update(value=True, ts=100.0)
+        self.mod._station_inflight["since"] = None
+        called = {"n": 0}
+        self.mod._probe_station = lambda timeout=1.5: called.__setitem__("n", called["n"] + 1) or True
+        self.mod.threading = types.SimpleNamespace(Thread=_SyncThread)
+        self.mod._station_available(ttl=30.0, now=140.0)          # 40s > 30s -> stale -> re-probe
+        self.assertEqual(called["n"], 1)
+
+    def test_station_available_does_not_double_probe_while_inflight(self):
+        self.mod._station_cache.update(value=None, ts=None)       # cold...
+        self.mod._station_inflight["since"] = 100.0              # ...but a probe is already running
+        called = {"n": 0}
+        self.mod._probe_station = lambda timeout=1.5: called.__setitem__("n", called["n"] + 1) or True
+        self.mod.threading = types.SimpleNamespace(Thread=_SyncThread)
+        self.mod._station_available(ttl=30.0, now=105.0)          # inflight 5s ago (< 10s max) -> skip
+        self.assertEqual(called["n"], 0)
+
+    def test_station_available_unknown_when_probe_raises(self):
+        self.mod._station_cache.update(value=True, ts=None)       # stale, currently "up"
+        self.mod._station_inflight["since"] = None
+        def boom(timeout=1.5):
+            raise RuntimeError("resolver blew up")
+        self.mod._probe_station = boom
+        self.mod.threading = types.SimpleNamespace(Thread=_SyncThread)
+        self.mod._station_available(now=0.0)                     # stale -> refresh -> probe raises
+        # the refresh swallowed the error and published UNKNOWN, not a false down
+        self.assertIsNone(self.mod._station_cache["value"])
 
     # ---- derive() surfaces both keys, and does not conflate them ----
     def test_derive_surfaces_both_keys(self):
         self.mod._run = lambda cmd: (None, "")          # everything unknown
         self.mod.socket = _fake_socket(resolve=False)   # station unknown
+        self.mod._station_refresh()                     # prime the cache off-loop
         out = self.mod.derive()
         self.assertIn("ag2space_app_running", out)
         self.assertIn("station_available", out)
@@ -97,6 +162,7 @@ class TestAg2SpaceStationSignals(unittest.TestCase):
     def test_derive_app_up_but_station_unreachable_are_independent(self):
         self.mod._run = lambda cmd: (0, "1\n")          # app process "running"
         self.mod.socket = _fake_socket(resolve=True, connect="refuse")  # gateway down
+        self.mod._station_refresh()                     # prime cache: resolves-but-refused -> False
         out = self.mod.derive()
         self.assertTrue(out["ag2space_app_running"])
         self.assertFalse(out["station_available"])       # app up != station reachable
