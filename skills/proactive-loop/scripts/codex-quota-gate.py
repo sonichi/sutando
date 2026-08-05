@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 STALE_AFTER_SECONDS = 30 * 60
 LOOKBACK_SECONDS = 14 * 24 * 60 * 60
+WEEKLY_MINUTES = 7 * 24 * 60  # the quota window this gate protects (10080 min)
 
 
 def _codex_home() -> Path:
@@ -54,6 +55,35 @@ def _rate_limits(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     if isinstance(info, dict) and isinstance(info.get("rate_limits"), dict):
         return info["rate_limits"]
     return None
+
+
+def _weekly_window(limits: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The weekly rate-limit window from one ``rate_limits`` snapshot, or None.
+
+    Codex does NOT always put the weekly quota in ``primary``: when a shorter
+    (e.g. 300-minute) window is also being reported it lands in ``primary`` and
+    the 10,080-minute weekly window is in ``secondary`` (qingyun CR #2676).  So
+    select the weekly window by ``window_minutes`` (>= 7 days) across BOTH keys
+    rather than assuming a fixed slot; assuming ``primary`` silently drops the
+    whole snapshot and reports LIGHT even though usable weekly telemetry exists.
+    When both windows qualify, take the longest (the true weekly)."""
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for key in ("primary", "secondary"):
+        window = limits.get(key)
+        if not isinstance(window, dict):
+            continue
+        used = window.get("used_percent")
+        if not isinstance(used, (int, float)) or isinstance(used, bool):
+            continue
+        window_minutes = window.get("window_minutes")
+        if not isinstance(window_minutes, (int, float)) or isinstance(window_minutes, bool):
+            continue
+        if int(window_minutes) < WEEKLY_MINUTES:
+            continue
+        candidates.append((int(window_minutes), window))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: c[0])[1]
 
 
 def _snapshots(home: Path) -> list[tuple[float, dict[str, Any]]]:
@@ -91,28 +121,26 @@ def _snapshots(home: Path) -> list[tuple[float, dict[str, Any]]]:
 
 def read_quota(home: Optional[Path] = None, now: Optional[float] = None) -> dict[str, Any]:
     now = time.time() if now is None else now
-    latest: dict[str, tuple[float, dict[str, Any]]] = {}
+    latest: dict[str, tuple[float, dict[str, Any], dict[str, Any]]] = {}
     for stamp, limits in _snapshots(home or _codex_home()):
-        primary = limits.get("primary")
-        if not isinstance(primary, dict) or not isinstance(primary.get("used_percent"), (int, float)):
-            continue
-        # The weekly window is the quota this gate is intended to protect.
-        if int(primary.get("window_minutes", 0)) < 7 * 24 * 60:
+        # The weekly window is the quota this gate protects — find it in either
+        # `primary` or `secondary` by window length, don't assume the slot.
+        weekly = _weekly_window(limits)
+        if weekly is None:
             continue
         lane = str(limits.get("limit_id") or limits.get("limit_name") or "unknown")
         if lane not in latest or stamp >= latest[lane][0]:
-            latest[lane] = (stamp, limits)
+            latest[lane] = (stamp, limits, weekly)
 
     rows = []
-    for lane, (stamp, limits) in latest.items():
-        primary = limits["primary"]
-        used = max(0.0, min(100.0, float(primary["used_percent"])))
+    for lane, (stamp, limits, weekly) in latest.items():
+        used = max(0.0, min(100.0, float(weekly["used_percent"])))
         rows.append({
             "limit_id": lane,
             "limit_name": limits.get("limit_name"),
             "used_percent": round(used, 1),
             "remaining_percent": round(100.0 - used, 1),
-            "resets_at": primary.get("resets_at"),
+            "resets_at": weekly.get("resets_at"),
             "sample_age_seconds": max(0, round(now - stamp)),
         })
 

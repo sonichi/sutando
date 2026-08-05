@@ -67,6 +67,54 @@ with tempfile.TemporaryDirectory() as td:
     result = gate.read_quota(only_stale, now=now)
     check("entirely stale telemetry fails closed", result["tier"] == "LIGHT" and not result["available"])
 
+    # qingyun CR #2676: the weekly window is not always `primary`. When a shorter
+    # (300-min) window occupies `primary` and the 10,080-min weekly window is in
+    # `secondary`, the gate must still read the weekly telemetry — not drop the
+    # snapshot and report unavailable/LIGHT.
+    dual = Path(td) / "dual-window-root"
+    dpath = dual / "sessions" / "fixture" / "codex.jsonl"
+    dpath.parent.mkdir(parents=True, exist_ok=True)
+    dpath.write_text(json.dumps({
+        "timestamp": datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "payload": {
+            "type": "token_count",
+            "rate_limits": {
+                "limit_id": "codex",
+                "primary": {"used_percent": 25, "window_minutes": 300, "resets_at": 111},
+                "secondary": {"used_percent": 90, "window_minutes": 10080, "resets_at": 222},
+            },
+        },
+    }) + "\n", encoding="utf-8")
+    result = gate.read_quota(dual, now=now)
+    check("weekly window read from secondary when primary is a short window",
+          result["available"] and len(result["limits"]) == 1)
+    check("secondary weekly used_percent (90) drives remaining, not primary (25)",
+          result["remaining_percent"] == 10.0)
+    check("10% remaining from the weekly secondary is MEDIUM", result["tier"] == "MEDIUM")
+    check("the weekly window's resets_at is surfaced (222, not the 300-min 111)",
+          result["limits"][0]["resets_at"] == 222)
+
+# _weekly_window branch coverage: every non-weekly shape degrades to None so the
+# snapshot is dropped (and the gate fails closed) rather than mis-read.
+check("no weekly window when only a short window is present",
+      gate._weekly_window({"primary": {"used_percent": 25, "window_minutes": 300}}) is None)
+check("non-dict window is ignored",
+      gate._weekly_window({"primary": "nope",
+                           "secondary": {"used_percent": 90, "window_minutes": 10080}})
+      is not None)
+check("non-numeric used_percent is ignored",
+      gate._weekly_window({"primary": {"used_percent": "x", "window_minutes": 10080}}) is None)
+check("boolean used_percent is not treated as numeric",
+      gate._weekly_window({"primary": {"used_percent": True, "window_minutes": 10080}}) is None)
+check("missing/non-numeric window_minutes is ignored",
+      gate._weekly_window({"primary": {"used_percent": 10}}) is None)
+check("empty snapshot yields no weekly window", gate._weekly_window({}) is None)
+check("longest qualifying window wins when both are weekly-length",
+      gate._weekly_window({
+          "primary": {"used_percent": 10, "window_minutes": 10080},
+          "secondary": {"used_percent": 20, "window_minutes": 20160},
+      })["window_minutes"] == 20160)
+
 if failures:
     raise SystemExit(f"{len(failures)} failure(s): {', '.join(failures)}")
 print("\nall tests passed")
