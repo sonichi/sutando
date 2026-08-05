@@ -198,6 +198,52 @@ class EmptyMentionContextTest(unittest.TestCase):
         BRIDGE.handle_mention(mention_event(thread_ts=None), None)
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
 
+    def test_served_bare_mention_is_a_boundary_not_walked_past(self):
+        # CR #2230 (bassilkhilo-ag2), exact repro: "delete X" → a bare @Sutando
+        # (already served) → a NEW bare @Sutando must NOT walk past the served
+        # mention and re-recover/re-run "delete X". No bot message sits between
+        # them, so ONLY the mention-only boundary can stop the walk here (the
+        # pre-existing bot-reply boundary does not apply).
+        BRIDGE.app.client.conversations_replies = lambda **kwargs: {
+            "messages": [
+                {"ts": "1700000000.000001", "user": "UOWNER", "text": "delete the prod database"},
+                {"ts": "1700000001.000002", "user": "UOWNER", "text": "<@UBOT>"},
+                {"ts": "1700000002.000003", "user": "UOWNER", "text": "<@UBOT>"},
+            ]
+        }
+        BRIDGE.handle_mention(mention_event(), None)
+        self.assertEqual(self.captured[0][1], "Slack mention")
+        self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
+
+    def test_recovery_ignores_a_stale_same_user_instruction(self):
+        # CR #2230: a same-user instruction older than the recovery window is not
+        # the other half of a split turn — it must not resurface "as if fresh".
+        stale_ts = float(mention_event()["ts"]) - (BRIDGE._EMPTY_MENTION_RECOVERY_MAX_AGE_S + 60)
+        BRIDGE.app.client.conversations_replies = lambda **kwargs: {
+            "messages": [
+                {"ts": f"{stale_ts:.6f}", "user": "UOWNER", "text": "delete the prod database"},
+                {"ts": "1700000002.000003", "user": "UOWNER", "text": "<@UBOT>"},
+            ]
+        }
+        BRIDGE.handle_mention(mention_event(), None)
+        self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
+
+    def test_recovery_within_window_still_succeeds(self):
+        # Positive control: an instruction well within the window (2 min before
+        # the mention) still recovers — the recency bound only rejects stale ones.
+        recent_ts = float(mention_event()["ts"]) - 120
+        BRIDGE.app.client.conversations_replies = lambda **kwargs: {
+            "messages": [
+                {"ts": f"{recent_ts:.6f}", "user": "UOWNER", "text": "Run it now"},
+                {"ts": "1700000002.000003", "user": "UOWNER", "text": "<@UBOT>"},
+            ]
+        }
+        BRIDGE.handle_mention(mention_event(), None)
+        self.assertEqual(
+            self.captured[0][1:],
+            ("Slack mention (recovered prior message)", "Run it now", "Rui"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
