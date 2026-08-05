@@ -21,7 +21,11 @@ import pathlib
 import subprocess
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+# REPO root, to import the resolver from src/ — not a workspace path. The
+# line-scoped pragma is the sanctioned form: it exempts this one line and leaves
+# every other line in the file visible to the lint, unlike a file-level
+# allowlist entry (which #2639 showed is a blind spot, not an exemption).
+ROOT = pathlib.Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(ROOT / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
