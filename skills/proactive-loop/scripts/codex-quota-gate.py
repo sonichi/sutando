@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -57,6 +58,15 @@ def _rate_limits(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
+def _finite_number(value: Any) -> bool:
+    """True only for a real finite int/float (not bool, not NaN/±inf). The cache
+    is JSON parsed with json.loads(), which accepts NaN/Infinity tokens, so a
+    telemetry field can be a non-finite float that passes an isinstance check but
+    breaks int()/comparisons (qingyun CR #2676)."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 def _weekly_window(limits: dict[str, Any]) -> Optional[dict[str, Any]]:
     """The weekly rate-limit window from one ``rate_limits`` snapshot, or None.
 
@@ -72,11 +82,15 @@ def _weekly_window(limits: dict[str, Any]) -> Optional[dict[str, Any]]:
         window = limits.get(key)
         if not isinstance(window, dict):
             continue
-        used = window.get("used_percent")
-        if not isinstance(used, (int, float)) or isinstance(used, bool):
+        # Require FINITE numerics: json.loads() accepts NaN/Infinity tokens by
+        # default, and a NaN is a float that passes an isinstance check but then
+        # poisons everything — int(NaN) raises ValueError (qingyun CR #2676), and
+        # a NaN used_percent would sail through the used-clamp as NaN. A malformed
+        # window must drop out so the gate fails closed to unavailable/LIGHT.
+        if not _finite_number(window.get("used_percent")):
             continue
         window_minutes = window.get("window_minutes")
-        if not isinstance(window_minutes, (int, float)) or isinstance(window_minutes, bool):
+        if not _finite_number(window_minutes):
             continue
         if int(window_minutes) < WEEKLY_MINUTES:
             continue
@@ -188,5 +202,5 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())
