@@ -83,5 +83,48 @@ with tempfile.TemporaryDirectory() as td:
     check("...and simply omits the writer attribution",
           "written by" in (r5 or {}).get("detail", ""), False)
 
+    # 6. MIGRATED WORKSPACE — the blocking finding on the first head. These four
+    #    sentinels are production-owned: workspace_default.py writes them to the
+    #    root for O(1) re-entry and deliberately KEEPS them. Warning on them would
+    #    put a permanent WARN on every upgraded install, which trains operators to
+    #    ignore the detector — the exact failure this probe exists to prevent.
+    import tempfile as _tf
+    td2 = Path(_tf.mkdtemp()); ws2 = td2 / "workspace"; (ws2 / "state").mkdir(parents=True)
+    for sentinel in (".status-migrated", ".notes-migrated",
+                     ".build_log-migrated", ".conversation-log-migrated"):
+        (ws2 / sentinel).write_text("")
+    check("sentinel-only migrated root stays SILENT", load(ws2).check_workspace_root_tidy(), None)
+
+    #    PAIRED CONTROL: silence must come from recognising the sentinels, not
+    #    from the probe going inert on a migrated workspace. One real loose file
+    #    beside them must still warn, and must NOT name the sentinels.
+    (ws2 / ".voice-agent.pid").write_text("1")
+    r6 = load(ws2).check_workspace_root_tidy()
+    check("a real loose file beside sentinels still warns", (r6 or {}).get("status"), "warn")
+    check("...and names only the real one",
+          ".voice-agent.pid" in (r6 or {}).get("detail", "")
+          and ".status-migrated" not in (r6 or {}).get("detail", ""), True)
+
+    #    Pattern, not four literals — `sutando-migrate.sh` finds the family with
+    #    `-name ".*-migrated*"`, so a sentinel added later must be exempt too.
+    td3 = Path(_tf.mkdtemp()); ws3 = td3 / "workspace"; (ws3 / "state").mkdir(parents=True)
+    (ws3 / ".some-future-thing-migrated").write_text("")
+    check("an UNLISTED sentinel matching the family glob is exempt",
+          load(ws3).check_workspace_root_tidy(), None)
+
+    # 7. Attribution must be unambiguous or absent. Two source files mentioning
+    #    the same name previously produced a confident hits[0] — which named
+    #    whichever sorted first, including a test that merely contains the string.
+    td4 = Path(_tf.mkdtemp()); ws4 = td4 / "workspace"; (ws4 / "state").mkdir(parents=True)
+    (ws4 / "ambiguous.tmp").write_text("")
+    fake_src = td4 / "repo" / "src"; fake_src.mkdir(parents=True)
+    (fake_src / "a.py").write_text("ambiguous.tmp")
+    (fake_src / "b.py").write_text("ambiguous.tmp")
+    m7 = load(ws4); m7.REPO_DIR = td4 / "repo"
+    r7 = m7.check_workspace_root_tidy()
+    check("two candidate writers -> no attribution rather than a wrong one",
+          "written by" in (r7 or {}).get("detail", ""), False)
+    check("...but the drift is still reported", "ambiguous.tmp" in (r7 or {}).get("detail", ""), True)
+
 print(("FAILED: " + ", ".join(fails)) if fails else "workspace-root-tidy: all checks passed")
 sys.exit(1 if fails else 0)

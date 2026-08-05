@@ -20,6 +20,7 @@ Checks:
 """
 
 import hashlib
+import fnmatch
 import json
 import os
 import re
@@ -1183,6 +1184,24 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     ".gitkeep",              # git placeholder, not state
 })
 
+#: Migration sentinels are production-owned and DELIBERATELY retained at the
+#: workspace root — `workspace_default.py` writes `.notes-migrated`,
+#: `.build_log-migrated`, `.status-migrated` and `.conversation-log-migrated`
+#: there for O(1) re-entry, and says so explicitly ("kept at the workspace root
+#: for consistency with the existing ...").
+#:
+#: Matched by PATTERN, not by four literal names, because that is how the family
+#: is already defined elsewhere: `scripts/sutando-migrate.sh` finds them with
+#: `-name ".*-migrated*"`. Reusing the existing definition means a sentinel added
+#: later is exempt automatically.
+#:
+#: This is the same mistake this probe exists to catch, made one layer up: the
+#: first version of it shipped a hardcoded allowlist that missed a whole
+#: documented family, exactly as `_STATUS_FILES` does. @qingyun-wu and
+#: @john-the-dev caught it before merge — a permanent WARN on every upgraded
+#: install would have trained operators to ignore the detector.
+WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
+
 
 def check_workspace_root_tidy() -> "dict | None":
     """Flag loose FILES at the workspace root — state that escaped `state/`.
@@ -1214,7 +1233,9 @@ def check_workspace_root_tidy() -> "dict | None":
     try:
         loose = sorted(
             p.name for p in WORKSPACE_DIR.iterdir()
-            if p.is_file() and p.name not in WORKSPACE_ROOT_ALLOWED
+            if p.is_file()
+            and p.name not in WORKSPACE_ROOT_ALLOWED
+            and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
         )
     except OSError:
         return None                      # unreadable workspace is another probe's job
@@ -1234,7 +1255,11 @@ def check_workspace_root_tidy() -> "dict | None":
             )
         except OSError:
             hits = []
-        if hits:
+        # Only attribute when EXACTLY one source file mentions the name. Taking
+        # hits[0] named whichever file happened to sort first — including a test
+        # that merely contains the string — and a confidently wrong writer is
+        # worse than none, because it sends the reader to the wrong file.
+        if len(hits) == 1:
             writers[name] = hits[0]
 
     shown = ", ".join(f"{n} (written by {writers[n]})" if n in writers else n
