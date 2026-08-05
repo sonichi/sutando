@@ -33,6 +33,7 @@ text is reported; a hundred lines of pure re-wrapping are not.
 import hashlib
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -59,13 +60,27 @@ def _new_content(saved: str, live: str) -> "list[str]":
     # substring of `The peer facts are documented elsewhere`, so a genuinely
     # unmerged line was treated as present. That is a false CLEAN in the
     # discriminator this PR exists to make trustworthy. (qingyun-wu, #2662.)
-    haystack = " " + " ".join(live.split()) + " "
+    haystack = " ".join(live.split())
     seen = set(live.splitlines())
     out = []
     for line in saved.splitlines():
         if not line.strip() or line in seen:
             continue
-        if " " + " ".join(line.split()) + " " in haystack:
+        needle = " ".join(line.split())
+        # Boundary = a NON-WORD character (or the string edge), not specifically
+        # a space. Space-padding was the first attempt and it over-tightened: a
+        # live line that gained trailing punctuation or was extended mid-sentence
+        # then read as absent. Found on real data — a memory index entry whose
+        # live copy is the saved text plus a period and an annotation was
+        # reported missing, though the content is fully present.
+        #
+        #   saved  '... match the body'
+        #   live   '... match the body. *(Restored 2026-08-04 ...)*'
+        #
+        # `\w` boundaries keep qingyun-wu's collision case reported --
+        # `The peer fact` inside `The peer facts` is followed by `s`, a word
+        # character -- while treating punctuation as a legitimate boundary.
+        if re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack):
             continue  # same text, laid out differently
         out.append(line)
     return out

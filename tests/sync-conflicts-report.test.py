@@ -160,6 +160,28 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("collide.md", r.stdout)
 
+    def test_live_text_that_gained_TRAILING_PUNCTUATION_is_not_reported(self):
+        """Regression on my own first boundary fix, found on live data.
+
+        Space-padding the match over-tightened it: a live line that is the saved
+        text plus a period (and an annotation) then read as ABSENT, though the
+        content is fully present. Real case, surfaced by the tool itself on the
+        very sync after I shipped the padding:
+
+            saved  '... match the body'
+            live   '... match the body. *(Restored 2026-08-04 ...)*'
+
+        The boundary is a NON-WORD character, not specifically a space, so
+        punctuation counts as a legitimate edge while the collision case above
+        (`fact` inside `facts`, followed by a word character) still reports.
+        """
+        self._pair("punct.md",
+                   "x match the body. *(Restored 2026-08-04 from a peer copy)*\n",
+                   "x match the body\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("punct.md", r.stdout)
+
     def test_boundary_matching_does_not_break_the_REFLOW_case(self):
         """The paired half: tightening the match must not start reporting
         re-wrapped or re-indented text, which is what the check exists to
