@@ -57,6 +57,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+# --- Hermetic isolation (scripts/lint-hermetic-bridge-tests.py) --------------
+# src/telegram-bridge.py resolves channel config at MODULE level during
+# exec_module (ACCESS_FILE = channel_access_path("telegram")). Without a seeded
+# temp CLAUDE_CONFIG_DIR, channel_access_path() falls back to the developer's
+# real ~/.claude/channels/telegram/access.json. Point it at a seeded temp dir
+# BEFORE any _load_bridge() import below.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-tg-routing-recovery-")
+_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / "access.json").write_text('{"allowFrom": []}')
+# -----------------------------------------------------------------------------
+
 
 def _load_bridge(workspace: Path):
     """Load telegram-bridge.py with a temp workspace. Each call does a fresh
