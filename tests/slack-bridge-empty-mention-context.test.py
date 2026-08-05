@@ -15,6 +15,17 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+# Hermetic isolation (enforced by scripts/lint-hermetic-bridge-tests.py): the Slack
+# bridge resolves channel config at MODULE level during exec_module, so this must
+# isolate CLAUDE_CONFIG_DIR to a temp dir AND seed the canonical slack access.json
+# BEFORE the bridge is imported — otherwise `channel_access_path("slack")` falls back
+# to the operator's real per-user allowlist. Must run at module scope and before the
+# import (the lint checks both order and that the value is a real temp dir).
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-slack-empty-mention-")
+_cfg_slack = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_cfg_slack.mkdir(parents=True, exist_ok=True)
+(_cfg_slack / "access.json").write_text('{"allowFrom": []}')
+
 
 def _load_bridge():
     os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-token"
@@ -227,6 +238,23 @@ class EmptyMentionContextTest(unittest.TestCase):
         }
         BRIDGE.handle_mention(mention_event(), None)
         self.assertEqual(self.captured[0][2], BRIDGE._EMPTY_MENTION_CLARIFICATION)
+
+    def test_malformed_timestamp_does_not_crash_recovery(self):
+        # Defensive (recency bound): a message whose ts cannot be parsed as a float
+        # must not crash the recovery walk — the check swallows the parse error and
+        # falls through to the normal same-user/text logic (fail-open to prior
+        # behavior). Here the unparseable-ts message still recovers its text.
+        BRIDGE.app.client.conversations_replies = lambda **kwargs: {
+            "messages": [
+                {"ts": "", "user": "UOWNER", "text": "Run it now"},
+                {"ts": "1700000002.000003", "user": "UOWNER", "text": "<@UBOT>"},
+            ]
+        }
+        BRIDGE.handle_mention(mention_event(), None)
+        self.assertEqual(
+            self.captured[0][1:],
+            ("Slack mention (recovered prior message)", "Run it now", "Rui"),
+        )
 
     def test_recovery_within_window_still_succeeds(self):
         # Positive control: an instruction well within the window (2 min before
