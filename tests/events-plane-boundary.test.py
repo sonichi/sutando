@@ -38,8 +38,19 @@ def check(name: str, cond: bool) -> None:
     failed += not cond
 
 
+def _is_test_file(p: Path) -> bool:
+    """True only for ACTUAL test artifacts: files under a tests/ directory,
+    `test_*.py`, or `*.test.py` (the repo's two conventions). A production
+    filename merely CONTAINING the substring "test" (latest.py, contest.py,
+    attestation.py) is NOT excluded — the john/bassil `latest.py` mutation
+    (#2666 review) proved a substring check silently blinds every probe."""
+    return ("tests" in p.parts
+            or p.name.startswith("test_")
+            or p.name.endswith(".test.py"))
+
+
 def _py_sources(root: Path) -> "list[Path]":
-    return [p for p in root.rglob("*.py") if "test" not in p.name]
+    return [p for p in root.rglob("*.py") if not _is_test_file(p)]
 
 
 # 1. Durable event store is sparrow-only.
@@ -116,6 +127,43 @@ taskifiers = {p.name for p in _py_sources(ROOM_OPS)
 ALLOWED_TASKIFIERS = {"events_acceptance.py"}
 check(f"event taskification frozen to {sorted(ALLOWED_TASKIFIERS)} (found {sorted(taskifiers)})",
       taskifiers <= ALLOWED_TASKIFIERS)
+
+
+# ── 5. Collector regression — the latest.py blind spot stays closed ─────────
+import tempfile as _tf
+
+with _tf.TemporaryDirectory() as _td:
+    _root = Path(_td)
+    (_root / "tests").mkdir()
+    (_root / "latest.py").write_text("import sqlite3\nwhile True: pass\n")
+    (_root / "test_foo.py").write_text("x = 1\n")
+    (_root / "foo.test.py").write_text("x = 1\n")
+    (_root / "tests" / "anything.py").write_text("x = 1\n")
+    _scanned = {p.name for p in _py_sources(_root)}
+    check("collector scans production files containing 'test' substring (latest.py)",
+          "latest.py" in _scanned)
+    check("collector still excludes real test artifacts (test_* / *.test.py / tests/)",
+          _scanned == {"latest.py"})
+
+# ── 6. Sparrow-side on-demand ban (the documented other half) ───────────────
+# The ratified boundary also bans NEW on-demand room verbs in sparrow. The
+# enforceable proxy is the room-verb ENDPOINT surface: the /v1/room op
+# envelope and the /v1/rooms/ REST facade. Existing debt, frozen shrink-only:
+#   human_action.py          — posts question cards via the /v1/room envelope
+#   remote_gateway_bridge.py — media upload via the /v1/rooms/{room}/media facade
+# (Ad-hoc event pull shares sparrow's legitimate /v1/events consumption
+# endpoint and is governed by review, not this grep — see the doc.)
+ALLOWED_SPARROW_ROOM_VERB_FILES = {"human_action.py", "remote_gateway_bridge.py"}
+sparrow_room_verbs = {p.name for p in _py_sources(SPARROW)
+                      if re.search(r"/v1/rooms?\b", p.read_text(errors="replace"))}
+check(f"sparrow room-verb surface frozen to {sorted(ALLOWED_SPARROW_ROOM_VERB_FILES)} (found {sorted(sparrow_room_verbs)})",
+      sparrow_room_verbs <= ALLOWED_SPARROW_ROOM_VERB_FILES)
+check("positive control: the grandfathered sparrow room-verb uses still exist",
+      sparrow_room_verbs >= ALLOWED_SPARROW_ROOM_VERB_FILES)
+_roomops_room_verbs = {p.name for p in _py_sources(ROOM_OPS)
+                       if "/v1/room" in p.read_text(errors="replace")}
+check("positive control: room-ops DOES use the room-verb surface (probe detects)",
+      len(_roomops_room_verbs) > 0)
 
 print(f"\n{passed}/{passed + failed} passed")
 raise SystemExit(0 if failed == 0 else 1)

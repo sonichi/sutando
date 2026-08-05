@@ -379,7 +379,18 @@ against main; frozen — may only shrink, never grow):
   side. Promotion of the taskify client to the sparrow plane is required
   work; the import is frozen as-is until then.
 
+Sparrow-side debt (same register, same rules):
+- `human_action.py` posts question cards through the `/v1/room` envelope;
+  `remote_gateway_bridge.py` uploads media through the `/v1/rooms/{room}/media`
+  facade. Both are frozen; no NEW sparrow file may touch the room-verb
+  endpoint surface.
+
 Do not add to the skill: SQLite inboxes, forever reconnect loops, durable
 cursor ownership, background daemon lifecycles, or event taskification. Do
-not add on-demand room verbs to sparrow. Enforced by
-`tests/events-plane-boundary.test.py` — allowlists frozen, shrink-only.
+not add on-demand room verbs to sparrow — enforced at the ENDPOINT surface
+(`/v1/room` envelope + `/v1/rooms/` facade, frozen to the two files above).
+Ad-hoc event pull shares sparrow's legitimate `/v1/events` consumption
+endpoint and is governed by review, not grep. All of this is pinned by
+`tests/events-plane-boundary.test.py` — allowlists frozen, shrink-only, and
+the collector excludes only real test artifacts (`tests/` dirs, `test_*.py`,
+`*.test.py`), never production filenames that merely contain "test".
