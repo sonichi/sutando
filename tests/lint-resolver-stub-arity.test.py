@@ -99,6 +99,44 @@ def main() -> int:
           lint.resolver_stub_violations(neutered) != [],
           "if this passes while the FLAG cases pass, the predicate is inert")
 
+    # --- try/finally: `finally` RUNS ON EVERY PATH, so its rebinding wins -----
+    # qingyun-wu's P1, independently reproduced by bassilkhilo-ag2 at e82c01b6.
+    # `finalbody` was collected as just another alternative branch and OR-merged
+    # with body/handlers, so the pre-`finally` state stayed live beside it. A
+    # `finally` that rebinds the stub to a SAFE absorbing lambda therefore left
+    # the unsafe binding in the merge and the following line was flagged —
+    # a mandatory lint blocking a safe test with no actionable repair, which is
+    # the exact false-positive class this PR exists to remove.
+    #
+    # All four directions are pinned. The three FLAG cases are what stop the fix
+    # from being "stop analysing try at all": disabling the construct would make
+    # the first case pass and these three regress.
+    check("finally rebinding to an absorbing lambda is SAFE (the P1 repro)",
+          not flags('_fake = lambda: x\n'
+                   'try:\n    pass\n'
+                   'finally:\n    _fake = lambda *a, **k: x\n'
+                   'wd.resolve_workspace = _fake'))
+    check("finally rebinding to a BARE lambda is still flagged",
+          flags('_fake = lambda *a, **k: x\n'
+                'try:\n    pass\n'
+                'finally:\n    _fake = lambda: x\n'
+                'wd.resolve_workspace = _fake'))
+    check("finally overrides an unsafe except-branch binding",
+          not flags('_fake = lambda: x\n'
+                   'try:\n    pass\n'
+                   'except Exception:\n    _fake = lambda: x\n'
+                   'finally:\n    _fake = lambda *a, **k: x\n'
+                   'wd.resolve_workspace = _fake'))
+    check("an unsafe binding in the try BODY, with an empty finally, still flags",
+          flags('try:\n    _fake = lambda: x\n'
+                'finally:\n    pass\n'
+                'wd.resolve_workspace = _fake'))
+    check("an unsafe binding in an EXCEPT handler still flags",
+          flags('_fake = lambda *a, **k: x\n'
+                'try:\n    pass\n'
+                'except Exception:\n    _fake = lambda: x\n'
+                'wd.resolve_workspace = _fake'))
+
     # --- reported location is usable ---------------------------------------
     hits = lint.resolver_stub_violations(
         ast.parse('x = 1\ny = 2\n_wd.resolve_workspace = lambda: REPO')

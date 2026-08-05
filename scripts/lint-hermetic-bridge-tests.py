@@ -1136,10 +1136,26 @@ class _ScopeWalk:
         if isinstance(node, ast.Assign):
             self._assign(node)
             return
-        branches = [b for b in (getattr(node, "body", None), getattr(node, "orelse", None),
-                                getattr(node, "finalbody", None)) if b]
+        # `finalbody` is NOT an alternative branch — it runs on EVERY path, after
+        # whichever of body/handlers/orelse ran. Merging it in with `or` (as this
+        # did) keeps the pre-`finally` state alive beside it, so a `finally` that
+        # rebinds a stub to a SAFE absorbing lambda still left the unsafe binding
+        # in the merge and the following line was flagged. qingyun-wu's repro,
+        # confirmed by bassilkhilo-ag2 at e82c01b6:
+        #
+        #     _fake = lambda: x
+        #     try:      pass
+        #     finally:  _fake = lambda *a, **k: x
+        #     wd.resolve_workspace = _fake      -> flagged, correct answer is SAFE
+        #
+        # A mandatory lint blocking a safe test with no actionable repair is the
+        # exact false-positive class this PR exists to remove, so it is handled
+        # SEQUENTIALLY below instead: merge the alternatives, commit, then run
+        # `finally` over that state and let it OVERWRITE.
+        finalbody = getattr(node, "finalbody", None)
+        branches = [b for b in (getattr(node, "body", None), getattr(node, "orelse", None)) if b]
         branches += [h.body for h in getattr(node, "handlers", [])]
-        if not branches:
+        if not branches and not finalbody:
             return
         merged: "dict[str, bool]" = {}
         # A statement whose body may not run at all leaves the PRE-STATE live:
@@ -1171,6 +1187,19 @@ class _ScopeWalk:
             for k, v in w.env.items():
                 merged[k] = merged.get(k, False) or v
         self.env.update(merged)
+        # `finally` last, over the merged state, and its result WINS. It executes
+        # whether the body completed, raised, or returned, so any name it rebinds
+        # holds that binding at every point after the statement — the one place a
+        # later write is guaranteed rather than merely possible. Overwrite (not
+        # `or`) is the whole point: `or` is what preserved the stale pre-`finally`
+        # unsafe state and produced the false positive above.
+        if finalbody:
+            w = _ScopeWalk(self.env, self.out, self.ever_unsafe,
+                           class_body=self.class_body)
+            w.func_env = dict(self.func_env)
+            w.func_unsafe = set(self.func_unsafe)
+            w.run(finalbody)
+            self.env.update(w.env)
 
     def _assign(self, node: ast.Assign) -> None:
         state = _binding_state(node.value, self.env)
