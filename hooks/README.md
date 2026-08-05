@@ -156,9 +156,20 @@ babysit."* The check therefore has to run where the marker is **authored**.
 adapter-local `<workspace>/slack-inbox/` so an uploaded file can be echoed back
 (`src/slack-bridge.py:153-158`). The guard resolves the destination from the task
 the result answers (`results/task-<id>.txt` -> `tasks/task-<id>.txt` -> `source:`)
-and applies that adapter's policy. When the destination can't be established it uses
-the **union** of adapter roots -- a false deny for a destination nobody can name is
-unsatisfiable for the author.
+and applies that adapter's policy. When the destination can't be established --
+a `results/proactive-*.txt` body, or any result with no originating task -- it uses
+the **canonical roots only, never the union**. An earlier version did use the union,
+reasoning that a false deny for a destination nobody can name is unsatisfiable; that
+is unsound. A proactive body has no task to name a source, and Discord, Telegram and
+Slack all claim proactive files with no deterministic winner (`slack-bridge.py`
+race-renames them), so the union would authorize a provider-local root such as
+`slack-inbox/` for a body a different adapter then refuses -- reproducing the exact
+silent failure this guard exists to prevent, behind a clean pass.
+
+Canonical-only inverts that: every adapter accepts these roots, so an allow here is
+an allow everywhere. The cost is one deny -- a provider-local path in a proactive
+body -- and it is satisfiable in one step: stage the file into a canonical sendable
+root such as `results/` and point the marker there. The reason text says so.
 
 **The repo root is CONFIGURED, never discovered.** The hook needs `src/` on
 `sys.path`, and it must not find it by walking up from `__file__`: deploying copies
