@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Tests for read-quota's binding-window forecast.
+
+The forecast answers "how many passes until the loop is stopped". Before this,
+it answered a narrower question — "until the 5h window is exhausted" — and
+printed the answer under the broader label. Two ways that misleads, one test
+class each:
+
+  * the 7d window can be the scarcer pool, and was not projected at all;
+  * a 5h projection longer than the time to the 5h reset is unreachable,
+    because the window refills first.
+
+All 8 fail against the pre-fix implementation, but be precise about why: 7 raise
+`TypeError: _update_burn_rate() takes 1 positional argument but 4 were given`
+and one raises `KeyError: 'binding_window'`. That is a signature/shape failure,
+not a value comparison — the old function cannot be asked these questions at
+all. The behavioural evidence is the live before/after in the PR body, where the
+unmodified binary reports a horizon longer than its own window's reset.
+
+Module loading mirrors tests/quota-burn-rate.test.py.
+
+Run: python3 tests/quota-forecast-binding-window.test.py
+Exit: 0 on pass, 1 on fail.
+
+Python 3.9 compatible (CI floor).
+"""
+from __future__ import annotations
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+_SCRIPT = REPO / "skills" / "quota-tracker" / "scripts" / "read-quota.py"
+
+HOUR = 3600.0
+PASS_S = 300.0
+
+
+def _load_module(workspace: Path):
+    """Load read-quota.py with a controlled workspace and a dummy quota-state.json."""
+    os.environ["SUTANDO_WORKSPACE"] = str(workspace)
+    os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
+    sys.modules.pop("read_quota_binding_under_test", None)
+
+    state_dir = workspace / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    quota_file = state_dir / "quota-state.json"
+    if not quota_file.exists():
+        quota_file.write_text(json.dumps({"headers": {
+            "anthropic-ratelimit-unified-status": "allowed",
+            "anthropic-ratelimit-unified-5h-utilization": "0.1",
+            "anthropic-ratelimit-unified-7d-utilization": "0.7",
+        }}))
+
+    spec = importlib.util.spec_from_file_location(
+        "read_quota_binding_under_test", _SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(REPO / "src"))
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class BindingWindowBase(unittest.TestCase):
+    # Far enough out that neither window refills first; overridden per class.
+    RESET_5H_S = 4 * HOUR
+    RESET_7D_S = 90 * HOUR
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="quota-binding-test-"))
+        self.mod = _load_module(self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def seed(self, samples):
+        """Feed (util_5h, util_7d) pairs one pass apart, back-dating history.
+
+        Three samples satisfy the >= 2 sample gate for both windows.
+        """
+        result = None
+        for i, (u5, u7) in enumerate(samples):
+            if i:
+                h = json.loads(self.mod.BURN_HISTORY_FILE.read_text())
+                h["last_read_ts"] = time.time() - PASS_S
+                self.mod.BURN_HISTORY_FILE.write_text(json.dumps(h))
+            result = self.mod._update_burn_rate(
+                u5, u7,
+                time.time() + self.RESET_5H_S,
+                time.time() + self.RESET_7D_S,
+            )
+        return result
+
+
+class TestSevenDayCanBind(BindingWindowBase):
+    """The 7d window is projected, and wins when it is the scarcer pool."""
+
+    SAMPLES = [(0.04, 0.92), (0.05, 0.93), (0.06, 0.94)]
+
+    def test_7d_is_named_as_the_binding_window(self):
+        r = self.seed(self.SAMPLES)
+        self.assertEqual(r["binding_window"], "7d")
+
+    def test_reported_horizon_is_the_smaller_of_the_two(self):
+        r = self.seed(self.SAMPLES)
+        five_h_only = ((1 - 0.06) * 100) / r["burn_rate_pct_per_pass"]
+        self.assertLess(r["estimated_passes_left"], five_h_only)
+        self.assertLessEqual(r["estimated_passes_left"], 7.0)
+
+    def test_7d_burn_rate_is_reported_separately(self):
+        r = self.seed(self.SAMPLES)
+        self.assertIn("burn_rate_7d_pct_per_pass", r)
+        self.assertGreater(r["burn_rate_7d_pct_per_pass"], 0)
+
+    def test_a_7d_sample_survives_a_5h_reset(self):
+        # util_5h drops (window reset) while util_7d keeps climbing. The 5h
+        # delta is skipped; the 7d reading must still be folded in.
+        r = self.seed([(0.80, 0.90), (0.90, 0.91), (0.02, 0.92)])
+        self.assertIn("burn_rate_7d_pct_per_pass", r)
+
+
+class TestForecastCannotOutrunItsOwnReset(BindingWindowBase):
+    """A window that refills before it empties does not constrain anything."""
+
+    RESET_5H_S = 10 * PASS_S      # refills in 10 passes
+    # 7d held flat so it contributes no rate — this class is about the 5h clamp.
+    SAMPLES = [(0.04, 0.10), (0.05, 0.10), (0.06, 0.10)]
+
+    def test_unreachable_5h_projection_does_not_bind(self):
+        # ~1pp/pass with 94% left projects ~94 passes, but the window refills
+        # in 10 — so the 5h window is not what will stop the loop.
+        r = self.seed(self.SAMPLES)
+        self.assertNotEqual(r["binding_window"], "5h")
+
+    def test_no_binding_window_reports_none_rather_than_a_number(self):
+        r = self.seed(self.SAMPLES)
+        self.assertIsNone(r["binding_window"])
+        self.assertIsNone(r["estimated_passes_left"])
+        self.assertIsNone(r["estimated_minutes_left"])
+
+
+class TestObservedReading(BindingWindowBase):
+    """The 2026-08-05 reading that motivated the change.
+
+    5h 89% remaining resetting in 212 min; 7d 27% remaining resetting in 5702.
+    The old code printed 615 minutes left — 403 past the 5h reset. Whatever is
+    reported now may not exceed the time until the window it came from resets.
+    """
+
+    RESET_5H_S = 212 * 60
+    RESET_7D_S = 5702 * 60
+
+    def test_horizon_never_exceeds_its_own_windows_reset(self):
+        r = self.seed([(0.09, 0.71), (0.10, 0.72), (0.11, 0.73)])
+        cap = {"5h": 212, "7d": 5702}.get(r["binding_window"])
+        if cap is not None:
+            self.assertLessEqual(r["estimated_minutes_left"], cap)
+
+
+class TestBackCompat(BindingWindowBase):
+    """The pre-existing single-argument call keeps working."""
+
+    def test_5h_only_call_still_forecasts(self):
+        r = None
+        for i, u5 in enumerate((0.10, 0.20, 0.30)):
+            if i:
+                h = json.loads(self.mod.BURN_HISTORY_FILE.read_text())
+                h["last_read_ts"] = time.time() - PASS_S
+                self.mod.BURN_HISTORY_FILE.write_text(json.dumps(h))
+            r = self.mod._update_burn_rate(u5)
+        self.assertEqual(r["binding_window"], "5h")
+        self.assertGreater(r["estimated_passes_left"], 0)
+        self.assertEqual(r["estimated_minutes_left"],
+                         round(r["estimated_passes_left"] * 5))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
