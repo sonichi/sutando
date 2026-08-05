@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sutando — cron-runner launchd job (template).
+
+  Role: the RELIABLE scheduler for Sutando's recurring prompts. Session
+  `CronCreate` jobs are best-effort — they only fire while the Claude REPL is
+  idle at the fire minute, they carry scheduler jitter, and they die with the
+  session. On 2026-07-02 the 6:02 loop-engineering digest silently never
+  delivered; the owner asked to "make the schedule reliably run". This job is
+  that path.
+
+  Cadence: every 60s (StartInterval). Each tick runs src/cron-runner.py, which
+  reads the per-host crons.json, decides which `"launchd": true` entries are DUE
+  since their last recorded fire, and emits a task file into tasks/ for each.
+  The streaming watcher hands that task to the running session, which executes
+  the prompt and delivers the result. Same OS-level → emit-task → process
+  pipeline the health-check fallback (com.sutando.health-check-fallback) uses.
+
+  Ownership / no double-fire: only entries flagged `"launchd": true` in
+  crons.json are handled here; the session `/schedule-crons` path skips those
+  same entries, so exactly one scheduler owns each cron.
+
+  Installed by `bash src/install-cron-runner-launchd.sh` after the install
+  script substitutes __REPO__, __WORKSPACE__, __PYTHON__, and __HOMEBREW_BIN__
+  with the user's actual paths. Do NOT load this template directly — paths must
+  be expanded first.
+
+  Behavior:
+    - Fires every 60s (StartInterval).
+    - Runs `python3 src/cron-runner.py`.
+    - Emits tasks/task-cron-<name>-<ms>.txt for each due entry; the runner
+      records last-fire in state/cron-runner-state.json so missed fires (asleep
+      / off) catch up exactly once on the next tick, never a backlog storm.
+    - ThrottleInterval=60 prevents crash-loop thrash.
+    - Exit-only job (KeepAlive omitted) — launchd waits StartInterval, fires
+      again, no zombie process between runs.
+    - All output goes to $WORKSPACE/logs/cron-runner-launchd.log for postmortem.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sutando.cron-runner</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO__/src/cron-runner.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOMEBREW_BIN__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__WORKSPACE__/logs/cron-runner-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__WORKSPACE__/logs/cron-runner-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

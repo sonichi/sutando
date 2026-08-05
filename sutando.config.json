@@ -1,4 +1,7 @@
 {
+  "core": {
+    "runtime": "claude"
+  },
   "workspace": {
     "path": "${REPO_DIR}/workspace"
   },
@@ -9,6 +12,13 @@
       "env_name": "CLAUDE_CONFIG_DIR",
       "synced": true,
       "value": "${WORKSPACE_DIR}/.claude-sutando"
+    },
+    {
+      "id": "codex-default",
+      "type": "codex",
+      "env_name": "CODEX_HOME",
+      "synced": false,
+      "value": "~/.codex"
     }
   ],
   "vault": {
@@ -26,5 +36,8 @@
       ]
     },
     "interval_seconds": 1800
+  },
+  "bridges": {
+    "progress_stream": false
   }
 }

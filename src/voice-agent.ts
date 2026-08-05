@@ -11,9 +11,9 @@
  *   4. Open http://localhost:8080 in Chrome and click Connect
  *
  * Environment:
- *   GEMINI_API_KEY       — Required: Google AI Studio API key (text LLM + vision + STT fallback)
- *   GEMINI_VOICE_API_KEY — Optional: separate key for the Gemini Live voice session.
- *                          Falls back to GEMINI_API_KEY. Useful for isolating voice
+ *   GEMINI_API_KEY       — Google AI Studio API key used as the default voice key.
+ *   GEMINI_VOICE_API_KEY — Optional dedicated key for the Gemini Live voice session.
+ *                          Takes precedence over GEMINI_API_KEY. Useful for isolating voice
  *                          (free-tier eligible) from paid-tier spend on a single key.
  *   ANTHROPIC_API_KEY   — Optional: only needed if not using claude CLI subscription auth
  *   (workspace)         — Per-user workspace dir resolved via `resolveWorkspace()`
@@ -30,26 +30,24 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
+import { inlineTools } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
-import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordToolCall } from './conversation-store.js';
-import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
-import { personalPath, sharedPersonalPath, memoryDirEnv, claudeHomePath } from './util_paths.js';
+import { sharedPersonalPath, claudeHomePath } from './util_paths.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -88,16 +86,19 @@ function assertGeminiKey(name: string, value: string): void {
 	}
 }
 
-import { voiceApiKey } from './voice-key.js';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? '';
-assertGeminiKey('GEMINI_API_KEY', GEMINI_API_KEY);
-// Voice surfaces use the shared GEMINI_VOICE_API_KEY → GEMINI_API_KEY chain
-// via voiceApiKey() (src/voice-key.ts). The VOICE-key fallback path isolates
-// voice billing onto a paid-tier key when set; unset still works.
-const GEMINI_VOICE_API_KEY = voiceApiKey();
-if (process.env.GEMINI_VOICE_API_KEY) {
-	assertGeminiKey('GEMINI_VOICE_API_KEY', process.env.GEMINI_VOICE_API_KEY);
-}
+import { resolveCredential } from './credential-resolver.js';
+// Voice credential resolves via the G8 capability resolver: managed tier
+// (state/auth/managed-credentials.json) → GEMINI_VOICE_API_KEY → GEMINI_API_KEY.
+// The VOICE-key fallback path isolates voice billing onto a paid-tier key when
+// set; unset still works. `source` names the winning tier in startup errors.
+const voiceCredential = resolveCredential('gemini-voice');
+const GEMINI_VOICE_API_KEY = voiceCredential.key;
+assertGeminiKey(
+	voiceCredential.source === 'managed'
+		? 'managed credentials (state/auth)'
+		: process.env.GEMINI_VOICE_API_KEY ? 'GEMINI_VOICE_API_KEY' : 'GEMINI_API_KEY',
+	GEMINI_VOICE_API_KEY,
+);
 
 const PORT = Number(process.env.PORT) || 9900;
 // Loopback by default: the voice WS has no auth, so it must NOT be reachable
@@ -118,10 +119,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
 const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
-const DEFAULT_THREAD_KEY = 'sutando_main';
 const SESSION_ID = `session_${Date.now()}`;
-const PHONE_PORT = Number(process.env.PHONE_PORT) || 3100;
-const PHONE_SERVER_URL = `http://localhost:${PHONE_PORT}`;
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
 /** Single-instance lock for this workspace.
@@ -472,6 +470,9 @@ let userHasInterrupted = false;
 // the next reconnect.
 let sessionEnding = false;
 
+// Intentionally unused: kept out of the tool list on purpose — see the
+// "endSession intentionally NOT in the tool list" note at the tools: field below.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const endSession: ToolDefinition = {
 	name: 'end_session',
 	description: 'End the voice session gracefully. Call when the user explicitly says goodbye or bye.',

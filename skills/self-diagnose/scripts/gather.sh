@@ -145,7 +145,12 @@ cp "$NOTES_DIR/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
 
 # 4) Voice-agent log — filter to window, grep for signal lines, keep it bounded.
 # Signals: transport closes (1006/1011/1007/1008), errors, GoAway, setup complete, 1006/1011 numeric.
-VLOG="$REPO/logs/voice-agent.log"
+# Logs live under the WORKSPACE, not the repo (CLAUDE.md "Workspace contract").
+# `$REPO/logs` does not exist, so the `[ -f ]` guard below went false and this
+# whole block was skipped with no error — the diagnose report then read as
+# "no transport events" when nothing had been looked at. `WS` is already
+# resolved at the top of this script via `sutando-config.sh workspace`.
+VLOG="$WS/logs/voice-agent.log"
 if [ -f "$VLOG" ]; then
 	awk -v since="$SINCE_ISO" '
 		# Approximate filter: log lines start with HH:MM:SS — we can'"'"'t easily compare dates,
@@ -158,7 +163,7 @@ if [ -f "$VLOG" ]; then
 fi
 
 # 5) Discord bridge log — last 200 non-dm-fallback lines
-DLOG="$REPO/logs/discord-bridge.log"
+DLOG="$WS/logs/discord-bridge.log"
 if [ -f "$DLOG" ]; then
 	grep -v "\[dm-fallback\]" "$DLOG" 2>/dev/null | tail -200 > "$OUT/discord-bridge-recent.txt" || true
 fi
@@ -172,7 +177,7 @@ fi
 # Use -mmin against SECONDS_AGO (not `-newer meta.txt` — meta.txt was created
 # at gather-start, so that would only match files written DURING the gather,
 # not files in the last $WINDOW).
-find "$REPO/results" -maxdepth 1 -type f -name "*.txt" -mmin "-$((SECONDS_AGO/60))" 2>/dev/null | head -20 > "$OUT/results-recent-paths.txt" || true
+find "$WS/results" -maxdepth 1 -type f -name "*.txt" -mmin "-$((SECONDS_AGO/60))" 2>/dev/null | head -20 > "$OUT/results-recent-paths.txt" || true
 
 # 8) Quota state
 _QUOTA_SCRIPT="$(bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/read-quota.py)"

@@ -8,7 +8,11 @@ contained: a fixture access.json + a temp workspace are pointed at via env
 so no live Discord is touched. All ids are FICTITIOUS. Run:
   python3 tests/context-source-guard.test.py
 """
-import json, os, subprocess, tempfile, sys
+import json
+import os
+import subprocess
+import tempfile
+import sys
 from pathlib import Path
 
 HOOK = str(Path(__file__).resolve().parent.parent / "hooks" / "context-source-guard.py")
@@ -41,8 +45,23 @@ ENV.pop("DISCORD_BOT_TOKEN", None)  # force offline (cache-only) guild resolutio
 
 
 def run(payload, env=ENV):
-    return subprocess.run([sys.executable, HOOK], input=json.dumps(payload),
-                          capture_output=True, text=True, timeout=20, env=env).stdout.strip()
+    # Assert the hook EXITED CLEANLY, not just that it printed something.
+    #
+    # The allow path is "exit 0 and print nothing" by design, and `is_deny()`
+    # returns False for any unparseable output — so a hook that CRASHED (empty
+    # stdout, non-zero exit) is indistinguishable from one that allowed. Every
+    # `assert not is_deny(...)` case below would pass on a crash; only the deny
+    # cases would catch it. Half this suite was blind, and it guards a security
+    # boundary.
+    #
+    # Same shape as the audit-script false green: a subprocess check that reads
+    # output but discards returncode cannot tell "ran" from "crashed".
+    proc = subprocess.run([sys.executable, HOOK], input=json.dumps(payload),
+                          capture_output=True, text=True, timeout=20, env=env)
+    assert proc.returncode == 0, (
+        f"hook exited {proc.returncode} (expected 0). "
+        f"stderr: {proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else 'none'}")
+    return proc.stdout.strip()
 
 
 def is_deny(out):

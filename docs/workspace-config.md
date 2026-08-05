@@ -26,6 +26,7 @@ That's it for a fresh clone — no setup, no env var, no config file. The direct
 
 ```json
 {
+  "core": { "runtime": "claude" },
   "workspace": {
     "path": "${REPO_DIR}/workspace"
   },
@@ -50,13 +51,35 @@ Keys whose name starts with `_` (e.g. `_comment`) are stripped before validation
 ## Three common overrides
 
 ```json
-// 1. Move workspace outside the repo (e.g. shared between clones)
+// 1. Use Codex CLI as the persistent core
+{ "core": { "runtime": "codex" } }
+
+// 2. Move workspace outside the repo (e.g. shared between clones)
 { "workspace": { "path": "/Users/you/.sutando/workspace" } }
 
-// 2. Enable vault sync to a private remote
+// 3. Enable vault sync to a private remote
 { "vault": { "enabled": true, "remote_url": "https://vault.example.com/you/workspace.git" } }
 
-// 3. Both
+// 3b. Pin a host that intentionally runs off a non-main branch (e.g. the
+//     dual-run pinned nodes). health-check's live-checkout-branch probe warns
+//     when the live checkout drifts off this branch; default is "main".
+//     Config (not env) is the durable home — launchd/Sutando.app callers
+//     never inherit an interactive shell's exports. SUTANDO_EXPECTED_BRANCH
+//     remains a per-invocation env override (wins over config).
+{ "core": { "expected_branch": "v0.4.0-pre-workspace-revamp" } }
+
+// 3c. Tune when a checkout on the RIGHT branch is nonetheless too stale.
+//     Being on `main` is only half of being current — a checkout can sit on
+//     main and still execute weeks-old code, which is how merged guards end up
+//     not running with nothing to report it. Default 10; deliberately not 1,
+//     because main moves several times a day and a probe that fires on every
+//     ordinary delta is one the reader learns to skip. Invalid values
+//     (non-integer, zero, negative) fall back to 10 rather than crashing the
+//     health check or warning on an up-to-date checkout. No env-var override —
+//     config is the only home.
+{ "core": { "checkout_behind_warn": 25 } }
+
+// 4. Multiple overrides
 {
   "workspace": { "path": "/Users/you/.sutando/workspace" },
   "vault": { "enabled": true, "remote_url": "https://vault.example.com/you/workspace.git" }
@@ -67,10 +90,10 @@ Keys whose name starts with `_` (e.g. `_comment`) are stripped before validation
 
 | Language | API |
 |---|---|
-| Python | `from sutando_config import resolve_workspace, resolve_vault, load_config` |
-| TypeScript | `import { resolveWorkspace, resolveVault, loadConfig } from './sutando_config.js'` |
+| Python | `from sutando_config import resolve_workspace, resolve_vault, resolve_core_runtime, load_config` |
+| TypeScript | `import { resolveWorkspace, resolveVault, resolveCoreRuntime, loadConfig } from './sutando_config.js'` |
 | Swift | `SutandoConfig.resolveWorkspace()` / `SutandoConfig.loadConfig()` |
-| Bash | `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"` |
+| Bash | `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"`; runtime via `core-runtime` |
 
 `src/workspace_default.{py,ts}` (the legacy resolver) now delegates to the loader transparently — existing callers don't need code changes.
 

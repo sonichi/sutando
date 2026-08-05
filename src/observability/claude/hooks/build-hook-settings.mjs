@@ -18,6 +18,7 @@
 // https://code.claude.com/docs/en/hooks.md (incl. UserPromptExpansion and
 // MessageDisplay). Unknown keys would be silently ignored by the CLI.
 
+
 const hookScript = process.argv[2];
 if (!hookScript) {
 	process.stderr.write('usage: build-hook-settings.mjs <hook-script-path>\n');
@@ -34,6 +35,10 @@ const hooks = [{ type: 'command', command }];
 const life = [{ hooks }]; // lifecycle events (no matcher)
 const tool = [{ matcher: '*', hooks }]; // tool events (matched)
 
+// Skill-usage product telemetry moved OUT of this obs blob (2026-07-28): it is
+// registered unconditionally by build-core-settings.mjs, so the anonymous
+// feature counter no longer depends on the obs-endpoint opt-in (the coupling
+// that made #2254 merge but emit nothing in production).
 process.stdout.write(
 	JSON.stringify({
 		hooks: {

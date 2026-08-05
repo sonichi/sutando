@@ -27,12 +27,33 @@ Exit 0 on pass, 1 on fail.
 """
 
 from __future__ import annotations
+import tempfile
+import os
 import asyncio
 import importlib.util
 import sys
 import time
 import types
 from pathlib import Path
+
+# Isolate the channel config BEFORE importing the bridge, and SEED it.
+#
+# This file used to write a fake DISCORD_BOT_TOKEN into the operator's real
+# `~/.claude/channels/discord/.env` whenever that file was absent. On a machine
+# that has the file the write is a no-op, which is why it survived — the damage
+# lands only on a host that has LOST its token, which is the host you least want
+# a fake one planted on. A fake token also satisfies startup.sh's
+# `grep -q "DISCORD_BOT_TOKEN="` and defeats the #2638 vault fallback, which
+# fires only when no `.env` value exists.
+#
+# Seeding matters as much as redirecting: `channel_access_path()` falls back to
+# the legacy real-home `access.json` when the canonical path is missing, so an
+# EMPTY temp config dir still reads the operator's live allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-discord-bridge-sta-")
+_ccd_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd_discord.mkdir(parents=True, exist_ok=True)
+(_ccd_discord / "access.json").write_text('{"allowFrom": []}')
+(_ccd_discord / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -102,7 +123,7 @@ sys.modules["discord"] = _discord_stub
 
 def load_bridge():
     src = (REPO / "src" / "discord-bridge.py").read_text()
-    fake_env_dir = Path.home() / ".claude" / "channels" / "discord"
+    fake_env_dir = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
     fake_env = fake_env_dir / ".env"
     if not fake_env.exists():
         fake_env_dir.mkdir(parents=True, exist_ok=True)
@@ -327,10 +348,10 @@ def case_i_no_refs_returns_none():
         fails.append(f"i) no-refs body should return None, got {type(enriched).__name__}")
     enriched_empty = asyncio.run(bridge._prefetch_discord_state_refs(""))
     if enriched_empty is not None:
-        fails.append(f"i2) empty body should return None")
+        fails.append("i2) empty body should return None")
     enriched_none = asyncio.run(bridge._prefetch_discord_state_refs(None))
     if enriched_none is not None:
-        fails.append(f"i3) None body should return None")
+        fails.append("i3) None body should return None")
     return fails
 
 
@@ -347,7 +368,7 @@ def case_j_unexpected_exception_silent_fail():
         fails.append(f"j) unexpected exception leaked out of prefetch: {type(e).__name__}: {e}")
         return fails
     if enriched is not None:
-        fails.append(f"j) unexpected exception should return None, got enriched body")
+        fails.append("j) unexpected exception should return None, got enriched body")
     return fails
 
 
