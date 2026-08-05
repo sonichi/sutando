@@ -106,8 +106,8 @@ state.
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
 
-    ↻ = a cron job fires the `/proactive-loop` skill every 5 minutes
-        (`*/5 * * * *` in `skills/schedule-crons/crons.json`). The skill
+    ↻ = a cron job fires the `/proactive-loop` skill every 15 minutes
+        (`*/15 * * * *` in the per-host `crons.json`). The skill
         runs as a 10-minute pass that keeps a persistent watcher on
         `tasks/` via Claude Code's `Monitor` tool — pending tasks are
         processed the moment they arrive, not just on the cron tick.
