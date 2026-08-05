@@ -343,12 +343,25 @@ def _write_station_cache(path, data):
         pass
 
 
-def _station_cached(workspace):
+def _station_cached(workspace, *, now=None, ttl=_STATION_TTL):
     """READ-ONLY tri-state Station verdict from the on-disk cache — NEVER probes,
     so it is safe on derive()'s ~3s supervisor loop (always returns instantly).
-    Returns the last persisted value, or None (unknown) if the cache is absent.
-    The value is refreshed off-loop by the one-shot main() via _refresh_station."""
-    return _read_station_cache(_station_cache_file(workspace)).get("value")
+
+    Returns the persisted value only while it is FRESH (younger than `ttl`); an
+    expired or absent verdict reads as None (unknown) rather than a stale
+    confident True/False. Without this a last-known `True` would keep reporting
+    `station_available: true` forever after Station went down — and a stale
+    `False` would conceal recovery — since the continuous core-input-watch path
+    calls only derive() (never the refreshing main()). qingyun CR #2680. The
+    value is refreshed off-loop by the one-shot main() via _refresh_station."""
+    cache = _read_station_cache(_station_cache_file(workspace))
+    value_ts = cache.get("value_ts")
+    if value_ts is None:
+        return None
+    t = now if now is not None else time.time()
+    if (t - value_ts) >= ttl:
+        return None  # expired — unknown, not a stale confident verdict
+    return cache.get("value")
 
 
 def _probe_station_bounded(connect_timeout=_STATION_CONNECT_TIMEOUT,
@@ -368,15 +381,20 @@ def _probe_station_bounded(connect_timeout=_STATION_CONNECT_TIMEOUT,
     return {"true": True, "false": False}.get(out, None)
 
 
-def _refresh_station(workspace, *, now=None, deadline=_STATION_PROBE_DEADLINE,
+def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
+                     deadline=_STATION_PROBE_DEADLINE,
                      cooldown=_STATION_ATTEMPT_COOLDOWN, probe=None):
     """Probe the gateway (bounded, cancellable) and persist the verdict. Called
-    ONLY from the one-shot main() — never from derive()/the 3s loop. Writes an
-    attempt timestamp BEFORE probing and honors a cooldown so a hung resolver is
-    not re-entered by a separate one-shot caller. `probe`/`now` injectable."""
+    ONLY from the one-shot main() — never from derive()/the 3s loop. Honors the
+    TTL (a still-fresh verdict is not re-probed) and an attempt cooldown (a hung
+    resolver is not re-entered by a separate one-shot caller). `probe`/`now`
+    injectable."""
     now = now if now is not None else time.time()
     path = _station_cache_file(workspace)
     cache = _read_station_cache(path)
+    value_ts = cache.get("value_ts")
+    if value_ts is not None and (now - value_ts) < ttl:
+        return cache.get("value")  # still FRESH — no need to re-probe
     attempt_ts = cache.get("attempt_ts")
     if attempt_ts is not None and (now - attempt_ts) < cooldown:
         return cache.get("value")  # a recent attempt is in flight/just done

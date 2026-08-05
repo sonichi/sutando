@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -110,10 +111,19 @@ class TestAg2SpaceStationSignals(unittest.TestCase):
         self._sabotage_probes()
         self.assertIsNone(self.mod._station_cached(self.ws))  # no cache, no probe
 
-    def test_station_cached_returns_persisted_value_without_probing(self):
+    def test_station_cached_returns_fresh_persisted_value_without_probing(self):
         self._sabotage_probes()
         self._seed_cache(value=True, value_ts=1.0, attempt_ts=1.0)
-        self.assertTrue(self.mod._station_cached(self.ws))
+        self.assertTrue(self.mod._station_cached(self.ws, now=1.5, ttl=60.0))  # 0.5s old
+
+    def test_station_cached_none_when_value_is_expired(self):
+        # qingyun CR #2680 repro: a value older than the TTL must read as None
+        # (unknown), NOT a stale confident True that hides Station going down.
+        self._sabotage_probes()
+        self._seed_cache(value=True, value_ts=1000.0, attempt_ts=1000.0)
+        self.assertIsNone(self.mod._station_cached(self.ws, now=1000.0 + 3600, ttl=60.0))
+        # ...but still fresh within the TTL:
+        self.assertTrue(self.mod._station_cached(self.ws, now=1000.0 + 30, ttl=60.0))
 
     def test_derive_never_probes_even_when_the_resolver_would_stall(self):
         # THE fix: derive() runs on the 3s supervisor loop, so it must NEVER
@@ -131,6 +141,15 @@ class TestAg2SpaceStationSignals(unittest.TestCase):
         self.mod._run = lambda cmd: (None, "")
         self.mod._refresh_station(self.ws, now=1000.0, probe=lambda: False)
         self.assertFalse(self.mod.derive()["station_available"])
+
+    def test_refresh_skips_probe_when_cache_still_fresh(self):
+        # qingyun CR #2680: the one-shot refresh honors the TTL too — a still-fresh
+        # verdict is served without re-probing (not just gated on the cooldown).
+        self._seed_cache(value=True, value_ts=1000.0, attempt_ts=1000.0)
+        called = {"n": 0}
+        self.mod._refresh_station(self.ws, now=1030.0, ttl=60.0,  # 30s old (<60) -> fresh
+                                  probe=lambda: called.__setitem__("n", 1) or True)
+        self.assertEqual(called["n"], 0)
 
     def test_refresh_cooldown_skips_probe_of_a_recent_attempt(self):
         self._seed_cache(value=None, value_ts=None, attempt_ts=995.0)
@@ -182,7 +201,7 @@ class TestAg2SpaceStationSignals(unittest.TestCase):
     def test_derive_app_up_but_station_unreachable_are_independent(self):
         self.mod._run = lambda cmd: (0, "1\n")             # app process "running"
         self.mod._resolve_workspace = lambda repo: self.ws
-        self._seed_cache(value=False, value_ts=9e18, attempt_ts=9e18)  # station cached down
+        self._seed_cache(value=False, value_ts=time.time(), attempt_ts=time.time())  # fresh, cached down
         out = self.mod.derive()
         self.assertTrue(out["ag2space_app_running"])
         self.assertFalse(out["station_available"])          # app up != station reachable
