@@ -62,10 +62,59 @@ and loads whichever repo it reviews.
 6. **No hardcoded absolute paths.** Machine- or user-specific path literals
    (`/Users/…`, `/home/<user>/…`, `~/.claude`, `~/.sutando`, …) break on other hosts;
    resolve via the workspace/config helpers instead. Enforced by the `checks:` block.
-7. **A verdict must state merge-readiness explicitly** — "ready to merge" /
+7. **Never invoke a developer-tool binary at an absolute `/usr/bin/` path.** On macOS
+   `/usr/bin/git`, `python3`, `swift`, `swiftc`, `clang`, `gcc` and `make` are not those
+   tools — they are one inode hardlinked **78 ways** (`cc`, `c++`, `g++`, `clang++`,
+   `gnumake`, `bison`, `flex`, `git-upload-pack` … re-derive with
+   `ls -li /usr/bin | awk '$3==78'`) as the Xcode Command Line Tools *stub*. The
+   file exists whether or not the tools are installed; running it without them raises a
+   modal "install command line developer tools" dialog and returns nothing. Note the
+   converse: a *longer* name in the same family is often a real binary —
+   `/usr/bin/swift-inspect` has its own inode — so match these paths whole, never as a
+   prefix. Three
+   consequences a reviewer should check for: an absolute path **cannot be shadowed** by
+   a real install on PATH, so the user's own git/python never wins; every existence
+   probe (`test -x`, `command -v`, `shutil.which`, `FileManager.fileExists`) **passes
+   against the stub**, so none of them is a usable guard; and on a timer or polling path
+   the dialog **reappears forever**, not once. Resolve through the repo's helpers
+   instead — `git_argv` (`src/git_binary.py`), `SutandoConfig.resolvePython`, the `$PY`
+   cascade in `scripts/sutando-config.sh` — gate the system path on `xcode-select -p`
+   (the one probe that does not prompt), and degrade when nothing runnable is found. A
+   background health check must never be able to raise a system dialog.
+   *Grounded by:* #2469 (`health-check.py`, `agent-api.py` hardcoding `/usr/bin/git`)
+   and #2473 (`Sutando.app` falling back to `/usr/bin/env python3` behind a dead
+   `python@3.11` probe) — both reported from a clean macOS VM installing a bundled
+   Sutando, where the dialog returned every 60 seconds. Enforced by the `checks:` block —
+   but note its **limit**: the machine gate matches explicit `/usr/bin/…` tokens only. A
+   bare `git` or `python3` resolved through PATH lands on the same stub and the scanner
+   cannot see it, so a green scan is *not* proof this class is absent. #2469 fixed exactly
+   such a caller (`check_live_checkout_branch`, a bare `git`) that no pattern would flag.
+   Read the activated path.
+8. **A verdict must state merge-readiness explicitly** — "ready to merge" /
    "changes requested: …" / "LGTM, non-blocking". And it is only honest if you actually
    ran these criteria on *this* PR — a readiness claim with no evidence attached
    (no test run, no failure-mode named, no blast-radius call) is an over-claim.
+
+9. **A negative result is not evidence until the instrument is shown able to produce a
+   positive.** Much of a PR's evidence is a *zero*: "no other call sites", "no conflicts",
+   "no hardcoded paths", "the check is silent at HEAD". Every one is produced by an
+   instrument — a grep, a query, a script run — and an instrument that cannot fire returns
+   the same zero as a genuinely clean tree. For any load-bearing negative, ask what was run
+   and whether it was ever demonstrated to return non-zero. A control is cheap: run it where
+   the thing DOES exist, or against the parent commit, and show it counting.
+   *Grounded by:* four instances in one 2026-08-04 session, three of them the reviewer's own.
+   (a) `gh pr list --json reviewDecision | select(==null)` was used to conclude "zero
+   unreviewed PRs" — this repo requires reviews, so that field is never null and the query
+   could not have returned anything; the same run also silently truncated at `--limit 100`
+   of 105 open PRs. (b) An orphan-memory scan reported 4 unrecallable files; its pattern was
+   `[a-z0-9_]+` and one filename contained an uppercase letter — the true count was 0.
+   (c) Two before/after health-check runs both printed nothing, which reads as "the change
+   didn't fire"; `MEMORY_DIR` is repo-slug scoped, so from a worktree it resolved to a
+   directory that does not exist and the probe returned `None` — the code was correct both
+   times and the harness was wrong. (d) A peer's probe reported `1 pending question` against
+   a true 38 and delivered that number to the owner.
+   The tell is that a broken instrument and a clean result are *byte-identical*, so the
+   author's confidence carries no information.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
@@ -80,10 +129,62 @@ checks:
       - '/private/'
       - '~/.claude'
       - '~/.sutando'
+    # Whole-token matches (lesson 7): the Xcode-CLT stubs. Listed here rather
+    # than under `flag` because these are full executable paths, and a substring
+    # rule would also reject longer siblings in the same directory family —
+    # '/usr/bin/swift-inspect' is a separate REAL binary (its own inode, link
+    # count 1), unlike '/usr/bin/swift' and '/usr/bin/swiftc' which share the
+    # stub inode with 76 other names. Blocking a legitimate platform tool is how
+    # a mandatory gate gets disabled, so each stub is named exactly.
+    #
+    # To re-derive the family on a Mac: `ls -li /usr/bin | awk '$3==78'` — every
+    # entry sharing that inode is the same stub. Only the names this repo
+    # plausibly invokes are listed; add others as they come up.
+    #
+    # Non-stub /usr/bin binaries (env, pgrep, lsof, osascript, open, id, pmset,
+    # xcode-select) are deliberately absent: they are real binaries and safe to
+    # address absolutely.
+    flag_exact:
+      - '/usr/bin/git'
+      - '/usr/bin/python3'
+      - '/usr/bin/swift'
+      - '/usr/bin/swiftc'
+      - '/usr/bin/clang'
+      - '/usr/bin/clang++'
+      - '/usr/bin/gcc'
+      - '/usr/bin/g++'
+      - '/usr/bin/cc'
+      - '/usr/bin/make'
+      - '/usr/bin/gnumake'
     # ...unless the path token also matches one of these (fixtures / system noise).
     allow:
       - '/nonexistent'
       - '/usr/fake'
       - '/tmp/'
       - 'example.com'
+    # Tokens allowed ONLY when the SAME added line also carries a companion path
+    # for the SAME binary — i.e. the portable candidate-list shape, never a naked
+    # literal. Encoded as 'TOKEN_PREFIX :: COMPANION_PREFIX'.
+    #
+    # The companion is matched by BASENAME, not as a bare substring:
+    # '/opt/homebrew/bin/ffmpeg' is exempt only beside '/usr/local/bin/ffmpeg'.
+    # A substring test would exempt the naked form whenever any unrelated
+    # '/usr/local/...' shared the line, re-opening the blind spot.
+    #
+    # Why paired and not a plain allow: '/opt/homebrew/' is Apple-Silicon-only
+    # (Intel Homebrew installs under /usr/local), so an UNPAIRED use still breaks
+    # a supported host — exactly the bug class rule 6 exists to catch. A global
+    # prefix allow would hide that naked form too, which is broader than the need.
+    # Pairing keeps the portable form legal while a bare
+    # `X = "/opt/homebrew/bin/ffmpeg"` stays flagged.
+    #
+    # Scope note: this is a SAME-LINE test. The candidate lists it exists for are
+    # written on one line (see skills/screen-record narration-tee.ts + record.py).
+    # A list split across lines will still flag — deliberately: a multi-line
+    # window would re-admit the naked form whenever a same-named companion
+    # appeared anywhere nearby. Reformat the list onto one line, or resolve via a
+    # shared helper. Controls for both directions live in
+    # tests/review-checks.test.sh ('candidate-list' / 'naked' / 'unrelated').
+    allow_paired:
+      - '/opt/homebrew/ :: /usr/local/'
 ```

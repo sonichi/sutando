@@ -141,7 +141,14 @@ export function serveCollector(collector: Collector, opts?: { port?: number; hos
 		if (url.startsWith('/health')) {
 			res
 				.writeHead(200, { 'content-type': 'application/json' })
-				.end(JSON.stringify({ ok: true, sources: collector.sources(), ingested }));
+				.end(
+					JSON.stringify({
+						ok: true,
+						service: 'sutando-observability-collector',
+						sources: collector.sources(),
+						ingested,
+					}),
+				);
 			return;
 		}
 
