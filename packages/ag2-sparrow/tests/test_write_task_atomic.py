@@ -49,8 +49,18 @@ def test_write_task_publishes_atomically_and_completely():
         assert list(m.TASKS_DIR.glob("task-*.txt")) == [dest]
         body = dest.read_text()
         assert body.endswith("\n")
-        # access_tier is written LAST so a last-occurrence parser can't be tricked.
-        assert body.rstrip().splitlines()[-1].startswith("access_tier:")
+        # The anti-spoof invariant survives the owner-tier ===SKILL INSTRUCTIONS===
+        # block (#2686): access_tier is the ONLY header-shaped access_tier line,
+        # and everything after it is bridge-generated block text that never
+        # carries the key — so a last-occurrence parser still can't be tricked.
+        lines = body.rstrip().splitlines()
+        tier_at = [i for i, ln in enumerate(lines) if ln.startswith("access_tier:")]
+        assert len(tier_at) == 1
+        tail = lines[tier_at[0] + 1:]
+        assert any(ln.startswith("===SKILL INSTRUCTIONS") for ln in tail)
+        # Completeness: the block's final line (the result path) is the file tail —
+        # a truncated write cannot produce it.
+        assert lines[-1].endswith(f"results/{tid}.txt")
         assert "id: task-1784500000000" in body
         assert "source: ag2space" in body
         print("PASS test_write_task_publishes_atomically_and_completely")
