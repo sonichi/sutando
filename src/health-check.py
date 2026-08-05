@@ -6295,6 +6295,25 @@ def _local_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0)
     file: the name `core_heartbeat` writes, via the same `util_paths._host_label()`
     it uses — not `socket.gethostname()`, which drifts from the label under a
     DHCP rename and would look for a file nobody writes.
+
+    THREE-STATE, and that is the whole point (john-the-dev, #2160). An earlier
+    version returned a plain bool and collapsed "I could not find out" into
+    "dead". The actuator computes `dead = not alive`, so a transient import,
+    permission, or filesystem failure restarted a perfectly healthy core.
+    Reproduced on the exact head: make `_host_label()` raise, call the actuator
+    twice, and pass 2 returns `restarted`.
+
+    My own case `t` had asserted that False was the "fail-safe" direction,
+    reasoning that an unidentifiable host must not get recovery SUPPRESSED. That
+    weighed only one of the two failures. For an actuator whose action is
+    destructive, killing a healthy core is the worse one, and it is the one a
+    flaky probe actually produces.
+
+    So the states are distinct:
+      True  — a heartbeat exists and is fresh
+      False — DEFINITIVELY dead: the file is absent, or its mtime is stale
+      None  — UNKNOWN: the host could not be identified, or the file exists but
+              could not be read. Callers must not take a destructive action.
     """
     if workspace is None:
         workspace = WORKSPACE_DIR
@@ -6303,12 +6322,14 @@ def _local_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0)
         from util_paths import _host_label
         label = _host_label()
     except Exception:
-        return False          # cannot identify this host -> do not claim alive
+        return None           # cannot identify this host -> UNKNOWN, not dead
     alive_file = workspace / "state" / "cores" / f"{label}.alive"
     try:
         return (time.time() - alive_file.stat().st_mtime) < max_age_s
+    except FileNotFoundError:
+        return False          # no heartbeat file at all == definitively dead
     except OSError:
-        return False          # absent or unreadable == not alive
+        return None           # exists but unreadable (permissions, I/O) -> UNKNOWN
 
 
 def _alerts_suppressed(check: dict) -> bool:
@@ -6838,9 +6859,18 @@ def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
     (qingyun-wu, #2160).
 
     Reads exactly the file `core_heartbeat` writes for this host, via the same
-    `util_paths._host_label()`. An unresolvable label or unreadable file means
-    NOT just-booted, so the failure mode is an extra observation rather than a
-    suppressed relaunch — the same direction `_local_core_alive` fails in.
+    `util_paths._host_label()`.
+
+    THREE-STATE for the same reason as `_local_core_alive` — this is the second
+    helper john-the-dev flagged. It gates a destructive action, so "I could not
+    read it" must not read as "not just booted, go ahead and restart":
+      True  — started_at is present and within the window
+      False — DEFINITIVELY not just-booted (fresh heartbeat, older started_at)
+      None  — UNKNOWN: unresolvable label, unreadable/undecodable file, or a
+              started_at that is missing or not a number.
+
+    Note a stale heartbeat still returns False, not None: a heartbeat we CAN
+    read and that is old is real evidence the core is not freshly booted.
     """
     if workspace is None:
         workspace = WORKSPACE_DIR
@@ -6851,17 +6881,19 @@ def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
         from util_paths import _host_label
         label = _host_label()
     except Exception:
-        return False
+        return None
     alive_file = workspace / "state" / "cores" / f"{label}.alive"
     try:
         if now - alive_file.stat().st_mtime >= 90.0:
-            return False          # stale heartbeat — not a live, just-booted core
+            return False          # stale heartbeat — readable, and not just-booted
         data = json.loads(alive_file.read_text())
+    except FileNotFoundError:
+        return False              # no heartbeat at all — nothing booted here
     except (OSError, ValueError):
-        return False
+        return None               # unreadable / undecodable -> UNKNOWN
     started = data.get("started_at")
     if not isinstance(started, (int, float)):
-        return False
+        return None               # cannot tell when it booted -> UNKNOWN
     return (now - started) < seconds
 
 
@@ -7002,11 +7034,25 @@ def recover_core_if_wedged(
         oldest_age = oldest[1] if oldest else None
         status_ts = status_ts_fn()
         alive = alive_fn()
+        just_booted = just_booted_fn()
+        # UNKNOWN liveness must never reach the destructive path (john-the-dev,
+        # #2160). `dead` below is `not alive`, so a None here would restart a
+        # healthy core on nothing but a failed probe. Bail BEFORE any decision,
+        # and deliberately leave the observation state untouched: clearing it
+        # would let an intermittently-failing probe reset the confirm window
+        # forever and silently disable recovery — the very failure the old
+        # fail-to-False was reaching for, now handled without the destructive
+        # side. An injected bool from a test is unaffected.
+        if alive is None or just_booted is None:
+            which = "liveness" if alive is None else "boot-guard"
+            print(f"[recover-core] WARNING: local {which} probe failed — state is "
+                  f"UNKNOWN, not dead; suppressing restart this pass", file=sys.stderr)
+            return {"action": "probe-failed", "probe": which}
         wedged = (
             alive
             and oldest is not None
             and oldest_age > RECOVER_WEDGE_SEC
-            and not just_booted_fn()
+            and not just_booted
         )
         # Dead-core relaunch: a fully-dead core (no fresh heartbeat) is a
         # DISTINCT gap from a wedge — the session exited, taking its in-session
@@ -7016,7 +7062,7 @@ def recover_core_if_wedged(
         # bounded by RECOVER_COOLDOWN_SEC + RECOVER_MAX_PER_HOUR), and the
         # confirm window means the death must persist across a pass (not a
         # brief mid-restart blip; `just_booted_fn()` also excludes a fresh core).
-        dead = (not alive) and (not just_booted_fn())
+        dead = (not alive) and (not just_booted)
 
         if not wedged and not dead:
             # Healthy / just booted. Clear any in-progress observation so a

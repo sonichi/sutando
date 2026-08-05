@@ -619,12 +619,83 @@ def case_t_unresolvable_host_label_reads_NOT_alive():
 
     util_paths._host_label = _boom
     try:
-        if hc._local_core_alive(ws):
+        got = hc._local_core_alive(ws)
+        # `is None`, NOT falsiness. The previous assertion was `if
+        # _local_core_alive(ws):` — which None passes just as well as False, so
+        # it could not tell the two apart and stayed green while the function
+        # returned the dangerous value. A three-state contract needs an
+        # identity check on each state or it pins nothing.
+        if got is not None:
             fails.append(
-                "t) an unresolvable host label read ALIVE — that suppresses the "
-                "relaunch on a host whose identity is already broken")
+                "t) an unresolvable host label returned %r — it must be None "
+                "(UNKNOWN). False means DEFINITIVELY DEAD, and the actuator "
+                "turns that into a restart of a healthy core." % (got,))
     finally:
         util_paths._host_label = original
+
+    # The other two states, so None is not simply what this function always
+    # returns — a control that cannot go positive proves nothing.
+    if hc._local_core_alive(ws) is not True:
+        fails.append("t) a fresh local heartbeat must read exactly True")
+    (ws / "state" / "cores" / f"{original()}.alive").unlink()
+    if hc._local_core_alive(ws) is not False:
+        fails.append("t) an ABSENT heartbeat must read exactly False (dead), not None")
+    return fails
+
+
+def case_v_an_unknown_probe_must_not_restart_a_healthy_core():
+    """The paired unknown-state control john-the-dev asked for (#2160).
+
+    Case t pins the helper; this pins the ACTUATOR, because they failed
+    independently — the helper returning False was only dangerous once
+    `dead = not alive` turned it into a destructive action.
+
+    Reviewer's exact repro, which reproduced on the pre-fix head: make
+    `_host_label()` raise, then run the actuator twice across the confirm
+    window with the DEFAULT liveness/boot guards. It returned `observed` then
+    `restarted`, killing a core it never established was down.
+
+    Two passes, not one: a single pass returns `observed` under BOTH the broken
+    and fixed versions, so a one-pass assertion is another test that cannot
+    fail. The restart only appears after the confirm window elapses.
+    """
+    import pathlib, sys as _sys, tempfile
+    fails = []
+    ws = pathlib.Path(tempfile.mkdtemp())
+    (ws / "state" / "cores").mkdir(parents=True)
+    orig_ws = hc.WORKSPACE_DIR
+    hc.WORKSPACE_DIR = ws
+
+    _sys.path.insert(0, str(pathlib.Path(hc.__file__).resolve().parent))
+    import util_paths
+    original = util_paths._host_label
+    util_paths._host_label = lambda: (_ for _ in ()).throw(RuntimeError("unresolvable"))
+
+    restarts = []
+    try:
+        common = dict(
+            state_file=ws / "rec.json",
+            oldest_task_fn=lambda: ("task-stuck", 5000),
+            status_ts_fn=lambda: None,
+            restart_fn=lambda standard_context: restarts.append(True) or True,
+            sender=lambda text: True,
+        )   # alive_fn / just_booted_fn DELIBERATELY not injected — the defaults
+            # are the thing under test.
+        r1 = hc.recover_core_if_wedged(now=1000000, **common)
+        r2 = hc.recover_core_if_wedged(now=1000200, **common)
+    finally:
+        util_paths._host_label = original
+        hc.WORKSPACE_DIR = orig_ws
+
+    if restarts:
+        fails.append(
+            "v) a failed liveness probe RESTARTED the core — unknown state must "
+            "suppress the destructive action, not trigger it")
+    for lbl, r in (("pass1", r1), ("pass2", r2)):
+        if (r or {}).get("action") != "probe-failed":
+            fails.append(
+                f"v) {lbl} returned {r} — an unknown probe must surface itself as "
+                "'probe-failed', not pass silently as an observation")
     return fails
 
 
@@ -692,6 +763,7 @@ def main() -> int:
         ("r", case_r_local_liveness_ignores_peer_heartbeats),
         ("s", case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet),
         ("t", case_t_unresolvable_host_label_reads_NOT_alive),
+        ("v", case_v_an_unknown_probe_must_not_restart_a_healthy_core),
         ("u", case_u_peer_boot_does_not_suppress_local_recovery),
         ("j2", case_j2_dead_core_before_after_output),
         ("k", case_k_draining_backlog_never_restarts),
