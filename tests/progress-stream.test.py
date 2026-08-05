@@ -6,6 +6,8 @@ matching the repo's other *.test.py suites).
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -34,6 +36,112 @@ check("flag on when =1", ps.stream_enabled() is True)
 os.environ["SUTANDO_PROGRESS_STREAM"] = "true"
 check("flag off when !=1 (strict)", ps.stream_enabled() is False)
 os.environ.pop("SUTANDO_PROGRESS_STREAM", None)
+
+# --- stream_enabled config-file fallback (env unset → bridges.progress_stream) ---
+import sutando_config as sc  # noqa: E402
+
+_orig_resolve = sc.resolve_progress_stream
+try:
+    os.environ.pop("SUTANDO_PROGRESS_STREAM", None)
+    sc.resolve_progress_stream = lambda *a, **k: True
+    check("config True → ON when env unset", ps.stream_enabled() is True)
+    sc.resolve_progress_stream = lambda *a, **k: False
+    check("config False → OFF when env unset", ps.stream_enabled() is False)
+    sc.resolve_progress_stream = lambda *a, **k: None
+    check("config unset → OFF (default)", ps.stream_enabled() is False)
+    # env is the override — it wins over config either way
+    os.environ["SUTANDO_PROGRESS_STREAM"] = "0"
+    sc.resolve_progress_stream = lambda *a, **k: True
+    check("env=0 overrides config True → OFF", ps.stream_enabled() is False)
+    os.environ["SUTANDO_PROGRESS_STREAM"] = "1"
+    sc.resolve_progress_stream = lambda *a, **k: False
+    check("env=1 overrides config False → ON", ps.stream_enabled() is True)
+    # config reader raising must fall through to the safe default (OFF), never
+    # break the caller — exercises the except branch in stream_enabled().
+    os.environ.pop("SUTANDO_PROGRESS_STREAM", None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("config unreadable")
+
+    sc.resolve_progress_stream = _boom
+    check("config read raises → OFF (safe)", ps.stream_enabled() is False)
+finally:
+    sc.resolve_progress_stream = _orig_resolve
+    os.environ.pop("SUTANDO_PROGRESS_STREAM", None)
+
+# --- resolve_progress_stream: exercise the REAL config reader (not mocked) ---
+with tempfile.TemporaryDirectory() as _cd:
+    _cfgp = Path(_cd) / "sutando.config.json"
+
+    def _resolve_with(val):
+        sc._reset_cache_for_tests()
+        body = {"bridges": {"progress_stream": val}} if val is not None else {"core": {"runtime": "claude"}}
+        _cfgp.write_text(json.dumps(body))
+        return sc.resolve_progress_stream(repo_root=Path(_cd))
+
+    check("resolve_progress_stream True", _resolve_with(True) is True)
+    check("resolve_progress_stream False", _resolve_with(False) is False)
+    check("resolve_progress_stream unset → None", _resolve_with(None) is None)
+
+    # --- ONLY a real JSON boolean counts (#2308 review, qingyun + john) ---
+    # The old `bool(val)` inverted intent on exactly the shapes people type
+    # when DISABLING something: `"false"` and `{"enabled": false}` both became
+    # True and switched owner-channel progress messages ON. The loader is
+    # deliberately schema-lenient at runtime, so the JSON schema does not
+    # protect a hand-edited sutando.config.local.json — the guard lives in the
+    # resolver and this is its regression.
+    #
+    # Deliberately the whole TYPE AXIS, not just the three values the reviewers
+    # named: the property is "non-bool ⇒ unset", so a fixture that only pins
+    # str/dict/int would stay green if a future branch special-cased lists or
+    # floats. Truthy AND falsy of each type, because the bug was a truthiness
+    # bug and a falsy-only fixture would have passed against the broken code.
+    def _resolve_capturing_stderr(val):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = _resolve_with(val)
+        return got, ("must be a JSON boolean" in err.getvalue())
+
+    for _label, _val in [
+        ('string "false"', "false"),          # the headline case
+        ('string "true"', "true"),
+        ('string "no"', "no"),
+        ("empty string", ""),
+        ('object {"enabled": false}', {"enabled": False}),
+        ("empty object", {}),
+        ("list [1]", [1]),
+        ("empty list", []),
+        ("int 1", 1),
+        ("int 0", 0),
+        ("float 1.0", 1.0),
+    ]:
+        _got, _warned = _resolve_capturing_stderr(_val)
+        check(f"non-bool {_label} → None (unset, streamer stays OFF)", _got is None)
+        check(f"non-bool {_label} emits a diagnostic", _warned)
+
+    # A real boolean must NOT draw the diagnostic — otherwise the warning is
+    # noise on every valid config and gets tuned out.
+    for _label, _val in (("True", True), ("False", False)):
+        _got, _warned = _resolve_capturing_stderr(_val)
+        check(f"bool {_label} still honored", _got is _val)
+        check(f"bool {_label} emits NO diagnostic", not _warned)
+
+    # The diagnostic is ONE-TIME, matching _warn_unknown_top_level_keys. The
+    # resolver is called per bridge message, so a per-call warning would spam
+    # the log for as long as the bad value sits in the config. Every case above
+    # resets the flag via _reset_cache_for_tests(), so without this the
+    # already-warned early-return never executes.
+    sc._reset_cache_for_tests()
+    _cfgp.write_text(json.dumps({"bridges": {"progress_stream": "false"}}))
+    _errs = []
+    for _ in range(3):
+        _e = io.StringIO()
+        with contextlib.redirect_stderr(_e):
+            sc.resolve_progress_stream(repo_root=Path(_cd))   # no reset between calls
+        _errs.append("must be a JSON boolean" in _e.getvalue())
+    check("diagnostic fires on the FIRST bad read", _errs[0])
+    check("diagnostic is one-time, not once per call", _errs[1:] == [False, False])
+sc._reset_cache_for_tests()
 
 # --- should_stream_task (owner-only) ---
 check("owner streams", ps.should_stream_task("owner") is True)
@@ -95,6 +203,21 @@ check("format negative elapsed clamps to 0", ps.format_progress("x", -5) == "⏳
 long_step = "z" * 500
 out = ps.format_progress(long_step, 3, max_len=180)
 check("format truncates long step", len(out) < 220 and out.endswith("(3s)") and "…" in out)
+
+# --- is_progress_placeholder (ingestion-gate flood guard) ---
+check("placeholder: working…", ps.is_progress_placeholder("⏳ working… (9s)") is True)
+check("placeholder: with step", ps.is_progress_placeholder("⏳ Checked 42 open PRs (137s)") is True)
+check("placeholder: leading/trailing ws", ps.is_progress_placeholder("  ⏳ working… (0s)  ") is True)
+check("placeholder: round-trips format_progress", ps.is_progress_placeholder(ps.format_progress("reviewing", 45)) is True)
+check("placeholder: round-trips None step", ps.is_progress_placeholder(ps.format_progress(None, 3)) is True)
+# false positives — real owner tasks must NOT be dropped
+check("not placeholder: emoji mid-sentence", ps.is_progress_placeholder("check the ⏳ status? (see #1)") is False)
+check("not placeholder: no (Ns) tail", ps.is_progress_placeholder("⏳ waiting on review") is False)
+check("not placeholder: no leading marker", ps.is_progress_placeholder("Please review PR (3s)") is False)
+check("not placeholder: multi-line", ps.is_progress_placeholder("⏳ a\nreal task (5s)") is False)
+check("not placeholder: empty", ps.is_progress_placeholder("") is False)
+check("not placeholder: None", ps.is_progress_placeholder(None) is False)
+check("not placeholder: non-str", ps.is_progress_placeholder(42) is False)
 
 print()
 if _fails:

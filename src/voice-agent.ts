@@ -86,13 +86,17 @@ function assertGeminiKey(name: string, value: string): void {
 	}
 }
 
-import { voiceApiKey } from './voice-key.js';
-// Voice surfaces use the shared GEMINI_VOICE_API_KEY → GEMINI_API_KEY chain
-// via voiceApiKey() (src/voice-key.ts). The VOICE-key fallback path isolates
-// voice billing onto a paid-tier key when set; unset still works.
-const GEMINI_VOICE_API_KEY = voiceApiKey();
+import { resolveCredential } from './credential-resolver.js';
+// Voice credential resolves via the G8 capability resolver: managed tier
+// (state/auth/managed-credentials.json) → GEMINI_VOICE_API_KEY → GEMINI_API_KEY.
+// The VOICE-key fallback path isolates voice billing onto a paid-tier key when
+// set; unset still works. `source` names the winning tier in startup errors.
+const voiceCredential = resolveCredential('gemini-voice');
+const GEMINI_VOICE_API_KEY = voiceCredential.key;
 assertGeminiKey(
-	process.env.GEMINI_VOICE_API_KEY ? 'GEMINI_VOICE_API_KEY' : 'GEMINI_API_KEY',
+	voiceCredential.source === 'managed'
+		? 'managed credentials (state/auth)'
+		: process.env.GEMINI_VOICE_API_KEY ? 'GEMINI_VOICE_API_KEY' : 'GEMINI_API_KEY',
 	GEMINI_VOICE_API_KEY,
 );
 

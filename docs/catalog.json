@@ -1,6 +1,20 @@
 {
   "schema_version": 1,
   "documents": {
+    "docs/design-credential-capability-resolver.md": {
+      "title": "Credential resolution by capability, not key (G8)",
+      "audience": ["contributors", "maintainers"],
+      "status": "draft",
+      "canonical_for": "the capability-not-key credential-resolver contract: tier order, managed-file schema, source observability, and the reader-sweep migration plan",
+      "last_verified": "2026-08-02"
+    },
+    "docs/runtime-dependencies.md": {
+      "title": "External runtime dependencies",
+      "audience": ["users", "operators", "contributors", "maintainers"],
+      "status": "canonical",
+      "canonical_for": "external tool and package requirements, and what to vendor when embedding Sutando",
+      "last_verified": "2026-08-04"
+    },
     "docs/README.md": {
       "title": "Sutando documentation",
       "audience": ["users", "operators", "contributors", "maintainers"],
@@ -13,7 +27,7 @@
       "audience": ["contributors", "maintainers"],
       "status": "draft",
       "canonical_for": "proposed core, enterprise, and extension architecture boundaries",
-      "last_verified": "2026-07-27"
+      "last_verified": "2026-08-02"
     },
     "docs/adr/0001-pointer-teacher-brain.md": {
       "title": "Pointer Teacher brain: accessibility-first, Gemini-vision fallback",
@@ -27,14 +41,14 @@
       "audience": ["users", "operators", "agents"],
       "status": "canonical",
       "canonical_for": "built-in capability catalog",
-      "last_verified": null
+      "last_verified": "2026-07-29"
     },
     "docs/codex-core.md": {
       "title": "Codex CLI as the Sutando core",
       "audience": ["users", "operators"],
       "status": "active",
       "canonical_for": "Codex core setup and rollback",
-      "last_verified": null
+      "last_verified": "2026-08-04"
     },
     "docs/community-use-cases/README.md": {
       "title": "Community use cases",

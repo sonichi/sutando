@@ -43,7 +43,28 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 3. For each job in the config:
    - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
    - **Skip any entry with `"launchd": true`** — it is owned by the OS-level cron-runner (see "Reliable OS-level crons" below), which emits its task independently. Registering it here too would double-fire (duplicate deliveries — the exact noise class the launchd path was built to avoid).
-   - Skip if a job with matching prompt/name already exists
+   - **For a `CronCreate`-registered entry (one visible as a job in `CronList`): if a job for this
+     entry already exists, RE-REGISTER it rather than skipping** — `CronDelete` the existing job,
+     then `CronCreate` from the current `crons.json` text, and confirm the replacement in
+     `CronList`. This bullet does **not** apply to the dynamic-loop branch below (`loop: "dynamic"`),
+     which is never `CronCreate`d and keeps its own freshness-sentinel guard — re-launching one
+     mid-session would re-run the loop body immediately, the exact failure that guard prevents. A session cron is a **snapshot of the prompt taken at registration
+     time**; editing `crons.json` afterwards does not reach it. The former rule here was "skip if a
+     job with matching prompt/name already exists", which made that snapshot permanent for the life
+     of the session: a long-lived core kept firing a prompt its own config had already superseded,
+     and every cheap check agreed the config was right.
+     Observed on a long-lived core: it booted 2026-07-30, the `pr-flag` entry gained
+     `--stand "<stand>"` on 2026-08-03, and the registered job kept firing the pre-edit text for two
+     days. That flag is what makes `pr_flag.py` populate `is_mine` (it is deliberately `null`
+     without one), so the cron's own instruction — "judge from `ci/mergeable/review/approvals/
+     is_mine`" — was reading a field that was structurally always null, with a correct script *and*
+     a correct config file. Re-registering fixed it: `is_mine` went from null on all 27 PRs to
+     20 true / 5 false.
+     **Do not "compare the prompt and only re-register on a mismatch": `CronList` truncates the
+     prompt**, so the differing tail is exactly what a comparison cannot see — the `--stand` drift
+     above sat past the truncation point. Unconditional re-registration is the only reliable form.
+     This does not risk the inline-fire failure described at the end of this step: `CronCreate`
+     schedules the next fire time and never runs the prompt on registration.
    - Call `CronCreate` with the cron expression and prompt:
      - If `prompt_skill` is set, pass `prompt: "/skill-name"` (the leading slash makes the scheduled cron fire the skill as a slash command at its scheduled time).
      - Otherwise pass `prompt: <prompt-string-from-config>`.
@@ -63,9 +84,18 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    WS="$(bash scripts/sutando-config.sh workspace)"
    H="$(bash scripts/sutando-config.sh host-label)"
    mkdir -p "$WS/hosts/$H"
-   echo "{\"ts\": $(date +%s), \"registered\": <count>, \"config_total\": <total entries in crons.json>}" > "$WS/hosts/$H/schedule-crons-stamp.json"
+   DIGESTS="$(python3 "$(git -C . rev-parse --show-toplevel)/src/cron_entry_digest.py" "$WS/hosts/$H/crons.json")"
+   echo "{\"ts\": $(date +%s), \"registered\": <count>, \"config_total\": <total entries in crons.json>, \"config_digests\": $DIGESTS}" > "$WS/hosts/$H/schedule-crons-stamp.json"
    ```
    `health-check.py`'s `session-crons` probe compares this host-owned stamp against the same host's core heartbeat `started_at`: a stamp older than the boot means session crons died with a previous session and were never re-registered (the silent 2/18 failure observed on a peer instance 2026-07-23). Do not skip the stamp on re-runs — a fresh stamp is what keeps the guard quiet.
+
+   **`config_digests` is what makes an edit visible.** Everything else in the stamp is a COUNT, and a
+   count cannot see an entry whose prompt changed after it was registered. Stamp the digest map of
+   the `crons.json` you just registered from; the probe recomputes it and names any session-owned
+   entry whose digest moved. Write it in the SAME command as the counts — a digest map stamped
+   separately can be skipped, and a stamp with fresh counts and a stale digest map is worse than one
+   with no digest map at all. Omitting the field is safe (the probe skips the check); a WRONG map
+   would report drift that is not there.
 
 6. Confirm what was scheduled — note whether the proactive-loop fallback was triggered (informs operator that crons.json may need a persistent entry).
 
@@ -135,3 +165,34 @@ This installs `com.sutando.cron-runner` (launchd, every 60s → `src/cron-runner
 When the selected core runtime is Codex on macOS, `src/agent/codex/cli/start-cli.sh` performs this installation/reconciliation automatically. Manual installation remains the opt-in path for Claude-core hosts.
 
 **Ownership partition (no double-fire):** the launchd runner handles ONLY `"launchd": true` entries; this session skill (step 3) skips those same entries. Exactly one scheduler owns each cron. Leave `main-loop` / `/proactive-loop` session-owned (it drives the session itself — it is not a task and must never be launchd-owned).
+
+## Digest cron delivery — write one `results/proactive-*.txt`, nothing else
+
+`notify.py` is for **progress pings only** (≤280 chars). Digest-style cron prompts that produce research summaries (1000–2000 chars) are silently dropped by notify.py's hard limit — the user sees nothing.
+
+**Correct delivery pattern for digest crons — the shared proactive primitive:**
+
+```
+DELIVERY: Write the complete digest to results/proactive-<name>-$(date +%s).txt
+(and nothing else). Do NOT use notify.py for the final result — it rejects
+messages over 280 chars (it is a progress-ping tool, not a delivery channel).
+```
+
+`results/proactive-*.txt` is the **one cross-surface delivery contract** — every
+configured bridge (Discord, Telegram, Slack) drains it, and `proactive_routing.py`
+routes each file to the channel where the owner was **most recently active**, exactly
+once (atomic `.sending` claim). That's why it's the primitive to use.
+
+**Do NOT** write `results/briefing-*` and **do NOT** mint a synthetic
+`tasks/task-cron-*` "for Tasks-tab visibility":
+- `briefing-*` is not a universal prefix — only Discord (`FALLBACK_PREFIXES` in
+  `poll_dm_fallback`) and Telegram (a briefing-as-proactive patch) drain it; **Slack
+  never delivers it**, so a `briefing-*` digest is silently archived on a Slack-only
+  install. `proactive-*` has no such gap.
+- A hand-written `tasks/task-cron-*` is an **orphan**: nothing writes a matching
+  `results/task-cron-*` keyed to that id, so the task never "completes" — the watcher
+  re-processes it (duplicate/noisy execution) and the task-id-keyed consumers
+  (Slack/Telegram/agent-api) deliver nothing. Delivery comes from the `proactive-*`
+  file alone; you don't need a task file for it.
+
+See `crons.example.json` for the `example-digest` entry that shows this pattern. Scripts (like `src/morning-briefing.py`) already emit `results/proactive-*.txt` themselves and don't need this — only inline prompt crons that produce long output.
