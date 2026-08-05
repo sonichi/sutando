@@ -57,6 +57,21 @@ parse_etime_seconds() {
   echo $(( 10#$days*86400 + 10#$hours*3600 + 10#$mins*60 + 10#$secs ))
 }
 
+# --- 0. refuse to kill what nothing would respawn ---
+# On a host where the launchd job is not loaded (plain dev checkout —
+# startup.sh launches voice-agent directly), the takeover below would kill the
+# running agent and the kickstart would then fail with NOTHING to respawn it:
+# a working voice stack turned into an outage. The old direct-kickstart
+# callers (voice-config-switch, health-check --fix) silently no-op'd on such
+# hosts; with those call sites routed through this wrapper (amendment T4), the
+# no-respawn case must abort BEFORE the guarded takeover runs.
+if ! launchctl print "${SERVICE}" > /dev/null 2>&1; then
+  echo "FAIL  ${SERVICE} is not loaded — voice-agent is not launchd-managed on this host,"
+  echo "      so nothing would respawn it after a kill. Aborting without touching the"
+  echo "      lock or the process. Restart it directly instead: bash src/restart.sh"
+  exit 5
+fi
+
 # --- 1. capture old listener PID ---
 OLD_PID="$(get_listener_pid || true)"
 if [ -z "${OLD_PID}" ]; then

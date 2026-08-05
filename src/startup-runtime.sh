@@ -189,3 +189,44 @@ configure_startup_runtime() {
 phone_stack_enabled() {
   [ "${SKIP_PHONE:-}" != "1" ] && [ "${SKIP_VOICE:-}" != "1" ]
 }
+
+# Voice-agent (:9900) must NOT go through startup.sh's generic
+# reap_wedged_listener: `lsof -ti :9900 | xargs kill` signals whatever owns the
+# port on a port match alone — exactly the unvalidated-kill class the
+# voice-reliability plan removes (amendments S4/T4/U1). The wedge probe is the
+# same real-HTTP liveness check, but the kill-and-replace transaction is
+# delegated to ONE guarded `voice-lock.py takeover` invocation: validate
+# identity (lock pid = :9900 LISTEN pid, realpath'd entry shape, startTimeMs)
+# → TERM → wait → KILL → revalidate → unlink, all under the held fcntl guard.
+# Identity mismatch or an unknown/absent lock ⇒ takeover-blocked: nothing is
+# signaled, the lock is left untouched, and the start path just reports the
+# port occupied. Interpreter unavailable ⇒ fail closed (skip the reap, warn) —
+# never signal without validation.
+#
+# Expects REPO, WORKSPACE and PY (resolved interpreter, may be empty) from the
+# caller. Lives here (sourceable) so the wedge-recovery test runs the real
+# function instead of a copy.
+reap_wedged_voice_agent() {
+  local port="$1" rc=0 out
+  lsof -i :"$port" -sTCP:LISTEN > /dev/null 2>&1 || return 0
+  curl -s -o /dev/null -m 10 "http://127.0.0.1:$port/__liveness_probe__" || rc=$?
+  [ "$rc" -eq 28 ] || return 0
+  echo "  ⚠ voice-agent (port $port) listening but unresponsive — attempting guarded takeover"
+  if [ -z "${PY:-}" ]; then
+    echo "  ⚠ no usable python3 for the guarded voice lock helper — not killing blindly (fail closed)"
+    return 0
+  fi
+  if out="$("$PY" "$REPO/scripts/voice-lock.py" takeover \
+      --pidfile "$WORKSPACE/.voice-agent.pid" \
+      --guard "$WORKSPACE/.voice-agent.lock.guard" \
+      --workspace "$WORKSPACE" \
+      --mode adopted --port "$port" \
+      --entry "$REPO/src/voice-agent.ts" \
+      --entry "$REPO/dist/voice-agent.js" 2>&1)"; then
+    echo "  ✓ guarded takeover of wedged voice-agent: $out"
+    sleep 1
+  else
+    echo "  ⚠ guarded takeover blocked/failed — leaving the listener untouched (a live lock is never removed): $out"
+  fi
+  return 0
+}

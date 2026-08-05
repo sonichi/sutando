@@ -833,11 +833,14 @@ else
   # don't fight over port 9900 (issue #1888 bug 2 — duplicate listeners when
   # launchd respawns while startup.sh's direct process still holds the port).
   #
-  # reap_wedged_listener runs BEFORE the launchd ownership check intentionally:
+  # The wedge reap runs BEFORE the launchd ownership check intentionally:
   # KeepAlive only triggers on process exit, not on hang. A hung process can hold
   # the port indefinitely — reaping it first frees the port so the subsequent
   # kickstart (or launchd's own respawn on exit) gets a clean bind.
-  reap_wedged_listener 9900 voice-agent
+  # NOT the generic reap_wedged_listener: voice-agent's kill path goes through
+  # the guarded voice-lock.py takeover (startup-runtime.sh, amendment T4) —
+  # identity mismatch means nothing is signaled.
+  reap_wedged_voice_agent 9900
   if launchctl print "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1; then
     if ! lsof -i :9900 > /dev/null 2>&1; then
       launchctl kickstart "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1 || true

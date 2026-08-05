@@ -10,7 +10,8 @@ Cases: legacy bare-pid lock with a dead owner → cleared; structured dev-shape
 and packaged-shape locks with live validated owners → killed + stolen;
 malformed lock → left in place with a WARN; live structured lock whose owner
 is a real running (non-listening / unvalidated) dummy process → never
-removed, never signaled.
+removed, never signaled; launchd job not loaded → abort BEFORE the takeover
+(nothing would respawn a killed agent on such a host — amendment T4 gate).
 
 `launchctl` and `lsof` are PATH shims: launchctl records its invocation and
 flips a marker; lsof reports a configured "listener" pid before the marker and
@@ -89,6 +90,8 @@ class Lab:
         (self.bin / "launchctl").write_text(
             "#!/bin/bash\n"
             'echo "launchctl-stub: $*" >> "$SHIM_STATE_DIR/launchctl.log"\n'
+            '# SHIM_NO_JOB=1 emulates a host where the launchd job is not loaded.\n'
+            'if [ "$1" = "print" ] && [ -n "${SHIM_NO_JOB:-}" ]; then exit 1; fi\n'
             'if [ "$1" = "kickstart" ]; then touch "$SHIM_STATE_DIR/kickstarted"; fi\n'
             "exit 0\n"
         )
@@ -107,7 +110,7 @@ class Lab:
         self.pidfile = self.ws / ".voice-agent.pid"
         self.procs = []
 
-    def run_script(self, old_pid="", fresh=True):
+    def run_script(self, old_pid="", fresh=True, no_job=False):
         fresh_proc = None
         env = dict(os.environ)
         env.update(
@@ -119,6 +122,8 @@ class Lab:
                 "SUTANDO_TEST_MODE": "1",
             }
         )
+        if no_job:
+            env["SHIM_NO_JOB"] = "1"
         if fresh:
             fresh_proc = spawn_dummy()
             self.procs.append(fresh_proc)
@@ -201,6 +206,26 @@ def main():
         check("blocked is a WARN, not a failure of the lock phase", "takeover-blocked" in p.stdout, p.stdout)
         bystander.kill()
         bystander.wait()
+
+        # --- launchd job not loaded → abort BEFORE the takeover, kill nothing ---
+        # With voice-config-switch and health-check --fix routed through this
+        # wrapper (amendment T4), a plain dev checkout (startup.sh-launched
+        # agent, no launchd job) must not have its working agent killed with
+        # nothing left to respawn it.
+        print("no launchd job:")
+        agent = spawn_dummy(entry_dev)
+        lab.procs.append(agent)
+        structured_lock(lab.pidfile, agent.pid, my_start_time_ms(agent.pid), entry_dev, lab.ws)
+        p = lab.run_script(old_pid=agent.pid, no_job=True)
+        check("aborts non-zero when the job is not loaded", p.returncode == 5, str(p.returncode))
+        check("abort names the remedy", "bash src/restart.sh" in p.stdout, p.stdout)
+        time.sleep(0.2)
+        check("no-job abort signals nothing", agent.poll() is None)
+        check("no-job abort leaves the lock", lab.pidfile.exists())
+        check("no kickstart attempted", not (lab.state / "kickstarted").exists())
+        agent.kill()
+        agent.wait()
+        lab.pidfile.unlink()
     finally:
         lab.cleanup()
 
