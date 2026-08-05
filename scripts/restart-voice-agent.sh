@@ -63,30 +63,53 @@ if [ -z "${OLD_PID}" ]; then
   echo "WARN  no LISTEN process on :${PORT} before kickstart — may be normal if voice-agent was down"
 fi
 
-# --- 1a. clear stale pid file ---
-# The voice-agent writes a pid file on startup and exits if it already exists.
-# If a previous kickstart killed the LaunchAgent wrapper but left the node
-# worker alive (orphaned), the new instance sees the pid file and exits with
-# "already running" — a silent no-op from the LaunchAgent's perspective.
-# Remove the file and force-kill any lingering workers before kickstart so the
-# new instance can start cleanly.
+# --- 1a. guarded lock takeover (design 1b; impl plan WS1 Step 5 + S4) ---
+# The voice-agent holds a structured JSON lock (`.voice-agent.pid`) created by
+# the guarded bundled-Python helper scripts/voice-lock.py. If a previous
+# kickstart killed the LaunchAgent wrapper but left the node worker alive
+# (orphaned), the new instance sees the lock and exits 7 — a silent no-op from
+# the LaunchAgent's perspective. The ENTIRE kill-and-replace transaction
+# (validate → TERM → wait → KILL → revalidate → unlink) runs inside ONE
+# `voice-lock.py takeover` invocation under the held fcntl guard — no
+# shell-side signaling, never `rm -f` (amendment S4). Identity validation
+# (amendment U1): the lock pid must equal the :9900 LISTEN pid, entry must
+# match the dev (src/voice-agent.ts) or packaged (dist/voice-agent.js) shape,
+# and a structured lock's startTimeMs must match `ps -o lstart=` — any
+# mismatch is takeover-blocked and the lock is left untouched (a live lock is
+# never removed); we still proceed to kickstart, whose etime verification
+# below catches a resulting silent no-op.
 SCRIPT_PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WORKSPACE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
 PID_FILE="${WORKSPACE}/.voice-agent.pid"
+GUARD_FILE="${WORKSPACE}/.voice-agent.lock.guard"
 if [ -f "${PID_FILE}" ]; then
-  STALE_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
-  echo "INFO  removing stale pid file ${PID_FILE} (had pid=${STALE_PID:-unknown})"
-  if [ -n "${STALE_PID}" ] && kill -0 "${STALE_PID}" 2>/dev/null; then
-    STALE_ARGS="$(ps -p "${STALE_PID}" -o args= 2>/dev/null || true)"
-    if echo "${STALE_ARGS}" | grep -q "voice-agent.ts"; then
-      echo "INFO  killing stale pid ${STALE_PID} (voice-agent confirmed)"
-      kill "${STALE_PID}" 2>/dev/null || true
-      sleep 1
-    else
-      echo "WARN  stale pid ${STALE_PID} does not look like voice-agent — skipping kill"
-    fi
+  # Interpreter per amendment R4/T1: sutando-config.sh python-bin (smoke-tested,
+  # absolute) — never bare python3, never /usr/bin/python3. Unavailable ⇒ lock
+  # operations fail closed (amendment R3): abort rather than race the lock.
+  if ! PY_BIN="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin)"; then
+    echo "FAIL  no usable python3 for the guarded lock helper — lock operations fail closed."
+    echo "      Fix: install python3 (brew install python), set SUTANDO_PY, or run xcode-select --install."
+    exit 6
   fi
-  rm -f "${PID_FILE}"
+  TAKEOVER_OUT="$("$PY_BIN" "$SCRIPT_PARENT/scripts/voice-lock.py" takeover \
+      --pidfile "${PID_FILE}" --guard "${GUARD_FILE}" --workspace "${WORKSPACE}" \
+      --mode adopted --port "${PORT}" \
+      --entry "$SCRIPT_PARENT/src/voice-agent.ts" \
+      --entry "$SCRIPT_PARENT/dist/voice-agent.js")"
+  TAKEOVER_RC=$?
+  case "${TAKEOVER_RC}" in
+    0)
+      echo "INFO  guarded lock takeover: ${TAKEOVER_OUT}"
+      ;;
+    3)
+      echo "WARN  takeover-blocked — leaving the lock untouched (a live lock is never removed): ${TAKEOVER_OUT}"
+      echo "WARN  proceeding to kickstart; the etime verification below will catch a silent no-op"
+      ;;
+    *)
+      echo "WARN  voice-lock.py takeover exited ${TAKEOVER_RC}: ${TAKEOVER_OUT}"
+      echo "WARN  lock left untouched; proceeding to kickstart"
+      ;;
+  esac
 fi
 
 # --- 2. kickstart ---

@@ -7,7 +7,29 @@
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "Stopping Sutando services..."
-pkill -f "voice-agent" 2>/dev/null
+# Voice-agent stop goes through the GUARDED lock takeover, never a broad
+# `pkill -f voice-agent` (voice-reliability plan amendment U2): the old blind
+# pkill could kill an unvalidated process and leave a live lock behind (or
+# race a concurrent guarded acquisition). The whole validate → TERM → wait →
+# KILL → revalidate → unlink transaction runs inside one voice-lock.py
+# invocation under the fcntl guard; identity mismatch → takeover-blocked and
+# nothing is signaled. Interpreter unavailable ⇒ fail closed (skip, warn) —
+# never signal without validation.
+if _VOICE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)"; then
+    _VOICE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+    if [ -n "$_VOICE_WS" ] && [ -f "$_VOICE_WS/.voice-agent.pid" ]; then
+        "$_VOICE_PY" "$REPO/scripts/voice-lock.py" takeover \
+            --pidfile "$_VOICE_WS/.voice-agent.pid" \
+            --guard "$_VOICE_WS/.voice-agent.lock.guard" \
+            --workspace "$_VOICE_WS" \
+            --mode adopted --port 9900 \
+            --entry "$REPO/src/voice-agent.ts" \
+            --entry "$REPO/dist/voice-agent.js" \
+            || echo "  WARN voice-agent takeover blocked/failed — not killing blindly (lock left untouched)"
+    fi
+else
+    echo "  WARN no usable python3 for the guarded voice lock helper — skipping voice-agent stop (fail closed)"
+fi
 pkill -f "web-client.ts" 2>/dev/null
 pkill -f "dashboard.py" 2>/dev/null
 pkill -f "agent-api.py" 2>/dev/null
