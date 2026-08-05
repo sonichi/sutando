@@ -197,7 +197,7 @@ class OwnershipTransitionTest(unittest.TestCase):
                            "config_digests": digest_map(registered)})
             check = self._check(ws)
             self.assertEqual(check["status"], "warn")
-            self.assertIn("still live", check["detail"])
+            self.assertIn("never de-registered", check["detail"])
 
     def test_codex_task_transition_warns(self):
         registered = entries()
@@ -302,7 +302,7 @@ class ZeroExpectedBoundaryTest(unittest.TestCase):
                            "config_digests": digest_map(moved)})
             check = self._check(ws)
             self.assertEqual(check["status"], "warn")
-            self.assertIn("still live", check["detail"])
+            self.assertIn("never de-registered", check["detail"])
 
     def test_one_to_zero_by_deletion_warns(self):
         """Same boundary, reached by deleting the entry rather than re-owning it."""

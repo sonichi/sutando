@@ -1037,7 +1037,7 @@ def check_session_cron_registration(
     # correctly stopped being registered is not reported as edited.
     #
     # So the signal is the surplus itself. It also covers an entry deleted from
-    # crons.json whose job is still live — same disruption, same remedy.
+    # crons.json whose job was never de-registered — same disruption, same remedy.
     #
     # There is deliberately NO allowance for step 4's bootstrap fallback (which
     # registers /proactive-loop when the config lacks it, legitimately putting
@@ -1067,8 +1067,9 @@ def check_session_cron_registration(
             "detail": (
                 f"{registered} session cron(s) were registered but only {expected} are "
                 f"session-owned now — {surplus} moved to launchd/codex ownership, were "
-                f"parked, or were deleted since registration, and the job registered under "
-                f"the OLD config is still live; re-run /schedule-crons to clear it{note}"
+                f"parked, or were deleted since registration, so a job registered under the "
+                f"OLD config was never de-registered and MAY still be firing; re-run "
+                f"/schedule-crons to clear it{note}"
             ),
         }
 
