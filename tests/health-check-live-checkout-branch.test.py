@@ -257,6 +257,212 @@ def main() -> int:
         check(r["status"] == "ok" and "behind" not in r["detail"],
               f"l) up-to-date -> clean ok, got {r}")
 
+    # Behavioral staleness (added 2026-08-03). The count threshold above is
+    # deliberately 10 and case k) pins that 1 behind stays ok — both correct for
+    # alert fatigue. But a count cannot distinguish one commit that rewrites a
+    # skill from nine that touch docs, and skills are the one case with no other
+    # detector: `src/` needs a restart, so the `*-stale` probes catch it by
+    # comparing a running process to its source; a skill has no process, since
+    # the agent re-reads the markdown from this checkout on every invocation.
+    #
+    # Observed on this node: exactly ONE commit behind, this probe reporting ok,
+    # while the live `context-reconstruct` still instructed writing the shared
+    # flat `state/current-track.md`, which delivers one host's anchor onto
+    # another host at the same local path (#2567/#2568). This used to say that
+    # collision "had destroyed a peer's anchor"; nothing was destroyed, and the
+    # observation does not depend on it — what the probe missed is that the
+    # running skill and the merged skill disagreed with nothing to compare.
+    def _mk_clone_behind_paths(td: Path, paths: "list[str]") -> Path:
+        """A clone on `main`, one commit behind per entry in `paths`."""
+        up = _mk_repo(td, "main")
+        work = td / "work"
+        subprocess.run(["git", "clone", "-q", str(up), str(work)],
+                       check=True, capture_output=True)
+        for i, rel in enumerate(paths):
+            f = up / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(f"{i}\n")
+            _git(up, "add", rel)
+            _git(up, "commit", "-q", "-m", f"touch {rel}")
+        _git(work, "fetch", "-q", "origin")
+        return work
+
+    # v1) THE GAP: one commit behind — under the nag threshold, so case k) says
+    #     ok — but it changes a skill the agent reads every invocation.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/context-reconstruct/SKILL.md"])
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "warn",
+              f"v1) 1 behind but it changes skills/ -> warn, got {r['status']}")
+        check("skills/" in r["detail"],
+              f"v1) must name skills/ as the reason, got {r['detail'][:110]}")
+        check("touch skills/context-reconstruct/SKILL.md" in r["detail"],
+              f"v1) must name the actual commit so it is actionable, got {r['detail'][:150]}")
+
+    # v2) Over-trigger control: the same one-commit drift in a path the agent
+    #     does NOT read live must stay ok, or this re-creates the alert fatigue
+    #     the threshold exists to prevent.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["docs/whatever.md"])
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "ok",
+              f"v2) 1 behind touching docs only -> still ok, got {r['status']} / {r['detail'][:90]}")
+
+    # v3) Only NOT-YET-PULLED commits count. A checkout that already contains
+    #     the skill change is current — history is not drift.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        _git(work, "pull", "-q", "--ff-only")
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "ok",
+              f"v3) skill change already pulled -> ok, got {r['status']} / {r['detail'][:90]}")
+
+    # v4) A mixed drift still names only the skill commits, and the count in the
+    #     message is the TOTAL — conflating the two would misstate how far behind
+    #     the checkout actually is.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(
+            Path(td), ["docs/a.md", "skills/one/SKILL.md", "docs/b.md"])
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "warn", f"v4) mixed drift with a skill -> warn, got {r['status']}")
+        check("1 of them change" in r["detail"],
+              f"v4) must count only the skill commits, got {r['detail'][:130]}")
+        check("3 commit(s) behind" in r["detail"],
+              f"v4) must still report the TOTAL behind count, got {r['detail'][:130]}")
+
+    # v5) git unrunnable -> no skill warning, and no exception either. This is the
+    #     branch that decides what happens when the MEASUREMENT fails, and an
+    #     uncaught raise here would take down the whole health run from inside the
+    #     probe that exists to report on it. Degrade closed: say nothing extra
+    #     rather than invent a warning from a failed read.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        real_run = hc.subprocess.run
+
+        def _boom_on_log(argv, *a, **kw):
+            if "log" in argv:
+                raise OSError("git vanished mid-run")
+            return real_run(argv, *a, **kw)
+
+        hc.subprocess.run = _boom_on_log
+        try:
+            got = hc._behind_commits_changing(work, "main", "skills/")
+            r = hc.check_live_checkout_branch(work)
+        finally:
+            hc.subprocess.run = real_run
+        check(got == [], f"v5) a failed measurement yields no commits, got {got}")
+        check(r["status"] == "ok",
+              f"v5) and must not invent a warning from it, got {r['status']}")
+
+    # v6) git present but the log call FAILS (bad ref, renamed remote) -> same
+    #     degrade. Distinct from v5: there the call raised, here it returns
+    #     non-zero, and the two are different lines in the function.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        got = hc._behind_commits_changing(work, "no-such-branch-xyz", "skills/")
+        check(got == [], f"v6) non-zero rc yields no commits, got {got}")
+
+    # v7) NET-ZERO history must stay quiet. Upstream adds a skill and removes it
+    #     in the next commit; the clone fetches and sits two commits behind.
+    #     Commit-path history lists BOTH commits, but the tree diff is empty —
+    #     pulling would change no skill bytes. Warning here is a false
+    #     behavioral-staleness alarm, i.e. exactly the alert fatigue this check
+    #     exists to argue against. Reproduced independently by qingyun-wu and
+    #     john-the-dev on #2573; this pins the tree-diff gate that fixes it.
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        up = _mk_repo(td, "main")
+        work = td / "work"
+        subprocess.run(["git", "clone", "-q", str(up), str(work)],
+                       check=True, capture_output=True)
+        (up / "skills" / "demo").mkdir(parents=True)
+        (up / "skills" / "demo" / "SKILL.md").write_text("y\n")
+        _git(up, "add", "-A"); _git(up, "commit", "-q", "-m", "add skills/demo")
+        _git(up, "rm", "-q", "skills/demo/SKILL.md")
+        _git(up, "commit", "-q", "-m", "remove skills/demo")
+        _git(work, "fetch", "-q", "origin")
+
+        # The two questions must genuinely disagree here, or this fixture proves
+        # nothing — assert the disagreement before asserting the verdict.
+        hist = subprocess.run(["git", "-C", str(work), "log", "--no-merges",
+                               "--format=%s", "HEAD..origin/main", "--", "skills/"],
+                              capture_output=True, text=True).stdout.split()
+        tree = subprocess.run(["git", "-C", str(work), "diff", "--name-only",
+                               "HEAD..origin/main", "--", "skills/"],
+                              capture_output=True, text=True).stdout.strip()
+        check(len(hist) > 0 and tree == "",
+              f"v7) fixture must have history-yes/tree-no, got hist={len(hist)} tree={tree!r}")
+
+        got = hc._behind_commits_changing(work, "main", "skills/")
+        check(got == [], f"v7) net-zero skill history yields no drift, got {got}")
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "ok",
+              f"v7) and must not warn on reversible history, got {r['status']} / {r['detail'][:100]}")
+
+    # v7b) The TREE-DIFF call has its own failure branch, distinct from the log
+    #      call's (v5). It runs FIRST and is the gate, so if it raises and the
+    #      code fell through to history, the net-zero false positive would come
+    #      straight back on any host where the diff happens to fail. Degrade
+    #      closed: no diff answer, no drift claim.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        real_run = hc.subprocess.run
+
+        def _boom_on_diff(argv, *a, **kw):
+            if "diff" in argv:
+                raise OSError("git vanished before the tree diff")
+            return real_run(argv, *a, **kw)
+
+        hc.subprocess.run = _boom_on_diff
+        try:
+            got = hc._behind_commits_changing(work, "main", "skills/")
+        finally:
+            hc.subprocess.run = real_run
+        check(got == [], f"v7b) a failed TREE DIFF yields no drift claim, got {got}")
+
+    # v7c) The LOG call's non-zero branch. Adding the tree-diff gate made this
+    #      unreachable from v6: a bad ref now fails at the DIFF and returns
+    #      early, so the log call is never issued. The branch is still live in
+    #      production though — the diff can succeed while the log fails — and it
+    #      must degrade the same way rather than return a half-answer. Reaching
+    #      it needs the diff to SUCCEED with output and only the log to fail.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind_paths(Path(td), ["skills/s/SKILL.md"])
+        real_run = hc.subprocess.run
+
+        def _log_fails(argv, *a, **kw):
+            if "log" in argv:
+                class _Bad:
+                    returncode, stdout, stderr = 128, "", "fatal"
+                return _Bad()
+            return real_run(argv, *a, **kw)
+
+        hc.subprocess.run = _log_fails
+        try:
+            got = hc._behind_commits_changing(work, "main", "skills/")
+        finally:
+            hc.subprocess.run = real_run
+        check(got == [], f"v7c) diff succeeds but log fails -> no drift claim, got {got}")
+
+    # v8) Over-trigger control for v7: a skill change that is NOT reverted must
+    #     still warn, or the tree-diff gate would have silenced the real case
+    #     along with the false one.
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        up = _mk_repo(td, "main")
+        work = td / "work"
+        subprocess.run(["git", "clone", "-q", str(up), str(work)],
+                       check=True, capture_output=True)
+        (up / "skills" / "demo").mkdir(parents=True)
+        (up / "skills" / "demo" / "SKILL.md").write_text("y\n")
+        _git(up, "add", "-A"); _git(up, "commit", "-q", "-m", "add skills/demo")
+        _git(work, "fetch", "-q", "origin")
+        got = hc._behind_commits_changing(work, "main", "skills/")
+        check(got == ["add skills/demo"], f"v8) a real skill change still reports, got {got}")
+        r = hc.check_live_checkout_branch(work)
+        check(r["status"] == "warn",
+              f"v8) and still warns, got {r['status']}")
+
     # m) No remote ref at all (fresh init, renamed remote) -> degrade to ok.
     #    A probe that cannot answer must not invent an alarm.
     with tempfile.TemporaryDirectory() as td:

@@ -161,8 +161,13 @@ def main() -> int:
             check("CLI: post stamps rate-limit state",
                   json.loads(sf.read_text()) == {"c": 50000}, sf.read_text())
         with um.patch.object(cn, "_post_to_room", return_value=None):
+            # `--state-file` is NOT optional here. Without it this call falls
+            # through to `_default_state_file()` and stamps the OPERATOR'S
+            # workspace — the enclosing TemporaryDirectory isolates `sf`, not
+            # the default path, and the sibling call above only looks isolated
+            # because it passes the flag.
             rc = cn.main(["--cron", "c2", "--summary", "news", "--kind", "error",
-                          "--room", "!r:x"])
+                          "--room", "!r:x", "--state-file", str(sf)])
             check("CLI: failed post exit 2", rc == 2)
 
     # ── CLI non-network paths ────────────────────────────────────────────
