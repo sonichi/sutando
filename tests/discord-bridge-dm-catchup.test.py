@@ -240,10 +240,15 @@ def test_ready_bridge_runs_reconciliation_without_reconnect():
 
 
 def test_catchup_passes_are_serialized():
-    """Reconnect and periodic reconciliation must share one async lock."""
+    """Reconnect and periodic reconciliation must share one async lock, created
+    lazily inside the running loop (not at module scope — #2655)."""
     src = (REPO / "src" / "discord-bridge.py").read_text()
-    assert "_dm_catchup_lock = asyncio.Lock()" in src
-    assert "async with _dm_catchup_lock:" in src
+    assert "def _get_dm_catchup_lock()" in src
+    assert "async with _get_dm_catchup_lock():" in src
+    # The MODULE-SCOPE construction (column 0) is the bug — it must be gone; the
+    # lazy assignment INSIDE the getter (indented) is the fix and is fine.
+    assert "\n_dm_catchup_lock = asyncio.Lock()" not in src
+    assert "\n_dm_catchup_lock = None" in src
 
 
 def test_gateway_and_rest_race_is_claimed_exactly_once():
@@ -649,9 +654,41 @@ def test_checkpoint_write_failure_does_not_break_the_handler():
         bridge._update_dm_checkpoint = orig
 
 
+def test_dm_catchup_lock_is_lazy_and_survives_contention_on_a_fresh_loop():
+    # #2655 P1 (qingyun/sonichi): the lock must NOT be constructed at import — on
+    # Python 3.9 asyncio.Lock() binds the event loop at construction, so a
+    # module-scope lock binds the pre-run default loop and a CONTENDED acquire
+    # under asyncio.run() raises "Future ... attached to a different loop".
+    # Constructed lazily inside the running loop, contention is safe.
+    bridge._dm_catchup_lock = None
+    assert bridge._dm_catchup_lock is None  # not constructed at import time
+
+    async def _contend():
+        async def _waiter(started):
+            started.set()
+            async with bridge._get_dm_catchup_lock():  # blocks while held below
+                return True
+        async with bridge._get_dm_catchup_lock():       # first use -> created in THIS loop
+            started = asyncio.Event()
+            waiter = asyncio.ensure_future(_waiter(started))
+            await started.wait()
+            await asyncio.sleep(0)                       # let the waiter reach the contended acquire
+            assert not waiter.done(), "waiter should be blocked on the contended lock"
+            return waiter
+        # (lock released here)
+
+    async def _run():
+        waiter = await _contend()
+        return await waiter  # the previously-contended acquire must NOT raise
+
+    assert asyncio.run(_run()) is True   # fresh asyncio.run() loop, exactly the prod path
+    bridge._dm_catchup_lock = None       # reset for test isolation
+
+
 def main():
     failures = []
     for fn in (
+        test_dm_catchup_lock_is_lazy_and_survives_contention_on_a_fresh_loop,
         test_load_returns_empty_when_file_missing,
         test_load_returns_empty_on_malformed_json,
         test_load_returns_empty_on_non_dict_root,

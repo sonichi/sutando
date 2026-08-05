@@ -4207,7 +4207,27 @@ def _update_dm_checkpoint(channel_id: int, message_id: int) -> None:
     _atomic_write_dm_checkpoint(current)
 
 
-_dm_catchup_lock = asyncio.Lock()
+# Serializes reconnect catch-up vs the periodic reconciliation pass. Created
+# LAZILY (on first use, inside the running Discord loop) — NOT at import time: on
+# Python 3.9 asyncio.Lock() binds the current event loop at construction, so a
+# module-scope lock binds the pre-run default loop, and a CONTENDED acquire under
+# asyncio.run() then raises "Future ... attached to a different loop". Contention
+# is exactly this lock's job (reconnect catch-up racing the 60s reconciliation),
+# so the failure is on the load-bearing path (qingyun/sonichi CR #2655).
+_dm_catchup_lock = None
+
+
+def _get_dm_catchup_lock():
+    """The DM-catchup lock, constructed on first use inside the running loop (see
+    the note above). No extra guarding needed: the create is synchronous with no
+    await between the None-check and the assignment, so two coroutines on the
+    single-threaded event loop can never both construct it."""
+    global _dm_catchup_lock
+    if _dm_catchup_lock is None:
+        _dm_catchup_lock = asyncio.Lock()
+    return _dm_catchup_lock
+
+
 DM_RECONCILE_INTERVAL_SECONDS = 60
 
 
@@ -4252,7 +4272,7 @@ async def _catchup_missed_dms_unlocked():
 
 async def _catchup_missed_dms():
     """Serialize reconnect and periodic REST reconciliation passes."""
-    async with _dm_catchup_lock:
+    async with _get_dm_catchup_lock():
         await _catchup_missed_dms_unlocked()
 
 
