@@ -85,9 +85,59 @@ def _token_dir():
                 sys.path.insert(0, repo_src)
             from workspace_default import resolve_workspace  # noqa: E402
             base = os.path.join(str(resolve_workspace(migrate=False)), "state")
-        except Exception:
-            base = os.path.join(os.getcwd(), "state")
+        except Exception as e:
+            # FAIL CLOSED. Never silently fall back to os.getcwd()/state — that
+            # would strand the OAuth refresh token in a second, unpredictable
+            # location depending on where the command was launched (qingyun CR
+            # #2682). If the workspace can't be resolved, require an explicit
+            # MS365_STATE_DIR rather than inventing a credential path.
+            raise SystemExit(
+                f"ms365: cannot resolve the workspace for the token cache "
+                f"({type(e).__name__}: {e}). Set MS365_STATE_DIR to an explicit "
+                f"owner-only directory and retry."
+            )
     return os.path.join(base, "ms365-token")
+
+
+# The cached OAuth token grants Files.ReadWrite / Mail.Send / Calendars.ReadWrite
+# (and Teams) — a long-lived, high-value credential. python-o365's
+# FileSystemTokenBackend creates missing parent dirs with no mode (0755 under the
+# usual 022 umask) and writes the token file with open("w") (0644), i.e.
+# world-readable. The helpers below force owner-only perms (qingyun CR #2682).
+_TOKEN_FILENAME = "o365_token.txt"
+
+
+def _secure_dir(path):
+    """Create `path` and force it to owner-only 0700, regardless of umask or a
+    pre-existing looser mode."""
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def _restrict_token_file(token_dir, filename=_TOKEN_FILENAME):
+    """Force the cached token file to owner-only 0600 (the backend writes 0644)."""
+    p = os.path.join(token_dir, filename)
+    try:
+        if os.path.exists(p):
+            os.chmod(p, 0o600)
+    except OSError:
+        pass
+
+
+def _owner_only_backend(FileSystemTokenBackend, token_dir, filename=_TOKEN_FILENAME):
+    """A FileSystemTokenBackend that re-applies 0600 to the token file after
+    EVERY save/refresh, so a token written on the initial consent or on a later
+    silent refresh never lands world-readable."""
+    class _OwnerOnlyTokenBackend(FileSystemTokenBackend):
+        def save_token(self, *args, **kwargs):
+            result = super().save_token(*args, **kwargs)
+            _restrict_token_file(token_dir, filename)
+            return result
+    return _OwnerOnlyTokenBackend(token_path=token_dir, token_filename=filename)
 
 
 def _require_credentials():
@@ -116,11 +166,8 @@ def _build_account():  # pragma: no cover  (live Graph calls; not unit-testable)
     Account, FileSystemTokenBackend = _require_o365()
     client_id, client_secret, tenant_id = _require_credentials()
 
-    token_dir = _token_dir()
-    os.makedirs(token_dir, exist_ok=True)
-    token_backend = FileSystemTokenBackend(
-        token_path=token_dir, token_filename="o365_token.txt"
-    )
+    token_dir = _secure_dir(_token_dir())
+    token_backend = _owner_only_backend(FileSystemTokenBackend, token_dir)
 
     account = Account(
         credentials=(client_id, client_secret),

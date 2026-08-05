@@ -11,7 +11,10 @@ runs for real. Run: python3 tests/ms365-connect.test.py
 """
 import importlib.util
 import os
+import shutil
+import stat
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -71,6 +74,25 @@ class TestTokenDir(unittest.TestCase):
         finally:
             os.environ.pop("MS365_STATE_DIR", None)
 
+    def test_fail_closed_when_workspace_unresolvable(self):
+        # No MS365_STATE_DIR + resolver raises => exit, never a silent
+        # os.getcwd()/state fallback that would strand the token (CR #2682).
+        os.environ.pop("MS365_STATE_DIR", None)
+        fake = types.ModuleType("workspace_default")
+        def _raise(migrate=True):
+            raise RuntimeError("no workspace here")
+        fake.resolve_workspace = _raise
+        saved = sys.modules.get("workspace_default")
+        sys.modules["workspace_default"] = fake
+        try:
+            with self.assertRaises(SystemExit):
+                ms365._token_dir()
+        finally:
+            if saved is not None:
+                sys.modules["workspace_default"] = saved
+            else:
+                sys.modules.pop("workspace_default", None)
+
     def test_defaults_to_resolved_workspace_state(self):
         # Without MS365_STATE_DIR, the token dir defaults through the repo's
         # resolve_workspace() (an absolute path under the resolved workspace),
@@ -112,6 +134,51 @@ class TestScopes(unittest.TestCase):
         reserved = {"openid", "offline_access", "profile"}
         overlap = reserved.intersection(s.lower() for s in ms365.SCOPES)
         self.assertEqual(overlap, set(), f"reserved scopes leaked: {overlap}")
+
+
+class TestTokenSecurity(unittest.TestCase):
+    """The cached OAuth token grants Mail/Files/Calendar access — its dir must be
+    0700 and the token file 0600, even though O365's backend leaves them looser."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_secure_dir_forces_owner_only_0700(self):
+        d = os.path.join(self.tmp, "ms365-token")
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, 0o755)  # start world-readable, as makedirs default would
+        ms365._secure_dir(d)
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+
+    def test_restrict_token_file_forces_0600(self):
+        d = ms365._secure_dir(os.path.join(self.tmp, "t"))
+        p = os.path.join(d, "o365_token.txt")
+        with open(p, "w") as f:
+            f.write("refresh-token")
+        os.chmod(p, 0o644)  # what FileSystemTokenBackend leaves it as
+        ms365._restrict_token_file(d)
+        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+
+    def test_owner_only_backend_chmods_token_after_every_save(self):
+        d = ms365._secure_dir(os.path.join(self.tmp, "b"))
+        token_path = os.path.join(d, "o365_token.txt")
+
+        class _FakeBackend:  # stand-in for O365's FileSystemTokenBackend
+            def __init__(self, token_path=None, token_filename=None):
+                self.dir, self.name = token_path, token_filename
+
+            def save_token(self, force=False):
+                fp = os.path.join(self.dir, self.name)
+                with open(fp, "w") as f:
+                    f.write("refresh-token")
+                os.chmod(fp, 0o644)  # the base leaves it world-readable
+                return True
+
+        backend = ms365._owner_only_backend(_FakeBackend, d)
+        backend.save_token()
+        self.assertEqual(stat.S_IMODE(os.stat(token_path).st_mode), 0o600)
 
 
 class TestAuthGuard(unittest.TestCase):
