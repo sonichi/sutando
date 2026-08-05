@@ -97,65 +97,81 @@ class TestAg2SpaceStationSignals(unittest.TestCase):
         self.mod.socket = _fake_socket(resolve=False)
         self.assertIsNone(self.mod._probe_station())
 
-    # ---- _station_available: FILE-cached, no threads (qingyun CR #2680) ----
-    def test_serves_fresh_cache_without_probing(self):
-        self._seed_cache(value=True, value_ts=100.0, attempt_ts=100.0)
-        called = {"n": 0}
-        self.mod._probe_station = lambda timeout=1.0: called.__setitem__("n", called["n"] + 1) or True
-        self.assertTrue(self.mod._station_available(self.ws, now=110.0, ttl=60.0))  # 10<60 fresh
-        self.assertEqual(called["n"], 0)                                            # no network
+    def _sabotage_probes(self):
+        """Make ANY probe attempt an immediate failure, to prove a code path
+        (derive / _station_cached) never touches the network."""
+        def boom(*a, **k):
+            raise AssertionError("this path must not probe the network")
+        self.mod._probe_station = boom
+        self.mod._probe_station_bounded = boom
 
-    def test_one_shot_cold_cache_returns_real_value_not_none(self):
-        # Blocker 1: a fresh one-shot process with no cache must PROBE and return a
-        # real verdict (then persist it), NOT return None like the async design.
-        self.mod._probe_station = lambda timeout=1.0: True
-        self.assertTrue(self.mod._station_available(self.ws, now=1000.0))
-        d = json.load(open(self.mod._station_cache_file(self.ws)))
-        self.assertTrue(d["value"])                    # persisted for the next process
-        self.assertIsNotNone(d["value_ts"])
+    # ---- _station_cached: READ-ONLY, never probes (qingyun CR #2680 hot path) ----
+    def test_station_cached_cold_is_none_and_never_probes(self):
+        self._sabotage_probes()
+        self.assertIsNone(self.mod._station_cached(self.ws))  # no cache, no probe
 
-    def test_reprobes_when_stale_and_publishes_new_verdict(self):
-        self._seed_cache(value=True, value_ts=100.0, attempt_ts=100.0)
-        called = {"n": 0}
-        self.mod._probe_station = lambda timeout=1.0: called.__setitem__("n", called["n"] + 1) or False
-        val = self.mod._station_available(self.ws, now=1000.0, ttl=60.0, cooldown=15.0)  # 900>60 stale
-        self.assertEqual(called["n"], 1)
-        self.assertFalse(val)
+    def test_station_cached_returns_persisted_value_without_probing(self):
+        self._sabotage_probes()
+        self._seed_cache(value=True, value_ts=1.0, attempt_ts=1.0)
+        self.assertTrue(self.mod._station_cached(self.ws))
 
-    def test_cooldown_prevents_reprobe_of_a_hung_resolver(self):
-        # Blocker 2: stale value + a very recent attempt => do NOT probe again. No
-        # threads, so no worker pile-up; the cooldown stops a stall/attempt storm.
+    def test_derive_never_probes_even_when_the_resolver_would_stall(self):
+        # THE fix: derive() runs on the 3s supervisor loop, so it must NEVER
+        # touch the network — a stalled/hung resolver can't delay the tick.
+        self._sabotage_probes()
+        self.mod._run = lambda cmd: (None, "")
+        self.mod._resolve_workspace = lambda repo: self.ws
+        out = self.mod.derive()                       # would raise if it probed
+        self.assertIsNone(out["station_available"])   # cold cache => unknown, promptly
+
+    # ---- _refresh_station: off-loop, bounded, cooldown (blocker 1 + hung one-shot) ----
+    def test_refresh_persists_verdict_read_by_derive(self):
+        # The one-shot refresh writes the cache; derive() then reads a REAL value.
+        self.mod._resolve_workspace = lambda repo: self.ws
+        self.mod._run = lambda cmd: (None, "")
+        self.mod._refresh_station(self.ws, now=1000.0, probe=lambda: False)
+        self.assertFalse(self.mod.derive()["station_available"])
+
+    def test_refresh_cooldown_skips_probe_of_a_recent_attempt(self):
         self._seed_cache(value=None, value_ts=None, attempt_ts=995.0)
         called = {"n": 0}
-        self.mod._probe_station = lambda timeout=1.0: called.__setitem__("n", called["n"] + 1) or True
-        self.mod._station_available(self.ws, now=1000.0, cooldown=15.0)  # attempt 5s ago < 15
-        self.assertEqual(called["n"], 0)
+        self.mod._refresh_station(self.ws, now=1000.0, cooldown=15.0,
+                                  probe=lambda: called.__setitem__("n", 1) or True)
+        self.assertEqual(called["n"], 0)              # attempt 5s ago (<15) -> no probe
 
-    def test_claims_attempt_on_disk_before_probing(self):
-        # attempt_ts is persisted BEFORE the probe runs, so a concurrent caller
-        # (or the next 3s tick) backs off instead of launching a second probe.
+    def test_refresh_claims_attempt_before_probing(self):
         seen = {}
-        def probe(timeout=1.0):
+        def probe():
             seen["attempt_ts"] = json.load(
                 open(self.mod._station_cache_file(self.ws))).get("attempt_ts")
             return True
-        self.mod._probe_station = probe
-        self.mod._station_available(self.ws, now=2000.0)
-        self.assertEqual(seen["attempt_ts"], 2000.0)
+        self.mod._refresh_station(self.ws, now=2000.0, probe=probe)
+        self.assertEqual(seen["attempt_ts"], 2000.0)  # persisted BEFORE the probe
 
-    def test_probe_exception_publishes_unknown_not_false(self):
-        self._seed_cache(value=True, value_ts=100.0, attempt_ts=100.0)
-        def boom(timeout=1.0):
+    def test_refresh_probe_exception_publishes_unknown_not_false(self):
+        self._seed_cache(value=True, value_ts=1.0, attempt_ts=1.0)
+        def boom():
             raise RuntimeError("resolver blew up")
-        self.mod._probe_station = boom
-        val = self.mod._station_available(self.ws, now=1000.0, ttl=60.0, cooldown=15.0)
-        self.assertIsNone(val)  # unknown, never a spurious False
+        val = self.mod._refresh_station(self.ws, now=1000.0, cooldown=15.0, probe=boom)
+        self.assertIsNone(val)
+
+    # ---- _probe_station_bounded: a KILLABLE end-to-end deadline ----
+    def test_probe_bounded_kills_a_hung_probe_and_returns_unknown(self):
+        # A child that sleeps past the deadline is killed -> None (the real bound
+        # on getaddrinfo, which settimeout can't cap).
+        hung = [sys.executable, "-c", "import time; time.sleep(30)"]
+        self.assertIsNone(self.mod._probe_station_bounded(deadline=0.4, argv=hung))
+
+    def test_probe_bounded_maps_child_output_to_tristate(self):
+        say = lambda s: [sys.executable, "-c", f"print({s!r})"]
+        self.assertIs(self.mod._probe_station_bounded(deadline=5, argv=say("true")), True)
+        self.assertIs(self.mod._probe_station_bounded(deadline=5, argv=say("false")), False)
+        self.assertIsNone(self.mod._probe_station_bounded(deadline=5, argv=say("")))
 
     # ---- derive() surfaces both keys, and does not conflate them ----
     def test_derive_surfaces_both_keys(self):
         self.mod._run = lambda cmd: (None, "")             # everything unknown
-        self.mod.socket = _fake_socket(resolve=False)      # station probe -> None
-        self.mod._resolve_workspace = lambda repo: self.ws  # cache -> throwaway ws
+        self.mod._resolve_workspace = lambda repo: self.ws  # cold cache -> station None
         out = self.mod.derive()
         self.assertIn("ag2space_app_running", out)
         self.assertIn("station_available", out)
@@ -165,8 +181,8 @@ class TestAg2SpaceStationSignals(unittest.TestCase):
 
     def test_derive_app_up_but_station_unreachable_are_independent(self):
         self.mod._run = lambda cmd: (0, "1\n")             # app process "running"
-        self.mod.socket = _fake_socket(resolve=True, connect="refuse")  # gateway down -> False
         self.mod._resolve_workspace = lambda repo: self.ws
+        self._seed_cache(value=False, value_ts=9e18, attempt_ts=9e18)  # station cached down
         out = self.mod.derive()
         self.assertTrue(out["ag2space_app_running"])
         self.assertFalse(out["station_available"])          # app up != station reachable

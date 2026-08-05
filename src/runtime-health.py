@@ -302,17 +302,20 @@ def _probe_station(timeout=_STATION_CONNECT_TIMEOUT):
         s.close()
 
 
-# Station reachability is FILE-cached (no threads). derive() runs every ~3s in
-# core-input-watch's IN-PROCESS loop AND once per one-shot `runtime-health.py`
-# subprocess (`sutando-config.sh runtime`). A verdict cached on disk lets the
-# hot loop skip the network almost always, while — unlike a background thread —
-# giving the one-shot process a REAL value instead of exiting before an async
-# probe finishes (qingyun CR #2680, blocker 1). No threads => no worker
-# accumulation on a hung resolver and no stale-completion overwrite (blocker 2).
-# Wall-clock time is used deliberately: the cache is shared across processes, so
-# monotonic clocks (per-process origins) would not compare.
-_STATION_TTL = 60.0               # serve the cached verdict for this long
+# Station reachability is FILE-cached, and the network probe is kept ENTIRELY off
+# derive()'s hot path (qingyun CR #2680). derive() runs every ~3s in
+# core-input-watch's IN-PROCESS liveness loop, so it must NEVER touch the network:
+# _station_cached() only READS the on-disk verdict and returns instantly (a hung
+# resolver can't stall the supervisor tick). The probe runs only from the one-shot
+# `runtime-health.py main()` (`sutando-config.sh runtime`), via _refresh_station(),
+# which bounds the whole DNS+connect in a KILLABLE subprocess with a hard deadline
+# — a real cancellable boundary (socket.settimeout doesn't bound getaddrinfo, so a
+# subprocess we can kill is the only way to cap a hung resolver). No threads => no
+# worker accumulation. Wall-clock time is used because the cache is shared across
+# processes (monotonic clocks have per-process origins).
+_STATION_TTL = 60.0               # a refresh older than this is stale
 _STATION_ATTEMPT_COOLDOWN = 15.0  # after an attempt, don't re-probe this soon
+_STATION_PROBE_DEADLINE = 3.0     # hard end-to-end cap on the killable probe
 _STATION_CACHE_NAME = "station-available.json"
 
 
@@ -340,34 +343,47 @@ def _write_station_cache(path, data):
         pass
 
 
-def _station_available(workspace, *, now=None, timeout=_STATION_CONNECT_TIMEOUT,
-                       ttl=_STATION_TTL, cooldown=_STATION_ATTEMPT_COOLDOWN):
-    """Tri-state Station reachability (True/False/None), FILE-cached — no threads.
+def _station_cached(workspace):
+    """READ-ONLY tri-state Station verdict from the on-disk cache — NEVER probes,
+    so it is safe on derive()'s ~3s supervisor loop (always returns instantly).
+    Returns the last persisted value, or None (unknown) if the cache is absent.
+    The value is refreshed off-loop by the one-shot main() via _refresh_station."""
+    return _read_station_cache(_station_cache_file(workspace)).get("value")
 
-    Reads the on-disk verdict: fresh (< `ttl`) => return it with no network. If
-    stale/cold, do ONE bounded synchronous probe and persist it — so a one-shot
-    process returns a real value, and the ~3s in-process loop refreshes at most
-    once per `ttl` (every other tick reads the fresh file). An attempt timestamp
-    written BEFORE probing means a hung/slow resolver is not re-hit within
-    `cooldown` (no pile-up, no stall storm). `now` is injectable for tests.
-    """
+
+def _probe_station_bounded(connect_timeout=_STATION_CONNECT_TIMEOUT,
+                           deadline=_STATION_PROBE_DEADLINE, argv=None):
+    """Run the blocking probe inside a KILLABLE subprocess with a hard end-to-end
+    `deadline`. Because socket.settimeout does not bound getaddrinfo, this is the
+    only way to cap a hung resolver: on timeout the child is killed and the result
+    is None (unknown). Child prints 'true'/'false'/'' (see the --probe-station
+    entrypoint). `argv` is injectable for tests."""
+    argv = argv or [sys.executable, os.path.abspath(__file__),
+                    "--probe-station", str(connect_timeout)]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=deadline)
+    except (subprocess.TimeoutExpired, OSError):
+        return None  # hung/failed resolver — killed at the deadline, UNKNOWN
+    out = (proc.stdout or "").strip()
+    return {"true": True, "false": False}.get(out, None)
+
+
+def _refresh_station(workspace, *, now=None, deadline=_STATION_PROBE_DEADLINE,
+                     cooldown=_STATION_ATTEMPT_COOLDOWN, probe=None):
+    """Probe the gateway (bounded, cancellable) and persist the verdict. Called
+    ONLY from the one-shot main() — never from derive()/the 3s loop. Writes an
+    attempt timestamp BEFORE probing and honors a cooldown so a hung resolver is
+    not re-entered by a separate one-shot caller. `probe`/`now` injectable."""
     now = now if now is not None else time.time()
     path = _station_cache_file(workspace)
     cache = _read_station_cache(path)
-    value = cache.get("value")
-    value_ts = cache.get("value_ts")
     attempt_ts = cache.get("attempt_ts")
-
-    if value_ts is not None and (now - value_ts) < ttl:
-        return value  # fresh — no network
     if attempt_ts is not None and (now - attempt_ts) < cooldown:
-        return value  # a very recent attempt is in flight/just done — don't pile on
-
-    # Claim the attempt on disk BEFORE probing so a concurrent caller or the next
-    # tick backs off instead of launching a second probe.
-    _write_station_cache(path, {"value": value, "value_ts": value_ts, "attempt_ts": now})
+        return cache.get("value")  # a recent attempt is in flight/just done
+    _write_station_cache(path, {**cache, "attempt_ts": now})
+    runner = probe or (lambda: _probe_station_bounded(deadline=deadline))
     try:
-        result = _probe_station(timeout)
+        result = runner()
     except Exception:
         result = None  # best-effort: never a spurious False
     _write_station_cache(path, {"value": result, "value_ts": time.time(), "attempt_ts": now})
@@ -421,7 +437,7 @@ def derive():
     core = _core_running()
     gateway = _gateway_running()
     ag2space_app = _ag2space_app_running()
-    station = _station_available(workspace)
+    station = _station_cached(workspace)  # READ-ONLY: never probes on the 3s loop
 
     # Raw signals, captured for the audited verdict. Defaults hold for the
     # offline / unknown branches (core gone or unprobeable → status/login
@@ -539,12 +555,20 @@ def _confirm_count(state_dir, health, severity):
 
 
 def main():
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ws = _resolve_workspace(repo)  # has its own repo/workspace fallback; never raises
+    # Refresh the Station verdict OFF the supervisor loop: this one-shot process
+    # (not core-input-watch's 3s derive() loop) is the only place the network
+    # probe runs, and it's bounded in a killable subprocess so a hung resolver
+    # can't freeze even this caller. derive() below then READS the fresh cache.
+    try:
+        _refresh_station(ws)
+    except Exception:
+        pass  # a refresh failure must never block the health read
     result = derive()
     # Best-effort persist so anything (app, dashboard) can read the latest without
     # re-probing; failure to write must not fail the read.
     try:
-        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ws = _resolve_workspace(repo)
         state_dir = os.path.join(ws, "state")
         os.makedirs(state_dir, exist_ok=True)
         with open(os.path.join(state_dir, "runtime-health.json"), "w") as f:
@@ -562,5 +586,14 @@ def main():
     print(json.dumps(result, indent=2))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI dispatch; logic tested via _probe_station
+    # `--probe-station <timeout>`: the child of _probe_station_bounded — runs the
+    # blocking probe once and prints its tri-state ('true'/'false'/'' for None) so
+    # the parent can bound it in a killable subprocess. Kept tiny and side-effect
+    # free (no cache writes, no health output).
+    if len(sys.argv) >= 2 and sys.argv[1] == "--probe-station":
+        _t = float(sys.argv[2]) if len(sys.argv) > 2 else _STATION_CONNECT_TIMEOUT
+        _r = _probe_station(_t)
+        print("" if _r is None else ("true" if _r else "false"))
+        sys.exit(0)
     main()
