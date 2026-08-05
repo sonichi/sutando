@@ -131,6 +131,66 @@ class ReadTests(EnvCase):
             rd.read_room(ROOM, HS, limit=9999, gate=None)
         self.assertIn(f"limit={rd.MAX_LIMIT}", cap["url"])
 
+    def _raw_window_gateway(self, total_messages=14, noise_per_message=2):
+        """A gateway whose `limit` bounds RAW EVENTS, of which only some are messages.
+
+        This is what the live ag2.space gateway does. Reproduced here because the failure
+        it causes is silent: fewer messages than asked for, ok:true, and no error.
+        """
+        import urllib.parse as _up
+
+        def _http(_m, url, _h):
+            raw = int(dict(_up.parse_qsl(_up.urlparse(url).query))["limit"])
+            # Newest-first timeline: every message preceded by `noise` non-message events,
+            # so the first `noise` slots of any window contain no messages at all.
+            msgs, consumed = [], 0
+            for i in range(total_messages):
+                consumed += noise_per_message
+                if consumed >= raw:
+                    break
+                consumed += 1
+                msgs.append({"sender": "@a:hs", "ts": 1000 - i, "body": f"m{i}"})
+                if consumed >= raw:
+                    break
+            return (200, json.dumps({"messages": msgs}).encode(), {})
+        return _http
+
+    def test_small_limit_does_not_report_an_empty_room(self):
+        """limit=3 must not return zero messages from a room that has fourteen.
+
+        REGRESSION (measured live 2026-08-05): the gateway's limit counts raw timeline
+        events, so `--limit 3` returned `ok:true` with an EMPTY message list on a busy
+        room. A cheap "did anyone reply?" probe is exactly what passes a small limit, and
+        the false empty is indistinguishable from silence. Before the fix this asserts 0.
+        """
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(rd, "http_request", side_effect=self._raw_window_gateway()):
+            res = rd.read_room(ROOM, HS, limit=3, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["messages"]), 3, "a small limit must still yield messages")
+
+    def test_limit_counts_messages_not_raw_events(self):
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(rd, "http_request", side_effect=self._raw_window_gateway()):
+            res = rd.read_room(ROOM, HS, limit=10, gate=None)
+        self.assertEqual(len(res["messages"]), 10)
+        self.assertTrue(res["complete"])
+
+    def test_short_room_under_claims_completeness(self):
+        """Short of `limit` never claims complete — the client cannot tell why it is short.
+
+        Updated per the #2678 review: a repeated message count across a wider window is
+        NOT proof of exhausted history (the extra raw events may all be non-messages), and
+        this endpoint returns only message-type items, so a short page is indistinguishable
+        from a noisy one. Under-claiming is the safe direction here.
+        """
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(rd, "http_request",
+                               side_effect=self._raw_window_gateway(total_messages=2)):
+            res = rd.read_room(ROOM, HS, limit=20, gate=None)
+        self.assertEqual(len(res["messages"]), 2)
+        self.assertFalse(res["complete"], "short of limit -> never claim complete")
+
     def test_success_parses(self):
         os.environ["RELAY_URL"] = "https://r"
         body = (200, json.dumps({"messages": [{"sender": "@a:hs", "ts": 1, "body": "hi"}]}).encode(), {})
