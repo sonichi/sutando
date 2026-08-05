@@ -21,6 +21,8 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 - **Skill config goes in the skill's `manifest.json` `config` block — not ad-hoc env vars.** See [`skills/MANIFEST.md`](skills/MANIFEST.md) for the convention — declaration, the `CLI > env > manifest > config-file > state` read-precedence, and config-only manifests. Don't invent an undocumented env var (Chi 2026-06-16).
 - **Optional capability discovery stays at the adapter edge.** Shared runners may standardize provider-neutral execution behavior, but adapters must inject script or capability paths. Core helpers must not name, locate, or import a concrete skill. Add direct contract tests for the runner and wiring tests for every adapter that delegates to it.
 - **Shared result-file lifecycle policy has one implementation.** Claim, recovery, collision, and retry rules for the common task/result protocol belong in dependency-light `src/` helpers. Adapters bind their resolved directories and retain provider-specific delivery only; do not copy filesystem state machines between bridges. Pin both the shared contract and every adapter's delegation in tests.
+
+- **HTTP handlers centralize transport mechanics.** Put repeated authentication gates, status/header emission, and JSON encoding in handler helpers; route branches own endpoint behavior. Protect status codes, headers, and payload shapes with direct contract tests when refactoring handlers.
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 
 ### Where does new code belong? (decision guide — issue #222)
@@ -79,7 +81,7 @@ When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.
 - Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
 - Merge only when the current head is mergeable, required CI + CLA are green, and two maintainers have recorded formal approvals. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
 
-**Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the 7 lessons here — read them from `REVIEW.md`. When you review, `review-preflight.py` reads `REVIEW.md` and prints the criteria inline so you see them on every preflight run; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Claude Code's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
+**Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the lessons here — read them from `REVIEW.md`. When you review, `review-preflight.py` reads `REVIEW.md` and prints the criteria inline so you see them on every preflight run; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Claude Code's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
 
 ## Workspace contract
 
@@ -105,6 +107,8 @@ If `PERSONAL_CLAUDE.md` exists, read and follow it. It contains user-specific ru
 
 ## Work Status
 
+> **Core-only — guests skip this (full rationale in [Chat-path task tracking](#chat-path-task-tracking-issue-585) below).** If you are a scheduled/one-shot/review automation that merely opened this repo (a `codex exec`/headless run, a PR-review or branch-hygiene cron, or any agent that auto-loaded this file by virtue of the repo being your cwd), you are a **guest in this checkout, not the live core**: do NOT write `core-status.json` or any `state/` liveness. Status/heartbeat/liveness writes belong to the single live Sutando core. The "applies to all work" note below scopes the core's *own* activities — it does not enlist guests.
+
 Signal your work status to the workspace `core-status.json` so the web UI and `health-check.py` can display it. Write the **absolute** workspace path: the session cwd is the repo, so a bare `state/core-status.json` lands in `<repo>/state/` — where no reader looks. Readers resolve `<workspace>/state/core-status.json` via `status_read_path` (`src/workspace_default.py`), where `<workspace>` = the M0 canonical (`<repo>/workspace/` by default; env-overridable as the legacy escape).
 
 ```bash
@@ -116,6 +120,8 @@ echo '{"status":"idle","ts":<epoch>}' > "$CORE_STATUS"                          
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
 ## Chat-path task tracking (issue #585)
+
+> **Core-only — automation/one-shot agents MUST skip this and every other runtime-operational section below** (task/result writing, the task watcher, the proactive loop, status/heartbeat/liveness writes). These mechanics belong to the *single live Sutando core* that owns this checkout. If you are instead a scheduled or one-shot agent that merely opened this repo — a Codex/Claude **review** automation, a `codex exec`/headless run, a PR-review or branch-hygiene cron, or any agent that auto-loaded this file by virtue of the repo being your cwd — you are a **guest in this checkout, not the core**: do NOT write `task-*` / `task-chat-*` / `results/` files, do NOT start the watcher, do NOT run the proactive loop, do NOT write `state/` liveness. Doing so injects fake tasks into the core's queue that it will process as real owner requests. (2026-07-11 incident: a Codex automation with `cwds=[this repo]` auto-loaded AGENTS.md and self-wrote a `task-chat` every 10 min; the core swallowed each one. Fix: run such automations in an isolated `/private/tmp` worktree with no repo cwd, per the safe pattern.)
 
 When you accept a non-trivial commitment from the user via **chat** (direct text input, not through voice/Discord/Telegram bridges), write a task file so the dashboard can track it.
 
