@@ -20,21 +20,22 @@ python3 src/health-check.py   # service-level health once running
 | `node` | `brew install node` | `src/startup.sh:478` |
 | `npx` | ships with Node | `src/startup.sh:479` |
 | `python3` | `brew install python3` | `src/startup.sh:481` |
-| `claude` **or** `codex` CLI | whichever `core.runtime` names | `src/startup.sh:483-485` |
+| Authenticated `claude` **or** `codex` CLI | whichever `core.runtime` names | `src/startup.sh` selected-core preflight |
 | `fswatch` | `brew install fswatch` (startup auto-installs when Homebrew is present) | `src/startup.sh:494,497` |
 
 That is the whole hard gate. Nothing else stops a boot.
 
 ### Strongly recommended, but not enforced at boot
 
-`startup.sh` checks only that these commands *exist*. It does not check versions
-or authentication, so a host can pass the boot gate and still fail at runtime:
+`startup.sh` checks the selected agent CLI's presence and authentication before
+services launch. It does not check platform or tool versions:
 
 - **macOS 15+** — not checked anywhere.
 - **Node.js 22+** — checked by `src/verify-setup.sh:22-26`, which is advisory.
-- **A signed-in agent CLI.** `startup.sh` only tests presence; an
-  unauthenticated CLI passes `command -v` and then fails when the core starts.
-  `src/verify-setup.sh:36` checks authentication separately — run it.
+- **A signed-in agent CLI is enforced at boot.** Claude uses the existing
+  login-state preflight; Codex exports its configured `CODEX_HOME` and runs
+  `codex login status`. `SUTANDO_SKIP_AUTH_PREFLIGHT=1` is a one-run escape
+  hatch; the runtime launcher still checks again before replacing the core.
 
 The agent CLI is the one dependency nothing can work around: **Sutando is a
 harness around Claude Code or Codex.**

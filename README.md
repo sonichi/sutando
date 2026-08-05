@@ -133,9 +133,13 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 - Python 3 (`brew install python3`)
 - fswatch (`brew install fswatch`) — auto-installs via Homebrew on first start
 
-**Also required, but *not* checked at boot** — startup tests only that a command exists, so a host can pass every check above and still fail once running:
-- **Sign in to your agent CLI.** An unauthenticated CLI passes the presence check and then fails when the core starts.
-- macOS 15+, Node.js 22+.
+**Also required** — sign in to the selected agent CLI. Startup checks the
+configured Claude or Codex home before launching background services and fails
+with the matching login remedy. `SUTANDO_SKIP_AUTH_PREFLIGHT=1` bypasses this
+once for recovery; the runtime launcher still checks again before replacing the
+core session.
+
+**Recommended, but not checked at boot** — macOS 15+ and Node.js 22+.
 
 `bash src/verify-setup.sh` covers this second list — it checks the Node version and whether your CLI is actually authenticated. Run it if startup succeeds but the core doesn't.
 
