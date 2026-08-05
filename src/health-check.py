@@ -20,6 +20,7 @@ Checks:
 """
 
 import hashlib
+import fnmatch
 import json
 import os
 import re
@@ -1171,6 +1172,109 @@ def _slug_derivation_key(name: str) -> str:
     """
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
+
+
+#: Files the workspace-root contract sanctions. Everything else at the root is
+#: drift. Kept next to the probe so adding a legitimate root file is a one-line
+#: edit in the same place a reader looks for the rule.
+WORKSPACE_ROOT_ALLOWED = frozenset({
+    "build_log.md",          # CLAUDE.md names it a workspace-root artifact
+    "pending-questions.md",  # same
+    "session-state.md",      # written by src/session-handoff.sh on compaction
+    ".gitkeep",              # git placeholder, not state
+})
+
+#: Migration sentinels are production-owned and DELIBERATELY retained at the
+#: workspace root — `workspace_default.py` writes `.notes-migrated`,
+#: `.build_log-migrated`, `.status-migrated` and `.conversation-log-migrated`
+#: there for O(1) re-entry, and says so explicitly ("kept at the workspace root
+#: for consistency with the existing ...").
+#:
+#: Matched by PATTERN, not by four literal names, because that is how the family
+#: is already defined elsewhere: `scripts/sutando-migrate.sh` finds them with
+#: `-name ".*-migrated*"`. Reusing the existing definition means a sentinel added
+#: later is exempt automatically.
+#:
+#: This is the same mistake this probe exists to catch, made one layer up: the
+#: first version of it shipped a hardcoded allowlist that missed a whole
+#: documented family, exactly as `_STATUS_FILES` does. @qingyun-wu and
+#: @john-the-dev caught it before merge — a permanent WARN on every upgraded
+#: install would have trained operators to ignore the detector.
+WORKSPACE_ROOT_SENTINEL_GLOB = ".*-migrated*"
+
+
+def check_workspace_root_tidy() -> "dict | None":
+    """Flag loose FILES at the workspace root — state that escaped `state/`.
+
+    CLAUDE.md: "Loose status/state .json files (...) live under `state/`; the
+    workspace root holds only the top-level directories."
+
+    That contract already has a MIGRATOR — `workspace_default._migrate_root_status`
+    — but it sweeps a hardcoded five-name list (`core-status.json`,
+    `voice-state.json`, `contextual-chips.json`, `dynamic-content.json`,
+    `quota-state.json`). An allowlist is the right shape for a migrator: its job is
+    relocating files it knows about. It is the wrong shape for enforcement, because
+    anything added afterwards is exempt by construction and nothing reports it.
+
+    So the contract had no detector at all, and drifted. Found on Chis-Mac-mini:
+    `.last-pq-notify` (written by check-pending-questions.py) and `.voice-agent.pid`
+    (voice-agent.ts) had accumulated at the root, plus two stray capture scripts —
+    none of them in the migrator's list, none of them flagged by any of the 23
+    existing probes.
+
+    WARN, never fail. This is drift, not breakage: the files work where they are,
+    and a fail-level probe would go red on every host that already has some, for
+    state nobody chose. A warn keeps it visible without gating anything.
+
+    Returns None when the root is clean, so a healthy install gains no line.
+    """
+    if not WORKSPACE_DIR.is_dir():
+        return None
+    try:
+        loose = sorted(
+            p.name for p in WORKSPACE_DIR.iterdir()
+            if p.is_file()
+            and p.name not in WORKSPACE_ROOT_ALLOWED
+            and not fnmatch.fnmatch(p.name, WORKSPACE_ROOT_SENTINEL_GLOB)
+        )
+    except OSError:
+        return None                      # unreadable workspace is another probe's job
+    if not loose:
+        return None
+
+    # Name the writer where a cheap grep finds one — "who put this here" is the
+    # first question, and answering it turns a nag into an action.
+    writers = {}
+    src = REPO_DIR / "src"
+    for name in loose:
+        try:
+            hits = sorted(
+                f.name for f in src.iterdir()
+                if f.is_file() and f.suffix in (".py", ".ts", ".sh")
+                and name in f.read_text(errors="replace")
+            )
+        except OSError:
+            hits = []
+        # Only attribute when EXACTLY one source file mentions the name. Taking
+        # hits[0] named whichever file happened to sort first — including a test
+        # that merely contains the string — and a confidently wrong writer is
+        # worse than none, because it sends the reader to the wrong file.
+        if len(hits) == 1:
+            writers[name] = hits[0]
+
+    shown = ", ".join(f"{n} (written by {writers[n]})" if n in writers else n
+                      for n in loose)
+    return {
+        "name": "workspace-root-tidy",
+        "status": "warn",
+        "detail": (
+            f"{len(loose)} loose file(s) at the workspace root, which the contract "
+            f"reserves for top-level directories: {shown}. State belongs under "
+            f"state/. `_migrate_root_status` only sweeps its five hardcoded names, "
+            f"so anything added since is exempt by construction — this probe is the "
+            f"detector that was missing, not a new rule."
+        ),
+    }
 
 def check_memory_dir_siblings() -> "dict | None":
     """Flag a populated memory corpus sitting under a DIFFERENT project slug.
@@ -5975,6 +6079,10 @@ def run_all_checks() -> list[dict]:
     _mem_siblings = check_memory_dir_siblings()
     if _mem_siblings:
         checks.append(_mem_siblings)
+
+    _root_tidy = check_workspace_root_tidy()
+    if _root_tidy:
+        checks.append(_root_tidy)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:
