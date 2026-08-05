@@ -1263,9 +1263,47 @@ def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
     if not rel:
         return []
     if any(ch in rel for ch in "*?["):
-        return sorted(workspace.glob(rel))
-    candidate = workspace / rel
-    return [candidate] if candidate.exists() else []
+        matches = sorted(workspace.glob(rel))
+    else:
+        candidate = workspace / rel
+        matches = [candidate] if candidate.exists() else []
+    return [m for m in matches if not _reaches_through_symlink(workspace, m)]
+
+
+def _reaches_through_symlink(workspace: Path, p: Path) -> bool:
+    """True when every file the probe would derive from `p` is "beyond a
+    symbolic link" to git: `p` itself is a symlinked DIRECTORY, or any
+    component between `workspace` and `p` is a symlink.
+
+    Found live 2026-08-05: a compat alias symlink under
+    `.claude-sutando/projects/` (a space-slug project dir pointing at its
+    dash-slug twin) was matched by the memory glob, `check-ignore` rejected
+    every pathspec under it with exit 128 ("beyond a symbolic link"), and the
+    whole entry read UNMEASURED every health pass — while the content was
+    backed up the entire time at its real path, which the same entry probes
+    via the twin's own materialization.
+
+    Git never stores content past a symlink — at most the link entry itself —
+    so such a materialization is outside what the vault could ever carry, and
+    probing it can only produce 128s (or, if the crossing link itself were
+    probed instead, a false `dropped`: dir-only un-ignore patterns like
+    `!projects/*/` cannot match a symlink, measured on the live host). The
+    content's real path is the one that answers the backup question, and
+    when it lies inside the workspace the same probe measures it directly.
+
+    A symlink to a FILE with a real parent chain is deliberately NOT
+    filtered: git accepts that pathspec (nothing is *beyond* the link) and
+    file rules match it, so the existing behavior of probing it stands.
+    """
+    ancestors = []
+    cur = p
+    while cur != workspace and cur != cur.parent:
+        ancestors.append(cur)
+        cur = cur.parent
+    for c in ancestors[1:]:  # components strictly between workspace and p
+        if c.is_symlink():
+            return True
+    return p.is_symlink() and p.is_dir()
 
 
 def _carrier_probe_files(rep: "Path") -> "list[Path]":
