@@ -193,6 +193,53 @@ def main() -> int:
             'dm-result.py does not derive attachments from actions with kind == "attach"'
         )
 
+    # 5. The architecture doc must not describe a CONFORMING consumer as an
+    # un-migrated drift instance. Section 1-4 above enforce the consumer set in
+    # code; this keeps the prose maintainers actually read from drifting out of
+    # sync with it. Regression: PR #2551 migrated telegram-bridge.py to
+    # parse_markers and updated CLAUDE.md, but left
+    # docs/architecture-boundaries.md asserting telegram-bridge.py "still
+    # compiles a local file|send|attach regex" — pointing maintainers at an
+    # already-closed gap. Paragraph-scoped rather than sentence-scoped because
+    # the claim spans a colon ("telegram-bridge.py does not: ... still
+    # compiles ...") and sentence splitting severs subject from predicate.
+    consumers = {
+        "discord-bridge.py": REPO / "src" / "discord-bridge.py",
+        "slack-bridge.py": REPO / "src" / "slack-bridge.py",
+        "telegram-bridge.py": REPO / "src" / "telegram-bridge.py",
+        "dm-result.py": REPO / "src" / "dm-result.py",
+    }
+    conforming = {
+        name
+        for name, path in consumers.items()
+        if path.is_file() and "from result_markers import parse_markers" in path.read_text()
+    }
+
+    doc_path = REPO / "docs" / "architecture-boundaries.md"
+    if not doc_path.is_file():
+        return fail("docs/architecture-boundaries.md is missing")
+
+    # Per-consumer non-conformance assertions. Deliberately NOT including
+    # paragraph-level hedges like "conformance is partial": those describe the
+    # section, not a named consumer, and matching them flags conforming
+    # consumers that the same paragraph correctly lists as conforming.
+    non_conformance_claims = (
+        "does not:",
+        "still compiles a",
+        "live instance of the drift",
+    )
+    for para in doc_path.read_text().split("\n\n"):
+        flat = " ".join(para.split())
+        if not any(claim in flat for claim in non_conformance_claims):
+            continue
+        named = sorted(n for n in conforming if n in flat)
+        if named:
+            return fail(
+                "docs/architecture-boundaries.md describes a consumer as un-migrated, "
+                f"but it imports parse_markers: {', '.join(named)}",
+                flat,
+            )
+
     print("PASS: bridges route marker decisions through parse_markers + parser strips all markers from body.")
     return 0
 
