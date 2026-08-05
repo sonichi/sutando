@@ -82,6 +82,12 @@ WORKING_DIR="${WORKING_DIR/#\~/$HOME}"
 mkdir -p "$WORKING_DIR"
 WORKING_DIR="$(cd "$WORKING_DIR" && pwd -P)"
 
+WORKSTREAM_SESSION_HANDLER="$REPO/skills/task-workstream-sessions/scripts/session-worker.py"
+if [ -x "$WORKSTREAM_SESSION_HANDLER" ]; then
+  export SUTANDO_TASK_EVENT_HANDLER="$WORKSTREAM_SESSION_HANDLER"
+  export SUTANDO_ISOLATED_WORKING_DIR="$WORKING_DIR"
+fi
+
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
 [ -n "${CODEX_HOME:-}" ] && CORE_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
@@ -113,11 +119,15 @@ apply_tmux_defaults() {
 
 ensure_task_notifier() {
   local expected_version active_version
+  local version_files
+  version_files=(
+    "$NOTIFIER_SUPERVISOR"
+    "$REPO/src/agent/codex/cli/task-notifier.sh"
+    "$REPO/src/watch-tasks-stream.sh"
+  )
+  [ -f "$WORKSTREAM_SESSION_HANDLER" ] && version_files+=("$WORKSTREAM_SESSION_HANDLER")
   expected_version="$(
-    cksum \
-      "$NOTIFIER_SUPERVISOR" \
-      "$REPO/src/agent/codex/cli/task-notifier.sh" \
-      "$REPO/src/watch-tasks-stream.sh" \
+    cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
   )"
   if session_exists "$WATCHER_SESSION"; then
@@ -133,6 +143,13 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
+  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
+  [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
+  [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")
+  if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
+    NOTIFIER_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
+  fi
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \

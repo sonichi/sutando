@@ -163,6 +163,14 @@ run_node_service() {
   fi
 }
 
+# Resolve the configured core BEFORE touching runtime-specific credentials or
+# running an auth probe. .env remains loaded at its established point below;
+# the helper consults it in a subshell only for SUTANDO_CORE_RUNTIME parity.
+# shellcheck source=startup-runtime.sh
+source "$REPO/src/startup-runtime.sh"
+core_runtime="$(resolve_startup_core_runtime)"
+[ -n "$core_runtime" ] || core_runtime="claude"
+
 # Export workspace-scoped CLAUDE_CONFIG_DIR before services launch. Without it,
 # init.sh + the bridge-launcher blocks below (L~262 proxy, L~429 telegram,
 # L~449 discord, L~473 slack) probe `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and
@@ -204,6 +212,7 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # entries keyed by absolute checkout path don't collide between hosts.
     # Followup: consider narrowing CLAUDE_CONFIG_DIR to a per-host non-synced
     # subdir.
+    if claude_auth_carry_enabled "$core_runtime"; then
     for _seed in .credentials.json .claude.json; do
       if [ ! -f "$_ccd/$_seed" ] && [ -f "$HOME/.claude/$_seed" ]; then
         # Mini 21:23Z: defensive log on cp failure (read-only target, disk full).
@@ -272,6 +281,7 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
         unset _env_token
       fi
     fi
+    fi
     export CLAUDE_CONFIG_DIR="$_ccd"
   else
     echo "startup: claude_sutando_config_dir invalid — refusing to start" >&2
@@ -282,15 +292,11 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
   rm -f "$_ccd_err"
 fi
 
-# Boot gate (#2396): verify the resolved CLAUDE_CONFIG_DIR can boot the CLI
-# authenticated BEFORE any service launches. A logged-out CLI (locked keychain
-# on SSH boots, fresh config dir) otherwise yields a half-up core — tmux +
-# bridges alive, CLI parked at /login, processing nothing (2026-07-30 outage).
-# The gate fails loud (stderr + notification + pending-questions + proactive
-# DM file) and aborts; SUTANDO_SKIP_AUTH_PREFLIGHT=1 is the escape hatch.
-if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-  bash "$REPO/src/auth-preflight-gate.sh" "$CLAUDE_CONFIG_DIR" || exit $?
-fi
+# Boot gate (#2396): verify the SELECTED core can boot authenticated BEFORE any
+# service launches. Claude retains its rich login-state gate; Codex checks the
+# configured CODEX_HOME with `codex login status`. The shared escape hatch is
+# SUTANDO_SKIP_AUTH_PREFLIGHT=1.
+preflight_selected_core_auth "$core_runtime" "${CLAUDE_CONFIG_DIR:-}" || exit $?
 
 # Git committer attribution: REMOVED (2026-05-21). This block used to set
 # committer.name/committer.email from stand-identity.json so `git log %cn`
@@ -323,8 +329,6 @@ git -C "$REPO" config --unset committer.email 2>/dev/null || true
 #  2) Voice needs a Gemini key, but the Codex core, text web UI, dashboard,
 #     API, and configured message bridges do not. Missing voice credentials
 #     disable only the voice service instead of blocking the whole product.
-# shellcheck source=startup-runtime.sh
-source "$REPO/src/startup-runtime.sh"
 configure_startup_runtime
 
 # v0.8 auto-migration helpers (PR #1440 safety hardening — Mini review).
@@ -527,8 +531,6 @@ if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; m
 # just printed that Python-backed services would be skipped (CR #2599,
 # @qingyun-wu). Tolerate the failure and fall back, so the skip actually
 # happens instead of being promised.
-core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || true)"
-[ -n "$core_runtime" ] || core_runtime="claude"
 if ! command -v "$core_runtime" > /dev/null 2>&1; then
   echo "  ✗ $core_runtime CLI not found — required by core.runtime"
   missing=1
