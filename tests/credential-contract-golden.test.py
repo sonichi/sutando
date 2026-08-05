@@ -153,6 +153,21 @@ check("  contract is case-insensitive on scheme",
 check("  bare secret containing %7C never touched",
       parse_onboarding_token("sekret%7Cstill-opaque") == ("", "sekret%7Cstill-opaque"))
 
+# Literal-pipe preference (#2670 review finding): a URL half legitimately
+# carrying an encoded %7C must NOT be split at the encoding when a literal
+# "|" separator exists — a raw pipe cannot occur inside a URL, so it IS the
+# separator. Legacy room-ops (literal-| only) already got this right; the
+# contract now agrees, so this golden holds on BOTH sides.
+golden("URL containing %7C before the '|' separator splits at the pipe",
+       {"REMOTE_TASK_TOKEN": "https://gw.example/a%7Cb|sec"})
+check("  contract prefers the literal pipe; URL's %7C intact",
+      parse_onboarding_token("https://gw.example/a%7Cb|sec")
+      == ("https://gw.example/a%7Cb", "sec"))
+check("  %7C-only combined still splits at the encoding (fallback intact)",
+      parse_onboarding_token("https://gw.example%7Csek5") == ("https://gw.example", "sek5"))
+check("  secret half keeps %7C verbatim after a pipe split",
+      parse_onboarding_token("https://gw.example|a%7Cb") == ("https://gw.example", "a%7Cb"))
+
 # ── C. sparrow goldens (module-level resolution via subprocess import) ──────
 SPARROW_SNIPPET = (
     "import json,sys,ag2_sparrow.remote_gateway_bridge as m;"
