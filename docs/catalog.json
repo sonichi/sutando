@@ -13,7 +13,7 @@
       "audience": ["users", "operators", "contributors", "maintainers"],
       "status": "canonical",
       "canonical_for": "external tool and package requirements, and what to vendor when embedding Sutando",
-      "last_verified": "2026-08-02"
+      "last_verified": "2026-08-04"
     },
     "docs/README.md": {
       "title": "Sutando documentation",
@@ -48,7 +48,7 @@
       "audience": ["users", "operators"],
       "status": "active",
       "canonical_for": "Codex core setup and rollback",
-      "last_verified": null
+      "last_verified": "2026-08-04"
     },
     "docs/community-use-cases/README.md": {
       "title": "Community use cases",

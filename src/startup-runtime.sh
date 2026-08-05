@@ -1,6 +1,76 @@
 #!/bin/bash
 # Runtime/credential decisions shared by startup and behavior-level tests.
 
+# Resolve the selected core before startup touches runtime-specific credentials.
+# The normal .env load happens later in configure_startup_runtime(); use a
+# subshell here so an invocation-scoped SUTANDO_CORE_RUNTIME stored there still
+# participates without exposing every .env value earlier than before.
+resolve_startup_core_runtime() {
+  local _repo
+  _repo="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  (
+    if [ -f "$_repo/.env" ]; then
+      set -a
+      # shellcheck disable=SC1091
+      source "$_repo/.env"
+      set +a
+    fi
+    bash "$_repo/scripts/sutando-config.sh" core-runtime 2>/dev/null
+  ) || true
+}
+
+claude_auth_carry_enabled() {
+  [ "${1:-claude}" = "claude" ]
+}
+
+# Fail before services launch when the SELECTED core cannot authenticate.
+# Claude keeps its existing rich auth-preflight gate. Codex uses the same
+# configured CODEX_HOME as its launcher, then asks the CLI itself for status.
+preflight_selected_core_auth() {
+  local _runtime="${1:-claude}" _claude_config_dir="${2:-}"
+  local _repo _config_env _config_value
+  _repo="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
+  case "$_runtime" in
+    claude)
+      if [ -n "$_claude_config_dir" ]; then
+        bash "$_repo/src/auth-preflight-gate.sh" "$_claude_config_dir"
+      fi
+      ;;
+    codex)
+      _config_env="$(bash "$_repo/scripts/sutando-config.sh" core-config-dir-env-name codex)" || {
+        echo "startup: could not resolve the Codex config-dir environment" >&2
+        return 1
+      }
+      _config_value="$(bash "$_repo/scripts/sutando-config.sh" core-config-dir-value codex)" || {
+        echo "startup: could not resolve the Codex config directory" >&2
+        return 1
+      }
+      if [ -n "$_config_env" ] && [ -n "$_config_value" ]; then
+        mkdir -p "$_config_value"
+        export "$_config_env=$_config_value"
+      fi
+      if [ "${SUTANDO_SKIP_AUTH_PREFLIGHT:-0}" = "1" ]; then
+        echo "codex-auth-preflight: skipped (SUTANDO_SKIP_AUTH_PREFLIGHT=1)"
+        return 0
+      fi
+      if ! command -v codex >/dev/null 2>&1; then
+        echo "startup: Codex CLI is not installed — install it, run 'codex login', then retry" >&2
+        return 127
+      fi
+      if ! codex login status >/dev/null 2>&1; then
+        echo "startup: Codex CLI is not authenticated for ${CODEX_HOME:-the configured Codex home} — run 'codex login' and retry" >&2
+        return 1
+      fi
+      echo "codex-auth-preflight: OK — ${CODEX_HOME:-the configured Codex home} can boot authenticated"
+      ;;
+    *)
+      echo "startup: unsupported core runtime: $_runtime" >&2
+      return 2
+      ;;
+  esac
+}
+
 # True when the canonical managed-credentials file carries a usable voice key.
 #
 # Deliberately reads the JSON here rather than calling resolveCredential() from
