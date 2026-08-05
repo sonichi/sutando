@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""read_room limit semantics — coverage-gate home.
+
+The room-ops suite lives under `skills/agent-room-ops/`, but the diff-coverage gate
+discovers only `tests/*.test.py` (`scripts/coverage-gate.sh` -> `find tests -name
+'*.test.py'`). So changed lines in `read.py` are RUN by the functional job and
+INVISIBLE to the coverage job — a passing test the gate never sees. Same reachability
+trap, and the same remedy, as `tests/room_ops_gateway_vault.test.py`.
+
+What is pinned here: `limit` counts MESSAGES, not raw timeline events.
+
+The gateway applies its limit to raw events — reactions, receipts, membership and media
+all consume the budget — so a small limit could return an EMPTY list with ok:true and no
+error, on a room that was not empty. Measured live 2026-08-05 against ag2.space:
+
+    limit=4 -> 0 messages, limit=10 -> 1, limit=20 -> 8, limit=40 -> 14, limit=100 -> 14
+
+Nine non-message events sat ahead of the newest message. A small limit is exactly what a
+cheap "has anyone replied?" probe passes, so the false empty lands precisely on polling.
+
+Run: python3 tests/room_ops_read_limit.test.py
+"""
+import json
+import os
+import pathlib
+import sys
+import unittest
+import urllib.parse
+from unittest import mock
+
+_ROOM_OPS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "agent-room-ops"
+sys.path.insert(0, str(_ROOM_OPS))
+import read as rd  # noqa: E402
+
+HS = "@a:hs"
+ROOM = "!r:hs"
+_ENVK = ("GATEWAY_URL", "GATEWAY_TOKEN", "RELAY_URL", "REMOTE_TASK_URL",
+         "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
+
+
+def raw_window_gateway(total_messages=14, noise_per_message=2, seen=None):
+    """A gateway whose `limit` bounds RAW EVENTS, only some of which are messages.
+
+    Reproduces the live ag2.space behaviour rather than asserting the new shape into
+    existence — so this fails if the client stops widening, instead of merely pinning
+    whatever the code does today.
+    """
+    def _http(_method, url, _headers):
+        raw = int(dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))["limit"])
+        if seen is not None:
+            seen.append(raw)
+        msgs, consumed = [], 0
+        for i in range(total_messages):
+            consumed += noise_per_message          # non-message events come first
+            if consumed >= raw:
+                break
+            consumed += 1
+            msgs.append({"sender": HS, "ts": 1000 - i, "body": f"m{i}"})
+            if consumed >= raw:
+                break
+        return (200, json.dumps({"messages": msgs}).encode(), {})
+    return _http
+
+
+class ReadLimitCountsMessages(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in _ENVK}
+        for k in _ENVK:
+            os.environ.pop(k, None)
+        os.environ["RELAY_URL"] = "https://r"
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+    def test_small_limit_does_not_report_an_empty_room(self):
+        """The regression: limit=3 returned ZERO from a room holding fourteen."""
+        with mock.patch.object(rd, "http_request", side_effect=raw_window_gateway()):
+            res = rd.read_room(ROOM, HS, limit=3, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["messages"]), 3)
+
+    def test_limit_counts_messages_not_raw_events(self):
+        with mock.patch.object(rd, "http_request", side_effect=raw_window_gateway()):
+            res = rd.read_room(ROOM, HS, limit=10, gate=None)
+        self.assertEqual(len(res["messages"]), 10)
+        self.assertTrue(res["complete"])
+
+    def test_widens_the_window_until_satisfied(self):
+        seen = []
+        with mock.patch.object(rd, "http_request",
+                               side_effect=raw_window_gateway(seen=seen)):
+            rd.read_room(ROOM, HS, limit=5, gate=None)
+        self.assertGreater(len(seen), 1, "must widen when the first window is short")
+        self.assertEqual(seen, sorted(seen), "the raw window must only grow")
+
+    def test_short_room_is_complete_not_truncated(self):
+        with mock.patch.object(rd, "http_request",
+                               side_effect=raw_window_gateway(total_messages=2)):
+            res = rd.read_room(ROOM, HS, limit=20, gate=None)
+        self.assertEqual(len(res["messages"]), 2)
+        self.assertTrue(res["complete"], "history exhausted -> complete")
+
+    def test_stops_at_max_limit(self):
+        seen = []
+        with mock.patch.object(rd, "http_request",
+                               side_effect=raw_window_gateway(total_messages=500,
+                                                              noise_per_message=9,
+                                                              seen=seen)):
+            res = rd.read_room(ROOM, HS, limit=rd.MAX_LIMIT, gate=None)
+        self.assertLessEqual(max(seen), rd.MAX_LIMIT, "never request beyond MAX_LIMIT")
+        self.assertFalse(res["complete"], "stopped early -> NOT complete")
+
+    def test_never_returns_more_than_requested(self):
+        with mock.patch.object(rd, "http_request", side_effect=raw_window_gateway()):
+            res = rd.read_room(ROOM, HS, limit=2, gate=None)
+        self.assertEqual(len(res["messages"]), 2)
+
+    # ---- error paths keep degrading, and stay reportable ---- #
+    def test_http_error_degrades(self):
+        import urllib.error
+        err = urllib.error.HTTPError("u", 404, "nf", {}, None)
+        with mock.patch.object(rd, "http_request", side_effect=err):
+            res = rd.read_room(ROOM, HS, gate=None)
+        self.assertFalse(res["ok"])
+        self.assertIsNone(res["complete"], "no completeness claim on an error")
+
+    def test_network_error_degrades(self):
+        import urllib.error
+        with mock.patch.object(rd, "http_request",
+                               side_effect=urllib.error.URLError("boom")):
+            res = rd.read_room(ROOM, HS, gate=None)
+        self.assertFalse(res["ok"])
+        self.assertIn("network error", res["reason"])
+
+    def test_bad_json_degrades(self):
+        with mock.patch.object(rd, "http_request",
+                               return_value=(200, b"not json", {})):
+            res = rd.read_room(ROOM, HS, gate=None)
+        self.assertFalse(res["ok"])
+        self.assertIn("parse error", res["reason"])
+
+    def test_bare_list_body_is_accepted(self):
+        body = (200, json.dumps([{"sender": HS, "ts": 1, "body": "hi"}]).encode(), {})
+        with mock.patch.object(rd, "http_request", return_value=body):
+            res = rd.read_room(ROOM, HS, limit=1, gate=None)
+        self.assertEqual(res["messages"][0]["body"], "hi")
+
+    def test_before_is_forwarded(self):
+        seen_urls = []
+
+        def _http(_m, url, _h):
+            seen_urls.append(url)
+            return (200, json.dumps({"messages": [{"sender": HS, "ts": 1, "body": "x"}]}).encode(), {})
+        with mock.patch.object(rd, "http_request", side_effect=_http):
+            rd.read_room(ROOM, HS, limit=1, gate=None, before="$evt")
+        self.assertIn("before=", seen_urls[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
