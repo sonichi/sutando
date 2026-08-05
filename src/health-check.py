@@ -7378,6 +7378,19 @@ def main():
         else None
     )
 
+    # skill-symlinks is warn-level, so it is never in `issues`. Its fix pass has
+    # to sit ABOVE both gates that follow, because each one independently made
+    # the repair unreachable:
+    #   * `if quiet: ... elif codex_notifier is None: sys.exit(0)` returns before
+    #     any fix runs, and
+    #   * the fix block itself lived inside `else:` of `if not issues:`.
+    # Net effect on a host whose ONLY problem was broken symlinks — the exact
+    # case this fixer exists for — `--fix` printed nothing and repaired nothing;
+    # it worked only when some UNRELATED check happened to be failing too.
+    # Prints only when it actually repairs something, so a healthy run is silent.
+    if do_fix:
+        apply_skill_symlink_fixes(checks)
+
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
     # — the launchd fallback wants the user-visible alert immediately, even
@@ -7467,9 +7480,6 @@ def main():
         if do_fix:
             print()
             print("Attempting fixes...")
-            # skill-symlinks is "warn" (excluded from issues) but auto-fixable —
-            # handle it separately from the issues loop.
-            apply_skill_symlink_fixes(checks)
             for c in issues:
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])
