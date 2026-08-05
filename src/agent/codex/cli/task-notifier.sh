@@ -11,6 +11,8 @@ else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
+TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
+TASK_HANDLER_FALLBACKS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-fallbacks"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -20,6 +22,25 @@ WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstr
 watcher_pid=""
 event_dir=""
 workstream_context_file=""
+
+probe_optional_task_handler() {
+  local filename="$1" rc
+  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || return 3
+  [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
+  "$SUTANDO_TASK_EVENT_HANDLER" \
+    --runtime codex \
+    --workspace "$(dirname "$TASKS_DIR")" \
+    --task-file "$TASKS_DIR/$filename" \
+    --results-dir "$RESULTS_DIR" \
+    --repo "$REPO" \
+    --probe >/dev/null
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+    echo "task-notifier: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
+    return 3
+  fi
+  return "$rc"
+}
 
 stop_watcher() {
   [ -n "$watcher_pid" ] || return 0
@@ -69,7 +90,10 @@ prepare_workstream_context() {
 
 has_result() {
   local filename="$1" stem archive_dir
-  [ -f "$RESULTS_DIR/$filename" ] && return 0
+  if [ -f "$RESULTS_DIR/$filename" ]; then
+    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
+    return 0
+  fi
   stem="${filename%.txt}"
   # Local bridges archive as archive/YYYY-MM/<task>.txt. The remote gateway
   # archives as archive/<task>-<epoch>.txt. Startup retention uses sibling
@@ -78,6 +102,7 @@ has_result() {
       -mindepth 1 -maxdepth 2 -type f \
       \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
       | grep -q .; then
+    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
     return 0
   fi
   for archive_dir in "$RESULTS_DIR"/archive-*; do
@@ -85,6 +110,7 @@ has_result() {
     if find "$archive_dir" -mindepth 1 -maxdepth 1 -type f \
         \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
         | grep -q .; then
+      rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
       return 0
     fi
   done
@@ -147,10 +173,16 @@ next_pending_task() {
     case "$candidate" in
       ""|*/*|*..*) continue ;;
     esac
-    if ! has_result "$candidate"; then
-      printf '%s\n' "$candidate"
-      return 0
+    has_result "$candidate" && continue
+    [ -f "$TASK_HANDLER_CLAIMS_DIR/$candidate" ] && continue
+    if [ ! -f "$TASK_HANDLER_FALLBACKS_DIR/$candidate" ] \
+        && probe_optional_task_handler "$candidate"; then
+      # The watcher has not published its claim yet. Leave the file durable;
+      # its provider receipt or explicit fallback event will wake us.
+      continue
     fi
+    printf '%s\n' "$candidate"
+    return 0
   done < <(
     python3 - "$REPO/src" "$TASKS_DIR" <<'PY'
 import sys
