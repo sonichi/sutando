@@ -108,8 +108,42 @@ check("derive: running with no ts -> working (can't prove stale)", d["health"] =
 d = _derive_with(core=True, pane="", status="idle")
 check("derive: idle status -> idle", d["health"] == "idle" and d["authenticated"] is True)
 
-d = _derive_with(core=True, pane=STUCK_PANE, status="running")
-check("derive: login pane wins over status -> needs_login", d["health"] == "needs_login" and d["authenticated"] is False)
+# CHANGED by #2456. This previously asserted "login pane wins over status" with a
+# FRESH status — which is the short-circuit the issue reports: the agent is
+# demonstrably advancing, so a sign-in prompt cannot also be true, and the
+# needs_login verdict erased the wedge signal. The code comment justifying cheap
+# false positives is about an UNRESPONSIVE agent; it does not reach a fresh one.
+d = _derive_with(core=True, pane=STUCK_PANE, status="running", ts="fresh")
+check("derive: login marker + FRESH status -> not needs_login (false positive)",
+      d["health"] == "working" and d["authenticated"] is True)
+check("derive: ...and the marker is still reported, not silently dropped",
+      "false positive" in d["detail"])
+
+# The marker is still authoritative wherever there is no positive evidence of
+# progress — a real sign-in prompt stops the loop, so these corroborate.
+d = _derive_with(core=True, pane=STUCK_PANE, status="running", ts="stale")
+check("derive: login marker + STALE status -> needs_login",
+      d["health"] == "needs_login" and d["authenticated"] is False)
+check("derive: ...and the wedge signal survives in the detail",
+      "stale" in d["detail"].lower())
+
+d = _derive_with(core=True, pane=STUCK_PANE, status="running", ts=None)
+check("derive: login marker + NO timestamp -> needs_login (absence of evidence is not freshness)",
+      d["health"] == "needs_login" and d["authenticated"] is False)
+
+d = _derive_with(core=True, pane=STUCK_PANE, status="idle", ts="fresh")
+check("derive: login marker + fresh IDLE -> idle, not needs_login",
+      d["health"] == "idle" and d["authenticated"] is True)
+
+d = _derive_with(core=True, pane=STUCK_PANE, status=None, ts="fresh")
+check("derive: login marker + unknown status -> needs_login (no proof of acting)",
+      d["health"] == "needs_login" and d["authenticated"] is False)
+
+# CONTROL: a clean pane must be unaffected in every one of those shapes.
+check("derive: CONTROL clean pane + stale running -> unknown (wedge preserved)",
+      _derive_with(core=True, pane="", status="running", ts="stale")["health"] == "unknown")
+check("derive: CONTROL clean pane + fresh running -> working",
+      _derive_with(core=True, pane="", status="running", ts="fresh")["health"] == "working")
 
 d = _derive_with(core=True, pane="", status=None)
 check("derive: running but no status -> unknown", d["health"] == "unknown")

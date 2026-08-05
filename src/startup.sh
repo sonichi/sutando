@@ -5,6 +5,46 @@
 set -e
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Resolve python3 ONCE, refusing Apple's Xcode-CLT stub. On a Mac without the
+# developer tools `/usr/bin/python3` exists but raises a modal install dialog
+# when executed, and this script spawns python3 ~15 times — dashboard.py and
+# agent-api.py on a respawn backoff, so each retry re-raised it. Measured on a
+# clean macOS 26.5 VM against Sutando 0.5.0-rc.2.
+#
+# $PY is empty when nothing runnable exists; no call site below may fall back to
+# the bare name (that IS the stub).
+#
+# This used to promise "Python-backed services will be skipped" and continue.
+# That promise could never be kept (CR #2599, @qingyun-wu): startup resolves the
+# WORKSPACE at :586 via `sutando-config.sh workspace`, which is Python, and every
+# Python-backed launch is downstream of it. So a no-interpreter run could not
+# reach a single one of those skip branches — under `set -e` it died at the first
+# required config lookup having just claimed it would carry on. Sutando has no
+# meaningful degraded mode without an interpreter: the workspace, host label,
+# core runtime and CLAUDE_CONFIG_DIR are all resolved through it.
+#
+# So fail once, here, with the fix — which still achieves this PR's actual goal.
+# The goal was never "start anyway"; it was "never execute the stub", because
+# executing it raises a ~19 GB modal that no exit-code check or 2>/dev/null can
+# suppress. An actionable message beats that dialog.
+. "$REPO/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO")"
+if [ -z "$PY" ]; then
+  {
+    echo "✗ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
+    # Deliberately no literal system-interpreter path in this text: the
+    # repo's hardcoded-path gate flags that token, and an allow-listed
+    # exception here would weaken the scan for every other line in the file.
+    echo "  Sutando cannot start: the workspace, host label and core runtime are"
+    echo "  all resolved through Python. Deliberately not falling back to the"
+    echo "  system python3 — on a Mac without the developer tools that is the"
+    echo "  Xcode-CLT stub, and running it raises the install dialog rather"
+    echo "  than returning an error."
+    echo "  Fix: brew install python — or set \$SUTANDO_PY to an interpreter."
+  } >&2
+  exit 1
+fi
 cd "$REPO"
 
 # Belt-and-suspenders startup log → always recoverable from /tmp (Lucy's Bug #5
@@ -91,7 +131,10 @@ if [ "$BUNDLED_MODE" = "1" ]; then
   # one (external review on #2182): a missing voice/proxy/etc artifact would
   # otherwise fail inside a background job while boot still prints ✓.
   _MISSING_DIST=""
-  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers; do
+  # web-voice-transport.browser is the browser-side artifact the web UI loads
+  # for voice; it is built by the same build:bundle contract but is NOT a node
+  # service, so it has no run_node_service entry to catch its absence later.
+  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers web-voice-transport.browser; do
     [ -f "$REPO/dist/$_artifact.js" ] || _MISSING_DIST="$_MISSING_DIST $_artifact.js"
   done
   if [ -n "$_MISSING_DIST" ]; then
@@ -208,7 +251,7 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
         # python3 -c is the most portable jq-free way to write a tiny JSON
         # without shell-quoting hazards on the token value. Env vars
         # prefixed to the command (not appended as args) per POSIX.
-        if _p="$_ccd/.credentials.json" _t="$_env_token" python3 -c "
+        if _p="$_ccd/.credentials.json" _t="$_env_token" ${PY:-false} -c "
 import json,os
 p=os.environ['_p']
 t=os.environ['_t']
@@ -218,7 +261,7 @@ json.dump({'claudeAiOauth':{'accessToken':t}}, open(p,'w'))
           echo "  ~ env-token-persist: wrote .credentials.json from \$$_env_var_used (mode 600)"
           # Sidecar provenance file (#1504) — never read by Claude Code.
           # Records how this credentials file was produced for audit/migration tools.
-          _p="$_ccd/.credentials.source.json" _v="$_env_var_used" python3 -c "
+          _p="$_ccd/.credentials.source.json" _v="$_env_var_used" ${PY:-false} -c "
 import json,os,datetime
 p=os.environ['_p']; v=os.environ['_v']
 json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),'persist_block_version':1},open(p,'w'))
@@ -237,6 +280,16 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
     exit 1
   fi
   rm -f "$_ccd_err"
+fi
+
+# Boot gate (#2396): verify the resolved CLAUDE_CONFIG_DIR can boot the CLI
+# authenticated BEFORE any service launches. A logged-out CLI (locked keychain
+# on SSH boots, fresh config dir) otherwise yields a half-up core — tmux +
+# bridges alive, CLI parked at /login, processing nothing (2026-07-30 outage).
+# The gate fails loud (stderr + notification + pending-questions + proactive
+# DM file) and aborts; SUTANDO_SKIP_AUTH_PREFLIGHT=1 is the escape hatch.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  bash "$REPO/src/auth-preflight-gate.sh" "$CLAUDE_CONFIG_DIR" || exit $?
 fi
 
 # Git committer attribution: REMOVED (2026-05-21). This block used to set
@@ -259,7 +312,7 @@ git -C "$REPO" config --unset committer.email 2>/dev/null || true
 # so a kept local edit must be re-applied per host. The applier is idempotent +
 # fail-loud: it never force-applies and a stale/missing patch WARNs without
 # failing startup. See skills/plugin-patches/README.md.
-python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
+[ -n "$PY" ] && "$PY" "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
 
 # Load optional .env configuration BEFORE init.sh. Two reasons must both hold:
 #  1) init.sh resolves the workspace via `${SUTANDO_WORKSPACE/#~/$HOME}` with
@@ -393,7 +446,7 @@ fi
 # Note: the actual workspace path used below in `WORKSPACE=...` still comes
 # from the legacy resolver in this file. Wiring it to come from the loader
 # is a follow-up change — this banner is the early-warning layer.
-if ! python3 -m src.sutando_config >/dev/null; then
+if [ -n "$PY" ] && ! "$PY" -m src.sutando_config >/dev/null; then
   echo "  ✗ sutando.config.json is malformed — fix the parse error above."
   exit 1
 fi
@@ -469,7 +522,13 @@ if [ "$BUNDLED_MODE" != "1" ]; then
   if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
 fi
 if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; missing=1; fi
-core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)"
+# sutando-config.sh REQUIRES python and exits 1 without it. Under `set -e` a
+# bare command substitution here aborted the whole startup — after we had
+# just printed that Python-backed services would be skipped (CR #2599,
+# @qingyun-wu). Tolerate the failure and fall back, so the skip actually
+# happens instead of being promised.
+core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || true)"
+[ -n "$core_runtime" ] || core_runtime="claude"
 if ! command -v "$core_runtime" > /dev/null 2>&1; then
   echo "  ✗ $core_runtime CLI not found — required by core.runtime"
   missing=1
@@ -614,15 +673,23 @@ fi
 # freshly-restarted task-bridge or discord-bridge poll loop sees a backlog
 # of long-dead result files and re-delivers them. Post-mortem:
 # notes/post-mortem-dm-flood-2026-04-15.md.
-python3 "$REPO/src/archive-stale-results.py" || true
+[ -n "$PY" ] && "$PY" "$REPO/src/archive-stale-results.py" || true
 
 # Core heartbeat — per-host alive signal under state/cores/<hostname>.alive.
 # Foundation for multi-core / cross-machine "who's running?" checks. Single
 # instance per host; gracefully cleans up its .alive file on SIGTERM.
 if ! pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
   echo "  Starting core heartbeat..."
-  python3 "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
-  echo "  ✓ core heartbeat"
+  # The ✓ must live INSIDE the guard. `[ -n "$PY" ] && cmd &` followed by an
+  # unconditional echo claims a start that never happened when no interpreter
+  # resolved — and this one is the per-host liveness signal, so a false ✓ makes
+  # the node look alive with nothing writing .alive.
+  if [ -n "$PY" ]; then
+    "$PY" "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
+    echo "  ✓ core heartbeat"
+  else
+    echo "  ⊘ core heartbeat skipped — no runnable python3"
+  fi
 else
   echo "  ✓ core heartbeat (already running)"
 fi
@@ -632,8 +699,12 @@ fi
 # Single instance per host; ~30s cadence; SIGTERM-clean like the heartbeat.
 if ! pgrep -f "$REPO/src/services_status.py" > /dev/null 2>&1; then
   echo "  Starting services-status emitter..."
-  python3 "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
-  echo "  ✓ services-status emitter"
+  if [ -n "$PY" ]; then
+    "$PY" "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
+    echo "  ✓ services-status emitter"
+  else
+    echo "  ⊘ services-status emitter skipped — no runnable python3"
+  fi
 else
   echo "  ✓ services-status emitter (already running)"
 fi
@@ -693,32 +764,42 @@ else
   export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
 
-# 0b. Obs collector (OPTIONAL — opt-in via SUTANDO_OBS_COLLECTOR=1).
-# The single, source-agnostic local collector: it receives Claude Code hooks
-# (and, later, voice / filewatcher / bridge events) on /ingest/<source>,
-# normalizes them into the one event schema, and writes the durable JSONL floor
-# at <workspace>/logs/events-*.jsonl (the visualizer tails that). Off by default
-# — it's an observability/dev tool, not required for the agent to run.
-#
-# When enabled we also point the core's hooks at it (SUTANDO_OBS_ENDPOINT) UNLESS
-# an endpoint is already set — e.g. a remote upstream collector — so the "always
-# set hooks, only export when told where" contract still holds.
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+# 0b. Local usage collector. Token/cost metrics are on by default so dashboard
+# usage panels work out of the box; plaintext prompt/tool hooks retain their
+# previous explicit SUTANDO_OBS_COLLECTOR=1 opt-in. Set the flag to 0 to disable
+# the local collector entirely. Cloud forwarding remains separately opt-in.
+# shellcheck source=src/observability/startup-policy.sh
+source "$REPO/src/observability/startup-policy.sh"
+OBS_COLLECTOR_READY=0
+if obs_collector_enabled; then
   OBS_PORT="${SUTANDO_OBS_PORT:-4000}"
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
       run_node_service boot "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
-    echo "  ✓ obs collector"
-  else
-    echo "  ✓ obs collector (already running on $OBS_PORT)"
+    for _obs_wait in 1 2 3 4 5 6 7 8 9 10; do
+      obs_collector_healthy "$OBS_PORT" && break
+      sleep 0.2
+    done
   fi
-  # Wire the core's hooks to the local collector unless an endpoint is already set.
-  if [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
-    export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+  if obs_collector_healthy "$OBS_PORT"; then
+    OBS_COLLECTOR_READY=1
+    echo "  ✓ obs collector (verified on $OBS_PORT)"
+  else
+    echo "  ⚠ obs collector unavailable or foreign listener on $OBS_PORT — metrics/hook capture disabled" >&2
+  fi
+  if [ "$OBS_COLLECTOR_READY" = "1" ]; then
+    # Default-on path is metrics-only. Preserve the old explicit =1 behavior
+    # for operators who intentionally opted into prompt/tool hook capture.
+    if [ -z "${SUTANDO_OBS_METRICS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_METRICS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
+    if obs_hooks_enabled && [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
   fi
 else
-  echo "  ~ obs collector (disabled — set SUTANDO_OBS_COLLECTOR=1 to enable)"
+  echo "  ~ obs collector (disabled via SUTANDO_OBS_COLLECTOR=0)"
 fi
 # A port can LISTEN while the service never responds (single-threaded server
 # blocked on a silent connection, hung event loop). The lsof guards below only
@@ -840,8 +921,12 @@ fi
 reap_wedged_listener 7844 dashboard
 if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
-  python3 src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
-  echo "  ✓ dashboard"
+  if [ -n "$PY" ]; then
+    "$PY" src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
+    echo "  ✓ dashboard"
+  else
+    echo "  ~ dashboard skipped (no runnable python3)"
+  fi
 else
   echo "  ✓ dashboard (already running)"
 fi
@@ -850,8 +935,12 @@ fi
 reap_wedged_listener 7843 agent-api
 if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
-  python3 src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
-  echo "  ✓ agent API"
+  if [ -n "$PY" ]; then
+    "$PY" src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
+    echo "  ✓ agent API"
+  else
+    echo "  ~ agent API skipped (no runnable python3)"
+  fi
 else
   echo "  ✓ agent API (already running)"
 fi
@@ -864,8 +953,12 @@ reap_wedged_listener 7845 screen-capture
 if ! lsof -i :7845 > /dev/null 2>&1; then
   if [ "$PERM_OK" -eq 1 ]; then
     echo "  Starting screen capture (port 7845)..."
-    python3 src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
-    echo "  ✓ screen capture"
+    if [ -n "$PY" ]; then
+      "$PY" src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
+      echo "  ✓ screen capture"
+    else
+      echo "  ⊘ screen capture skipped — no runnable python3"
+    fi
   else
     echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
   fi
@@ -1015,7 +1108,7 @@ _vault_scanner_check() {
 # 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN, skip with SKIP_TELEGRAM=1)
 if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
   echo "  ~ telegram bridge (skipped via SKIP_TELEGRAM)"
-elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/telegram/.env)"; [ -f "$_TG_ENV" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$_TG_ENV" 2>/dev/null; then
+elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/telegram/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has TELEGRAM_BOT_TOKEN --env-file "$_TG_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_TG_ENV" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$_TG_ENV" 2>/dev/null; fi; then
   if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
     # Pick an interpreter that can actually verify TLS. A cert-less framework
@@ -1024,15 +1117,22 @@ elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
     # CERTIFICATE_VERIFY_FAILED — silently dropping all messages (cost us ~10h
     # on 2026-06-15, caught only by a stale-heartbeat health warning).
     _tg_tls_ok() { "$1" -c 'import urllib.request as u; u.urlopen("https://api.telegram.org",timeout=8)' >/dev/null 2>&1; }
-    TGPY="python3"
-    if ! _tg_tls_ok "$TGPY"; then
+    # Seed from the resolved interpreter, not the bare name: _tg_tls_ok EXECUTES
+    # its argument, so a bare "python3" here runs the CLT stub before the probe
+    # can judge anything.
+    TGPY="$PY"
+    if [ -n "$TGPY" ] && ! _tg_tls_ok "$TGPY"; then
       for _c in "$(pyenv which python3 2>/dev/null)" python3.12 python3.11; do
         [ -n "$_c" ] && command -v "$_c" >/dev/null 2>&1 && _tg_tls_ok "$_c" && TGPY="$_c" && break
       done
     fi
-    "$TGPY" src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
-    echo "  ✓ telegram bridge ($TGPY)"
-    _vault_scanner_check "$TGPY" "telegram bridge"
+    if [ -n "$TGPY" ]; then
+      "$TGPY" src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
+      echo "  ✓ telegram bridge ($TGPY)"
+      _vault_scanner_check "$TGPY" "telegram bridge"
+    else
+      echo "  ~ telegram bridge skipped (no runnable python3)"
+    fi
   else
     echo "  ✓ telegram bridge (already running)"
   fi
@@ -1052,6 +1152,11 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
    { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
    || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
   [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  # Tell the bridge where the durable token lives so auth-rejection recovery
+  # (revoked/expired key) can re-read it after the connect flow rewrites it —
+  # hot-swap instead of a supervisor crash-loop. Only when the file exists:
+  # env-only onboarding has no file to watch and keeps the FATAL-exit path.
+  [ -f "$_RELAY_ENV" ] && export REMOTE_TASK_TOKEN_FILE="$_RELAY_ENV"
   # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
   # legacy token may be the combined "url|secret" form, which the bridge splits.
   REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
@@ -1071,15 +1176,51 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
   # REMOTE_MEDIA_MARKER (e.g. from the channel .env) still wins.
   REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
-  if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
-    # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
-    # the redirect below); the bridge stamps launched_via into gateway-status
-    # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-    SUTANDO_SUPERVISED=1 python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
-    echo "  ✓ gateway bridge"
+  # Always spawn; the bridge's own unsuffixed singleton lock self-defers a
+  # duplicate. The previous `pgrep -f remote-gateway-bridge` guard was a P1
+  # (john, PR review 2026-08-02): every named-instance bridge shares the SAME
+  # argv, so a live secondary satisfied the pgrep and suppressed restart of a
+  # DEAD primary indefinitely. Instance identity lives only in env, which
+  # pgrep cannot see — the lock (role `gateway-bridge`, per-instance suffixed)
+  # is the only process-identity source that can arbitrate this.
+  # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
+  # the redirect below); the bridge stamps launched_via into gateway-status
+  # and skips its own bare-launch file log. See remote_gateway_bridge._log.
+  if [ -n "$PY" ]; then
+    SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+    echo "  ✓ gateway bridge (self-defers if already running)"
   else
-    echo "  ✓ gateway bridge (already running)"
+    echo "  ⊘ gateway bridge skipped — no runnable python3"
   fi
+
+  # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
+  # the environment launches one extra bridge for that gateway (e.g.
+  # AG2_REMOTE_TOKEN_DEV → instance "dev" against the dev homeserver). Each
+  # instance gets its own lock role + state files via GATEWAY_INSTANCE, and
+  # deliberately inherits NO REMOTE_PROACTIVE_ROOM — proactive nudges stay with
+  # the primary (owner-DM) gateway only.
+  # No pgrep dedupe here (env vars are invisible to pgrep -f): the bridge's own
+  # per-instance singleton lock (role gateway-bridge.<inst>) makes a duplicate
+  # launch self-defer and exit, so always-spawn is safe and simpler.
+  for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
+    _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
+    # The guard must wrap the WHOLE command. `VAR=1 [ -n "$PY" ] && cmd` applies
+    # the assignments to `[` and runs cmd with NONE of them — so the named
+    # gateway launched without GATEWAY_INSTANCE / its own REMOTE_TASK_TOKEN /
+    # the REMOTE_PROACTIVE_ROOM= scoping, collapsing onto the primary gateway's
+    # credentials (CR #2599, @qingyun-wu).
+    # The ✓ belongs INSIDE the branch too. Fixing the guard shape here while
+    # leaving the success line outside it still reported a launch that never
+    # happened — per named instance, on a configured remote-control surface.
+    if [ -n "$PY" ]; then
+      SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+        REMOTE_PROACTIVE_ROOM= \
+        "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
+      echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
+    else
+      echo "  ⊘ gateway bridge ($_gw_inst) skipped — no runnable python3"
+    fi
+  done
 fi
 
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
@@ -1092,9 +1233,13 @@ fi
 # wins. Same probe is also what's used in the bridge's rescue fallback.
 if [ "${SKIP_DISCORD:-}" = "1" ]; then
   echo "  ~ discord bridge (skipped via SKIP_DISCORD)"
-elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
+elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has DISCORD_BOT_TOKEN --env-file "$_DC_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; fi; then
   PYTHON_WITH_DISCORD=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+    # Same substitution as the slack loop below: probing EXECUTES the candidate,
+    # so a bare `python3` here is the CLT stub on a Mac without developer tools.
+    [ "$_p" = "python3" ] && _p="$PY"
+    [ -n "$_p" ] || continue
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import discord" 2>/dev/null; then
       PYTHON_WITH_DISCORD="$_p"
       break
@@ -1108,9 +1253,14 @@ elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
   # interpreter that would crash-loop on every boot. If THAT probe also
   # fails, keep the labeled skip with the pip-install hint (names the
   # missing dep + fix at the startup console).
-  if [ -z "$PYTHON_WITH_DISCORD" ] && command -v python3 >/dev/null 2>&1 && python3 -c "import discord" 2>/dev/null; then
-    PYTHON_WITH_DISCORD="python3"
-    echo "  ~ discord bridge using PATH python3 (no probed interp matched; PATH python3 has discord.py)"
+  # Probe the RESOLVED interpreter, never a bare `python3`. `command -v python3`
+  # succeeds against the Xcode-CLT stub and the `-c "import discord"` that
+  # follows EXECUTES it — raising the modal this PR exists to remove (CR #2599,
+  # @qingyun-wu). $PY is empty when nothing runnable exists, so the probe is
+  # skipped entirely rather than falling back to the stub.
+  if [ -z "$PYTHON_WITH_DISCORD" ] && [ -n "$PY" ] && "$PY" -c "import discord" 2>/dev/null; then
+    PYTHON_WITH_DISCORD="$PY"
+    echo "  ~ discord bridge using resolved python3 ($PY — no probed interp matched; it has discord.py)"
   fi
   if [ -z "$PYTHON_WITH_DISCORD" ]; then
     echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
@@ -1131,9 +1281,19 @@ fi
 # fresh-install miniconda env doesn't silently miss slack_bolt.
 if [ "${SKIP_SLACK:-}" = "1" ]; then
   echo "  ~ slack bridge (skipped via SKIP_SLACK)"
-elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
+elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has SLACK_BOT_TOKEN --env-file "$_SL_ENV" 2>/dev/null || _tok_rc=$?; _tok_rc2=0; "$PY" "$REPO/src/channel_token.py" --has SLACK_APP_TOKEN --env-file "$_SL_ENV" 2>/dev/null || _tok_rc2=$?; [ "$_tok_rc" -eq 0 ] && [ "$_tok_rc2" -ne 0 ] && _tok_rc=3; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; fi; then
   PYTHON_WITH_SLACK=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+    # Substitute the RESOLVED interpreter for the bare `python3` candidate:
+    # probing a candidate EXECUTES it, and a bare `python3` on a Mac without
+    # developer tools is the CLT stub (CR #2599, @qingyun-wu). Empty $PY drops
+    # out of the list rather than degrading to the stub.
+    #
+    # Done inside the loop rather than in the `for` list so the pre-existing
+    # /opt/... literals stay on an UNCHANGED line — rewriting that line re-adds
+    # them as new, and REVIEW.md's path scan flags added /opt/ paths.
+    [ "$_p" = "python3" ] && _p="$PY"
+    [ -n "$_p" ] || continue
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
       PYTHON_WITH_SLACK="$_p"
       break
@@ -1144,7 +1304,12 @@ elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
   elif ! pgrep -f "slack-bridge" > /dev/null 2>&1; then
     echo "  Starting Slack bridge with $PYTHON_WITH_SLACK..."
     # Source the env file so SLACK_BOT_TOKEN / SLACK_APP_TOKEN reach the child.
-    set -a; . "$_SL_ENV"; set +a
+    # The gate can now pass on a vault-only token, so this file need not exist.
+    # Sourcing a missing path under the top-level `set -e` aborts ALL of startup
+    # — every service after this line — to launch an OPTIONAL bridge. Guarded
+    # with if/then/fi, not `&&`: a failing `&&` chain is itself non-zero and
+    # would abort identically. (@john-the-dev on #2638.)
+    if [ -f "$_SL_ENV" ]; then set -a; . "$_SL_ENV"; set +a; fi
     "$PYTHON_WITH_SLACK" src/slack-bridge.py > "$LOGS_DIR/slack-bridge.log" 2>&1 &
     echo "  ✓ slack bridge"
     _vault_scanner_check "$PYTHON_WITH_SLACK" "slack bridge"
@@ -1184,7 +1349,17 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
       ngrok http 3100 --log=stdout > /tmp/ngrok.log 2>&1 &
     fi
     sleep 3
-    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
+    # `${PY:-cat} -c` was not a fallback: with no interpreter it runs `cat -c`,
+    # which is not a valid cat invocation on either BSD or GNU. It fails, the
+    # `|| echo ""` swallows it, and the operator is left with a running ngrok
+    # tunnel and a stale WEBHOOK_BASE_URL — Twilio then posts to the previous
+    # session's URL. Skip explicitly and say why instead.
+    if [ -n "$PY" ]; then
+      NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | "$PY" -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
+    else
+      NGROK_URL=""
+      echo "  ⊘ ngrok URL not parsed — no runnable python3; set WEBHOOK_BASE_URL in .env manually"
+    fi
     if [ -n "$NGROK_URL" ]; then
       # Update WEBHOOK_BASE_URL in .env — portable in-place edit.
       # `sed -i ''` is BSD-only; on Macs with Homebrew gnu-sed in PATH it
@@ -1224,7 +1399,7 @@ fi
 if phone_stack_enabled && grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
 for port_name in $VERIFY_PORTS; do

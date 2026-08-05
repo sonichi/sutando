@@ -14,6 +14,8 @@ Machine-readable ownership and lifecycle metadata lives in
   resolver APIs.
 - [Run Codex as the core](codex-core.md) — core selection, setup, and rollback.
 - [Use built-in tools](built-in-tools.md) — authoritative capability catalog.
+- [External runtime dependencies](runtime-dependencies.md) — what must be
+  installed, what only a feature needs, and what to vendor when embedding.
 
 ## Guides and examples
 
@@ -45,6 +47,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
+- [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
 - [ADR 0001: Pointer Teacher brain](adr/0001-pointer-teacher-brain.md)
 
 ## Documentation contract

@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
+import { presenterModeActive } from './presenter-mode.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -22,7 +23,11 @@ const WORKSPACE_DIR = resolveWorkspace();
 
 // Gate slide-control + fullscreen on presenter-mode.sentinel.
 // Issue #1171: registering these globally causes Gemini to fire them on greetings.
-const _presenterActive = existsSync(join(WORKSPACE_DIR, 'state', 'presenter-mode.sentinel'));
+// Expiry-aware (#2501 policy twin): bare existsSync re-activated the gate
+// forever after a talk window lapsed without `presenter-mode.sh stop`, because
+// a naturally-expired sentinel stays on disk. Still evaluated once at module
+// load — the per-session registration semantics are unchanged.
+const _presenterActive = presenterModeActive(WORKSPACE_DIR);
 
 // Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
 // workspace. Compute REPO_ROOT from this file's URL so the resolution
@@ -940,6 +945,95 @@ export const deleteNoteTool: ToolDefinition = {
 
 const VOICE_SESSION_CONTEXT_PATH = join(WORKSPACE_DIR, 'state', 'voice-session-context.json');
 
+// Anything older than this is almost certainly a PREVIOUS session's context.
+// The file exists to bridge voice's ~10-minute Gemini window inside one live
+// session, so a multi-hour gap means the session that wrote it is long gone.
+export const VOICE_CONTEXT_STALE_HOURS = 6;
+
+// Clocks between the writing process and the reading one disagree by seconds in
+// practice. Inside this window a future timestamp is ordinary skew and the age is
+// clamped to 0; beyond it the stamp is untrustworthy and degrades to 'unknown'.
+export const VOICE_CONTEXT_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+
+/**
+ * Stamp the context payload with its own age.
+ *
+ * WHY: the writer is a PROSE INSTRUCTION, not code — CLAUDE.md tells core to
+ * update this file "whenever a durable decision lands". That is a discipline,
+ * and disciplines lapse silently. Measured 2026-08-03: the canonical file was
+ * **97 hours old and still carried `pending_action`**, and the legacy copy was
+ * 878 hours old. `recent_context` returned both verbatim, so voice would answer
+ * "what's pending?" with a four-day-old action stated as current — while the
+ * tool's own description promises "the CURRENT voice-session context".
+ *
+ * The payload is deliberately NOT withheld when stale: dropping it would hide
+ * context that is often still correct, and the failure this guards against is
+ * voice asserting currency it cannot verify. So it returns everything and adds
+ * the one fact the caller could not otherwise know.
+ */
+export function annotateContextFreshness(
+	parsed: Record<string, unknown> | null | undefined,
+	nowMs: number = Date.now(),
+): Record<string, unknown> {
+	const base: Record<string, unknown> = { ...(parsed ?? {}) };
+	const rawTs = base.updated_at;
+	const updatedMs = typeof rawTs === 'string' ? Date.parse(rawTs) : Number.NaN;
+	if (!Number.isFinite(updatedMs)) {
+		base.freshness = 'unknown';
+		base.note =
+			'context has no parseable updated_at — age unknown, so treat pending_action and active_drafts as historical unless the user confirms them.';
+		return base;
+	}
+	// A FUTURE timestamp fails both branches below unless it is caught here: the age
+	// goes negative, so it is never >= the stale threshold, and Number.isFinite() is
+	// true so it never reaches 'unknown'. A skewed or corrupt clock would therefore
+	// bypass the guard completely and let voice assert an old pending_action as
+	// current until wall time caught up — the very defect this function exists to
+	// close, through the one input I had not considered (qingyun-wu + john-the-dev,
+	// review of #2560).
+	//
+	// The tolerance matters as much as the check: machine clocks routinely disagree
+	// by seconds, so treating ANY future stamp as untrusted would flag healthy
+	// contexts and train the reader to ignore the marker. Inside the window the age
+	// is clamped to 0 (healthy, never negative); beyond it the stamp cannot be
+	// trusted at all, so it degrades to unknown rather than to fresh.
+	const ageMs = nowMs - updatedMs;
+	// Close the CLASS, not the case. The reviewed defect was a future timestamp
+	// producing a negative age that satisfied neither branch; a non-finite `nowMs`
+	// (NaN/Infinity, e.g. a caller passing a parsed value) fails both the same way
+	// and reads as fresh. Found by enumerating this function's inputs rather than
+	// waiting for a fourth review round. Any age arithmetic that is not a finite
+	// number means the age is unknowable, so it degrades to unknown — never fresh.
+	if (!Number.isFinite(ageMs)) {
+		base.freshness = 'unknown';
+		base.note =
+			'context age could not be computed (the current time was not a finite value), so it ' +
+			'cannot be trusted. Treat pending_action and active_drafts as historical unless the ' +
+			'user confirms them.';
+		return base;
+	}
+	if (ageMs < -VOICE_CONTEXT_SKEW_TOLERANCE_MS) {
+		const aheadHours = Math.round((-ageMs / 3_600_000) * 10) / 10;
+		base.age_hours = Math.round((ageMs / 3_600_000) * 10) / 10;
+		base.freshness = 'unknown';
+		base.note =
+			`this context is timestamped ${aheadHours}h in the FUTURE — a skewed or corrupt clock, ` +
+			'so its age cannot be trusted. Treat pending_action and active_drafts as historical ' +
+			'unless the user confirms them.';
+		return base;
+	}
+	const ageHours = Math.max(0, ageMs) / 3_600_000;
+	base.age_hours = Math.round(ageHours * 10) / 10;
+	if (ageHours >= VOICE_CONTEXT_STALE_HOURS) {
+		base.stale = true;
+		base.note =
+			`this context is ${base.age_hours}h old — almost certainly written by an EARLIER session, ` +
+			'not the one you are in. Do not present pending_action or active_drafts as current; ' +
+			'say how old it is, or confirm with the user before acting on it.';
+	}
+	return base;
+}
+
 export const recentContextTool: ToolDefinition = {
 	name: 'recent_context',
 	description:
@@ -947,7 +1041,10 @@ export const recentContextTool: ToolDefinition = {
 		'Call this when the user references something with a deictic pronoun ("the post", "the draft", "the one I just typed") that you can\'t place from your own recent transcript. ' +
 		'Also fine to call proactively at the start of an active session to ground yourself. ' +
 		'Returns JSON with keys: active_drafts (array), pending_action (object|null), last_results (array of {task_id, subject, ts}). ' +
-		'If the file is missing or empty, returns {note: "no context recorded yet"}.',
+		'If the file is missing or empty, returns {note: "no context recorded yet"}. ' +
+		'The response also carries age_hours, and stale:true with a note when the context predates this session. ' +
+		'Age is load-bearing: when stale is set, do NOT state pending_action or active_drafts as current — ' +
+		'say how old it is, or ask the user to confirm, before acting on it.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
@@ -956,8 +1053,8 @@ export const recentContextTool: ToolDefinition = {
 				return { note: 'no context recorded yet — core hasn\'t written voice-session-context.json' };
 			}
 			const raw = readFileSync(VOICE_SESSION_CONTEXT_PATH, 'utf-8');
-			const parsed = JSON.parse(raw);
-			console.log(`${ts()} [RecentContext] returned (updated_at=${parsed.updated_at || 'unknown'}, ${(parsed.active_drafts || []).length} drafts, ${(parsed.last_results || []).length} results)`);
+			const parsed = annotateContextFreshness(JSON.parse(raw));
+			console.log(`${ts()} [RecentContext] returned (updated_at=${parsed.updated_at || 'unknown'}, age=${parsed.age_hours ?? '?'}h${parsed.stale ? ' STALE' : ''}, ${((parsed.active_drafts as unknown[]) || []).length} drafts, ${((parsed.last_results as unknown[]) || []).length} results)`);
 			return parsed;
 		} catch (err) {
 			return { error: `recent_context read failed: ${err instanceof Error ? err.message : err}` };
