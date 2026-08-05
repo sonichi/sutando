@@ -4545,9 +4545,22 @@ def check_skill_symlinks() -> dict:
     if orphaned:
         parts.append(f"{len(orphaned)} dangling not in this repo: {', '.join(orphaned[:4])}{'...' if len(orphaned) > 4 else ''}")
     if shadowed:
+        # The remedy must MOVE the real directory aside first. `ln -sfn` alone
+        # does NOT repair this state: with the directory still present, macOS
+        # `ln` treats the destination as a target DIRECTORY and creates a nested
+        # `<dst>/<name>/<name>` symlink, leaving the real dir in place — so the
+        # skill stays unlinked while the operator believes it is fixed.
+        # Reproduced (john-the-dev, #2660): dest_is_symlink=no, and
+        # `readlink <dst>/alpha/alpha` returned the source path.
+        #
+        # Moving rather than deleting is deliberate and is the whole reason this
+        # is not auto-fixed: the directory may carry local edits, and `rm -rf`
+        # would destroy them silently.
         parts.append(
-            f"{len(shadowed)} a real dir, not a link (diverges silently; "
-            f"`ln -sfn` to re-track, but check for local edits first): "
+            f"{len(shadowed)} a real dir, not a link (diverges silently; repair with "
+            f"`mv <dst>/<name> <dst>/<name>.local-backup && ln -s <src>/<name> <dst>/<name>` "
+            f"— move aside, do NOT `ln -sfn` over it, and keep the backup until you have "
+            f"checked it for local edits): "
             f"{', '.join(shadowed[:4])}{'...' if len(shadowed) > 4 else ''}"
         )
 

@@ -94,6 +94,63 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         self.assertEqual(r["_shadowed"], ["alpha"])
         self.assertIn("real dir", r["detail"])
 
+    def test_the_advertised_remedy_ACTUALLY_REPAIRS_the_state(self):
+        """Run the remedy the warning prints. Not a string match — the command
+        is extracted from the detail and EXECUTED.
+
+        The first version of this warning said "`ln -sfn` to re-track", which
+        does not repair it: with the real directory still present, macOS `ln`
+        treats the destination as a target DIRECTORY and creates a nested
+        `<dst>/<name>/<name>` symlink while the real dir stays. The operator
+        follows the advice, sees no error, and is still broken
+        (john-the-dev, #2660). A wording-only assertion would not have caught
+        that, so this one runs it.
+        """
+        import re
+        import subprocess
+
+        self._skill("alpha")
+        real = self.dst / "alpha"
+        real.mkdir()
+        (real / "SKILL.md").write_text("# local edits\n")
+
+        detail = self.hc.check_skill_symlinks()["detail"]
+
+        # The remedy is the backticked command in the warning. Extract it rather
+        # than hardcoding, so a future edit to the text is what gets tested.
+        cmds = re.findall(r"`([^`]+)`", detail)
+        remedy = next((c for c in cmds if "ln -s" in c), None)
+        self.assertIsNotNone(remedy, f"no remedy command in the warning: {detail}")
+        self.assertNotIn("ln -sfn", remedy,
+                         "the warning advertises `ln -sfn`, which does NOT repair a real dir")
+
+        concrete = (remedy.replace("<dst>", str(self.dst))
+                          .replace("<src>", str(self.src))
+                          .replace("<name>", "alpha"))
+        subprocess.run(["bash", "-c", concrete], check=True)
+
+        self.assertTrue((self.dst / "alpha").is_symlink(),
+                        "the advertised remedy did not produce a symlink")
+        self.assertFalse((self.dst / "alpha" / "alpha").exists(),
+                         "the remedy created a NESTED link — the `ln -sfn` failure mode")
+        self.assertTrue((self.dst / "alpha.local-backup" / "SKILL.md").exists(),
+                        "the remedy did not preserve the local edits it moved aside")
+
+    def test_ln_sfn_alone_does_NOT_repair_it(self):
+        """The control that justifies the remedy above. If this ever starts
+        passing, macOS `ln` changed and the warning can be simplified."""
+        import subprocess
+        self._skill("alpha")
+        real = self.dst / "alpha"
+        real.mkdir()
+        (real / "SKILL.md").write_text("# local\n")
+        subprocess.run(["bash", "-c",
+                        f"ln -sfn {self.src}/alpha {self.dst}/alpha"], check=True)
+        self.assertFalse((self.dst / "alpha").is_symlink(),
+                         "ln -sfn repaired it — the warning's caveat is now obsolete")
+        self.assertTrue((self.dst / "alpha" / "alpha").is_symlink(),
+                        "expected the nested-link failure mode")
+
     def test_shadowed_is_reported_but_NOT_auto_fixed(self):
         """--fix must not clobber it: a real dir may be an intentional local
         install someone is editing. Same reason refresh-skill.sh refuses."""
