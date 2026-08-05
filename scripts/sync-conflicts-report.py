@@ -148,6 +148,35 @@ def _new_content(saved: str, live: str) -> "list[str]":
     return out
 
 
+def _split_by_reason(extra: "list[str]", live: str) -> "tuple[list[str], list[str]]":
+    """Split reported lines into (absent-entirely, present-under-another-heading).
+
+    Section-scoping is what catches john-the-dev's swap, and it necessarily also
+    reports a line that merely MOVED between headings — the text is present, the
+    association is not. Those two cases need different human responses and the
+    old count could not tell them apart, so the report said "5 lines" and the
+    operator had to open the file to learn whether anything was actually lost.
+
+    Nothing is suppressed here. The second bucket is NOT benign: a policy
+    inversion IS a line appearing under a different heading, which is the whole
+    point of the fix. It is labelled, not filtered, so the swap still reports
+    and a re-section still reports — the operator just learns which they have
+    before opening anything.
+
+    The test is deliberately the OLD global-haystack rule, so the second bucket
+    is exactly "what the pre-section-scoping version would have called clean".
+    """
+    haystack = " ".join(live.split())
+    absent, resectioned = [], []
+    for line in extra:
+        needle = " ".join(line.split())
+        if re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack):
+            resectioned.append(line)
+        else:
+            absent.append(line)
+    return absent, resectioned
+
+
 def _retired_path(root: pathlib.Path) -> pathlib.Path:
     return root / ".retired.json"
 
@@ -225,9 +254,11 @@ def unmerged(workspace: pathlib.Path):
             if not live.exists():
                 out.append((batch.name, rel, None))
                 continue
-            extra = _new_content(saved_text, live.read_text(errors="replace"))
+            live_text = live.read_text(errors="replace")
+            extra = _new_content(saved_text, live_text)
             if extra:
-                out.append((batch.name, rel, len(extra)))
+                absent, resectioned = _split_by_reason(extra, live_text)
+                out.append((batch.name, rel, (len(extra), len(absent), len(resectioned))))
     return out, None
 
 
@@ -348,7 +379,21 @@ def main() -> int:
         return 0
     print(f"sync-conflicts: {len(rows)} file(s) hold peer content not in the live copy")
     for batch, rel, n in rows:
-        where = f"{n} lines" if n is not None else "live file MISSING"
+        if n is None:
+            where = "live file MISSING"
+        else:
+            total, absent, resectioned = n
+            # Name WHICH kind, because the two need different responses and the
+            # bare count could not distinguish them: `absent` may be real loss;
+            # `under another heading` is present text whose ASSOCIATION changed,
+            # which is both the benign re-section case AND the policy inversion
+            # this reporter exists to catch. Neither is filtered out.
+            parts = []
+            if absent:
+                parts.append(f"{absent} absent")
+            if resectioned:
+                parts.append(f"{resectioned} under another heading")
+            where = f"{total} lines: " + ", ".join(parts)
         print(f"  {rel}  ({where})  <- {batch}")
     return 1
 

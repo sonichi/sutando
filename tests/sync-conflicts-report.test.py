@@ -215,6 +215,55 @@ class TestSyncConflictsReport(unittest.TestCase):
                          "the body under a renamed heading must NOT be reported — "
                          "its text is present in the live copy")
 
+    def test_the_report_SPLITS_absent_from_moved_between_sections(self):
+        """Section-scoping necessarily reports a line that merely MOVED headings.
+
+        That is the cost of catching the swap: the text is present, the
+        ASSOCIATION is not, and the discriminator cannot tell a benign
+        re-section from a policy inversion — because structurally they are the
+        same edit. Found on live data: 4 flagged files, and 2 of them were
+        content present VERBATIM elsewhere in the file.
+
+        So the report names which kind. Nothing is filtered — a swap still
+        reports, labelled "under another heading", which is exactly what a
+        policy inversion looks like.
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rep", SCRIPT)
+        rep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rep)
+
+        # genuinely new text -> absent
+        live = "## A\nkeep\n"
+        extra = rep._new_content("## A\nkeep\nbrand new fact\n", live)
+        absent, moved = rep._split_by_reason(extra, live)
+        self.assertEqual(absent, ["brand new fact"])
+        self.assertEqual(moved, [])
+
+        # the swap -> reported, and classed as under-another-heading
+        live2 = "## Allowed\n- Alice\n## Denied\n- Bob\n"
+        extra2 = rep._new_content("## Allowed\n- Bob\n## Denied\n- Alice\n", live2)
+        absent2, moved2 = rep._split_by_reason(extra2, live2)
+        self.assertEqual(absent2, [], "a swap loses no TEXT, so nothing is absent")
+        self.assertEqual(sorted(moved2), ["- Alice", "- Bob"],
+                         "the swap must still be REPORTED, just correctly labelled")
+
+    def test_the_split_is_the_OLD_global_rule_so_the_buckets_are_meaningful(self):
+        """`under another heading` == what the pre-section-scoping version called
+        clean. Pinning that keeps the second bucket interpretable: it is exactly
+        the set john-the-dev's blocker made visible, not an arbitrary category.
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rep", SCRIPT)
+        rep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rep)
+        live = "## X\nthe peer fact\n## Y\nunrelated\n"
+        # present verbatim, different heading -> moved, not absent
+        extra = rep._new_content("## Y\nthe peer fact\n", live)
+        absent, moved = rep._split_by_reason(extra, live)
+        self.assertEqual(absent, [])
+        self.assertEqual(moved, ["the peer fact"])
+
     def test_a_saved_line_that_is_a_PARTIAL_SUBSTRING_of_live_text_still_reports(self):
         """The collision control (qingyun-wu, #2662).
 
