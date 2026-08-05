@@ -485,6 +485,105 @@ def case_q_preupgrade_state_dead_reobserves() -> list[str]:
     return fails
 
 
+def case_r_local_liveness_ignores_peer_heartbeats():
+    """qingyun-wu's P1 (#2160): a PEER heartbeat must not suppress a local relaunch.
+
+    The dead-core actuator defaulted to `_any_core_alive`, whose contract is
+    explicitly "any host" and which globs every `state/cores/*.alive`. The
+    workspace is SHARED, so on a multi-core setup one fresh peer record made a
+    dead local host look alive forever and the relaunch never fired.
+
+    Four states, because two of them are what stop the fix becoming "never
+    believe a heartbeat": a fresh LOCAL beat must still read alive, and a stale
+    one must not.
+    """
+    import os
+    import pathlib
+    import tempfile
+    import time as _t
+    fails = []
+    ws = pathlib.Path(tempfile.mkdtemp())
+    (ws / "state" / "cores").mkdir(parents=True)
+    (ws / "state" / "cores" / "peer-host.alive").write_text("{}")
+
+    if not hc._any_core_alive(ws):
+        fails.append("r) _any_core_alive should still see the peer — that contract is fleet-wide")
+    if hc._local_core_alive(ws):
+        fails.append("r) a PEER heartbeat made the local core look alive (the P1)")
+
+    sys.path.insert(0, str(pathlib.Path(hc.__file__).resolve().parent))
+    from util_paths import _host_label
+    local = ws / "state" / "cores" / f"{_host_label()}.alive"
+    local.write_text("{}")
+    if not hc._local_core_alive(ws):
+        fails.append("r) a fresh LOCAL heartbeat must read alive")
+
+    stale = _t.time() - 600
+    os.utime(local, (stale, stale))
+    if hc._local_core_alive(ws):
+        fails.append("r) a STALE local heartbeat must not read alive")
+
+    # and the actuator must actually relaunch when only a peer is beating
+    (ws / "state" / "cores" / "peer-host.alive").write_text("{}")
+    if hc._local_core_alive(ws):
+        fails.append("r) local liveness still true after refreshing only the peer")
+    return fails
+
+
+def case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet():
+    """Pin the WIRING, not just the function.
+
+    Case r proves `_local_core_alive` is correct. It does NOT prove the actuator
+    USES it: `Harness` always injects `alive_fn`, so the default is never
+    exercised. I verified that by reverting `alive_fn = alive_fn or
+    _local_core_alive` back to `_any_core_alive` — case r still passed. A test
+    that cannot fail in the broken state proves nothing about it.
+
+    So this one calls the actuator with NO injected alive_fn, against a
+    workspace where only a PEER is beating. With the fleet-wide default the core
+    reads alive and nothing is observed; with the local default it observes.
+    """
+    import os
+    import pathlib
+    import tempfile
+    fails = []
+    ws = pathlib.Path(tempfile.mkdtemp())
+    (ws / "state" / "cores").mkdir(parents=True)
+    (ws / "state" / "cores" / "peer-host.alive").write_text("{}")   # PEER only
+
+    orig = hc.WORKSPACE_DIR
+    hc.WORKSPACE_DIR = ws
+    try:
+        r = hc.recover_core_if_wedged(
+            state_file=ws / "rec.json",
+            now=1_000_000,
+            # alive_fn deliberately NOT injected — this is the point of the case
+            oldest_task_fn=lambda: ("t1", 5000),
+            status_ts_fn=lambda: None,
+            just_booted_fn=lambda: False,
+            restart_fn=lambda standard_context: True,
+            sender=lambda text: True,
+        )
+    finally:
+        hc.WORKSPACE_DIR = orig
+
+    # Assert on wedge_mode, NOT on action. Both modes return "observed" — the
+    # fleet-wide default reaches it via the WEDGE path (alive but stuck) and the
+    # local default via the DEAD path. An action-only assertion passes under
+    # both, which is exactly how my first draft of this case failed to pin
+    # anything; the revert control caught it.
+    import json as _json
+    st = _json.loads((ws / "rec.json").read_text()) if (ws / "rec.json").exists() else {}
+    if st.get("wedge_mode") != "dead":
+        fails.append(
+            "s) with only a PEER heartbeat the local core is DEAD, but the "
+            f"actuator recorded wedge_mode={st.get('wedge_mode')!r} — the "
+            "default alive_fn is fleet-wide, not local")
+    if r is None or r.get("action") != "observed":
+        fails.append(f"s) expected an observation, got {r}")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_healthy_no_action),
@@ -497,6 +596,8 @@ def main() -> int:
         ("h", case_h_give_up_cap),
         ("i", case_i_failed_restart_does_not_burn_state),
         ("j", case_j_dead_core_relaunches),
+        ("r", case_r_local_liveness_ignores_peer_heartbeats),
+        ("s", case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet),
         ("j2", case_j2_dead_core_before_after_output),
         ("k", case_k_draining_backlog_never_restarts),
         ("l", case_l_progress_resets_long_task),

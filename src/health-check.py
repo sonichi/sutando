@@ -2119,6 +2119,37 @@ def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -
     return False
 
 
+def _local_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -> bool:
+    """Return True if THIS host's core has a live heartbeat.
+
+    `_any_core_alive` answers a fleet question — "is anyone up to service a
+    queued task?" — and globbing every `state/cores/*.alive` is right for that.
+    It is the wrong question for the dead-core RESTART actuator: the workspace
+    is shared, so one fresh peer record made a dead local host look alive
+    forever and the relaunch never fired. Repro with only `peer-host.alive`
+    present returned `any_core_alive: True, local_heartbeat_exists: False`
+    (qingyun-wu, #2160 P1).
+
+    Restarting is a local action about the local core, so it reads exactly one
+    file: the name `core_heartbeat` writes, via the same `util_paths._host_label()`
+    it uses — not `socket.gethostname()`, which drifts from the label under a
+    DHCP rename and would look for a file nobody writes.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from util_paths import _host_label
+        label = _host_label()
+    except Exception:
+        return False          # cannot identify this host -> do not claim alive
+    alive_file = workspace / "state" / "cores" / f"{label}.alive"
+    try:
+        return (time.time() - alive_file.stat().st_mtime) < max_age_s
+    except OSError:
+        return False          # absent or unreadable == not alive
+
+
 def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
     """Emit a task file describing health-check failures so the proactive
     loop's CLI session sees them via the watcher and can decide what to do
@@ -2680,7 +2711,12 @@ def recover_core_if_wedged(
         now = time.time()
     if state_file is None:
         state_file = WORKSPACE_DIR / "state" / "core-recovery.json"
-    alive_fn = alive_fn or _any_core_alive
+    # LOCAL, not fleet-wide: a peer's heartbeat must not suppress the relaunch
+    # of a dead core on THIS host (qingyun-wu, #2160 P1). The two call sites
+    # that gate "queue a task for someone to pick up" keep `_any_core_alive`,
+    # because any live core can service a queued task — that question really is
+    # fleet-wide. Restarting is not.
+    alive_fn = alive_fn or _local_core_alive
     oldest_task_fn = oldest_task_fn or (lambda: _oldest_pending_task(now))
     status_ts_fn = status_ts_fn or _core_status_ts
     just_booted_fn = just_booted_fn or (lambda: _core_started_within(RECOVER_WEDGE_SEC, now=now))
