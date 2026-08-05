@@ -39,6 +39,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -202,8 +203,85 @@ class TestObservedReading(BindingWindowBase):
             self.assertLessEqual(r["estimated_minutes_left"], cap)
 
 
+class TestV1HistoryWarmUp(BindingWindowBase):
+    """An expected window with no history of its own is INCOMPLETE, not clear.
+
+    Blocking review finding (qingyun-wu, at `c326df8a`). Every pre-existing v1
+    history already satisfies the 5h sample gate and carries no `burn_samples_7d`
+    at all, so for the first reads after the upgrade the 7d window is
+    expected-but-unforecast. Folding that into `binding_window: null` made the
+    human path print "no window runs out before its own reset" over a 7d window
+    sitting at 95% — an all-clear on a window nobody measured, which is the exact
+    failure this whole change removes, one layer up.
+    """
+
+    def v1_history(self):
+        """A real pre-upgrade history: warm 5h EWMA, no 7d fields whatsoever."""
+        self.mod.BURN_HISTORY_FILE.write_text(json.dumps({
+            "last_read_ts": time.time() - PASS_S,
+            "last_util_5h": 0.09,
+            "schema_version": 1,
+            "burn_rate_5h_ewma": 0.0037,
+            "burn_samples": 99,
+        }))
+
+    def test_7d_without_history_is_reported_unforecast(self):
+        self.v1_history()
+        r = self.mod._update_burn_rate(
+            0.10, 0.95, time.time() + self.RESET_5H_S, time.time() + self.RESET_7D_S)
+        self.assertEqual(r["unforecast_windows"], ["7d"])
+
+    def test_incomplete_is_not_reported_as_a_binding_number(self):
+        self.v1_history()
+        r = self.mod._update_burn_rate(
+            0.10, 0.95, time.time() + self.RESET_5H_S, time.time() + self.RESET_7D_S)
+        self.assertIsNone(r["binding_window"])
+        self.assertIsNone(r["estimated_passes_left"])
+
+    def test_a_7d_stream_that_never_matures_stays_unforecast(self):
+        # One 7d sample is not two. Omission must never age into safety.
+        self.v1_history()
+        r = self.mod._update_burn_rate(
+            0.10, 0.95, time.time() + self.RESET_5H_S, time.time() + self.RESET_7D_S)
+        h = json.loads(self.mod.BURN_HISTORY_FILE.read_text())
+        h["last_read_ts"] = time.time() - PASS_S
+        self.mod.BURN_HISTORY_FILE.write_text(json.dumps(h))
+        r = self.mod._update_burn_rate(
+            0.11, 0.96, time.time() + self.RESET_5H_S, time.time() + self.RESET_7D_S)
+        self.assertEqual(r["unforecast_windows"], ["7d"])
+
+    def test_human_output_does_not_state_an_all_clear(self):
+        # End-to-end through the real script: the printed line is what a human
+        # acts on, and it is the thing that was wrong.
+        self.v1_history()
+        (self.tmp / "state" / "quota-state.json").write_text(json.dumps({"headers": {
+            "anthropic-ratelimit-unified-status": "allowed",
+            "anthropic-ratelimit-unified-5h-utilization": "0.10",
+            "anthropic-ratelimit-unified-7d-utilization": "0.95",
+        }}))
+        env = dict(os.environ, SUTANDO_WORKSPACE=str(self.tmp), SUTANDO_TEST_MODE="1")
+        out = subprocess.run([sys.executable, str(_SCRIPT)], env=env,
+                             capture_output=True, text=True).stdout
+        self.assertNotIn("no window runs out", out)
+        self.assertIn("INCOMPLETE", out)
+        self.assertIn("7d", out.split("Est. passes left:")[-1])
+
+
 class TestBackCompat(BindingWindowBase):
     """The pre-existing single-argument call keeps working."""
+
+    def test_a_5h_only_caller_does_not_expect_7d(self):
+        # No 7d utilization supplied -> 7d is not an expected window, so it
+        # cannot be "unforecast". Otherwise every legacy caller reads INCOMPLETE
+        # forever over a window it never asked about.
+        r = None
+        for i, u5 in enumerate((0.10, 0.20, 0.30)):
+            if i:
+                h = json.loads(self.mod.BURN_HISTORY_FILE.read_text())
+                h["last_read_ts"] = time.time() - PASS_S
+                self.mod.BURN_HISTORY_FILE.write_text(json.dumps(h))
+            r = self.mod._update_burn_rate(u5)
+        self.assertEqual(r["unforecast_windows"], [])
 
     def test_5h_only_call_still_forecasts(self):
         r = None

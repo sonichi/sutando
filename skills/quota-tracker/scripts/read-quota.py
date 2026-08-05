@@ -61,6 +61,8 @@ _EWMA_ALPHA = 0.3
 # Sample inclusion window: skip deltas from outside [MIN_GAP_S, MAX_GAP_S].
 _MIN_GAP_S = 120     # 2 min — same-pass double-reads shouldn't count
 _MAX_GAP_S = 7200    # 2 h — stale gap yields unreliable per-pass rate
+# A window needs this many of its OWN samples before it can be forecast.
+_MIN_SAMPLES = 2
 
 
 def _load_burn_history() -> dict:
@@ -170,15 +172,34 @@ def _update_burn_rate(current_util_5h: float, current_util_7d=None,
 
     _save_burn_history(new_h)
 
-    horizons = {}
-    if new_h.get("burn_samples", 0) >= 2:
-        horizons["5h"] = _window_horizon(
-            new_h.get("burn_rate_5h_ewma"), current_util_5h, reset_5h_epoch)
-    if current_util_7d is not None and new_h.get("burn_samples_7d", 0) >= 2:
-        horizons["7d"] = _window_horizon(
-            new_h.get("burn_rate_7d_ewma"), current_util_7d, reset_7d_epoch)
+    # A window is EXPECTED whenever the caller supplied its utilization, and
+    # FORECAST only once it has two samples of its own. Keeping those separate
+    # is the whole point: every pre-existing v1 history already satisfies the 5h
+    # gate and carries NO 7d counter, so for the first reads after an upgrade
+    # the 7d window is expected-but-unforecast. Folding that into "no window
+    # binds" prints an all-clear over a window nobody measured — the same
+    # could-not-measure-reported-as-a-result this change exists to remove, one
+    # layer up. Reproduced against a real v1 history with 7d at 95%: it returned
+    # binding_window null and the human path said "no window runs out".
+    # The same guard covers a 7d stream that never matures; omission is never
+    # read as safety.
+    expected = ["5h"] + (["7d"] if current_util_7d is not None else [])
+    samples = {"5h": new_h.get("burn_samples", 0),
+               "7d": new_h.get("burn_samples_7d", 0)}
+    utils = {"5h": current_util_5h, "7d": current_util_7d}
+    ewmas = {"5h": new_h.get("burn_rate_5h_ewma"),
+             "7d": new_h.get("burn_rate_7d_ewma")}
+    resets = {"5h": reset_5h_epoch, "7d": reset_7d_epoch}
+
+    horizons, unforecast = {}, []
+    for w in expected:
+        if samples[w] >= _MIN_SAMPLES:
+            horizons[w] = _window_horizon(ewmas[w], utils[w], resets[w])
+        else:
+            unforecast.append(w)
     if not horizons:
         return None
+
     binding = min((w for w in horizons if horizons[w] is not None),
                   key=lambda w: horizons[w], default=None)
 
@@ -188,6 +209,9 @@ def _update_burn_rate(current_util_5h: float, current_util_7d=None,
         "binding_window": binding,
         "estimated_passes_left": round(horizons[binding], 1) if binding else None,
         "estimated_minutes_left": round(horizons[binding] * 5) if binding else None,
+        # Non-empty means the verdict is INCOMPLETE, not clear. A consumer that
+        # reads `binding_window: null` on its own cannot tell those apart.
+        "unforecast_windows": unforecast,
     }
     if new_h.get("burn_rate_7d_ewma"):
         result["burn_rate_7d_pct_per_pass"] = round(new_h["burn_rate_7d_ewma"] * 100, 2)
@@ -257,9 +281,20 @@ def main():
     if result.get("burn"):
         b = result["burn"]
         print(f"Burn rate: {b['burn_rate_pct_per_pass']}%/pass ({b['burn_samples']} samples)")
+        # An unforecast window taints BOTH outcomes, not just the empty one: a
+        # binding number is only the minimum over the windows actually measured,
+        # so printing it bare while another window is unmeasured asserts more
+        # than was checked. Caveat first, verdict second.
+        pending = b.get("unforecast_windows") or []
+        caveat = (f" [INCOMPLETE: no history yet for {', '.join(pending)} — "
+                  f"not forecast]") if pending else ""
         if b.get("binding_window"):
             print(f"Est. passes left: {b['estimated_passes_left']} "
-                  f"(~{b['estimated_minutes_left']}m, {b['binding_window']} window binds)")
+                  f"(~{b['estimated_minutes_left']}m, {b['binding_window']} window binds)"
+                  + caveat)
+        elif pending:
+            print(f"Est. passes left: INCOMPLETE — no history yet for "
+                  f"{', '.join(pending)}; those windows are not forecast")
         else:
             print("Est. passes left: no window runs out before its own reset")
 
