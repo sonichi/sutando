@@ -91,14 +91,46 @@ if [[ -n "$staged_py" ]]; then
   if [[ -z "$ruff_cmd" ]]; then
     printf '\033[33m~ pre-commit: no ruff found locally; skipping lint pre-filter (CI still checks).\033[0m\n' >&2
   else
+    # Findings and failures are DIFFERENT STREAMS with different exit codes, and
+    # conflating them is what made an earlier version of this hook refuse clean
+    # commits whenever the runner itself was broken:
+    #
+    #   rc 0            no findings
+    #   rc 1 + stdout   real lint findings          -> refuse
+    #   rc >= 2         config/flag/download/cache failure, message on STDERR
+    #   rc 1 + NO stdout   a runner that errored but exited 1 anyway
+    #
+    # Only the second case is a finding. Everything else is the runner failing to
+    # RUN, which must fail open exactly like "no ruff installed" — CI is the
+    # authority, and a local toolchain problem must never block a clean commit.
     ruff_out=""
-    while IFS= read -r f; do
+    runner_err=""
+    for f in $staged_py; do
       [[ -n "$f" ]] || continue
-      out="$(git show ":$f" 2>/dev/null | $ruff_cmd check --stdin-filename "$f" - 2>&1 || true)"
-      if [[ "$out" != *"All checks passed"* && -n "$out" ]]; then
-        ruff_out+="$out"$'\n'
+      out_f="$(mktemp)"; err_f="$(mktemp)"
+      # `|| rc=$?` is load-bearing twice over: this file runs under `set -e`
+      # (line 30), so a nonzero runner would abort the hook before the status
+      # could be read — the hook exited 2 and printed nothing. It also captures
+      # the code, which a bare `|| true` would discard (the original defect).
+      rc=0
+      git show ":$f" 2>/dev/null | $ruff_cmd check --stdin-filename "$f" - >"$out_f" 2>"$err_f" || rc=$?
+      out="$(cat "$out_f")"; err="$(cat "$err_f")"
+      rm -f "$out_f" "$err_f"
+      if [[ "$rc" -eq 0 ]]; then
+        continue                                  # clean
+      elif [[ "$rc" -eq 1 && -n "${out// }" ]]; then
+        ruff_out+="$out"$'\n'                     # genuine findings
+      else
+        runner_err="${err:-$out}"                 # the runner could not run
+        break
       fi
-    done <<< "$staged_py"
+    done
+
+    if [[ -n "${runner_err// }" ]]; then
+      printf '\033[33m~ pre-commit: ruff could not run (%s); skipping lint pre-filter — CI still checks.\033[0m\n' \
+        "$(printf '%s' "$runner_err" | head -1 | cut -c1-100)" >&2
+      ruff_out=""
+    fi
 
     if [[ -n "${ruff_out// }" ]]; then
       printf '\n\033[31m✖ pre-commit refusing: ruff findings in staged Python.\033[0m\n\n'

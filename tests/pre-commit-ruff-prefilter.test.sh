@@ -66,6 +66,63 @@ if env PATH=/usr/bin:/bin git commit -q -m x >/dev/null 2>&1; then ok "no ruff o
 else bad "no ruff on PATH -> commit still allowed (fail-open)"; fi
 rm -f scripts/d.py
 
+# --- runner FAILURE must fail open, not refuse (review of #2664) ------------
+# A ruff that cannot RUN — bad config, version skew, offline download, cache
+# error — is not a lint finding. The first version of this hook discarded the
+# exit status and treated any non-empty output as a finding, so a broken runner
+# refused clean commits: the exact opposite of the stated fail-open contract.
+#
+# Deterministic by construction: these fakes shadow ruff on PATH, so the result
+# does not depend on which ruff version a contributor or reviewer happens to
+# have. Two shapes, because a broken runner does not reliably exit 2.
+fake_bin="$TMP/fakebin"; mkdir -p "$fake_bin"
+
+make_fake () {   # $1 = exit code
+    cat > "$fake_bin/ruff" <<FAKE
+#!/usr/bin/env bash
+echo "ruff failed" >&2
+echo "  Cause: Failed to parse ruff.toml (unknown field)" >&2
+exit $1
+FAKE
+    chmod +x "$fake_bin/ruff"
+}
+
+# A DISTINCT file per iteration: a successful commit consumes the staged file,
+# so reusing one name leaves the next iteration with nothing staged and `git
+# commit` fails for that reason instead — scoring as "refused" and inverting the
+# result. (Cost one false FAIL while writing this.)
+for code in 2 1; do
+    make_fake "$code"
+    printf 'import os\nimport sys\nprint(os, sys)\n' > "scripts/e$code.py"   # CLEAN content
+    git add "scripts/e$code.py"
+    if PATH="$fake_bin:$PATH" git commit -q -m x >/dev/null 2>&1; then
+        ok "broken runner exiting $code -> clean commit still allowed (fail-open)"
+    else
+        bad "broken runner exiting $code -> clean commit still allowed (fail-open)"
+    fi
+    git reset -q HEAD -- . 2>/dev/null
+    rm -f "scripts/e$code.py"
+done
+rm -f "$fake_bin/ruff"
+
+# ...and the fail-open must not be blanket: a runner that WORKS and reports a
+# real finding still refuses. Without this, "always fail open" would pass above.
+cat > "$fake_bin/ruff" <<'FAKE'
+#!/usr/bin/env bash
+echo "E401 [*] Multiple imports on one line"
+echo " --> scripts/f.py:1:1"
+exit 1
+FAKE
+chmod +x "$fake_bin/ruff"
+printf 'import os, sys\nprint(os, sys)\n' > scripts/f.py
+git add scripts/f.py
+if PATH="$fake_bin:$PATH" git commit -q -m x >/dev/null 2>&1; then
+    bad "CONTROL: a working runner reporting findings still refuses"
+else
+    ok "CONTROL: a working runner reporting findings still refuses"
+fi
+git reset -q HEAD -- . 2>/dev/null; rm -f scripts/f.py "$fake_bin/ruff"
+
 # 5. the pre-existing workspace/ guard still refuses.
 echo hi > workspace/leak.txt
 git add -f workspace/leak.txt
