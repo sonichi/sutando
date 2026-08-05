@@ -343,3 +343,43 @@ core internals or maintain a long-lived core fork.
   gone.
 - Consider a separate public core repository only after the package boundary is
   proven inside this repository.
+
+## Events plane: resident transport vs on-demand capability (2026-08-05)
+
+Two components consume gateway room events. Ownership, ratified by the owner
+in the client-stack review (Feature Haul, 2026-08-05):
+
+**ag2-sparrow owns (resident plane):**
+- the resident SSE connection and its reconnect loop
+- durable cursor ownership
+- the SQLite inbox (`event_inbox.EventInbox`)
+- dedupe / exactly-once consumption
+- event → ambient task promotion (taskification)
+
+**agent-room-ops owns (on-demand plane):**
+- subscription configuration (`subscribe`/`unsubscribe`)
+- subscription inspection (`subscriptions`)
+- bounded ad-hoc `pull`
+- bounded, foreground, non-durable diagnostic streaming (debug-only; must be
+  bounded via `--max-events`/`--duration`-class limits, never a second
+  resident event client)
+- the event-acceptance policy the Agent applies
+
+**Grandfathered debt register** (discovered/confirmed by running the guard
+against main; frozen — may only shrink, never grow):
+- `skills/agent-room-ops/events.py:stream_with_resume` + its durable
+  `save_cursor` file: resident-lifecycle behavior (forever-reconnect with
+  durable cursor ownership) in the on-demand skill. Already over the
+  boundary; migrates to sparrow's event pump, after which the bounded
+  debug-only stream is what remains. (`room_ops.py`'s `events stream
+  --cursor-file` is this debt's CLI wiring; its `--once`/`--max-events`
+  bounded modes are the shape the surviving debug stream keeps.)
+- `skills/agent-room-ops/events_acceptance.py` imports
+  `ag2_sparrow.event_consumer` and performs taskification from the skill
+  side. Promotion of the taskify client to the sparrow plane is required
+  work; the import is frozen as-is until then.
+
+Do not add to the skill: SQLite inboxes, forever reconnect loops, durable
+cursor ownership, background daemon lifecycles, or event taskification. Do
+not add on-demand room verbs to sparrow. Enforced by
+`tests/events-plane-boundary.test.py` — allowlists frozen, shrink-only.
