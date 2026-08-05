@@ -49,21 +49,20 @@ Each pass, in order:
    **`step` is an owner-facing live message, not internal telemetry.** With `SUTANDO_PROGRESS_STREAM=1` (ON in the running bridge) the Discord bridge renders it to the owner verbatim as `⏳ <step> (Ns)` while he waits on an owner task, via `progress_stream.format_progress`. A generic placeholder ("Starting pass...", "running") shows up in his DM as noise; when processing an owner task, `step` should say what he is waiting on. Rewrite it on every pivot — a stale `step` actively lies to him. See memory `feedback_rich_core_status_step`. (This template previously read `"Starting pass..."` — the exact string that memory names as the anti-pattern, which is why the mistake kept recurring across compactions: this file is loaded every pass, the memory only when recalled.)
 
 0.5. **Check quota.** Run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
-   **Compute BOTH windows, then take the MOST RESTRICTIVE result.** `read-quota.py` reports two
-   (5h and 7d). Score each with the formulas below and adopt the **lower `headroom`** — do NOT pick
-   the window with the larger `burn`. Those select differently: a short window can show a huge `burn`
+   **Tier EACH window by its OWN rule, then take the MOST RESTRICTIVE TIER.** `read-quota.py`
+   reports two windows and they are scored differently — do not apply one window's thresholds to the
+   other, and do not pick a window by largest `burn`. Those select differently: a short window can show a huge `burn`
    from one early burst while still holding more headroom than the window that actually limits you.
    `5h` at 19% used / 2% elapsed gives `burn 9.50, headroom 0.827` (MEDIUM); `7d` at 90% used / 70%
    elapsed gives `burn 1.29, headroom 0.333` (LIGHT). Selecting on `burn` picks the 5h window and
    authorises MEDIUM work while the 7d pool — which cannot refill for days — is already LIGHT.
    `burn` explains *how you got here*; `headroom` is what constrains what you may still do.
 
-   **Pace against that window's OWN even pace, as a ratio.** Do NOT apply the absolute
-   per-pass thresholds below to the 7d window: they are calibrated to the 5h window and on 7d they
-   are a *constant*. Every reachable 7d input yields LIGHT — 100% remaining over a full week gives
-   0.0496%/pass, 1% remaining gives 0.0005%/pass, and even 1% remaining with one hour to reset gives
-   0.083%/pass. Reaching MEDIUM would require 2016% remaining. A rule whose best case and worst case
-   agree is not measuring anything.
+   **Why 7d needs its own rule:** the absolute per-pass thresholds are a *constant* on it. Every
+   reachable 7d input yields LIGHT — 100% remaining over a full week gives 0.0496%/pass, 1% remaining
+   gives 0.0005%/pass, and even 1% remaining with one hour to reset gives 0.083%/pass. Reaching
+   MEDIUM would require 2016% remaining. A rule whose best case and worst case agree is not
+   measuring anything. So 7d is paced against its own even pace, as a ratio:
 
    ```
    elapsed  = (now - window_start) / (window_reset - window_start)
@@ -71,16 +70,21 @@ Each pass, in order:
    headroom = remaining% / (1 - elapsed)  # <1 means the rest must be slower than even pace
    sustainable_vs_current = headroom / burn
    ```
+   **7d window — tier by `headroom`:**
    - **headroom ≥ 1.5 → FULL**: subagents, write code, heavy research all fair game.
    - **headroom 0.8–1.5 → MEDIUM**: code fixes, monitoring, no subagents.
    - **headroom < 0.8 → LIGHT**: task processing + health checks only.
-   - **0% remaining → MINIMAL**: process owner tasks + health + update log.
+
+   **5h window — tier by its retained absolute budget**, `remaining % / (minutes to reset / 5)`:
+   >3% FULL / 1–3% MEDIUM / <1% LIGHT. These were calibrated for this window; they are NOT
+   interchangeable with the headroom bands and must not be applied to 7d (there they are a constant).
+
+   **Then adopt the more restrictive of the two tiers** (FULL > MEDIUM > LIGHT), and name which
+   window bound it. **0% remaining on either window → MINIMAL**: owner tasks + health + log only.
 
    Quote `sustainable_vs_current` when reporting pace, and **name the denominator** — "0.45x even
    pace" and "0.27x current pace" are the same state and differ by 1.67x.
 
-   The absolute thresholds below remain valid for the **5h** window only:
-   `budget = remaining % / (minutes until reset / 5)`; >3% FULL / 1-3% MEDIUM / <1% LIGHT.
 
    Budget informs the **depth** of step 6 — not whether to do it. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the only legitimate reasons step 6 may be skipped.
 
