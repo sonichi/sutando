@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from collections import Counter
@@ -818,6 +819,47 @@ def test_runtime_wiring_is_optional_and_adapter_injected() -> None:
     assert 'NOTIFIER_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=' in codex
 
 
+
+
+def test_worker_emits_task_processed_mirroring_the_live_path():
+    """#2603 routed tasks to this worker but never emitted the task_processed
+    telemetry #2274 added on the live-core path — cron/worker-handled tasks
+    silently dropped out of the metric. The worker must now emit it, keyed on
+    the task's source, best-effort (a broken telemetry must not break handling).
+    """
+    import types
+    with tempfile.TemporaryDirectory() as td:
+        tf = Path(td) / "task-cron-x.txt"
+        tf.write_text("id: task-cron-x\nsource: cron\naccess_tier: owner\ntask: do it\n", encoding="utf-8")
+
+        captured = []
+        fake = types.ModuleType("telemetry")
+        fake.task_processed = lambda source: captured.append(source)
+        saved = sys.modules.get("telemetry")
+        sys.modules["telemetry"] = fake
+        try:
+            worker._emit_task_processed(REPO, tf)
+            assert captured == ["cron"], f"expected ['cron'], got {captured}"
+
+            # no source header -> 'unknown', still emitted (never dropped)
+            tf2 = Path(td) / "task-y.txt"
+            tf2.write_text("id: task-y\ntask: do it\n", encoding="utf-8")
+            captured.clear()
+            worker._emit_task_processed(REPO, tf2)
+            assert captured == ["unknown"], f"expected ['unknown'], got {captured}"
+
+            # a telemetry that raises must be swallowed (best-effort), not propagate
+            def _boom(source):
+                raise RuntimeError("posthog down")
+            fake.task_processed = _boom
+            worker._emit_task_processed(REPO, tf)  # must not raise
+        finally:
+            if saved is not None:
+                sys.modules["telemetry"] = saved
+            else:
+                sys.modules.pop("telemetry", None)
+
+
 if __name__ == "__main__":
     test_resolution_is_owner_only_and_fail_open()
     test_claude_creates_then_resumes_the_same_durable_session()
@@ -836,4 +878,5 @@ if __name__ == "__main__":
     test_codex_notifier_dispatches_each_isolated_task_once_without_waiting()
     test_codex_notifier_never_submits_a_watcher_claim_to_live_core()
     test_runtime_wiring_is_optional_and_adapter_injected()
+    test_worker_emits_task_processed_mirroring_the_live_path()
     print("task workstream session worker tests passed")

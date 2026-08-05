@@ -326,6 +326,25 @@ def probe(runtime: str, workspace: Path, task_file: Path) -> int:
     return 0
 
 
+def _emit_task_processed(repo: Path, task_file: Path) -> None:
+    """Count a worker-handled task in telemetry, mirroring the live-core path.
+
+    #2274 emits ``task_processed(<source>)`` when the live core handles a task,
+    but tasks routed to this isolated worker (#2603) never reached that call, so
+    cron/other worker-handled tasks silently dropped out of the metric. Emit it
+    here on success. Best-effort: telemetry must NEVER break task handling.
+    """
+    try:
+        src_dir = str((repo / "src").resolve())
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+        import telemetry  # noqa: E402
+        source = _headers(task_file).get("source") or "unknown"
+        telemetry.task_processed(source)
+    except Exception:
+        pass
+
+
 def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, repo: Path) -> int:
     if probe(runtime, workspace, task_file) != 0:
         return UNHANDLED
@@ -348,6 +367,7 @@ def handle(runtime: str, workspace: Path, task_file: Path, results_dir: Path, re
             if not body.strip():
                 raise RuntimeError(f"{runtime} returned an empty result")
             _publish_result(result_path, body)
+            _emit_task_processed(repo, task_file)
             return 0
     except Exception as exc:
         print(f"workstream session worker: {exc}", file=sys.stderr)
