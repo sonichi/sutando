@@ -101,8 +101,15 @@ once in the Azure Portal:
    | `Mail.Read` | Read Outlook inbox messages |
    | `Mail.Send` | Send Outlook email as the user |
    | `Calendars.ReadWrite` | Read (and create) calendar events |
+   | `Team.ReadBasic.All` | Look up the team by name (`GET /me/joinedTeams`) — required before posting |
+   | `Channel.ReadBasic.All` | Look up the channel by name (`GET /teams/{id}/channels`) — required before posting |
    | `ChannelMessage.Send` | Post messages to Teams channels |
    | `Chat.Read` | Read Teams chat/channel context |
+
+   > `teams-post` resolves the team and channel **by display name** before it
+   > can send, so the two `*.ReadBasic.All` lookup scopes are mandatory — without
+   > them the lookups return empty and the CLI reports `Team not found` even
+   > though the team exists.
 
    Click **Grant admin consent** for the tenant if your org requires it.
 

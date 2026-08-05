@@ -60,12 +60,22 @@ def _require_o365():  # pragma: no cover - live dependency; not unit-testable
 # ("You cannot use any scope value that is reserved") if they're passed
 # explicitly — which breaks `auth` out of the box. Refresh tokens still work:
 # MSAL always requests offline_access for us.
+# Teams lookup scopes (qingyun CR #2682): `teams-post` first enumerates the
+# team via O365's get_my_teams() -> GET /me/joinedTeams, then the channel via
+# get_channels() -> GET /teams/{id}/channels, BEFORE it can send. Graph requires
+# delegated Team.ReadBasic.All for the first and Channel.ReadBasic.All for the
+# second; Chat.Read/ChannelMessage.Send do NOT cover either lookup. Without them
+# both lookups return empty and the CLI misreports "Team not found". Kept to the
+# least-privileged *.ReadBasic.All (not Team.ReadWrite / Directory.Read.All).
+TEAMS_LOOKUP_SCOPES = ("Team.ReadBasic.All", "Channel.ReadBasic.All")
+
 SCOPES = [
     "User.Read",
     "Files.ReadWrite.All",
     "Mail.Read",
     "Mail.Send",
     "Calendars.ReadWrite",
+    *TEAMS_LOOKUP_SCOPES,
     "ChannelMessage.Send",
     "Chat.Read",
 ]

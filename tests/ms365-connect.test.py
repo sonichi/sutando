@@ -135,6 +135,24 @@ class TestScopes(unittest.TestCase):
         overlap = reserved.intersection(s.lower() for s in ms365.SCOPES)
         self.assertEqual(overlap, set(), f"reserved scopes leaked: {overlap}")
 
+    def test_teams_lookup_scopes_present(self):
+        # qingyun CR #2682: teams-post enumerates the team (/me/joinedTeams) and
+        # channel (/teams/{id}/channels) by name BEFORE it can send. Graph needs
+        # delegated Team.ReadBasic.All + Channel.ReadBasic.All for those lookups;
+        # ChannelMessage.Send/Chat.Read do NOT cover them. Pin both so a future
+        # edit can't drop a lookup scope and reintroduce the "Team not found" trap.
+        self.assertEqual(ms365.TEAMS_LOOKUP_SCOPES,
+                         ("Team.ReadBasic.All", "Channel.ReadBasic.All"))
+        for scope in ms365.TEAMS_LOOKUP_SCOPES:
+            self.assertIn(scope, ms365.SCOPES)
+
+    def test_teams_lookup_scopes_documented_in_setup_guide(self):
+        # The consent guide the user follows must list every scope teams-post
+        # needs, or they grant an incomplete set and the lookups fail silently.
+        skill_md = (Path(_MODULE_PATH).resolve().parents[1] / "SKILL.md").read_text()
+        for scope in ms365.TEAMS_LOOKUP_SCOPES:
+            self.assertIn(scope, skill_md, f"{scope} missing from SKILL.md consent guide")
+
 
 class TestTokenSecurity(unittest.TestCase):
     """The cached OAuth token grants Mail/Files/Calendar access — its dir must be
