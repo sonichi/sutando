@@ -24,27 +24,29 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# python-o365 is imported LAZILY (see _require_o365 below), not at module
-# level, so `ms365.py --help` and argparse work on any interpreter — including
-# Python 3.9, where python-o365 itself won't import (it needs 3.10+). Only the
-# commands that actually talk to Microsoft Graph pull the dependency in.
+# python-o365 is imported LAZILY (see _require_o365 below), not at module level,
+# so `ms365.py --help` and argparse work even when the optional dependency isn't
+# installed. Only the commands that actually talk to Microsoft Graph pull it in.
+# requirements.txt pins O365<2.1.6 (the last line supporting the stock Python 3.9
+# runtime), so the dependency imports on 3.9 — the lazy import is for graceful
+# behaviour when it's simply absent, not a version workaround.
 # ---------------------------------------------------------------------------
 def _require_o365():  # pragma: no cover - live dependency; not unit-testable
     """Import python-o365, exiting with a helpful message if it can't load.
 
-    Catches SyntaxError as well as ImportError: on Python < 3.10 the O365
-    source uses 3.10+ syntax and raises SyntaxError on import, which we turn
-    into a clean 'requires Python 3.10+' message instead of a traceback.
+    Catches SyntaxError as well as ImportError defensively — if a mis-pinned or
+    too-new O365 (2.1.6+, which needs Python 3.10) is installed on a 3.9 host, a
+    SyntaxError on import becomes a clean 'reinstall from requirements' message
+    instead of a traceback.
     """
     try:
         from O365 import Account, FileSystemTokenBackend
     except (ImportError, SyntaxError):
         sys.stderr.write(
             "Cannot load 'O365' (python-o365). Install it with:\n"
-            "    pip install O365\n"
-            "    (or: pip install -r requirements.txt)\n"
-            "python-o365 requires Python 3.10+; this interpreter is "
-            f"{sys.version_info.major}.{sys.version_info.minor}.\n"
+            "    pip install -r skills/ms365-connect/requirements.txt\n"
+            "(requirements pin O365<2.1.6 — the last line supporting Sutando's "
+            "stock Python 3.9 runtime; 2.1.6+ needs Python 3.10+.)\n"
         )
         sys.exit(1)
     return Account, FileSystemTokenBackend

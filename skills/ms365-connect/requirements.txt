@@ -1,5 +1,8 @@
 # Microsoft 365 connectivity via Microsoft Graph.
-# python-o365 (Apache-2.0). Verified against 2.1.9. The 2.0.26 floor keeps the
-# Account/mailbox/schedule/storage/teams API used by scripts/ms365.py available;
-# the auth call falls back from requested_scopes= (2.1+) to scopes= (2.0.x).
-O365>=2.0.26
+# python-o365 (Apache-2.0). Capped at <2.1.6: O365 2.1.6 raised its floor to
+# Python 3.10, but Sutando's supported stock runtime is 3.9, so we pin the last
+# 3.9-compatible line (2.1.5 — verified importing + reaching the auth flow on
+# Python 3.9). The 2.0.26 floor keeps the Account/mailbox/schedule/storage/teams
+# API used by scripts/ms365.py; the auth call falls back from requested_scopes=
+# (2.1+) to scopes= (2.0.x).
+O365>=2.0.26,<2.1.6
