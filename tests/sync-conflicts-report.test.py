@@ -10,14 +10,49 @@ hours. A reporter that flagged all 13 would be as useless as the silence it
 replaces -- the whole value is the discrimination, so the negative cases are
 tested as hard as the positive one.
 """
+import contextlib
+import importlib.util
+import io
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "sync-conflicts-report.py"
+
+
+def _load_module() -> types.ModuleType:
+    """Import the script as a module so the suite runs it IN-PROCESS.
+
+    Every case used to spawn `python3 scripts/sync-conflicts-report.py`. That
+    exercises the code but is invisible to `coverage`, which instruments the
+    parent only: the Coverage Gate reported `sync-conflicts-report.py (0.0%):
+    Missing 137 lines` on a file whose every branch this suite drives. Coverage
+    measured the harness, not the behaviour.
+
+    ONE subprocess case remains on purpose, below — the caller's-cwd test,
+    whose subject IS the process boundary and which cannot be expressed
+    in-process. (An earlier draft of this docstring said "two"; there were
+    four. Counted them.)
+    """
+    spec = importlib.util.spec_from_file_location("sync_conflicts_report", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+MOD = _load_module()
+
+
+class _Result:
+    """Same shape the subprocess harness returned, so the cases read the same."""
+
+    def __init__(self, returncode: int, stdout: str):
+        self.returncode = returncode
+        self.stdout = stdout
 
 
 class TestSyncConflictsReport(unittest.TestCase):
@@ -39,9 +74,20 @@ class TestSyncConflictsReport(unittest.TestCase):
         d.mkdir(parents=True, exist_ok=True)
         (d / name).write_text(saved)
 
+    def _main(self, *args) -> "_Result":
+        """Drive `main()` in-process with a patched argv, capturing stdout."""
+        buf = io.StringIO()
+        argv = sys.argv
+        sys.argv = [str(SCRIPT), *args]
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = MOD.main()
+        finally:
+            sys.argv = argv
+        return _Result(rc, buf.getvalue())
+
     def _run(self):
-        return subprocess.run([sys.executable, str(SCRIPT), str(self.ws)],
-                              capture_output=True, text=True)
+        return self._main(str(self.ws))
 
     def test_reports_a_file_whose_peer_copy_holds_unmerged_content(self):
         """The case it exists for: the peer appended a section we never got."""
@@ -182,8 +228,7 @@ class TestSyncConflictsReport(unittest.TestCase):
                       "output does not name the workspace the canonical resolver returns")
 
     def _retire(self, *targets):
-        return subprocess.run([sys.executable, str(SCRIPT), str(self.ws), "--retire", *targets],
-                              capture_output=True, text=True)
+        return self._main(str(self.ws), "--retire", *targets)
 
     def _second_batch(self, name: str, text: str) -> None:
         d = self.ws / ".git" / "sutando-sync-conflicts" / "batch-b" / "memory"
@@ -305,16 +350,14 @@ class TestSyncConflictsReport(unittest.TestCase):
         """
         inner = self.ws / "never-initialised"
         inner.mkdir()
-        r = subprocess.run([sys.executable, str(SCRIPT), str(inner)],
-                           capture_output=True, text=True)
+        r = self._main(str(inner))
         self.assertEqual(r.returncode, 2, r.stdout)
         self.assertIn("not a git repo", r.stdout)
         self.assertIn("ancestor", r.stdout)
         self.assertNotIn("no unmerged peer content", r.stdout)
 
     def test_a_missing_directory_exits_2_rather_than_claiming_clean(self):
-        r = subprocess.run([sys.executable, str(SCRIPT), str(self.ws / "nope")],
-                           capture_output=True, text=True)
+        r = self._main(str(self.ws / "nope"))
         self.assertEqual(r.returncode, 2, r.stdout)
         self.assertIn("no such directory", r.stdout)
 
@@ -330,8 +373,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         indistinguishable from a real clean result."""
         d = Path(self._tmp.name) / "notarepo"
         d.mkdir()
-        r = subprocess.run([sys.executable, str(SCRIPT), str(d)],
-                           capture_output=True, text=True)
+        r = self._main(str(d))
         self.assertEqual(r.returncode, 2, r.stdout)
         self.assertNotIn("no unmerged peer content", r.stdout)
 
