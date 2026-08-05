@@ -13,7 +13,8 @@ import types
 import unittest
 from pathlib import Path
 
-_MODULE_PATH = Path(__file__).resolve().parent / "ms365.py"
+_MODULE_PATH = (Path(__file__).resolve().parent.parent
+                / "skills" / "ms365-connect" / "scripts" / "ms365.py")
 
 
 def _fake_o365():
