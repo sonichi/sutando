@@ -126,5 +126,29 @@ with tempfile.TemporaryDirectory() as td:
           "written by" in (r7 or {}).get("detail", ""), False)
     check("...but the drift is still reported", "ambiguous.tmp" in (r7 or {}).get("detail", ""), True)
 
+    # 8. POSITIVE CONTROL for attribution — without this, check 7 is unfalsifiable.
+    #    "Two writers -> no attribution" passes identically whether the tightened
+    #    rule works or attribution is broken outright and never fires at all. Only
+    #    a case that MUST name a writer separates those two worlds.
+    td5 = Path(_tf.mkdtemp()); ws5 = td5 / "workspace"; (ws5 / "state").mkdir(parents=True)
+    (ws5 / ".sole-writer.pid").write_text("")
+    src5 = td5 / "repo" / "src"; src5.mkdir(parents=True)
+    (src5 / "only-me.py").write_text("path = '.sole-writer.pid'")
+    (src5 / "unrelated.py").write_text("nothing to see")
+    m8 = load(ws5); m8.REPO_DIR = td5 / "repo"
+    r8 = m8.check_workspace_root_tidy()
+    check("exactly one candidate writer -> the file IS named",
+          "written by only-me.py" in (r8 or {}).get("detail", ""), True)
+
+    # 9. The probe must be REGISTERED, not merely defined. A check that no
+    #    aggregate ever calls is a latent no-op: it passes its own unit test
+    #    forever while reporting nothing to any operator.
+    td6 = Path(_tf.mkdtemp()); ws6 = td6 / "workspace"; (ws6 / "state").mkdir(parents=True)
+    (ws6 / "definitely-loose.tmp").write_text("")
+    m9 = load(ws6)
+    names = [c.get("name") for c in m9.run_all_checks()]
+    check("workspace-root-tidy is wired into run_all_checks()",
+          "workspace-root-tidy" in names, True)
+
 print(("FAILED: " + ", ".join(fails)) if fails else "workspace-root-tidy: all checks passed")
 sys.exit(1 if fails else 0)
