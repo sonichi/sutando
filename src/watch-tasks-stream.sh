@@ -467,7 +467,12 @@ cleanup() {
   # cleanup helpers so a subshell cannot recursively re-enter the trap.
   trap - EXIT
   trap '' TERM HUP INT
-  rm -f "$PID_FILE"
+  # A duplicate watcher can overwrite the sentinel before the stale watcher
+  # exits. Only the watcher named by the file may remove it; otherwise the live
+  # watcher would look orphaned and recovery would spawn another duplicate.
+  if [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$PID_FILE"
+  fi
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi

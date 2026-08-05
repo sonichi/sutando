@@ -51,6 +51,7 @@ from git_binary import GitUnavailable  # noqa: E402
 from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
+from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
@@ -930,10 +931,25 @@ def check_session_cron_registration(
         return True
 
     expected = sum(1 for e in crons if isinstance(e, dict) and session_owned(e))
-    if runtime == "codex" or expected == 0:
+    if runtime == "codex":
         # codex has no session CronCreate surface (check_cron_runner owns that
-        # story); zero expected → nothing to verify.
+        # story), so nothing here applies regardless of the counts.
         return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
+
+    # `expected == 0` DELIBERATELY does not short-circuit here (@john-the-dev on
+    # #2654). It used to, and that made the complete 1→0 transition the one case
+    # the surplus check below could never see: move a host's last session cron to
+    # `launchd: true` / `execution: codex-task`, park it, or delete it, and
+    # `expected` reaches 0 while the job registered under the old config is still
+    # firing. The probe then said `ok — no session-owned schedules expected`,
+    # which is the WORST form of this failure: every session job can be stale and
+    # health explicitly reports that none is expected.
+    #
+    # Zero-expected is not by itself evidence of health; it is only healthy when
+    # nothing was registered either. That question is answered by the stamp, so
+    # the decision moves BELOW the stamp read — the never-had-session-crons host
+    # exits at the no-stamp branch, and a host that DID register something falls
+    # through to the surplus check like any other.
 
     # The SESSION boundary, not the heartbeat's age. `.alive.started_at` is
     # `core_heartbeat._STARTED_AT`, stamped once at module load, and both launch
@@ -962,6 +978,11 @@ def check_session_cron_registration(
     try:
         stamp = json.loads(stamp_file.read_text())
     except FileNotFoundError:
+        if expected == 0:
+            # THE genuine never-had-session-crons host: nothing expected AND
+            # nothing ever registered. This is the case the old `expected == 0`
+            # short-circuit was really protecting, and it still exits healthy.
+            return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
         return {
             "name": name,
             "status": "warn",
@@ -977,6 +998,12 @@ def check_session_cron_registration(
     if isinstance(stamp_ts, bool) or not isinstance(stamp_ts, (int, float)):
         return {"name": name, "status": "warn", "detail": "stamp malformed (missing numeric ts)"}
     if started_at is not None and stamp_ts < started_at:
+        if expected == 0:
+            # The stamp is from a PREVIOUS session, and session crons die with
+            # their session — so nothing it registered is still firing, and
+            # nothing is expected now. Telling the operator to re-run
+            # /schedule-crons here would be advice with no subject.
+            return {"name": name, "status": "ok", "detail": "no session-owned schedules expected"}
         return {
             "name": name,
             "status": "warn",
@@ -999,6 +1026,86 @@ def check_session_cron_registration(
             "status": "warn",
             "detail": f"only {registered}/{expected} session cron(s) registered at last /schedule-crons",
         }
+
+    # OWNERSHIP TRANSITION (@john-the-dev on #2654). The check above runs one
+    # way only, and the opposite inequality is a real failure it cannot see:
+    # edit a registered entry to `launchd: true` or `execution: codex-task` and
+    # it leaves `expected`, while the session job registered under the old
+    # config KEEPS FIRING. Counts then read registered=2, expected=1, and
+    # `2 < 1` is false — green. The digest cannot see it either, deliberately:
+    # entry_digest ignores the ownership fields precisely so that an entry which
+    # correctly stopped being registered is not reported as edited.
+    #
+    # So the signal is the surplus itself. It also covers an entry deleted from
+    # crons.json whose job was never de-registered — same disruption, same remedy.
+    #
+    # There is deliberately NO allowance for step 4's bootstrap fallback (which
+    # registers /proactive-loop when the config lacks it, legitimately putting
+    # registered one above expected). Subtracting one for it was the first
+    # attempt and it is wrong: from counts alone a benign fallback and a single
+    # real transition are the SAME surplus, so the allowance silently absorbs
+    # exactly one transition — an amnesty, not a filter. A host whose crons.json
+    # carries no proactive-loop entry has a config gap worth surfacing anyway,
+    # so the honest move is to warn either way and name both causes.
+    surplus = registered - expected
+    if surplus > 0:
+        fallback_armed = not any(
+            isinstance(e, dict) and session_owned(e)
+            and (e.get("prompt_skill") == "proactive-loop"
+                 or "proactive-loop" in str(e.get("prompt") or ""))
+            for e in crons
+        )
+        note = (
+            " (crons.json carries no proactive-loop entry, so step 4's bootstrap "
+            "fallback plausibly accounts for one of these — add an explicit entry "
+            "to tell the two apart)"
+            if fallback_armed else ""
+        )
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"{registered} session cron(s) were registered but only {expected} are "
+                f"session-owned now — {surplus} moved to launchd/codex ownership, were "
+                f"parked, or were deleted since registration, so a job registered under the "
+                f"OLD config was never de-registered and MAY still be firing; re-run "
+                f"/schedule-crons to clear it{note}"
+            ),
+        }
+
+    # CONFIG DRIFT. Everything above answers "was a registration completed for
+    # this boot?" — a count, and a count cannot see an entry whose PROMPT was
+    # edited after it was registered. That drift is silent by construction: the
+    # config is right, the script is right, and only the stale registration is
+    # wrong (#2653, where a `--stand` flag added four days into a session kept
+    # not firing, and the field it populates read null on all 27 PRs).
+    #
+    # #2653 makes /schedule-crons re-register rather than skip, so the drift
+    # self-heals on the next run. This makes an UNHEALED one visible in between,
+    # because until the next run the only other observation point is a fire.
+    #
+    # Restricted to `session_owned` names: an edit to a launchd- or codex-owned
+    # entry is not a session-cron problem and must not warn as one. A stamp
+    # written before this field existed simply skips the check — an old stamp
+    # must not manufacture a warning it has no data for.
+    stamped_digests = stamp.get("config_digests")
+    if isinstance(stamped_digests, dict):
+        session_names = [
+            e.get("name") for e in crons if isinstance(e, dict) and session_owned(e)
+        ]
+        moved = drifted(stamped_digests, digest_map(crons), names=session_names)
+        if moved:
+            shown = ", ".join(moved[:4]) + ("…" if len(moved) > 4 else "")
+            return {
+                "name": name,
+                "status": "warn",
+                "detail": (
+                    f"{len(moved)} session cron(s) edited in crons.json since they were "
+                    f"registered ({shown}) — the running job still fires the OLD prompt; "
+                    f"re-run /schedule-crons"
+                ),
+            }
+
     return {"name": name, "status": "ok", "detail": f"{expected} session cron(s) stamped registered this boot"}
 
 
@@ -4634,6 +4741,72 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     }
 
 
+def check_proactive_quarantine() -> dict:
+    """Report proactive bodies that were SAVED from deletion and then forgotten.
+
+    `poll_proactive` used to `unlink()` a DM that Discord rejected, so a message
+    the owner never saw was also destroyed — observed live here as
+    `413 Payload Too Large (error code: 40005)`. The fix (#2626) moves the body
+    to `results/undelivered/` instead of deleting it, which is strictly better
+    and still ends with nobody being told: a scan of the whole tree at that
+    change's head finds the writer and **no reader at all**. The nearest
+    candidate, `friction-detector.check_stale_results()`, is a stub that returns
+    `[]` and is never called.
+
+    That is the shape this probe exists to close. Preservation without a reader
+    is a message that exists on disk and reaches no one — the same failure as
+    deletion from the owner's side, minus the recoverability. Losing it loudly
+    at least surfaces; losing it quietly does not.
+
+    Deliberately NOT a failure: quarantine is the correct end state for a body
+    Discord will never accept (a 413 never becomes a 200). The action is for a
+    human to read it and decide, so `warn` — visible, not alarming.
+
+    Silent before #2626 lands: the directory is created only by that writer, so
+    an absent dir reports ok rather than inventing a problem.
+    """
+    name = "proactive-quarantine"
+    quarantine = WORKSPACE_DIR / "results" / "undelivered"
+    if not quarantine.is_dir():
+        return {"name": name, "status": "ok",
+                "detail": "no quarantined proactive bodies (undelivered/ absent)"}
+    now = time.time()
+    try:
+        entries = list(quarantine.iterdir())
+    except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/undelivered/: {e}"}
+    kept: list[tuple[str, int]] = []
+    unreadable = 0
+    for path in entries:
+        # Per-file isolation, same reason as check_orphaned_results: one
+        # unreadable entry must not decide the answer for the directory.
+        try:
+            if not path.is_file():
+                continue
+            age = now - path.stat().st_mtime
+        except OSError:
+            unreadable += 1
+            continue
+        kept.append((path.name, int(age)))
+    partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
+               if unreadable else "")
+    if not kept:
+        status = "warn" if unreadable else "ok"
+        return {"name": name, "status": status,
+                "detail": f"no quarantined proactive bodies{partial}"}
+    kept.sort(key=lambda item: -item[1])
+    oldest_name, oldest_age = kept[0]
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{len(kept)} proactive message(s) kept in results/undelivered/ that Discord "
+                   f"refused — preserved, but nothing reads this directory, so nobody has been "
+                   f"told; oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
+                   f"{partial}"),
+    }
+
+
 def _proc_argv(pid: int) -> str:
     """argv of `pid`, or "" if no such process.
 
@@ -5100,6 +5273,54 @@ def check_notes_split_brain() -> "dict | None":
             f"Overlap: {examples}{tail}"
         ),
     }
+
+
+def _drop_launcher_parents(pids: list) -> list:
+    """Collapse a launcher+child pair to the child that is the real process.
+
+    `pgrep -f '<name>\\.py$'` matches the LAUNCHER as well as the bridge,
+    because the launcher's own argv ends with the same script path:
+
+        pid 27538  secret-vault.py env TELEGRAM_BOT_TOKEN -- python3 src/telegram-bridge.py
+        pid 27541  python3 src/telegram-bridge.py            <- ppid 27538
+
+    Both match, so the duplicate-process check reported "multiple processes
+    (2 PIDs)" for a perfectly healthy single bridge — every run, indefinitely.
+    The `\\.py$` anchor above was added to stop a different false positive and
+    cannot help here: the launcher's command line genuinely ends in the script.
+
+    A standing false warning is worse than no warning: it is the one the
+    operator learns to scroll past, and this probe exists to catch a REAL
+    duplicate (two pollers racing for the same Telegram `getUpdates` cursor,
+    which silently splits inbound messages between them).
+
+    Identify by PID SCOPE, not by pattern: drop any matched pid that is the
+    parent of another matched pid. Keeps the leaf — the process actually doing
+    the work — and is agnostic to which launcher is in use (vault, `env`, a
+    shell wrapper). A pid whose parent is NOT in the set is untouched, so two
+    genuinely independent bridges still both survive and still warn.
+    """
+    if len(pids) < 2:
+        return list(pids)
+    try:
+        out = subprocess.run(
+            ["/bin/ps", "-o", "pid=,ppid=", "-p", ",".join(pids)],
+            capture_output=True, text=True,
+        )
+    except Exception:
+        return list(pids)
+    if out.returncode != 0:
+        # Could not resolve parentage — return the input untouched rather than
+        # guessing. Over-reporting a duplicate is recoverable; silently
+        # dropping a real second poller is not.
+        return list(pids)
+    parents = set()
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] in pids:
+            parents.add(parts[1])
+    kept = [p for p in pids if p not in parents]
+    return kept or list(pids)
 
 
 def _should_skip_bridge(channel_name: str, env_path: Path) -> bool:
@@ -5807,6 +6028,9 @@ def run_all_checks() -> list[dict]:
             result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
             pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
             pids = [p for p in pids if p]
+            # A launcher's argv ends with the same script path, so it matches
+            # this pgrep too — see _drop_launcher_parents.
+            pids = _drop_launcher_parents(pids)
         except Exception:
             pids = []
 
@@ -6021,6 +6245,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
+    checks.append(check_proactive_quarantine())
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())

@@ -16,7 +16,6 @@ Examples:
 """
 
 import os
-import subprocess
 import sys
 
 # Allow running from any directory by adding src/ to path
@@ -71,8 +70,29 @@ def cmd_env(keys: list[str], cmd: list[str]) -> None:
         except KeyError:
             print(f"vault env: key '{k}' not found — aborting", file=sys.stderr)
             sys.exit(1)
-    result = subprocess.run(cmd, env=env)
-    sys.exit(result.returncode)
+    # exec, don't fork-and-wait — `env`-style wrappers replace themselves.
+    #
+    # With subprocess.run() this process lingers as a parent for the whole life of
+    # CMD, which costs three things for a long-running service:
+    #   1. Two processes carry CMD's name in their argv, so any `ps`-based probe
+    #      counts double. health-check's telegram-bridge probe reported "multiple
+    #      processes (2 PIDs)" for a single bridge launched this way (2026-08-04).
+    #   2. A signal sent to the wrapper (SIGTERM from a supervisor, launchd, or a
+    #      stop script) is delivered to the WRAPPER, not to CMD, so the service it
+    #      is meant to stop keeps running.
+    #   3. If the wrapper dies, CMD is orphaned rather than exiting with it.
+    # execvpe replaces this image with CMD, so CMD's pid, signals and exit status
+    # are the wrapper's by construction — the same contract /usr/bin/env provides.
+    # sys.exit(returncode) is no longer needed: after a successful exec there is
+    # no code here to run, and CMD's own status is what the caller sees.
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except OSError as e:
+        # Reached only when exec itself fails (command not found, not executable).
+        # subprocess.run() raised here too, so this stays a non-zero exit — but say
+        # which command failed rather than surfacing a bare traceback.
+        print(f"vault env: cannot execute {cmd[0]!r}: {e}", file=sys.stderr)
+        sys.exit(127)
 
 
 def main() -> None:
