@@ -105,6 +105,15 @@ class TestMain(unittest.TestCase):
         self.assertEqual(seen.get("n"), 3)
 
 
+class TestScopes(unittest.TestCase):
+    def test_no_msal_reserved_scopes(self):
+        # MSAL reserves openid/offline_access/profile and adds them itself;
+        # passing them explicitly raises ValueError and breaks `auth`.
+        reserved = {"openid", "offline_access", "profile"}
+        overlap = reserved.intersection(s.lower() for s in ms365.SCOPES)
+        self.assertEqual(overlap, set(), f"reserved scopes leaked: {overlap}")
+
+
 class TestAuthGuard(unittest.TestCase):
     def test_ensure_authenticated_exits_3_when_not_authed(self):
         acct = types.SimpleNamespace(is_authenticated=False)

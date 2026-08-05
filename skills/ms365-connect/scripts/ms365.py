@@ -52,8 +52,13 @@ def _require_o365():  # pragma: no cover - live dependency; not unit-testable
 
 # Delegated Microsoft Graph scopes this skill requests. These must match the
 # delegated permissions granted on the Azure AD app registration.
+#
+# Do NOT list the MSAL-reserved scopes here (openid / offline_access / profile):
+# MSAL's initiate_auth_code_flow adds them itself and raises ValueError
+# ("You cannot use any scope value that is reserved") if they're passed
+# explicitly — which breaks `auth` out of the box. Refresh tokens still work:
+# MSAL always requests offline_access for us.
 SCOPES = [
-    "offline_access",
     "User.Read",
     "Files.ReadWrite.All",
     "Mail.Read",
