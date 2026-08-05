@@ -37,6 +37,17 @@ export type CredentialSource = 'managed' | 'env' | 'none';
 export interface ResolvedCredential {
 	key: string;
 	source: CredentialSource;
+	/**
+	 * Opaque credential-generation ID (e.g. `cg1-<UUID>`) minted by the Rust
+	 * host when the credential was committed/materialized (design 1a′;
+	 * amendments R7/S3). This resolver only REPORTS it — never mints, never
+	 * derives it from the secret:
+	 *   - managed tier: the managed entry's `generation` field, when present;
+	 *   - env tier (voice): `SUTANDO_VOICE_CREDENTIAL_GENERATION`, injected
+	 *     into the child env by the launcher after materialization.
+	 * Legacy credentials without a generation omit the field.
+	 */
+	credentialGeneration?: string;
 }
 
 /** Per-capability lookup order within a tier (voice falls back to text). */
@@ -55,7 +66,7 @@ export function managedCredentialsPath(): string {
 	return join(resolveWorkspace(), 'state', 'auth', 'managed-credentials.json');
 }
 
-function readManaged(path: string): Record<string, { key?: unknown }> {
+function readManaged(path: string): Record<string, { key?: unknown; generation?: unknown }> {
 	try {
 		const parsed = JSON.parse(readFileSync(path, 'utf8'));
 		const caps = parsed?.capabilities;
@@ -72,12 +83,38 @@ export function resolveCredential(
 	const slots = CAPABILITY_FALLBACKS[capability];
 	const managed = readManaged(opts?.managedPath ?? managedCredentialsPath());
 	for (const slot of slots) {
-		const key = managed[slot]?.key;
-		if (typeof key === 'string' && key) return { key, source: 'managed' };
+		const entry = managed[slot];
+		const key = entry?.key;
+		if (typeof key === 'string' && key) {
+			// S3: managed entries may carry an opaque Rust-minted `generation`.
+			// Report it verbatim; legacy entries without one omit the field.
+			const generation = entry?.generation;
+			return {
+				key,
+				source: 'managed',
+				...(typeof generation === 'string' && generation
+					? { credentialGeneration: generation }
+					: {}),
+			};
+		}
 	}
 	for (const slot of slots) {
 		const key = process.env[ENV_VARS[slot]];
-		if (key) return { key, source: 'env' };
+		if (key) {
+			// S3/U4: for the voice capability the launcher injects
+			// SUTANDO_VOICE_CREDENTIAL_GENERATION beside a materialized BYOK
+			// key. Report it verbatim; manual/legacy .env keys (no injected
+			// generation) stay generationless.
+			const generation =
+				capability === 'gemini-voice'
+					? process.env.SUTANDO_VOICE_CREDENTIAL_GENERATION
+					: undefined;
+			return {
+				key,
+				source: 'env',
+				...(generation ? { credentialGeneration: generation } : {}),
+			};
+		}
 	}
 	return { key: '', source: 'none' };
 }
