@@ -243,6 +243,27 @@ def _gateway_running():
     return False
 
 
+
+# The AG2 Space desktop app runs its own engine runtime under
+# `space.ag2.app/engine`, and that engine is what serves the Station connector
+# gateway (sutando.ag2.space). Station connectors are therefore available only
+# while AG2 Space is running; when it is not, Station calls fail with a bare
+# ENOTFOUND. Surfacing this lets any reader (health-check, dashboard, the agent)
+# attribute a Station failure to "AG2 Space not running" rather than guess.
+_AG2SPACE_ENGINE_MARKER = "space.ag2.app/engine"
+
+
+def _ag2space_running():
+    """True when the AG2 Space app engine (which serves the Station gateway) is up.
+
+    Matches the engine runtime path, not the window-chrome process, since the
+    engine — not the UI — is what makes Station available. A missing pgrep
+    degrades cleanly to False via _run's 127.
+    """
+    rc, _ = _run(["pgrep", "-f", _AG2SPACE_ENGINE_MARKER])
+    return rc == 0
+
+
 def _pane_text():
     rc, out = _run(["tmux", "-S", TMUX_SOCKET, "capture-pane", "-p", "-t", SESSION])
     return out if rc == 0 else ""
@@ -289,6 +310,7 @@ def derive():
 
     core = _core_running()
     gateway = _gateway_running()
+    ag2space = _ag2space_running()
 
     # Raw signals, captured for the audited verdict. Defaults hold for the
     # offline / unknown branches (core gone or unprobeable → status/login
@@ -366,6 +388,9 @@ def derive():
         "authenticated": authed,
         "core_running": core,
         "gateway_running": gateway,
+        "ag2space_running": ag2space,
+        # Station connectors are served by AG2 Space; available iff it is running.
+        "station_available": ag2space,
         "tmux_socket": TMUX_SOCKET,
         "session": SESSION,
         "detail": detail,
