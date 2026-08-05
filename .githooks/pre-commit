@@ -52,4 +52,64 @@ if [[ -n "$offenders" ]]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# ruff pre-filter for staged Python.
+#
+# CI runs `ruff check .` and it is a required check. Three PRs in one session
+# passed their whole test suite and then failed CI on ruff alone (E401, a
+# two-second fix), each costing a push/CI/fix cycle. The failure mode is not
+# carelessness — it is that the check only existed remotely.
+#
+# Deliberately a PRE-FILTER, not an authority:
+#
+#   • FAIL-OPEN when no ruff is installed. A contributor without the tool must
+#     never be blocked from committing; CI remains the gate that decides.
+#   • Lints the STAGED BLOB, not the working tree. `--stdin-filename` keeps the
+#     path so ruff.toml still resolves, while the bytes are the ones actually
+#     being committed; linting the worktree would both miss violations you
+#     staged and block on ones you did not.
+#   • Only files staged in THIS commit, so a pre-existing violation elsewhere
+#     never blocks unrelated work.
+#   • Local ruff may differ from the version CI pins; a disagreement is CI's to
+#     settle. This catches the obvious case before the push, not to mirror CI.
+#
+# Escape hatch, same as above: git commit --no-verify
+# ---------------------------------------------------------------------------
+
+staged_py="$(printf '%s\n' "$staged" | grep -E '\.py$' || true)"
+
+if [[ -n "$staged_py" ]]; then
+  ruff_cmd=""
+  if command -v ruff >/dev/null 2>&1; then
+    ruff_cmd="ruff"
+  elif command -v uvx >/dev/null 2>&1; then
+    ruff_cmd="uvx ruff"
+  elif command -v uv >/dev/null 2>&1; then
+    ruff_cmd="uv tool run ruff"
+  fi
+
+  if [[ -z "$ruff_cmd" ]]; then
+    printf '\033[33m~ pre-commit: no ruff found locally; skipping lint pre-filter (CI still checks).\033[0m\n' >&2
+  else
+    ruff_out=""
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      out="$(git show ":$f" 2>/dev/null | $ruff_cmd check --stdin-filename "$f" - 2>&1 || true)"
+      if [[ "$out" != *"All checks passed"* && -n "$out" ]]; then
+        ruff_out+="$out"$'\n'
+      fi
+    done <<< "$staged_py"
+
+    if [[ -n "${ruff_out// }" ]]; then
+      printf '\n\033[31m✖ pre-commit refusing: ruff findings in staged Python.\033[0m\n\n'
+      printf '%s\n' "$ruff_out"
+      printf 'Fix them, or re-run the check yourself with:\n'
+      printf '  %s check .\n\n' "$ruff_cmd"
+      printf 'If this is a false positive or a local/CI version disagreement,\n'
+      printf 'pass --no-verify to git commit and let CI adjudicate.\n\n'
+      exit 1
+    fi
+  fi
+fi
+
 exit 0
