@@ -153,6 +153,59 @@ class TestSyncConflictsReport(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), str(self.ws), "--retire", *targets],
                               capture_output=True, text=True)
 
+    def _second_batch(self, name: str, text: str) -> None:
+        d = self.ws / ".git" / "sutando-sync-conflicts" / "batch-b" / "memory"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text(text)
+
+    def test_retiring_one_batch_leaves_ANOTHER_batchs_copy_reporting(self):
+        """john-the-dev's activated repro (#2662).
+
+        Two batches hold the same relative path: batch-a's copy is merged,
+        batch-b's is never-merged. The first selector matched on BASENAME across
+        every batch, so `--retire note.md` retired both and turned exit 1 into a
+        permanent false-clean — silencing content the operator never saw.
+
+        The content digest in the retire key protects a copy created LATER; it
+        does nothing about a distinct copy already on disk. My own comment on
+        that key called a permanent false negative "the worse of the two", and
+        the selector shipped exactly that.
+        """
+        self._pair("note.md", "base\nmerged fact\n", "base\nmerged fact\n")
+        self._second_batch("note.md", "base\nNEVER MERGED fact\n")
+        self.assertEqual(self._run().returncode, 1, "batch-b should report")
+
+        # `_pair` writes into the fixture's own batch, NOT "batch-a" — an
+        # earlier draft of this test guessed the name and the guard correctly
+        # refused it, which is itself the fail-closed behaviour working.
+        r = self._retire(f"{self.batch.name}/memory/note.md")
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+        after = self._run()
+        self.assertEqual(after.returncode, 1,
+                         "retiring batch-a silenced batch-b: " + after.stdout)
+        self.assertIn("note.md", after.stdout)
+
+    def test_an_AMBIGUOUS_selector_mutates_nothing(self):
+        """Bare basename matches two copies -> refuse, and leave both reporting."""
+        self._pair("note.md", "base\nmerged fact\n", "base\nmerged fact\n")
+        self._second_batch("note.md", "base\nNEVER MERGED fact\n")
+        r = self._retire("note.md")
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("no preserved copy matches", r.stdout)
+        self.assertIn("did you mean", r.stdout)          # names the qualified options
+        self.assertEqual(self._run().returncode, 1, "an ambiguous retire mutated state")
+
+    def test_a_BARE_retire_refuses_rather_than_retiring_everything(self):
+        """Empty targets read as "match all" in the first version, so a bare
+        `--retire` cleared the whole queue and returned a false-clean exit 0."""
+        self._pair("note.md", "base\n", "base\nnever merged\n")
+        self.assertEqual(self._run().returncode, 1)
+        r = self._retire()
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("refusing to retire everything", r.stdout)
+        self.assertEqual(self._run().returncode, 1, "bare --retire mutated state")
+
     def test_merged_then_RETRACTED_content_stays_silent_once_retired(self):
         """The lifecycle john-the-dev activated (#2662 P1).
 
@@ -166,7 +219,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         """
         self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
         self.assertEqual(self._run().returncode, 0, "identical copies should be silent")
-        self.assertEqual(self._retire("note.md").returncode, 0)
+        self.assertEqual(self._retire(f"{self.batch.name}/memory/note.md").returncode, 0)
         # the operator now deliberately retracts the previously-merged line
         (self.ws / "memory" / "note.md").write_text("base\n")
         r = self._run()
@@ -177,7 +230,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         """The paired control. A retire lifecycle that silenced everything would
         trade a permanent false positive for a permanent false negative."""
         self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
-        self._retire("note.md")
+        self._retire(f"{self.batch.name}/memory/note.md")
         self._pair("other.md", "x\n", "x\nnever merged fact\n")
         r = self._run()
         self.assertEqual(r.returncode, 1, r.stdout)
@@ -188,7 +241,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         """The retire key carries a digest of the preserved copy, so the same
         path conflicting again with NEW peer content is a new entry."""
         self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
-        self._retire("note.md")
+        self._retire(f"{self.batch.name}/memory/note.md")
         later = self.ws / ".git" / "sutando-sync-conflicts" / "20260806T000000Z-peer" / "memory"
         later.mkdir(parents=True)
         (later / "note.md").write_text("base\na LATER peer fact\n")
@@ -202,7 +255,7 @@ class TestSyncConflictsReport(unittest.TestCase):
         the entry is silent — so that version could never record the case it
         exists for, and printed 'nothing matched'."""
         self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
-        out = self._retire("note.md").stdout
+        out = self._retire(f"{self.batch.name}/memory/note.md").stdout
         self.assertIn("retired 1", out, out)
         self.assertNotIn("nothing matched", out)
 

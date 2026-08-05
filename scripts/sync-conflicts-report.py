@@ -152,6 +152,19 @@ def retire(workspace: pathlib.Path, targets: "list[str]"):
     Either decision ends the same way: the operator has SEEN this content and
     the live file is now correct. Recording that is what lets a later retraction
     stay retracted instead of being re-reported as missing.
+
+    SELECTION FAILS CLOSED. A target must be `<batch>/<relpath>` and must match
+    exactly ONE preserved copy; zero matches, an ambiguous match, or no target at
+    all mutates nothing and returns an error.
+
+    The first version matched on basename OR relpath across EVERY batch, so
+    `--retire note.md` retired batch-a's merged copy AND batch-b's never-merged
+    copy, turning exit 1 into a permanent false-clean; bare `--retire` retired
+    everything for the same reason (empty targets read as "match all"). The
+    content digest in the key protects a LATER copy, not a distinct copy already
+    on disk. My own comment on that key called a permanent false negative "the
+    worse of the two" — and the selector shipped exactly that.
+    (john-the-dev, #2662.)
     """
     _, err = unmerged(workspace)          # reuse its validation of the workspace
     if err:
@@ -170,21 +183,39 @@ def retire(workspace: pathlib.Path, targets: "list[str]"):
     # set could never record the case it exists for, and the first later
     # retraction would resurrect it. (Caught by activating john-the-dev's
     # sequence before pushing: step 2 printed "nothing matched".)
-    retired = _load_retired(root)
-    done = []
+    if not targets:
+        return None, ("--retire needs an explicit <batch>/<path> selector; "
+                      "refusing to retire everything")
+    # Index every preserved copy by its batch-qualified path FIRST, so selection
+    # is resolved against the full set and ambiguity is detectable before any
+    # write.
+    index: "dict[str, list]" = {}
     for batch in sorted(p for p in root.iterdir() if p.is_dir()):
         for saved in batch.rglob("*"):
             if not saved.is_file():
                 continue
             rel = saved.relative_to(batch)
-            if targets and str(rel) not in targets and rel.name not in targets:
-                continue
-            key = _entry_key(batch.name, rel, saved.read_text(errors="replace"))
-            if key in retired:
-                continue
-            retired[key] = {"retired_at": int(time.time()), "path": str(rel),
-                            "batch": batch.name}
-            done.append(f"{batch.name}/{rel}")
+            index.setdefault(f"{batch.name}/{rel}", []).append((batch.name, rel, saved))
+    resolved = []
+    for t in targets:
+        hits = [v for k, vs in index.items() if k == t for v in vs]
+        if not hits:
+            near = [k for k in index if k.endswith("/" + t) or pathlib.PurePath(k).name == t]
+            hint = (f" — did you mean one of: {', '.join(sorted(near)[:4])}"
+                    if near else "")
+            return None, f"no preserved copy matches {t!r}{hint}"
+        if len(hits) > 1:
+            return None, f"{t!r} is ambiguous ({len(hits)} copies) — qualify it further"
+        resolved.append(hits[0])
+    retired = _load_retired(root)
+    done = []
+    for batch_name, rel, saved in resolved:
+        key = _entry_key(batch_name, rel, saved.read_text(errors="replace"))
+        if key in retired:
+            continue
+        retired[key] = {"retired_at": int(time.time()), "path": str(rel),
+                        "batch": batch_name}
+        done.append(f"{batch_name}/{rel}")
     _retired_path(root).write_text(json.dumps(retired, indent=1, sort_keys=True))
     return done, None
 
@@ -204,7 +235,7 @@ def main() -> int:
         argv = argv[:i]
     ws = pathlib.Path(argv[0]) if argv else pathlib.Path(
         resolve_workspace(migrate=False))
-    if targets or "--retire" in sys.argv:
+    if "--retire" in sys.argv:
         done, err = retire(ws, targets)
         if err:
             print(f"sync-conflicts: {err}")
