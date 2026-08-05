@@ -584,6 +584,50 @@ def case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet():
     return fails
 
 
+def case_t_unresolvable_host_label_reads_NOT_alive():
+    """The fail-safe direction, which is the whole reason this branch exists.
+
+    `_local_core_alive` resolves this host's name through
+    `util_paths._host_label()`. If that cannot be resolved, the function must
+    return False — NOT alive — so an unidentifiable host produces an extra
+    observation rather than a SUPPRESSED relaunch. Failing the other way would
+    silently disable core recovery on exactly the hosts whose identity is
+    already broken.
+
+    Reachable in practice: `util_paths` is imported inside the function, so an
+    import error, a renamed helper, or a raising label resolver all land here.
+    """
+    import pathlib
+    import sys as _sys
+    import tempfile
+    fails = []
+    ws = pathlib.Path(tempfile.mkdtemp())
+    (ws / "state" / "cores").mkdir(parents=True)
+
+    _sys.path.insert(0, str(pathlib.Path(hc.__file__).resolve().parent))
+    import util_paths
+    original = util_paths._host_label
+
+    # a fresh heartbeat for THIS host exists — so a False result can only come
+    # from the label failing, never from a missing file
+    (ws / "state" / "cores" / f"{original()}.alive").write_text("{}")
+    if not hc._local_core_alive(ws):
+        fails.append("t) precondition: a fresh local heartbeat should read alive")
+
+    def _boom():
+        raise RuntimeError("cannot resolve host label")
+
+    util_paths._host_label = _boom
+    try:
+        if hc._local_core_alive(ws):
+            fails.append(
+                "t) an unresolvable host label read ALIVE — that suppresses the "
+                "relaunch on a host whose identity is already broken")
+    finally:
+        util_paths._host_label = original
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_healthy_no_action),
@@ -598,6 +642,7 @@ def main() -> int:
         ("j", case_j_dead_core_relaunches),
         ("r", case_r_local_liveness_ignores_peer_heartbeats),
         ("s", case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet),
+        ("t", case_t_unresolvable_host_label_reads_NOT_alive),
         ("j2", case_j2_dead_core_before_after_output),
         ("k", case_k_draining_backlog_never_restarts),
         ("l", case_l_progress_resets_long_task),
