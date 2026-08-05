@@ -31,7 +31,8 @@ def check(name, got, want):
 
 def run_capturing(checks, argv):
     """Same, but return (fired, stdout, stderr) so the --json contract is testable."""
-    import contextlib, io
+    import contextlib
+    import io
     spec = importlib.util.spec_from_file_location("hc_under_test", MOD)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
