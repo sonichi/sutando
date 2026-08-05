@@ -1557,6 +1557,40 @@ def _write_task(task: dict) -> str | None:
     # no header-shaped lines, so the access-tier-wins-last invariant holds.
     if _secret_types:
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
+    # ===SKILL INSTRUCTIONS=== (owner-tier only): the same task-hygiene block
+    # the discord bridge writes — context-first thread reconstruction, early
+    # notify, result path — with ag2space-native recipes (owner ask 2026-08-05,
+    # circulated the discord task file as the reference shape). Owner-only:
+    # non-owner tiers carry ===SUTANDO SYSTEM INSTRUCTIONS=== and must not get
+    # a second instruction block competing with it. Appended after access_tier
+    # like the secret notice: prose + numbered sentences, no header-shaped
+    # lines, so the access-tier-wins-last invariant holds. Commands are
+    # repo-relative — the core session's cwd is the repo by contract.
+    if sender_tier == "owner":
+        _chan = _one_line(task.get("channel_id") or "")
+        _step = 1
+        _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
+        if _chan:
+            _skill.append(
+                f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
+                f"message, reconstruct the room thread — `python3 "
+                f"skills/agent-room-ops/room_ops.py read '{_chan}' --limit 30` (if it "
+                f"reports no gateway configured, load the channel env first: `set -a; . "
+                f"\"$CLAUDE_CONFIG_DIR/channels/ag2space/.env\"; set +a`) — and read it "
+                "back (everyone's messages including your own prior replies) until this "
+                "message stands on its own, then answer from the reconstructed thread, "
+                "NOT from memory. Do this every time; do NOT skip it because the message "
+                "looks self-contained or you feel you already understand it — felt "
+                "confidence is exactly the signal that fails. The only exception is a "
+                'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
+            _step += 1
+            _skill.append(
+                f"{_step}. NOTIFY FIRST (if task takes >60s): python3 "
+                f"skills/task-progress/scripts/notify.py --source ag2space "
+                f"--channel-id '{_chan}' --message \"On it — back in a moment.\"")
+            _step += 1
+        _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
+        lines.extend(_skill)
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file

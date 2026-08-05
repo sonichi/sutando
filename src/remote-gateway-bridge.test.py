@@ -319,6 +319,26 @@ def main() -> int:
     mem = (rtc.TASKS_DIR / "task-MEMBERS.txt").read_text()
     check("room_members: @a:x, @b:x (+3 more)" in mem and "room_member_count: 5" in mem,
           "room_members + room_member_count serialize when the gateway sends them")
+    # ===SKILL INSTRUCTIONS=== rides OWNER-tier tasks only (non-owner tiers carry
+    # the SUTANDO SYSTEM INSTRUCTIONS block and must not get a competing one).
+    check("===SKILL INSTRUCTIONS" not in ctx,
+          "non-owner (clamped) task carries NO skill-instructions block")
+    _saved_tier = rtc.LOCAL_TIER
+    rtc.LOCAL_TIER = "owner"
+    try:
+        rtc._write_task({**TASK, "id": "task-SKILL", "channel_id": "!room:ag2.space"})
+        sk = (rtc.TASKS_DIR / "task-SKILL.txt").read_text()
+    finally:
+        rtc.LOCAL_TIER = _saved_tier
+    check("===SKILL INSTRUCTIONS (follow before any other action)===" in sk
+          and "room_ops.py read '!room:ag2.space' --limit 30" in sk
+          and "--source ag2space --channel-id '!room:ag2.space'" in sk
+          and "write the result to results/task-SKILL.txt" in sk,
+          "owner task carries the ag2space skill-instructions block (context-first, notify, result path)")
+    check(sk.rstrip().splitlines()[-1].startswith("3. Process"),
+          "skill block is the file tail (appended after access_tier)")
+    tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
+    check(tiers_sk == ["access_tier: owner"], "exactly one access_tier line, owner")
     check(rtc._post_task_ack(tid), "task ack POSTed after local queue write")
     check(len(STATE["acks"]) == 1
           and STATE["acks"][0]["path"] == "/v1/tasks/task-MOCK1/ack"
