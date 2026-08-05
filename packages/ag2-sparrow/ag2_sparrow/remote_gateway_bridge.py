@@ -534,6 +534,9 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
                 "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                # Room-membership context (gateway writer side, same contract):
+                # a capped one-line mxid list + the true joined total.
+                "room_members", "room_member_count",
                 "source_message_id", "user_id", "priority", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
