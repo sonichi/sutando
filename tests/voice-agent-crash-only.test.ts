@@ -10,7 +10,13 @@
  * Integration (spawned agents against a temp workspace):
  *  - duplicate lock: loser exits 7 with the FATAL line, winner unaffected,
  *    lock file is structured JSON naming the winner (Steps 2+4);
- *  - EADDRINUSE reaches exit 7 through `main().catch` (R2's second path);
+ *  - EADDRINUSE reaches exit 7 through `main().catch` (R2's second path),
+ *    with the R1 release suppression pinned on THIS path too (the loser's
+ *    own lock is left in place — the exit-time Python release is skipped);
+ *  - EADDRINUSE reaches exit 7 through the uncaughtException handler
+ *    directly (R2's FIRST path, driven by test-only fault injection);
+ *  - a non-EADDRINUSE `main()` failure exits 1 through the bounded crash
+ *    record with static-string logging only (design 1d), release suppressed;
  *  - unusable lock-helper interpreter ⇒ FAIL CLOSED with an actionable error,
  *    no unguarded bare-pid lock is ever written (R3/R4/T1).
  */
@@ -285,7 +291,57 @@ describe('voice-agent duplicate-instance + fail-closed lock (integration)', () =
 		const bCode = await b.exited;
 		assert.equal(bCode, 7, `port loser must exit 7; stderr: ${b.stderr()} stdout: ${b.stdout()}`);
 		assert.match(b.stdout() + b.stderr(), /already in use|EADDRINUSE/);
+		// R1 release suppression pinned on the main().catch path too: this is
+		// a FATAL exit, so the exit-time Python release helper is skipped and
+		// the loser's own (now stale) lock stays for the supervisor to replace
+		// under the guard — identical crash-only rules on both fatal paths.
+		assert.equal(
+			existsSync(join(wsB, '.voice-agent.pid')),
+			true,
+			'main().catch fatal must NOT release the lock (amendment R1)',
+		);
 		await killAndWait(a.child);
+	});
+
+	it('non-EADDRINUSE main() failure: bounded crash record, static log, release suppressed (1d/R1/R2)', async () => {
+		const ws = makeWorkspace('mainfatal');
+		const agent = spawnAgent(ws, 19961, 19962, { SUTANDO_TEST_FAIL_MAIN: 'boom-from-main' });
+		const code = await agent.exited;
+		assert.equal(code, 1, `generic fatal exits 1; stderr: ${agent.stderr()}`);
+		// Static-string logging only — never `console.error('Fatal:', err)`
+		// (object inspection inside error reporting was the 2026-08-04 spin).
+		assert.match(agent.stderr(), /\[FATAL\] main\(\) failed — crash-only exit/);
+		assert.doesNotMatch(agent.stderr(), /Fatal: Error/, 'no object-inspected err dump');
+		// Bounded primitive-only crash record, same file as the uncaught path.
+		const rec = JSON.parse(readFileSync(join(ws, 'logs', 'voice-agent.crash.json'), 'utf-8'));
+		assert.equal(rec.name, 'Error');
+		assert.equal(rec.message, 'boom-from-main');
+		assert.equal(typeof rec.at, 'number');
+		assert.equal(typeof rec.pid, 'number');
+		// R1: the acquired lock is left in place (release helper suppressed).
+		assert.equal(
+			existsSync(join(ws, '.voice-agent.pid')),
+			true,
+			'fatal main() exit must NOT release the lock (amendment R1)',
+		);
+	});
+
+	it('EADDRINUSE reaches exit 7 through the uncaughtException handler directly (amendment R2)', async () => {
+		const ws = makeWorkspace('uncaught');
+		const agent = spawnAgent(ws, 19971, 19972, { SUTANDO_TEST_RAISE_UNCAUGHT: 'EADDRINUSE' });
+		// The injection fires only AFTER the fatal handlers are installed
+		// (post-session-construction), so this pins onFatal — not main().catch.
+		const code = await agent.exited;
+		assert.equal(code, 7, `uncaught EADDRINUSE must exit 7; stderr: ${agent.stderr()} stdout: ${agent.stdout()}`);
+		assert.match(agent.stderr(), /\[FATAL\] EADDRINUSE on :\d+ — another voice-agent is listening/);
+		// The EADDRINUSE branch is static-string only — no crash record.
+		assert.equal(existsSync(join(ws, 'logs', 'voice-agent.crash.json')), false, 'duplicate-instance exit writes no crash record');
+		// And the fatal flag suppresses the exit-time release here too (R1).
+		assert.equal(
+			existsSync(join(ws, '.voice-agent.pid')),
+			true,
+			'uncaught fatal must NOT release the lock (amendment R1)',
+		);
 	});
 
 	it('unusable interpreter: lock ops fail closed, no bare-pid fallback lock (R3/R4/T1)', async () => {

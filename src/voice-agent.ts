@@ -121,6 +121,10 @@ const HOST = process.env.HOST || '127.0.0.1';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
 const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
+/** Bounded primitive-only crash record — shared by BOTH fatal paths (the
+ * uncaught handler and `main().catch`), which obey identical crash-only
+ * rules (design 1d; amendments R1/R2). */
+const CRASH_RECORD_PATH = join(WORKSPACE_DIR, 'logs', 'voice-agent.crash.json');
 const SESSION_ID = `session_${Date.now()}`;
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
@@ -712,6 +716,14 @@ async function main() {
 	// so a duplicate exits without stranding `:7847` with a dead session.
 	acquirePidLock();
 
+	// Test-only fault injection (SUTANDO_TEST_MODE only): throw AFTER the lock
+	// is acquired so the crash-only contract of `main().catch` — bounded crash
+	// record, static-string logging, R1 release suppression (the stale lock
+	// stays for the supervisor) — is provable end-to-end.
+	if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_FAIL_MAIN) {
+		throw new Error(process.env.SUTANDO_TEST_FAIL_MAIN);
+	}
+
 	// --- Voice agent observability ---
 	// Same format as phone agent's call-metrics.jsonl so diagnose.py can
 	// analyze both. State + flush + usage-ticker management moved to
@@ -1033,7 +1045,7 @@ async function main() {
 	// SQLite, no `err.stack`, no object inspection. `recorder.flush()` stays
 	// ONLY in the graceful shutdown path above; richer crash metadata is the
 	// supervisor's job when it reaps the exit.
-	const crashRecordPath = join(WORKSPACE_DIR, 'logs', 'voice-agent.crash.json');
+	const crashRecordPath = CRASH_RECORD_PATH;
 	const onFatal = (err: unknown) => {
 		// One-shot guard: a second fatal while handling the first goes
 		// straight to process.exit(1). markFatalExit() also suppresses the
@@ -1060,6 +1072,20 @@ async function main() {
 	};
 	process.on('uncaughtException', onFatal);
 	process.on('unhandledRejection', onFatal);
+
+	// Test-only fault injection (SUTANDO_TEST_MODE only): raise an uncaught
+	// exception AFTER the fatal handlers are installed so tests can pin the
+	// uncaughtException path directly — e.g. EADDRINUSE → exit 7 through
+	// `onFatal`, not only through `main().catch` (amendment R2).
+	if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_RAISE_UNCAUGHT) {
+		const raiseCode = process.env.SUTANDO_TEST_RAISE_UNCAUGHT;
+		setTimeout(() => {
+			throw Object.assign(
+				new Error(`test uncaught ${raiseCode}`),
+				raiseCode === 'EADDRINUSE' ? { code: raiseCode } : {},
+			);
+		}, 250);
+	}
 
 	voiceSessionRef = session;
 
@@ -1276,6 +1302,17 @@ async function main() {
 }
 
 main().catch((err) => {
+	// This is a FATAL path and obeys the SAME crash-only rules as the
+	// uncaught handler above (design 1d; amendments R1/R2): markFatalExit()
+	// FIRST, so the exit-time lock release skips the (potentially
+	// guard-blocked) Python helper and a second fatal while handling this
+	// one goes straight to process.exit(1); never `console.error(err)` —
+	// object inspection inside error reporting was the 2026-08-04 incident's
+	// spin — only static strings + the bounded primitive-only crash record.
+	if (markFatalExit()) {
+		process.exit(1);
+		return;
+	}
 	// Centralized exit classification (amendment R2): EADDRINUSE reaches
 	// exit 7 on BOTH fatal paths — the uncaught handler above AND this one —
 	// so the supervisor's exit-7 grace window sees every duplicate-instance
@@ -1285,8 +1322,10 @@ main().catch((err) => {
 		console.error(`\nError: port ${PORT} is already in use.`);
 		console.error(`Kill the existing process: kill $(lsof -ti :${PORT})`);
 		console.error('Then run pnpm start again.\n');
-	} else {
-		console.error('Fatal:', err);
+		process.exit(code);
+		return;
 	}
-	process.exit(code);
+	// Static string only — the crash record replaces `'Fatal:', err`.
+	console.error(`[FATAL] main() failed — crash-only exit (record: ${CRASH_RECORD_PATH})`);
+	writeCrashRecordAndExit(err, CRASH_RECORD_PATH, { exit: (c) => process.exit(c) });
 });
