@@ -109,22 +109,25 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
         items = parsed.get("messages") if isinstance(parsed, dict) else parsed
         return _normalize(items)
 
-    messages, previous, exhausted = [], None, False
+    # NO EARLY STOP ON A REPEATED COUNT. An unchanged message count across a wider raw
+    # window looks like "history exhausted" and is not: the extra raw events may all be
+    # non-messages, with older messages just past the wall. Both reviewers of #2678
+    # produced the control independently — a 20-event front gap makes windows [3, 13]
+    # return zero twice, and stopping there rebuilds the exact false-empty this function
+    # exists to remove. Guarding the check on "we have seen a message" was MY first
+    # attempt and only moves the wall: one message ahead of a 60-event gap still returned
+    # 1 of 5 with complete=True. There is no safe repeated-count inference.
+    #
+    # The gateway offers no genuine exhaustion signal either — this endpoint returns only
+    # message-type items, so a short page is indistinguishable from a noisy window. So the
+    # only sound stop conditions are "we have what was asked for" and "we have looked as
+    # far as the API allows", and `complete` means strictly the former.
+    messages = []
     try:
         for raw in _windows(limit, MAX_LIMIT):
             messages = _fetch(raw)
             if len(messages) >= limit:
                 break
-            # A WIDER window that surfaced nothing new means the history is exhausted —
-            # but ONLY once we have actually seen a message. Two consecutive ZEROS mean
-            # the opposite: the window has not yet cleared the leading run of non-message
-            # events, which is the very condition this function exists to survive. Caught
-            # live: windows 1 and 11 both returned 0 on a room holding fourteen, and
-            # treating that as exhaustion reproduced the empty-room bug one layer down.
-            if previous is not None and len(messages) == previous and messages:
-                exhausted = True
-                break
-            previous = len(messages)
     except HTTPError as e:
         return _result(False, reason=degrade_reason(e.code), room_id=room_id)
     except (URLError, TimeoutError) as e:
@@ -132,8 +135,10 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     except ValueError as e:
         return _result(False, reason=f"parse error: {e}", room_id=room_id)
 
-    # `complete` is the half that makes a short result readable. Without it, "3 messages"
-    # cannot be told apart from "3 messages AND we stopped looking", which is the same
-    # ambiguity that made the zero above so misleading.
-    complete = exhausted or len(messages) >= limit
-    return _result(True, messages[:limit], room_id=room_id, complete=complete)
+    # `complete` is the half that makes a short result readable, and it UNDER-claims on
+    # purpose: short-of-limit is reported False even for a room that may genuinely hold
+    # nothing more, because from here those two cases are indistinguishable. A caller that
+    # sees complete=False knows only "do not treat this as the whole story", which is the
+    # safe direction for a function whose failure mode is a confident empty.
+    return _result(True, messages[:limit], room_id=room_id,
+                   complete=len(messages) >= limit)

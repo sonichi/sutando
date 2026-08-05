@@ -176,14 +176,20 @@ class ReadTests(EnvCase):
         self.assertEqual(len(res["messages"]), 10)
         self.assertTrue(res["complete"])
 
-    def test_short_room_is_marked_complete_not_truncated(self):
-        """Fewer messages than asked for is fine — but say WHICH kind of short it is."""
+    def test_short_room_under_claims_completeness(self):
+        """Short of `limit` never claims complete — the client cannot tell why it is short.
+
+        Updated per the #2678 review: a repeated message count across a wider window is
+        NOT proof of exhausted history (the extra raw events may all be non-messages), and
+        this endpoint returns only message-type items, so a short page is indistinguishable
+        from a noisy one. Under-claiming is the safe direction here.
+        """
         os.environ["RELAY_URL"] = "https://r"
         with mock.patch.object(rd, "http_request",
                                side_effect=self._raw_window_gateway(total_messages=2)):
             res = rd.read_room(ROOM, HS, limit=20, gate=None)
         self.assertEqual(len(res["messages"]), 2)
-        self.assertTrue(res["complete"], "history exhausted -> complete, not truncated")
+        self.assertFalse(res["complete"], "short of limit -> never claim complete")
 
     def test_success_parses(self):
         os.environ["RELAY_URL"] = "https://r"

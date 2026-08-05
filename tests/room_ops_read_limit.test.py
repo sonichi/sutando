@@ -97,12 +97,65 @@ class ReadLimitCountsMessages(unittest.TestCase):
         self.assertGreater(len(seen), 1, "must widen when the first window is short")
         self.assertEqual(seen, sorted(seen), "the raw window must only grow")
 
-    def test_short_room_is_complete_not_truncated(self):
+    def test_short_room_under_claims_completeness(self):
+        """Short of `limit` reports complete=False even if the room may hold no more.
+
+        Deliberate under-claim (#2678 review): from the client those two cases are
+        indistinguishable — this endpoint returns only message-type items, so a short page
+        looks identical to a noisy window. A caller seeing complete=False learns only "do
+        not treat this as the whole story", the safe direction for a function whose
+        failure mode is a confident empty.
+        """
         with mock.patch.object(rd, "http_request",
                                side_effect=raw_window_gateway(total_messages=2)):
             res = rd.read_room(ROOM, HS, limit=20, gate=None)
         self.assertEqual(len(res["messages"]), 2)
-        self.assertTrue(res["complete"], "history exhausted -> complete")
+        self.assertFalse(res["complete"], "short of limit -> never claim complete")
+
+    def _front_gap_gateway(self, gap, total=14, before=0):
+        """`before` messages, then a wall of `gap` non-message events, then the rest."""
+        import urllib.parse as _up
+
+        def _http(_m, url, _h):
+            raw = int(dict(_up.parse_qsl(_up.urlparse(url).query))["limit"])
+            msgs, consumed = [], 0
+            for _ in range(before):
+                consumed += 1
+                if consumed > raw:
+                    break
+                msgs.append({"sender": HS, "ts": 1, "body": f"pre{len(msgs)}"})
+            consumed += gap
+            while consumed < raw and len(msgs) < total:
+                consumed += 1
+                msgs.append({"sender": HS, "ts": 1, "body": f"m{len(msgs)}"})
+            return (200, json.dumps({"messages": msgs}).encode(), {})
+        return _http
+
+    def test_front_gap_is_not_exhausted_history(self):
+        """Both #2678 reviewers' control: a 20-event front gap is not an empty room.
+
+        Windows [3, 13] both return zero because neither clears the wall. Inferring
+        exhaustion from that repeated count rebuilds the exact false-empty this module
+        exists to remove, for rooms with a larger front gap.
+        """
+        with mock.patch.object(rd, "http_request",
+                               side_effect=self._front_gap_gateway(gap=20)):
+            res = rd.read_room(ROOM, HS, limit=3, gate=None)
+        self.assertEqual(len(res["messages"]), 3)
+        self.assertTrue(res["complete"])
+
+    def test_a_wall_after_the_first_message_is_not_exhausted_either(self):
+        """Guarding the plateau on "we have seen a message" only MOVES the wall.
+
+        That was the author's first attempt at the fix; one message ahead of a 60-event
+        gap still returned 1 of 5 with complete=True. There is no safe repeated-count
+        inference, which is why the check is gone rather than conditioned.
+        """
+        with mock.patch.object(rd, "http_request",
+                               side_effect=self._front_gap_gateway(gap=60, before=1)):
+            res = rd.read_room(ROOM, HS, limit=5, gate=None)
+        self.assertGreaterEqual(len(res["messages"]), 5)
+        self.assertTrue(res["complete"])
 
     def test_stops_at_max_limit(self):
         seen = []
