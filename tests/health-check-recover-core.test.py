@@ -643,6 +643,68 @@ def case_t_unresolvable_host_label_reads_NOT_alive():
     return fails
 
 
+def case_x_uncertainty_between_two_deaths_invalidates_the_window():
+    """qingyun-wu (#2160 follow-up): an UNKNOWN probe must not be a free pass.
+
+    The first fix suppressed the restart on UNKNOWN but deliberately LEFT the
+    confirmation window intact, on the reasoning that an intermittently-failing
+    probe would otherwise reset it forever and silently disable recovery.
+    Reproduced at the exact head, that reasoning was backwards:
+
+        liveness  dead -> UNKNOWN -> dead
+        actions   observed / probe-failed / RESTARTED    restart_calls == [False]
+
+    A single post-uncertainty DEAD reading inherited a window opened BEFORE the
+    uncertainty, so "the death persists across a pass" did not hold — the middle
+    pass confirmed nothing at all. For a DESTRUCTIVE actuator that is the wrong
+    direction to fail: a probe too flaky to give two consecutive affirmative
+    deaths means the state is genuinely unknown, and not restarting is correct.
+
+    BOTH halves are asserted, because the first alone would also pass if I had
+    simply disabled recovery:
+      1. dead -> UNKNOWN -> dead            must NOT restart
+      2. ... -> dead -> dead (window clear) MUST restart
+
+    Without (2) this case cannot tell "correctly re-observing" from "broken".
+    """
+    import pathlib
+    import tempfile
+    fails = []
+    ws = pathlib.Path(tempfile.mkdtemp())
+    restarts = []
+    common = dict(
+        state_file=ws / "rec.json",
+        oldest_task_fn=lambda: ("t1", 5000),
+        status_ts_fn=lambda: None,
+        just_booted_fn=lambda: False,
+        restart_fn=lambda standard_context: restarts.append(standard_context) or True,
+        sender=lambda text: True,
+    )
+    seq = iter([False, None, False])          # dead, UNKNOWN, dead
+    acts = [hc.recover_core_if_wedged(now=t, alive_fn=lambda: next(seq), **common)
+            for t in (1000000, 1000200, 1000400)]
+
+    if restarts:
+        fails.append(
+            "x) dead -> UNKNOWN -> dead RESTARTED — an uncertain pass must invalidate "
+            f"the confirmation window, not be skipped over (actions={[a and a.get('action') for a in acts]})")
+    if (acts[2] or {}).get("action") == "restarted":
+        fails.append("x) the third pass restarted on a window opened before the uncertainty")
+    if (acts[1] or {}).get("action") != "probe-failed":
+        fails.append(f"x) the UNKNOWN pass should surface as probe-failed, got {acts[1]}")
+
+    # PAIRED HALF: recovery must still work once the probe is clean again.
+    seq2 = iter([False, False])
+    acts2 = [hc.recover_core_if_wedged(now=t, alive_fn=lambda: next(seq2), **common)
+             for t in (1000600, 1000800)]
+    if not restarts:
+        fails.append(
+            "x) two clean consecutive DEAD observations after the uncertainty did NOT "
+            f"restart — the reset disabled recovery instead of deferring it "
+            f"(actions={[a and a.get('action') for a in acts2]})")
+    return fails
+
+
 def case_w_every_three_state_branch_of_both_helpers():
     """Direct branch coverage for the three-state helpers (#2160).
 
@@ -855,6 +917,7 @@ def main() -> int:
         ("t", case_t_unresolvable_host_label_reads_NOT_alive),
         ("v", case_v_an_unknown_probe_must_not_restart_a_healthy_core),
         ("w", case_w_every_three_state_branch_of_both_helpers),
+        ("x", case_x_uncertainty_between_two_deaths_invalidates_the_window),
         ("u", case_u_peer_boot_does_not_suppress_local_recovery),
         ("j2", case_j2_dead_core_before_after_output),
         ("k", case_k_draining_backlog_never_restarts),

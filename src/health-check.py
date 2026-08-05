@@ -7045,8 +7045,29 @@ def recover_core_if_wedged(
         # side. An injected bool from a test is unaffected.
         if alive is None or just_booted is None:
             which = "liveness" if alive is None else "boot-guard"
+            # RESET the confirmation window (qingyun-wu, #2160 follow-up). An
+            # earlier version deliberately left it intact, reasoning that an
+            # intermittently-failing probe would otherwise reset forever and
+            # silently disable recovery. Reproduced at the exact head, that
+            # choice was the destructive one: liveness `dead -> UNKNOWN -> dead`
+            # returned observed / probe-failed / RESTARTED, so a single
+            # post-uncertainty DEAD reading inherited a window opened BEFORE the
+            # uncertainty. The "death persists across a pass" guarantee was not
+            # holding — the middle pass confirmed nothing.
+            #
+            # Both directions fail, so the question is which way. A flaky probe
+            # that never permits two consecutive affirmative deaths means the
+            # state is genuinely unknown, and NOT restarting is correct there.
+            # Killing a healthy core on one observation plus a gap is not.
+            # Uncertainty therefore invalidates the streak; recovery resumes as
+            # soon as two clean consecutive observations exist, which case `x`
+            # pins so this cannot be read as disabling recovery.
+            if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
+                _reset_observation()
+                _save()
             print(f"[recover-core] WARNING: local {which} probe failed — state is "
-                  f"UNKNOWN, not dead; suppressing restart this pass", file=sys.stderr)
+                  f"UNKNOWN, not dead; suppressing restart and RESETTING the "
+                  f"confirmation window", file=sys.stderr)
             return {"action": "probe-failed", "probe": which}
         wedged = (
             alive
