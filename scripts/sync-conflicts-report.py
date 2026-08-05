@@ -118,22 +118,24 @@ def unmerged(workspace: pathlib.Path):
     # content" about somebody else's repository. Caught by running this from a
     # PR worktree, where the fallback workspace exists but is not a repo and
     # git happily returned the worktree's own git dir.
-    top = subprocess.run(
-        ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+    # ONE rev-parse for both answers. A second `--git-dir` call cannot fail once
+    # `--show-toplevel` has succeeded on the same path, so its error branch was
+    # unreachable — dead code that the coverage gate correctly refused to accept
+    # as covered (john-the-dev, #2662).
+    rp = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--show-toplevel", "--git-dir"],
         capture_output=True, text=True,
     )
-    if top.returncode:
+    if rp.returncode:
         return None, f"not a git repo: {workspace}"
-    if pathlib.Path(top.stdout.strip()).resolve() != workspace.resolve():
+    lines = rp.stdout.strip().splitlines()
+    if len(lines) < 2:
+        return None, f"not a git repo: {workspace}"
+    top_s, gitdir_s = lines[0], lines[1]
+    if pathlib.Path(top_s).resolve() != workspace.resolve():
         return None, (f"not a git repo: {workspace} "
-                      f"(git resolved the ancestor {top.stdout.strip()})")
-    gitdir = subprocess.run(
-        ["git", "-C", str(workspace), "rev-parse", "--git-dir"],
-        capture_output=True, text=True,
-    )
-    if gitdir.returncode:
-        return None, f"not a git repo: {workspace}"
-    root = pathlib.Path(gitdir.stdout.strip())
+                      f"(git resolved the ancestor {top_s})")
+    root = pathlib.Path(gitdir_s)
     if not root.is_absolute():
         root = workspace / root
     root = root / "sutando-sync-conflicts"
@@ -225,8 +227,10 @@ def retire(workspace: pathlib.Path, targets: "list[str]"):
             hint = (f" — did you mean one of: {', '.join(sorted(near)[:4])}"
                     if near else "")
             return None, f"no preserved copy matches {t!r}{hint}"
-        if len(hits) > 1:
-            return None, f"{t!r} is ambiguous ({len(hits)} copies) — qualify it further"
+        # No len>1 guard: `index` is keyed by "<batch>/<relpath>", which is unique
+        # per filesystem walk, so a bucket cannot hold two. Ambiguity is caught
+        # one line up instead — a bare basename matches NO key and the near-miss
+        # hint names the qualified candidates.
         resolved.append(hits[0])
     retired = _load_retired(root)
     done = []

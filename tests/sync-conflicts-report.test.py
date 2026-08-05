@@ -358,6 +358,47 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn("retired 1", out, out)
         self.assertNotIn("nothing matched", out)
 
+
+    def test_retire_on_a_NON_REPO_propagates_the_validation_error(self):
+        """`retire()` reuses `unmerged()`'s workspace validation, so a bad
+        target must fail there rather than proceeding to mutate anything."""
+        d = Path(self._tmp.name) / "notarepo"
+        d.mkdir()
+        r = self._main(str(d), "--retire", "anything")
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("not a git repo", r.stdout)
+
+    def test_retire_with_NO_conflicts_directory_is_clean_not_an_error(self):
+        """A workspace that has never had a conflict: nothing to retire, and
+        that is a normal state, not a failure."""
+        r = self._main(str(self.ws), "--retire", "whatever")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("nothing matched", r.stdout)
+
+    def test_retiring_the_SAME_copy_twice_is_idempotent(self):
+        """Second retire of an already-retired copy must not re-record it, and
+        must report honestly that nothing changed.
+
+        This is the branch that decides whether a repeated operator action
+        quietly rewrites state. It also drives the `nothing matched` CLI result,
+        which is otherwise only reachable through a selector that matched an
+        entry already retired.
+        """
+        self._pair("note.md", "base\n", "base\nnew fact\n")
+        target = f"{self.batch.name}/memory/note.md"
+
+        first = self._main(str(self.ws), "--retire", target)
+        self.assertEqual(first.returncode, 0, first.stdout)
+        self.assertIn("retired 1", first.stdout)
+
+        second = self._main(str(self.ws), "--retire", target)
+        self.assertEqual(second.returncode, 0, second.stdout)
+        self.assertIn("nothing matched", second.stdout)
+        self.assertNotIn("retired 1", second.stdout)
+
+        # and the entry stays retired — idempotence must not un-retire it
+        self.assertEqual(self._run().returncode, 0, "the copy came back after a second retire")
+
     def test_a_non_repo_dir_INSIDE_a_repo_does_not_answer_about_the_ancestor(self):
         """`git rev-parse` searches ANCESTORS, and that is a silent false clean.
 
