@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ag2-gateway-client"
+version = "0.1.0"
+description = "Provider-neutral AG2 Space gateway client: credential/identity resolution + profiled HTTP"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# stdlib-only by design (owner-ratified day-one constraint): no runtime deps.
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["ag2_gateway_client*"]
