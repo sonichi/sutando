@@ -28,13 +28,14 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 _TS_LINE = re.compile(
     r"^(\d{2}):(\d{2}):(\d{2})[.,]\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}[.,]\d{3}")
 _TAG = re.compile(r"<[^>]+>")
 
 
-def _resolve_ytdlp() -> list[str] | None:
+def _resolve_ytdlp() -> Optional[list[str]]:
     """Runtime probe for the extractor: PATH binary first, then the importable
     module. None → caller emits the actionable install error."""
     exe = shutil.which("yt-dlp")

@@ -11,6 +11,7 @@ Run: python3 tests/media-transcript.test.py   (exit 0 pass / 1 fail)
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
 import json
@@ -20,6 +21,7 @@ import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location(
@@ -129,7 +131,7 @@ check("vtt: hour-long cue formats h:mm:ss",
 # end-to-end with a STUB yt-dlp on PATH (no network)
 # ---------------------------------------------------------------------------
 def make_stub_bin(vtt_body: str, fail: bool = False, no_output: bool = False,
-                  args_log: str | None = None) -> str:
+                  args_log: Optional[str] = None) -> str:
     d = tempfile.mkdtemp(prefix="mt-stub-")
     stub = Path(d) / "yt-dlp"
     log_line = f"printf '%s\\n' \"$@\" > {args_log}\n" if args_log else ""
@@ -300,6 +302,40 @@ check("two tracks: uploader subtitles win over auto-captions",
       rc == 0 and "uploader subtitle track wins" in out
       and "auto caption track must lose" not in out,
       f"rc={rc} out={out.strip()[:80]}")
+
+# Regression guard (qingyun CR on #2435): this skill's Python must use
+# typing.Optional/Union, not PEP-604 `X | Y` unions — CONTRIBUTING.md's 3.9
+# source convention. The repo's python39-compat gate can't catch this: it is
+# compile-only (PEP-604 parses fine under `from __future__ import annotations`)
+# and scans only src/, not skills/. Scoped to THIS skill on purpose — a
+# repo-wide skills/ scan would flag 65 pre-existing usages across 17 other
+# skills, which is a separate cleanup, not this feature's concern.
+def _pep604_union_lines(path: Path) -> list[int]:
+    def _has_bitor(ann) -> bool:
+        return ann is not None and any(
+            isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr)
+            for n in ast.walk(ann))
+
+    hits: list[int] = []
+    for node in ast.walk(ast.parse(path.read_text(), str(path))):
+        anns = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            anns.append(node.returns)
+            anns += [a.annotation for a in (*node.args.posonlyargs,
+                     *node.args.args, *node.args.kwonlyargs)]
+        elif isinstance(node, ast.AnnAssign):
+            anns.append(node.annotation)
+        if any(_has_bitor(a) for a in anns):
+            hits.append(node.lineno)
+    return hits
+
+
+_guard_targets = sorted(
+    (REPO / "skills" / "media-transcript" / "scripts").glob("*.py")) + [Path(__file__)]
+_pep604_bad = {str(p.relative_to(REPO)): ls
+               for p in _guard_targets if (ls := _pep604_union_lines(p))}
+check("no PEP-604 (X | Y) unions in skill + test (use Optional/Union — CONTRIBUTING 3.9 floor)",
+      not _pep604_bad, f"found at {_pep604_bad}")
 
 print()
 if failures:
