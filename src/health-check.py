@@ -4590,10 +4590,17 @@ def apply_skill_symlink_fixes(checks: list, stream=None) -> None:
         if c["name"] == "skill-symlinks" and (c.get("_unlinked") or c.get("_broken")):
             result = fix_skill_symlinks(c)
             print(f"  {c['name']}: {result['detail']}", file=out)
-            c["status"] = result["status"]
-            c["detail"] = result["detail"]
-            c.pop("_unlinked", None)
-            c.pop("_broken", None)
+            # RE-RUN the check instead of adopting the fixer's own verdict.
+            # `fix_skill_symlinks` repairs only `_unlinked`/`_broken`, and its
+            # status is computed solely from what it repaired — it is blind to
+            # `_orphaned`, which it deliberately does not remove. Copying that
+            # status over the check reported `ok` while a dangling link
+            # survived: a false clean, in the very payload added to make the
+            # post-fix state honest. A repair's self-report is not evidence of
+            # the resulting state; only re-measuring is.
+            fresh = check_skill_symlinks()
+            c.clear()
+            c.update(fresh)
 
 
 def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> list[Path]:

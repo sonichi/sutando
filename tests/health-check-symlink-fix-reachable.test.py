@@ -17,6 +17,7 @@ failure) passed before the fix too, so on its own it proves nothing; it is here
 to show the fix did not simply move the breakage to the other branch.
 """
 import importlib.util
+import io
 import sys
 from pathlib import Path
 
@@ -41,6 +42,12 @@ def run_capturing(checks, argv):
         called.append(c["name"]),
         {"name": "skill-symlinks", "status": "ok", "detail": "relinked"},
     )[1]
+    # The re-run is what decides the reported verdict now, so it is stubbed with
+    # a DISTINGUISHABLE detail. If the payload ever carries "relinked" again the
+    # code went back to trusting the fixer's self-report.
+    m.check_skill_symlinks = lambda: {
+        "name": "skill-symlinks", "status": "ok", "detail": "re-measured: all linked",
+    }
     m.run_all_checks = lambda: [dict(c) for c in checks]
     saved, sys.argv = sys.argv, ["health-check.py"] + argv
     out, err = io.StringIO(), io.StringIO()
@@ -92,6 +99,32 @@ for mode in (["--fix", "--quiet"], ["--fix"]):
 # Control: without --fix, a broken warn must never be silently repaired.
 check("no --fix flag -> repair never runs", run([BROKEN, OK], ["--quiet"]), False)
 
+# --- mixed fixable + ORPHANED (blocking review of #2663) --------------------
+# `fix_skill_symlinks` repairs only _unlinked/_broken and its status is computed
+# from what it repaired — it never looks at _orphaned, which it deliberately
+# leaves alone. Copying that status onto the check reported `ok` while a dangling
+# link survived. The fix re-runs the check instead; a repair's self-report is not
+# evidence of the resulting state.
+def _apply_with(fix_result, recheck):
+    spec_m = importlib.util.spec_from_file_location("hc_mixed", MOD)
+    mm = importlib.util.module_from_spec(spec_m)
+    spec_m.loader.exec_module(mm)
+    mm.fix_skill_symlinks = lambda c: fix_result
+    mm.check_skill_symlinks = lambda: recheck
+    chk = {"name": "skill-symlinks", "status": "warn", "detail": "1 unlinked, 1 orphaned",
+           "_unlinked": ["good"], "_orphaned": ["foreign"]}
+    mm.apply_skill_symlink_fixes([chk], stream=io.StringIO())
+    return chk
+
+_mixed = _apply_with(
+    {"name": "skill-symlinks", "status": "ok", "detail": "linked 1 (fixable)"},
+    {"name": "skill-symlinks", "status": "warn", "detail": "1 orphaned link remains",
+     "_orphaned": ["foreign"]})
+check("fixable+orphaned -> still warn, not a false clean", _mixed["status"], "warn")
+check("...and the surviving orphan is still named", _mixed.get("_orphaned"), ["foreign"])
+check("...and the detail is the re-measure, not the fixer's 'linked 1 (fixable)'",
+      _mixed["detail"], "1 orphaned link remains")
+
 # --- the --json contract (regression caught in review of #2663) -------------
 # The first version of this hoist printed the repair line to stdout
 # unconditionally, so `--json --fix` emitted prose ahead of the payload and
@@ -118,7 +151,8 @@ check("[--json --fix] ...and NOT on stdout",
 
 ss = [c for c in (parsed or {}).get("checks", []) if c["name"] == "skill-symlinks"]
 check("[--json --fix] payload reports the POST-fix status", (ss or [{}])[0].get("status"), "ok")
-check("[--json --fix] ...and the post-fix detail", (ss or [{}])[0].get("detail"), "relinked")
+check("[--json --fix] payload carries the RE-MEASURED detail, not the fixer's self-report",
+      (ss or [{}])[0].get("detail"), "re-measured: all linked")
 
 # Control: the stderr routing must be --json-only. Without --json the operator
 # still sees the repair on stdout, where it has always been.
