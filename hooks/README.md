@@ -136,3 +136,95 @@ PY
 ```
 
 Test: `python3 tests/gmail-write-guard.test.py`.
+
+## `result-file-marker-guard.py`
+
+Denies a **Write/Edit into `<workspace>/results/`** whose body carries a
+`[file:|send:|attach:]` marker pointing at a path the delivering bridge will refuse
+to send (policy: `src/send_allowlist.py`). Parsing and the verdict both come from
+the modules the delivery path itself uses (`result_markers` + `send_allowlist`), so
+the guard cannot drift from what it enforces.
+
+Why: on 2026-08-04 a finished video was attached from `skill-repos/`, which is not
+on the allowlist. The bridge posted a literal `(file not allowed: ...)` into the
+owner's channel and the task archived as delivered -- the file existed, the marker
+parsed, the write succeeded, nothing errored. Every signal available to the author
+said "sent". The owner found it: *"Can't see this file. And I don't want to
+babysit."* The check therefore has to run where the marker is **authored**.
+
+**Destination-aware.** The allowlist is not global: Slack extends it with its
+adapter-local `<workspace>/slack-inbox/` so an uploaded file can be echoed back
+(`src/slack-bridge.py:153-158`). The guard resolves the destination from the task
+the result answers (`results/task-<id>.txt` -> `tasks/task-<id>.txt` -> `source:`)
+and applies that adapter's policy. When the destination can't be established --
+a `results/proactive-*.txt` body, or any result with no originating task -- it uses
+the **canonical roots only, never the union**. An earlier version did use the union,
+reasoning that a false deny for a destination nobody can name is unsatisfiable; that
+is unsound. A proactive body has no task to name a source, and Discord, Telegram and
+Slack all claim proactive files with no deterministic winner (`slack-bridge.py`
+race-renames them), so the union would authorize a provider-local root such as
+`slack-inbox/` for a body a different adapter then refuses -- reproducing the exact
+silent failure this guard exists to prevent, behind a clean pass.
+
+Canonical-only inverts that: every adapter accepts these roots, so an allow here is
+an allow everywhere. The cost is one deny -- a provider-local path in a proactive
+body -- and it is satisfiable in one step: stage the file into a canonical sendable
+root such as `results/` and point the marker there. The reason text says so.
+
+**The repo root is CONFIGURED, never discovered.** The hook needs `src/` on
+`sys.path`, and it must not find it by walking up from `__file__`: deploying copies
+the file out of the checkout, and that pattern is banned repo-wide
+(`scripts/lint-workspace-resolution.sh`) because it breaks under symlinked/bundled
+layouts. Pass `--repo <path>` (the snippet below does) or set `$SUTANDO_REPO_ROOT`.
+If neither resolves, the hook prints `INERT: repo root not configured` **to stderr**
+and allows -- an unresolvable root must never be indistinguishable from a clean pass.
+
+Denies rather than warns -- a warning still puts a broken message in the owner's
+channel. The reason names the offending path and the allowed roots, so the fix
+(re-encode or copy into `results/`, then point the marker there) is one step.
+
+Fails **open** on any internal error, unlike `context-source-guard.py`, which fails
+closed. That one prevents blacklisted content entering context, where being wrong
+means a leak; here being wrong means a message the owner can see and re-request,
+so wedging the core would be the larger harm.
+
+Escape hatch: `SUTANDO_SKIP_FILE_MARKER_GUARD=1`.
+
+### Deploy (per node)
+
+Registration embeds this node's checkout path, so it is correct per host and the
+hook never has to guess:
+
+```bash
+REPO="$(git rev-parse --show-toplevel)"
+cp hooks/result-file-marker-guard.py ~/.claude/hooks/
+REPO="$REPO" python3 - <<'PY'
+import json, os, shlex
+sp = os.path.expanduser("~/.claude/settings.json"); s = json.load(open(sp))
+# SHELL-QUOTE BOTH PATHS. Claude Code stores `command` as a shell string and
+# reparses it when the hook fires, so an unquoted path containing a space --
+# e.g. the app install shape ~/Library/Application Support/.../sutando -- is
+# split before _repo_root() ever sees it, and the hook goes silently INERT.
+# Same class the repo already guards in src/install-claude-hooks.sh.
+hook = shlex.quote(os.path.expanduser("~/.claude/hooks/result-file-marker-guard.py"))
+cmd = f"python3 {hook} --repo {shlex.quote(os.environ['REPO'])}"
+pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])
+for m in ("Write", "Edit", "MultiEdit"):
+    blk = next((b for b in pre if b.get("matcher") == m), None)
+    if blk is None: pre.append({"matcher": m, "hooks": [{"type": "command", "command": cmd}]})
+    elif cmd not in [h.get("command") for h in blk["hooks"]]: blk["hooks"].append({"type": "command", "command": cmd})
+json.dump(s, open(sp, "w"), indent=2)
+PY
+```
+
+**Verify it is not inert after deploying.** An unconfigured hook only complains on
+stderr, so confirm it actually denies:
+
+```bash
+WS="$(bash scripts/sutando-config.sh workspace)"
+printf '{"tool_name":"Write","tool_input":{"file_path":"%s/results/task-probe.txt","content":"x [file: /etc/hosts]"}}' "$WS" \
+  | python3 ~/.claude/hooks/result-file-marker-guard.py --repo "$REPO"
+# expect a JSON object with "permissionDecision": "deny"
+```
+
+Tests: `python3 tests/result-file-marker-guard.test.py`
