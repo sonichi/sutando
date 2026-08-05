@@ -32,6 +32,7 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -392,6 +393,20 @@ interface AgentHandle {
 	stdout: () => string;
 }
 
+// Ephemeral free port (bind :0, read the assigned port, release) so parallel
+// CI runners or a stray listener never collide with a hardcoded number.
+function freePort(): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const srv = createServer();
+		srv.on('error', reject);
+		srv.listen(0, '127.0.0.1', () => {
+			const addr = srv.address();
+			const p = typeof addr === 'object' && addr ? addr.port : 0;
+			srv.close(() => (p ? resolve(p) : reject(new Error('no port'))));
+		});
+	});
+}
+
 function spawnAgent(ws: string, port: number, visionPort: number, extraEnv: Record<string, string> = {}): AgentHandle {
 	const child = spawn('npx', ['tsx', 'src/voice-agent.ts'], {
 		cwd: REPO_ROOT,
@@ -481,10 +496,10 @@ describe('agent.state emission (integration, spawned agent)', () => {
 
 	it('immediate frame on connect; transition frame on injected terminal close; lifecycle file tracks it', async () => {
 		const ws = makeWorkspace('main');
-		const port = 19981;
+		const port = await freePort();
 		const trigger = join(ws, 'close-trigger');
 		const GEN = 'cg1-11111111-2222-3333-4444-555555555555';
-		spawnAgent(ws, port, 19982, {
+		spawnAgent(ws, port, await freePort(), {
 			SUTANDO_VOICE_CREDENTIAL_GENERATION: GEN,
 			SUTANDO_VOICE_LAUNCHD_CONTRACT: '1',
 			// Injected close fires only when the trigger file appears — the
@@ -550,8 +565,8 @@ describe('agent.state emission (integration, spawned agent)', () => {
 
 	it('legacy spawn (no injected generation, no launchd marker) omits both fields', async () => {
 		const ws = makeWorkspace('legacy');
-		const port = 19983;
-		spawnAgent(ws, port, 19984);
+		const port = await freePort();
+		spawnAgent(ws, port, await freePort());
 
 		const client = await connectClient(port, 90_000);
 		try {
