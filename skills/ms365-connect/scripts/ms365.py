@@ -21,19 +21,33 @@ import argparse
 import os
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Import guard: fail with a helpful message if python-o365 is not installed.
+# python-o365 is imported LAZILY (see _require_o365 below), not at module
+# level, so `ms365.py --help` and argparse work on any interpreter — including
+# Python 3.9, where python-o365 itself won't import (it needs 3.10+). Only the
+# commands that actually talk to Microsoft Graph pull the dependency in.
 # ---------------------------------------------------------------------------
-try:
-    from O365 import Account, FileSystemTokenBackend
-except ImportError:  # pragma: no cover - exercised only without the dependency
-    sys.stderr.write(
-        "Missing dependency 'O365'. Install it with:\n"
-        "    pip install O365\n"
-        "(or: pip install -r requirements.txt)\n"
-    )
-    sys.exit(1)
+def _require_o365():  # pragma: no cover - live dependency; not unit-testable
+    """Import python-o365, exiting with a helpful message if it can't load.
+
+    Catches SyntaxError as well as ImportError: on Python < 3.10 the O365
+    source uses 3.10+ syntax and raises SyntaxError on import, which we turn
+    into a clean 'requires Python 3.10+' message instead of a traceback.
+    """
+    try:
+        from O365 import Account, FileSystemTokenBackend
+    except (ImportError, SyntaxError):
+        sys.stderr.write(
+            "Cannot load 'O365' (python-o365). Install it with:\n"
+            "    pip install O365\n"
+            "    (or: pip install -r requirements.txt)\n"
+            "python-o365 requires Python 3.10+; this interpreter is "
+            f"{sys.version_info.major}.{sys.version_info.minor}.\n"
+        )
+        sys.exit(1)
+    return Account, FileSystemTokenBackend
 
 
 # Delegated Microsoft Graph scopes this skill requests. These must match the
@@ -51,12 +65,23 @@ SCOPES = [
 
 
 def _token_dir():
-    """Directory holding the cached OAuth token, under the workspace state dir."""
+    """Directory holding the cached OAuth token, under the resolved workspace.
+
+    MS365_STATE_DIR is an explicit override. Otherwise default through the
+    repo's resolve_workspace() (repo root and the resolved workspace differ on
+    some hosts, so `os.getcwd()/state` would cache the token in the wrong tree);
+    fall back to `os.getcwd()/state` only if that resolver is unavailable.
+    """
     base = os.environ.get("MS365_STATE_DIR")
     if not base:
-        # Default to <workspace>/state; MS365_STATE_DIR should point at the
-        # workspace state dir in production.
-        base = os.path.join(os.getcwd(), "state")
+        try:
+            repo_src = str(Path(__file__).resolve().parents[3] / "src")
+            if repo_src not in sys.path:
+                sys.path.insert(0, repo_src)
+            from workspace_default import resolve_workspace  # noqa: E402
+            base = os.path.join(str(resolve_workspace(migrate=False)), "state")
+        except Exception:
+            base = os.path.join(os.getcwd(), "state")
     return os.path.join(base, "ms365-token")
 
 
@@ -83,6 +108,7 @@ def _require_credentials():
 
 def _build_account():  # pragma: no cover  (live Graph calls; not unit-testable)
     """Construct an O365 Account with a filesystem-backed token cache."""
+    Account, FileSystemTokenBackend = _require_o365()
     client_id, client_secret, tenant_id = _require_credentials()
 
     token_dir = _token_dir()

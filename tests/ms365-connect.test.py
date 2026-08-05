@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """ms365.py — pure-logic coverage without the optional O365 dependency.
 
-CI has no `O365` installed, so the module's import guard would sys.exit; we
-inject a minimal fake `O365` module first, then the parser / credential-guard /
-token-path / auth-guard logic runs for real (the live-Graph command bodies are
-`# pragma: no cover`). Run: python3 skills/ms365-connect/scripts/ms365.test.py
+O365 is imported lazily (only inside `_build_account`, a `# pragma: no cover`
+live-Graph path), so the module imports cleanly on any interpreter WITHOUT
+`O365` installed — which is exactly the CI environment. We deliberately do NOT
+inject a fake `O365` here: a clean import is part of what this suite pins (the
+fix that makes `ms365.py --help` work on Python 3.9, where O365 can't import).
+The parser / credential-guard / token-path / auth-guard / main-dispatch logic
+runs for real. Run: python3 tests/ms365-connect.test.py
 """
 import importlib.util
 import os
@@ -17,19 +20,9 @@ _MODULE_PATH = (Path(__file__).resolve().parent.parent
                 / "skills" / "ms365-connect" / "scripts" / "ms365.py")
 
 
-def _fake_o365():
-    m = types.ModuleType("O365")
-    class Account:  # minimal stand-in
-        def __init__(self, *a, **k): self.is_authenticated = False
-    class FileSystemTokenBackend:
-        def __init__(self, *a, **k): pass
-    m.Account = Account
-    m.FileSystemTokenBackend = FileSystemTokenBackend
-    return m
-
-
 def _load():
-    sys.modules["O365"] = _fake_o365()  # satisfy the import guard
+    # No fake O365 injected on purpose — the module must import without it.
+    sys.modules.pop("O365", None)
     spec = importlib.util.spec_from_file_location("ms365_under_test", _MODULE_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -78,9 +71,38 @@ class TestTokenDir(unittest.TestCase):
         finally:
             os.environ.pop("MS365_STATE_DIR", None)
 
-    def test_defaults_to_cwd_state(self):
+    def test_defaults_to_resolved_workspace_state(self):
+        # Without MS365_STATE_DIR, the token dir defaults through the repo's
+        # resolve_workspace() (an absolute path under the resolved workspace),
+        # NOT a bare os.getcwd()/state join — repo root and workspace differ on
+        # some hosts, so cwd-relative caching would land the token in the wrong
+        # tree. We assert the shape (absolute + .../state/ms365-token) rather
+        # than a literal path, since the resolved workspace is host-specific.
         os.environ.pop("MS365_STATE_DIR", None)
-        self.assertTrue(ms365._token_dir().endswith(os.path.join("state", "ms365-token")))
+        td = ms365._token_dir()
+        self.assertTrue(os.path.isabs(td), td)
+        self.assertTrue(td.endswith(os.path.join("state", "ms365-token")), td)
+
+
+class TestMain(unittest.TestCase):
+    def test_main_dispatches_to_subcommand_func(self):
+        # main() must build the parser, parse argv, and call the selected
+        # subcommand's func — patch a handler and confirm it's invoked with the
+        # parsed namespace and its return value propagates.
+        seen = {}
+
+        def fake(args):
+            seen["n"] = args.n
+            return 0
+
+        orig = ms365.cmd_outlook_list
+        ms365.cmd_outlook_list = fake  # build_parser (called inside main) binds this
+        try:
+            rc = ms365.main(["outlook-list", "--n", "3"])
+        finally:
+            ms365.cmd_outlook_list = orig
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen.get("n"), 3)
 
 
 class TestAuthGuard(unittest.TestCase):

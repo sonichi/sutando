@@ -1,0 +1,11 @@
+{
+ "name": "ms365-connect",
+ "version": "1.0.0",
+ "owner": "github:sonichi/sutando",
+ "license": "MIT",
+ "stability": "experimental",
+ "description": "Microsoft 365 connectivity (OneDrive, Outlook mail, Calendar, Teams) via Microsoft Graph using the open-source python-o365 library.",
+ "provenance": {
+  "source_repo": "https://github.com/sonichi/sutando"
+ }
+}
