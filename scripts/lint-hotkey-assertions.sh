@@ -57,7 +57,17 @@ ALLOWED='^(README\.md|src/Sutando/main\.swift|src/screen-capture-server\.py|src/
 
 if [[ "$mode" == "--diff" ]]; then
   base="${BASE_REF:-origin/main}"
-  files="$(git diff --name-only --diff-filter=AM "$base"...HEAD -- '*.md' '*.swift' '*.sh' '*.py' '*.ts' || true)"
+  # NO `|| true` here. An empty $files is a legitimate result (this PR touched
+  # nothing scannable) and exits 0 two lines below -- which is exactly why a
+  # FAILED discovery must not also produce an empty $files. `set -e` aborts on a
+  # failing command substitution in a plain assignment, so leaving this bare is
+  # what keeps "git could not resolve $base" distinguishable from "clean". With
+  # the `|| true` this line used to carry, a bad BASE_REF printed
+  # `fatal: bad revision` to stderr and then `nothing to scan` with exit 0 --
+  # a required gate reporting clean because it could not look. The three sibling
+  # --diff lints are bare for the same reason; tests/lint-diff-discovery-failure.test.py
+  # pins all four.
+  files="$(git diff --name-only --diff-filter=AM "$base"...HEAD -- '*.md' '*.swift' '*.sh' '*.py' '*.ts')"
 else
   files="$(git ls-files -- '*.md' '*.swift' '*.sh' '*.py' '*.ts')"
 fi

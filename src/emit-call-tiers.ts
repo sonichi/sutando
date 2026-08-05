@@ -25,7 +25,8 @@
  * entry degrades gracefully (client tries it, times out, falls back to cloud).
  * Re-emitting on a network change / core heartbeat is a documented follow-up.
  */
-import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync, unlinkSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import { statusPath } from './workspace_default.js';
@@ -177,7 +178,24 @@ export function releaseSingleInstance(pidFile: string, myPid: number): void {
 // startup wires this so the descriptor has a fresh advertisement each session.
 // With `--interval <sec>` (or SUTANDO_CALL_TIERS_INTERVAL_S) it stays resident
 // and re-emits on that cadence so the advertisement tracks reachability changes.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Compare REAL PATHS, not URL strings: `import.meta.url` percent-encodes, so a
+// `file://${process.argv[1]}` template never matches a path containing a space
+// — and the desktop-bundled install lives under "~/Library/Application
+// Support/…", which always does. This guard was silently false on every
+// packaged launch, so the resident emitter never started and
+// `state/call-tiers.json` was never written (the Direct/Tailscale call tier
+// simply never appeared). Node also resolves the specifier through symlinks
+// before setting import.meta.url while argv[1] keeps what the caller typed, so
+// realpath both sides. realpathSync throws on a missing path (bare import, or
+// `node -e`), and mapping that to false keeps import-without-run intact.
+const isEntrypoint = (a: string, b: string): boolean => {
+	try {
+		return realpathSync(a) === realpathSync(b);
+	} catch {
+		return false;
+	}
+};
+if (isEntrypoint(fileURLToPath(import.meta.url), process.argv[1] ?? '')) {
 	const intervalS = parseReemitInterval();
 	if (intervalS) {
 		// Resident mode: claim the single-instance slot BEFORE any write so a

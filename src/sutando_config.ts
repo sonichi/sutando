@@ -21,7 +21,7 @@
 
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // --------------------------------------------------------------------------- //
@@ -44,6 +44,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 	'core_config_dirs',
 	'vault',
 	'migrate',
+	'bridges',
+	'stand',
 ]);
 
 /**

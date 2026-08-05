@@ -26,10 +26,13 @@ import re
 import sys
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 
 MAX_PROGRESS_CHARS = 280
 MAX_PROGRESS_LINES = 4
+_DISCORD_USER_MENTION_RE = re.compile(r"<@!?([0-9]{17,20})>")
+_PLAIN_AT_MENTION_RE = re.compile(r"(?<![\w@])@([A-Za-z0-9_.-]{2,64})")
 
 
 def _progress_message_error(message: str) -> str | None:
@@ -95,6 +98,32 @@ def _post(url: str, payload: dict, headers: dict) -> bool:
         return False
 
 
+def _discord_request(url: str, token: str, payload: Optional[dict] = None):
+    """Make a Discord JSON request and return its response body, or None."""
+    try:
+        data = json.dumps(payload).encode() if payload is not None else None
+        headers = {
+            "Authorization": f"Bot {token}",
+            "User-Agent": "DiscordBot (https://github.com/sonichi/sutando, 1.0)",
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"[task-progress] Discord request failed: {e}", file=sys.stderr)
+        return None
+
+
+def _discord_mentions(message: str):
+    """Return (structured user ids, unresolved plain @handles), preserving order."""
+    user_ids = list(dict.fromkeys(_DISCORD_USER_MENTION_RE.findall(message)))
+    without_structured = _DISCORD_USER_MENTION_RE.sub("", message)
+    plain_handles = list(dict.fromkeys(_PLAIN_AT_MENTION_RE.findall(without_structured)))
+    return user_ids, plain_handles
+
+
 def send_slack(channel_id: str, message: str, thread_ts: str | None = None) -> bool:
     token = _token("slack", "SLACK_BOT_TOKEN")
     if not token:
@@ -110,20 +139,67 @@ def send_slack(channel_id: str, message: str, thread_ts: str | None = None) -> b
     )
 
 
-def send_discord(channel_id: str, message: str) -> bool:
+def send_discord(channel_id: str, message: str, validate_mentions: bool = True) -> bool:
     token = _token("discord", "DISCORD_BOT_TOKEN")
     if not token:
         print("[task-progress] DISCORD_BOT_TOKEN not found", file=sys.stderr)
         return False
-    return _post(
+    user_ids, plain_handles = _discord_mentions(message)
+    if validate_mentions and plain_handles:
+        rendered = ", ".join(f"@{handle}" for handle in plain_handles)
+        print(
+            "[task-progress] unresolved Discord mention(s): "
+            f"{rendered}. Use <@USER_ID>, or --no-validate-mentions for "
+            "intentional plain-text handles.",
+            file=sys.stderr,
+        )
+        return False
+
+    if validate_mentions:
+        for user_id in user_ids:
+            resolved = _discord_request(
+                f"https://discord.com/api/v10/users/{user_id}", token
+            )
+            if not isinstance(resolved, dict) or str(resolved.get("id")) != user_id:
+                print(
+                    f"[task-progress] Discord mention <@{user_id}> did not resolve; "
+                    "message was not sent.",
+                    file=sys.stderr,
+                )
+                return False
+
+    payload = {
+        "content": message,
+        "allowed_mentions": {
+            "parse": [],
+            "users": user_ids,
+            "replied_user": False,
+        },
+    }
+    posted = _discord_request(
         f"https://discord.com/api/v10/channels/{channel_id}/messages",
-        {"content": message},
-        # Discord's API (behind Cloudflare) 403s the default `Python-urllib/x`
-        # User-Agent with Cloudflare error 1010. Discord requires the
-        # `DiscordBot ($url, $version)` UA format — send it or every POST fails.
-        {"Authorization": f"Bot {token}",
-         "User-Agent": "DiscordBot (https://github.com/sonichi/sutando, 1.0)"},
+        token,
+        payload,
     )
+    if not isinstance(posted, dict):
+        return False
+
+    if validate_mentions:
+        resolved_ids = {
+            str(mention.get("id"))
+            for mention in posted.get("mentions", [])
+            if isinstance(mention, dict)
+        }
+        missing = [user_id for user_id in user_ids if user_id not in resolved_ids]
+        if missing:
+            rendered = ", ".join(f"<@{user_id}>" for user_id in missing)
+            print(
+                "[task-progress] Discord posted the message but did not resolve "
+                f"expected mention(s): {rendered}.",
+                file=sys.stderr,
+            )
+            return False
+    return True
 
 
 def send_telegram(chat_id: str, message: str) -> bool:
@@ -161,32 +237,41 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     # channels directory. The containment root is the realpath of channels/
     # itself (so a symlinked channels dir works), but a channel entry that
     # symlinks OUT of the directory is refused by design.
-    real_env = os.path.realpath(env_path)
-    real_root = os.path.realpath(channels_dir)
-    if not real_env.startswith(real_root + os.sep):
-        print(f"[task-progress] refusing env path outside channels dir: {env_path}",
-              file=sys.stderr)
-        return False
-    env = _env_file(real_env)
-    url = (os.environ.get("REMOTE_TASK_URL") or env.get("REMOTE_TASK_URL", "")).rstrip("/")
-    token = os.environ.get("REMOTE_TASK_TOKEN", "").strip() or env.get("REMOTE_TASK_TOKEN", "")
-    # One-token onboarding: REMOTE_TASK_TOKEN (or the legacy AG2_REMOTE_TOKEN
-    # alias) may carry the combined "https://<gateway>|<secret>" form — the URL
-    # travels inside the token. This is the same contract ag2-sparrow's
-    # remote_gateway_bridge accepts and the documented bootstrap shortcut
-    # (docs/remote-gateway-protocol.md). Fall back to the alias when no
-    # REMOTE_TASK_TOKEN is set, then split the "|" form for EITHER var so a
-    # channel provisioned with only a compact token (in either name) still
-    # delivers — without this, ag2space escalations fail while the relay's
-    # debounce would otherwise mark them notified.
-    if not token:
-        token = (os.environ.get("AG2_REMOTE_TOKEN") or env.get("AG2_REMOTE_TOKEN", "")).strip()
-    if "|" in token:
-        _u, token = token.split("|", 1)
-        if not url:
-            url = _u.rstrip("/")
-    if not url:
-        url = (os.environ.get("AG2_REMOTE_URL") or env.get("AG2_REMOTE_URL", "")).rstrip("/")
+    # Derive the EFFECTIVE gateway config from os.environ ALONE first — including
+    # the alias and the combined "url|secret" one-token form. Only if that is still
+    # missing a value do we resolve/guard/read the channel file. Checking just the
+    # split REMOTE_TASK_URL+REMOTE_TASK_TOKEN pair was not enough: the documented
+    # one-token onboarding (REMOTE_TASK_TOKEN=https://gw|secret, or the legacy
+    # AG2_REMOTE_TOKEN) is a fully env-configured send, and it was still being
+    # refused by the containment guard over a file it never needed.
+    #
+    # One-token onboarding: the URL travels inside the token — the same contract
+    # ag2-sparrow's remote_gateway_bridge accepts (docs/remote-gateway-protocol.md).
+    def _derive(get):
+        u = (get("REMOTE_TASK_URL") or "").strip().rstrip("/")
+        tok = (get("REMOTE_TASK_TOKEN") or "").strip()
+        if not tok:
+            tok = (get("AG2_REMOTE_TOKEN") or "").strip()
+        if "|" in tok:
+            _u, tok = tok.split("|", 1)
+            if not u:
+                u = _u.rstrip("/")
+        if not u:
+            u = (get("AG2_REMOTE_URL") or "").strip().rstrip("/")
+        return u, tok
+
+    url, token = _derive(lambda k: os.environ.get(k, ""))
+    if not (url and token):
+        # The file IS needed, so the containment check applies — unchanged. A
+        # channel entry that symlinks OUT of channels/ is refused by design.
+        real_env = os.path.realpath(env_path)
+        real_root = os.path.realpath(channels_dir)
+        if not real_env.startswith(real_root + os.sep):
+            print(f"[task-progress] refusing env path outside channels dir: {env_path}",
+                  file=sys.stderr)
+            return False
+        env = _env_file(real_env)
+        url, token = _derive(lambda k: os.environ.get(k, "") or env.get(k, ""))
     if not url or not token:
         print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
               f"for source '{source}' (looked in {env_path})", file=sys.stderr)
@@ -209,6 +294,11 @@ def main() -> int:
     parser.add_argument("--chat-id", help="Telegram chat ID (alias for --channel-id on telegram)")
     parser.add_argument("--thread-ts", default=None,
                         help="Slack thread timestamp for threaded replies")
+    parser.add_argument(
+        "--no-validate-mentions",
+        action="store_true",
+        help="Discord only: allow intentional plain-text @handles and skip mention checks",
+    )
     parser.add_argument("--message", required=True, help="Text to send")
     args = parser.parse_args()
 
@@ -233,7 +323,11 @@ def main() -> int:
     if source == "slack":
         ok = send_slack(channel, message, thread_ts=args.thread_ts)
     elif source == "discord":
-        ok = send_discord(channel, message)
+        ok = send_discord(
+            channel,
+            message,
+            validate_mentions=not args.no_validate_mentions,
+        )
     elif source == "telegram":
         ok = send_telegram(channel, message)
     else:

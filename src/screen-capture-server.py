@@ -85,6 +85,18 @@ _recording_lock = threading.Lock()
 MAX_RECORDING_SECONDS = 600  # safety cap for a recording nobody stopped
 
 
+def _post_recording_state(on: bool):
+    """Darwin-notify recording state so Sutando.app can flip the Drop Video
+    Clip 🔴 without polling (Susan 2026-07-22: the server KNOWS when recording
+    starts/stops — push, don't poll). Covers ⌃R toggles, watcher-started
+    sessions, and the watchdog auto-stop uniformly. Fire-and-forget."""
+    try:
+        subprocess.Popen(["notifyutil", "-p",
+                          "com.sutando.recording." + ("on" if on else "off")])
+    except Exception:
+        pass
+
+
 def _signal_seeing_blocking():
     try:
         req = urllib.request.Request(WEB_CLIENT_STATE_URL, method="GET")
@@ -135,16 +147,26 @@ def _notify_capture():
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
+    def _send_json(self, status: int, payload: dict) -> None:
+        """Emit the shared JSON response contract for capture routes."""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode())
+
+    def _require_capture_token(self) -> bool:
+        """Fail closed unless the request carries the startup capture token."""
+        supplied = self.headers.get("X-Sutando-Capture-Token", "")
+        if CAPTURE_TOKEN and supplied and secrets.compare_digest(supplied, CAPTURE_TOKEN):
+            return True
+        self._send_json(403, {"status": "error", "error": "forbidden"})
+        return False
+
     def do_GET(self):
         if self.path.startswith("/capture") and not self.path.startswith("/capture-video"):
             # Reject if no valid token — a browser page on loopback cannot set a
             # custom header on a no-cors fetch, so this is a same-origin CSRF guard.
-            provided = self.headers.get("X-Sutando-Capture-Token", "")
-            if not CAPTURE_TOKEN or not provided or not secrets.compare_digest(provided, CAPTURE_TOKEN):
-                self.send_response(403)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"status":"error","error":"forbidden"}')
+            if not self._require_capture_token():
                 return
             # Parse display number from query: /capture?display=2 or /capture?all=true
             from urllib.parse import urlparse, parse_qs
@@ -198,19 +220,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         cmd.append(f"-D{display}")
                     cmd.append(path)
                     subprocess.run(cmd, timeout=5, check=True)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
                 resp = {"status": "ok", "path": paths[0] if paths else path}
                 if len(paths) > 1:
                     resp["all_paths"] = paths
                     resp["displays"] = len(paths)
-                self.wfile.write(json.dumps(resp).encode())
+                self._send_json(200, resp)
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
+                self._send_json(500, {"status": "error", "error": str(e)})
         elif self.path.startswith("/capture-video"):
             # Record a short screen video and return the .mov path. Backs the
             # ⌃R "Drop Video Clip" hotkey — a few-second video repro is far easier
@@ -220,12 +236,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             #
             # Token gate FIRST — before any side effect (no flash, no recording)
             # so an unauthorized request can't even signal. See CAPTURE_TOKEN.
-            supplied = self.headers.get("X-Sutando-Capture-Token", "")
-            if not CAPTURE_TOKEN or not secrets.compare_digest(supplied, CAPTURE_TOKEN):
-                self.send_response(403)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "error": "forbidden"}).encode())
+            if not self._require_capture_token():
                 return
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
@@ -239,10 +250,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     rec = _active_recording
                     _active_recording = None
                 if not rec:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status": "idle"}).encode())
+                    self._send_json(200, {"status": "idle"})
                     return
                 try:
                     if rec.get("watchdog"):
@@ -250,20 +258,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     rec["proc"].send_signal(signal.SIGINT)  # -v finalizes on SIGINT
                     rec["proc"].wait(timeout=30)
                     path = rec["path"]
+                    # Only publish OFF if no NEW recording started during this
+                    # finalization (SIGINT+wait released the lock). Otherwise the
+                    # stale stop would stomp the new recording's ON state, leaving
+                    # the app's isRecordingVideo=false while it records. (CR: qingyun-wu)
+                    with _recording_lock:
+                        if _active_recording is None:
+                            _post_recording_state(False)
                     if not (os.path.exists(path) and os.path.getsize(path) > 0):
                         raise RuntimeError("recording produced no file")
                     if query.get("silent", ["false"])[0] != "true":
                         _signal_seeing()
                         _notify_capture()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status": "ok", "path": path}).encode())
+                    self._send_json(200, {"status": "ok", "path": path})
                 except Exception as e:
-                    self.send_response(500)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
+                    self._send_json(500, {"status": "error", "error": str(e)})
                 return
 
             # ⌃R toggle — START: spawn an open-ended `screencapture -v` (no -V) and
@@ -277,10 +286,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 path = f"{DIR}/clip-{ts}{suffix}.mov"
                 with _recording_lock:
                     if _active_recording:
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"status": "already_recording", "path": _active_recording["path"]}).encode())
+                        self._send_json(200, {"status": "already_recording", "path": _active_recording["path"]})
                         return
                     if query.get("silent", ["false"])[0] != "true":
                         _signal_seeing()
@@ -301,39 +307,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     try:
                         proc = subprocess.Popen(cmd)
                     except Exception as e:
-                        self.send_response(500)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"status": "error", "error": str(e)}).encode())
+                        self._send_json(500, {"status": "error", "error": str(e)})
                         return
 
                     def _auto_stop(p=proc):
                         global _active_recording
+                        # Publish OFF only if this watchdog still OWNS the active
+                        # recording, atomically under the lock — a stale watchdog
+                        # (its proc already replaced by a newer recording) must not
+                        # stomp the newer recording's ON state. (CR: qingyun-wu)
                         with _recording_lock:
                             if _active_recording and _active_recording.get("proc") is p:
                                 _active_recording = None
+                                _post_recording_state(False)
                         try:
                             p.send_signal(signal.SIGINT)
                             p.wait(timeout=30)
                         except Exception:
                             pass
 
-                    wd = threading.Timer(MAX_RECORDING_SECONDS, _auto_stop)
+                    # ?max=<seconds> raises the safety cap for known-long sessions
+                    # (meeting-link auto-record needs meeting-length clips; the
+                    # 600s default ate a 41-min meeting on 2026-07-22). Bounded
+                    # at 4h so a typo can't disable the watchdog entirely.
+                    max_raw = query.get("max", [None])[0]
+                    cap = MAX_RECORDING_SECONDS
+                    if max_raw and max_raw.isdigit() and int(max_raw) > 0:
+                        cap = min(int(max_raw), 4 * 3600)
+                    wd = threading.Timer(cap, _auto_stop)
                     wd.daemon = True
-                    wd.start()
+                    # Register the active recording BEFORE arming the watchdog: a
+                    # tiny cap could fire _auto_stop almost immediately, and it must
+                    # see _active_recording already set (both run under
+                    # _recording_lock, so the callback blocks until this returns).
                     _active_recording = {"proc": proc, "path": path, "watchdog": wd}
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "recording", "path": path}).encode())
+                    wd.start()
+                    _post_recording_state(True)  # under the lock: a concurrent stop can't interleave a stale ON (CR: qingyun-wu)
+                self._send_json(200, {"status": "recording", "path": path})
                 return
 
             # Toggle-only: /capture-video needs action=start|stop. (The old
             # fixed-duration -V path was removed — ⌃R is a start/stop toggle now.)
-            self.send_response(400)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "error", "error": "action must be start or stop"}).encode())
+            self._send_json(400, {"status": "error", "error": "action must be start or stop"})
         elif self.path == "/ping":
             self.send_response(200)
             self.end_headers()

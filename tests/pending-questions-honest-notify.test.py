@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""check-pending-questions must not claim delivery it did not achieve.
+
+2026-07-21: the cron printed "Notified: 16 pending questions" on a host where no
+bridge was draining results/proactive-*.txt. The DM never reached the owner; only
+a local macOS notification did. A notifier that reports success regardless of
+outcome is how a blocked decision sits unseen for a day.
+"""
+import importlib.util
+import time
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _load(results_dir):
+    spec = importlib.util.spec_from_file_location("cpq", REPO / "src" / "check-pending-questions.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.RESULTS_DIR = Path(results_dir)
+    return m
+
+
+class TestUndrainedDetection(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.d = Path(tempfile.mkdtemp(prefix="cpq-"))
+        self.m = _load(self.d)
+
+    def _write(self, name, age_s):
+        p = self.d / name
+        p.write_text("x")
+        t = time.time() - age_s
+        import os
+        os.utime(p, (t, t))
+        return p
+
+    def test_a_fresh_file_is_not_undrained(self):
+        self._write("proactive-pending-q-abc.txt", 5)
+        self.assertEqual(self.m.undrained_proactive_files(), [])
+
+    def test_b_old_file_is_undrained(self):
+        self._write("proactive-pending-q-abc.txt", self.m.UNDRAINED_AGE_S + 60)
+        self.assertEqual(self.m.undrained_proactive_files(), ["proactive-pending-q-abc.txt"])
+
+    def test_c_only_proactive_files_count(self):
+        self._write("task-123.txt", self.m.UNDRAINED_AGE_S + 60)
+        self.assertEqual(self.m.undrained_proactive_files(), [],
+                         "a stale task result is a different thing entirely")
+
+    def test_d_glob_raising_oserror_is_swallowed(self):
+        """The outer handler. A missing dir does NOT raise from glob() — it
+        yields nothing — so the earlier version of this test passed without ever
+        reaching the except it was named for."""
+        class Boom:
+            def glob(self, _pat):
+                raise OSError("boom")
+        self.m.RESULTS_DIR = Boom()
+        self.assertEqual(self.m.undrained_proactive_files(), [])
+
+    def test_d2_stat_raising_oserror_skips_that_file(self):
+        """The inner handler: one unstattable entry must not lose the others."""
+        good = self._write("proactive-good.txt", self.m.UNDRAINED_AGE_S + 60)
+
+        class Bad:
+            name = "proactive-bad.txt"
+            def stat(self):
+                raise OSError("nope")
+
+        class Dir:
+            def glob(self, _pat):
+                return [Bad(), good]
+        self.m.RESULTS_DIR = Dir()
+        self.assertEqual(self.m.undrained_proactive_files(), ["proactive-good.txt"])
+
+    def test_e_notify_macos_reports_failure(self):
+        import subprocess
+        real = subprocess.run
+        try:
+            subprocess.run = lambda *a, **k: type("R", (), {"returncode": 1})()
+            self.assertFalse(self.m.notify_macos(1, ["t"]), "a failed osascript must not read as delivered")
+            subprocess.run = lambda *a, **k: type("R", (), {"returncode": 0})()
+            self.assertTrue(self.m.notify_macos(1, ["t"]))
+        finally:
+            subprocess.run = real
+
+
+
+class TestNotifySummary(unittest.TestCase):
+    """The summary line is the claim. It must not assert delivery that failed."""
+
+    def setUp(self):
+        import tempfile
+        self.m = _load(tempfile.mkdtemp(prefix="cpq-sum-"))
+
+    def test_a_all_paths_healthy(self):
+        s, w = self.m.notify_summary(3, True, True, [])
+        self.assertIn("macos=ok", s)
+        self.assertIn("voice=ok", s)
+        self.assertIn("proactive-file=written", s)
+        self.assertIsNone(w, "no warning when nothing is undrained")
+
+    def test_b_macos_failure_is_not_reported_as_ok(self):
+        s, _ = self.m.notify_summary(3, False, True, [])
+        self.assertIn("macos=FAILED", s)
+        self.assertNotIn("macos=ok", s)
+
+    def test_c_voice_offline_says_skipped_not_ok(self):
+        s, _ = self.m.notify_summary(3, True, False, [])
+        self.assertIn("voice=skipped(not connected)", s)
+
+    def test_d_undrained_produces_an_explicit_warning(self):
+        s, w = self.m.notify_summary(16, True, False, ["proactive-pending-q-old.txt"])
+        self.assertIn("UNDRAINED", s)
+        self.assertIsNotNone(w)
+        self.assertIn("NOT reaching the owner", w)
+        self.assertIn("proactive-pending-q-old.txt", w)
+
+    def test_e_count_is_carried(self):
+        s, _ = self.m.notify_summary(16, True, True, [])
+        self.assertIn("16 pending questions", s)
+
+
+class TestDeliver(unittest.TestCase):
+    """deliver() must report per-path truth, not a blanket success."""
+
+    def setUp(self):
+        import tempfile
+        self.m = _load(tempfile.mkdtemp(prefix="cpq-del-"))
+        self.m.notify_discord_dm = lambda q: None
+        self.m.notify_voice = lambda q: None
+
+    def test_a_voice_connected_reports_ok(self):
+        self.m.notify_macos = lambda c, t: True
+        self.m.voice_client_connected = lambda: True
+        s = self.m.deliver([{"title": "q"}], 1, ["q"])
+        self.assertIn("voice=ok", s)
+
+    def test_b_voice_offline_reports_skipped(self):
+        self.m.notify_macos = lambda c, t: True
+        self.m.voice_client_connected = lambda: False
+        s = self.m.deliver([{"title": "q"}], 1, ["q"])
+        self.assertIn("voice=skipped", s)
+
+    def test_c_macos_failure_surfaces(self):
+        self.m.notify_macos = lambda c, t: False
+        self.m.voice_client_connected = lambda: False
+        s = self.m.deliver([{"title": "q"}], 1, ["q"])
+        self.assertIn("macos=FAILED", s)
+
+    def test_d_undrained_backlog_produces_warning(self):
+        self.m.notify_macos = lambda c, t: True
+        self.m.voice_client_connected = lambda: False
+        self.m.undrained_proactive_files = lambda: ["proactive-old.txt"]
+        import io
+        import contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            s = self.m.deliver([{"title": "q"}], 1, ["q"])
+        self.assertIn("UNDRAINED", s)
+        self.assertIn("NOT reaching the owner", err.getvalue(),
+                      "the warning must reach stderr, not just be returned")
+
+
+class TestReviewFindings(unittest.TestCase):
+    """Both cases john-the-dev flagged: the suite passed without exercising either."""
+
+    def setUp(self):
+        import tempfile
+        self.d = __import__("pathlib").Path(tempfile.mkdtemp(prefix="cpq-rev-"))
+        self.m = _load(self.d)
+
+    def _age(self, name, secs):
+        import os
+        p = self.d / name
+        p.write_text("x")
+        t = __import__("time").time() - secs
+        os.utime(p, (t, t))
+        return p
+
+    # --- finding 1: cooldown must not be stamped when delivery raises ---
+    def test_a_cooldown_not_stamped_when_delivery_raises(self):
+        import tempfile
+        import pathlib
+        stamp = pathlib.Path(tempfile.mkdtemp()) / "last-notify"
+        self.m.LAST_NOTIFY_FILE = stamp
+        self.m.deliver = lambda *a, **k: (_ for _ in ()).throw(OSError("delivery blew up"))
+        self.m.get_waiting_questions = lambda: [{"title": "q"}]
+        self.m.should_notify = lambda *a, **k: True
+        with self.assertRaises(OSError):
+            self.m.main()
+        self.assertFalse(stamp.exists(),
+                         "a failed delivery must NOT put the next hour on cooldown")
+
+    def test_a2_cooldown_IS_stamped_when_delivery_succeeds(self):
+        """The positive half. Testing only the failure case let the stamp be
+        deleted outright without any test failing — which would notify on every
+        run forever. A guard needs both directions or it pins nothing."""
+        import tempfile
+        import pathlib
+        stamp = pathlib.Path(tempfile.mkdtemp()) / "last-notify"
+        self.m.LAST_NOTIFY_FILE = stamp
+        self.m.deliver = lambda *a, **k: "Notified: 1 pending questions [ok]"
+        self.m.get_waiting_questions = lambda: [{"title": "q"}]
+        self.m.should_notify = lambda *a, **k: True
+        self.m.main()
+        self.assertTrue(stamp.exists(), "a successful delivery MUST set the cooldown")
+        # The marker carries "<epoch> <content-key>" as of 2026-08-01: the cooldown
+        # gates on the SET rather than only the clock, so the key must persist next
+        # to the timestamp. Assert BOTH — if a later change drops the key the file
+        # still parses as an int, and hourly re-notification of an unchanged queue
+        # would come back silently.
+        ts, _, key = stamp.read_text().partition(" ")
+        self.assertGreater(int(ts), 0)
+        self.assertTrue(key.strip(),
+                        "the content key must be stamped alongside the timestamp")
+
+    # --- finding 2: only THIS notifier's files are evidence ---
+    def test_b_unrelated_stale_proactive_file_is_ignored(self):
+        self._age("proactive-schedule-alert-cron.txt", self.m.UNDRAINED_AGE_S + 60)
+        self._age("proactive-morning-brief.txt", self.m.UNDRAINED_AGE_S + 60)
+        self.assertEqual(self.m.undrained_proactive_files(), [],
+                         "another producer's stale file must not diagnose OUR path as dead")
+
+    def test_c_our_own_stale_file_is_still_detected(self):
+        self._age(f"{self.m.PROACTIVE_PREFIX}abc.txt", self.m.UNDRAINED_AGE_S + 60)
+        self.assertEqual(self.m.undrained_proactive_files(),
+                         [f"{self.m.PROACTIVE_PREFIX}abc.txt"])
+
+    def test_d_written_name_matches_the_scanned_prefix(self):
+        """Writer and detector must agree, or the check silently never fires."""
+        src = (REPO / "src" / "check-pending-questions.py").read_text()
+        self.assertIn('RESULTS_DIR / f"{PROACTIVE_PREFIX}', src)
+        self.assertIn('RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}', src)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,6 +66,52 @@ def gate_allows(agent_mxid, room_id, gate):
 # --------------------------------------------------------------------------- #
 # Gateway coordinates + HTTP
 # --------------------------------------------------------------------------- #
+def _token_from_vault(vault_get=None):
+    """Vault fallback for the gateway bearer — parity with the channel bridges
+    (sonichi#2638) and the sparrow bridge.
+
+    gateway() resolves the token from GATEWAY_TOKEN / RELAY_TOKEN /
+    REMOTE_TASK_TOKEN in the process env; when the launcher didn't export any of
+    them (the desktop-spawned core is the case that bites — its supervisor uses a
+    fixed env whitelist), `vault set REMOTE_TASK_TOKEN <url|secret>` should still
+    arm room ops. Nothing here read the vault, so it was a silent no-op — even
+    though this module's own docstring already promised "token from env/vault".
+    This closes that gap and makes the code match the doc.
+
+    Reuses the shared core policy `channel_token.token_from_vault` (never copies
+    it); total-failure-safe; the value is never logged. Tries the names gateway()
+    honors, then the legacy `AG2_REMOTE_TOKEN` alias. Prefer the **combined**
+    onboarding value (`https://<gateway>|<secret>`) so the URL travels with the
+    token: a vault-set BARE secret with no REMOTE_TASK_URL env resolves a bearer
+    but no base, which degrades to "no gateway configured" exactly as an env-only
+    bare secret does today (caller-consistent — the vault tier adds no new URL
+    obligation).
+    """
+    try:
+        cur = os.path.dirname(os.path.abspath(__file__))
+        src = ""
+        while True:
+            if os.path.isfile(os.path.join(cur, "src", "channel_token.py")):
+                src = os.path.join(cur, "src")
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        if not src:
+            return ""
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from channel_token import token_from_vault
+    except Exception:
+        return ""
+    for var in ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+        tok = token_from_vault(var, vault_get=vault_get)
+        if tok:
+            return tok
+    return ""
+
+
 def gateway():
     """Return (base_url, headers). base is '' when no gateway is configured.
 
@@ -80,6 +127,10 @@ def gateway():
     # transition aliases so nothing breaks mid-migration.
     explicit_token = os.environ.get("GATEWAY_TOKEN") or os.environ.get("RELAY_TOKEN")
     raw = explicit_token or os.environ.get("REMOTE_TASK_TOKEN") or ""
+    if not raw:
+        # Env is empty — try the Keychain vault last (parity with sonichi#2638).
+        # Vault last means a stored value can never override a fresher env token.
+        raw = _token_from_vault()
     url_from_token = ""
     # The combined onboarding string is "https://<gateway>|<secret>" — the URL
     # travels inside the token. Detect it by the leading URL scheme (NOT a bare

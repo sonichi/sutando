@@ -4,6 +4,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { resolveCredential } from './credential-resolver.js';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
@@ -304,7 +305,7 @@ function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | nul
 async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
 	// Prefer free-tier voice key (gemini-3.1-flash-lite-preview is free-tier eligible on REST
 	// generateContent — verified 2026-05-14). Falls back to paid GEMINI_API_KEY if voice key absent.
-	const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
 		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
@@ -927,11 +928,10 @@ export function startRecordingNarration(session: any): void {
 			return;
 		}
 		// Inject the pre-captured description
-		let desc = nextDescRef.value!;
+		const desc = nextDescRef.value!;
 		nextDescRef.value = null;
 		lastDesc = desc;
 		previousDescs.push(desc);
-		const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 		const lastSaid = lastSpokenRef.value || '(first description)';
 		narrationSpeakingRef.value = true;
 		lastPushTime = Date.now();

@@ -90,9 +90,11 @@ CLASS_RULES=(
 {body}
 )
 """
-        p = Path(tempfile.mktemp(suffix=".sh"))
-        p.write_text(content)
-        return p
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sh", delete=False
+        ) as tmp:
+            tmp.write(content)
+            return Path(tmp.name)
 
     def test_parses_simple_rules(self):
         f = self._make_migrate_sh([

@@ -157,7 +157,8 @@ def test_negative_cases() -> None:
         )
     # Guarded file: has __future__, so check_file returns None
     src = "from __future__ import annotations\ndef f(x: str | None): pass"
-    import tempfile, os
+    import tempfile
+    import os
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
         f.write(src)
         fname = f.name

@@ -144,9 +144,9 @@ cron_line() {
     [ "$mins" -ge 1 ] || mins=1
     if [ "$mins" -gt 59 ]; then
         echo "install-workspace-sync: interval > 59min not expressible as */N on cron; capping at hourly." >&2
-        echo "0 * * * * cd $REPO && bash $SYNC --default >> $LOG 2>&1"
+        echo "0 * * * * cd \"$REPO\" && bash \"$SYNC\" --default >> \"$LOG\" 2>&1"
     else
-        echo "*/$mins * * * * cd $REPO && bash $SYNC --default >> $LOG 2>&1"
+        echo "*/$mins * * * * cd \"$REPO\" && bash \"$SYNC\" --default >> \"$LOG\" 2>&1"
     fi
 }
 

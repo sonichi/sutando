@@ -8,6 +8,8 @@ for processing by the cron loop.
 Endpoints:
   POST /task              — submit a task (JSON: {from, task, priority?, callback_url?})
   GET  /result/<id>       — poll for task result
+  GET  /tasks/history     — authenticated archive-backed task history
+  POST /tasks/workstreams/infer — authenticated manual workstream-classifier trigger
   GET  /status            — current health + capabilities
   GET  /ping              — alive check
   POST /twilio/voice      — inbound call webhook (Twilio)
@@ -37,8 +39,10 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -60,7 +64,9 @@ def validate_twilio_signature(handler, body: str) -> bool:
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     if not auth_token:
         return False
-    import hmac, hashlib, base64
+    import hmac
+    import hashlib
+    import base64
     from urllib.parse import parse_qs
 
     signature = handler.headers.get("X-Twilio-Signature", "")
@@ -97,18 +103,41 @@ def validate_twilio_signature(handler, body: str) -> bool:
 #               stay aligned with these writes.
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 import local_task_protocol  # noqa: E402
+import task_workstreams  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
+TASK_WORKSTREAM_GROUPING_SKILL = REPO_DIR / "skills" / "task-workstream-grouping" / "SKILL.md"
 PORT = 7843
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
+from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+
+
+def _emit_task_processed(content: str) -> None:
+    """Anonymous, opt-out product telemetry for tasks this API creates —
+    relay-voice (POST /delegation/tasks), local web/API chat (the ``api``
+    surface), and the Twilio voice/SMS/voicemail surfaces. Mirrors the discord/slack/
+    telegram bridges, which emit at their own accept points; those surfaces are
+    counted, these weren't. Source is read from the task body's own ``source:``
+    header. Fire-and-forget: never blocks or breaks task creation; no-op when
+    telemetry is opted out / unconfigured. Never carries task content or ids.
+    """
+    try:  # pragma: no cover — fire-and-forget glue; logic tested in tests/telemetry.test.py
+        from telemetry import task_processed  # sibling module (src/ on sys.path)
+
+        m = re.search(r"^source:\s*(\S+)", content, re.MULTILINE)
+        task_processed(m.group(1) if m else "unknown")
+    except Exception:  # pragma: no cover — telemetry must never break the API
+        pass
+
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
@@ -192,7 +221,6 @@ def _remember_done_result_file(result_file: Path) -> None:
 # **Status:** markers) while the writer still required a **Status:**/**Options:**
 # line, so every free-form question was listed but unanswerable — POST /answer
 # 404'd on every id. Both paths stay on this function.
-PQ_ARCHIVE_RE = re.compile(r'^#\s+Resolved\b', re.MULTILINE)
 PQ_SECTION_RE = re.compile(r'^## ', re.MULTILINE)
 PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', re.IGNORECASE)
 PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')
@@ -223,8 +251,7 @@ def parse_pending_questions(content: str) -> list[dict]:
     Sections below the `# Resolved` divider are the audit trail, not open
     questions (same cut as check-pending-questions.py:95).
     """
-    archive = PQ_ARCHIVE_RE.search(content)
-    active = content[:archive.start()] if archive else content
+    active = active_region(content)
     starts = [m.start() for m in PQ_SECTION_RE.finditer(active)]
     questions: list[dict] = []
     for n, start in enumerate(starts):
@@ -364,7 +391,57 @@ def delegation_submit_task(data: dict):
     if embedded != tid:
         return 400, {"error": f"body id header ({embedded!r}) does not match request id"}
     TASK_DIR.mkdir(parents=True, exist_ok=True)
-    (TASK_DIR / f"{tid}.txt").write_text(content)
+    # Keep the containment check in this function so CodeQL can follow the
+    # tainted HTTP value through normalization to the filesystem sink.  The
+    # task-id regex alone prevents lexical traversal, but not an existing
+    # `<task-id>.txt` symlink that points outside TASK_DIR.
+    task_dir_real = os.path.realpath(TASK_DIR)
+    task_file_str = os.path.realpath(
+        os.path.join(task_dir_real, f"{tid}.txt")
+    )
+    if not task_file_str.startswith(task_dir_real + os.sep):
+        return 400, {"error": "task path escapes task directory"}
+    # Do not reopen the validated pathname: a local process could swap in a
+    # symlink between the realpath check above and write_text().  Write a
+    # private temporary entry through an already-open directory descriptor,
+    # then atomically replace the final directory entry.  os.replace replaces
+    # a raced symlink itself instead of following it to an outside target.
+    task_name = f"{tid}.txt"
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    task_dir_fd = os.open(task_dir_real, dir_flags)
+    temp_name = f".{task_name}.{secrets.token_hex(8)}.tmp"
+    try:
+        try:
+            existing = os.stat(task_name, dir_fd=task_dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            return 400, {"error": "task path escapes task directory"}
+
+        open_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                      | getattr(os, "O_NOFOLLOW", 0)
+                      | getattr(os, "O_CLOEXEC", 0))
+        temp_fd = os.open(temp_name, open_flags, 0o600, dir_fd=task_dir_fd)
+        try:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+        except Exception:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+            raise
+        os.replace(temp_name, task_name,
+                   src_dir_fd=task_dir_fd, dst_dir_fd=task_dir_fd)
+        temp_name = ""
+    finally:
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=task_dir_fd)
+            except FileNotFoundError:
+                pass
+        os.close(task_dir_fd)
+    _emit_task_processed(content)
     return 200, {"ok": True, "task_id": tid}
 
 
@@ -372,13 +449,22 @@ def delegation_archive_result(data: dict):
     name = str(data.get("name", ""))
     tid = str(data.get("task_id", ""))
     stem = name[:-4] if name.endswith(".txt") else name
-    src = _safe_path(RESULT_DIR, stem)
     # Identity coherence (Codex P1 on #1956): a relay client may only archive
     # ITS OWN result — the source name must be exactly <task_id>.txt. Without
     # this, any safe name could be filed under any valid id, hijacking other
     # consumers' results into a foreign archive slot.
-    if src is None or not local_task_protocol.valid_task_id(tid) or stem != tid:
+    if not local_task_protocol.valid_task_id(tid) or stem != tid:
         return 400, {"error": "invalid name/task id, or name does not match task id"}
+    # Inline the CodeQL-modeled normalization + prefix guard at both the
+    # source and destination sinks.  `_safe_path` enforces the same policy,
+    # but CodeQL does not propagate that sanitizer through the helper return.
+    result_dir_real = os.path.realpath(RESULT_DIR)
+    src_str = os.path.realpath(
+        os.path.join(result_dir_real, f"{stem}.txt")
+    )
+    if not src_str.startswith(result_dir_real + os.sep):
+        return 400, {"error": "result path escapes result directory"}
+    src = Path(src_str)
     if not os.path.exists(src):
         return 200, {"ok": True, "note": "already gone"}
     # Same destination scheme as task-bridge's archiveFile():
@@ -388,9 +474,20 @@ def delegation_archive_result(data: dict):
     dest_dir = local_task_protocol.archive_month_dir(
         RESULT_DIR, datetime.now().isoformat())
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{tid}.txt"
+    dest_dir_real = os.path.realpath(dest_dir)
+    dest_str = os.path.realpath(
+        os.path.join(dest_dir_real, f"{tid}.txt")
+    )
+    if not dest_str.startswith(dest_dir_real + os.sep):
+        return 400, {"error": "archive path escapes archive directory"}
+    dest = Path(dest_str)
     if dest.exists():
-        dest = dest_dir / f"{tid}-{int(datetime.now().timestamp())}.txt"
+        dest_str = os.path.realpath(os.path.join(
+            dest_dir_real, f"{tid}-{int(datetime.now().timestamp())}.txt"
+        ))
+        if not dest_str.startswith(dest_dir_real + os.sep):
+            return 400, {"error": "archive path escapes archive directory"}
+        dest = Path(dest_str)
     os.replace(src, dest)
     return 200, {"ok": True}
 
@@ -522,6 +619,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def send_private_json(self, status: int, data: dict):
+        """JSON for owner-history routes: no cross-origin read permission."""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def check_private_history_auth(self) -> bool:
+        """Fail closed for browsers and non-loopback clients without a token."""
+        import hmac as _hmac
+
+        if API_TOKEN:
+            token = self.headers.get("Authorization", "").replace("Bearer ", "")
+            if _hmac.compare_digest(token, API_TOKEN):
+                return True
+            self.send_private_json(401, {"error": "unauthorized"})
+            return False
+        try:
+            loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            loopback = False
+        # The same-origin web-client proxy and local CLI callers send no
+        # Origin. A browser page always does for cross-origin fetches, so this
+        # also blocks hostile sites from reading localhost history.
+        if loopback and not self.headers.get("Origin"):
+            return True
+        self.send_private_json(403, {"error": "task history requires a local proxy or API token"})
+        return False
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -549,6 +676,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
             self.send_json(200, get_status())
+        elif path == "/tasks/history":
+            if not self.check_private_history_auth():
+                return
+            # Reconstruct durable history from immutable live + archived task
+            # records, then join inferred workstream metadata from its sidecar.
+            # This GET is read-only; inference has a separate authenticated
+            # POST trigger used by the same-origin dashboard proxy.
+            payload = task_workstreams.task_history_payload(WORKSPACE_DIR, limit=500)
+            try:
+                inference = task_workstreams.classifier_status(WORKSPACE_DIR)
+            except Exception:
+                # Workstream inference is optional maintenance. History stays
+                # useful when classifier state is temporarily unavailable.
+                inference = task_workstreams.ClassifierQueueResult(
+                    pending=True, enqueued=False, reason="classifier-unavailable"
+                )
+            payload["inference"] = {
+                "pending": inference.pending,
+                "enqueued": inference.enqueued,
+                "reason": inference.reason,
+                "snapshot_hash": inference.snapshot_hash,
+            }
+            self.send_private_json(200, payload)
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
             watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
@@ -565,7 +715,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 claude_ok = False
             # Scan disk for active tasks, update history (preserve existing text)
-            for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
+            live_task_files = [
+                f for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if not f.stem.startswith((
+                    task_workstreams.CLASSIFIER_TASK_PREFIX,
+                    task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
+                ))
+            ][:10]
+            for f in live_task_files:
                 task_id = f.stem
                 content = f.read_text()
                 # Capture the first `source:` and first `task:` regardless of
@@ -622,6 +779,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Return most recent 10 from history
             sorted_tasks = sorted(task_history.items(), key=lambda x: x[1].get("time", 0), reverse=True)[:10]
             tasks = [{"id": tid, **tdata} for tid, tdata in sorted_tasks]
+            tasks = task_workstreams.enrich_task_rows(WORKSPACE_DIR, tasks)
             # Parse pending questions. `start`/`end` are the writer's splice
             # offsets — internal, not part of the wire format.
             questions = []
@@ -676,8 +834,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Recent activity: git commits + processed tasks
             activity = []
             try:
+                # git_argv raises GitUnavailable (an OSError) on a host with no
+                # runnable git — absorbed by the `except Exception` below, which
+                # already degrades this endpoint to "no commit activity". Never
+                # hardcode /usr/bin/git: on a Mac without developer tools it is
+                # the CLT shim and raises a modal install dialog.
                 git_log = subprocess.run(
-                    ["/usr/bin/git", "-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"],
+                    git_argv("-C", str(REPO_DIR), "log", "--oneline", "--since=24 hours ago", "-10"),
                     capture_output=True, text=True, timeout=5
                 ).stdout.strip()
                 for line in git_log.split("\n"):
@@ -818,6 +981,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: Incoming phone call from {safe_caller}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        _emit_task_processed(task_content)
 
         # TwiML: greet caller, record message
         self.send_twiml(
@@ -826,7 +990,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             '<Say voice="alice">Hello, you\'ve reached Sutando. '
             "Please leave a message after the tone and I will get back to you.</Say>"
             '<Record maxLength="120" transcribe="true" '
-            f'transcribeCallback="/twilio/transcription"/>'
+            'transcribeCallback="/twilio/transcription"/>'
             '<Say voice="alice">Thank you. Goodbye.</Say>'
             "</Response>"
         )
@@ -852,6 +1016,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: SMS from {safe_sender}: {confine_user_content(body)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        _emit_task_processed(task_content)
 
         # Reply with acknowledgment
         self.send_twiml(
@@ -878,6 +1043,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"task: Voicemail from {safe_caller}: {confine_user_content(text)}\n"
             )
             (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+            _emit_task_processed(task_content)
         self.send_json(200, {"ok": True})
 
     def do_POST(self):
@@ -1038,6 +1204,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(400, {"error": str(e)})
             return
 
+        if path == "/tasks/workstreams/infer":
+            if not self.check_private_history_auth():
+                return
+            try:
+                queued = task_workstreams.maybe_enqueue_classifier_task(
+                    WORKSPACE_DIR, skill_file=TASK_WORKSTREAM_GROUPING_SKILL
+                )
+                self.send_private_json(200, {
+                    "pending": queued.pending,
+                    "enqueued": queued.enqueued,
+                    "reason": queued.reason,
+                    "snapshot_hash": queued.snapshot_hash,
+                })
+            except Exception:
+                self.send_private_json(503, {"error": "task workstream classifier unavailable"})
+            return
+
         if path != "/task":
             self.send_json(404, {"error": "not found"})
             return
@@ -1107,6 +1290,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: {confine_user_content(task)}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        _emit_task_processed(task_content)
+
+        # Dashboard replies name their parent task explicitly. Give those
+        # follow-ups the same workstream immediately; unrelated new tasks remain
+        # ungrouped until the idle classifier can inspect them.
+        parent_match = re.fullmatch(r"web-reply:(task-[a-zA-Z0-9_.-]+)", from_agent)
+        if parent_match:
+            task_workstreams.inherit_assignment(WORKSPACE_DIR, task_id, parent_match.group(1))
 
         # Register webhook callback if provided
         if callback_url:
@@ -1185,14 +1376,30 @@ if __name__ == "__main__":
     # lsof guard, so nothing restarted it (2026-07-04 incident; same fix as
     # dashboard, #1709).
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
+    workstream_maintenance_stop = threading.Event()
+    workstream_maintenance = threading.Thread(
+        target=task_workstreams.run_classifier_maintenance,
+        kwargs={
+            "workspace": WORKSPACE_DIR,
+            "skill_file": TASK_WORKSTREAM_GROUPING_SKILL,
+            "stop_event": workstream_maintenance_stop,
+        },
+        name="task-workstream-maintenance",
+        daemon=True,
+    )
+    workstream_maintenance.start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
-    print(f"  POST /task  — submit a task")
-    print(f"  GET  /status — health + capabilities")
-    print(f"  GET  /ping   — alive check")
+    print("  POST /task  — submit a task")
+    print("  GET  /status — health + capabilities")
+    print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
-        print(f"  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+        print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nDone.")
+    finally:
+        workstream_maintenance_stop.set()
+        workstream_maintenance.join(timeout=1)
+        server.server_close()

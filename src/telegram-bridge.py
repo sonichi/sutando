@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 import re
 import secrets
+import shutil
 import sys
 import time
 import urllib.request
@@ -42,6 +44,8 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -53,48 +57,27 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from util_paths import channel_access_path, claude_home_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
+from presenter_mode import presenter_mode_active  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
 
 # Allowlist for paths that may be sent via Telegram [file: /path] markers.
 # Mirrors _is_path_sendable() in discord-bridge.py.
-SEND_ALLOWED_ROOTS = (
-    str(REPO / "results"),
-    str(REPO / "notes"),
-    str(REPO / "docs"),
-)
-SEND_ALLOWED_PREFIXES = (
-    "/tmp/sutando-",
-    "/private/tmp/sutando-",
-    "/tmp/echo-",
-    "/private/tmp/echo-",
-)
-
-
-def _is_path_sendable(fpath: str) -> bool:
-    """True iff `fpath` is a real file AND resolves under an allowed root."""
-    if not os.path.isfile(fpath):
-        return False
-    try:
-        real = os.path.realpath(fpath)
-    except OSError:
-        return False
-    for root in SEND_ALLOWED_ROOTS:
-        root_real = os.path.realpath(root)
-        if real == root_real or real.startswith(root_real + os.sep):
-            return True
-    for prefix in SEND_ALLOWED_PREFIXES:
-        if real.startswith(prefix):
-            return True
-    return False
+# Outbound attachment allowlisting is canonical policy — src/send_allowlist.py
+# is the single source of truth. A hand-written copy here drifted from it: it
+# lacked the personal-notes, iclr-backups and launch-assets roots, so a file
+# Discord would happily send was silently dropped from a Telegram reply.
+# Telegram inherits the complete canonical policy with no extra roots.
+from send_allowlist import is_path_sendable as _is_path_sendable  # noqa: E402
 
 
 # --- Config loading (independent of _is_path_sendable above) ---
@@ -134,7 +117,15 @@ if channels_env.exists():  # pragma: no cover — telegram import path not drive
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not TOKEN:
-    print("TELEGRAM_BOT_TOKEN not set")
+    # Last resort: the Keychain vault. A peer host lost this token for eight
+    # weeks because the only copy lived in a running process's environment and
+    # `vault set` was not read by anything.
+    from channel_token import token_from_vault  # noqa: E402
+    TOKEN = token_from_vault("TELEGRAM_BOT_TOKEN")
+
+if not TOKEN:
+    print("TELEGRAM_BOT_TOKEN not set in channels/telegram/.env and not in the "
+          "vault (`vault set TELEGRAM_BOT_TOKEN`)")
     exit(1)
 
 TASKS_DIR = REPO / "tasks"
@@ -194,9 +185,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
         }
         if channel_id:
             payload["channel_id"] = str(channel_id)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Per-PID staging name: this file is written by four processes (this
+        # bridge + slack/discord/sparrow). A shared ".json.tmp" name lets two
+        # concurrent writers truncate and interleave the same temp file, so the
+        # rename can publish torn JSON. A per-PID temp is never shared, and
+        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}")
 
@@ -221,28 +217,6 @@ def archive_file(src: "Path", kind: str, task_id: str) -> None:
             src.unlink(missing_ok=True)
         except Exception:
             pass
-
-# Presenter mode: silence proactive DMs during ICLR/talk windows. Sentinel
-# is written by scripts/presenter-mode.sh with an ISO-8601 expiry. Matches
-# the check in src/check-pending-questions.py and src/discord-bridge.py.
-PRESENTER_SENTINEL = REPO / "state" / "presenter-mode.sentinel"
-
-
-def presenter_mode_active():
-    if not PRESENTER_SENTINEL.exists():
-        return False
-    try:
-        expire_iso = PRESENTER_SENTINEL.read_text().strip()
-        # Require an ISO-8601-ish prefix (starts with a digit). Without
-        # this guard, malformed sentinel content like "garbage" compares
-        # LESS than any real now_iso ("2" < "g" in ASCII) and the mode
-        # fails OPEN — appears active forever.
-        if not expire_iso or not expire_iso[0].isdigit():
-            return False
-        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        return now_iso < expire_iso
-    except Exception:
-        return False
 
 # Load access config
 ACCESS_FILE = channel_access_path("telegram")
@@ -329,8 +303,7 @@ def tofu_onboard(sender_id, username):
         "tofuOnboardedAt": int(time.time()),
         "tofuOnboardedUsername": username or None,
     }
-    ACCESS_FILE.write_text(json.dumps(payload, indent=2) + "\n")
-    os.chmod(ACCESS_FILE, 0o600)  # don't inherit umask 644 — file holds owner's Telegram user ID
+    write_private_text(ACCESS_FILE, json.dumps(payload, indent=2) + "\n")  # don't inherit umask 644 — file holds owner's Telegram user ID
     print(f"  TOFU: auto-onboarded @{username} (id={sender_id}) as owner — wrote {ACCESS_FILE}")
     return {sender_id}
 
@@ -358,20 +331,16 @@ def _transcribe_via_skill(local_path: str) -> str | None:
     Optional — if the skill is absent the caller falls back to [Voice note attached:].
     Errors are swallowed; transcription failure must never block task delivery.
     """
-    import subprocess
     skill_script = Path(os.path.realpath(__file__)).parent.parent / "skills" / "audio-transcribe" / "scripts" / "transcribe.py"
-    if not skill_script.exists():
-        return None
-    try:
-        result = subprocess.run(
-            [sys.executable, str(skill_script), local_path],
-            capture_output=True, text=True, timeout=25,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    except Exception as e:
-        print(f"  [stt] skill call failed for {os.path.basename(local_path)}: {e}", flush=True)
-    return None
+    return _run_optional_script_shared(
+        skill_script,
+        [local_path],
+        timeout=25,
+        on_error=lambda exc: print(
+            f"  [stt] skill call failed for {os.path.basename(local_path)}: {exc}",
+            flush=True,
+        ),
+    )
 
 
 def download_file(file_id, name_hint="file"):
@@ -385,7 +354,9 @@ def download_file(file_id, name_hint="file"):
     local_name = f"{int(time.time()*1000)}{ext}"
     local_path = INBOX_DIR / local_name
     try:
-        urllib.request.urlretrieve(url, str(local_path))
+        req = urllib.request.Request(url, headers={"User-Agent": "Sutando"})
+        with urllib.request.urlopen(req, timeout=30) as resp, open(local_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
         return str(local_path)
     except Exception as e:
         print(f"  Download failed: {e}")
@@ -487,37 +458,8 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     return {"text_chunks": text_chunks, "files_sent": files_sent, "ok": delivered_ok}
 
 def _recover_orphan_sending_files() -> int:
-    """Restart-safety: rename any orphan `results/proactive-*.sending`
-    files back to `*.txt` so they get re-claimed on the next poll.
-
-    Mirrors `_recover_orphan_sending_files` in discord-bridge.py.
-    See that docstring for the bug class this closes.
-    """
-    if not RESULTS_DIR.exists():
-        return 0
-    recovered = 0
-    for f in RESULTS_DIR.iterdir():
-        if not (f.name.startswith("proactive-") and f.suffix == ".sending"):
-            continue
-        target = f.with_suffix(".txt")
-        try:
-            if target.exists():
-                print(
-                    f"  [startup] skipping orphan recovery: {target.name} "
-                    f"already exists (collision with {f.name})",
-                    flush=True,
-                )
-                continue
-            f.rename(target)
-            recovered += 1
-            print(f"  [startup] recovered orphan {f.name} → {target.name}", flush=True)
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            print(f"  [startup] failed to recover {f.name}: {e}", flush=True)
-    if recovered:
-        print(f"  [startup] recovered {recovered} orphan .sending file(s)", flush=True)
-    return recovered
+    """Recover this adapter's stranded proactive delivery claims."""
+    return recover_orphan_sending_files(RESULTS_DIR)
 
 
 # --- Opt-in owner progress streaming (Telegram parity with Discord PR #97) ---
@@ -711,7 +653,7 @@ def poll_progress(pending_replies: dict) -> None:
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
-    print(f"Telegram bridge started. Polling for messages...", flush=True)
+    print("Telegram bridge started. Polling for messages...", flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loop starts. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
@@ -726,10 +668,10 @@ def main():  # pragma: no cover
     if not ACCESS_FILE.exists():
         _TOFU_ENROLLMENT_CODE = secrets.token_hex(3)  # 6-char hex, 16M combinations
         print("", flush=True)
-        print(f"  *** TOFU enrollment required ***", flush=True)
+        print("  *** TOFU enrollment required ***", flush=True)
         print(f"  Enrollment code: {_TOFU_ENROLLMENT_CODE}", flush=True)
-        print(f"  Send this code in your first DM to register as owner.", flush=True)
-        print(f"  Anyone who sends this code first becomes owner — keep it private.", flush=True)
+        print("  Send this code in your first DM to register as owner.", flush=True)
+        print("  Anyone who sends this code first becomes owner — keep it private.", flush=True)
         print("", flush=True)
 
     offset = None
@@ -868,7 +810,10 @@ def main():  # pragma: no cover
 
                 forward_note = extract_forward_note(msg)
 
-                print(f"  @{username}{forward_note}: {redact_vault_commands(text)}{attachment_note}")
+                safe_detail_log = filter_chat_secrets(
+                    f"{redact_vault_commands(text)}{attachment_note}"
+                ).text
+                print(f"  @{username}{forward_note}: {safe_detail_log}")
 
                 # Reply/parent context. Telegram embeds the full replied-to
                 # message when this is a reply — capture it (+ message ids) so a
@@ -912,6 +857,19 @@ def main():  # pragma: no cover
                         print(f"  [vault] stored keys: {vault_result.stored}", flush=True)
                     if vault_result.failed:
                         print(f"  [vault] store failed (still redacted): {vault_result.failed}", flush=True)
+
+                filtered_text = filter_chat_secrets(text)
+                filtered_attachment = filter_chat_secrets(attachment_note)
+                filtered_reply = filter_chat_secrets(reply_note)
+                text = filtered_text.text
+                attachment_note = filtered_attachment.text
+                reply_note = filtered_reply.text
+                detected_secret_types = set(filtered_text.secret_types)
+                detected_secret_types.update(filtered_attachment.secret_types)
+                detected_secret_types.update(filtered_reply.secret_types)
+                secret_notice = secret_handling_instruction(
+                    "Telegram", detected_secret_types
+                )
 
                 # Inject skill instructions so the agent follows notify-before-work
                 # and transcription protocol even after conversation compaction.
@@ -983,6 +941,7 @@ def main():  # pragma: no cover
                     f"priority: {priority}\n"
                     f"task: {confine_user_content(f'[Telegram @{username}{forward_note}] {text}{attachment_note}{reply_note}')}\n"
                     f"{tg_skill_hints}"
+                    f"{secret_notice}"
                 )
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
@@ -1021,7 +980,7 @@ def main():  # pragma: no cover
         from proactive_routing import should_claim_proactive
         try:
             if (
-                not presenter_mode_active()
+                not presenter_mode_active(REPO)
                 and should_claim_proactive(OWNER_ACTIVITY_FILE, "telegram")
             ):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
