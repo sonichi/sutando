@@ -62,5 +62,26 @@ with tempfile.TemporaryDirectory() as td:
     m3 = load(Path(td) / "does-not-exist")
     check("absent workspace -> None", m3.check_workspace_root_tidy(), None)
 
+    # 5. FAIL-SAFE BRANCHES. Both `except OSError` paths are the ones that decide
+    #    what happens when the filesystem will not answer, and an untested
+    #    fail-safe is indistinguishable from one that never runs. Drive them by
+    #    making the directory listing raise.
+    class _Boom(type(ws)):
+        def iterdir(self):
+            raise OSError("simulated unreadable directory")
+
+    m4 = load(ws)
+    m4.WORKSPACE_DIR = _Boom(str(ws))
+    check("unreadable workspace root -> None, not a crash", m4.check_workspace_root_tidy(), None)
+
+    # The writer-scan's OSError path: root is readable, src/ is not. The probe
+    # must still report the drift, just without attributing a writer.
+    m5 = load(ws)
+    m5.REPO_DIR = Path(td) / "no-such-repo"
+    r5 = m5.check_workspace_root_tidy()
+    check("unreadable src/ still reports the drift", (r5 or {}).get("status"), "warn")
+    check("...and simply omits the writer attribution",
+          "written by" in (r5 or {}).get("detail", ""), False)
+
 print(("FAILED: " + ", ".join(fails)) if fails else "workspace-root-tidy: all checks passed")
 sys.exit(1 if fails else 0)
