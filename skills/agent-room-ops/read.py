@@ -14,6 +14,29 @@ from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_rea
 
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 100
+# How many times the raw-event window may widen before we stop. Small and FIXED so the
+# widening below is a bounded `for` rather than a resident loop: the room-ops skill bans
+# new ones outright (tests/events-plane-boundary.test.py freezes the allowlist to two
+# grandfathered entries and shrinks it monotonically). The widening was always finite —
+# it is capped by MAX_LIMIT — so the bounded ladder is the honest shape too, not merely
+# the one that satisfies the gate.
+#
+# NB the guard regexes every LINE, comments included, so spelling the banned construct
+# out here — even inside backticks — would itself trip it.
+_MAX_WIDENINGS = 6
+
+
+def _windows(start, cap):
+    """Raw-event window sizes to try, smallest first. Precomputed and bounded."""
+    out, raw = [], max(1, min(int(start), cap))
+    for _ in range(_MAX_WIDENINGS):
+        out.append(raw)
+        if raw >= cap:
+            break
+        raw = min(cap, max(raw * 3, raw + 10))
+    if out[-1] != cap:
+        out.append(cap)
+    return out
 
 
 def _result(ok, messages=None, reason=None, room_id=None, complete=None):
@@ -86,20 +109,22 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
         items = parsed.get("messages") if isinstance(parsed, dict) else parsed
         return _normalize(items)
 
-    raw = limit
-    messages, previous, exhausted = [], -1, False
+    messages, previous, exhausted = [], None, False
     try:
-        while True:
+        for raw in _windows(limit, MAX_LIMIT):
             messages = _fetch(raw)
             if len(messages) >= limit:
                 break
-            if len(messages) == previous:
-                exhausted = True          # a wider window returned nothing new
-                break
-            if raw >= MAX_LIMIT:
+            # A WIDER window that surfaced nothing new means the history is exhausted —
+            # but ONLY once we have actually seen a message. Two consecutive ZEROS mean
+            # the opposite: the window has not yet cleared the leading run of non-message
+            # events, which is the very condition this function exists to survive. Caught
+            # live: windows 1 and 11 both returned 0 on a room holding fourteen, and
+            # treating that as exhaustion reproduced the empty-room bug one layer down.
+            if previous is not None and len(messages) == previous and messages:
+                exhausted = True
                 break
             previous = len(messages)
-            raw = min(MAX_LIMIT, max(raw * 3, raw + 10))
     except HTTPError as e:
         return _result(False, reason=degrade_reason(e.code), room_id=room_id)
     except (URLError, TimeoutError) as e:

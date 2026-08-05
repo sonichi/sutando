@@ -114,6 +114,22 @@ class ReadLimitCountsMessages(unittest.TestCase):
         self.assertLessEqual(max(seen), rd.MAX_LIMIT, "never request beyond MAX_LIMIT")
         self.assertFalse(res["complete"], "stopped early -> NOT complete")
 
+    def test_leading_noise_wider_than_the_first_windows(self):
+        """Two consecutive ZERO windows must not be read as an empty room.
+
+        REGRESSION, caught live 2026-08-05: raw windows 1 and 11 both returned 0 messages
+        on a room holding fourteen, because a long run of reactions/receipts sat in front
+        of the newest message. Stopping there — "a wider window returned nothing new" —
+        reproduced the exact empty-room bug this module exists to prevent, one layer down.
+        Exhaustion may only be inferred once at least one message has been seen.
+        """
+        with mock.patch.object(rd, "http_request",
+                               side_effect=raw_window_gateway(total_messages=14,
+                                                              noise_per_message=12)):
+            res = rd.read_room(ROOM, HS, limit=1, gate=None)
+        self.assertEqual(len(res["messages"]), 1,
+                         "leading noise must be walked past, not mistaken for an empty room")
+
     def test_never_returns_more_than_requested(self):
         with mock.patch.object(rd, "http_request", side_effect=raw_window_gateway()):
             res = rd.read_room(ROOM, HS, limit=2, gate=None)
