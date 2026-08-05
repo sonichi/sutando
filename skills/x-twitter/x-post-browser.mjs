@@ -38,7 +38,7 @@
  */
 
 import { chromium } from 'playwright';
-import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readdirSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +46,7 @@ import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
 import { pidsHoldingProfile } from './profile-match.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
+import { readManifestConfig, resolveSetting } from './manifest-config.mjs';
 
 async function readComposer(page) {
   return await page.$eval('[data-testid="tweetTextarea_0"]', (el) => el.innerText ?? el.textContent ?? '');
@@ -102,11 +103,25 @@ function workspaceDir() {
  *  constant, referenced only to migrate — never as a default. */
 const LEGACY_PROFILE_DIR = join(homedir(), '.sutando', 'x-browser-profile');
 
+/** The `config` block this skill DECLARES. Read here because this script runs as
+ *  its own node process and so inherits nothing from the voice-agent loader's
+ *  process.env — see ./manifest-config.mjs for why that distinction matters. */
+const MANIFEST_CONFIG = readManifestConfig({
+  manifestPath: join(dirname(fileURLToPath(import.meta.url)), 'manifest.json'),
+  readFile: readFileSync,
+});
+
+/** env override > manifest config > built-in default, per skills/MANIFEST.md. */
+const setting = (key, fallback) =>
+  resolveSetting(key, { env: process.env, config: MANIFEST_CONFIG, fallback }).value;
+
 /** Durable Chrome profile holding the X login. Precedence + rationale live in
  *  ./profile-dir.mjs, which is importable and unit-tested; this only supplies the
- *  real filesystem and the real workspace resolver. */
+ *  real filesystem and the real workspace resolver. The override now also honors a
+ *  manifest-declared value, not just the env var — it ships empty, so the derived
+ *  per-workspace path is unchanged. */
 const _profile = resolveProfileDir({
-  env: process.env.X_BROWSER_PROFILE,
+  env: setting('X_BROWSER_PROFILE', ''),
   workspace: workspaceDir(),
   legacyDir: LEGACY_PROFILE_DIR,
   exists: existsSync,
@@ -214,9 +229,9 @@ if (cmd === 'login') {
     'I\'ll detect completion automatically; you can leave the window and I\'ll close it.'
   );
 
-  const SENTINEL = process.env.X_LOGIN_DONE_SENTINEL || '/tmp/x-login-done';
+  const SENTINEL = setting('X_LOGIN_DONE_SENTINEL', '/tmp/x-login-done');
   try { rmSync(SENTINEL, { force: true }); } catch {}
-  const iters = parseInt(process.env.X_LOGIN_TIMEOUT_ITERS || '120', 10) || 120; // ~10min
+  const iters = parseInt(setting('X_LOGIN_TIMEOUT_ITERS', '120'), 10) || 120; // ~10min
   for (let i = 0; i < iters; i++) {
     execFileSync('sleep', ['5']);
     if (authTokenOnDisk() >= 1 || existsSync(SENTINEL)) {
