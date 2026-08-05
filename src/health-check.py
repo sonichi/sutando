@@ -6825,6 +6825,46 @@ def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: 
     return (now - youngest_start) < seconds
 
 
+def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
+                               now: Optional[float] = None) -> bool:
+    """True if THIS host's core reports `started_at` within the last `seconds`.
+
+    The local twin of `_core_started_within`, and the same local-vs-fleet
+    boundary the liveness check needed. The workspace is shared, so the
+    fleet-wide version is satisfied by a PEER that just booted: local liveness
+    reads dead, the boot guard reads "just booted", `recover_core_if_wedged`
+    returns None, and no confirm window is ever started. A peer boot therefore
+    suppressed local dead-core recovery for the whole startup window
+    (qingyun-wu, #2160).
+
+    Reads exactly the file `core_heartbeat` writes for this host, via the same
+    `util_paths._host_label()`. An unresolvable label or unreadable file means
+    NOT just-booted, so the failure mode is an extra observation rather than a
+    suppressed relaunch — the same direction `_local_core_alive` fails in.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    if now is None:
+        now = time.time()
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from util_paths import _host_label
+        label = _host_label()
+    except Exception:
+        return False
+    alive_file = workspace / "state" / "cores" / f"{label}.alive"
+    try:
+        if now - alive_file.stat().st_mtime >= 90.0:
+            return False          # stale heartbeat — not a live, just-booted core
+        data = json.loads(alive_file.read_text())
+    except (OSError, ValueError):
+        return False
+    started = data.get("started_at")
+    if not isinstance(started, (int, float)):
+        return False
+    return (now - started) < seconds
+
+
 def _resolve_launch_env() -> dict:
     """Environment for out-of-process core restarts (start-cli.sh --restart).
 
@@ -6909,7 +6949,13 @@ def recover_core_if_wedged(
     alive_fn = alive_fn or _local_core_alive
     oldest_task_fn = oldest_task_fn or (lambda: _oldest_pending_task(now))
     status_ts_fn = status_ts_fn or _core_status_ts
-    just_booted_fn = just_booted_fn or (lambda: _core_started_within(RECOVER_WEDGE_SEC, now=now))
+    # LOCAL boot guard, matching the local liveness check above. Fleet-wide here
+    # meant a PEER that just booted suppressed local dead-core recovery for the
+    # whole startup window — liveness said dead, the boot guard said "wait", and
+    # the actuator returned without even starting a confirm window
+    # (qingyun-wu, #2160).
+    just_booted_fn = just_booted_fn or (
+        lambda: _local_core_started_within(RECOVER_WEDGE_SEC, now=now))
     restart_fn = restart_fn or _default_core_restart
     send = sender or _default_slack_sender
 

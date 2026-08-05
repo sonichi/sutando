@@ -628,6 +628,55 @@ def case_t_unresolvable_host_label_reads_NOT_alive():
     return fails
 
 
+def case_u_peer_boot_does_not_suppress_local_recovery():
+    """qingyun-wu (#2160): the boot guard had the same local-vs-fleet leak.
+
+    Fixing liveness was half of it. `_core_started_within` still globbed every
+    host, so a PEER that just booted satisfied the just-booted guard: local
+    liveness said dead, the guard said "wait", and `recover_core_if_wedged`
+    returned None — no recovery state, no confirm window ever started. A peer
+    boot suppressed local dead-core recovery for the whole startup window.
+
+    Exercised through the ACTUATOR with no injected fns, because that is where
+    the leak lived; asserting on the two helpers alone would not have caught the
+    wiring (the lesson from cases r and s one commit earlier).
+    """
+    import json as _json
+    import pathlib
+    import tempfile
+    fails = []
+    ws = pathlib.Path(tempfile.mkdtemp())
+    (ws / "state" / "cores").mkdir(parents=True)
+    (ws / "state" / "cores" / "peer-host.alive").write_text(
+        _json.dumps({"started_at": 1_000_000}))          # fresh mtime, peer JUST booted
+
+    if not hc._core_started_within(300, workspace=ws, now=1_000_100):
+        fails.append("u) precondition: the fleet guard should see the peer's boot")
+    if hc._local_core_started_within(300, workspace=ws, now=1_000_100):
+        fails.append("u) a PEER's boot satisfied the LOCAL just-booted guard (the leak)")
+
+    orig = hc.WORKSPACE_DIR
+    hc.WORKSPACE_DIR = ws
+    try:
+        r = hc.recover_core_if_wedged(
+            state_file=ws / "rec.json", now=1_000_100,
+            # alive_fn and just_booted_fn deliberately NOT injected
+            oldest_task_fn=lambda: ("task-peer-started", 5000),
+            status_ts_fn=lambda: None,
+            restart_fn=lambda standard_context: True,
+            sender=lambda text: True,
+        )
+    finally:
+        hc.WORKSPACE_DIR = orig
+
+    if r is None:
+        fails.append("u) a peer boot suppressed local recovery entirely — no confirm window started")
+    st = _json.loads((ws / "rec.json").read_text()) if (ws / "rec.json").exists() else {}
+    if st.get("wedge_mode") != "dead":
+        fails.append(f"u) expected the local core recorded DEAD, got wedge_mode={st.get('wedge_mode')!r}")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_healthy_no_action),
@@ -643,6 +692,7 @@ def main() -> int:
         ("r", case_r_local_liveness_ignores_peer_heartbeats),
         ("s", case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet),
         ("t", case_t_unresolvable_host_label_reads_NOT_alive),
+        ("u", case_u_peer_boot_does_not_suppress_local_recovery),
         ("j2", case_j2_dead_core_before_after_output),
         ("k", case_k_draining_backlog_never_restarts),
         ("l", case_l_progress_resets_long_task),
