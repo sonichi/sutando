@@ -9,6 +9,7 @@ Usage:
   python3 src/health-check.py --emit-task      # write tasks/task-health-*.txt on failure
   python3 src/health-check.py --notify-on-fail # macOS notification on failure
   python3 src/health-check.py --notify-slack   # DM the owner on Slack on failure (remote, core-independent)
+  python3 src/health-check.py --notify-gateway # DM the owner on ag2.space/gateway on failure (remote, core-independent)
   python3 src/health-check.py --recover-core   # auto-restart the core when alive-but-wedged (guarded)
 
 Checks:
@@ -3891,6 +3892,107 @@ def check_quota_telemetry(proxy_status: str, core_env_prober=None) -> dict:
     return check
 
 
+def _fmt_quota_reset(epoch_str: Optional[str]) -> str:
+    """Human-readable local time for a unix-epoch reset string; '' if unusable."""
+    try:
+        return time.strftime("%H:%M %Z", time.localtime(int(epoch_str)))
+    except (TypeError, ValueError):
+        return ""
+
+
+def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
+    """FAIL (loudly, to the remote owner surface) when the core's model quota is
+    exhausted — the 'stuck silently' condition.
+
+    Why this exists (owner-reported 2026-08-01): the core was on a model, ran
+    OVER QUOTA, and then every task stalled with no report — the agent went dark
+    with no signal to the owner. `check_quota_telemetry` above only warns on the
+    ABSENCE of quota-state.json; it deliberately never reads the values, so an
+    *exhausted* quota reads as "ok, quota state present" and the outage stays
+    invisible. This check closes that gap by reading the state and failing on an
+    EXPLICIT exhaustion signal (unified status "rejected" or available:false),
+    while leaving unknown/missing/corrupt state non-paging (fail-safe).
+
+    Delivery is automatic and core-independent: a `fail` here is picked up by
+    `_slack_failures()` → `notify_slack_for_failures()`, the remote owner DM that
+    runs from the launchd health-check-fallback and does NOT depend on the (now
+    stuck) core agent being able to speak. Dedup is the shared transition-hash
+    contract, so the owner is told once per episode, not every tick.
+
+    Staleness guard (fail-safe): quota-state.json is written by the credential
+    proxy from upstream rate-limit headers. An *actively* over-quota core keeps
+    hitting the API (429s carry the headers), so a genuine exhaustion reads
+    FRESH + not-available. A stale not-available reading is ambiguous (an old
+    snapshot from a long-quiet host), so we DON'T raise an owner alert on it —
+    only on a fresh exhaustion. Absence/staleness of telemetry is already the
+    `quota-telemetry` check's job; this one must not false-alarm on old data.
+    """
+    check = {"name": "core-quota", "status": "ok"}
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if not path.exists():
+        check["detail"] = "no quota-state.json (absence handled by quota-telemetry)"
+        return check
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        check["status"] = "warn"
+        check["detail"] = "quota-state.json present but unreadable"
+        return check
+
+    # Validate the persisted shape before touching it. quota-state.json is
+    # written by a separate process; a corrupt/foreign payload (a JSON list,
+    # null, or a non-object `headers`) must yield a bounded warn — NEVER crash
+    # the whole health-check run via `.get` on a non-dict, especially since this
+    # check runs from the fallback health checker while the core may be down.
+    if not isinstance(data, dict):
+        check["status"] = "warn"
+        check["detail"] = "quota-state.json is not a JSON object"
+        return check
+    headers = data.get("headers")
+    if not isinstance(headers, dict):
+        headers = {}
+    status = headers.get("anthropic-ratelimit-unified-status", "unknown")
+
+    # Page ONLY on an explicit exhaustion signal. The unified status header is
+    # "allowed" or "rejected" (skills/quota-tracker/SKILL.md) and the proxy also
+    # writes a top-level `available` bool. Exhaustion = an explicit "rejected"
+    # status OR an explicit available:false. Ambiguous state — unknown/missing
+    # status, e.g. a fresh partial response carrying available:true with status
+    # "unknown" — is NOT exhaustion and must not raise a false owner page.
+    exhausted = status == "rejected" or data.get("available") is False
+    if not exhausted:
+        check["detail"] = f"core quota not exhausted (status={status})"
+        return check
+
+    # Explicit exhaustion. Only alert if the reading is FRESH — a stale OR
+    # age-unknown reading is ambiguous and must not page the owner (fail-safe).
+    try:
+        age_sec = time.time() - path.stat().st_mtime
+    except OSError:
+        # An unreadable age is NOT "fresh" — do not page on an age we can't read.
+        check["detail"] = (
+            "quota reports exhausted but the file age is unreadable — "
+            "not alerting (fail-safe)"
+        )
+        return check
+    if age_sec > fresh_sec:
+        check["detail"] = (
+            f"quota-state reports exhausted (status={status}) but the reading is "
+            f"stale ({int(age_sec / 60)}m old) — not alerting on ambiguous old data"
+        )
+        return check
+
+    reset = _fmt_quota_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
+    reset_note = f" 5h window resets {reset}." if reset else ""
+    check["status"] = "fail"
+    check["detail"] = (
+        f"CORE IS OVER QUOTA (rate-limit status={status}).{reset_note} The core "
+        "cannot process tasks until quota resets or you switch models (/model) — "
+        "this is the 'stuck silently' condition; tasks will queue undelivered."
+    )
+    return check
+
+
 def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
     """Mirror of credential-proxy.ts `scopedKeychainService`.
 
@@ -6045,6 +6147,10 @@ def run_all_checks() -> list[dict]:
     # passes every branch above (observed 2026-08-03).
     checks.append(check_quota_account_identity(proxy_check["status"]))
 
+    # Core over-quota — fail loudly to the remote owner surface so an exhausted
+    # model no longer stalls every task silently (owner-reported 2026-08-01).
+    checks.append(check_core_quota_exhausted())
+
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.
     checks.append(check_node_runtime())
@@ -6760,6 +6866,78 @@ def _default_slack_sender(text: str) -> bool:
         return False
 
 
+def _env_file_dict(path: Path) -> dict:
+    """Parse a KEY=VALUE .env file into a dict (launchd-minimal-env safe).
+    Returns {} if unreadable. Strips surrounding quotes; ignores comments."""
+    out: dict = {}
+    try:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+def _gateway_owner_room(source: str = "ag2space") -> "str | None":
+    """The room to post owner alerts to — an EXPLICITLY configured, owner-only
+    room (REMOTE_ALERT_ROOM in channels/<source>/.env). None if unset.
+
+    We deliberately do NOT infer the room from state/last-owner-activity.json:
+    that records wherever the owner *last spoke*, which may be a SHARED room, and
+    a health alert can carry host/config/outage details that must never leak into
+    a team room (qingyun #2487 P1-privacy). Requiring an explicit config entry
+    makes the target owner-controlled and owner-only by construction; unset means
+    no gateway post at all (the Slack surface stays as the backup)."""
+    return (_env_file_dict(claude_home_path("channels", source, ".env")).get("REMOTE_ALERT_ROOM") or "").strip() or None
+
+
+def _gateway_creds(source: str = "ag2space") -> "tuple[str, str] | None":
+    """(url, token) for the gateway op:message endpoint, or None. Supports the
+    one-token onboarding form (REMOTE_TASK_TOKEN='https://gw|secret') and the
+    legacy AG2_REMOTE_URL / AG2_REMOTE_TOKEN aliases honored by startup.sh."""
+    env = _env_file_dict(claude_home_path("channels", source, ".env"))
+
+    def get(key: str) -> str:
+        return os.environ.get(key) or env.get(key) or ""
+
+    url = (get("REMOTE_TASK_URL") or get("AG2_REMOTE_URL")).strip().rstrip("/")
+    token = (get("REMOTE_TASK_TOKEN") or get("AG2_REMOTE_TOKEN")).strip()
+    if "|" in token:
+        _u, token = token.split("|", 1)
+        url = url or _u.strip().rstrip("/")
+    return (url, token) if url and token else None
+
+
+def _default_gateway_sender(text: str) -> bool:
+    """Post `text` to the owner's ag2.space room via the gateway op:message —
+    the same transport notify.py uses (POST {url}/v1/room, op:message), so it
+    reaches the owner even when the core is wedged. Returns True on a 2xx."""
+    room = _gateway_owner_room()
+    creds = _gateway_creds()
+    if not room or not creds:
+        return False
+    url, token = creds
+    try:
+        req = urllib.request.Request(
+            f"{url}/v1/room",
+            data=json.dumps({"op": "message", "room_id": room, "body": text}).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "sutando-health-check/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            code = getattr(resp, "status", None) or resp.getcode()
+            return 200 <= code < 300
+    except Exception:
+        return False
+
+
 def notify_slack_for_failures(
     checks: list[dict],
     state_file: Optional[Path] = None,
@@ -6814,6 +6992,66 @@ def notify_slack_for_failures(
     )
 
     send = sender or _default_slack_sender
+    if not send(text):
+        # Send failed — don't record dedup, so the next tick retries.
+        return
+
+    history[hash_key] = now_ms
+    history[_LAST_HASH_KEY] = hash_key
+    cutoff = now_ms - (24 * 3600 * 1000)
+    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    try:
+        state_file.write_text(json.dumps(history))
+    except Exception:
+        pass
+
+
+def notify_gateway_for_failures(
+    checks: list[dict],
+    state_file: Optional[Path] = None,
+    sender=None,
+) -> None:
+    """DM the owner on ag2.space (the gateway) when health checks fail — the
+    remote-visible surface the owner actually watches, and one that does NOT
+    depend on the core agent being alive (posts straight to the gateway
+    op:message endpoint from the launchd fallback).
+
+    Owner-requested 2026-08-01: the over-quota alert must land where the owner
+    is (ag2.space), not only Slack. Same transition-hash dedup contract as
+    notify_slack_for_failures, but a SEPARATE state file so the gateway and
+    Slack surfaces never suppress each other, and dedup is recorded only on a
+    SUCCESSFUL send so a transient gateway blip doesn't silence the alert.
+    `sender` is injected by tests to avoid real network calls.
+    """
+    failures = _slack_failures(checks)
+    if not failures:
+        return
+
+    if state_file is None:
+        state_file = WORKSPACE_DIR / "state" / "health-last-gateway.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    set_key = "|".join(sorted(c["name"] for c in failures))
+    hash_key = hashlib.sha256(set_key.encode()).hexdigest()[:16]
+    now_ms = int(time.time() * 1000)
+
+    history: dict = {}
+    try:
+        if state_file.exists():
+            history = json.loads(state_file.read_text())
+    except Exception:
+        history = {}
+    if not isinstance(history, dict):
+        history = {}
+
+    if history.get(_LAST_HASH_KEY) == hash_key:
+        return
+
+    lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
+    extra = f"\n…(+{len(failures) - 5} more)" if len(failures) > 5 else ""
+    text = "⚠️ Sutando health check — " + f"{len(failures)} issue(s):\n" + "\n".join(lines) + extra
+
+    send = sender or _default_gateway_sender
     if not send(text):
         # Send failed — don't record dedup, so the next tick retries.
         return
@@ -7531,6 +7769,7 @@ def main():
     do_emit = "--emit-task" in sys.argv
     do_notify = "--notify-on-fail" in sys.argv
     do_notify_slack = "--notify-slack" in sys.argv
+    do_notify_gateway = "--notify-gateway" in sys.argv
     do_recover = "--recover-core" in sys.argv
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
@@ -7581,6 +7820,13 @@ def main():
     # the launchd-supervised fallback invocation so outages self-report.
     if do_notify_slack:
         notify_slack_for_failures(checks)
+
+    # Optional: remote ag2.space (gateway) DM surface — the channel the owner
+    # actually watches. Same core-independent guarantee as --notify-slack, via
+    # the gateway op:message endpoint. Intended for the launchd fallback so an
+    # over-quota / wedged core self-reports where the owner will see it.
+    if do_notify_gateway:
+        notify_gateway_for_failures(checks)
 
     # Optional: auto-recover a wedged core (alive-but-stuck) by restarting it.
     # Independent of the checks list — keys off the queue-drain + heartbeat
