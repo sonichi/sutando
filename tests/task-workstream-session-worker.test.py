@@ -152,7 +152,9 @@ def test_codex_records_reported_uuid_then_uses_exec_resume() -> None:
         root = Path(td)
         workspace = root / "workspace"
         log = root / "codex-args.jsonl"
-        thread_id = "12345678-1234-4123-8123-123456789abc"
+        # Current Codex threads are UUIDv7. Keep the real provider shape here
+        # so the worker cannot silently reject a successful live launch.
+        thread_id = "019fcfd0-12bf-7d63-b4b0-d386f5966622"
         fake = _executable(root / "codex", f"""#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
