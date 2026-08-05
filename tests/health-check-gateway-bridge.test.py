@@ -23,6 +23,7 @@ Exit code: 0 on pass, 1 on fail.
 from __future__ import annotations
 
 import importlib.util
+import re
 import tempfile
 import unittest.mock
 from pathlib import Path
@@ -110,6 +111,42 @@ def main() -> int:
     r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0, pgrep_out="111\n222\n")
     check("configured + duplicates → warn", r is not None and r["status"] == "warn", f"got {r!r}")
     check("duplicate detail says multiple", r and "multiple processes" in r["detail"], f"got {r!r}")
+
+    # 4b) THE PATTERN ITSELF must see a process running under the DEPRECATED filename.
+    #
+    # src/remote-relay-bridge.py is a compat stub the repo deliberately ships so
+    # existing launchers keep working; it runs the gateway client in-process via
+    # runpy, so an instance under that name IS a real second instance. The pattern
+    # was anchored to the new filename only, which made the pileup branch above
+    # structurally unable to fire for the most likely duplicate. Measured live: two
+    # instances running, the old pattern matched 1 and reported ok while a 41-day-old
+    # stub-named process carried most of the traffic.
+    #
+    # Asserted by MATCHING the pattern against real argv strings rather than
+    # string-comparing it, so a future rewrite that stays correct still passes.
+    captured: list = []
+
+    def _capture(cmd, **kw):
+        captured.append(cmd)
+        return _pgrep(1, "")(cmd, **kw)
+
+    with unittest.mock.patch.object(hc, "_gateway_configured", lambda: True), \
+         unittest.mock.patch.object(hc.subprocess, "run", side_effect=_capture):
+        hc.check_gateway_bridge()
+    check("pgrep was invoked", bool(captured), f"got {captured!r}")
+    pattern = captured[0][2] if captured and len(captured[0]) > 2 else ""
+    argvs = {
+        "new name": "/usr/bin/python3 /Users/x/sutando/src/remote-gateway-bridge.py",
+        "deprecated stub": "/usr/bin/python3 /Users/x/sutando/src/remote-relay-bridge.py",
+    }
+    for label, argv in argvs.items():
+        check(f"pattern matches the {label}",
+              re.search(pattern, argv) is not None,
+              f"pattern {pattern!r} did not match {argv!r}")
+    # ...and must NOT match an unrelated process that merely mentions the word.
+    check("pattern does not match an unrelated bridge",
+          re.search(pattern, "/usr/bin/python3 src/discord-bridge.py") is None,
+          f"pattern {pattern!r} over-matched")
 
     # 5) configured via the channel .env file (not env var) → detected as ok
     with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:

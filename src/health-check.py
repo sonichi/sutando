@@ -4595,7 +4595,15 @@ def check_gateway_bridge() -> "dict | None":
         return None
     try:
         gw = subprocess.run(
-            ["/usr/bin/pgrep", "-f", r"remote-gateway-bridge\.py$"],
+            # BOTH filenames. src/remote-relay-bridge.py is the DEPRECATED name kept
+            # as a compat stub that runs the gateway client in-process via runpy —
+            # the repo ships it precisely so existing launchers keep working, so a
+            # long-lived instance under the old name is the EXPECTED case, not an
+            # exotic one. Matching only the new name made this check's own
+            # duplicate-pileup branch unable to see the duplicate: measured on a live
+            # host with two instances, the anchored pattern matched 1 and reported ok
+            # while a 41-day-old stub-named process was serving most of the traffic.
+            ["/usr/bin/pgrep", "-f", r"remote-(gateway|relay)-bridge\.py$"],
             capture_output=True, text=True,
         )
         pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
