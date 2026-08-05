@@ -1402,6 +1402,35 @@ cmd_default_bidirectional() {
     acquire_lock
     _pull_only_impl || true   # pull failures shouldn't block push
     _push_only_impl
+    local _rc=$?
+    # `_resolve_conflicts_keep_ours` preserves every discarded incoming file, so
+    # nothing is unrecoverable — but recoverable only helps if somebody looks,
+    # and until now nothing said when a preserved file still held content the
+    # live copy lacked. Reported here rather than resolved differently: a union
+    # merge would never lose a line, but it resurrects an in-place retraction
+    # directly beneath its own correction, where it reads as current. Losing
+    # recoverably beats corrupting silently.
+    _report_unmerged_conflicts || true   # fail-open: never change sync's outcome
+    return "$_rc"
+}
+
+# Print preserved-but-unmerged peer content. Deliberately does NOT gate on the
+# reporter's exit status: it is diagnostics, and a broken diagnostic must not
+# turn a successful sync into a failed one.
+_report_unmerged_conflicts() {
+    local script="$REPO_DIR/scripts/sync-conflicts-report.py"
+    [ -f "$script" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    local out
+    out="$(python3 "$script" "$WORKSPACE_DIR" 2>&1)" || true
+    # Only speak up when there is something to merge back; the clean case is
+    # silent so a 30-minute cron does not grow a nag nobody reads.
+    case "$out" in
+        *"no unmerged peer content"*) log "_report_unmerged_conflicts: clean" ;;
+        "") : ;;
+        *) log "_report_unmerged_conflicts: $out"; printf '%s\n' "$out" ;;
+    esac
+    return 0
 }
 
 cmd_status() {
