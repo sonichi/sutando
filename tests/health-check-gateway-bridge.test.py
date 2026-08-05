@@ -144,8 +144,14 @@ def main() -> int:
               re.search(pattern, argv) is not None,
               f"pattern {pattern!r} did not match {argv!r}")
     # ...and must NOT match an unrelated process that merely mentions the word.
+    #
+    # The filename here is deliberately FICTIONAL. scripts/lint-hermetic-bridge-tests.py
+    # greps test sources for `(discord|slack|telegram)-bridge\.py` to find tests that
+    # import a real bridge without isolating CLAUDE_CONFIG_DIR; naming a real bridge here
+    # — even inside a string that is only ever fed to re.search — trips that lint. Keep it
+    # fictional rather than "fixing" the lint.
     check("pattern does not match an unrelated bridge",
-          re.search(pattern, "/usr/bin/python3 src/discord-bridge.py") is None,
+          re.search(pattern, "/usr/bin/python3 src/some-other-bridge.py") is None,
           f"pattern {pattern!r} over-matched")
 
     # 5) configured via the channel .env file (not env var) → detected as ok
