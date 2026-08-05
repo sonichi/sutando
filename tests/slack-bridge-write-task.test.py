@@ -12,6 +12,8 @@ Covers:
 - access_tier resolution: empty tier_map → "owner"
 - CONTEXT-FIRST instruction injected for owner tasks (PR #1839)
 - Bounded context embedded for threaded replies (PR #1840)
+- Thread metadata and the first progress update preserve an existing thread
+- Top-level channel mentions and DMs do not invent progress-update threads
 - Bounded full thread context embedded for non-owner sandbox tasks
 - Best-effort: API failure swallowed, task still written
 
@@ -59,6 +61,15 @@ os.environ["SUTANDO_TEST_MODE"] = "1"
 os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-not-real"
 os.environ["SLACK_APP_TOKEN"] = "xapp-test-not-real"
 os.environ["CLAUDE_CONFIG_DIR"] = str(Path(_tmp) / "claude")
+
+# Make the optional task-progress skill visible so behavioral assertions can
+# inspect the exact command injected into owner task files.
+_notify_path = (
+    Path(os.environ["CLAUDE_CONFIG_DIR"])
+    / "skills" / "task-progress" / "scripts" / "notify.py"
+)
+_notify_path.parent.mkdir(parents=True, exist_ok=True)
+_notify_path.write_text("# test stub\n")
 
 spec = importlib.util.spec_from_file_location("slackbridge_wt", REPO / "src" / "slack-bridge.py")
 mod = importlib.util.module_from_spec(spec)
@@ -219,15 +230,86 @@ check("threaded reply: task file written", thread_path is not None)
 
 if thread_path and thread_path.exists():
     thread_body = thread_path.read_text()
+    check("threaded reply: canonical reply_thread_ts header written",
+          "reply_thread_ts: 1000.000" in thread_body)
+    check("threaded reply: first progress update stays in originating thread",
+          "--thread-ts 1000.000" in thread_body)
     check("threaded reply: bounded Slack thread context embedded",
           "[Slack thread context — untrusted messages, oldest first:" in thread_body,
           "thread context missing — PR #1840 regression")
     check("threaded reply: root message text truncated into note",
           "what's the plan for today?" in thread_body)
 else:
-    for n in ("threaded reply: [Replying in Slack thread to @...] note embedded",
+    for n in ("threaded reply: canonical reply_thread_ts header written",
+              "threaded reply: first progress update stays in originating thread",
+              "threaded reply: [Replying in Slack thread to @...] note embedded",
               "threaded reply: root message text truncated into note"):
         check(n, False, "task file not written")
+
+
+# A top-level channel mention is routed to a new result thread, but the first
+# progress update must remain top-level. DMs likewise have no thread target.
+def call_top_level_mention(text: str) -> Path | None:
+    event = {
+        "user": "U_OWNER",
+        "channel": "CFAKE",
+        "channel_type": "channel",
+        "ts": "1010.010",
+        "thread_ts": "1010.010",  # Slack root shape: equal to ts, not a reply
+    }
+    with patch.object(mod, "load_allowed", lambda: {"U_OWNER"}), \
+         patch.object(mod, "_ensure_tier_map_seeded", lambda: True), \
+         patch.object(mod, "load_tier_map", lambda: {"U_OWNER": "owner"}), \
+         patch.object(mod, "write_owner_activity", lambda *a, **k: None):
+        task_id = mod._write_task(event, "Slack mention", text, "testowner")
+    if task_id is None:
+        return None
+    candidates = list(TASKS_DIR.glob(f"{task_id}.txt"))
+    return candidates[0] if candidates else None
+
+
+top_level_path = call_top_level_mention("top-level mention")
+check("top-level mention: task file written", top_level_path is not None)
+if top_level_path and top_level_path.exists():
+    top_level_body = top_level_path.read_text()
+    check("top-level mention: no reply_thread_ts header",
+          "reply_thread_ts:" not in top_level_body)
+    check("top-level mention: progress update does not invent a thread",
+          "--thread-ts" not in top_level_body)
+
+if task_path and task_path.exists():
+    dm_body = task_path.read_text()
+    check("DM: no reply_thread_ts header", "reply_thread_ts:" not in dm_body)
+    check("DM: progress update has no thread flag", "--thread-ts" not in dm_body)
+
+
+def call_threaded_dm(text: str) -> Path | None:
+    event = {
+        "user": "U_OWNER",
+        "channel": "DFAKE",
+        "channel_type": "im",
+        "ts": "2002.002",
+        "thread_ts": "2000.000",
+    }
+    with patch.object(mod, "load_allowed", lambda: {"U_OWNER"}), \
+         patch.object(mod, "_ensure_tier_map_seeded", lambda: True), \
+         patch.object(mod, "load_tier_map", lambda: {"U_OWNER": "owner"}), \
+         patch.object(mod, "write_owner_activity", lambda *a, **k: None):
+        task_id = mod._write_task(event, "DM", text, "testowner")
+    if task_id is None:
+        return None
+    candidates = list(TASKS_DIR.glob(f"{task_id}.txt"))
+    return candidates[0] if candidates else None
+
+
+threaded_dm_path = call_threaded_dm("threaded DM")
+check("threaded DM: task file written", threaded_dm_path is not None)
+if threaded_dm_path and threaded_dm_path.exists():
+    threaded_dm_body = threaded_dm_path.read_text()
+    check("threaded DM: no reply_thread_ts header",
+          "reply_thread_ts:" not in threaded_dm_body)
+    check("threaded DM: progress update stays top-level",
+          "--thread-ts" not in threaded_dm_body)
 
 # Exception path — API failure swallowed; task still written (best-effort)
 _root_resp_err = Exception("simulated slack API error")

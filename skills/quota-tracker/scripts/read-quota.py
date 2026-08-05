@@ -61,6 +61,8 @@ _EWMA_ALPHA = 0.3
 # Sample inclusion window: skip deltas from outside [MIN_GAP_S, MAX_GAP_S].
 _MIN_GAP_S = 120     # 2 min — same-pass double-reads shouldn't count
 _MAX_GAP_S = 7200    # 2 h — stale gap yields unreliable per-pass rate
+# A window needs this many of its OWN samples before it can be forecast.
+_MIN_SAMPLES = 2
 
 
 def _load_burn_history() -> dict:
@@ -84,52 +86,135 @@ def _save_burn_history(h: dict) -> None:
         pass
 
 
-def _update_burn_rate(current_util_5h: float) -> dict | None:
-    """Update burn-rate EWMA with the current 5h utilization sample.
+def _advance_ewma(prev, per_pass: float, samples: int):
+    """Fold one per-pass sample into an EWMA. Returns (ewma, samples)."""
+    if prev is None:
+        return per_pass, 1
+    return _EWMA_ALPHA * per_pass + (1 - _EWMA_ALPHA) * prev, min(samples + 1, 99)
 
-    Returns a dict with burn_rate_pct_per_pass and estimated_passes_left
-    if enough history exists, else None.
+
+def _window_horizon(ewma, util, reset_epoch):
+    """Passes until `util` reaches 1.0 at `ewma`/pass — or None if it never does.
+
+    None means "this window does not bind": either there is no usable rate, or
+    the forecast runs past the window's own reset, at which point it refills and
+    the projection is void. A window cannot constrain you beyond its refill, so
+    reporting a number larger than the time to that refill is not a conservative
+    estimate — it is an unreachable one.
+    """
+    if not ewma or ewma <= 0:
+        return None
+    passes = ((1 - util) * 100) / (ewma * 100)
+    if reset_epoch is not None:
+        passes_until_reset = max(0.0, (reset_epoch - time.time()) / 300.0)
+        if passes > passes_until_reset:
+            return None
+    return passes
+
+
+def _update_burn_rate(current_util_5h: float, current_util_7d=None,
+                      reset_5h_epoch=None, reset_7d_epoch=None) -> dict | None:
+    """Update the burn-rate EWMAs and forecast the BINDING window.
+
+    Both rolling limits are tracked, because either can be the one that stops
+    the loop and they run out at different times. The 5h window refills every
+    five hours; the 7d window can be days from its reset, so a 5h-only forecast
+    reports headroom that the account does not actually have. Observed
+    2026-08-05 on Chis-Mac-mini: 5h at 89% remaining and 7d at 27%, and the
+    5h-only forecast printed 615 minutes left when the 5h window it was
+    projecting refilled in 212 — a number 403 minutes past its own reset, while
+    the window that could not refill for another four days went unmentioned.
+
+    `estimated_passes_left` keeps its name and its meaning of "passes until the
+    loop is stopped"; what changes is that it now considers every window that
+    can stop it. `binding_window` names which one it came from, and is None when
+    no window runs out before its own reset.
     """
     now = time.time()
     h = _load_burn_history()
     last_ts = h.get("last_read_ts")
-    last_util = h.get("last_util_5h")
-    ewma = h.get("burn_rate_5h_ewma")
-    samples = h.get("burn_samples", 0)
 
     new_h = dict(h)
     new_h["last_read_ts"] = now
     new_h["last_util_5h"] = current_util_5h
-    new_h["schema_version"] = 1
+    if current_util_7d is not None:
+        new_h["last_util_7d"] = current_util_7d
+    new_h["schema_version"] = 2
 
-    result = None
-    if last_ts is not None and last_util is not None:
+    ewma_5h = h.get("burn_rate_5h_ewma")
+    ewma_7d = h.get("burn_rate_7d_ewma")
+    samples_5h = h.get("burn_samples", 0)
+    samples_7d = h.get("burn_samples_7d", 0)
+
+    if last_ts is not None:
         gap = now - last_ts
-        delta = current_util_5h - last_util
-        if _MIN_GAP_S <= gap <= _MAX_GAP_S and delta >= 0:
-            # Normalise delta to a "per 5-min pass" rate regardless of actual gap
-            per_pass = delta * (300.0 / gap)
-            if ewma is None:
-                ewma = per_pass
-                samples = 1
-            else:
-                ewma = _EWMA_ALPHA * per_pass + (1 - _EWMA_ALPHA) * ewma
-                samples = min(samples + 1, 99)
-            new_h["burn_rate_5h_ewma"] = ewma
-            new_h["burn_samples"] = samples
+        if _MIN_GAP_S <= gap <= _MAX_GAP_S:
+            scale = 300.0 / gap
+            # `burn_samples` keeps its pre-existing meaning — 5h samples — so a
+            # v1 history file carries over without reinterpretation.
+            last_5h = h.get("last_util_5h")
+            if last_5h is not None and current_util_5h - last_5h >= 0:
+                ewma_5h, samples_5h = _advance_ewma(
+                    ewma_5h, (current_util_5h - last_5h) * scale, samples_5h)
+                new_h["burn_rate_5h_ewma"] = ewma_5h
+                new_h["burn_samples"] = samples_5h
+            # 7d is folded on its OWN counter. The windows reset independently:
+            # a 5h reset zeroes that delta while 7d keeps climbing, so a shared
+            # counter would suppress the 7d forecast for exactly the readings
+            # taken across a 5h reset — the moments the 7d number matters most.
+            last_7d = h.get("last_util_7d")
+            if (current_util_7d is not None and last_7d is not None
+                    and current_util_7d - last_7d >= 0):
+                ewma_7d, samples_7d = _advance_ewma(
+                    ewma_7d, (current_util_7d - last_7d) * scale, samples_7d)
+                new_h["burn_rate_7d_ewma"] = ewma_7d
+                new_h["burn_samples_7d"] = samples_7d
 
     _save_burn_history(new_h)
 
-    ewma_final = new_h.get("burn_rate_5h_ewma")
-    if ewma_final and ewma_final > 0 and new_h.get("burn_samples", 0) >= 2:
-        remaining_pct = (1 - current_util_5h) * 100
-        passes_left = remaining_pct / (ewma_final * 100)
-        result = {
-            "burn_rate_pct_per_pass": round(ewma_final * 100, 2),
-            "burn_samples": new_h["burn_samples"],
-            "estimated_passes_left": round(passes_left, 1),
-            "estimated_minutes_left": round(passes_left * 5),
-        }
+    # A window is EXPECTED whenever the caller supplied its utilization, and
+    # FORECAST only once it has two samples of its own. Keeping those separate
+    # is the whole point: every pre-existing v1 history already satisfies the 5h
+    # gate and carries NO 7d counter, so for the first reads after an upgrade
+    # the 7d window is expected-but-unforecast. Folding that into "no window
+    # binds" prints an all-clear over a window nobody measured — the same
+    # could-not-measure-reported-as-a-result this change exists to remove, one
+    # layer up. Reproduced against a real v1 history with 7d at 95%: it returned
+    # binding_window null and the human path said "no window runs out".
+    # The same guard covers a 7d stream that never matures; omission is never
+    # read as safety.
+    expected = ["5h"] + (["7d"] if current_util_7d is not None else [])
+    samples = {"5h": new_h.get("burn_samples", 0),
+               "7d": new_h.get("burn_samples_7d", 0)}
+    utils = {"5h": current_util_5h, "7d": current_util_7d}
+    ewmas = {"5h": new_h.get("burn_rate_5h_ewma"),
+             "7d": new_h.get("burn_rate_7d_ewma")}
+    resets = {"5h": reset_5h_epoch, "7d": reset_7d_epoch}
+
+    horizons, unforecast = {}, []
+    for w in expected:
+        if samples[w] >= _MIN_SAMPLES:
+            horizons[w] = _window_horizon(ewmas[w], utils[w], resets[w])
+        else:
+            unforecast.append(w)
+    if not horizons:
+        return None
+
+    binding = min((w for w in horizons if horizons[w] is not None),
+                  key=lambda w: horizons[w], default=None)
+
+    result = {
+        "burn_rate_pct_per_pass": round((new_h.get("burn_rate_5h_ewma") or 0) * 100, 2),
+        "burn_samples": new_h.get("burn_samples", 0),
+        "binding_window": binding,
+        "estimated_passes_left": round(horizons[binding], 1) if binding else None,
+        "estimated_minutes_left": round(horizons[binding] * 5) if binding else None,
+        # Non-empty means the verdict is INCOMPLETE, not clear. A consumer that
+        # reads `binding_window: null` on its own cannot tell those apart.
+        "unforecast_windows": unforecast,
+    }
+    if new_h.get("burn_rate_7d_ewma"):
+        result["burn_rate_7d_pct_per_pass"] = round(new_h["burn_rate_7d_ewma"] * 100, 2)
     return result
 
 
@@ -167,7 +252,11 @@ def main():
         result["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).isoformat()
 
     if "--gate" not in sys.argv:
-        burn = _update_burn_rate(util_5h)
+        burn = _update_burn_rate(
+            util_5h, util_7d,
+            int(reset_5h) if reset_5h else None,
+            int(reset_7d) if reset_7d else None,
+        )
         if burn:
             result["burn"] = burn
 
@@ -192,7 +281,22 @@ def main():
     if result.get("burn"):
         b = result["burn"]
         print(f"Burn rate: {b['burn_rate_pct_per_pass']}%/pass ({b['burn_samples']} samples)")
-        print(f"Est. passes left: {b['estimated_passes_left']} (~{b['estimated_minutes_left']}m)")
+        # An unforecast window taints BOTH outcomes, not just the empty one: a
+        # binding number is only the minimum over the windows actually measured,
+        # so printing it bare while another window is unmeasured asserts more
+        # than was checked. Caveat first, verdict second.
+        pending = b.get("unforecast_windows") or []
+        caveat = (f" [INCOMPLETE: no history yet for {', '.join(pending)} — "
+                  f"not forecast]") if pending else ""
+        if b.get("binding_window"):
+            print(f"Est. passes left: {b['estimated_passes_left']} "
+                  f"(~{b['estimated_minutes_left']}m, {b['binding_window']} window binds)"
+                  + caveat)
+        elif pending:
+            print(f"Est. passes left: INCOMPLETE — no history yet for "
+                  f"{', '.join(pending)}; those windows are not forecast")
+        else:
+            print("Est. passes left: no window runs out before its own reset")
 
 
 if __name__ == "__main__":
