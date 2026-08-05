@@ -343,25 +343,40 @@ def _write_station_cache(path, data):
         pass
 
 
+def _cache_ts(x):
+    """A cache timestamp as a number, or None if missing/malformed. The cache is
+    a mutable workspace state file — it can be corrupted, synced, or hand-edited
+    — so NEVER do arithmetic on a value straight out of it (qingyun CR #2680: a
+    `"bad"` value_ts raised TypeError in derive(), which core-input-watch calls
+    unguarded every ~3s → killed the supervisor). bool is an int subclass in
+    Python, so exclude it explicitly."""
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+
+def _cache_verdict(v):
+    """A tri-state verdict (True/False/None); anything else reads as None."""
+    return v if v in (True, False, None) else None
+
+
 def _station_cached(workspace, *, now=None, ttl=_STATION_TTL):
     """READ-ONLY tri-state Station verdict from the on-disk cache — NEVER probes,
     so it is safe on derive()'s ~3s supervisor loop (always returns instantly).
 
     Returns the persisted value only while it is FRESH (younger than `ttl`); an
-    expired or absent verdict reads as None (unknown) rather than a stale
-    confident True/False. Without this a last-known `True` would keep reporting
-    `station_available: true` forever after Station went down — and a stale
-    `False` would conceal recovery — since the continuous core-input-watch path
-    calls only derive() (never the refreshing main()). qingyun CR #2680. The
-    value is refreshed off-loop by the one-shot main() via _refresh_station."""
+    expired, absent, OR malformed verdict reads as None (unknown) rather than a
+    stale confident True/False or a raised exception. Without the freshness check
+    a last-known `True` would keep reporting `station_available: true` forever
+    after Station went down; without the schema guard a corrupt cache record
+    would crash core-input-watch (qingyun CR #2680). The value is refreshed
+    off-loop by the one-shot main() via _refresh_station."""
     cache = _read_station_cache(_station_cache_file(workspace))
-    value_ts = cache.get("value_ts")
+    value_ts = _cache_ts(cache.get("value_ts"))
     if value_ts is None:
-        return None
+        return None  # missing or malformed timestamp -> unknown
     t = now if now is not None else time.time()
     if (t - value_ts) >= ttl:
         return None  # expired — unknown, not a stale confident verdict
-    return cache.get("value")
+    return _cache_verdict(cache.get("value"))
 
 
 def _probe_station_bounded(connect_timeout=_STATION_CONNECT_TIMEOUT,
@@ -392,12 +407,12 @@ def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
     now = now if now is not None else time.time()
     path = _station_cache_file(workspace)
     cache = _read_station_cache(path)
-    value_ts = cache.get("value_ts")
+    value_ts = _cache_ts(cache.get("value_ts"))
     if value_ts is not None and (now - value_ts) < ttl:
-        return cache.get("value")  # still FRESH — no need to re-probe
-    attempt_ts = cache.get("attempt_ts")
+        return _cache_verdict(cache.get("value"))  # still FRESH — no re-probe
+    attempt_ts = _cache_ts(cache.get("attempt_ts"))
     if attempt_ts is not None and (now - attempt_ts) < cooldown:
-        return cache.get("value")  # a recent attempt is in flight/just done
+        return _cache_verdict(cache.get("value"))  # a recent attempt in flight
     _write_station_cache(path, {**cache, "attempt_ts": now})
     runner = probe or (lambda: _probe_station_bounded(deadline=deadline))
     try:

@@ -125,6 +125,33 @@ class TestAg2SpaceStationSignals(unittest.TestCase):
         # ...but still fresh within the TTL:
         self.assertTrue(self.mod._station_cached(self.ws, now=1000.0 + 30, ttl=60.0))
 
+    def test_malformed_cache_degrades_to_unknown_never_raises(self):
+        # qingyun CR #2680: the cache is a mutable workspace file — a corrupt /
+        # synced / hand-edited record must degrade to None, never raise (else
+        # core-input-watch's unguarded ~3s derive() dies on one bad record).
+        self._sabotage_probes()
+        for bad in ({"value": True, "value_ts": "bad", "attempt_ts": "bad"},
+                    {"value": "yes", "value_ts": 100.0},   # non-tri-state value
+                    {"value": True, "value_ts": True},      # bool is not a timestamp
+                    {"value": True, "value_ts": None},
+                    {"value": True}):                       # no timestamp at all
+            self._seed_cache(**bad)
+            self.assertIsNone(self.mod._station_cached(self.ws, now=200.0))
+
+    def test_refresh_survives_malformed_timestamps(self):
+        # A malformed value_ts/attempt_ts must not raise in _refresh_station's
+        # freshness/cooldown arithmetic — it falls through to a fresh probe.
+        self._seed_cache(value=True, value_ts="bad", attempt_ts="bad")
+        self.assertFalse(self.mod._refresh_station(self.ws, now=200.0, probe=lambda: False))
+
+    def test_derive_survives_a_corrupt_cache(self):
+        # The whole point: one bad record can't crash the supervisor tick.
+        self._sabotage_probes()
+        self.mod._run = lambda cmd: (None, "")
+        self.mod._resolve_workspace = lambda repo: self.ws
+        self._seed_cache(value=True, value_ts="bad")
+        self.assertIsNone(self.mod.derive()["station_available"])  # no raise, unknown
+
     def test_derive_never_probes_even_when_the_resolver_would_stall(self):
         # THE fix: derive() runs on the 3s supervisor loop, so it must NEVER
         # touch the network — a stalled/hung resolver can't delay the tick.
