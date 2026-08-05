@@ -64,12 +64,34 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertNotIn("subset.md", r.stdout)
 
-    def test_a_trivial_line_difference_is_NOT_reported(self):
-        """Reformatting is not content. Two real batches differed by 2-3 lines."""
-        self._pair("trivial.md", "# c\nx\ny\n", "# c\nx\ny\nz\nw\n")
+    def test_a_SINGLE_real_added_line_IS_reported(self):
+        """The P1 the line-count threshold hid (qingyun-wu, #2662).
+
+        One extra line is the archetypal loss this tool exists to catch -- a
+        fact, a bullet, a corrected number. The previous `TRIVIAL_LINES = 3`
+        rule called it noise and exited 0. The old assertion in this slot
+        (`a trivial line difference is NOT reported`) ENCODED that bug, which is
+        why the suite went green over it.
+        """
+        self._pair("note.md", "keep\n", "keep\nimportant new fact\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("note.md", r.stdout)
+
+    def test_a_pure_REFLOW_is_NOT_reported(self):
+        """What the threshold was reaching for, done by content instead.
+
+        Re-wrapping, re-indenting and trailing-space churn all leave the text
+        present in the live copy, so whitespace-normalised presence finds it --
+        at ANY line count, where the old rule only tolerated three.
+        """
+        self._pair("wrap.md", "alpha beta gamma delta\n",
+                   "alpha beta\ngamma delta\n")
+        self._pair("indent.md", "x = 1\n", "    x = 1\n")
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stdout)
-        self.assertNotIn("trivial.md", r.stdout)
+        self.assertNotIn("wrap.md", r.stdout)
+        self.assertNotIn("indent.md", r.stdout)
 
     def test_mixed_batch_reports_only_the_lossy_file(self):
         """The discrimination, exercised in one run rather than three."""

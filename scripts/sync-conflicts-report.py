@@ -10,12 +10,25 @@ correction, which reads as current (demonstrated 2026-08-05).
 Recoverable only helps if someone looks. Measured on Chis-MacBook-Pro the same
 day: 13 preserved files, of which 6 were strict SUBSETS of the local copy (zero
 loss -- keeping ours was correct), 1 was a legacy flat path retired by #2567,
-and 3 carried real peer content that had sat unmerged for hours. Nothing
+and 5 carried real peer content that had sat unmerged for hours. Nothing
 reported the difference, so the count of batches looked alarming and the count
 that mattered was invisible.
 
-This prints only the third category: files where the discarded copy still holds
-lines the live copy lacks.
+WHY NOT A LINE-COUNT THRESHOLD. The first version ignored diffs of <= 3 lines as
+"reformatting noise". qingyun-wu reproduced the hole: a peer copy one line longer
+-- `important new fact` -- reported clean. Line count cannot separate a reflow
+from a short, meaningful addition, and the short addition is exactly what this
+tool exists to catch.
+
+It was not hypothetical. Re-classifying the 13 by CONTENT moved two files out of
+"trivial" and into real loss (3 -> 5), including a `MEMORY.md` overflow cap and
+two lines documenting a send-syntax trap. My own earlier analysis had called both
+noise on the strength of their line count.
+
+The discriminator is presence, not size: a reflow re-lays-out text that still
+EXISTS in the live copy, so its content is found there under whitespace
+normalisation. Genuinely new content is absent at any length. One line of new
+text is reported; a hundred lines of pure re-wrapping are not.
 """
 import pathlib
 import subprocess
@@ -29,7 +42,24 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent  # lint-workspace-resoluti
 sys.path.insert(0, str(ROOT / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
-TRIVIAL_LINES = 3  # a handful of differing lines is reformatting, not content
+def _new_content(saved: str, live: str) -> "list[str]":
+    """Lines in the preserved copy whose TEXT is absent from the live copy.
+
+    Whitespace-normalised on both sides, so re-wrapping, re-indenting and
+    trailing-space churn all resolve to "already present" — the reflow case the
+    old line-count threshold was reaching for, without its blindness to a single
+    real line.
+    """
+    haystack = " ".join(live.split())
+    seen = set(live.splitlines())
+    out = []
+    for line in saved.splitlines():
+        if not line.strip() or line in seen:
+            continue
+        if " ".join(line.split()) in haystack:
+            continue  # same text, laid out differently
+        out.append(line)
+    return out
 
 
 def unmerged(workspace: pathlib.Path):
@@ -71,12 +101,9 @@ def unmerged(workspace: pathlib.Path):
             if not live.exists():
                 out.append((batch.name, saved.relative_to(batch), None))
                 continue
-            ours = set(live.read_text(errors="replace").splitlines())
-            extra = [
-                ln for ln in saved.read_text(errors="replace").splitlines()
-                if ln not in ours and ln.strip()
-            ]
-            if len(extra) > TRIVIAL_LINES:
+            extra = _new_content(saved.read_text(errors="replace"),
+                                 live.read_text(errors="replace"))
+            if extra:
                 out.append((batch.name, saved.relative_to(batch), len(extra)))
     return out, None
 

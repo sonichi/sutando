@@ -1401,8 +1401,14 @@ cmd_default_bidirectional() {
     fi
     acquire_lock
     _pull_only_impl || true   # pull failures shouldn't block push
-    _push_only_impl
-    local _rc=$?
+    # `|| _rc=$?`, NOT a bare call then `$?`. This file runs under `set -euo
+    # pipefail` and `cmd_default_bidirectional` is invoked bare from the case
+    # dispatch, so a non-zero `_push_only_impl` terminates the function AT THAT
+    # CALL — before the rc is captured and before the reporter below runs. The
+    # diagnostic would be skipped exactly when it matters most: a pull that
+    # preserved incoming content followed by a failed push. (qingyun-wu, #2662 P2.)
+    local _rc=0
+    _push_only_impl || _rc=$?
     # `_resolve_conflicts_keep_ours` preserves every discarded incoming file, so
     # nothing is unrecoverable — but recoverable only helps if somebody looks,
     # and until now nothing said when a preserved file still held content the
