@@ -49,8 +49,14 @@ Each pass, in order:
    **`step` is an owner-facing live message, not internal telemetry.** With `SUTANDO_PROGRESS_STREAM=1` (ON in the running bridge) the Discord bridge renders it to the owner verbatim as `⏳ <step> (Ns)` while he waits on an owner task, via `progress_stream.format_progress`. A generic placeholder ("Starting pass...", "running") shows up in his DM as noise; when processing an owner task, `step` should say what he is waiting on. Rewrite it on every pivot — a stale `step` actively lies to him. See memory `feedback_rich_core_status_step`. (This template previously read `"Starting pass..."` — the exact string that memory names as the anti-pattern, which is why the mistake kept recurring across compactions: this file is loaded every pass, the memory only when recalled.)
 
 0.5. **Check quota.** Run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
-   **Pick the BINDING window first.** `read-quota.py` reports two (5h and 7d). The binding one is
-   whichever is further ahead of even pace — usually 7d, because it cannot refill for days.
+   **Compute BOTH windows, then take the MOST RESTRICTIVE result.** `read-quota.py` reports two
+   (5h and 7d). Score each with the formulas below and adopt the **lower `headroom`** — do NOT pick
+   the window with the larger `burn`. Those select differently: a short window can show a huge `burn`
+   from one early burst while still holding more headroom than the window that actually limits you.
+   `5h` at 19% used / 2% elapsed gives `burn 9.50, headroom 0.827` (MEDIUM); `7d` at 90% used / 70%
+   elapsed gives `burn 1.29, headroom 0.333` (LIGHT). Selecting on `burn` picks the 5h window and
+   authorises MEDIUM work while the 7d pool — which cannot refill for days — is already LIGHT.
+   `burn` explains *how you got here*; `headroom` is what constrains what you may still do.
 
    **Pace against that window's OWN even pace, as a ratio.** Do NOT apply the absolute
    per-pass thresholds below to the 7d window: they are calibrated to the 5h window and on 7d they
@@ -84,7 +90,7 @@ Each pass, in order:
 
 Skip step 6 (end the pass early after step 3) if and only if one of these applies:
 
-- **(a) Quota**: per-pass budget is below the LIGHT threshold (<1%).
+- **(a) Quota**: the selected tier from step 0.5 is MINIMAL (i.e. the most-restrictive window has 0% remaining). A LIGHT tier does NOT skip step 6 — it caps its depth.
 - **(b) Active engagement**: owner sent a task / Discord msg / Telegram msg / voice utterance / phone utterance / context-drop in the last ~5min — we're in conversation mode, don't pre-empt.
 - **(c) Presenter/meeting mode**: `state/presenter-mode.sentinel` is active (set via `bash scripts/presenter-mode.sh start N`).
 - **(d) Explicit pause**: `state/loop-paused-until.sentinel` is active (future-dated).
