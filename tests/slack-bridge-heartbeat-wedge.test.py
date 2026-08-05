@@ -12,6 +12,20 @@ against fake handlers. Run: python3 tests/slack-bridge-heartbeat-wedge.test.py
 import re
 import types
 from pathlib import Path
+import os
+import tempfile
+
+# --- Hermetic isolation at MODULE level, BEFORE any bridge source is exec'd ---
+# (scripts/lint-hermetic-bridge-tests.py). Point CLAUDE_CONFIG_DIR at a SEEDED
+# temp dir so any bridge config resolution reads the temp channels/slack/access.json
+# instead of the operator's real ~/.claude tree.
+os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-token-wedge")
+os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-token-wedge")
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="wedge-test-ccd-")
+_ccd_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_ccd_cfg.mkdir(parents=True, exist_ok=True)
+(_ccd_cfg / "access.json").write_text('{"allowFrom": []}')
+# -----------------------------------------------------------------------------
 
 SRC_PATH = Path(__file__).resolve().parent.parent / "src" / "slack-bridge.py"
 SRC = SRC_PATH.read_text()
@@ -240,8 +254,6 @@ class _StubApp:
 def _load_bridge():
     os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-token-wedge")
     os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-token-wedge")
-    # Isolate config reads (access.json etc.) from the operator's real tree.
-    os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="wedge-test-cfg-")
     try:
         import slack_bolt as _real_bolt
         _real_bolt.App = _StubApp
