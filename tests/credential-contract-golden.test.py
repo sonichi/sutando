@@ -5,10 +5,12 @@ Owner-ratified narrow scope (Feature Haul 2026-08-05): the shared credential
 contract is PURE parsing/precedence only — consumers keep their runtime
 adapters. Three sections:
 
-  A. IDENTITY GUARD — skills/agent-room-ops/_credential_contract.py must be
-     byte-identical to the canonical
-     packages/ag2-sparrow/ag2_sparrow/gateway_credentials.py below the
-     4-line vendored header. Edit-one-place is machine-enforced.
+  A. GENERATED-COPY GUARD — tools/sync_gateway_credentials.py --check
+     regenerates both consumer copies from the canonical
+     shared/ag2_gateway_credentials.py and byte-compares (copies are checked
+     against fresh generation, not each other, so both drifting together
+     still fails). Plus the secret-leak guard: the token never appears in
+     GatewayCredentials repr/str.
 
   B. ROOM-OPS GOLDENS — the legacy `_gateway.gateway()` resolver's
      (base_url, token) frozen across the ratified env matrix, and compared
@@ -42,10 +44,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
-from ag2_sparrow.gateway_credentials import (  # noqa: E402
+sys.path.insert(0, str(REPO / "shared"))
+from ag2_gateway_credentials import (  # noqa: E402
     parse_onboarding_token, normalize_credentials, resolve_alias_precedence,
-    TOKEN_ALIAS_PRECEDENCE, URL_ALIAS_PRECEDENCE)
+    GatewayCredentials, TOKEN_ALIAS_PRECEDENCE, URL_ALIAS_PRECEDENCE)
 
 passed = failed = 0
 
@@ -57,15 +59,16 @@ def check(name, cond, detail=""):
     failed += not cond
 
 
-# ── A. vendored-copy identity guard ─────────────────────────────────────────
-canonical = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" /
-             "gateway_credentials.py").read_text()
-vendored_lines = (REPO / "skills" / "agent-room-ops" /
-                  "_credential_contract.py").read_text().splitlines(keepends=True)
-check("vendored header is exactly 4 lines of '#' comment",
-      len(vendored_lines) >= 4 and all(l.startswith("#") for l in vendored_lines[:4]))
-check("vendored copy byte-identical to canonical below the header",
-      "".join(vendored_lines[4:]) == canonical)
+# ── A. generated-copy guard (regenerate-then-diff) + secret-leak guard ─────
+sync = subprocess.run([sys.executable, str(REPO / "tools" / "sync_gateway_credentials.py"),
+                       "--check"], capture_output=True, text=True)
+check("sync --check: both generated copies match canonical",
+      sync.returncode == 0, detail=sync.stdout + sync.stderr)
+_c = GatewayCredentials(base_url="https://gw", token="SECRET-VALUE", source="env:GATEWAY_TOKEN")
+check("token never appears in repr (secret-leak guard)",
+      "SECRET-VALUE" not in repr(_c) and "SECRET-VALUE" not in str(_c), detail=repr(_c))
+check("source carries qualified origin, base_url visible in repr",
+      "env:GATEWAY_TOKEN" in repr(_c) and "https://gw" in repr(_c), detail=repr(_c))
 
 # ── B. room-ops goldens (legacy resolver frozen; contract compared) ─────────
 _spec = importlib.util.spec_from_file_location(
@@ -100,7 +103,7 @@ def contract_resolve(env: dict):
     explicit_url, _ = resolve_alias_precedence(env, ("GATEWAY_URL", "RELAY_URL",
                                                      "REMOTE_TASK_URL"))
     return normalize_credentials(raw, explicit_url=explicit_url,
-                                 source="env" if raw else "none")
+                                 source=f"env:{name}" if raw else "none")
 
 
 def golden(name, env, expect_same=True):
@@ -210,6 +213,38 @@ with tempfile.TemporaryDirectory() as td:
                          "REMOTE_TASK_URL": "https://gwe.example"})
     check("sparrow: env token beats device-env file",
           r.get("TOKEN") == "env-beats-file", detail=str(r))
+    # channel .env fallback (candidate 2: $CLAUDE_CONFIG_DIR/channels/ag2space/.env)
+    cfg = Path(td) / "cfgdir"
+    (cfg / "channels" / "ag2space").mkdir(parents=True)
+    (cfg / "channels" / "ag2space" / ".env").write_text(
+        "REMOTE_TASK_TOKEN=https://gwc.example|sekc\n")
+    r = sparrow_resolve({"CLAUDE_CONFIG_DIR": str(cfg)})
+    check("sparrow: channel .env fallback via CLAUDE_CONFIG_DIR",
+          r.get("URL") == "https://gwc.example" and r.get("TOKEN") == "sekc", detail=str(r))
+    r = sparrow_resolve({"AG2_DEVICE_ENV": str(dev_env), "CLAUDE_CONFIG_DIR": str(cfg)})
+    check("sparrow: AG2_DEVICE_ENV beats channel .env",
+          r.get("TOKEN") == "sekd", detail=str(r))
+
+# legacy-alias deprecation warning behavior (frozen: stderr, once)
+proc = subprocess.run([sys.executable, "-c", SPARROW_SNIPPET],
+                      env={"PATH": os.environ.get("PATH", ""),
+                           "PYTHONPATH": str(REPO / "packages" / "ag2-sparrow"),
+                           "HOME": os.environ.get("HOME", "/tmp"),
+                           "AG2_REMOTE_TOKEN": "legacy-tok",
+                           "AG2_REMOTE_URL": "https://gwl.example"},
+                      capture_output=True, text=True, timeout=30)
+check("sparrow: legacy alias emits deprecation warning on stderr",
+      "deprecated" in proc.stderr and "AG2_REMOTE_TOKEN" in proc.stderr,
+      detail=proc.stderr[-200:])
+
+# explicit REMOTE_TASK_TOKEN_FILE arms the rotation source
+with tempfile.TemporaryDirectory() as td2:
+    tokf = Path(td2) / "token.env"
+    tokf.write_text("REMOTE_TASK_TOKEN=https://gwr.example|sekr\n")
+    r = sparrow_resolve({"REMOTE_TASK_TOKEN": "https://gwr.example|sekr",
+                         "REMOTE_TASK_TOKEN_FILE": str(tokf)})
+    check("sparrow: explicit REMOTE_TASK_TOKEN_FILE preserved as rotation source",
+          r.get("TOKEN_FILE") == str(tokf), detail=str(r))
 
 print(f"\n{passed}/{passed + failed} passed")
 raise SystemExit(0 if failed == 0 else 1)
