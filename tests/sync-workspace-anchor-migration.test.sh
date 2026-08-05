@@ -72,3 +72,71 @@ ref "without the helper, no per-host copy exists after the deletion" \
     "[ -f '$WS2/hosts/test-host/current-track.md' ]"
 
 echo; echo "Total: $((pass+fail)) — pass: $pass, fail: $fail"; [ "$fail" -eq 0 ]
+
+# --- PHASE 2 REGRESSION (#2607, qingyun-wu review): --push-only must migrate too.
+#     `_migrate_flat_anchor` was called only from `_pull_only_impl`, but the hazard
+#     is `_enforce_carrier_set_pre` — which `--push-only` also runs. On a host whose
+#     anchor exists ONLY at the flat path, push-only untracked and committed the
+#     deletion and wrote no replacement: the sole carried copy, gone.
+#     Drives the REAL script end to end rather than calling the helper, because a
+#     direct-call test is what missed this the first time.
+PO_ROOT="$(mktemp -d -t anchor-pushonly.XXXXXX)"
+PO_REPO="$PO_ROOT/repo"; PO_WS="$PO_ROOT/ws"; PO_VAULT="$PO_ROOT/v.git"
+mkdir -p "$PO_REPO/scripts" "$PO_REPO/src" "$PO_WS/state" "$PO_REPO/skills"
+cp "$REPO/scripts/sync-workspace.sh" "$PO_REPO/scripts/"
+cp "$REPO/scripts/sutando-config.sh" "$PO_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh"  "$PO_REPO/scripts/"
+cp "$REPO/src/sutando_config.py"     "$PO_REPO/src/"
+cp "$REPO/sutando.config.json"       "$PO_REPO/"
+touch "$PO_REPO/CLAUDE.md"
+git init -q "$PO_REPO"; git init -q --bare "$PO_VAULT"
+printf '{"workspace": {"path": "%s"}}\n' "$PO_WS" > "$PO_REPO/sutando.config.local.json"
+# Pre-#2607 world: the anchor exists ONLY at the flat path, and no per-host copy.
+printf 'the only anchor\n' > "$PO_WS/state/current-track.md"
+# Set the PRIMARY var, not the legacy SUTANDO_HOST_OVERRIDE alias. Both are
+# honored (util_paths.py:113), so the alias is not dead — but it is LOWER
+# precedence, and this harness inherits the caller's environment. A shell that
+# already exports SUTANDO_HOST_LABEL (a real core session does) silently
+# outranks the alias we set here, so the fixture builds under the developer's
+# own host label instead of `pushonly-host` and the assertions below then look
+# like the FIX failing. Diagnosed by Sutando-Pro 2026-08-04, whose session
+# exported SUTANDO_HOST_LABEL=Chis-MacBook-Pro. Setting the top-precedence name
+# explicitly makes the fixture immune to whatever the caller exports.
+PO_ENV=(SUTANDO_HOST_LABEL=pushonly-host SUTANDO_WS_ID_OVERRIDE=po1
+        SUTANDO_SYNC_LOCK_DIR="$PO_ROOT/lock"
+        GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@e GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@e)
+
+# SETUP FAILURES MUST BE LOUD. These two commands build the fixture the three
+# assertions below measure; when they were `>/dev/null 2>&1 || true` a broken
+# setup was indistinguishable from a broken FIX, and the assertions reported
+# "the anchor was not carried" — which reads as the change under test failing.
+# That cost a reviewer an hour on 2026-08-04. Capture and surface instead.
+_po_run() {  # $1 = label, rest = args to sync-workspace.sh
+    local _label="$1"; shift
+    local _out _rc
+    _out=$(env "${PO_ENV[@]}" bash "$PO_REPO/scripts/sync-workspace.sh" "$@" 2>&1); _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        echo "FAIL: push-only fixture setup ($_label) exited $_rc — the assertions below measure a fixture that was never built:"
+        printf '%s\n' "$_out" | sed 's/^/      /'
+        fail=$((fail+1))
+    fi
+}
+_po_run "--init" --vault-url "$PO_VAULT" --init
+_po_run "--push-only" --push-only
+
+chk "push-only wrote the per-host anchor on disk" \
+    "[ -f '$PO_WS/hosts/pushonly-host/current-track.md' ]"
+chk "push-only CARRIED the per-host anchor (this is the durability claim)" \
+    "git -C '$PO_WS' ls-files --error-unmatch hosts/pushonly-host/current-track.md"
+chk "the rescued copy has the original content, not an empty placeholder" \
+    "grep -qFx 'the only anchor' '$PO_WS/hosts/pushonly-host/current-track.md'"
+# Control: the flat path is genuinely retired by this PR, so the test above is
+# proving a RESCUE and not merely that nothing changed.
+ref "flat state/current-track.md is no longer carried" \
+    "git -C '$PO_WS' ls-files --error-unmatch state/current-track.md"
+rm -rf "$PO_ROOT"
+
+echo
+echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"
+[ "$fail" -eq 0 ]
