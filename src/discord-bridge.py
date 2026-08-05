@@ -90,7 +90,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
-from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
 # depth 0). Only the immediate parent is inlined, so beyond this there is no
@@ -3350,7 +3350,15 @@ async def _handle_discord_message(message, force=False):
     # bot sees only the new reply text in isolation.
     reply_context = ""
     reply_chain_ids_line = ""   # `reply_chain_ids:` metadata (root-first) for thread reconstruction
-    if message.reference and message.reference.message_id:
+    # A forward sets `reference` too, and its target is in the SOURCE channel —
+    # fetching it here is a guaranteed 404 plus a misleading log line. The
+    # forward's body is not lost: the snapshot handler above already extracted
+    # it. (#2633 review: the first version gated only the header.)
+    if should_fetch_reply_context(
+        has_reference=bool(message.reference),
+        has_message_id=bool(message.reference and message.reference.message_id),
+        is_forward=bool(getattr(message, "message_snapshots", None)),
+    ):
         try:
             ref_msg = message.reference.resolved
             if ref_msg is None:
@@ -3829,14 +3837,20 @@ async def _handle_discord_message(message, force=False):
     # line into the task file's k:v shape (per qingyun review on #1077).
     channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
     guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
-    # When this message is a reply, emit the parent's id so the core agent can
+    # When this message is a REPLY, emit the parent's id so the core agent can
     # re-fetch the full original on demand rather than relying on the lossy
     # 400-char `[Replying to ...]` snippet. Mirrors how the official Claude
-    # Discord plugin works (reference by message_id + fetch).
-    parent_msg_line = (
-        f"parent_message_id: {message.reference.message_id}\n"
-        if getattr(message, "reference", None) and message.reference.message_id
-        else ""
+    # Discord plugin works (reference by message_id + fetch). A FORWARD also
+    # carries a reference — pointing into its SOURCE channel — so it is keyed
+    # separately; see `format_parent_reference`.
+    _ref = getattr(message, "reference", None)
+    parent_msg_line = format_parent_reference(
+        getattr(_ref, "message_id", None) if _ref else None,
+        # A forward sets `reference` too, so the key must not be decided by the
+        # reference alone. The snapshot IS the forward — same signal the
+        # forward-handler above already extracts the body from.
+        is_forward=bool(getattr(message, "message_snapshots", None)),
+        source_channel_id=getattr(_ref, "channel_id", None) if _ref else None,
     )
     # Full walked ancestor id spine (root-first) for thread reconstruction —
     # handles to re-fetch any ancestor the inlined chain clipped/dropped past
@@ -3991,21 +4005,106 @@ async def _handle_discord_message(message, force=False):
         await asyncio.sleep(0.5)
 
 
+def _approved_dirs() -> "list[Path]":
+    """Every directory an approval marker can legitimately arrive in.
+
+    The producer and the consumer disagreed on the path. The official plugin's
+    `access` skill hardcodes the vanilla home —
+    `claude-plugins-official/discord/0.0.4/skills/access/SKILL.md:73` mkdir's
+    the STOCK Claude home — while this bridge resolves through
+    `$CLAUDE_CONFIG_DIR`. They coincide on a default install and diverge on
+    every Sutando install that relocates the config dir, so the two sides look
+    at different directories with the same trailing shape.
+
+    so the confirmation was never sent. The user IS granted access (access.json
+    is a separate write) — they are simply never told, which reads to them as
+    still waiting. Reported by @Sutando-Mini as sonichi#2629.
+
+    Canonical first, legacy second, per CLAUDE.md's "Migration transition window
+    (30-day reader-fallback)". The bridge is not the wrong side here — reading
+    `$CLAUDE_CONFIG_DIR` is correct — but the plugin is upstream and pinned, so a
+    cross-repo fix has an unbounded landing time while this bug is live on every
+    relocated-config install. Ordering matters: a stale marker left in the vanilla
+    home must never shadow a fresh one in the canonical dir.
+    """
+    dirs = [ACCESS_FILE.parent / "approved"]
+    legacy = claude_home_path("channels", "discord", "approved", vanilla=True)
+    if legacy != dirs[0]:
+        dirs.append(legacy)
+    return dirs
+
+
 async def poll_approved():
-    """Poll approved/ dir and send 'you're in' confirmations."""
-    approved_dir = ACCESS_FILE.parent / "approved"
+    """Poll approved/ dirs and send 'you're in' confirmations."""
+    _legacy_warned = False
     while True:
         try:
-            if approved_dir.exists():
+            # One confirmation per SENDER per pass, not per file. The marker's
+            # filename IS the sender id, so the same id appearing in both the
+            # canonical and the legacy dir is one obligation recorded twice --
+            # a stale copy left in the vanilla home by an earlier grant. Sending
+            # from both DMs the user "You're in!" twice, the second time via a
+            # chat_id that is by then usually wrong. Canonical wins because it is
+            # first in `_approved_dirs()`.
+            _done: "set[str]" = set()
+            for _i, approved_dir in enumerate(_approved_dirs()):
+                if not approved_dir.exists():
+                    continue
                 for f in approved_dir.iterdir():
+                    if not f.is_file():
+                        continue
                     sender_id = f.name
-                    chat_id = f.read_text().strip()
+                    if sender_id in _done:
+                        # Consume the shadowed duplicate so it cannot resurface.
+                        f.unlink(missing_ok=True)
+                        continue
+                    # Per-entry try. The read used to sit in the OUTER try, so a
+                    # single unreadable entry aborted the scan of every remaining
+                    # marker in the directory and the loop just slept.
                     try:
+                        chat_id = f.read_text().strip()
                         channel = await client.fetch_channel(int(chat_id))
-                        await channel.send(f"You're in! Access approved.")
+                        await channel.send("You're in! Access approved.")
                         print(f"  Sent approval confirmation to {sender_id} in {chat_id}")
+                        if _i > 0 and not _legacy_warned:
+                            _legacy_warned = True
+                            print(
+                                f"  [approved] read from the LEGACY path {approved_dir} — "
+                                f"the official plugin still writes the stock Claude home; "
+                                f"canonical is {ACCESS_FILE.parent / 'approved'}",
+                                file=sys.stderr, flush=True,
+                            )
                     except Exception as e:
+                        # QUARANTINE, never delete. This marker file is the SOLE
+                        # record that a confirmation is owed — unlike
+                        # `poll_proactive`, where the file carries a message,
+                        # here the file IS the obligation. Deleting it on failure
+                        # loses the obligation, not merely the attempt.
+                        #
+                        # Quarantining rather than leaving it also avoids the 3s
+                        # hot loop: a permanently-invalid chat_id never becomes
+                        # valid, so an un-deleted marker would re-fail forever and
+                        # bury the log. Same resolution as sonichi#2626.
                         print(f"  Failed to send approval to {sender_id}: {e}")
+                        try:
+                            _undeliv = f.parent / "undelivered"
+                            _undeliv.mkdir(parents=True, exist_ok=True)
+                            f.rename(_undeliv / f.name)
+                            print(
+                                f"  [approved] kept at undelivered/{f.name} — "
+                                f"NOT deleted; a confirmation is still owed",
+                                flush=True,
+                            )
+                        except Exception as _mv_exc:
+                            # Leaving it in place is noisy; noise is recoverable
+                            # and deletion is not.
+                            print(
+                                f"  [approved] could not quarantine {f.name}: "
+                                f"{_mv_exc} — leaving it in place rather than losing it",
+                                flush=True,
+                            )
+                        continue
+                    _done.add(sender_id)
                     f.unlink(missing_ok=True)
         except Exception as e:
             print(f"  Approved poll error: {e}")
