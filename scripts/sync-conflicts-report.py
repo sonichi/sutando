@@ -53,13 +53,19 @@ def _new_content(saved: str, live: str) -> "list[str]":
     old line-count threshold was reaching for, without its blindness to a single
     real line.
     """
-    haystack = " ".join(live.split())
+    # Space-PADDED on both sides so the containment test lands on word
+    # boundaries. A raw substring search reports clean whenever a saved line
+    # happens to sit inside unrelated live text -- `The peer fact` is a
+    # substring of `The peer facts are documented elsewhere`, so a genuinely
+    # unmerged line was treated as present. That is a false CLEAN in the
+    # discriminator this PR exists to make trustworthy. (qingyun-wu, #2662.)
+    haystack = " " + " ".join(live.split()) + " "
     seen = set(live.splitlines())
     out = []
     for line in saved.splitlines():
         if not line.strip() or line in seen:
             continue
-        if " ".join(line.split()) in haystack:
+        if " " + " ".join(line.split()) + " " in haystack:
             continue  # same text, laid out differently
         out.append(line)
     return out

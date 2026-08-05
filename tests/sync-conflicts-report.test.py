@@ -93,6 +93,38 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("wrap.md", r.stdout)
         self.assertNotIn("indent.md", r.stdout)
 
+    def test_a_saved_line_that_is_a_PARTIAL_SUBSTRING_of_live_text_still_reports(self):
+        """The collision control (qingyun-wu, #2662).
+
+        The reflow check asks whether the saved line's text already exists in
+        the live copy. With a raw substring search, any saved line that happens
+        to sit inside unrelated live prose reads as "already merged":
+
+            saved  'The peer fact'
+            live   'The peer facts are documented elsewhere.'   -> false CLEAN
+
+        That is a false negative in the discriminator this whole PR exists to
+        make trustworthy. Matching is now space-padded on both sides, so
+        containment lands on word boundaries.
+        """
+        self._pair("collide.md",
+                   "The peer facts are documented elsewhere.\n",
+                   "The peer fact\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("collide.md", r.stdout)
+
+    def test_boundary_matching_does_not_break_the_REFLOW_case(self):
+        """The paired half: tightening the match must not start reporting
+        re-wrapped or re-indented text, which is what the check exists to
+        tolerate."""
+        self._pair("wrap2.md", "alpha beta gamma delta\n", "alpha beta\ngamma delta\n")
+        self._pair("indent2.md", "x = 1\n", "        x = 1\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("wrap2.md", r.stdout)
+        self.assertNotIn("indent2.md", r.stdout)
+
     def test_mixed_batch_reports_only_the_lossy_file(self):
         """The discrimination, exercised in one run rather than three."""
         self._pair("lost.md", "# a\n", "# a\n" + "\n".join(f"n{i}" for i in range(9)) + "\n")
