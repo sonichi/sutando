@@ -27,7 +27,7 @@ from pathlib import Path
 # python-o365 is imported LAZILY (see _require_o365 below), not at module level,
 # so `ms365.py --help` and argparse work even when the optional dependency isn't
 # installed. Only the commands that actually talk to Microsoft Graph pull it in.
-# requirements.txt pins O365<2.1.6 (the last line supporting the stock Python 3.9
+# requirements.txt pins O365<2.1.3 (the last line that imports on the stock Python 3.9
 # runtime), so the dependency imports on 3.9 — the lazy import is for graceful
 # behaviour when it's simply absent, not a version workaround.
 # ---------------------------------------------------------------------------
@@ -35,7 +35,7 @@ def _require_o365():  # pragma: no cover - live dependency; not unit-testable
     """Import python-o365, exiting with a helpful message if it can't load.
 
     Catches SyntaxError as well as ImportError defensively — if a mis-pinned or
-    too-new O365 (2.1.6+, which needs Python 3.10) is installed on a 3.9 host, a
+    too-new O365 (2.1.3+, which imports typing.TypeAlias) is installed on a 3.9 host, a
     SyntaxError on import becomes a clean 'reinstall from requirements' message
     instead of a traceback.
     """
@@ -45,8 +45,8 @@ def _require_o365():  # pragma: no cover - live dependency; not unit-testable
         sys.stderr.write(
             "Cannot load 'O365' (python-o365). Install it with:\n"
             "    pip install -r skills/ms365-connect/requirements.txt\n"
-            "(requirements pin O365<2.1.6 — the last line supporting Sutando's "
-            "stock Python 3.9 runtime; 2.1.6+ needs Python 3.10+.)\n"
+            "(requirements pin O365<2.1.3 — the last line that imports on Sutando's "
+            "stock Python 3.9 runtime; 2.1.3+ import typing.TypeAlias.)\n"
         )
         sys.exit(1)
     return Account, FileSystemTokenBackend
