@@ -10,12 +10,22 @@ class each:
   * a 5h projection longer than the time to the 5h reset is unreachable,
     because the window refills first.
 
-All 8 fail against the pre-fix implementation, but be precise about why: 7 raise
-`TypeError: _update_burn_rate() takes 1 positional argument but 4 were given`
-and one raises `KeyError: 'binding_window'`. That is a signature/shape failure,
-not a value comparison — the old function cannot be asked these questions at
-all. The behavioural evidence is the live before/after in the PR body, where the
-unmodified binary reports a horizon longer than its own window's reset.
+Running these against the pre-fix script is a weak control and should not be
+quoted as a strong one: `_update_burn_rate` gained three parameters, so every
+case dies on `TypeError` before an assertion runs. That proves coupling to the
+signature, not that a logic regression would be caught.
+
+The real control is mutation, at the new signature — each mutation must fail the
+cases that guard it, on a VALUE, and leave the rest untouched:
+
+  remove the reset clamp in `_window_horizon`
+      -> 3 failures, all AssertionError, all in the two clamp classes
+  never forecast 7d (`if False` on its horizon branch)
+      -> 3 failures, all AssertionError, all in TestSevenDayCanBind
+
+`seed()` asserts the result is non-None precisely so those land on values rather
+than on a downstream `NoneType` TypeError. A control that dies on a type error
+proves less than one that dies on a value.
 
 Module loading mirrors tests/quota-burn-rate.test.py.
 
@@ -81,7 +91,11 @@ class BindingWindowBase(unittest.TestCase):
     def seed(self, samples):
         """Feed (util_5h, util_7d) pairs one pass apart, back-dating history.
 
-        Three samples satisfy the >= 2 sample gate for both windows.
+        Three samples satisfy the >= 2 sample gate for both windows. The result
+        is asserted non-None here so that a regression which drops the forecast
+        entirely fails on the assertion below rather than on a downstream
+        `NoneType` TypeError — a control that dies on a type error proves less
+        than one that dies on a value.
         """
         result = None
         for i, (u5, u7) in enumerate(samples):
@@ -94,6 +108,7 @@ class BindingWindowBase(unittest.TestCase):
                 time.time() + self.RESET_5H_S,
                 time.time() + self.RESET_7D_S,
             )
+        self.assertIsNotNone(result, "no forecast produced at all")
         return result
 
 
@@ -108,6 +123,7 @@ class TestSevenDayCanBind(BindingWindowBase):
 
     def test_reported_horizon_is_the_smaller_of_the_two(self):
         r = self.seed(self.SAMPLES)
+        self.assertIsNotNone(r["estimated_passes_left"], "no horizon reported")
         five_h_only = ((1 - 0.06) * 100) / r["burn_rate_pct_per_pass"]
         self.assertLess(r["estimated_passes_left"], five_h_only)
         self.assertLessEqual(r["estimated_passes_left"], 7.0)
@@ -122,6 +138,30 @@ class TestSevenDayCanBind(BindingWindowBase):
         # delta is skipped; the 7d reading must still be folded in.
         r = self.seed([(0.80, 0.90), (0.90, 0.91), (0.02, 0.92)])
         self.assertIn("burn_rate_7d_pct_per_pass", r)
+
+
+class TestPastResetSuppressesTheForecast(BindingWindowBase):
+    """A reset already in the past means the state file is stale.
+
+    Found by Sutando-Pro on a node whose `quota-state.json` had not been
+    refreshed for 56.8 h (the core was not routed through the credential proxy,
+    sonichi/sutando#2417). Both reset epochs were then in the past, and the
+    pre-fix script forecast ~9,836 passes — 34 days — from three-day-old data.
+
+    The clamp suppresses this for free: `passes_until_reset` floors at 0.0 for a
+    past reset, so no projection can be less than it and every window returns
+    None. Pinned here because it is a second, independently-reachable defect
+    that this guard closes, and nothing else in the suite covers it.
+    """
+
+    RESET_5H_S = -3 * HOUR
+    RESET_7D_S = -56 * HOUR
+
+    def test_no_window_forecasts_from_a_past_reset(self):
+        r = self.seed([(0.09, 0.71), (0.10, 0.72), (0.11, 0.73)])
+        self.assertIsNone(r["binding_window"])
+        self.assertIsNone(r["estimated_passes_left"])
+        self.assertIsNone(r["estimated_minutes_left"])
 
 
 class TestForecastCannotOutrunItsOwnReset(BindingWindowBase):
