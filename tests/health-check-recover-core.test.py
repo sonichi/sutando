@@ -643,6 +643,94 @@ def case_t_unresolvable_host_label_reads_NOT_alive():
     return fails
 
 
+def case_w_every_three_state_branch_of_both_helpers():
+    """Direct branch coverage for the three-state helpers (#2160).
+
+    Cases t and v pin the DANGEROUS transitions. The Coverage Gate then showed
+    the rest of `_local_core_started_within` was never executed at all — only
+    its label-exception path — so most of the new contract was asserted by
+    inspection rather than by running it. Diff coverage read 82.3%, missing
+    src/health-check.py 6331-6332, 6878, 6888-6889, 6892-6897.
+
+    Each assertion is `is`, not truthiness: the whole point of three states is
+    that None and False are different, and `assert not x` cannot tell them
+    apart (which is exactly how case t stayed green over the bug).
+    """
+    import json as _json
+    import pathlib
+    import sys as _sys
+    import tempfile
+    import time as _t
+    from unittest import mock
+
+    fails = []
+    ws = pathlib.Path(tempfile.mkdtemp())
+    (ws / "state" / "cores").mkdir(parents=True)
+    _sys.path.insert(0, str(pathlib.Path(hc.__file__).resolve().parent))
+    import util_paths
+    label = util_paths._host_label()
+    alive = ws / "state" / "cores" / f"{label}.alive"
+
+    # --- _local_core_alive: OSError that is NOT FileNotFoundError -> UNKNOWN.
+    # A permission/IO error on a file that EXISTS is the case that must not read
+    # as dead. Patched rather than chmod-ed so it behaves the same on any host
+    # and as any user (a chmod test silently passes when running as root).
+    alive.write_text("{}")
+    real_stat = pathlib.Path.stat
+
+    def _boom_stat(self, *a, **k):
+        if self.name == alive.name:
+            raise PermissionError("simulated unreadable heartbeat")
+        return real_stat(self, *a, **k)
+
+    with mock.patch.object(pathlib.Path, "stat", _boom_stat):
+        got = hc._local_core_alive(ws)
+    if got is not None:
+        fails.append(f"w) an unreadable-but-PRESENT heartbeat returned {got!r}; must be None")
+
+    # --- _local_core_started_within, every branch ---
+    # stale mtime -> False (readable evidence of "not just booted")
+    alive.write_text(_json.dumps({"started_at": _t.time()}))
+    import os as _os
+    old = _t.time() - 500
+    _os.utime(alive, (old, old))
+    if hc._local_core_started_within(600, workspace=ws) is not False:
+        fails.append("w) a STALE heartbeat must read exactly False, not None")
+
+    # fresh + valid + recent started_at -> True (the happy path, never executed before)
+    now = _t.time()
+    alive.write_text(_json.dumps({"started_at": now - 10}))
+    if hc._local_core_started_within(600, workspace=ws, now=now) is not True:
+        fails.append("w) a fresh core booted 10s ago must read exactly True")
+
+    # fresh + valid + OLD started_at -> False
+    alive.write_text(_json.dumps({"started_at": now - 5000}))
+    if hc._local_core_started_within(600, workspace=ws, now=now) is not False:
+        fails.append("w) a core booted 5000s ago must read exactly False")
+
+    # undecodable payload -> UNKNOWN (the except (OSError, ValueError) clause)
+    alive.write_text("{ not json")
+    if hc._local_core_started_within(600, workspace=ws, now=now) is not None:
+        fails.append("w) an UNDECODABLE heartbeat must read None, not False")
+
+    # started_at missing / non-numeric -> UNKNOWN
+    for payload in ({}, {"started_at": "soon"}):
+        alive.write_text(_json.dumps(payload))
+        if hc._local_core_started_within(600, workspace=ws, now=now) is not None:
+            fails.append(f"w) started_at={payload!r} must read None — the boot time is unknown")
+
+    # absent file -> False (nothing booted here), distinct from unreadable
+    alive.unlink()
+    if hc._local_core_started_within(600, workspace=ws, now=now) is not False:
+        fails.append("w) an ABSENT heartbeat must read False (nothing booted), not None")
+
+    # now=None default path
+    alive.write_text(_json.dumps({"started_at": _t.time()}))
+    if hc._local_core_started_within(600, workspace=ws) is not True:
+        fails.append("w) the now=None default must resolve to wall-clock and read True")
+    return fails
+
+
 def case_v_an_unknown_probe_must_not_restart_a_healthy_core():
     """The paired unknown-state control john-the-dev asked for (#2160).
 
@@ -659,7 +747,9 @@ def case_v_an_unknown_probe_must_not_restart_a_healthy_core():
     and fixed versions, so a one-pass assertion is another test that cannot
     fail. The restart only appears after the confirm window elapses.
     """
-    import pathlib, sys as _sys, tempfile
+    import pathlib
+    import sys as _sys
+    import tempfile
     fails = []
     ws = pathlib.Path(tempfile.mkdtemp())
     (ws / "state" / "cores").mkdir(parents=True)
@@ -764,6 +854,7 @@ def main() -> int:
         ("s", case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet),
         ("t", case_t_unresolvable_host_label_reads_NOT_alive),
         ("v", case_v_an_unknown_probe_must_not_restart_a_healthy_core),
+        ("w", case_w_every_three_state_branch_of_both_helpers),
         ("u", case_u_peer_boot_does_not_suppress_local_recovery),
         ("j2", case_j2_dead_core_before_after_output),
         ("k", case_k_draining_backlog_never_restarts),
