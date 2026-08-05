@@ -25,6 +25,7 @@ unreadable status file yields `unknown`, never a crash. This is a read-only
 observer; it starts nothing and kills nothing.
 """
 import json
+import math
 import os
 import socket
 import subprocess
@@ -344,18 +345,42 @@ def _write_station_cache(path, data):
 
 
 def _cache_ts(x):
-    """A cache timestamp as a number, or None if missing/malformed. The cache is
-    a mutable workspace state file — it can be corrupted, synced, or hand-edited
-    — so NEVER do arithmetic on a value straight out of it (qingyun CR #2680: a
-    `"bad"` value_ts raised TypeError in derive(), which core-input-watch calls
-    unguarded every ~3s → killed the supervisor). bool is an int subclass in
-    Python, so exclude it explicitly."""
-    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+    """A cache timestamp as a FINITE number, or None if missing/malformed. The
+    cache is a mutable workspace state file — it can be corrupted, synced, or
+    hand-edited — so NEVER do arithmetic on a value straight out of it (qingyun
+    CR #2680: a `"bad"` value_ts raised TypeError in derive(), which
+    core-input-watch calls unguarded every ~3s → killed the supervisor). bool is
+    an int subclass in Python, so exclude it explicitly. NaN/±inf are floats but
+    poison every comparison — `(now - NaN) >= ttl` is always False, so a
+    `value_ts: NaN` would read as permanently FRESH and freeze the verdict
+    forever (qingyun CR #2680 round 2) — so require math.isfinite too."""
+    return (x if isinstance(x, (int, float)) and not isinstance(x, bool)
+            and math.isfinite(x) else None)
 
 
 def _cache_verdict(v):
-    """A tri-state verdict (True/False/None); anything else reads as None."""
-    return v if v in (True, False, None) else None
+    """A tri-state verdict (True/False/None); anything else reads as None. Use
+    IDENTITY, not `in (True, False, None)`: `1 == True` and `0 == False` in
+    Python, so membership would let an integer `1`/`0` masquerade as the bool
+    verdict and be returned unchanged, violating the bool|null field contract
+    (qingyun CR #2680 round 2)."""
+    return v if (v is True or v is False or v is None) else None
+
+
+def _fresh_age(now, value_ts, ttl):
+    """`now - value_ts` when the timestamp is plausibly fresh, else None.
+
+    "Fresh" = within `ttl` AND not implausibly in the future. The cache is synced
+    across hosts with independent clocks, so a corrupt/skewed record can carry a
+    far-future `value_ts`; a naive `(now - value_ts) < ttl` reads that as fresh
+    (age is very negative) and freezes the verdict indefinitely (qingyun CR #2680:
+    "revive an indefinitely stale availability verdict"). A small negative age is
+    tolerated as benign clock skew; anything more than `ttl` in the future is
+    treated as not-fresh (unknown)."""
+    age = now - value_ts
+    if age >= ttl or age < -ttl:
+        return None
+    return age
 
 
 def _station_cached(workspace, *, now=None, ttl=_STATION_TTL):
@@ -374,8 +399,8 @@ def _station_cached(workspace, *, now=None, ttl=_STATION_TTL):
     if value_ts is None:
         return None  # missing or malformed timestamp -> unknown
     t = now if now is not None else time.time()
-    if (t - value_ts) >= ttl:
-        return None  # expired — unknown, not a stale confident verdict
+    if _fresh_age(t, value_ts, ttl) is None:
+        return None  # expired OR implausibly-future -> unknown, not a stale verdict
     return _cache_verdict(cache.get("value"))
 
 
@@ -408,10 +433,10 @@ def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
     path = _station_cache_file(workspace)
     cache = _read_station_cache(path)
     value_ts = _cache_ts(cache.get("value_ts"))
-    if value_ts is not None and (now - value_ts) < ttl:
+    if value_ts is not None and _fresh_age(now, value_ts, ttl) is not None:
         return _cache_verdict(cache.get("value"))  # still FRESH — no re-probe
     attempt_ts = _cache_ts(cache.get("attempt_ts"))
-    if attempt_ts is not None and (now - attempt_ts) < cooldown:
+    if attempt_ts is not None and _fresh_age(now, attempt_ts, cooldown) is not None:
         return _cache_verdict(cache.get("value"))  # a recent attempt in flight
     _write_station_cache(path, {**cache, "attempt_ts": now})
     runner = probe or (lambda: _probe_station_bounded(deadline=deadline))

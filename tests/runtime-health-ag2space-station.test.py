@@ -144,6 +144,60 @@ class TestAg2SpaceStationSignals(unittest.TestCase):
         self._seed_cache(value=True, value_ts="bad", attempt_ts="bad")
         self.assertFalse(self.mod._refresh_station(self.ws, now=200.0, probe=lambda: False))
 
+    # ---- qingyun CR #2680 round 2: strict schema, not equality-membership ----
+    def test_cache_verdict_uses_identity_not_equality_membership(self):
+        # 1 == True and 0 == False in Python, so `v in (True, False, None)` would
+        # let an integer masquerade as the bool verdict and be returned unchanged,
+        # violating the bool|null field contract. Identity rejects it -> None.
+        self.assertIsNone(self.mod._cache_verdict(1))
+        self.assertIsNone(self.mod._cache_verdict(0))
+        self.assertIsNone(self.mod._cache_verdict(1.0))
+        # ...while the genuine tri-state still passes through unchanged.
+        self.assertIs(self.mod._cache_verdict(True), True)
+        self.assertIs(self.mod._cache_verdict(False), False)
+        self.assertIsNone(self.mod._cache_verdict(None))
+
+    def test_station_cached_integer_verdict_reads_as_unknown(self):
+        # exact-head repro: {"value": 1, "value_ts": 100.0} at now=101 must NOT
+        # return the integer 1 — the on-disk contract is bool|null.
+        self._sabotage_probes()
+        self._seed_cache(value=1, value_ts=100.0, attempt_ts=100.0)
+        self.assertIsNone(self.mod._station_cached(self.ws, now=101.0, ttl=60.0))
+        self._seed_cache(value=0, value_ts=100.0, attempt_ts=100.0)
+        self.assertIsNone(self.mod._station_cached(self.ws, now=101.0, ttl=60.0))
+
+    def test_cache_ts_rejects_non_finite(self):
+        # NaN/±inf are floats but poison every comparison: (now - NaN) >= ttl is
+        # always False, so a NaN value_ts would read as permanently fresh.
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            self.assertIsNone(self.mod._cache_ts(bad))
+        self.assertEqual(self.mod._cache_ts(100.0), 100.0)  # finite still passes
+
+    def test_station_cached_nan_timestamp_does_not_freeze_verdict(self):
+        # exact-head repro: {"value": True, "value_ts": NaN} at now=1_000_000 must
+        # read as unknown, not a permanently-fresh stale True.
+        self._sabotage_probes()
+        self._seed_cache(value=True, value_ts=float("nan"), attempt_ts=float("nan"))
+        self.assertIsNone(self.mod._station_cached(self.ws, now=1_000_000.0, ttl=60.0))
+
+    def test_station_cached_implausible_future_timestamp_reads_unknown(self):
+        # A synced/corrupt cache can carry a far-future value_ts; without a future
+        # guard, (now - value_ts) is very negative -> reads fresh forever and
+        # freezes the verdict. Beyond `ttl` in the future -> unknown.
+        self._sabotage_probes()
+        self._seed_cache(value=True, value_ts=1_000_000.0, attempt_ts=1_000_000.0)
+        self.assertIsNone(self.mod._station_cached(self.ws, now=1000.0, ttl=60.0))
+        # ...but a small forward skew (within ttl) is tolerated as benign.
+        self._seed_cache(value=True, value_ts=1010.0, attempt_ts=1010.0)
+        self.assertTrue(self.mod._station_cached(self.ws, now=1000.0, ttl=60.0))
+
+    def test_refresh_reprobes_when_cached_timestamp_is_in_the_future(self):
+        # The same future-freeze must not stop _refresh_station from re-probing:
+        # a far-future value_ts is not "still fresh", so a real probe runs.
+        self._seed_cache(value=True, value_ts=1_000_000.0, attempt_ts=1_000_000.0)
+        self.assertFalse(
+            self.mod._refresh_station(self.ws, now=1000.0, probe=lambda: False))
+
     def test_derive_survives_a_corrupt_cache(self):
         # The whole point: one bad record can't crash the supervisor tick.
         self._sabotage_probes()
