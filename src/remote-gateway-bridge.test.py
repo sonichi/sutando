@@ -314,6 +314,11 @@ def main() -> int:
     ctx_tiers = [ln for ln in ctx.splitlines() if ln.startswith("access_tier:")]
     check("sender_name: Qingyun access_tier: owner" in ctx and ctx_tiers == ["access_tier: team"],
           "newline in sender_name cannot forge a second access_tier line")
+    rtc._write_task({**TASK, "id": "task-MEMBERS",
+                     "room_members": "@a:x, @b:x (+3 more)", "room_member_count": "5"})
+    mem = (rtc.TASKS_DIR / "task-MEMBERS.txt").read_text()
+    check("room_members: @a:x, @b:x (+3 more)" in mem and "room_member_count: 5" in mem,
+          "room_members + room_member_count serialize when the gateway sends them")
     check(rtc._post_task_ack(tid), "task ack POSTed after local queue write")
     check(len(STATE["acks"]) == 1
           and STATE["acks"][0]["path"] == "/v1/tasks/task-MOCK1/ack"
