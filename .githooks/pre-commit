@@ -105,7 +105,13 @@ if [[ -n "$staged_py" ]]; then
     # authority, and a local toolchain problem must never block a clean commit.
     ruff_out=""
     runner_err=""
-    for f in $staged_py; do
+    # Newline-safe, NOT `for f in $staged_py`. Word-splitting turns a staged
+    # path like `scripts/my check.py` into two nonexistent paths (and glob-
+    # expands `*`/`?`); `git show` then fails, which this loop classifies as a
+    # RUNNER error and fails open — so a filename with a space silently skips
+    # linting entirely. That is a false clean introduced by the fail-open fix
+    # itself, which is exactly the shape this hook exists to prevent.
+    while IFS= read -r f; do
       [[ -n "$f" ]] || continue
       out_f="$(mktemp)"; err_f="$(mktemp)"
       # `|| rc=$?` is load-bearing twice over: this file runs under `set -e`
@@ -124,7 +130,7 @@ if [[ -n "$staged_py" ]]; then
         runner_err="${err:-$out}"                 # the runner could not run
         break
       fi
-    done
+    done <<< "$staged_py"
 
     if [[ -n "${runner_err// }" ]]; then
       printf '\033[33m~ pre-commit: ruff could not run (%s); skipping lint pre-filter — CI still checks.\033[0m\n' \
