@@ -16,8 +16,12 @@ DEFAULT_LIMIT = 20
 MAX_LIMIT = 100
 
 
-def _result(ok, messages=None, reason=None, room_id=None):
-    return {"ok": bool(ok), "room_id": room_id, "reason": reason, "messages": messages or []}
+def _result(ok, messages=None, reason=None, room_id=None, complete=None):
+    # `complete` is False when the raw-event window was still growing when we stopped, so a
+    # caller can tell "this room is quiet" from "I did not look far enough". None on error
+    # paths, where the question does not arise.
+    return {"ok": bool(ok), "room_id": room_id, "reason": reason, "messages": messages or [],
+            "complete": complete}
 
 
 def _normalize(items):
@@ -52,20 +56,59 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     base, headers = gateway()
     if not base:
         return _result(False, reason="no gateway configured", room_id=room_id)
-    params = {"limit": limit}
-    if before:
-        params["before"] = before
-    url = f"{base}/v1/rooms/{quote(room_id)}/messages?" + urlencode(params)
-    try:
+    # `limit` here means MESSAGES, but the gateway applies its limit to RAW TIMELINE
+    # EVENTS and only some of those are messages — reactions, receipts, membership and
+    # media events all consume the budget. Measured on a live room 2026-08-05:
+    #
+    #     limit=  4 ->  0 messages      <- ok:true, no error, reads as an empty room
+    #     limit= 10 ->  1
+    #     limit= 20 ->  8
+    #     limit= 40 -> 14
+    #     limit=100 -> 14               <- history exhausted
+    #
+    # Nine non-message events sat in front of the newest message, so a caller asking for
+    # the last few messages got a confident, silent ZERO. That is the dangerous shape: a
+    # small limit is exactly what a cheap "has anyone replied yet?" probe passes, and the
+    # answer it gets back is indistinguishable from a genuinely quiet room.
+    #
+    # So widen the raw window until we actually hold `limit` messages, the server stops
+    # producing new ones (history exhausted), or MAX_LIMIT is reached. Each response is a
+    # superset of the previous one — the window only grows — so the last one is the answer.
+    import json
+
+    def _fetch(raw_limit):
+        params = {"limit": raw_limit}
+        if before:
+            params["before"] = before
+        url = f"{base}/v1/rooms/{quote(room_id)}/messages?" + urlencode(params)
         _, body, _h = http_request("GET", url, headers)
+        parsed = json.loads(body.decode("utf-8") or "{}")
+        items = parsed.get("messages") if isinstance(parsed, dict) else parsed
+        return _normalize(items)
+
+    raw = limit
+    messages, previous, exhausted = [], -1, False
+    try:
+        while True:
+            messages = _fetch(raw)
+            if len(messages) >= limit:
+                break
+            if len(messages) == previous:
+                exhausted = True          # a wider window returned nothing new
+                break
+            if raw >= MAX_LIMIT:
+                break
+            previous = len(messages)
+            raw = min(MAX_LIMIT, max(raw * 3, raw + 10))
     except HTTPError as e:
         return _result(False, reason=degrade_reason(e.code), room_id=room_id)
     except (URLError, TimeoutError) as e:
         return _result(False, reason=f"network error: {e}", room_id=room_id)
-    import json
-    try:
-        parsed = json.loads(body.decode("utf-8") or "{}")
     except ValueError as e:
         return _result(False, reason=f"parse error: {e}", room_id=room_id)
-    items = parsed.get("messages") if isinstance(parsed, dict) else parsed
-    return _result(True, _normalize(items), room_id=room_id)
+
+    # `complete` is the half that makes a short result readable. Without it, "3 messages"
+    # cannot be told apart from "3 messages AND we stopped looking", which is the same
+    # ambiguity that made the zero above so misleading.
+    complete = exhausted or len(messages) >= limit
+    return _result(True, messages[:limit], room_id=room_id, complete=complete)
