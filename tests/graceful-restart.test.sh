@@ -300,6 +300,50 @@ else
   say FAIL "$decisions restart decisions after a lease loss — concurrent destructive restart: $(grep -h 'would exec\|lost the restart lease' "$TMP/ws10_A.out" "$TMP/ws10_B.out" 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
 fi
 
+echo "11. lost-lease holder → exit 4 (NOT 1), and the foreign lock is PRESERVED"
+# cleanup_lock used to end in `own_lock && rm -rf "$LOCKDIR"`, whose status IS the
+# function's status. On the lease-loss path the lock is no longer ours, so that is
+# FALSE, and bash takes the EXIT trap's status as the script's — turning the
+# documented `exit 4` defer into 1. A supervisor branching on 4 sees a crash.
+WS11="$TMP/ws11"; mkws "$WS11"
+printf '{"status":"running","step":"busy","ts":%s}\n' "$(date +%s)" > "$WS11/state/core-status.json"
+( GR_WS="$WS11" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run > "$TMP/ws11.out" 2>&1; echo $? > "$TMP/ws11.rc" ) &
+gr11=$!
+LOCK11="$WS11/state/locks/graceful-restart.lock"
+for _ in $(seq 1 60); do [ -f "$LOCK11/rid" ] && break; sleep 0.2; done
+echo "some-other-holder" > "$LOCK11/rid"        # reaper took the lease out from under us
+wait "$gr11" 2>/dev/null || true
+rc11="$(cat "$TMP/ws11.rc" 2>/dev/null || echo missing)"
+[ "$rc11" = 4 ] && say ok "lease-loss exits 4" \
+  || say FAIL "lease-loss exits 4 (got $rc11) — the EXIT trap replaced the explicit status"
+grep -q "lost the restart lease" "$TMP/ws11.out" \
+  && say ok "lease-loss logged its reason" || say FAIL "lease-loss logged its reason: $(cat "$TMP/ws11.out" | tr '\n' ' ' | cut -c1-160)"
+[ -d "$LOCK11" ] && say ok "the foreign lock is left alone" \
+  || say FAIL "the foreign lock was deleted — a run that lost the lease must not free the new holder's lock"
+
+echo "12. direct TERM → exit 143 (NOT 1), while still removing our OWN lock"
+# Two distinct failures met here, and the second is why an owned-lock fixture is
+# required: (a) `trap 'cleanup_lock; exit 143' TERM` under `set -e` aborts at a
+# non-zero cleanup_lock, so `exit 143` is never reached; (b) even when cleanup
+# SUCCEEDS, `exit 143` re-fires the EXIT trap, which runs cleanup_lock a SECOND
+# time against a lock it just deleted — own_lock is now false, status 1, and it
+# overrides the 143. Verified 1 -> 143 across this exact fixture.
+WS12="$TMP/ws12"; mkws "$WS12"
+printf '{"status":"running","step":"busy","ts":%s}\n' "$(date +%s)" > "$WS12/state/core-status.json"
+( GR_WS="$WS12" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run > "$TMP/ws12.out" 2>&1; echo $? > "$TMP/ws12.rc" ) &
+gr12=$!
+LOCK12="$WS12/state/locks/graceful-restart.lock"
+for _ in $(seq 1 60); do [ -f "$LOCK12/rid" ] && break; sleep 0.2; done
+# TERM the script itself, not the subshell wrapper.
+gr12_pid="$(pgrep -P "$gr12" -f "graceful-restart.sh" | head -1)"
+[ -n "$gr12_pid" ] && kill -TERM "$gr12_pid" 2>/dev/null
+wait "$gr12" 2>/dev/null || true
+rc12="$(cat "$TMP/ws12.rc" 2>/dev/null || echo missing)"
+[ "$rc12" = 143 ] && say ok "TERM exits 143" \
+  || say FAIL "TERM exits 143 (got $rc12) — set -e aborted the trap, or the re-fired EXIT trap overrode it"
+[ ! -d "$LOCK12" ] && say ok "our own lock is released on TERM" \
+  || say FAIL "our own lock survived TERM — cleanup must not be skipped to make the exit code right"
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else

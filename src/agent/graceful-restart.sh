@@ -133,6 +133,18 @@ cleanup_lock() {
   # core is expected to be serving long before LOCK_STALE_S elapses.
   [ "$RESTART_DECIDED" = 1 ] && return 0
   own_lock && rm -rf "$LOCKDIR"
+  # ALWAYS succeed. Cleanup is best-effort: the lock being already gone, or
+  # belonging to a reaper, is a normal outcome — not this run's exit status.
+  #
+  # Without this the function's status is `own_lock && rm -rf`, which is FALSE
+  # whenever the lock isn't ours, and that leaks into the caller two ways
+  # (qingyun-wu, #2334; both reproduced before fixing):
+  #   - EXIT trap: bash takes the trap's last status, so the documented
+  #     `exit 4` defer became 1.
+  #   - TERM trap: `cleanup_lock; exit 143` under `set -e` aborts at
+  #     cleanup_lock, so `exit 143` is NEVER REACHED and the shell exits 1.
+  # Both are exactly the paths a supervisor branches on.
+  return 0
 }
 
 # Do we still hold the lease we took? The lock directory can be reaped out from
