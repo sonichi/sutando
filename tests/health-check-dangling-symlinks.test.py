@@ -76,6 +76,47 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         self.assertIn("dangling", r["detail"])
         self.assertEqual(r["_broken"], ["alpha"])
 
+    def test_real_directory_is_not_reported_as_linked(self):
+        """The fourth state. A real dir where a symlink belongs fell through
+        BOTH branches into "healthy": `is_symlink()` False, `exists()` True.
+
+        It is not a link -- it is a copy, so `git pull` never reaches it and the
+        running skill diverges silently. Observed live 2026-08-05: `x-twitter`
+        had been a real dir since Jul 17, 11 days behind the repo, while the
+        probe reported "all 60 skills linked".
+        """
+        self._skill("alpha")
+        real = self.dst / "alpha"
+        real.mkdir()
+        (real / "SKILL.md").write_text("# stale copy\n")
+        r = self.hc.check_skill_symlinks()
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertEqual(r["_shadowed"], ["alpha"])
+        self.assertIn("real dir", r["detail"])
+
+    def test_shadowed_is_reported_but_NOT_auto_fixed(self):
+        """--fix must not clobber it: a real dir may be an intentional local
+        install someone is editing. Same reason refresh-skill.sh refuses."""
+        self._skill("alpha")
+        real = self.dst / "alpha"
+        real.mkdir()
+        (real / "SKILL.md").write_text("# local edits\n")
+        (real / "LOCAL_ONLY.txt").write_text("do not lose me\n")
+        r = self.hc.check_skill_symlinks()
+        self.hc.fix_skill_symlinks(r)
+        self.assertFalse((self.dst / "alpha").is_symlink(),
+                         "--fix replaced a real dir with a symlink")
+        self.assertTrue((real / "LOCAL_ONLY.txt").exists(),
+                        "--fix destroyed local-only content")
+
+    def test_a_healthy_symlink_is_NOT_flagged_as_shadowed(self):
+        """Control: without this, a fix that flags everything would pass above."""
+        self._skill("alpha")
+        (self.dst / "alpha").symlink_to(self.src / "alpha")
+        r = self.hc.check_skill_symlinks()
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertEqual(r.get("_shadowed", []), [])
+
     def test_healthy_link_still_ok(self):
         self._skill("alpha")
         (self.dst / "alpha").symlink_to(self.src / "alpha")

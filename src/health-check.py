@@ -4483,6 +4483,22 @@ def check_skill_symlinks() -> dict:
     # invisible AND reported healthy. Tracked as #2213.
     unlinked: list[str] = []   # no entry at all -> symlink_to() works
     broken: list[str] = []     # dangling link  -> must be unlinked first
+    # A REAL DIRECTORY where a symlink belongs is a fourth state this check did
+    # not model, and it fell through both branches below into "healthy":
+    # `is_symlink()` is False and `exists()` is True, so neither condition
+    # matched and the skill counted as linked.
+    #
+    # It is not linked. It is a COPY, so `git pull` never reaches it and the
+    # running skill diverges from the repo silently and permanently. Both
+    # repair paths decline by design: refresh-skill.sh prints "skip <name>
+    # (not a symlink -- won't clobber a local/copy install)" and install.sh
+    # skips-on-elsewhere, so nothing ever converts it back.
+    #
+    # Observed on Chis-MacBook-Pro 2026-08-05: `x-twitter` had been a real
+    # directory since Jul 17 and was 11 days behind the repo, while this probe
+    # reported "all 60 skills linked". The drift was one ruff E401 import split
+    # -- harmless that time, which is exactly why it survived unnoticed.
+    shadowed: list[str] = []   # real dir where a symlink belongs -> NOT auto-fixed
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
             continue
@@ -4498,6 +4514,8 @@ def check_skill_symlinks() -> dict:
             broken.append(skill_name)
         elif not dst.exists() and not dst.is_symlink():
             unlinked.append(skill_name)
+        elif dst.is_dir() and not dst.is_symlink():
+            shadowed.append(skill_name)
 
     # Dangling links whose skill is NOT in this repo are missed by the loop
     # above, which only walks repo skills. They are still dead entries that make
@@ -4516,7 +4534,7 @@ def check_skill_symlinks() -> dict:
     except OSError:
         pass
 
-    if not unlinked and not broken and not orphaned:
+    if not unlinked and not broken and not orphaned and not shadowed:
         return {"name": name, "status": "ok", "detail": f"all {sum(1 for d in skills_src.iterdir() if d.is_dir())} skills linked"}
 
     parts = []
@@ -4526,6 +4544,12 @@ def check_skill_symlinks() -> dict:
         parts.append(f"{len(unlinked)} unlinked: {', '.join(unlinked[:4])}{'...' if len(unlinked) > 4 else ''}")
     if orphaned:
         parts.append(f"{len(orphaned)} dangling not in this repo: {', '.join(orphaned[:4])}{'...' if len(orphaned) > 4 else ''}")
+    if shadowed:
+        parts.append(
+            f"{len(shadowed)} a real dir, not a link (diverges silently; "
+            f"`ln -sfn` to re-track, but check for local edits first): "
+            f"{', '.join(shadowed[:4])}{'...' if len(shadowed) > 4 else ''}"
+        )
 
     return {
         "name": name,
@@ -4534,6 +4558,11 @@ def check_skill_symlinks() -> dict:
         "_unlinked": unlinked,
         "_broken": broken,
         "_orphaned": orphaned,
+        # Deliberately NOT consumed by fix_skill_symlinks(): a real directory may
+        # be an intentional local install someone is editing, and replacing it
+        # with a symlink would discard that work silently. Reported only --
+        # the same reason refresh-skill.sh refuses to touch it.
+        "_shadowed": shadowed,
         "_skills_src": str(skills_src),
         "_skills_dst": str(skills_dst),
     }
