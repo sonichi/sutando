@@ -139,6 +139,82 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("wrap.md", r.stdout)
         self.assertNotIn("indent.md", r.stdout)
 
+    def test_SWAPPED_SECTIONS_are_reported(self):
+        """john-the-dev's #2662 blocker: a policy inversion read as clean.
+
+        Every line and every heading appears on BOTH sides — only the
+        ASSOCIATION between them changed. A global line set and a global
+        normalised haystack prove text exists somewhere and discard order and
+        heading association entirely, so an access-policy inversion was
+        completely unmerged while the reporter exited 0.
+
+            live:   ## Allowed / - Alice / ## Denied / - Bob
+            saved:  ## Allowed / - Bob   / ## Denied / - Alice
+
+        (`_pair` takes live FIRST, then saved — the inversion is symmetric, so
+        the direction does not change the assertion, but the labels should not
+        lie about which side is which.)
+
+        This is the reason presence is now keyed to the nearest preceding
+        heading. No set-membership test can see it.
+        """
+        self._pair("access.md",
+                   "## Allowed\n- Alice\n## Denied\n- Bob\n",
+                   "## Allowed\n- Bob\n## Denied\n- Alice\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)   # 1 == found unmerged content
+        self.assertIn("access.md", r.stdout)
+
+    def test_the_same_KEY_under_DIFFERENT_sections_is_reported(self):
+        """The generalisation john named alongside the swap.
+
+        Repeated keys/bullets under different headings fail identically: both
+        values are globally present, so only the section binding distinguishes
+        `key: A` under Prod from `key: A` under Dev.
+        """
+        self._pair("cfg.md",
+                   "## Prod\nkey: A\n## Dev\nkey: B\n",
+                   "## Prod\nkey: B\n## Dev\nkey: A\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)   # 1 == found unmerged content
+        self.assertIn("cfg.md", r.stdout)
+
+    def test_a_REFLOW_inside_one_section_is_still_NOT_reported(self):
+        """The paired negative for the section fix.
+
+        Section-scoping must not resurrect the false POSITIVE the reflow
+        negative exists to prevent: re-wrapping within a heading still resolves
+        to present, because each section gets its own normalised haystack.
+        """
+        self._pair("wrapsec.md", "## S\nalpha beta gamma\n", "## S\nalpha beta\ngamma\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("wrapsec.md", r.stdout)
+
+    def test_a_RENAMED_heading_does_not_report_the_whole_body(self):
+        """The documented fallback, pinned so it cannot silently change.
+
+        If the saved line's heading is absent from live, strict section
+        matching would report every line beneath a renamed heading — a
+        false-positive class these files hit constantly. The fallback is the
+        global haystack for those lines.
+
+        Measured behaviour, and the assertion is deliberately about the BODY:
+        `## Notes` -> `## Note` reports the heading line (its text really is
+        absent) and stays quiet about `- x` beneath it. A test that merely
+        asserted "file not reported" would be wrong — the file IS reported,
+        for the heading. What must not happen is the body coming with it.
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rep", SCRIPT)
+        rep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rep)
+        got = rep._new_content("## Notes\n- x\n", "## Note\n- x\n")
+        self.assertIn("## Notes", got, "the renamed heading itself should report")
+        self.assertNotIn("- x", got,
+                         "the body under a renamed heading must NOT be reported — "
+                         "its text is present in the live copy")
+
     def test_a_saved_line_that_is_a_PARTIAL_SUBSTRING_of_live_text_still_reports(self):
         """The collision control (qingyun-wu, #2662).
 

@@ -46,13 +46,59 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent  # lint-workspace-resoluti
 sys.path.insert(0, str(ROOT / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+
+
+def _by_section(text: str):
+    """Yield (heading, line) for every line, heading = nearest one ABOVE it.
+
+    A heading line's own context is itself, so a renamed heading is detected
+    like any other changed line. Lines before the first heading get "".
+    """
+    head = ""
+    for line in text.splitlines():
+        if _HEADING_RE.match(line):
+            head = " ".join(line.split())
+        yield head, line
+
+
 def _new_content(saved: str, live: str) -> "list[str]":
-    """Lines in the preserved copy whose TEXT is absent from the live copy.
+    """Lines in the preserved copy whose TEXT is absent from the live copy
+    IN THE SAME SECTION.
 
     Whitespace-normalised on both sides, so re-wrapping, re-indenting and
     trailing-space churn all resolve to "already present" — the reflow case the
     old line-count threshold was reaching for, without its blindness to a single
     real line.
+
+    SECTION-SCOPED, and that is the fix for john-the-dev's #2662 blocker. The
+    previous version tested presence against a GLOBAL line set and a global
+    normalised haystack, which proves the text exists SOMEWHERE and discards
+    order and heading association entirely. A peer access-policy change was
+    therefore invisible:
+
+        saved:  ## Allowed / - Alice / ## Denied / - Bob
+        live:   ## Allowed / - Bob   / ## Denied / - Alice
+        -> []            every line is present globally; the POLICY inverted
+
+    Both names and both headings appear on both sides, so a set-membership test
+    can never see it. Keying each line to its nearest preceding heading does,
+    and it generalises to the repeated-keys-under-different-sections case from
+    the same review.
+
+    Two limits, stated because a discriminator whose blind spots are unwritten
+    is the thing this PR exists to stop being:
+
+      * If the saved line's heading is ABSENT from live (a renamed or deleted
+        section) the check falls back to the global search for that line. A
+        rename would otherwise report every line beneath it as unmerged, which
+        is a false-positive class these files would hit constantly. Measured,
+        `## Notes` -> `## Note` reports the HEADING line only (its text really
+        is absent) and correctly stays quiet about the body beneath it. The
+        cost is that a rename AND a swap together can still hide.
+      * Pure REORDERING of identical lines within one section is not detected —
+        both sides hold the same (heading, line) pairs. Sequence-preservation
+        would catch it; section context is the axis this fix chose.
     """
     # Space-PADDED on both sides so the containment test lands on word
     # boundaries. A raw substring search reports clean whenever a saved line
@@ -60,13 +106,29 @@ def _new_content(saved: str, live: str) -> "list[str]":
     # substring of `The peer facts are documented elsewhere`, so a genuinely
     # unmerged line was treated as present. That is a false CLEAN in the
     # discriminator this PR exists to make trustworthy. (qingyun-wu, #2662.)
-    haystack = " ".join(live.split())
-    seen = set(live.splitlines())
+    haystack = " ".join(live.split())          # global fallback (renamed section)
+    live_pairs = set()
+    live_lines_by_section: "dict[str, list[str]]" = {}
+    for head, line in _by_section(live):
+        live_pairs.add((head, line))
+        live_lines_by_section.setdefault(head, []).append(line)
+    # One normalised haystack PER section, so the reflow negative keeps working
+    # inside a section without letting text from another section vouch for a
+    # line that moved out of this one.
+    live_haystacks = {
+        h: " ".join(" ".join(ls).split()) for h, ls in live_lines_by_section.items()
+    }
     out = []
-    for line in saved.splitlines():
-        if not line.strip() or line in seen:
+    for head, line in _by_section(saved):
+        if not line.strip() or (head, line) in live_pairs:
             continue
         needle = " ".join(line.split())
+        # Section present in live -> judge strictly within it. Section absent
+        # (renamed/deleted) -> fall back to the global haystack rather than
+        # reporting every line beneath a renamed heading. Bound to a LOCAL name:
+        # rebinding `haystack` here would leak one section's scope into every
+        # later iteration.
+        hay = live_haystacks.get(head, haystack)
         # Boundary = a NON-WORD character (or the string edge), not specifically
         # a space. Space-padding was the first attempt and it over-tightened: a
         # live line that gained trailing punctuation or was extended mid-sentence
@@ -80,7 +142,7 @@ def _new_content(saved: str, live: str) -> "list[str]":
         # `\w` boundaries keep qingyun-wu's collision case reported --
         # `The peer fact` inside `The peer facts` is followed by `s`, a word
         # character -- while treating punctuation as a legitimate boundary.
-        if re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack):
+        if re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", hay):
             continue  # same text, laid out differently
         out.append(line)
     return out
