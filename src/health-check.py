@@ -1833,6 +1833,13 @@ def _checkout_is_canonical(repo_dir) -> tuple:
     return (True, "clean + on main")
 
 
+# Printed when an owner alert could not be delivered. A distinct, greppable
+# token so an operator or log monitor can distinguish "the owner was told" from
+# "we printed something locally and the send quietly failed" — the two used to
+# look identical (#2316).
+ALERT_UNDELIVERED_MARKER = "ALERT-UNDELIVERED"
+
+
 def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None) -> list:
     """Restart or alert on configured-but-not-running channel bridges.
 
@@ -1882,10 +1889,24 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None) -> l
 
     def _alert(msg: str) -> None:
         print(f"  {msg}")
+        # The sender signals failure by RETURNING False, not by raising:
+        # `_default_slack_sender` returns False when the owner's creds are
+        # absent or any Slack API call fails. Discarding that return made
+        # `down_bridge_action=alert` a no-op wherever Slack isn't working —
+        # it printed locally, called a sender that quietly failed, and left
+        # nothing an operator or monitor could act on. That is precisely the
+        # silent-failure shape this check exists to catch, occurring inside
+        # the check itself. (qingyun-wu, independently confirmed by
+        # bassilkhilo-ag2 against the source, #2316.)
+        #
+        # Still fail-safe: a broken alerter must never break the health run,
+        # so an exception is caught and treated as undelivered, not raised.
         try:
-            send(msg)
+            delivered = bool(send(msg))
         except Exception:  # noqa: BLE001 — alerting must never break the check
-            pass
+            delivered = False
+        if not delivered:
+            print(f"  {ALERT_UNDELIVERED_MARKER}: owner was NOT alerted — {msg}")
 
     restarted = []
     for c in checks:

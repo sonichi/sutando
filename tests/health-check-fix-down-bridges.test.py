@@ -463,6 +463,60 @@ def case_v_alert_send_failure_is_swallowed() -> list[str]:
     return fails
 
 
+def case_w_alert_undelivered_is_observable() -> list[str]:
+    """A sender that RETURNS False (not raises) must be observable.
+
+    `_default_slack_sender` reports failure by returning False — missing owner
+    creds, or any Slack API call failing. `_alert` used to call `send(msg)` as
+    a bare statement and discard that, so on any host without a working Slack
+    bridge `action=alert` printed locally, silently failed to deliver, and left
+    NOTHING distinguishing it from a delivered alert. Found by qingyun-wu,
+    confirmed against the source by bassilkhilo-ag2 (#2316).
+
+    Asserts BOTH directions — a marker that is always printed would pass a
+    one-sided check while telling an operator nothing.
+    """
+    import io
+    import contextlib
+
+    fails = []
+    checks = [check("discord-bridge", "warn", "configured but not running")]
+
+    # 1. sender returns False -> marker present
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: False)
+    out_false = buf.getvalue()
+    if hc.ALERT_UNDELIVERED_MARKER not in out_false:
+        fails.append(
+            "w) a sender returning False produced no "
+            f"{hc.ALERT_UNDELIVERED_MARKER} signal: {out_false!r}"
+        )
+
+    # 2. CONTROL: sender returns True -> marker absent
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert", sender=lambda _m: True)
+    out_true = buf.getvalue()
+    if hc.ALERT_UNDELIVERED_MARKER in out_true:
+        fails.append(
+            f"w) a DELIVERED alert wrongly printed {hc.ALERT_UNDELIVERED_MARKER}: {out_true!r}"
+        )
+
+    # 3. a RAISING sender is undelivered too — same observable signal, and it
+    #    still must not propagate (case_v pins the non-propagation).
+    def boom(_m):
+        raise RuntimeError("slack unreachable")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_with_popen_stub(checks, action="alert", sender=boom)
+    if hc.ALERT_UNDELIVERED_MARKER not in buf.getvalue():
+        fails.append("w) a RAISING sender produced no undelivered signal")
+
+    return fails
+
+
 def case_o_action_off_is_noop() -> list[str]:
     """down_bridge_action="off": never restart, never alert (return [])."""
     fails = []
@@ -606,7 +660,8 @@ def main() -> int:
                  case_s_checkout_is_canonical,
                  case_t_resolve_down_bridge_action,
                  case_u_defaults_from_config_and_module,
-                 case_v_alert_send_failure_is_swallowed):
+                 case_v_alert_send_failure_is_swallowed,
+                 case_w_alert_undelivered_is_observable):
         fails = case()
         status = "PASS" if not fails else "FAIL"
         print(f"  {status} {case.__name__}")
