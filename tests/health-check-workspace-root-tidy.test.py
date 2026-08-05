@@ -11,7 +11,9 @@ Found on a live host: `.last-pq-notify` and `.voice-agent.pid` had accumulated
 at the root, in none of the 23 existing probes and none of the migrator's five
 names.
 """
-import importlib.util, sys, tempfile
+import importlib.util
+import sys
+import tempfile
 from pathlib import Path
 
 MOD = Path(__file__).resolve().parent.parent / "src" / "health-check.py"
