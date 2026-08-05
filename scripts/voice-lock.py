@@ -401,16 +401,37 @@ def cmd_guard_hold(args):
 
 
 def _argv_entry_matches(argv, entry):
-    """True when a live argv token realpath-matches `entry` (absolute tokens),
-    or a relative token is a path suffix of it."""
+    """True when the live argv names `entry`. Matches against the FULL args
+    string (`ps -o args=`), never bare whitespace tokens: entry paths can
+    contain spaces (e.g. under 'Application Support'), which tokenization
+    would split into fragments that can never match (amendment U1). A
+    candidate is any substring running from one whitespace boundary to
+    another; absolute candidates match on realpath equality with `entry`,
+    relative candidates when they are a path suffix of it."""
     if not argv:
         return False
-    for tok in argv.split():
-        if os.path.isabs(tok):
-            if _realpath(tok) == entry:
+    entry = _realpath(entry)
+    n = len(argv)
+    starts = [
+        i
+        for i in range(n)
+        if not argv[i].isspace() and (i == 0 or argv[i - 1].isspace())
+    ]
+    ends = [
+        i
+        for i in range(1, n + 1)
+        if (i == n or argv[i].isspace()) and not argv[i - 1].isspace()
+    ]
+    for s in starts:
+        for e in ends:
+            if e <= s:
+                continue
+            cand = argv[s:e]
+            if cand.startswith("/"):
+                if cand == entry or _realpath(cand) == entry:
+                    return True
+            elif entry.endswith("/" + cand):
                 return True
-        elif entry.endswith("/" + tok):
-            return True
     return False
 
 

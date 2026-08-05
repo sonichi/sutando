@@ -362,6 +362,28 @@ def main():
         bystander.kill()
         bystander.wait()
 
+        # U1 (review): entry paths containing spaces (e.g. under
+        # 'Application Support') must validate — argv matching runs against
+        # the FULL `ps -o args=` string, never whitespace tokens, which would
+        # split the path into fragments that can never match.
+        spaced_entry = tmp / "Application Support" / "sutando" / "dist" / "voice-agent.js"
+        spaced_entry.parent.mkdir(parents=True)
+        spaced_entry.write_text("// packaged stand-in entry\n")
+        spaced = spawn_listener_group(port, spaced_entry)
+        structured_lock(pidfile, spaced.pid, my_start_time_ms(spaced.pid), spaced_entry, ws)
+        p = run_helper(
+            base("takeover")
+            + ["--workspace", ws, "--mode", "adopted", "--port", port, "--entry", spaced_entry]
+        )
+        res = out_json(p)
+        check(
+            "spaced-path entry takeover replaced",
+            p.returncode == 0 and res.get("code") == "replaced",
+            p.stdout + p.stderr,
+        )
+        check("spaced-path owner terminated", spaced.wait(timeout=5) is not None)
+        check("spaced-path lock unlinked", not pidfile.exists())
+
         # --- takeover (owned, Z1): live NON-listening owned child + group ---
         print("takeover (owned):")
         # Parent (no listener — like a dev tsx parent) spawning a child in the
