@@ -127,14 +127,27 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 
 ## Quick start
 
-**Prerequisites:**
-- macOS 15+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) (sign in to the CLI you select)
-- Node.js 22+ (`brew install node`)
-- fswatch (`brew install fswatch`)
-- [Gemini API key](https://ai.google.dev) for voice (optional for text/core-only use)
-- *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls; you can run the browser + Telegram + Discord paths without them.
-- *(optional, for video/audio)* ffmpeg (`brew install ffmpeg`) — used by subtitle-burn, video-concat, and recording handoff.
+**Prerequisites** — `bash src/startup.sh` checks that these are **installed** and refuses to boot otherwise:
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) — whichever you select
+- Node.js (`brew install node`)
+- Python 3 (`brew install python3`)
+- fswatch (`brew install fswatch`) — auto-installs via Homebrew on first start
+
+**Also required, but *not* checked at boot** — startup tests only that a command exists, so a host can pass every check above and still fail once running:
+- **Sign in to your agent CLI.** An unauthenticated CLI passes the presence check and then fails when the core starts.
+- macOS 15+, Node.js 22+.
+
+`bash src/verify-setup.sh` covers this second list — it checks the Node version and whether your CLI is actually authenticated. Run it if startup succeeds but the core doesn't.
+
+**Optional** — each unlocks one feature and degrades alone:
+- [Gemini API key](https://ai.google.dev) — voice (text/core paths work without it)
+- `pip3 install discord.py` / `slack_bolt` — Discord / Slack bridges (Telegram needs no package)
+- ffmpeg (`brew install ffmpeg`) — subtitle-burn, video-concat, recording handoff
+- tmux (`brew install tmux`) — Sutando.app watcher auto-restart; the core starts without it
+- git — vault sync, self-upgrade, commit provenance
+- [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — phone calls and SMS
+
+Full list with the line enforcing each, plus what to vendor when embedding Sutando in another application: **[External runtime dependencies](docs/runtime-dependencies.md)**.
 
 ```bash
 # Clone
@@ -290,7 +303,7 @@ When running, Sutando exposes these local ports:
 
 ## Keyboard shortcuts
 
-The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It launches automatically via `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published in [`state/hotkeys.json`](state/hotkeys.json) (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
+The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It launches automatically via `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published at runtime to `<workspace>/state/hotkeys.json` (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
 
 | Action | Default binding |
 |--------|-----------------|
@@ -352,6 +365,9 @@ owner-requested code change is still allowed.
 - **Contacts / Calendar / Reminders** → asked on demand by the features that use them (contact lookup before a call, `gws calendar +agenda`, `reminders.py add/list/complete`). You can grant these when first prompted rather than up front.
 
 See **[SECURITY.md](SECURITY.md)** for full details, best practices, and how to test your setup.
+
+For setup guides, operator runbooks, architecture, protocols, and release
+policy, start at the **[documentation hub](docs/README.md)**.
 
 ---
 

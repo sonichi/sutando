@@ -31,9 +31,16 @@ Move `task:` last and wrap body/text in confine_user_content().
 """
 
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
+
+# This suite drives real task-accept handlers but does not test telemetry.
+# Keep it hermetic: the production emitter otherwise starts daemon urllib
+# threads, which can still be inside OpenSSL while this short-lived interpreter
+# shuts down (observed as a post-success Linux segfault in clean-install CI).
+os.environ["SUTANDO_TELEMETRY"] = "0"
 
 REPO = Path(__file__).resolve().parent.parent
 

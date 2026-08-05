@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from util_paths import claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 import discord_config  # noqa: E402  — workspace-local Sutando discord config (#1147)
+from result_markers import parse_markers  # noqa: E402  — skip markers ([no-send] etc.)
 REPO = resolve_workspace()
 ACCESS_JSON = claude_home_path("channels", "discord", "access.json")
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
@@ -304,14 +305,44 @@ def send_dm(text: str) -> bool:
     sendable_files = [p for p in expanded_files if _is_path_sendable(p)]
     rejected_files = [p for p in expanded_files if not _is_path_sendable(p)]
     if rejected_files:
-        # Same security signal as discord-bridge: rejected paths log
-        # but don't leak the failure to the user.
         print(
             f"dm-result: {len(rejected_files)} file marker(s) rejected by "
             f"allowlist (would deliver via [file:] but path is outside "
             f"_SEND_ALLOWED_ROOTS / _SEND_ALLOWED_PREFIXES): {rejected_files}",
             file=sys.stderr,
         )
+
+    # Tell the RECIPIENT, not just the log. The comment that used to sit here
+    # claimed "same security signal as discord-bridge", and that parity did not
+    # exist: discord-bridge.py sends `(file not allowed: <path>)` into the
+    # channel, while this path logged to stderr only. So an attachment could
+    # silently never arrive — body delivered, task archived, nothing anywhere
+    # telling the recipient a file was meant to be there.
+    #
+    # Worst exactly here: dm-result is the REST FALLBACK, used when the live
+    # bridge is down, so its stderr is the least-watched output in the system.
+    #
+    # Split the same way discord-bridge does, because the two cases mean
+    # different things:
+    #   * path does not exist  -> almost always a `[file:/path]` substring
+    #     inside prose (a quoted example). discord-bridge logs it and
+    #     deliberately does NOT surface it; a notice here would fire on
+    #     ordinary text that merely mentions a path.
+    #   * path EXISTS but is outside the allowlist -> a real file the author
+    #     meant to attach and the policy refused. That one the recipient needs.
+    blocked = [p for p in rejected_files if os.path.isfile(p)]
+    if blocked:
+        # The path itself is NOT echoed. discord-bridge prints it, but a
+        # rejected marker is by definition outside the allowlist and could be
+        # attacker-chosen if a marker ever reaches a result body from untrusted
+        # input. The count plus the reason tells the recipient an attachment was
+        # dropped without echoing an arbitrary string back out; paths stay in
+        # stderr above.
+        plural = "" if len(blocked) == 1 else "s"
+        notice = ("_({} attachment{} not sent — outside the send allowlist; "
+                  "path{} in the dm-result log)_").format(
+                      len(blocked), plural, plural)
+        clean_text = f"{clean_text}\n\n{notice}" if clean_text else notice
 
     # An all-marker / all-whitespace body becomes empty after strip.
     # Sending `""` to Discord returns 400 ("Cannot send an empty
@@ -393,6 +424,22 @@ def main():
         text = Path(sys.argv[2]).read_text().strip()
     else:
         text = " ".join(sys.argv[1:])
+
+    # Honor the skip markers before any delivery path. This script is the LAST
+    # consumer in the result chain (poll_dm_fallback shells out to it only when
+    # nothing else claimed the file), so a marker it ignores becomes exactly the
+    # DM the marker existed to prevent:
+    #   [no-send]      internally handled, no user-visible reply
+    #   [REPLIED]      already delivered through another path
+    #   [deduped: …]   superseded by another task's result
+    # The file markers below are already parsed for the same stated reason —
+    # "without parsing these markers it would deliver the literal text" — and
+    # that argument is stronger here, since these do not merely look wrong in a
+    # DM, they mean do-not-deliver.
+    skip = next((a for a in parse_markers(text).actions if a.kind == "skip"), None)
+    if skip:
+        print(f"dm-result: [{skip.value}] marker — not delivering")
+        return
 
     if voice_connected():
         print("dm-result: voice client connected, skipping DM (voice will deliver)")

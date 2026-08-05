@@ -98,17 +98,48 @@ def _load_module():
     return mod
 
 
-def main() -> int:
+def _run_cases(is_path_sendable, workspace) -> int:
+    """Evaluate every allowlist case, and ALWAYS remove what this run created.
+
+    Split out of `main()` so the FAILURE path is testable — a caller can pass a
+    predicate that raises and then assert the carrier paths are clean. That
+    regression is `_failure_path_leaves_nothing_behind()` below.
+
+    Cleanup is in a `finally`, not at the end of the happy path. The first cut
+    unlinked only after all case evaluation, so any exception — in
+    `_is_path_sendable`, in a case, or in the symlink section — exited before
+    cleanup and left fixtures under `notes/`, a vault-carrier path. That is the
+    very pollution class this file exists to close, and it failed exactly when it
+    mattered most: on an aborted run. john-the-dev and qingyun-wu each reproduced
+    it by fault injection on head 262aeb9e (#2614); both were right.
+
+    `created` is appended immediately after each successful create, so a partial
+    setup (first fixture made, second raising) is cleaned up too.
+    """
+    created: "list[Path]" = []
     try:
-        mod = _load_module()
-    except Exception as e:
-        print(f"FAIL: could not load slack-bridge.py for testing: {e}", file=sys.stderr)
-        return 1
+        return _cases_body(is_path_sendable, workspace, created)
+    finally:
+        # Reversed so a symlink goes before anything it was derived from. Each
+        # unlink is independently guarded: one failure must not strand the rest.
+        for leftover in reversed(created):
+            try:
+                leftover.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:  # pragma: no cover — surfaced, never silent
+                print(f"  WARN: could not remove fixture {leftover}: {exc}", file=sys.stderr)
 
-    is_path_sendable = mod._is_path_sendable
-    workspace = Path(mod.REPO)
 
-    # Set up test fixtures inside the temp workspace
+def _cases_body(is_path_sendable, workspace, created: "list[Path]") -> int:
+    # Fixtures go in the LIVE workspace, because that is where the allowlist
+    # roots are: `_is_path_sendable` resolves against `resolve_workspace()`, so a
+    # file under a tmpdir is not sendable and the "allowed" cases cannot be tested
+    # at all. Given that, the fixture NAMES must be unique — a fixed `ok.md` both
+    # collides with any real owner file of that name and makes cleanup a deletion
+    # hazard (john-the-dev, #2614: pre-seeding `notes/ok.md` with owner bytes and
+    # running main() destroyed it). `mkstemp` gives a name nothing else can hold,
+    # so there is no owner state to overwrite and none to restore.
     notes_dir = workspace / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
     docs_dir = workspace / "docs"
@@ -117,10 +148,28 @@ def main() -> int:
     results_dir.mkdir(parents=True, exist_ok=True)
     inbox_dir = workspace / "slack-inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
-    allowed_file = notes_dir / "ok.md"
+
+    # Register with `created` in the same breath as the create. Anything between
+    # the two is a window where an exception strands the file.
+    _fd, _p = tempfile.mkstemp(prefix="allowlist-test-", suffix=".md", dir=str(notes_dir))
+    os.close(_fd)
+    allowed_file = Path(_p)
+    created.append(allowed_file)
     allowed_file.write_text("ok")
-    inbox_file = inbox_dir / "downloaded.png"
+    _fd, _p = tempfile.mkstemp(prefix="allowlist-test-", suffix=".png", dir=str(inbox_dir))
+    os.close(_fd)
+    inbox_file = Path(_p)
+    created.append(inbox_file)
     inbox_file.write_text("binary")
+
+    # Regression for the deletion hazard: whatever lives at the two names the
+    # old fixtures hard-coded must be byte-identical when this test finishes —
+    # including the case where the owner genuinely has a file there. Recorded
+    # BEFORE the run, asserted after; nothing is created, so an absent path
+    # must stay absent.
+    _guarded = {}
+    for _name in (notes_dir / "ok.md", inbox_dir / "downloaded.png"):
+        _guarded[_name] = _name.read_bytes() if _name.is_file() else None
 
     # /tmp/sutando-* allowed-prefix fixture. dir="/tmp" forces real /tmp
     # — without it macOS tempfile uses $TMPDIR (/var/folders/...), which
@@ -158,21 +207,98 @@ def main() -> int:
     # Symlink traversal — the CodeQL-recognized sanitizer is realpath.
     # A symlink in an allowed dir pointing OUT must return False.
     if hasattr(os, "symlink"):
-        symlink_path = notes_dir / "evil-link"
-        try:
-            symlink_path.symlink_to(not_allowed_file)
-            actual = is_path_sendable(str(symlink_path))
-            label = "symlink in allowed root targeting non-allowed file"
-            if actual is not False:
-                print(f"FAIL: {label} → expected False, got {actual}", file=sys.stderr)
-                failed += 1
-            else:
-                print(f"  OK: {label}")
-        finally:
-            try:
-                symlink_path.unlink()
-            except FileNotFoundError:
-                pass
+        # Derived from the already-unique mkstemp name rather than a fixed
+        # `evil-link`: a hard-coded name in a carrier path is the same collision
+        # hazard the fixtures themselves were fixed for, and `symlink_to` on an
+        # existing owner path would raise mid-run.
+        symlink_path = notes_dir / f"{allowed_file.stem}-evil-link"
+        symlink_path.symlink_to(not_allowed_file)
+        created.append(symlink_path)
+        actual = is_path_sendable(str(symlink_path))
+        label = "symlink in allowed root targeting non-allowed file"
+        if actual is not False:
+            print(f"FAIL: {label} → expected False, got {actual}", file=sys.stderr)
+            failed += 1
+        else:
+            print(f"  OK: {label}")
+
+    # No happy-path unlink block here any more: every fixture is registered in
+    # `created` and removed by `_run_cases`'s `finally`, which runs on the
+    # exception path too. A cleanup that only fires on a normal return is the
+    # defect this PR was opened to fix.
+
+    # Prove we touched nothing the owner had at the hard-coded names.
+    for _name, _orig in _guarded.items():
+        _now = _name.read_bytes() if _name.is_file() else None
+        if _now != _orig:
+            print(
+                f"FAIL: pre-existing owner file changed: {_name} "
+                f"({'absent' if _orig is None else f'{len(_orig)} B'} -> "
+                f"{'absent' if _now is None else f'{len(_now)} B'})",
+                file=sys.stderr,
+            )
+            failed += 1
+        else:
+            print(f"  OK: left {_name.name} untouched "
+                  f"({'absent' if _orig is None else 'pre-existing, byte-identical'})")
+
+    return failed
+
+
+def _failure_path_leaves_nothing_behind(workspace) -> int:
+    """THE regression: an aborted run must strand nothing in the carrier paths.
+
+    Requested by john-the-dev and qingyun-wu on #2614 after both fault-injected a
+    raising `_is_path_sendable` on head 262aeb9e and got:
+
+        LEAKED_FIXTURES ['notes/allowlist-test-*.md', 'slack-inbox/allowlist-test-*.png']
+
+    The guarded-name byte comparison could not catch this — it only proves the
+    two FIXED owner names are unchanged on a normal return, and says nothing
+    about unique fixtures on the exception path.
+
+    Deliberately asserted by scanning the directories for the `allowlist-test-`
+    prefix rather than by checking the paths `_run_cases` happened to hand back:
+    on the failure path it hands nothing back, and a leak we forgot to track is
+    exactly the leak worth catching.
+    """
+    notes_dir, inbox_dir = workspace / "notes", workspace / "slack-inbox"
+    before = {p for d in (notes_dir, inbox_dir) if d.is_dir() for p in d.glob("allowlist-test-*")}
+
+    def _raises(_path):
+        raise RuntimeError("injected: predicate fails mid-run")
+
+    try:
+        _run_cases(_raises, workspace)
+    except RuntimeError:
+        pass                      # expected — the point is what it left behind
+    else:
+        print("FAIL: injected fault did not propagate; regression is vacuous", file=sys.stderr)
+        return 1
+
+    leaked = sorted(
+        p for d in (notes_dir, inbox_dir) if d.is_dir()
+        for p in d.glob("allowlist-test-*") if p not in before
+    )
+    if leaked:
+        print(f"FAIL: aborted run left {len(leaked)} fixture(s) in carrier paths:", file=sys.stderr)
+        for p in leaked:
+            print(f"       {p}", file=sys.stderr)
+        return 1
+    print("  OK: aborted run left no fixtures in notes/ or slack-inbox/")
+    return 0
+
+
+def main() -> int:
+    try:
+        mod = _load_module()
+    except Exception as e:
+        print(f"FAIL: could not load slack-bridge.py for testing: {e}", file=sys.stderr)
+        return 1
+
+    workspace = Path(mod.REPO)
+    failed = _run_cases(mod._is_path_sendable, workspace)
+    failed += _failure_path_leaves_nothing_behind(workspace)
 
     if failed:
         print(f"\nFAIL: {failed} case(s) failed", file=sys.stderr)
