@@ -98,6 +98,25 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("no unmerged peer content", r.stdout)
 
+    def test_no_argument_uses_the_canonical_resolver_NOT_the_caller_cwd(self):
+        """Run from a directory that is not the workspace and not a git repo.
+
+        With `Path.cwd()` as the fallback this exits 2 ("not a git repo") -- it
+        would be answering about whatever directory invoked it. The cron path
+        invokes it from the REPO, not the workspace, so cwd is never the right
+        answer. With `resolve_workspace()` it resolves the real workspace and
+        reports on that instead. `cwd-lint` gates the same rule statically;
+        this pins the behaviour it protects.
+        """
+        elsewhere = Path(self._tmp.name) / "not-the-workspace"
+        elsewhere.mkdir()
+        r = subprocess.run([sys.executable, str(SCRIPT)], cwd=str(elsewhere),
+                           capture_output=True, text=True)
+        self.assertNotEqual(
+            r.returncode, 2,
+            "no-arg run resolved the caller's cwd instead of the workspace: " + r.stdout)
+        self.assertNotIn("not a git repo", r.stdout)
+
     def test_a_non_git_directory_exits_2_rather_than_claiming_clean(self):
         """A tool that cannot look must not report 'nothing found' -- that is
         indistinguishable from a real clean result."""

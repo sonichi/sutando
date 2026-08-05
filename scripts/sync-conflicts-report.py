@@ -21,6 +21,10 @@ import pathlib
 import subprocess
 import sys
 
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+from workspace_default import resolve_workspace  # noqa: E402
+
 TRIVIAL_LINES = 3  # a handful of differing lines is reformatting, not content
 
 
@@ -57,7 +61,14 @@ def unmerged(workspace: pathlib.Path):
 
 
 def main() -> int:
-    ws = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path.cwd()
+    # No positional arg -> the canonical resolver, never Path.cwd(). A reporter
+    # about workspace state that guessed the workspace from the caller's cwd
+    # would answer about whichever directory happened to invoke it -- and the
+    # cron path invokes it from the repo, not the workspace. `migrate=False`
+    # because this is a read-only diagnostic: it must never trigger a migration
+    # as a side effect of being asked a question. (bassilkhilo-ag2, #2662.)
+    ws = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(
+        resolve_workspace(migrate=False))
     rows, err = unmerged(ws)
     if err:
         print(f"sync-conflicts: {err}")
