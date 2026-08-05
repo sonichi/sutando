@@ -250,18 +250,53 @@ def _gateway_running():
 # while AG2 Space is running; when it is not, Station calls fail with a bare
 # ENOTFOUND. Surfacing this lets any reader (health-check, dashboard, the agent)
 # attribute a Station failure to "AG2 Space not running" rather than guess.
-_AG2SPACE_ENGINE_MARKER = "space.ag2.app/engine"
+_AG2SPACE_APP_MARKER = "AG2 Space.app/Contents/MacOS"
+_STATION_GATEWAY_HOST = "sutando.ag2.space"
 
 
-def _ag2space_running():
-    """True when the AG2 Space app engine (which serves the Station gateway) is up.
+def _ag2space_app_running():
+    """Tri-state: is the AG2 Space desktop app (its UI binary) running?
 
-    Matches the engine runtime path, not the window-chrome process, since the
-    engine — not the UI — is what makes Station available. A missing pgrep
-    degrades cleanly to False via _run's 127.
+    Matches ONLY the app bundle's MacOS executable, NOT the broad
+    `space.ag2.app/engine` tree (which every bundled Sutando process shares —
+    credential-proxy, web-client, voice-agent, the core tmux, etc.; qingyun CR
+    on #2680). This is a narrow "the app is open" signal and does NOT by itself
+    imply the Station gateway is reachable — see _station_available. rc None
+    (pgrep unexecutable) → None (unknown), never a False down-vote.
     """
-    rc, _ = _run(["pgrep", "-f", _AG2SPACE_ENGINE_MARKER])
+    rc, _ = _run(["pgrep", "-f", _AG2SPACE_APP_MARKER])
+    if rc is None:
+        return None
     return rc == 0
+
+
+def _station_available(timeout=1.5):
+    """Tri-state reachability of the Station connector gateway.
+
+    Station connectors are served over `sutando.ag2.space`, so probe THAT
+    directly rather than inferring availability from a process match (which
+    cannot tell "gateway reachable" from "some bundled process alive"). Returns
+    True when the host resolves and accepts a TLS-port TCP connection, False
+    when it resolves but no address accepts the connection (refused/down), and
+    None when it cannot be determined at all — a DNS/resolver or socket error,
+    which may be a transient or local-network problem, so it is UNKNOWN rather
+    than a positive "unavailable" (same tri-state discipline as _run).
+    """
+    try:
+        addrs = socket.getaddrinfo(_STATION_GATEWAY_HOST, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return None
+    for family, socktype, proto, _canon, sockaddr in addrs:
+        s = socket.socket(family, socktype, proto)
+        s.settimeout(timeout)
+        try:
+            s.connect(sockaddr)
+            return True
+        except (socket.timeout, OSError):
+            continue
+        finally:
+            s.close()
+    return False
 
 
 def _pane_text():
@@ -310,7 +345,8 @@ def derive():
 
     core = _core_running()
     gateway = _gateway_running()
-    ag2space = _ag2space_running()
+    ag2space_app = _ag2space_app_running()
+    station = _station_available()
 
     # Raw signals, captured for the audited verdict. Defaults hold for the
     # offline / unknown branches (core gone or unprobeable → status/login
@@ -388,9 +424,9 @@ def derive():
         "authenticated": authed,
         "core_running": core,
         "gateway_running": gateway,
-        "ag2space_running": ag2space,
-        # Station connectors are served by AG2 Space; available iff it is running.
-        "station_available": ag2space,
+        "ag2space_app_running": ag2space_app,
+        # Real reachability of the Station gateway (tri-state); None = unknown.
+        "station_available": station,
         "tmux_socket": TMUX_SOCKET,
         "session": SESSION,
         "detail": detail,
