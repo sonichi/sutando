@@ -167,6 +167,14 @@ check("  %7C-only combined still splits at the encoding (fallback intact)",
       parse_onboarding_token("https://gw.example%7Csek5") == ("https://gw.example", "sek5"))
 check("  secret half keeps %7C verbatim after a pipe split",
       parse_onboarding_token("https://gw.example|a%7Cb") == ("https://gw.example", "a%7Cb"))
+# The documented TRADE (review on #2679): pipe-preference is not a strict
+# superset. A %7C-separated token whose SECRET contains a literal | now splits
+# at the pipe inside the secret — previously parsed correctly. Both edge
+# classes are rare and fail loudly; literal-pipe-wins is the better default
+# because a transport that encodes the separator most likely encodes the
+# whole value, secret pipes included. Pinned so the trade stays on the record:
+check("  %7C-separated token with a literal | in the secret splits at the pipe (documented trade)",
+      parse_onboarding_token("https://gw/path%7Csec|ret") == ("https://gw/path%7Csec", "ret"))
 
 # ── C. sparrow goldens (module-level resolution via subprocess import) ──────
 SPARROW_SNIPPET = (
