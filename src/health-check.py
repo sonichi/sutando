@@ -4634,6 +4634,72 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     }
 
 
+def check_proactive_quarantine() -> dict:
+    """Report proactive bodies that were SAVED from deletion and then forgotten.
+
+    `poll_proactive` used to `unlink()` a DM that Discord rejected, so a message
+    the owner never saw was also destroyed — observed live here as
+    `413 Payload Too Large (error code: 40005)`. The fix (#2626) moves the body
+    to `results/undelivered/` instead of deleting it, which is strictly better
+    and still ends with nobody being told: a scan of the whole tree at that
+    change's head finds the writer and **no reader at all**. The nearest
+    candidate, `friction-detector.check_stale_results()`, is a stub that returns
+    `[]` and is never called.
+
+    That is the shape this probe exists to close. Preservation without a reader
+    is a message that exists on disk and reaches no one — the same failure as
+    deletion from the owner's side, minus the recoverability. Losing it loudly
+    at least surfaces; losing it quietly does not.
+
+    Deliberately NOT a failure: quarantine is the correct end state for a body
+    Discord will never accept (a 413 never becomes a 200). The action is for a
+    human to read it and decide, so `warn` — visible, not alarming.
+
+    Silent before #2626 lands: the directory is created only by that writer, so
+    an absent dir reports ok rather than inventing a problem.
+    """
+    name = "proactive-quarantine"
+    quarantine = WORKSPACE_DIR / "results" / "undelivered"
+    if not quarantine.is_dir():
+        return {"name": name, "status": "ok",
+                "detail": "no quarantined proactive bodies (undelivered/ absent)"}
+    now = time.time()
+    try:
+        entries = list(quarantine.iterdir())
+    except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/undelivered/: {e}"}
+    kept: list[tuple[str, int]] = []
+    unreadable = 0
+    for path in entries:
+        # Per-file isolation, same reason as check_orphaned_results: one
+        # unreadable entry must not decide the answer for the directory.
+        try:
+            if not path.is_file():
+                continue
+            age = now - path.stat().st_mtime
+        except OSError:
+            unreadable += 1
+            continue
+        kept.append((path.name, int(age)))
+    partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
+               if unreadable else "")
+    if not kept:
+        status = "warn" if unreadable else "ok"
+        return {"name": name, "status": status,
+                "detail": f"no quarantined proactive bodies{partial}"}
+    kept.sort(key=lambda item: -item[1])
+    oldest_name, oldest_age = kept[0]
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{len(kept)} proactive message(s) kept in results/undelivered/ that Discord "
+                   f"refused — preserved, but nothing reads this directory, so nobody has been "
+                   f"told; oldest {oldest_name} ({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
+                   f"{partial}"),
+    }
+
+
 def _proc_argv(pid: int) -> str:
     """argv of `pid`, or "" if no such process.
 
@@ -6021,6 +6087,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_orphaned_results())
+    checks.append(check_proactive_quarantine())
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
