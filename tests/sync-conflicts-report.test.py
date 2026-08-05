@@ -149,6 +149,63 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertIn(expected, r.stdout,
                       "output does not name the workspace the canonical resolver returns")
 
+    def _retire(self, *targets):
+        return subprocess.run([sys.executable, str(SCRIPT), str(self.ws), "--retire", *targets],
+                              capture_output=True, text=True)
+
+    def test_merged_then_RETRACTED_content_stays_silent_once_retired(self):
+        """The lifecycle john-the-dev activated (#2662 P1).
+
+        Merged and later deliberately retracted is INDISTINGUISHABLE on disk
+        from never-merged -- both end with the line absent from the live copy --
+        so `_new_content()` cannot separate them by content at any level of
+        cleverness. Without a retire record the reporter re-flags every
+        legitimate correction on every sync, forever, which is the same sin this
+        PR cites when rejecting union merges: a withdrawn claim must not be
+        resurrected, including as a nag.
+        """
+        self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
+        self.assertEqual(self._run().returncode, 0, "identical copies should be silent")
+        self.assertEqual(self._retire("note.md").returncode, 0)
+        # the operator now deliberately retracts the previously-merged line
+        (self.ws / "memory" / "note.md").write_text("base\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 0, "retracted content was resurrected: " + r.stdout)
+        self.assertNotIn("note.md", r.stdout)
+
+    def test_retire_still_lets_genuinely_NEVER_merged_content_report(self):
+        """The paired control. A retire lifecycle that silenced everything would
+        trade a permanent false positive for a permanent false negative."""
+        self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
+        self._retire("note.md")
+        self._pair("other.md", "x\n", "x\nnever merged fact\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("other.md", r.stdout)
+        self.assertNotIn("note.md", r.stdout)
+
+    def test_retiring_one_copy_does_not_silence_a_LATER_different_one(self):
+        """The retire key carries a digest of the preserved copy, so the same
+        path conflicting again with NEW peer content is a new entry."""
+        self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
+        self._retire("note.md")
+        later = self.ws / ".git" / "sutando-sync-conflicts" / "20260806T000000Z-peer" / "memory"
+        later.mkdir(parents=True)
+        (later / "note.md").write_text("base\na LATER peer fact\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("note.md", r.stdout)
+
+    def test_retire_works_while_the_entry_is_SILENT_not_only_while_reporting(self):
+        """Regression on my own first implementation, which scanned only the
+        currently-reporting set. The operator retires right AFTER merging, when
+        the entry is silent — so that version could never record the case it
+        exists for, and printed 'nothing matched'."""
+        self._pair("note.md", "base\npeer fact\n", "base\npeer fact\n")
+        out = self._retire("note.md").stdout
+        self.assertIn("retired 1", out, out)
+        self.assertNotIn("nothing matched", out)
+
     def test_a_non_repo_dir_INSIDE_a_repo_does_not_answer_about_the_ancestor(self):
         """`git rev-parse` searches ANCESTORS, and that is a silent false clean.
 
