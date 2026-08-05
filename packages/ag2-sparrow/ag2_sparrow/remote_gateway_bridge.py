@@ -323,8 +323,11 @@ def _env_compat(new, old):
 # A %7C-separated token carries no literal "|", so a naive split leaves it a bare
 # secret with an empty URL and the bridge FATALs at startup — the core looks
 # "connected" (device-connect completed) but never responds, the Vidhu-onboarding
-# failure 2026-07-24.
-_SEPARATOR_RE = re.compile(r"\||%7[Cc]")
+# failure 2026-07-24. A literal "|" is PREFERRED over %7C/%7c when both appear:
+# a raw pipe cannot legally occur inside a URL, so when one exists it IS the
+# separator — keeps a URL half carrying an encoded %7C intact (#2679; same
+# rule as the shared credential contract until PR3 delegates this parser).
+_ENCODED_SEPARATOR_RE = re.compile(r"%7[Cc]")
 
 
 def _parse_onboarding_token(raw):
@@ -341,7 +344,10 @@ def _parse_onboarding_token(raw):
     """
     if not raw.lower().startswith(("http://", "https://")):
         return "", raw  # bare secret — opaque, never touched
-    m = _SEPARATOR_RE.search(raw)
+    i = raw.find("|")
+    if i != -1:
+        return raw[:i], raw[i + 1:]  # literal pipe wins; URL + secret verbatim
+    m = _ENCODED_SEPARATOR_RE.search(raw)
     if m is None:
         return "", raw  # scheme but no separator; the URL-less guard in main() speaks
     return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
