@@ -4556,9 +4556,18 @@ def check_skill_symlinks() -> dict:
         # Moving rather than deleting is deliberate and is the whole reason this
         # is not auto-fixed: the directory may carry local edits, and `rm -rf`
         # would destroy them silently.
+        #
+        # Every complete path is QUOTED. Unquoted, a workspace or checkout path
+        # containing a space word-splits before `mv` runs, so the command exits 1
+        # with `mv: <tail>/alpha.local-backup is not a directory`, leaves the real
+        # directory in place, and creates neither the symlink nor the backup — the
+        # operator is told the repair succeeded by a command that did nothing.
+        # Reproduced independently by qingyun-wu and bassilkhilo-ag2 (#2660) against
+        # `/private/tmp/pr2660 spaced repro .../{src,dst} tree`. The activation test
+        # below runs the emitted command under a spaced fixture for this reason.
         parts.append(
             f"{len(shadowed)} a real dir, not a link (diverges silently; repair with "
-            f"`mv <dst>/<name> <dst>/<name>.local-backup && ln -s <src>/<name> <dst>/<name>` "
+            f'`mv "<dst>/<name>" "<dst>/<name>.local-backup" && ln -s "<src>/<name>" "<dst>/<name>"` '
             f"— move aside, do NOT `ln -sfn` over it, and keep the backup until you have "
             f"checked it for local edits): "
             f"{', '.join(shadowed[:4])}{'...' if len(shadowed) > 4 else ''}"

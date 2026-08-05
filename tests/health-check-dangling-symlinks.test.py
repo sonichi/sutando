@@ -44,7 +44,15 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
     def setUp(self):
         self.hc = _load()
         self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
+        # SPACES ARE DELIBERATE, and belong in the shared fixture rather than in
+        # one bespoke test. The remedy this suite executes is a SHELL command
+        # built from these paths, so an unquoted placeholder word-splits and the
+        # repair silently does nothing (qingyun-wu + bassilkhilo-ag2, #2660).
+        # A space-free fixture passes against the broken command, which is
+        # exactly how the defect survived a test that already ran the remedy.
+        # Widening the axis here means every case below carries the property.
+        root = Path(self._tmp.name) / "sp ace root"
+        root.mkdir()
         self.repo = root / "repo"
         self.src = self.repo / "skills"
         self.dst = root / "home" / ".claude" / "skills"
@@ -136,6 +144,39 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         self.assertTrue((self.dst / "alpha.local-backup" / "SKILL.md").exists(),
                         "the remedy did not preserve the local edits it moved aside")
 
+    def test_every_path_in_the_remedy_is_QUOTED(self):
+        """Pin the property, not just the fixture.
+
+        The suite's paths now contain spaces, so an unquoted remedy fails when
+        executed. But a later refactor could quietly de-space the fixture and
+        this class would go green against a broken command again. This asserts
+        the shape directly: every complete path in the emitted command is
+        wrapped in double quotes.
+
+        The failure it guards is silent, which is what makes it worth a second
+        test: unquoted, `mv` exits 1 with "<tail>.local-backup is not a
+        directory", the real directory stays, and NEITHER the symlink nor the
+        backup is created -- the operator's only recovery path reports success
+        while doing nothing.
+        """
+        import re
+
+        self._skill("alpha")
+        (self.dst / "alpha").mkdir()
+
+        detail = self.hc.check_skill_symlinks()["detail"]
+        remedy = next(c for c in re.findall(r"`([^`]+)`", detail) if "ln -s" in c)
+
+        bare = re.findall(r'(?<!")<(?:src|dst)>/<name>[^\s"]*', remedy)
+        self.assertEqual(
+            bare, [],
+            f"unquoted path(s) {bare} in the remedy -- a path with a space "
+            f"word-splits and the repair silently no-ops: {remedy}",
+        )
+        for placeholder in ("<dst>/<name>", "<src>/<name>", "<dst>/<name>.local-backup"):
+            self.assertIn(f'"{placeholder}"', remedy,
+                          f"{placeholder} must be quoted in: {remedy}")
+
     def test_ln_sfn_alone_does_NOT_repair_it(self):
         """The control that justifies the remedy above. If this ever starts
         passing, macOS `ln` changed and the warning can be simplified."""
@@ -144,8 +185,12 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         real = self.dst / "alpha"
         real.mkdir()
         (real / "SKILL.md").write_text("# local\n")
+        # Quoted for the same reason the remedy is: the fixture paths contain
+        # spaces, and this control must fail on `ln -sfn` SEMANTICS (the nested
+        # link), not on word-splitting -- otherwise it would "pass" for the
+        # wrong reason and stop justifying the longer remedy.
         subprocess.run(["bash", "-c",
-                        f"ln -sfn {self.src}/alpha {self.dst}/alpha"], check=True)
+                        f'ln -sfn "{self.src}/alpha" "{self.dst}/alpha"'], check=True)
         self.assertFalse((self.dst / "alpha").is_symlink(),
                          "ln -sfn repaired it — the warning's caveat is now obsolete")
         self.assertTrue((self.dst / "alpha" / "alpha").is_symlink(),
