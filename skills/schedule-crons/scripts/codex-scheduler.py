@@ -12,7 +12,6 @@ import argparse
 import fcntl
 import json
 import os
-import plistlib
 import re
 import subprocess
 import sys
@@ -521,6 +520,33 @@ def install(
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         },
     }
+    # Imported HERE rather than at module scope, and only `install` ever needs
+    # it. `plistlib` pulls in `xml.parsers.expat` -> the `pyexpat` C extension,
+    # which dlopens libexpat: a Python whose pyexpat was built against a
+    # different libexpat than it finds at runtime raises ImportError at import
+    # time. At module scope that killed EVERY subcommand — including `tick`,
+    # which launchd invokes once a minute, and `health`, whose entire job is to
+    # report that the scheduler is broken. Neither writes a plist.
+    #
+    # Measured on a live host 2026-08-03, same file, same commit:
+    #
+    #   /opt/homebrew/bin/python3 3.14.5 -> `tick` and `health` both die with
+    #                                       ImportError: dlopen … pyexpat …
+    #                                       _XML_SetAllocTrackerActivationThreshold
+    #   /usr/bin/python3          3.9.6  -> both reach real logic
+    #
+    # A durable scheduler that cannot run is worse than one that is absent: the
+    # launchd job stays loaded and `--status` still reports it. Sibling fix to
+    # #2588 (same defect shape in src/health-check.py).
+    try:
+        import plistlib
+    except ImportError as exc:  # pragma: no cover - platform-dependent
+        raise SystemExit(
+            f"codex-scheduler: cannot write the launchd plist — this Python "
+            f"cannot import plistlib ({exc.__class__.__name__}: {exc}). "
+            f"Re-run `install` with an interpreter whose pyexpat works — the "
+            f"system python usually does. `tick` and `health` are unaffected."
+        )
     tmp = plist_path.with_name(f".{plist_path.name}.{os.getpid()}.tmp")
     with tmp.open("wb") as handle:
         plistlib.dump(payload, handle, sort_keys=True)
