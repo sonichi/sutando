@@ -112,10 +112,54 @@ class TestSyncConflictsReport(unittest.TestCase):
         elsewhere.mkdir()
         r = subprocess.run([sys.executable, str(SCRIPT)], cwd=str(elsewhere),
                            capture_output=True, text=True)
-        self.assertNotEqual(
-            r.returncode, 2,
-            "no-arg run resolved the caller's cwd instead of the workspace: " + r.stdout)
-        self.assertNotIn("not a git repo", r.stdout)
+        # Assert WHICH path it reported on, not the exit code. The exit code was
+        # a proxy and it broke the moment the ancestor-walk guard landed: a
+        # correctly-resolved workspace that is not a repo now legitimately
+        # exits 2, so the old assertion failed for the right behaviour.
+        self.assertNotIn(str(elsewhere), r.stdout,
+                         "reported on the caller's cwd instead of the resolver's answer")
+        expected = subprocess.run(
+            [sys.executable, "-c",
+             "import sys,pathlib;sys.path.insert(0,%r);"
+             "from workspace_default import resolve_workspace;"
+             "print(resolve_workspace(migrate=False))" % str(REPO / "src")],
+            capture_output=True, text=True, cwd=str(elsewhere)).stdout.strip()
+        self.assertIn(expected, r.stdout,
+                      "output does not name the workspace the canonical resolver returns")
+
+    def test_a_non_repo_dir_INSIDE_a_repo_does_not_answer_about_the_ancestor(self):
+        """`git rev-parse` searches ANCESTORS, and that is a silent false clean.
+
+        Found by running the reporter from a PR worktree: the fallback
+        workspace path existed but had never been `--init`ed, so git walked up,
+        found the worktree's own repo, saw no conflicts directory there, and
+        printed "no unmerged peer content" -- a confident verdict about a
+        completely different repository.
+
+        `--show-toplevel` must equal the directory asked about; anything else is
+        an ancestor and the tool has not looked at what it was asked to look at.
+        """
+        inner = self.ws / "never-initialised"
+        inner.mkdir()
+        r = subprocess.run([sys.executable, str(SCRIPT), str(inner)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("not a git repo", r.stdout)
+        self.assertIn("ancestor", r.stdout)
+        self.assertNotIn("no unmerged peer content", r.stdout)
+
+    def test_a_missing_directory_exits_2_rather_than_claiming_clean(self):
+        r = subprocess.run([sys.executable, str(SCRIPT), str(self.ws / "nope")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("no such directory", r.stdout)
+
+    def test_the_clean_line_NAMES_the_workspace_it_examined(self):
+        """A clean verdict that does not say what it looked at is unfalsifiable
+        -- printing the path is what exposed the ancestor-walk bug."""
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn(str(self.ws), r.stdout)
 
     def test_a_non_git_directory_exits_2_rather_than_claiming_clean(self):
         """A tool that cannot look must not report 'nothing found' -- that is

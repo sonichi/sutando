@@ -29,6 +29,23 @@ TRIVIAL_LINES = 3  # a handful of differing lines is reformatting, not content
 
 
 def unmerged(workspace: pathlib.Path):
+    if not workspace.is_dir():
+        return None, f"no such directory: {workspace}"
+    # `git rev-parse` SEARCHES ANCESTORS. Pointing it at a non-repo directory
+    # that merely sits inside one succeeds and answers about the ANCESTOR --
+    # so a workspace that was never `--init`ed reports "no unmerged peer
+    # content" about somebody else's repository. Caught by running this from a
+    # PR worktree, where the fallback workspace exists but is not a repo and
+    # git happily returned the worktree's own git dir.
+    top = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if top.returncode:
+        return None, f"not a git repo: {workspace}"
+    if pathlib.Path(top.stdout.strip()).resolve() != workspace.resolve():
+        return None, (f"not a git repo: {workspace} "
+                      f"(git resolved the ancestor {top.stdout.strip()})")
     gitdir = subprocess.run(
         ["git", "-C", str(workspace), "rev-parse", "--git-dir"],
         capture_output=True, text=True,
@@ -74,7 +91,11 @@ def main() -> int:
         print(f"sync-conflicts: {err}")
         return 2
     if not rows:
-        print("sync-conflicts: no unmerged peer content")
+        # Name the workspace even on the clean path. "no unmerged peer content"
+        # is only meaningful if the reader can see WHICH workspace was examined;
+        # the ancestor-walk bug above produced exactly that sentence about the
+        # wrong repository, and printing the path is what made it visible.
+        print(f"sync-conflicts: no unmerged peer content ({ws})")
         return 0
     print(f"sync-conflicts: {len(rows)} file(s) hold peer content not in the live copy")
     for batch, rel, n in rows:
