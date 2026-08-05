@@ -49,11 +49,32 @@ Each pass, in order:
    **`step` is an owner-facing live message, not internal telemetry.** With `SUTANDO_PROGRESS_STREAM=1` (ON in the running bridge) the Discord bridge renders it to the owner verbatim as `⏳ <step> (Ns)` while he waits on an owner task, via `progress_stream.format_progress`. A generic placeholder ("Starting pass...", "running") shows up in his DM as noise; when processing an owner task, `step` should say what he is waiting on. Rewrite it on every pivot — a stale `step` actively lies to him. See memory `feedback_rich_core_status_step`. (This template previously read `"Starting pass..."` — the exact string that memory names as the anti-pattern, which is why the mistake kept recurring across compactions: this file is loaded every pass, the memory only when recalled.)
 
 0.5. **Check quota.** Run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
-   - **Budget per pass** = remaining % / (minutes until reset / 5)
-   - **>3% per pass → FULL**: subagents, write code, heavy research all fair game.
-   - **1-3% per pass → MEDIUM**: code fixes, monitoring, no subagents.
-   - **<1% per pass → LIGHT**: task processing + health checks only.
+   **Pick the BINDING window first.** `read-quota.py` reports two (5h and 7d). The binding one is
+   whichever is further ahead of even pace — usually 7d, because it cannot refill for days.
+
+   **Pace against that window's OWN even pace, as a ratio.** Do NOT apply the absolute
+   per-pass thresholds below to the 7d window: they are calibrated to the 5h window and on 7d they
+   are a *constant*. Every reachable 7d input yields LIGHT — 100% remaining over a full week gives
+   0.0496%/pass, 1% remaining gives 0.0005%/pass, and even 1% remaining with one hour to reset gives
+   0.083%/pass. Reaching MEDIUM would require 2016% remaining. A rule whose best case and worst case
+   agree is not measuring anything.
+
+   ```
+   elapsed  = (now - window_start) / (window_reset - window_start)
+   burn     = used% / elapsed           # >1 means ahead of even pace
+   headroom = remaining% / (1 - elapsed)  # <1 means the rest must be slower than even pace
+   sustainable_vs_current = headroom / burn
+   ```
+   - **headroom ≥ 1.5 → FULL**: subagents, write code, heavy research all fair game.
+   - **headroom 0.8–1.5 → MEDIUM**: code fixes, monitoring, no subagents.
+   - **headroom < 0.8 → LIGHT**: task processing + health checks only.
    - **0% remaining → MINIMAL**: process owner tasks + health + update log.
+
+   Quote `sustainable_vs_current` when reporting pace, and **name the denominator** — "0.45x even
+   pace" and "0.27x current pace" are the same state and differ by 1.67x.
+
+   The absolute thresholds below remain valid for the **5h** window only:
+   `budget = remaining % / (minutes until reset / 5)`; >3% FULL / 1-3% MEDIUM / <1% LIGHT.
 
    Budget informs the **depth** of step 6 — not whether to do it. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the only legitimate reasons step 6 may be skipped.
 
