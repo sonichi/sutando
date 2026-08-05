@@ -1153,7 +1153,33 @@ class _ScopeWalk:
         # SEQUENTIALLY below instead: merge the alternatives, commit, then run
         # `finally` over that state and let it OVERWRITE.
         finalbody = getattr(node, "finalbody", None)
-        branches = [b for b in (getattr(node, "body", None), getattr(node, "orelse", None)) if b]
+        # On a `try`, `else` is NOT an alternative to the body — Python runs it
+        # SEQUENTIALLY after the body completes without raising. OR-merging it
+        # kept the body's pre-`else` binding alive beside it, so an `else` that
+        # rebinds a stub to a SAFE absorbing lambda still left the unsafe body
+        # binding in the merge and the following line was flagged. Same shape as
+        # the `finally` fix above, one branch over. Repro (john-the-dev,
+        # independently reproduced by bassilkhilo-ag2 at 160af1c2):
+        #
+        #     _fake = lambda *a, **k: x
+        #     try:              _fake = lambda: x          # unsafe
+        #     except Exception: _fake = lambda *a, **k: x  # safe
+        #     else:             _fake = lambda *a, **k: x  # safe
+        #     wd.resolve_workspace = _fake   -> flagged; every real path is SAFE
+        #
+        # So the success path is body THEN orelse, walked as ONE sequence, and
+        # that is what gets OR-merged against the handlers. Scoped to `try`:
+        # on `if` the `orelse` really IS the alternative branch, and on loops it
+        # runs only when the loop was not broken out of, so neither may be
+        # folded into the body this way.
+        _try_types = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
+        if isinstance(node, _try_types):
+            success = list(getattr(node, "body", None) or []) + \
+                list(getattr(node, "orelse", None) or [])
+            branches = [success] if success else []
+        else:
+            branches = [b for b in (getattr(node, "body", None),
+                                    getattr(node, "orelse", None)) if b]
         branches += [h.body for h in getattr(node, "handlers", [])]
         if not branches and not finalbody:
             return

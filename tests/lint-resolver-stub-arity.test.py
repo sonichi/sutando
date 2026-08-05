@@ -381,6 +381,41 @@ else:
 wd.resolve_workspace = _fake
 """) != [], "control flow is unknown, so an unsafe path must still flag")
 
+    # --- try/else: `else` runs SEQUENTIALLY after a successful body ----------
+    # john-the-dev's blocker, independently reproduced by bassilkhilo-ag2 at
+    # 160af1c2, one branch over from the `finally` defect above: `orelse` was
+    # OR-merged as an ALTERNATIVE to the body, but Python executes it after the
+    # body completes without raising. So the body's pre-`else` binding stayed
+    # live in the merge and a safe `else` rebinding could not clear it.
+    #
+    # Same four directions as `finally`. The three FLAG cases are what stop the
+    # fix from degenerating into "fold orelse into the body unconditionally":
+    # on `if` the orelse really IS the alternative, and folding it there would
+    # make the if/else case below regress.
+    check("else rebinding to an absorbing lambda is SAFE (the repro)",
+          not flags('_fake = lambda *a, **k: x\n'
+                    'try:\n    _fake = lambda: x\n'
+                    'except Exception:\n    _fake = lambda *a, **k: x\n'
+                    'else:\n    _fake = lambda *a, **k: x\n'
+                    'wd.resolve_workspace = _fake'))
+    check("else leaving a BARE lambda is still flagged",
+          flags('_fake = lambda *a, **k: x\n'
+                'try:\n    pass\n'
+                'except Exception:\n    _fake = lambda *a, **k: x\n'
+                'else:\n    _fake = lambda: x\n'
+                'wd.resolve_workspace = _fake'))
+    check("an unsafe EXCEPT branch is still flagged despite a safe else",
+          flags('_fake = lambda *a, **k: x\n'
+                'try:\n    _fake = lambda *a, **k: x\n'
+                'except Exception:\n    _fake = lambda: x\n'
+                'else:\n    _fake = lambda *a, **k: x\n'
+                'wd.resolve_workspace = _fake'))
+    check("if/else orelse is STILL an alternative branch, not sequential",
+          flags('if cond:\n    _fake = lambda: x\n'
+                'else:\n    _fake = lambda *a, **k: x\n'
+                'wd.resolve_workspace = _fake'),
+          "folding orelse into the body unconditionally would silence this")
+
     # --- the grandfather list must not rot ---------------------------------
     for rel in sorted(lint.KNOWN_RESOLVER_STUBS):
         p = REPO / rel
