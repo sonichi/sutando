@@ -74,10 +74,11 @@ SCOPES = [
 def _token_dir():
     """Directory holding the cached OAuth token, under the resolved workspace.
 
-    MS365_STATE_DIR is an explicit override. Otherwise default through the
-    repo's resolve_workspace() (repo root and the resolved workspace differ on
-    some hosts, so `os.getcwd()/state` would cache the token in the wrong tree);
-    fall back to `os.getcwd()/state` only if that resolver is unavailable.
+    MS365_STATE_DIR is an explicit override. Otherwise default through the repo's
+    resolve_workspace() (repo root and the resolved workspace differ on some
+    hosts, so a bare `os.getcwd()/state` would cache the token in the wrong
+    tree). If that resolver is unavailable, FAIL CLOSED (raise) rather than
+    guessing a cwd-relative path — see the except branch below.
     """
     base = os.environ.get("MS365_STATE_DIR")
     if not base:
