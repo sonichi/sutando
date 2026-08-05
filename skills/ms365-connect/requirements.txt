@@ -1,0 +1,5 @@
+# Microsoft 365 connectivity via Microsoft Graph.
+# python-o365 (Apache-2.0). Verified against 2.1.9. The 2.0.26 floor keeps the
+# Account/mailbox/schedule/storage/teams API used by scripts/ms365.py available;
+# the auth call falls back from requested_scopes= (2.1+) to scopes= (2.0.x).
+O365>=2.0.26
