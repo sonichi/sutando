@@ -106,24 +106,42 @@ class TestDynamicLoopFreshness(unittest.TestCase):
         self.assertIn("never stamped", out["detail"])
 
     def test_stalled_stays_down_even_when_the_declaration_is_REMOVED(self):
-        # THE DANGEROUS DIRECTION. Config-gating is applied to the ABSENT branch
-        # only. If the age thresholds were gated on the declaration too, deleting
-        # the crons.json entry would silently disarm a real stall.
+        # THE DANGEROUS DIRECTION, tested by actually removing the declaration.
         #
-        # NOTE this is deliberately asymmetric with the probe's enumeration: the
-        # loop names come from crons.json, so "removed" here means the branch is
-        # exercised through a stamp that exists for a still-declared loop. The
-        # guarantee under test is that _host_dynamic_loops is never consulted
-        # again once the sentinel is on disk.
+        # An earlier revision of this test did NOT do that — it left the entry in
+        # crons.json and only asserted _host_dynamic_loops wasn't called twice,
+        # then claimed removal-proofness in the docstring. bassilkhilo-ag2
+        # reproduced the real behaviour on #2692: enumeration came from crons.json
+        # alone, so deleting the entry dropped a stalled loop out of the output
+        # entirely. A test whose own comment concedes it isn't exercising the
+        # claim is not covering it.
+        self._declare()
+        self._stamp(age_s=99_999, next_delay_s=2400)
+        self._crons([])  # entry deleted; the sentinel on disk is untouched
+        out = self._one()
+        self.assertEqual(out["name"], "dynamic-loop:inbox-score")
+        self.assertEqual(out["status"], "down",
+                         "an undeclared loop was dropped — deleting a crons.json entry "
+                         "must not be able to silence a stall that is still real")
+
+    def test_config_is_consulted_once_not_per_loop(self):
+        # The narrower guarantee the old test actually held, kept on its own so
+        # the removal case above tests removal and nothing else.
         self._declare()
         self._stamp(age_s=99_999, next_delay_s=2400)
         with mock.patch.object(self.hc, "_host_dynamic_loops",
                                wraps=self.hc._host_dynamic_loops) as spy:
-            out = self._one()
-        self.assertEqual(out["status"], "down")
-        self.assertEqual(spy.call_count, 1,
-                         "config was re-consulted after the stamp was found — the age "
-                         "thresholds must not be gated on the declaration")
+            self._one()
+        self.assertEqual(spy.call_count, 1)
+
+    def test_a_stray_but_FRESH_sentinel_does_not_manufacture_an_alarm(self):
+        # The other half of the widened axis. Enumerating sentinels off disk must
+        # not turn every leftover file into a permanent warn — that is the same
+        # ignored-output failure the lane-awareness rule exists to prevent. An
+        # undeclared loop that is still re-arming is simply healthy.
+        self._crons([])
+        self._stamp(age_s=60, next_delay_s=2400)
+        self.assertEqual(self._one()["status"], "ok")
 
     # --- the sentinel carries its own threshold -------------------------
 
@@ -246,6 +264,20 @@ class TestDynamicLoopFreshness(unittest.TestCase):
         names = [c.get("name") for c in checks if isinstance(c, dict)]
         self.assertIn("dynamic-loop:inbox-score", names,
                       "run_all_checks() emitted no dynamic-loop check (branch unreachable)")
+
+    def test_run_all_checks_sees_an_UNDECLARED_stalled_loop(self):
+        # Reachability for the union branch specifically. The unit-level check
+        # above can pass while run_all_checks() still filters by declaration, and
+        # run_all_checks() is the only path the operator ever actually sees — so
+        # the dangerous direction has to be proven at the real call site too.
+        self._crons([])
+        self._stamp(age_s=99_999, next_delay_s=2400)
+        checks = self.hc.run_all_checks()
+        row = next((c for c in checks
+                    if isinstance(c, dict) and c.get("name") == "dynamic-loop:inbox-score"), None)
+        self.assertIsNotNone(row, "a stalled loop vanished from run_all_checks() once its "
+                                  "crons.json entry was deleted")
+        self.assertEqual(row["status"], "down")
 
 
 if __name__ == "__main__":

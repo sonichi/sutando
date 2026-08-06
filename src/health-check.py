@@ -5838,6 +5838,33 @@ def _host_dynamic_loops(
     return names
 
 
+def _stamped_dynamic_loops(workspace_dir: Optional[Path] = None) -> list[str]:
+    """Loop names that have a `dynamic-loop-<name>.alive` sentinel ON DISK.
+
+    The counterpart to `_host_dynamic_loops`, and the reason enumeration is a
+    union of the two: a stall whose `crons.json` entry was edited away is still
+    a stall. Deriving the watch-list from config alone lets an unrelated config
+    edit un-declare a real one into invisibility.
+
+    Globs BOTH locations `status_read_path` reads from, so an un-migrated
+    install is enumerated the same way it is read. Never raises: an unreadable
+    state dir degrades to "nothing found here", and the declared names still
+    produce rows.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    prefix, suffix = "dynamic-loop-", ".alive"
+    names: set[str] = set()
+    for base in (workspace / "state", workspace):
+        try:
+            for path in base.glob(f"{prefix}*{suffix}"):
+                stem = path.name[len(prefix):-len(suffix)].strip()
+                if stem:
+                    names.add(stem)
+        except OSError:
+            continue
+    return sorted(names)
+
+
 def _positive_seconds(value) -> Optional[float]:
     """A sentinel field is only usable as a duration/timestamp if it is a finite
     positive number. `bool` is an `int` in Python, so exclude it explicitly —
@@ -6372,18 +6399,27 @@ def check_dynamic_loop_freshness(
     by a sync on an unrelated host. The self-reported `ts` is the honest clock;
     mtime is a fallback for a payload that won't parse, and the detail says so.
 
-    Returns a LIST — one check per declared loop, and an EMPTY list on a host
-    that declares none. That is the lane-awareness lesson from
-    `check_comm_sweep_freshness`: a permanent warn on a host with nothing to
-    monitor is how a health output gets ignored, which would take this probe's
-    real alarms down with it.
+    Returns a LIST — one row per loop this host declares OR has a sentinel for,
+    and an EMPTY list on a host with neither. That is the lane-awareness lesson
+    from `check_comm_sweep_freshness`: a permanent warn on a host with nothing
+    to monitor is how a health output gets ignored, which would take this
+    probe's real alarms down with it.
 
-    Gated on config for the ABSENT branch only. Once a sentinel exists the age
-    thresholds apply unconditionally, so removing the crons.json entry can never
-    silently disarm a real stall — the dangerous direction.
+    Enumeration is the UNION of the two sources, and that is load-bearing.
+    Config gates the ABSENT branch only: `crons.json` can add a loop to watch
+    (declared-but-never-stamped ⇒ warn), but it can never remove one, because a
+    sentinel on disk is judged on its age no matter what the config says. An
+    earlier revision enumerated from `crons.json` alone, so deleting the entry
+    during an unrelated edit dropped a genuinely stalled loop out of
+    `run_all_checks()` entirely — a probe whose whole purpose is "a stall that
+    pages nobody" going silent in exactly that direction.
     """
     checks: list[dict] = []
-    for loop in _host_dynamic_loops(workspace_dir, host_label):
+    loops = sorted(
+        set(_host_dynamic_loops(workspace_dir, host_label))
+        | set(_stamped_dynamic_loops(workspace_dir))
+    )
+    for loop in loops:
         name = f"dynamic-loop:{loop}"
         stem = f"dynamic-loop-{loop}.alive"
         path = status_read_path(stem, workspace_dir or WORKSPACE_DIR)
