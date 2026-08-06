@@ -42,7 +42,14 @@ Config (CLI flag > BEE_* env > package default in _DEFAULTS). Run via the
   BEE_API_TOKEN     bearer for BEE_API_BASE (vault-preferred). The headless
                     server-side custody of the Bee token — see the DM room /
                     always-on trade in the task-bridge thread.
-  BEE_SINK          broker (default) | local. LOCAL is the fully-OSS mode
+  BEE_INBOX_FILE    sqlite path for the inbox sink's OWN EventInbox (default
+                    <state>/bee-events.db). Never point it at the gateway
+                    channel's inbox — MAX(cursor) there is its resume anchor.
+  BEE_SINK          broker (default) | local | inbox. INBOX delivers into
+                    ag2-sparrow's durable EventInbox and drains through the
+                    shared TaskifyHandler (threshold=1), which stamps every
+                    promoted task access_tier: ambient — the framework path.
+                    LOCAL is the fully-OSS mode
                     (owner question 2026-08-06: "the user does not need to
                     depend on ag2space's relay?"): events are written as
                     task FILES into <workspace>/tasks/ — the same file
@@ -242,6 +249,54 @@ def _write_local_task(task: dict) -> bool:
     return True
 
 
+class _InboxSink:
+    """BEE_SINK=inbox: deliver events into ag2-sparrow's durable EventInbox and
+    drain them through the shared TaskifyHandler (threshold=1 — Bee events are
+    discrete captures, not room chatter to batch). The consumer stamps every
+    promoted task `access_tier: ambient` with the in-band observation block, so
+    this sink inherits the framework's authorization posture by construction.
+
+    The inbox lives in its OWN sqlite file (default <state>/bee-events.db,
+    override BEE_INBOX_FILE): the gateway EventChannel resumes from
+    MAX(cursor) of ITS inbox, so a second source must never share that file
+    or it corrupts the resume anchor. Cursor here is a local monotonic int;
+    the Bee-side SSE resume stays the existing BEE_CURSOR_FILE string id.
+
+    Delivery contract: insert() committing IS delivery (durable, at-least-once
+    downstream); drain/promotion failures are retried on later drains and never
+    halt the stream. A duplicate replay after reconnect returns False from
+    insert() but is already durable — treated as delivered."""
+
+    def __init__(self, types: set):
+        from ag2_sparrow import _dirs
+        from ag2_sparrow.event_inbox import EventInbox
+        from ag2_sparrow.event_consumer import EventConsumer, TaskifyHandler
+        path = os.environ.get("BEE_INBOX_FILE", "").strip() \
+            or str(_dirs.state_dir() / "bee-events.db")
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._inbox = EventInbox(path)
+        self._next = (self._inbox.durable_cursor() or 0) + 1
+        handler = TaskifyHandler(str(_dirs.task_dir()), agent_mxid=None,
+                                 threshold=1, log=_log, types=types)
+        self._consumer = EventConsumer(self._inbox, handler)
+
+    def deliver(self, task: dict, etype: str) -> bool:
+        env = {"event_id": task["id"], "cursor": self._next,
+               "type": f"bee.{etype}", "room_id": f"bee:{task['channel_id']}",
+               "actor_id": "bee", "content": {"body": task["task"]}}
+        try:
+            self._inbox.insert(env)
+        except Exception as e:  # noqa: BLE001 — sqlite failure = not durable, halt
+            _log(f"inbox insert failed for {task['id']}: {e}")
+            return False
+        self._next += 1
+        try:
+            self._consumer.drain()
+        except Exception as e:  # noqa: BLE001 — events stay durable; retried next drain
+            _log(f"inbox drain error (event remains durable): {e}")
+        return True
+
+
 def _post_task(cfg: dict, task: dict) -> bool:
     req = urllib.request.Request(
         cfg["BEE_BROKER_URL"].rstrip("/") + "/v1/ingest",
@@ -284,6 +339,8 @@ def _sse_frames(resp):
 
 def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
     wanted = {t.strip() for t in cfg["BEE_EVENT_TYPES"].split(",") if t.strip()}
+    _sink = (_InboxSink({f"bee.{t}" for t in wanted})
+             if cfg.get("BEE_SINK") == "inbox" else None)
     _direct = bool(cfg.get("BEE_API_BASE") and cfg.get("BEE_API_TOKEN"))
     _base = cfg["BEE_API_BASE"] if _direct else cfg["BEE_PROXY_URL"]
     url = _base.rstrip("/") + cfg["BEE_EVENTS_PATH"]
@@ -310,9 +367,13 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
                     except ValueError:
                         data = {"text": data_raw}
                     task = event_to_task(etype, eid or data_raw, data)
-                    _deliver = (_write_local_task if cfg.get("BEE_SINK") == "local"
-                                else lambda t: _post_task(cfg, t))
-                    if not _deliver(task):
+                    if _sink is not None:
+                        ok = _sink.deliver(task, etype)
+                    elif cfg.get("BEE_SINK") == "local":
+                        ok = _write_local_task(task)
+                    else:
+                        ok = _post_task(cfg, task)
+                    if not ok:
                         # Contiguous-prefix cursor discipline (review P1
                         # 2026-08-06): a failed delivery HALTS the stream.
                         # Processing a later event would advance the cursor
@@ -355,7 +416,7 @@ def main() -> int:
     if not _source_ok:
         # neither a local proxy nor a direct API source is configured
         required = ["BEE_PROXY_URL (or BEE_API_BASE+BEE_API_TOKEN)"]
-    if cfg.get("BEE_SINK") != "local":
+    if cfg.get("BEE_SINK") not in ("local", "inbox"):
         required += [k for k in ("BEE_BROKER_URL", "BEE_BROKER_TOKEN") if not cfg[k]]
     missing = required
     if missing:

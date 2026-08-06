@@ -208,6 +208,32 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertNotIn("access_tier: owner", body)
         self.assertFalse(list(tasksdir.glob("*.tmp")))
 
+    def test_inbox_sink_promotes_ambient_tasks_via_framework(self):
+        # BEE_SINK=inbox: events land durably in the sink's OWN EventInbox and
+        # the shared TaskifyHandler (threshold=1) promotes each into an ambient
+        # task file — the framework path John's tier review pointed at. Broker
+        # never contacted; redelivery is idempotent end-to-end (event_id dedup
+        # in the inbox + deterministic promoted task ids).
+        from ag2_sparrow import _dirs
+        base = Path(self.tmp.name) / "inboxmode"
+        tasksdir = base / "tasks"
+        _dirs.set_dirs(task_dir=str(tasksdir), state_dir=str(base / "state"))
+        self.addCleanup(_dirs.set_dirs)
+        cfg = {**self.cfg, "BEE_SINK": "inbox",
+               "BEE_BROKER_URL": "", "BEE_BROKER_TOKEN": ""}
+        rc = self.mod.run(cfg, once=True)
+        rc2 = self.mod.run(cfg, once=True)          # redelivery: same outcome
+        self.assertEqual((rc, rc2), (0, 0))
+        self.assertEqual(_Server.ingested, [])       # broker untouched
+        self.assertTrue((base / "state" / "bee-events.db").exists())
+        files = sorted(tasksdir.glob("task-taskify-*.txt"))
+        self.assertEqual(len(files), 2)              # threshold=1: one task per event
+        joined = "\n".join(f.read_text() for f in files)
+        self.assertIn("access_tier: ambient", joined)
+        self.assertNotIn("access_tier: owner", joined)
+        self.assertIn("bee.todo-created", joined)    # typed provenance survives
+        self.assertIn("buy milk", joined)            # captured text reaches the body
+
     def test_local_sink_needs_no_broker_config(self):
         with patch.object(sys, "argv",
                           ["bee_watcher.py", "--once", "--bee-sink", "local"]):

@@ -47,11 +47,14 @@ class TaskifyHandler:
     task file into `task_dir`. Skips self events and non-meaningful types."""
 
     def __init__(self, task_dir: str, agent_mxid: "str | None",
-                 threshold: int = 5, log=print):
+                 threshold: int = 5, log=print, types=None):
         self.task_dir = task_dir
         self.agent_mxid = agent_mxid
         self.threshold = max(1, int(threshold))
         self._log = log
+        # Per-source meaningful-type set (e.g. bee.* from the Bee inbox sink);
+        # default preserves the room-activity behavior exactly.
+        self.types = frozenset(types) if types else MEANINGFUL_TYPES
         # Batches are PARTITIONED BY ROOM (review P1: one global batch mixed
         # rooms into a single task, attributing a private room's events to the
         # last room seen — a provenance/context boundary crossing). Each room
@@ -68,7 +71,7 @@ class TaskifyHandler:
         re-drain (idempotent), so re-processing never double-counts a batch."""
         eid = str(event.get("event_id") or "")
         etype = event.get("type")
-        if etype not in MEANINGFUL_TYPES:
+        if etype not in self.types:
             return [eid] if eid else []          # noise → settled, skip
         if self.agent_mxid and event.get("actor_id") == self.agent_mxid:
             return [eid] if eid else []          # self-echo → settled, never wakes Core
