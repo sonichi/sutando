@@ -114,6 +114,39 @@ class TestVaultIntercept(unittest.TestCase):
         self.assertNotIn(SECRET, content)
         self.assertIn("NOT stored", content)
 
+    def test_quoted_and_equals_forms_intercepted(self):
+        # Review P1 2026-08-06: the shipped vault parser (vault_intercept)
+        # documents quoted values and =-separated forms; the gateway intercept
+        # must cover the same shapes or those bodies persist in plaintext with
+        # no sink call. Each case pins sink args, task-file redaction, AND
+        # last-owner-activity.json redaction.
+        cases = [
+            (f'vault set QUOTED "{SECRET} with spaces"',
+             "QUOTED", f"{SECRET} with spaces"),
+            (f"vault set SINGLE '{SECRET}'", "SINGLE", SECRET),
+            (f"vault set TICK `{SECRET}`", "TICK", SECRET),
+            (f"vault set EQUALS={SECRET}", "EQUALS", SECRET),
+            (f"vault set SPACED = {SECRET}", "SPACED", SECRET),
+            (f"VAULT SET UPPER {SECRET}", "UPPER", SECRET),
+        ]
+        for body, key, value in cases:
+            with self.subTest(body=body):
+                calls = []
+                self.mod.VAULT_SINK = lambda k, v: calls.append((k, v)) or True
+                content = self._write(body)
+                self.assertEqual(calls, [(key, value)])
+                self.assertNotIn(SECRET, content)
+                self.assertIn("stored to the vault", content)
+                activity = (self.ws / "state" / "last-owner-activity.json").read_text()
+                self.assertNotIn(SECRET, activity)
+
+    def test_empty_quoted_value_not_intercepted(self):
+        calls = []
+        self.mod.VAULT_SINK = lambda k, v: calls.append((k, v)) or True
+        content = self._write('vault set EMPTY ""')
+        self.assertEqual(calls, [])                 # nothing to store
+        self.assertIn('vault set EMPTY ""', content)  # left as ordinary text
+
     def test_prose_mention_not_intercepted(self):
         calls = []
         self.mod.VAULT_SINK = lambda k, v: calls.append((k, v)) or True

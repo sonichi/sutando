@@ -51,20 +51,33 @@ _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
 )
 # The explicit vault-set command shape. The WHOLE body must be the command —
 # a command quoted inside prose is not an intent to store (and redacting it is
-# the generic filter's job when the value matches a known pattern). KEY is
-# env-var-shaped; VALUE is any non-whitespace run (client secrets and the like
-# have no reliable shape — see the 2026-08-06 MS365 secret, which matched no
-# fallback pattern and reached disk).
+# the generic filter's job when the value matches a known pattern). VALUE
+# shapes and the key/value separator MIRROR the shipped vault parser
+# (`_VAULT_SET_RE` in src/vault_intercept.py): double/single/backtick-quoted
+# strings (spaces allowed, quotes stripped), bare non-space token, and both
+# `KEY VALUE` and `KEY=VALUE` / `KEY = VALUE` separators. Review P1
+# 2026-08-06: matching only `KEY <bare-token>` left the other documented
+# forms — exactly the ones owners use for secrets with punctuation or
+# spaces — persisting in plaintext with no sink call. KEY is `[^\s=]+` like
+# the shipped parser; the whole-body anchor is what keeps prose out, so the
+# looser key shape adds no FP surface.
 VAULT_SET_RE = re.compile(
-    r"^\s*vault\s+set\s+([A-Za-z_][A-Za-z0-9_]*)\s+(\S+)\s*$"
+    r"^\s*vault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)"
+    r"(?:\"([^\"]*)\"|'([^']*)'|`([^`]*)`|(\S+))\s*$",
+    re.IGNORECASE,
 )
 
 
 def extract_vault_set(text: str) -> "tuple[str, str] | None":
     """Return (key, value) when the entire body is a `vault set KEY VALUE`
-    command, else None."""
+    command (any supported value shape), else None. Quotes are stripped —
+    the stored value is the content, matching vault_intercept semantics. An
+    empty value (`vault set K ""`) returns None: nothing to store."""
     m = VAULT_SET_RE.match(text or "")
-    return (m.group(1), m.group(2)) if m else None
+    if not m:
+        return None
+    value = next((g for g in m.groups()[1:] if g is not None), "")
+    return (m.group(1), value) if value else None
 
 
 def vault_set_replacement(key: str, *, stored: bool, owner: bool) -> str:
