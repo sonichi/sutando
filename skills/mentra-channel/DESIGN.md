@@ -62,9 +62,12 @@ glasses ── MentraOS Cloud ──(webhook + WS)── mentra app server (ours
 1. Mentra developer console account + app registration (`packageName`,
    webhook URL, `MENTRAOS_API_KEY`) — needs an identity decision from the
    owner (her account vs an agent account).
-2. A public HTTPS endpoint for the webhook + WS egress. Candidate: the EC2
-   box alongside the broker — **git-tracked deploy only** (owner hard rule
-   2026-07-16); a `deploy-mentra.yml` sibling of `deploy-broker.yml`.
+2. A public HTTPS endpoint for the webhook + WS egress. AG2 Space runs on
+   **EKS** (owner correction 2026-08-06 — no longer EC2): the app server
+   deploys as a Deployment/Service on the cluster with an ingress route for
+   `chat.ag2.space/mentra`, sibling of the broker's EKS deploy. Same
+   git-tracked-only rule (owner hard rule 2026-07-16): manifests + image
+   build land in the backend repo first; never hand-edit the cluster.
 3. Secrets via vault: `MENTRAOS_API_KEY`, the lane's ingest bearer.
 
 ## Test plan
