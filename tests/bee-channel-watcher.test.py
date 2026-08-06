@@ -185,6 +185,30 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(_Server.ingested), 1)
 
+    def test_partial_failure_never_advances_cursor_past_failed_event(self):
+        # Review P1: e1 fails, e2 would succeed in the SAME stream. The
+        # watcher must HALT at e1 — not deliver e2 and persist its id, which
+        # would make the reconnect's Last-Event-ID skip e1 forever.
+        calls = []
+        real_post = self.mod._post_task
+
+        def flaky(cfg, task):
+            calls.append(task["id"])
+            if len(calls) == 1:
+                return False                       # e1: broker rejects
+            return real_post(cfg, task)            # later events would work
+
+        with patch.object(self.mod, "_post_task", side_effect=flaky):
+            rc = self.mod.run(self.cfg, once=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["task-bee-e1"])   # halted: e2 never attempted
+        self.assertFalse(self._cursor.exists())    # cursor untouched
+        # Recovery: next connection (broker healthy) replays from the start
+        # of the undelivered suffix and the cursor lands on the last event.
+        self.mod.run(self.cfg, once=True)
+        self.assertEqual(
+            json.loads(self._cursor.read_text())["last_event_id"], "f:9/x")
+
     def test_ingest_failure_logged_no_cursor_write(self):
         # Broker down: POST fails, watcher survives, cursor never advances.
         cfg = {**self.cfg, "BEE_BROKER_URL": "http://127.0.0.1:9"}  # closed port

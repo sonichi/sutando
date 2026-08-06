@@ -199,11 +199,22 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
                     except ValueError:
                         data = {"text": data_raw}
                     task = event_to_task(etype, eid or data_raw, data)
-                    if _post_task(cfg, task):
-                        forwarded += 1
-                        _log(f"forwarded {task['id']} ({etype}) → {cfg['BEE_AGENT_ID']}")
-                        if eid:
-                            _write_cursor(eid)
+                    if not _post_task(cfg, task):
+                        # Contiguous-prefix cursor discipline (review P1
+                        # 2026-08-06): a failed delivery HALTS the stream.
+                        # Processing a later event would advance the cursor
+                        # past this one, and the reconnect's Last-Event-ID
+                        # would tell Bee never to replay it — silent data
+                        # loss. Reconnect resumes from the last fully
+                        # delivered prefix; broker enqueue idempotency
+                        # absorbs any replays of already-accepted events.
+                        _log(f"halting stream at {task['id']} — delivery "
+                             "failed; will reconnect from last good cursor")
+                        break
+                    forwarded += 1
+                    _log(f"forwarded {task['id']} ({etype}) → {cfg['BEE_AGENT_ID']}")
+                    if eid:
+                        _write_cursor(eid)
                     if max_events and forwarded >= max_events:
                         return 0
         except (urllib.error.URLError, OSError) as e:
