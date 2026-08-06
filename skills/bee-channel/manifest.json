@@ -4,7 +4,7 @@
   "owner": "github:sonichi/sutando",
   "stability": "experimental",
   "enabled": true,
-  "access_tier": "ambient",
+  "access_tier": "owner",
   "description": "Bee AI wearable as an inbound-only channel: a client-side watcher subscribes to the Bee local proxy's SSE event stream and posts selected events into the ag2space task broker via /v1/ingest (source=bee). Results route to the Bee fallback DM room broker-side (backend#444 asymmetric-channel rule). Config-only manifest \u2014 no runtime tools; run scripts/bee_watcher.py as a background process.",
   "config": {
     "BEE_PROXY_URL": "",
