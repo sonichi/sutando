@@ -241,9 +241,10 @@ def _write_local_task(task: dict) -> bool:
              f"channel_id: {task['channel_id']}", f"user_id: {task['user_id']}",
              "room_name: Bee", "priority: low", "access_tier: ambient"]
     dest = tasks_dir / f"{task['id']}.txt"
-    # Archive-aware dedupe: the core moves a consumed task to tasks/archive/,
-    # so a live-file-only check re-created already-processed events on replay.
-    if dest.exists() or (tasks_dir / "archive" / dest.name).exists():
+    # Archive-aware dedupe via the shared lookup: covers live, legacy-flat
+    # archive, AND the month-partitioned tasks/archive/YYYY-MM/ the core uses.
+    from ag2_sparrow.local_task_protocol import find_archived_task
+    if find_archived_task(tasks_dir, task["id"]) is not None:
         return True                     # same event redelivered — idempotent
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")

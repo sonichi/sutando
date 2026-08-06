@@ -209,11 +209,14 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertFalse(list(tasksdir.glob("*.tmp")))
 
     def test_local_sink_dedupes_after_core_archives_the_task(self):
-        # Codex P1 (2026-08-06): live-file-only dedupe re-created an already-
-        # PROCESSED event after the core moved it to tasks/archive/ — a Bee
-        # replay then caused duplicate work. Mirror of the reviewer's probe:
-        # deliver → simulate core consume (mv live → archive/) → replay must
-        # NOT recreate a live task.
+        # Codex P1 x2 (2026-08-06): live-file-only dedupe re-created already-
+        # PROCESSED events after the core archived them; the first fix probed
+        # only the legacy FLAT archive while the core actually archives to
+        # month-partitioned tasks/archive/YYYY-MM/ (src/task-bridge.ts). This
+        # mirrors the reviewer's second probe: one event archived through the
+        # CANONICAL month layout, one through the legacy flat layout — replay
+        # must recreate NEITHER.
+        import time as _t
         from ag2_sparrow import _dirs
         tasksdir = Path(self.tmp.name) / "archivews" / "tasks"
         _dirs.set_dirs(task_dir=str(tasksdir))
@@ -223,14 +226,14 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertEqual(self.mod.run(cfg, once=True), 0)
         live = sorted(tasksdir.glob("task-bee-*.txt"))
         self.assertEqual(len(live), 2)
-        archive = tasksdir / "archive"
-        archive.mkdir()
-        for f in live:                               # core consumes + archives
-            f.rename(archive / f.name)
-        self.assertEqual(self.mod.run(cfg, once=True), 0)   # SSE replay
+        month = tasksdir / "archive" / _t.strftime("%Y-%m")
+        month.mkdir(parents=True)
+        live[0].rename(month / live[0].name)                 # canonical layout
+        live[1].rename(tasksdir / "archive" / live[1].name)  # legacy flat
+        self.assertEqual(self.mod.run(cfg, once=True), 0)    # SSE replay
         self.assertEqual(sorted(tasksdir.glob("task-bee-*.txt")), [],
                          "replay after archive must not recreate live tasks")
-        self.assertEqual(len(list(archive.glob("task-bee-*.txt"))), 2)
+        self.assertEqual(len(list((tasksdir / "archive").rglob("task-bee-*.txt"))), 2)
 
     def test_inbox_sink_promotes_ambient_tasks_via_framework(self):
         # BEE_SINK=inbox: events land durably in the sink's OWN EventInbox and
