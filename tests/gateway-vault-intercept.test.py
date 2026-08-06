@@ -125,5 +125,81 @@ class TestVaultIntercept(unittest.TestCase):
         self.assertIn("NOT stored", content)
 
 
+class TestCanonicalSrcCopy(unittest.TestCase):
+    """The canonical src/chat_secret_filter.py (package copy is generated from
+    it) must carry the same vault-set behavior — covered directly so the diff
+    gate sees the canonical lines, not just the package mirror."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "csf_canonical", Path(__file__).resolve().parent.parent / "src" / "chat_secret_filter.py")
+        self.csf = importlib.util.module_from_spec(spec)
+        # dataclass decoration resolves cls.__module__ via sys.modules — the
+        # module must be registered BEFORE exec or the import dies.
+        sys.modules["csf_canonical"] = self.csf
+        spec.loader.exec_module(self.csf)
+
+    def test_extract_shapes(self):
+        self.assertEqual(self.csf.extract_vault_set("vault set K v"), ("K", "v"))
+        self.assertIsNone(self.csf.extract_vault_set("say vault set K v"))
+        self.assertIsNone(self.csf.extract_vault_set("vault set K v\nx"))
+        self.assertIsNone(self.csf.extract_vault_set(""))
+
+    def test_replacement_branches_never_contain_value(self):
+        for kwargs, marker in (
+            (dict(stored=True, owner=True), "stored to the vault"),
+            (dict(stored=False, owner=False), "not owner-tier"),
+            (dict(stored=False, owner=True), "no vault sink configured"),
+        ):
+            body = self.csf.vault_set_replacement("KEY", **kwargs)
+            self.assertIn("KEY", body)
+            self.assertIn(marker, body)
+            self.assertIn("REDACTED", body)
+
+
+class TestKeychainSinkWiring(unittest.TestCase):
+    """The loader's _keychain_vault_sink shells to skills/secret-vault with the
+    value on STDIN (never argv) and maps the exit code to bool."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        ws = Path(self.tmp.name)
+        for d in ("tasks", "results", "state"):
+            (ws / d).mkdir()
+        env = {"CLAUDE_CONFIG_DIR": str(ws / "cfg"),
+               "REMOTE_TASK_TOKEN": "https://gw.example|s"}
+        self._old_env = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        self.mod = _load("rgb_sink_wiring", str(ws))
+
+    def tearDown(self):
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def test_sink_invokes_secret_vault_with_stdin_value(self):
+        import subprocess as sp
+        from unittest.mock import patch
+        with patch.object(sp, "run") as run:
+            run.return_value = type("R", (), {"returncode": 0})()
+            ok = self.mod._keychain_vault_sink("K1", "v-secret")
+        self.assertTrue(ok)
+        args, kwargs = run.call_args
+        self.assertIn("secret-vault.py", " ".join(map(str, args[0])))
+        self.assertEqual(args[0][-2:], ["set", "K1"])
+        self.assertEqual(kwargs.get("input"), b"v-secret")
+        self.assertNotIn("v-secret", " ".join(map(str, args[0])))
+
+    def test_sink_maps_nonzero_to_false(self):
+        import subprocess as sp
+        from unittest.mock import patch
+        with patch.object(sp, "run") as run:
+            run.return_value = type("R", (), {"returncode": 1})()
+            self.assertFalse(self.mod._keychain_vault_sink("K1", "v"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
