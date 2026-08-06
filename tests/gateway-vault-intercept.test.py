@@ -140,19 +140,49 @@ class TestVaultIntercept(unittest.TestCase):
                 activity = (self.ws / "state" / "last-owner-activity.json").read_text()
                 self.assertNotIn(SECRET, activity)
 
-    def test_empty_quoted_value_not_intercepted(self):
+    def test_empty_quoted_value_scrubbed_not_stored(self):
+        # Nothing to store (empty value) — but EMPTY is a deliberate key, so
+        # the embedded fail-closed scrub still replaces the fragment rather
+        # than leaving command-shaped text in the task body.
         calls = []
         self.mod.VAULT_SINK = lambda k, v: calls.append((k, v)) or True
         content = self._write('vault set EMPTY ""')
         self.assertEqual(calls, [])                 # nothing to store
-        self.assertIn('vault set EMPTY ""', content)  # left as ordinary text
+        self.assertIn("vault set EMPTY [REDACTED", content)
 
-    def test_prose_mention_not_intercepted(self):
+    def test_embedded_candidate_scrubbed_not_stored(self):
+        # Review P1 (mid-prose repro): a quoted secret after a deliberate key
+        # inside prose must not persist ANYWHERE — and must NOT be stored
+        # (quoting a command is not a store intent). Mirrors the shipped
+        # Slack/Discord parser's fail-closed posture.
+        calls = []
+        self.mod.VAULT_SINK = lambda k, v: calls.append((k, v)) or True
+        body = f'please store this: vault set MIDPROSE "{SECRET} with spaces" for later'
+        content = self._write(body)
+        self.assertEqual(calls, [])                       # never stored
+        self.assertNotIn(SECRET, content)
+        self.assertIn("embedded in prose; NOT stored", content)
+        activity = (self.ws / "state" / "last-owner-activity.json").read_text()
+        self.assertNotIn(SECRET, activity)
+
+    def test_embedded_env_shaped_key_fail_closed(self):
+        # #2074 guard parity: an env-shaped key is a deliberate key — the
+        # candidate is scrubbed even when the value looks harmless. The value
+        # is lost fail-closed; the sender is told how to store properly.
         calls = []
         self.mod.VAULT_SINK = lambda k, v: calls.append((k, v)) or True
         content = self._write("how do I use vault set KEY VALUE from here?")
         self.assertEqual(calls, [])
-        self.assertIn("vault set KEY VALUE", content)
+        self.assertNotIn("KEY VALUE", content)            # value gone
+        self.assertIn("vault set KEY [REDACTED", content)
+
+    def test_true_prose_untouched(self):
+        # Guard's other half: plain-lowercase key + non-secret value = prose.
+        calls = []
+        self.mod.VAULT_SINK = lambda k, v: calls.append((k, v)) or True
+        content = self._write("btw the vault set command works fine now")
+        self.assertEqual(calls, [])
+        self.assertIn("the vault set command works fine now", content)
 
     def test_sink_failure_still_redacts(self):
         def _boom(k, v):

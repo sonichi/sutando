@@ -80,6 +80,47 @@ def extract_vault_set(text: str) -> "tuple[str, str] | None":
     return (m.group(1), value) if value else None
 
 
+# Embedded (mid-prose) vault-set candidates. The whole-body form above is a
+# STORE intent; a candidate inside prose is not — but review P1 2026-08-06
+# proved it still leaks: `please store this: vault set K "secret" for later`
+# persisted the plaintext because only the generic pattern filter saw it. The
+# shipped Slack/Discord parser (vault_intercept._VAULT_SET_RE) intentionally
+# finds candidates ANYWHERE and fail-closes on them; this ports that pattern
+# and its #2074 false-positive guard (prose = key fullmatches [a-z]+ AND the
+# value is not secret-shaped; anything else is deliberate → redact). Embedded
+# candidates are REDACTED, never stored — quoting a command is not an intent
+# to store, but the value must not persist either way.
+EMBEDDED_VAULT_SET_RE = re.compile(
+    r"\bvault\s+set\s+([^\s=]+)(?:\s*=\s*|\s+)"
+    r"(?:\"([^\"]*)\"|'([^']*)'|`([^`]*)`|(\S+))",
+    re.IGNORECASE,
+)
+_PLAIN_LOWER_WORD = re.compile(r"[a-z]+")
+
+
+def scrub_embedded_vault_sets(text: str) -> "tuple[str, tuple[str, ...]]":
+    """Redact vault-set candidates embedded in prose (fail-closed, no store).
+    Returns (scrubbed_text, keys). Mirrors vault_intercept's FP guard: a
+    candidate is left alone ONLY when the key is a single plain lowercase
+    word AND the value is not secret-shaped — ordinary sentences pass
+    through; deliberately-named keys are always scrubbed."""
+    keys: list = []
+
+    def _sub(m: "re.Match") -> str:
+        key = m.group(1)
+        value = next((g for g in m.groups()[1:] if g is not None), "")
+        prose_key = _PLAIN_LOWER_WORD.fullmatch(key) is not None
+        secret_shaped = bool(_TOKENISH_RUN.fullmatch(value)) or any(
+            p.fullmatch(value) for _, p in _FALLBACK_PATTERNS)
+        if prose_key and not secret_shaped:
+            return m.group(0)
+        keys.append(key)
+        return (f"vault set {key} [REDACTED — embedded in prose; NOT stored. "
+                "Send `vault set` as its own message to store]")
+
+    return EMBEDDED_VAULT_SET_RE.sub(_sub, text or ""), tuple(keys)
+
+
 def vault_set_replacement(key: str, *, stored: bool, owner: bool) -> str:
     """The persisted body replacing an intercepted vault-set command. Never
     contains the value; tells the core exactly what happened so its reply to

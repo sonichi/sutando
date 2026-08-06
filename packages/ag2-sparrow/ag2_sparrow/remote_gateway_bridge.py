@@ -182,6 +182,7 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 # src/ and pointed outside the repo).
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
 from .chat_secret_filter import (extract_vault_set, filter_chat_secrets,
+                                 scrub_embedded_vault_sets,
                                  secret_handling_instruction,
                                  vault_set_replacement)
 from .task_archive import find_task_file
@@ -1447,6 +1448,8 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None,
             _kv = extract_vault_set(body)
             if _kv:
                 body = f"vault set {_kv[0]} [REDACTED]"
+            else:
+                body, _ = scrub_embedded_vault_sets(body)
             # #2267 parity: the presence summary is persisted state too — a
             # pasted token must not survive in last-owner-activity.json either.
             body = filter_chat_secrets(body).text
@@ -1573,6 +1576,16 @@ def _write_task(task: dict) -> str | None:
                     _vk, stored=_stored, owner=(sender_tier == "owner"))
                 _log(f"vault-set intercepted in {tid}: key={_vk} "
                      f"stored={_stored} tier={sender_tier}")
+            else:
+                # Embedded (mid-prose) candidates: never stored, but the value
+                # must not persist either (review P1 2026-08-06 — the generic
+                # filter alone missed a quoted mid-prose secret). Runs only
+                # when the whole-body branch didn't, so a real store intent is
+                # never double-processed.
+                _fetched, _embedded_keys = scrub_embedded_vault_sets(_fetched)
+                if _embedded_keys:
+                    _log(f"embedded vault-set candidate(s) scrubbed in {tid}: "
+                         f"{', '.join(_embedded_keys)}")
             _filtered = filter_chat_secrets(_fetched)
             if _filtered.secret_types:
                 _secret_types = tuple(_filtered.secret_types)
