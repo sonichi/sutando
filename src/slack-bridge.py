@@ -1113,7 +1113,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"interaction_type: message\n"
         f"{media_headers}"
         f"channel_id: {channel}\n"
-        + (f"thread_ts: {thread_ts}\n" if thread_ts else "")
+        + (f"reply_thread_ts: {thread_ts}\n" if thread_ts else "")
         + f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
