@@ -349,6 +349,49 @@ class TestResolveActiveTarget(unittest.TestCase):
                 else:
                     os.environ["CLAUDE_CONFIG_DIR"] = old
 
+    def test_symlinked_out_channel_dir_is_not_deliverable(self):
+        # notify.py's sender REFUSES a channel entry that resolves outside
+        # channels/ (realpath containment); the probe must agree or we recreate
+        # selected-then-send-fails via the symlink mismatch (#2701 review P1).
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg, \
+             tempfile.TemporaryDirectory() as outside:
+            os.makedirs(os.path.join(cfg, "channels"), exist_ok=True)
+            with open(os.path.join(outside, ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            os.symlink(outside, os.path.join(cfg, "channels", "sneaky"))
+            p = self._write(td, {"channel": "sneaky", "channel_id": "!r:s"})
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            try:
+                self.assertEqual(resolve_active_target(p), ("", ""))
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_claude_home_tier_is_honored(self):
+        # notify.py resolves CLAUDE_CONFIG_DIR -> CLAUDE_HOME -> ~/.claude; the
+        # probe must walk the SAME tiers (a CLAUDE_HOME-only env previously
+        # made probe and sender disagree — #2701 review P1).
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, "channels", "dev-ag2space"))
+            with open(os.path.join(home, "channels", "dev-ag2space", ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            old_cfg = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            old_home = os.environ.get("CLAUDE_HOME")
+            os.environ["CLAUDE_HOME"] = home
+            try:
+                self.assertEqual(resolve_active_target(p), ("dev-ag2space", "!r:d"))
+            finally:
+                if old_cfg is not None:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old_cfg
+                if old_home is None:
+                    del os.environ["CLAUDE_HOME"]
+                else:
+                    os.environ["CLAUDE_HOME"] = old_home
+
     def test_traversal_shaped_source_is_never_probed(self):
         # The slug guard must reject path-shaped sources outright.
         with tempfile.TemporaryDirectory() as td:

@@ -206,13 +206,23 @@ def _is_deliverable(source):
         return True
     if not source or not _SOURCE_SLUG_RE.match(source):
         return False
-    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    # Probe for exactly what notify.py's sender reads — channels/<source>/.env.
-    # A broader *.env glob would mark lanes deliverable that the sender then
-    # fails on (exit 1), losing the escalation AND blocking the debounce latch
-    # (review P1 on #2701). If notify.py ever learns more filenames (#2686's
-    # try-both), widen BOTH sides together.
-    return os.path.isfile(os.path.join(base, "channels", source, ".env"))
+    # Probe for exactly what notify.py's sender reads, mirroring its FULL
+    # resolution contract (review P1 x2 on #2701 — filename alone was not
+    # enough): (1) same three-tier base, CLAUDE_CONFIG_DIR -> CLAUDE_HOME ->
+    # ~/.claude; (2) same realpath containment — a channel entry symlinked
+    # OUTSIDE channels/ is one the sender refuses, so probing it deliverable
+    # would recreate the selected-then-send-fails class via a different
+    # mismatch. If notify.py ever learns more filenames (#2686's try-both),
+    # widen BOTH sides together.
+    base = (os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
+            or os.path.join(os.path.expanduser("~"), ".claude"))
+    channels_dir = os.path.join(base, "channels")
+    env_path = os.path.join(channels_dir, source, ".env")
+    if not os.path.isfile(env_path):
+        return False
+    real_env = os.path.realpath(env_path)
+    real_root = os.path.realpath(channels_dir)
+    return real_env.startswith(real_root + os.sep)
 
 
 def resolve_active_target(activity_path):
