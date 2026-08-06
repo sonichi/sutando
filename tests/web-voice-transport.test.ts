@@ -872,6 +872,180 @@ describe('disconnect() awaitable teardown (T8 — teardown awaited before lease 
 	});
 });
 
+describe('closeSettled() — attempt-conclusion close completion (P1: lease release must await the handshake)', () => {
+	it('fresh transport: resolved immediately (no socket ever existed)', async () => {
+		const t = new VoiceTransport();
+		let settled = false;
+		void t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(0);
+		assert.equal(settled, true);
+	});
+
+	it('mic-error while the socket is open → the completion read INSIDE onConnectFailure settles only after the socket close event', async () => {
+		gumImpl = async () => {
+			const err = new Error('denied');
+			err.name = 'NotAllowedError';
+			throw err;
+		};
+		const failures: VoiceConnectFailure[] = [];
+		let atFailure: Promise<void> | null = null;
+		const h = harness({
+			onConnectFailure: (f) => {
+				failures.push(f);
+				// The contract consumers rely on: the completion is already
+				// latched when the failure callback runs.
+				atFailure = h.t.closeSettled();
+			},
+		});
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.open();
+		await delay(5); // startMic throws → latched mic error
+		assert.equal(failures[0]?.kind, 'mic-permission');
+		assert.ok(atFailure, 'closeSettled() readable from inside onConnectFailure');
+		assert.ok(s.closeCalls >= 1, 'transport closed its socket');
+		let settled = false;
+		void atFailure!.then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'not settled while the self-inflicted close handshake is in flight');
+		s.serverClose(1006); // the handshake completes
+		await delay(0);
+		assert.equal(settled, true, 'settles once the socket close event fires');
+	});
+
+	it('connect timeout → closeSettled() resolves only after the socket close event', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		await delay(45); // > connectTimeoutMs → latched timeout error
+		assert.equal(h.failures[0]?.kind, 'timeout');
+		let settled = false;
+		void h.t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'timeout latched but the close handshake is still in flight');
+		s.serverClose(1006);
+		await delay(0);
+		assert.equal(settled, true);
+	});
+
+	it('pre-open socket error → closeSettled() resolves only after the trailing close event', async () => {
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.error(); // pre-open → latched connect-error
+		assert.equal(h.failures[0]?.kind, 'connect-error');
+		let settled = false;
+		void h.t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'error latched but the trailing 1006 close has not fired yet');
+		s.serverClose(1006); // the browser's trailing close
+		await delay(0);
+		assert.equal(settled, true);
+	});
+
+	it('upstream-failed teardown → closeSettled() resolves only after the self-inflicted close event', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.message({
+			type: 'agent.state',
+			v: 1,
+			initialized: true,
+			upstream: 'failed',
+			reason: 'upstream-auth',
+			category: 'auth',
+			clientAttached: true,
+		});
+		assert.equal(h.failures[0]?.kind, 'agent-failed');
+		let settled = false;
+		void h.t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'agent-failed latched but the close handshake is still in flight');
+		s.serverClose(1000); // the self-inflicted close completes
+		await delay(0);
+		assert.equal(settled, true);
+	});
+
+	it('server-initiated closes (plain / 4409 / 4410) → closeSettled() captured at the terminal status is already settled', async () => {
+		for (const code of [4000, CLOSE_CODE_CLIENT_BUSY, CLOSE_CODE_SUPERSEDED_BY_TAKEOVER]) {
+			let captured: Promise<void> | null = null;
+			const h = harness({
+				onStatus: (status, detail, close) => {
+					h.statuses.push({ status, detail, close });
+					if (status === 'closed' || status === 'error' || status === 'superseded') {
+						captured = h.t.closeSettled();
+					}
+				},
+			});
+			const s = await goLive(h);
+			s.serverClose(code, 'server-close');
+			assert.ok(captured, `code ${code}: terminal status observed`);
+			let settled = false;
+			void captured!.then(() => {
+				settled = true;
+			});
+			await delay(0); // no close event, no fallback — a microtask must suffice
+			assert.equal(settled, true, `code ${code}: socket already closed ⇒ completion already settled`);
+		}
+	});
+
+	it('bounded fallback: a wedged self-close handshake resolves after disconnectCloseTimeoutMs', async () => {
+		gumImpl = async () => {
+			const err = new Error('busy');
+			err.name = 'NotReadableError';
+			throw err;
+		};
+		const h = harness({ disconnectCloseTimeoutMs: 20 });
+		await h.t.connect('ws://fake:9900/');
+		h.sock().open();
+		await delay(5); // mic-error latch; the fake deliberately never emits its close event
+		assert.equal(h.failures[0]?.kind, 'mic-device');
+		let settled = false;
+		void h.t.closeSettled().then(() => {
+			settled = true;
+		});
+		await delay(5);
+		assert.equal(settled, false, 'still awaiting a close that never comes');
+		await delay(40); // past the injected bound
+		assert.equal(settled, true, 'fallback fires — a wedged handshake cannot hang lease release');
+	});
+
+	it('a later disconnect() with the socket already gone returns the still-pending conclusion completion', async () => {
+		// Consumer shape: transport-initiated failure → surface ALSO calls
+		// disconnect() for cleanup. The returned promise must still cover the
+		// in-flight handshake of the socket the latch already closed.
+		gumImpl = async () => {
+			const err = new Error('denied');
+			err.name = 'NotAllowedError';
+			throw err;
+		};
+		const h = harness();
+		await h.t.connect('ws://fake:9900/');
+		const s = h.sock();
+		s.open();
+		await delay(5); // mic-error latch: socket closed + nulled by the transport
+		assert.equal(h.failures[0]?.kind, 'mic-permission');
+		let settled = false;
+		void h.t.disconnect().then(() => {
+			settled = true;
+		});
+		await delay(10);
+		assert.equal(settled, false, 'disconnect() after the latch still awaits the old handshake');
+		s.serverClose(1006);
+		await delay(0);
+		assert.equal(settled, true);
+	});
+});
+
 describe('`agent.state` client handling (Step 18 — design 1a′)', () => {
 	const frame = (over: Partial<AgentStateV1>): AgentStateV1 => ({
 		type: 'agent.state',

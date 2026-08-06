@@ -58,7 +58,16 @@
  *     that resolves once the underlying socket's real close handshake
  *     completes (bounded), so lease owners can await teardown before
  *     releasing exclusivity — the synchronous `closed` status still fires
- *     first, exactly as before.
+ *     first, exactly as before;
+ *   - EVERY attempt conclusion exposes that same completion via
+ *     `closeSettled()` (T8 generalized): self-initiated terminal closes
+ *     (connect timeout, mic failure, pre-open socket error, upstream-failed)
+ *     track their socket's real close handshake exactly like disconnect(),
+ *     and close-derived conclusions (statuses decoded from a WS close frame)
+ *     are already settled when they emit. After any terminal status /
+ *     onConnectFailure, consumers releasing single-client resources must
+ *     await closeSettled() before releasing, or the server may still count
+ *     the departing client (spurious 4409 on the next attempt).
  *
  * The DSP functions are pure and exported standalone so they unit-test in Node
  * (see tests/web-voice-transport.test.ts). The class is drivable from node:test
@@ -333,6 +342,13 @@ export interface VoiceTransportEvents {
    * Fires alongside the latched `error` status; surfaces route on `kind`
    * (mic-permission → permission flow, agent-failed/timeout → voice setup,
    * client-busy → take-over affordance, …).
+   *
+   * Lease-release contract (P1): after this fires (or any terminal status),
+   * `closeSettled()` settles once the underlying socket's close handshake is
+   * done — already resolved for close-derived conclusions, tracked (bounded)
+   * for self-initiated terminal closes. Consumers releasing single-client
+   * resources (e.g. a voice lease) must await it before releasing, or the
+   * server may still count this client and reject the next attempt with 4409.
    */
   onConnectFailure?(failure: VoiceConnectFailure): void;
   /**
@@ -463,6 +479,9 @@ export class VoiceTransport {
   private agentStateSeen = false;
   private legacyServer = false;
   private lastUpstream: AgentUpstreamState | null = null;
+  /** Current attempt-conclusion close completion — see closeSettled(). Starts
+   *  resolved: no socket ever existed. */
+  private closeCompletion: Promise<void> = Promise.resolve();
 
   // Debug-panel counters. They exist to bound the trace output (first N only),
   // not as protocol state — the surface reads byte totals from onStats.
@@ -625,9 +644,12 @@ export class VoiceTransport {
    * underlying WebSocket's real close handshake completes — i.e. the socket's
    * own `close` event has fired — so lease owners can await teardown before
    * releasing exclusivity. The synchronous behavior above is unchanged and the
-   * synchronous `closed` status always fires BEFORE the promise resolves. With
-   * no socket, or one already CLOSED, the promise resolves immediately; a
-   * wedged handshake is bounded by `disconnectCloseTimeoutMs` (default
+   * synchronous `closed` status always fires BEFORE the promise resolves. An
+   * already-CLOSED socket resolves immediately; with no socket the current
+   * attempt-conclusion completion is returned (immediately resolved unless a
+   * terminal latch already closed a socket whose handshake is still in
+   * flight — so `await disconnect()` always covers the last real teardown);
+   * a wedged handshake is bounded by `disconnectCloseTimeoutMs` (default
    * DISCONNECT_CLOSE_TIMEOUT_MS) so teardown can never hang.
    */
   disconnect(): Promise<void> {
@@ -637,37 +659,7 @@ export class VoiceTransport {
     const emitClosed = this.attemptActive && !this.terminal;
     this.attemptActive = false;
     const ws = this.ws;
-    let completion: Promise<void>;
-    if (!ws || ws.readyState === WebSocket.CLOSED) {
-      // Nothing to hand-shake: no socket, or its close already completed.
-      completion = Promise.resolve();
-    } else {
-      // Listen for the socket's REAL close event — attached BEFORE close() is
-      // called and BEFORE this.ws is cleared. The wsFactory seam guarantees
-      // only the onopen/onmessage/onerror/onclose property surface (fakes
-      // provide no addEventListener), so wrap the current onclose handler:
-      // it is connect()'s generation-fenced closure, already a guaranteed
-      // no-op after the bump above, and close fires at most once.
-      completion = new Promise<void>((resolve) => {
-        let settled = false;
-        let fallback: ReturnType<typeof setTimeout> | null = null;
-        const settle = (): void => {
-          if (settled) return;
-          settled = true;
-          if (fallback) clearTimeout(fallback);
-          resolve();
-        };
-        fallback = setTimeout(settle, this.disconnectCloseTimeoutMs);
-        const prevOnClose = ws.onclose;
-        ws.onclose = (event: CloseEvent) => {
-          try {
-            if (prevOnClose) prevOnClose.call(ws, event);
-          } finally {
-            settle();
-          }
-        };
-      });
-    }
+    const completion = this.trackCloseCompletion(ws);
     if (ws) {
       try {
         ws.close();
@@ -687,6 +679,72 @@ export class VoiceTransport {
    *  the same awaitable close-handshake completion (T8). */
   close(): Promise<void> {
     return this.disconnect();
+  }
+
+  /**
+   * Track the REAL close-handshake completion of a socket this side is about
+   * to close (factored from disconnect(); T8, generalized by the P1 fix to
+   * every self-initiated terminal close). The returned promise resolves once
+   * the socket's own `close` event has fired; a wedged handshake is bounded
+   * by `disconnectCloseTimeoutMs`. Must be called BEFORE `close()` and BEFORE
+   * `this.ws` is cleared. The wsFactory seam guarantees only the
+   * onopen/onmessage/onerror/onclose property surface (fakes provide no
+   * addEventListener), so this wraps the current onclose handler: it is
+   * connect()'s generation-fenced closure — already a guaranteed no-op once
+   * the caller has bumped the generation — and close fires at most once.
+   * The result is latched as the attempt-conclusion completion returned by
+   * `closeSettled()`; an already-CLOSED socket latches an immediately
+   * resolved completion, and with no socket the prior completion is kept
+   * (nothing new to hand-shake).
+   */
+  private trackCloseCompletion(ws: WebSocket | null): Promise<void> {
+    if (!ws) return this.closeCompletion;
+    if (ws.readyState === WebSocket.CLOSED) {
+      // Nothing to hand-shake: the socket's close already completed.
+      this.closeCompletion = Promise.resolve();
+      return this.closeCompletion;
+    }
+    const completion = new Promise<void>((resolve) => {
+      let settled = false;
+      let fallback: ReturnType<typeof setTimeout> | null = null;
+      const settle = (): void => {
+        if (settled) return;
+        settled = true;
+        if (fallback) clearTimeout(fallback);
+        resolve();
+      };
+      fallback = setTimeout(settle, this.disconnectCloseTimeoutMs);
+      const prevOnClose = ws.onclose;
+      ws.onclose = (event: CloseEvent) => {
+        try {
+          if (prevOnClose) prevOnClose.call(ws, event);
+        } finally {
+          settle();
+        }
+      };
+    });
+    this.closeCompletion = completion;
+    return completion;
+  }
+
+  /**
+   * The CURRENT attempt-conclusion close completion (P1 lease-release
+   * contract). After ANY terminal status / onConnectFailure, the returned
+   * promise settles once the underlying socket's close handshake is done:
+   * self-initiated terminal closes (connect timeout, mic failure, pre-open
+   * socket error, upstream-failed) track their own socket's close exactly
+   * like disconnect() does — the completion is latched BEFORE the terminal
+   * status/failure emits, so it can be read from inside the callbacks —
+   * while close-derived conclusions ('closed'/'error'/'superseded' decoded
+   * from a WS close frame) are already settled when they emit, because the
+   * socket is already closed. Resolved immediately when no socket ever
+   * existed; bounded by `disconnectCloseTimeoutMs`, so it can never hang.
+   * Consumers releasing single-client resources (e.g. a voice lease) MUST
+   * await this before releasing, or the server may still count the departing
+   * client and reject the next attempt with 4409.
+   */
+  closeSettled(): Promise<void> {
+    return this.closeCompletion;
   }
 
   /**
@@ -745,15 +803,22 @@ export class VoiceTransport {
     this.terminal = true;
     this.attemptActive = false;
     this.teardownAudio();
+    // P1: latch the close-handshake completion BEFORE the terminal status/
+    // failure emit, so closeSettled() read from inside the callbacks is
+    // already THIS conclusion's completion (a lease released before the
+    // handshake finishes leaves the server counting the old client →
+    // spurious 4409 on the next attempt).
+    const ws = this.ws;
+    this.trackCloseCompletion(ws);
     this.status('error', detail);
     this.emitFailure({
       kind: 'timeout',
       detail,
       remediation: VOICE_FAILURE_REMEDIATION.timeout,
     });
-    if (this.ws) {
+    if (ws) {
       try {
-        this.ws.close();
+        ws.close();
       } catch {
         /* already closed */
       }
@@ -799,6 +864,9 @@ export class VoiceTransport {
       this.attemptActive = false;
       this.clearLegacyTimer();
       this.teardownAudio();
+      // P1: latch the self-inflicted close-handshake completion before any
+      // callback emits (see onConnectTimeout).
+      this.trackCloseCompletion(ws);
       this.status('error', 'Mic error');
       this.ev.onMicError?.(name, err?.message ?? '', friendly);
       this.emitFailure({ kind, detail: friendly, remediation: VOICE_FAILURE_REMEDIATION[kind] });
@@ -827,15 +895,20 @@ export class VoiceTransport {
       this.attemptActive = false;
       this.clearConnectTimer();
       this.teardownAudio();
+      // P1: latch the close-handshake completion before the terminal emits
+      // (see onConnectTimeout). The browser's trailing 1006 close lands on
+      // the wrapped handler and settles it.
+      const ws = this.ws;
+      this.trackCloseCompletion(ws);
       this.status('error', detail);
       this.emitFailure({
         kind: 'connect-error',
         detail,
         remediation: VOICE_FAILURE_REMEDIATION['connect-error'],
       });
-      if (this.ws) {
+      if (ws) {
         try {
-          this.ws.close();
+          ws.close();
         } catch {
           /* already closed */
         }
@@ -863,6 +936,13 @@ export class VoiceTransport {
     // overwrite the close-derived status emitted below, the just-granted mic
     // stream would stay captured, and the statsTimer would leak.
     this.attemptGen++;
+    // P1: a close-derived conclusion needs no handshake tracking — the event
+    // driving this method IS the socket's close, so the attempt-conclusion
+    // completion is already settled by definition (closeSettled() resolves
+    // immediately for every status emitted below). Self-initiated terminal
+    // closes never reach here: their tracking wrapper replaced this socket's
+    // onclose.
+    this.closeCompletion = Promise.resolve();
     if (this.terminal) {
       // Latched terminal attempt (timeout / mic / pre-open error /
       // upstream-failed / client-busy / superseded): the self-inflicted or
@@ -969,6 +1049,9 @@ export class VoiceTransport {
         this.clearConnectTimer();
         this.teardownAudio();
         const ws = this.ws;
+        // P1: latch the self-initiated close-handshake completion before the
+        // terminal status/failure emit (see onConnectTimeout).
+        this.trackCloseCompletion(ws);
         this.ws = null;
         if (ws) {
           try {
