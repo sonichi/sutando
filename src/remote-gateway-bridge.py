@@ -69,21 +69,9 @@ for _root in (
     if str(_root) not in _send_allowlist._EXTRA_ROOTS:
         _send_allowlist.register_extra_roots(_root)
 
-# Run the canonical client source in-place. exec (not import) is deliberate:
-# module-level config (tier fail-closed parsing, URL/TOKEN, dirs) must
-# re-evaluate on EVERY load of this file — the mock-gateway test harness loads
-# it repeatedly under different env — and attribute reads/writes
-# (``rtc._ack_disabled_until = 0.0``) must hit the same namespace the running code
-# uses. A cached ``import ag2_sparrow.remote_gateway_bridge`` gives neither.
-_IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
-__package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
-exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
-
 # Sutando wiring: intercepted `vault set KEY VALUE` bodies store to the macOS
 # Keychain vault (skills/secret-vault) instead of persisting plaintext — the
 # same guarantee the Slack/Discord bridges give (owner gap-report 2026-08-06).
-# Assigned AFTER the exec so the canonical module's default (None) is replaced
-# in the very namespace the running code reads.
 def _keychain_vault_sink(key: str, value: str) -> bool:
     import subprocess as _sp
     _p = _sp.run(
@@ -93,4 +81,35 @@ def _keychain_vault_sink(key: str, value: str) -> bool:
     return _p.returncode == 0
 
 
+# Run the canonical client source in-place. exec (not import) is deliberate:
+# module-level config (tier fail-closed parsing, URL/TOKEN, dirs) must
+# re-evaluate on EVERY load of this file — the mock-gateway test harness loads
+# it repeatedly under different env — and attribute reads/writes
+# (``rtc._ack_disabled_until = 0.0``) must hit the same namespace the running code
+# uses. A cached ``import ag2_sparrow.remote_gateway_bridge`` gives neither.
+#
+# The canonical source ends with `if __name__ == "__main__": main()`. In
+# SCRIPT MODE (`python3 src/remote-gateway-bridge.py`) this loader's __name__
+# IS "__main__", so an unmasked exec would fire the canonical main() DURING
+# the exec — the poll loop starts and the VAULT_SINK assignment below never
+# runs, leaving the live script path sink-less (review P1 2026-08-06:
+# LIVE_MAIN_ENTRY_VAULT_SINK=None). So mask __name__ across the exec, wire
+# the sink into the SAME namespace the running code reads, THEN run main()
+# ourselves if we are the entrypoint. Import-mode callers (__name__ != main)
+# are unaffected: masking is a no-op and main() is not auto-run either way.
+_IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
+__package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
+_entrypoint = (__name__ == "__main__")
+_real_name = __name__
+__name__ = "_ag2_sparrow_bridge_impl"  # neutralize the canonical main-guard
+try:
+    exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
+finally:
+    __name__ = _real_name
+
+# Assigned AFTER the exec (which sets the canonical default None) but BEFORE
+# main() runs, so the running code reads the real sink.
 VAULT_SINK = _keychain_vault_sink
+
+if _entrypoint:
+    main()  # noqa: F821 — defined by the exec'd canonical source above

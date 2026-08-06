@@ -353,5 +353,53 @@ class TestKeychainSinkWiring(unittest.TestCase):
             self.assertFalse(self.mod._keychain_vault_sink("K1", "v"))
 
 
+class TestScriptModeSinkWired(unittest.TestCase):
+    """Review P1 2026-08-06: the loader execs the canonical source, which ends
+    `if __name__ == "__main__": main()`. In SCRIPT MODE the loader IS
+    __main__, so an unmasked exec fired main() before the sink was wired and
+    the live path ran with VAULT_SINK=None. Run the loader as __main__ in a
+    subprocess with main() stubbed, and assert VAULT_SINK is the keychain sink
+    at the moment main() is entered — the exact production entry order."""
+
+    def test_sink_precedes_entrypoint_main_in_source_order(self):
+        # Structural guard: the exec (which defines the real symbols and sets
+        # the canonical VAULT_SINK=None) comes first, THEN the sink is wired,
+        # THEN the entrypoint main() runs — and the canonical main-guard is
+        # masked across the exec so it can't auto-fire mid-exec.
+        loader = Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.py"
+        text = loader.read_text()
+        i_sink = text.index("VAULT_SINK = _keychain_vault_sink")
+        i_exec = text.index("exec(compile(_IMPL")
+        i_main = text.rindex("main()")
+        self.assertLess(i_exec, i_sink, "sink must be assigned AFTER the exec (real defs)")
+        self.assertLess(i_sink, i_main, "sink must be wired BEFORE the entrypoint main()")
+        # And the canonical main-guard is masked across the exec:
+        self.assertIn('__name__ = "_ag2_sparrow_bridge_impl"', text)
+        self.assertIn("_entrypoint = (__name__ == \"__main__\")", text)
+
+    def test_live_main_entry_vault_sink_not_none(self):
+        # Behavioral: exec the loader as __main__ with the canonical main
+        # replaced by a recorder, and assert VAULT_SINK is callable at entry.
+        import subprocess as sp
+        loader = Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.py"
+        prog = (
+            "import sys, types, pathlib\n"
+            f"loader = pathlib.Path({str(loader)!r})\n"
+            "src = loader.read_text()\n"
+            # Neuter the poll loop: after exec defines main, the loader calls it;
+            # we replace the trailing 'main()' entry with a sink-capture.\n"
+            "src = src.replace('\\nif _entrypoint:\\n    main()',"
+            "                  '\\nif _entrypoint:\\n    print(\\'LIVE_MAIN_ENTRY_VAULT_SINK=\\' + type(VAULT_SINK).__name__)')\n"
+            "g = {'__name__': '__main__', '__file__': str(loader)}\n"
+            "exec(compile(src, str(loader), 'exec'), g)\n"
+        )
+        env = dict(os.environ, REMOTE_TASK_TOKEN="https://gw.example|s",
+                   CLAUDE_CONFIG_DIR="/tmp/rgb-scriptmode-probe")
+        r = sp.run([sys.executable, "-c", prog], capture_output=True, text=True,
+                   env=env, timeout=30)
+        self.assertIn("LIVE_MAIN_ENTRY_VAULT_SINK=function", r.stdout,
+                      f"stdout={r.stdout!r} stderr={r.stderr[-400:]!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
