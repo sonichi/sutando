@@ -4694,6 +4694,16 @@ def check_disk_space() -> dict:
     return {"name": name, "status": "ok", "detail": where}
 
 
+# Temp roots whose contents do not survive a sweep or reboot. `/var/folders` is
+# the macOS per-user temp base that $TMPDIR points into.
+_EPHEMERAL_ROOTS = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/")
+
+
+def _is_ephemeral(target: str) -> bool:
+    """True if `target` lives under a temp root that gets swept."""
+    return any(target.startswith(r) for r in _EPHEMERAL_ROOTS)
+
+
 def check_skill_symlinks() -> dict:
     """Detect skills in the OSS repo checkout that are not symlinked into
     the Claude home's skills/ dir. A missing symlink means Claude Code never
@@ -4743,6 +4753,7 @@ def check_skill_symlinks() -> dict:
     # reported "all 60 skills linked". The drift was one ruff E401 import split
     # -- harmless that time, which is exactly why it survived unnoticed.
     shadowed: list[str] = []   # real dir where a symlink belongs -> NOT auto-fixed
+    misdirected: list[tuple[str, str]] = []  # resolves, but into a temp dir
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
             continue
@@ -4760,6 +4771,28 @@ def check_skill_symlinks() -> dict:
             unlinked.append(skill_name)
         elif dst.is_dir() and not dst.is_symlink():
             shadowed.append(skill_name)
+        elif (dst.is_symlink() and _is_ephemeral(os.path.realpath(dst))
+              and not _is_ephemeral(str(skills_src.resolve()))):
+            # A link that RESOLVES, into a temp dir. Every branch above asks
+            # "does it load?"; this asks "will it still be there tomorrow?".
+            # A scratch worktree satisfies the first and fails the second: the
+            # skill loads from code `git pull` never reaches, then vanishes on
+            # the next tmp sweep and reads as a dangling link with no record of
+            # how it got that way.
+            #
+            # Two conditions, both required. "Target is under a temp root"
+            # alone is wrong: a test fixture builds its whole install under
+            # tempfile, so every CORRECT link there is temp-rooted. What marks
+            # the defect is the MISMATCH -- a durable repo whose skill escapes
+            # into temp. When the repo is temp-rooted too, the layout is
+            # self-consistent and says nothing.
+            #
+            # Also deliberately NOT "resolves somewhere other than this
+            # checkout": pointing at another DURABLE clone is a supported
+            # layout (a skills repo installed alongside), and comparing against
+            # the running checkout flags every link when health-check runs from
+            # a worktree or a second clone -- 57 of 57 on this host.
+            misdirected.append((skill_name, os.path.realpath(dst)))
 
     # Dangling links whose skill is NOT in this repo are missed by the loop
     # above, which only walks repo skills. They are still dead entries that make
@@ -4778,7 +4811,7 @@ def check_skill_symlinks() -> dict:
     except OSError:
         pass
 
-    if not unlinked and not broken and not orphaned and not shadowed:
+    if not unlinked and not broken and not orphaned and not shadowed and not misdirected:
         return {"name": name, "status": "ok", "detail": f"all {sum(1 for d in skills_src.iterdir() if d.is_dir())} skills linked"}
 
     parts = []
@@ -4788,6 +4821,12 @@ def check_skill_symlinks() -> dict:
         parts.append(f"{len(unlinked)} unlinked: {', '.join(unlinked[:4])}{'...' if len(unlinked) > 4 else ''}")
     if orphaned:
         parts.append(f"{len(orphaned)} dangling not in this repo: {', '.join(orphaned[:4])}{'...' if len(orphaned) > 4 else ''}")
+    if misdirected:
+        parts.append(
+            f"{len(misdirected)} loaded from temp (vanishes on sweep): "
+            + ", ".join(f"{n} -> {t}" for n, t in misdirected[:2])
+            + ("..." if len(misdirected) > 2 else "")
+        )
     if shadowed:
         # The remedy must MOVE the real directory aside first. `ln -sfn` alone
         # does NOT repair this state: with the directory still present, macOS
