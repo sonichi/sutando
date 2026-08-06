@@ -77,44 +77,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# parents: [0]=scripts, [1]=bee-channel, [2]=skills, [3]=repo root. The
-# suite's cursor-path test imports through this for real — a wrong index
-# fails loudly there instead of silently degrading vault + cursor in prod.
-_REPO = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(_REPO / "src"))
+# The sources/ split: Bee's SUBSCRIBE + NORMALIZE specifics live in
+# ag2_sparrow/sources/bee.py; this module is the shared RUNNER (SSE parse,
+# resume cursor, sinks, halt-on-failure, backoff, CLI). Names re-exported
+# below keep the public surface (and tests) stable.
+from ag2_sparrow.sources import bee as _source
 
-# Bee events are THIRD-PARTY device content (a wearable's transcription/todo
-# text) — room-level trust, never the owner's. Their text is interpolated into
-# the task body the core reads and acts on, so it MUST be confined against
-# header/fence injection exactly like a Discord/Slack body. Import the shared
-# guard; if it is somehow unavailable (a stripped container), fail CLOSED with
-# an equivalent inline defang rather than persist raw untrusted text.
-try:
-    from task_body_guard import confine_user_content
-except Exception:  # pragma: no cover - only when src/ is absent
-    import re as _re
-    _ZWSP = "\u200b"
-    _INLINE_FORGE = _re.compile(r"^(={3,}|[\w-]+\s*:)")
-    _INLINE_SEP = _re.compile("\r\n|[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
-
-    def confine_user_content(text: str) -> str:
-        if not text:
-            return text
-        out = []
-        for line in _INLINE_SEP.sub("\n", text).split("\n"):
-            out.append(_ZWSP + line if _INLINE_FORGE.match(line.lstrip()) else line)
-        return "\n".join(out)
-
-_SAFE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,48}")
-
-# Package-owned config defaults (was a skill manifest before this lane moved into
-# ag2-sparrow). Inline so the watcher is self-contained — no skill dir to resolve.
-_DEFAULTS = {
-    "BEE_EVENTS_PATH": "/v1/stream",              # verified live 2026-08-06
-    "BEE_EVENT_TYPES": "todo-created,todo-updated",  # conservative; utterances flood
-    "BEE_AGENT_ID": "bee-lane",
-    "BEE_SINK": "broker",
-}
+confine_user_content = _source.confine_user_content
+_safe_task_id = _source._safe_task_id
+event_to_task = _source.event_to_task
+_DEFAULTS = _source.DEFAULTS
 
 
 def _log(msg: str) -> None:
@@ -124,13 +96,11 @@ def _log(msg: str) -> None:
 def _config(cli: argparse.Namespace) -> dict:
     """CLI > env > package default."""
     cfg = {}
-    for key in ("BEE_PROXY_URL", "BEE_EVENTS_PATH", "BEE_EVENT_TYPES",
-                "BEE_BROKER_URL", "BEE_BROKER_TOKEN", "BEE_AGENT_ID",
-                "BEE_SINK", "BEE_API_BASE", "BEE_API_TOKEN"):
+    for key in _source.CONFIG_KEYS:
         cli_val = getattr(cli, key.lower(), None)
         cfg[key] = (cli_val if cli_val not in (None, "")
                     else os.environ.get(key, "").strip() or _DEFAULTS.get(key, ""))
-    for _k in ("BEE_BROKER_TOKEN", "BEE_API_TOKEN"):
+    for _k in _source.VAULT_KEYS:
         if not cfg[_k]:
             try:  # vault is the preferred home for bearers
                 from vault_intercept import get_vault_key
@@ -165,53 +135,6 @@ def _write_cursor(event_id: str) -> None:
     tmp = p.with_suffix(f".json.{os.getpid()}.tmp")
     tmp.write_text(json.dumps({"last_event_id": event_id, "ts": int(time.time())}))
     os.replace(tmp, p)
-
-
-def _safe_task_id(raw: str) -> str:
-    """Mirror of the broker-side id rule: sparrow's task-id contract is
-    [A-Za-z0-9._-]{1,64}; in-alphabet ids pass through, anything else becomes
-    a stable sha256 slug so no task can be lane-rejected."""
-    if _SAFE_ID_RE.fullmatch(raw):
-        return f"task-bee-{raw}"
-    return f"task-bee-{hashlib.sha256(raw.encode()).hexdigest()[:24]}"
-
-
-def event_to_task(etype: str, event_id: str, data: dict) -> dict:
-    """Normalize one SSE event into the relay task shape.
-
-    Field mapping VERIFIED against a live authenticated stream (2026-08-06,
-    first real capture): utterance events nest text under `utterance.text`
-    with the stable id at `utterance.id`; the conversation key is
-    `conversation_uuid` (not conversation_id); and the stream sends NO SSE
-    `id:` field, so the stable entity id inside the payload is the dedupe
-    key. Unknown shapes still fall back to compact JSON — visible to the
-    core rather than dropped."""
-    utt = data.get("utterance") if isinstance(data.get("utterance"), dict) else {}
-    todo = data.get("todo") if isinstance(data.get("todo"), dict) else {}
-    text = ""
-    for v in (utt.get("text"), todo.get("text"), data.get("text"),
-              data.get("summary"), data.get("name"), data.get("title")):
-        if isinstance(v, str) and v.strip():
-            text = v.strip()
-            break
-    if not text:
-        text = json.dumps(data, separators=(",", ":"))[:500]
-    text = confine_user_content(text)   # untrusted device content — defang
-    conv = str(data.get("conversation_uuid") or data.get("conversation_id")
-               or data.get("id") or event_id)[:120]
-    stable = str(utt.get("id") or todo.get("id") or data.get("id") or event_id)
-    # No access_tier: the broker path resolves it locally (REMOTE_TASK_TIER),
-    # ignoring the wire — a hosted bee-lane MUST set that to team (no ambient there).
-    return {
-        "id": _safe_task_id(f"{etype}-{stable}"),
-        "task": f"[Bee {etype}] {text}",
-        "source": "bee",
-        "user_id": "bee",
-        "sender_name": "Bee",
-        "channel_id": conv,
-        "room_name": "Bee",
-        "interaction_type": "message",
-    }
 
 
 def _write_local_task(task: dict) -> bool:
@@ -344,15 +267,10 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
     wanted = {t.strip() for t in cfg["BEE_EVENT_TYPES"].split(",") if t.strip()}
     _sink = (_InboxSink({f"bee.{t}" for t in wanted})
              if cfg.get("BEE_SINK") == "inbox" else None)
-    _direct = bool(cfg.get("BEE_API_BASE") and cfg.get("BEE_API_TOKEN"))
-    _base = cfg["BEE_API_BASE"] if _direct else cfg["BEE_PROXY_URL"]
-    url = _base.rstrip("/") + cfg["BEE_EVENTS_PATH"]
+    url, base_headers = _source.stream_request(cfg)
     backoff, forwarded = 1, 0
     while True:
-        headers = {"Accept": "text/event-stream",
-                   "User-Agent": "sutando-bee-watcher/1.0"}
-        if _direct:
-            headers["Authorization"] = f"Bearer {cfg['BEE_API_TOKEN']}"
+        headers = dict(base_headers)
         cursor = _read_cursor()
         if cursor:
             headers["Last-Event-ID"] = cursor
@@ -413,10 +331,8 @@ def main() -> int:
     ap.add_argument("--max-events", type=int, default=0)
     args = ap.parse_args()
     cfg = _config(args)
-    _direct = bool(cfg.get("BEE_API_BASE") and cfg.get("BEE_API_TOKEN"))
-    _source_ok = _direct or cfg.get("BEE_PROXY_URL")
     required = []
-    if not _source_ok:
+    if not _source.source_configured(cfg):
         # neither a local proxy nor a direct API source is configured
         required = ["BEE_PROXY_URL (or BEE_API_BASE+BEE_API_TOKEN)"]
     if cfg.get("BEE_SINK") not in ("local", "inbox"):

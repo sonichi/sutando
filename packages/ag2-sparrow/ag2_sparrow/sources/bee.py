@@ -1,0 +1,131 @@
+"""sources/bee.py — the Bee AI wearable as a watcher SOURCE.
+
+The sources/ split (owner ask 2026-08-07): an integration contributes only its
+SUBSCRIBE specifics (where the event stream lives, how to authenticate) and its
+NORMALIZE fn (provider payload -> the one relay task shape). Everything else —
+SSE parsing, resume cursor, sink selection (local/inbox/broker), halt-on-failed-
+delivery, reconnect/backoff, CLI — is the shared runner (bee_watcher.py today;
+gains --source dispatch via sources.SOURCES when integration #2 lands).
+
+Adding integration N = one module like this + a registry entry.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+SOURCE = "bee"
+
+# Config vocabulary the runner resolves (CLI > env > DEFAULTS) for this source.
+CONFIG_KEYS = (
+    "BEE_PROXY_URL", "BEE_EVENTS_PATH", "BEE_EVENT_TYPES",
+    "BEE_BROKER_URL", "BEE_BROKER_TOKEN", "BEE_AGENT_ID",
+    "BEE_SINK", "BEE_API_BASE", "BEE_API_TOKEN",
+)
+VAULT_KEYS = ("BEE_BROKER_TOKEN", "BEE_API_TOKEN")
+
+# Package-owned defaults (was a skill manifest before the ag2-sparrow move).
+DEFAULTS = {
+    "BEE_EVENTS_PATH": "/v1/stream",              # verified live 2026-08-06
+    "BEE_EVENT_TYPES": "todo-created,todo-updated",  # conservative; utterances flood
+    "BEE_AGENT_ID": "bee-lane",
+    "BEE_SINK": "broker",
+}
+
+_REPO = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(_REPO / "src"))
+
+# Bee events are THIRD-PARTY device content (a wearable's transcription/todo
+# text) — room-level trust, never the owner's. Their text is interpolated into
+# the task body the core reads and acts on, so it MUST be confined against
+# header/fence injection exactly like a Discord/Slack body. Import the shared
+# guard; if it is somehow unavailable (a stripped container), fail CLOSED with
+# an equivalent inline defang rather than persist raw untrusted text.
+try:
+    from task_body_guard import confine_user_content
+except Exception:  # pragma: no cover - only when src/ is absent
+    import re as _re
+    _ZWSP = "\u200b"
+    _INLINE_FORGE = _re.compile(r"^(={3,}|[\w-]+\s*:)")
+    _INLINE_SEP = _re.compile("\r\n|[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
+    def confine_user_content(text: str) -> str:
+        if not text:
+            return text
+        out = []
+        for line in _INLINE_SEP.sub("\n", text).split("\n"):
+            out.append(_ZWSP + line if _INLINE_FORGE.match(line.lstrip()) else line)
+        return "\n".join(out)
+
+
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,48}")
+
+
+def _safe_task_id(raw: str) -> str:
+    """Mirror of the broker-side id rule: sparrow's task-id contract is
+    [A-Za-z0-9._-]{1,64}; in-alphabet ids pass through, anything else becomes
+    a stable sha256 slug so no task can be lane-rejected."""
+    if _SAFE_ID_RE.fullmatch(raw):
+        return f"task-bee-{raw}"
+    return f"task-bee-{hashlib.sha256(raw.encode()).hexdigest()[:24]}"
+
+
+def stream_request(cfg: dict) -> "tuple[str, dict]":
+    """SUBSCRIBE half: (url, headers) for this source's live event stream.
+    Two modes: the local authenticated proxy (`bee login`), or the headless
+    cloud API (BEE_API_BASE + BEE_API_TOKEN bearer) for an always-on runner."""
+    direct = bool(cfg.get("BEE_API_BASE") and cfg.get("BEE_API_TOKEN"))
+    base = cfg["BEE_API_BASE"] if direct else cfg["BEE_PROXY_URL"]
+    headers = {"Accept": "text/event-stream",
+               "User-Agent": "sutando-bee-watcher/1.0"}
+    if direct:
+        headers["Authorization"] = f"Bearer {cfg['BEE_API_TOKEN']}"
+    return base.rstrip("/") + cfg["BEE_EVENTS_PATH"], headers
+
+
+def source_configured(cfg: dict) -> bool:
+    """True when either subscribe mode (proxy or cloud bearer) is configured."""
+    return bool(cfg.get("BEE_PROXY_URL")
+                or (cfg.get("BEE_API_BASE") and cfg.get("BEE_API_TOKEN")))
+
+
+def event_to_task(etype: str, event_id: str, data: dict) -> dict:
+    """NORMALIZE half: one SSE event into the relay task shape.
+
+    Field mapping VERIFIED against a live authenticated stream (2026-08-06,
+    first real capture): utterance events nest text under `utterance.text`
+    with the stable id at `utterance.id`; the conversation key is
+    `conversation_uuid` (not conversation_id); and the stream sends NO SSE
+    `id:` field, so the stable entity id inside the payload is the dedupe
+    key. Unknown shapes still fall back to compact JSON — visible to the
+    core rather than dropped."""
+    utt = data.get("utterance") if isinstance(data.get("utterance"), dict) else {}
+    todo = data.get("todo") if isinstance(data.get("todo"), dict) else {}
+    text = ""
+    for v in (utt.get("text"), todo.get("text"), data.get("text"),
+              data.get("summary"), data.get("name"), data.get("title")):
+        if isinstance(v, str) and v.strip():
+            text = v.strip()
+            break
+    if not text:
+        text = json.dumps(data, separators=(",", ":"))[:500]
+    text = confine_user_content(text)   # untrusted device content — defang
+    conv = str(data.get("conversation_uuid") or data.get("conversation_id")
+               or data.get("id") or event_id)[:120]
+    stable = str(utt.get("id") or todo.get("id") or data.get("id") or event_id)
+    # No access_tier: the broker path resolves it locally (REMOTE_TASK_TIER),
+    # ignoring the wire — a hosted bee-lane MUST set that to team (no ambient there).
+    return {
+        "id": _safe_task_id(f"{etype}-{stable}"),
+        "task": f"[Bee {etype}] {text}",
+        "source": "bee",
+        "user_id": "bee",
+        "sender_name": "Bee",
+        "channel_id": conv,
+        "room_name": "Bee",
+        "interaction_type": "message",
+    }
