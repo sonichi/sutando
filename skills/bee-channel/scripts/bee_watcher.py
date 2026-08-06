@@ -189,6 +189,8 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
     conv = str(data.get("conversation_uuid") or data.get("conversation_id")
                or data.get("id") or event_id)[:120]
     stable = str(utt.get("id") or todo.get("id") or data.get("id") or event_id)
+    # No access_tier: the broker path resolves it locally (REMOTE_TASK_TIER),
+    # ignoring the wire — a hosted bee-lane MUST set that to team (no ambient there).
     return {
         "id": _safe_task_id(f"{etype}-{stable}"),
         "task": f"[Bee {etype}] {text}",
