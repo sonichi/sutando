@@ -256,7 +256,14 @@ def questions_key(questions):
 
 
 def notify_voice(questions):
-    """Write to results/ so voice agent can speak it."""
+    """Write to results/ so voice agent can speak it.
+
+    A new digest supersedes any older undelivered ones (owner 2026-08-06:
+    「新清单作废旧清单」). Without this, a jammed consumer accumulates N
+    near-identical question-*.txt files and whoever drains the queue later
+    delivers every copy."""
+    for old in RESULTS_DIR.glob("question-*.txt"):
+        old.unlink(missing_ok=True)
     ts = int(time.time() * 1000)
     path = RESULTS_DIR / f"question-{ts}.txt"
     titles = [q["title"] for q in questions]
