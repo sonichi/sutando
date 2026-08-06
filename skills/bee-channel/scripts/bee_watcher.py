@@ -204,10 +204,20 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
 def _write_local_task(task: dict) -> bool:
     """LOCAL sink: persist the event as a task file on the same file bridge
     every local channel uses (atomic tmp+rename so the stream watcher never
-    sees a partial file). access_tier owner: the events come from the
-    OWNER's own device and feed the owner's own core — same trust stance as
-    voice tasks. priority low: ambient wearable events shouldn't preempt
-    direct asks."""
+    sees a partial file).
+
+    access_tier `ambient`, NOT `owner`: tier is an AUTHORIZATION boundary,
+    not a trust-of-content one. Voice is the owner DELIBERATELY addressing
+    the agent; a Bee event is DEVICE-CAPTURED (a passing utterance, an
+    auto-extracted todo) that the owner never consciously issued as a
+    command. Stamping it `owner` would make a captured "email Sam the deck"
+    or "cancel the booking" eligible for privileged/irreversible execution.
+    `ambient` (CLAUDE.md "Ambient access control") routes it through the
+    sandboxed path: act on the observation, but surface any privileged
+    action to the owner instead of executing it. This is orthogonal to
+    `confine_user_content` (which defangs injection in the body) — that
+    guards the text; this guards what the agent is allowed to DO with it.
+    priority low: ambient wearable events shouldn't preempt direct asks."""
     from workspace_default import resolve_workspace
     import datetime
     tasks_dir = Path(resolve_workspace()) / "tasks"
@@ -216,7 +226,7 @@ def _write_local_task(task: dict) -> bool:
     lines = [f"id: {task['id']}", f"timestamp: {ts}", f"task: {task['task']}",
              "source: bee", "interaction_type: message",
              f"channel_id: {task['channel_id']}", f"user_id: {task['user_id']}",
-             "room_name: Bee", "priority: low", "access_tier: owner"]
+             "room_name: Bee", "priority: low", "access_tier: ambient"]
     dest = tasks_dir / f"{task['id']}.txt"
     if dest.exists():
         return True                     # same event redelivered — idempotent

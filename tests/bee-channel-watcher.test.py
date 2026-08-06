@@ -201,9 +201,13 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertEqual(len(files), 2)              # 2 wanted events, deduped
         body = files[0].read_text()
         for needle in ("id: task-bee-todo-created-t1", "source: bee",
-                       "access_tier: owner", "priority: low",
+                       "access_tier: ambient", "priority: low",
                        "task: [Bee todo-created] buy milk", "channel_id: c9"):
             self.assertIn(needle, body)
+        # AUTHORIZATION boundary: a device-captured event is NEVER owner-tier
+        # (a captured "email Sam" must route through the sandboxed/ambient
+        # path, not become eligible for privileged execution). Regression pin.
+        self.assertNotIn("access_tier: owner", body)
         self.assertFalse(list((wsdir / "tasks").glob("*.tmp")))
 
     def test_local_sink_needs_no_broker_config(self):
