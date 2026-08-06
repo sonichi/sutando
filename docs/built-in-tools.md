@@ -145,6 +145,24 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 
 **Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
 
+**Trusted capability catalog** — discover, inspect, install, and update skills
+from the allowlisted repositories declared in
+`skills/trusted-capabilities/manifest.json`:
+```bash
+C=skills/trusted-capabilities/scripts/catalog.py
+python3 "$C" sources
+python3 "$C" search browser
+python3 "$C" inspect anthropic-skills skills/skill-creator
+python3 "$C" install anthropic-skills skills/skill-creator        # dry run
+# Review the dry-run output, then copy its exact commit into the write:
+python3 "$C" install anthropic-skills skills/skill-creator --commit <40-char-sha> --yes
+python3 "$C" update skill-creator                                 # dry run
+python3 "$C" update skill-creator --commit <40-char-sha> --yes
+```
+Skill installs are pinned to an upstream commit and record provenance for later
+updates. Tool repositories can be searched and inspected but are
+install-disabled because their setup and permissions are source-specific.
+
 **App launcher** — open any macOS app:
 ```bash
 open -a "Safari"                    # open by name
@@ -154,4 +172,4 @@ open "https://github.com"           # open URL in default browser
 
 **Context drop + shortcuts** — the Sutando menu bar app (`src/Sutando/`) provides global hotkeys. **Live config**: `~/.config/sutando/hotkeys.json` (per-user override) with defaults registered in `src/Sutando/main.swift:944` (`registerHotKey()` action list). When the user asks "what hotkeys do I have", read those sources — don't quote a static list from this file (it would drift behind the actual registration).
 
-Launches automatically via `startup.sh`. Check `tasks/` for dropped context.
+The menu-bar app is optional and is not built or launched by the headless core's `startup.sh`; compile and launch the app separately, including `bash skills/context-drop/build.sh` when enabling context-drop. Check `tasks/` for dropped context.

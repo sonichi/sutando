@@ -25,9 +25,24 @@
 # simplification (versus the earlier canonical-id translation-layer design).
 #
 # User-configurable carrier set: vault.sync.{include, exclude} in
-# sutando.config.{json,local.json}. Include adds to default; exclude
-# subtracts (rsync semantics, exclude wins on conflict). Currently
-# defaults-only (config-merge tracked for follow-up).
+# sutando.config.{json,local.json}.
+#
+# `include` REPLACES the default list wholesale — it does NOT add to it.
+# Config merging is `_deep_merge` (src/sutando_config.py), whose contract is
+# "dicts merge; everything else (lists, scalars, None) is REPLACED by the
+# override", and that behaviour is pinned by
+# tests/sutando-config.test.py::test_local_replaces_arrays_wholesale.
+#
+# This matters more than an ordinary doc nit because the carrier set is a
+# WHITELIST: _compose_exclude_content() emits `*` (ignore everything) and then
+# un-ignores exactly the include list. So setting vault.sync.include to add one
+# path silently DROPS every default path — notes/, hosts/*/ and the whole
+# .claude-sutando/projects/*/memory/ corpus — out of the backup, while this
+# script goes on printing "pushed to <branch>" on every run. To add a path you
+# must restate the full carrier set.
+#
+# `exclude` subtracts, carving subpaths out of an included parent (emitted after
+# the includes so gitignore's last-match-wins applies).
 #
 # Usage:
 #   bash scripts/sync-workspace.sh                # default: pull + push (one tick)
@@ -207,6 +222,12 @@ _host() {
     # Comcast → Chis-MBP) and split per-host paths/branches from the stable
     # LocalHostName (Chis-MacBook-Pro). 2026-06-22 incident.
     local env="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+    # Trim first: `[ -n "  " ]` is true, so a blank-but-set override became the
+    # host label and produced a whitespace-named branch/dir. Lockstep with
+    # _host_label()'s strip() — trim the ENDS only, so an (unusual but legal)
+    # label containing a space is preserved rather than silently compacted.
+    env="${env#"${env%%[![:space:]]*}"}"
+    env="${env%"${env##*[![:space:]]}"}"
     if [ -n "$env" ]; then
         printf '%s\n' "$env"
         return
@@ -1051,11 +1072,57 @@ _resolve_conflicts_keep_ours() {
     fi
 }
 
+# Pre-pull anchor migration (#2567). `state/current-track.md` is per-host state
+# that used to be carried at a shared flat path; that path is removed from the
+# carrier set in this change. On any vault where the file is still TRACKED,
+# `_enforce_carrier_set_pre` will untrack it and COMMIT that deletion — and a
+# peer pulls the deletion before its own enforcement ever runs (the pull half of
+# `cmd_default_bidirectional` precedes the push half). Without this helper that
+# peer loses its anchor.
+#
+# Same-commit migration on the PUSHING host does not fix it: that host can only
+# add ITS OWN `hosts/<label>/current-track.md`, which is not the puller's anchor.
+# The guarantee therefore has to be local and to run BEFORE the fetch/merge —
+# each host rescues its own copy. Same placement and contract as
+# `_migrate_flat_branch` above.
+#
+# Called from BOTH entry points, and the reason is worth stating because the
+# pull-side rationale above does not imply it. The hazard is not the merge; it
+# is `_enforce_carrier_set_pre`, which untracks newly-excluded files and lets
+# the caller commit that deletion. `--push-only` runs that enforcement without
+# ever passing through `_pull_only_impl`, so a pull-only call site leaves the
+# explicit push mode able to delete the sole carried copy of an anchor it never
+# replaced. Idempotent, so calling it twice in the default bidirectional path
+# costs one `[ -e ]`. Idempotent: a no-op once the per-host file
+# exists, so it costs one `[ -e ]` per tick thereafter.
+_migrate_flat_anchor() {
+    local _flat _dest
+    _flat="$WORKSPACE_DIR/state/current-track.md"
+    _dest="$WORKSPACE_DIR/hosts/$(_host)/current-track.md"
+    [ -f "$_flat" ] || return 0
+    [ -e "$_dest" ] && return 0
+    # DRY_RUN is checked HERE, not only at the call site: this helper runs before
+    # _pull_only_impl's dry-run early return (it must, to beat an incoming
+    # deletion), so the guard has to live with the mutation it protects. A future
+    # caller cannot reintroduce the violation by placing the call differently.
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "DRY-RUN: would migrate state/current-track.md -> hosts/$(_host)/current-track.md (#2567)" >&2
+        return 0
+    fi
+    mkdir -p "$(dirname "$_dest")" || return 0
+    cp "$_flat" "$_dest" || return 0
+    log "_migrate_flat_anchor: copied state/current-track.md -> hosts/$(_host)/current-track.md before pull (#2567)"
+    echo "sync-workspace: migrated the per-host anchor to hosts/$(_host)/current-track.md (was at the shared flat path; #2567)" >&2
+}
+
 _pull_only_impl() {
     cd "$WORKSPACE_DIR" || die "pull-only: cannot cd to $WORKSPACE_DIR"
     [ -d ".git" ] || die "pull-only: $WORKSPACE_DIR is not a git repo; run --init first"
 
     _assert_sync_initialized "pull-only"
+
+    # Rescue this host's anchor BEFORE any peer deletion can merge in (#2567).
+    _migrate_flat_anchor
 
     if [ "$DRY_RUN" = "1" ]; then
         echo "DRY-RUN: would fetch + merge peer branches" >&2
@@ -1222,6 +1289,14 @@ _push_only_impl() {
     # access.json) into hosts/<host>/ before staging, so it's carried + survives
     # a rebuild. Non-fatal: never blocks the push.
     _snapshot_per_host_config || color_warn "sync-workspace: per-host config snapshot failed (non-fatal); push continues"
+    # Rescue this host's anchor BEFORE carrier enforcement can untrack it
+    # (#2567/#2607). `--push-only` never reaches `_pull_only_impl`, so without
+    # this call the enforcement below regenerates the exclude, untracks the
+    # now-uncarried flat `state/current-track.md`, and COMMITS that deletion —
+    # on a host whose anchor exists only at the flat path that removes the sole
+    # carried copy and writes no replacement. Pull-side placement alone is not
+    # enough: the hazard is carrier enforcement, and both entry points run it.
+    _migrate_flat_anchor
     _enforce_carrier_set_pre
     git add -A
     _refuse_staged_secrets
