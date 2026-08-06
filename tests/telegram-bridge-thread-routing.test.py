@@ -21,6 +21,15 @@ from unittest.mock import patch
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 
+# Isolate CLAUDE_CONFIG_DIR BEFORE exec_module: telegram-bridge.py resolves its
+# channel config at module level, so an unset var here would import whichever
+# operator's real ~/.claude/channels/telegram/access.json happens to exist
+# (scripts/lint-hermetic-bridge-tests.py).
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-tgbridge-thread-routing-")
+_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / "access.json").write_text('{"allowFrom": []}')
+
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("tgbridge_thread_routing", ROOT / "src" / "telegram-bridge.py")
 tg = importlib.util.module_from_spec(_spec)
