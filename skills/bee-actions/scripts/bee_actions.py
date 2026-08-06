@@ -152,8 +152,10 @@ def _call(base: str, headers: dict, method: str, path: str,
         from urllib.parse import urlencode
         url += "?" + urlencode({k: v for k, v in query.items() if v is not None})
     data = json.dumps(body).encode() if body is not None else None
+    # charset is load-bearing: the Bee proxy's parser 415s on bare
+    # "application/json" (verified live 2026-08-06).
     req = urllib.request.Request(url, data=data, method=method, headers={
-        **headers, "Content-Type": "application/json",
+        **headers, "Content-Type": "application/json; charset=utf-8",
         "User-Agent": "sutando-bee-actions/1.0"})
     with urllib.request.urlopen(req, timeout=20) as r:
         raw = r.read().decode() or "{}"
