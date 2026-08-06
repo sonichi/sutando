@@ -132,11 +132,8 @@ def _read_calendar_cache() -> list[dict] | None:
             raw, cal = str(ev).strip(), ""
         if raw:
             out = {"raw": raw, "calendar": cal}
-            # Carry `start` through. This loop REBUILDS each event rather than
-            # passing it along, so a field the producer writes is dropped here
-            # unless it is named — which would leave _next_event() reading a key
-            # that never arrives, and the "Next up" fix silently inert while
-            # every part of it looked correct.
+            # This loop rebuilds each event, so any field not named here is
+            # dropped — `start` must be carried or _next_event() never fires.
             if start:
                 out["start"] = start
             events.append(out)
@@ -647,12 +644,11 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
             if upcoming is not None:
                 parts.append(f"{count} meetings today. Next up: {upcoming['raw']}.")
             elif _any_start(events):
-                # Every start is in the past — say so rather than announcing the
-                # day's first meeting as though it were ahead of you.
+                # Starts known and all past — naming the first would imply it is ahead.
                 parts.append(f"{count} meetings today, all earlier — "
                              f"last was {events[-1]['raw']}.")
             else:
-                # No start times (piped events / macOS fallback): unchanged.
+                # No start times anywhere: keep the prior wording.
                 parts.append(f"{count} meetings today. First up: {events[0]['raw']}.")
     else:
         parts.append("Your calendar is clear today.")
