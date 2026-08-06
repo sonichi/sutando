@@ -9,7 +9,8 @@ to the Teams design doc (ag2space-backend#443).
 
 - npm `@mentra/sdk` (2.x; the docs page's `@mentraos/sdk` name is stale — verified against the registry + installed types); app = a self-hosted server holding an `AppSession`
   per user session: `new AppSession({ packageName, apiKey, cloudUrl:
-  "wss://cloud.mentraos.com/app-ws" })`.
+  ... })` (the SDK defaults `cloudApiUrl` to `api.mentra.glass`; the
+  server bootstrap sets no explicit cloud URL).
 - Session lifecycle is **webhook-initiated**: MentraOS Cloud POSTs
   `https://<app-domain>/webhook/session-start` with `sessionId` + `userId`;
   the app then opens the WebSocket for that session.
@@ -35,7 +36,7 @@ glasses ── MentraOS Cloud ──(webhook + WS)── mentra app server (ours
 - **The app server is a client-side adapter** (like the Bee watcher, unlike
   the Teams broker module): MentraOS only talks to a server WE host over its
   own webhook+WS protocol, so the adapter cannot live inside the broker.
-  New skill `skills/mentra-channel/` (TypeScript, `@mentraos/sdk`).
+  New skill `skills/mentra-channel/` (TypeScript, `@mentra/sdk`).
 - **Inbound:** utterance segments from `onTranscription` are debounced into
   message-sized chunks (final-transcript boundaries, not per-word), then
   POSTed to the broker's `/v1/ingest` as `source: "mentra"` tasks
@@ -60,7 +61,7 @@ glasses ── MentraOS Cloud ──(webhook + WS)── mentra app server (ours
 ## Registration / deployment (the non-code prerequisites)
 
 1. Mentra developer console account + app registration (`packageName`,
-   webhook URL, `MENTRAOS_API_KEY`) — needs an identity decision from the
+   webhook URL, `MENTRA_API_KEY`) — needs an identity decision from the
    owner (her account vs an agent account).
 2. A public HTTPS endpoint for the webhook + WS egress. AG2 Space runs on
    **EKS** (owner correction 2026-08-06 — no longer EC2): the app server
@@ -68,7 +69,10 @@ glasses ── MentraOS Cloud ──(webhook + WS)── mentra app server (ours
    `chat.ag2.space/mentra`, sibling of the broker's EKS deploy. Same
    git-tracked-only rule (owner hard rule 2026-07-16): manifests + image
    build land in the backend repo first; never hand-edit the cluster.
-3. Secrets via vault: `MENTRAOS_API_KEY`, the lane's ingest bearer.
+3. Secrets via vault: `MENTRA_API_KEY`, the lane's ingest bearer. (The
+   owner-supplied key was vaulted as `MENTRAOS_API_KEY` on 2026-08-06;
+   re-store it under `MENTRA_API_KEY` — the name `requiredConfigMissing`
+   checks — or set `MENTRA_API_KEY` from it at deploy.)
 
 ## Test plan
 
