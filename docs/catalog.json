@@ -279,17 +279,6 @@
       "status": "draft",
       "canonical_for": "the single authoritative severity-tagged core-health verdict and the report-vs-restart severity gate",
       "last_verified": "2026-08-02"
-    },
-    "docs/bee-user-flows.md": {
-      "title": "Bee channel — user flows for both runtime modes",
-      "audience": [
-        "users",
-        "contributors",
-        "maintainers"
-      ],
-      "status": "draft",
-      "canonical_for": "the local vs server-side Bee onboarding flows (connect/credential/enable/disconnect skeleton) and their open product decisions",
-      "last_verified": "2026-08-06"
     }
   }
 }
