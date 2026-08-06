@@ -1,0 +1,10 @@
+{
+  "name": "sutando-mentra-channel",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Self-contained deps for the Sutando MentraOS app server (repo root stays untouched; core.ts is dependency-free and tested by the root suite).",
+  "type": "module",
+  "dependencies": {
+    "@mentraos/sdk": "^2"
+  }
+}

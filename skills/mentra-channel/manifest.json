@@ -1,0 +1,18 @@
+{
+  "name": "mentra-channel",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "stability": "experimental",
+  "enabled": true,
+  "access_tier": "owner",
+  "description": "Sutando as a MentraOS glasses app (full-duplex channel): wake-phrase-gated live transcription becomes broker tasks (source=mentra via /v1/ingest), replies render on the glasses (text wall + TTS) with the broker's Mentra fallback room covering glasses-off delivery. Config-only manifest — run scripts/server.ts (node/tsx) on the public host; design in DESIGN.md / PR #2707.",
+  "config": {
+    "MENTRA_PACKAGE_NAME": "sutando",
+    "MENTRA_API_KEY": "",
+    "MENTRA_WAKE_PHRASE": "hey sutando",
+    "MENTRA_BROKER_URL": "",
+    "MENTRA_BROKER_TOKEN": "",
+    "MENTRA_AGENT_ID": "mentra-lane",
+    "MENTRA_PORT": "8093"
+  }
+}
