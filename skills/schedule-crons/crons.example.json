@@ -1,7 +1,7 @@
 [
   {
     "name": "main-loop",
-    "cron": "*/5 * * * *",
+    "cron": "*/15 * * * *",
     "prompt_skill": "proactive-loop"
   },
   {
