@@ -45,7 +45,7 @@ except Exception:  # pragma: no cover — bridge must keep running
         return False
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -1018,9 +1018,9 @@ def main():  # pragma: no cover
                         except FileNotFoundError:
                             continue
                         f = claim
-                        text = f.read_text().strip()
-                        if not text:
-                            f.unlink(missing_ok=True)
+                        text = read_ready_result(f)
+                        if text is None:
+                            release_claim(f)
                             continue
                         # Pre-fix used `next(iter(load_allowed()))`,
                         # which iterates a `set` — hash-slot order, not

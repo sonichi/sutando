@@ -78,7 +78,7 @@ from util_paths import channel_access_path, claude_home_path, personal_path, sha
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -4973,9 +4973,9 @@ async def poll_proactive():
                     except FileNotFoundError:
                         continue
                     f = claim  # subsequent reads + unlink operate on the claim path
-                    text = f.read_text().strip()
-                    if not text:
-                        f.unlink(missing_ok=True)
+                    text = read_ready_result(f)
+                    if text is None:
+                        release_claim(f)
                         continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
