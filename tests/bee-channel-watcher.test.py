@@ -74,7 +74,7 @@ class _Server(BaseHTTPRequestHandler):
     last_event_id_seen: list = []
 
     def do_GET(self):
-        if self.path == "/v1/events":
+        if self.path == "/v1/stream":
             _Server.last_event_id_seen.append(self.headers.get("Last-Event-ID"))
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -123,7 +123,7 @@ class TestBeeWatcher(unittest.TestCase):
         self._patch.start()
         self.cfg = {
             "BEE_PROXY_URL": self.base,
-            "BEE_EVENTS_PATH": "/v1/events",
+            "BEE_EVENTS_PATH": "/v1/stream",
             "BEE_EVENT_TYPES": "todo-created,todo-updated",
             "BEE_BROKER_URL": self.base,
             "BEE_BROKER_TOKEN": "tok-abc",

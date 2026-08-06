@@ -15,7 +15,9 @@ per skills/MANIFEST.md read precedence):
   BEE_PROXY_URL     Bee local proxy base (e.g. http://127.0.0.1:<port>).
                     REQUIRED — empty means the skill is not configured and the
                     watcher exits 2 with a clear message instead of guessing.
-  BEE_EVENTS_PATH   SSE endpoint path on the proxy (default /v1/events).
+  BEE_EVENTS_PATH   SSE endpoint path on the proxy (default /v1/stream —
+                    VERIFIED against a live authenticated proxy 2026-08-06;
+                    /v1/events, the docs-derived guess, 404s).
   BEE_EVENT_TYPES   comma-list of SSE event types to forward
                     (default todo-created,todo-updated — conservative; the
                     per-utterance stream would flood the task queue).
