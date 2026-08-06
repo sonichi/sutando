@@ -160,11 +160,19 @@ def _parse_start(ev: dict):
     return dt
 
 
-def _any_start(events: list[dict]) -> bool:
-    """True if ANY event carries a usable start — i.e. the next-event choice is
-    meaningful at all. Without this, a cache with no start times is
-    indistinguishable from a day whose meetings have all finished."""
-    return any(_parse_start(e) is not None for e in events)
+def _all_starts_known(events: list[dict]) -> bool:
+    """True only if EVERY event has a usable start.
+
+    Both time-based claims assert something about the whole day, so partial
+    knowledge cannot support either: one unknown-time event may be upcoming.
+    """
+    return bool(events) and all(_parse_start(e) is not None for e in events)
+
+
+def _last_event(events: list[dict]):
+    """The latest event by parsed start — not list order, which may be unsorted."""
+    dated = [(s, e) for e in events if (s := _parse_start(e)) is not None]
+    return max(dated, key=lambda pair: pair[0])[1] if dated else None
 
 
 def _next_event(events: list[dict], now=None):
@@ -640,15 +648,16 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         if count == 1:
             parts.append(f"One meeting today: {events[0]['raw']}.")
         else:
-            upcoming = _next_event(events)
+            upcoming = _next_event(events) if _all_starts_known(events) else None
+            last = _last_event(events) if _all_starts_known(events) else None
             if upcoming is not None:
                 parts.append(f"{count} meetings today. Next up: {upcoming['raw']}.")
-            elif _any_start(events):
-                # Starts known and all past — naming the first would imply it is ahead.
+            elif last is not None:
+                # Every start known and all past — naming one implies it is ahead.
                 parts.append(f"{count} meetings today, all earlier — "
-                             f"last was {events[-1]['raw']}.")
+                             f"last was {last['raw']}.")
             else:
-                # No start times anywhere: keep the prior wording.
+                # Incomplete start times: claim neither, keep the prior wording.
                 parts.append(f"{count} meetings today. First up: {events[0]['raw']}.")
     else:
         parts.append("Your calendar is clear today.")

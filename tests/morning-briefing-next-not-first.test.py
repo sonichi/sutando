@@ -74,7 +74,7 @@ class TestNextEventSelection(unittest.TestCase):
         arbitrary meeting as next."""
         events = [{"raw": "no start", "calendar": ""}]
         self.assertIsNone(self.mod._next_event(events))
-        self.assertFalse(self.mod._any_start(events))
+        self.assertFalse(self.mod._all_starts_known(events))
 
     def test_unparseable_start_is_ignored_not_epoch(self):
         events = [{"raw": "junk", "calendar": "", "start": "not-a-date"},
@@ -139,6 +139,65 @@ class TestWriterKeepsStart(unittest.TestCase):
     def test_plain_string_events_still_work(self):
         out = self.writer.normalize_events(["9:30am Standup"])
         self.assertEqual(out, [{"raw": "9:30am Standup", "calendar": ""}])
+
+
+class TestPartialAndUnsortedStarts(unittest.TestCase):
+    """Both repros from the CHANGES_REQUESTED review on this PR.
+
+    A time claim describes the whole day, so partial knowledge cannot support
+    one: with a known-past event plus an unknown-time event the briefing said
+    "all earlier — last was unknown-time meeting", and on unsorted all-past
+    input it named events[-1] ("last was oldest past") rather than the latest.
+    Both are the confident-but-unverified calendar claim this PR removes.
+    """
+
+    def setUp(self):
+        self.mod = _load(SCRIPT, "morning_briefing")
+        self.now = datetime.now().astimezone()
+
+    def _say(self, events):
+        return self.mod.synthesize("W", events, [], [], [], [])
+
+    def _ev(self, mins, label, start=True):
+        ev = {"raw": label, "calendar": "work"}
+        if start:
+            ev["start"] = _iso(self.now + timedelta(minutes=mins))
+        return ev
+
+    def test_partial_starts_never_claim_all_earlier(self):
+        out = self._say([self._ev(-300, "8am known past"),
+                         self._ev(0, "unknown-time meeting", start=False)])
+        self.assertNotIn("all earlier", out)
+        self.assertIn("First up: 8am known past", out)
+
+    def test_partial_starts_never_claim_next_up_either(self):
+        """Same reasoning: an unknown-time event may precede the known one."""
+        out = self._say([self._ev(0, "unknown-time", start=False),
+                         self._ev(45, "8am Zoom")])
+        self.assertNotIn("Next up", out)
+        self.assertNotIn("all earlier", out)
+
+    def test_last_is_selected_by_time_not_list_order(self):
+        out = self._say([self._ev(-30, "newest past"), self._ev(-300, "oldest past")])
+        self.assertIn("all earlier", out)
+        self.assertIn("last was newest past", out)
+        self.assertNotIn("oldest past", out)
+
+    def test_next_is_selected_by_time_on_unsorted_input(self):
+        out = self._say([self._ev(300, "later today"), self._ev(20, "soon"),
+                         self._ev(-60, "past")])
+        self.assertIn("Next up: soon", out)
+
+    def test_all_starts_known_requires_every_event(self):
+        known = [self._ev(-10, "a"), self._ev(-20, "b")]
+        self.assertTrue(self.mod._all_starts_known(known))
+        self.assertFalse(self.mod._all_starts_known(known + [self._ev(0, "c", start=False)]))
+        self.assertFalse(self.mod._all_starts_known([]))
+
+    def test_last_event_ignores_undated_entries(self):
+        evs = [self._ev(-30, "newest"), self._ev(0, "undated", start=False)]
+        self.assertEqual(self.mod._last_event(evs)["raw"], "newest")
+        self.assertIsNone(self.mod._last_event([self._ev(0, "x", start=False)]))
 
 
 class TestSpokenSentence(unittest.TestCase):
