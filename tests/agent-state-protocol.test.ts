@@ -44,7 +44,9 @@ import {
 	createIsolatedIdleRestore,
 	credentialSourceLabel,
 	mapUpstream,
+	publishCapabilitiesMarker,
 	publishLifecycleSnapshot,
+	voiceCapabilitiesPath,
 	voiceLifecyclePath,
 	type AgentStateV1,
 } from '../src/voice-agent-state.ts';
@@ -241,6 +243,30 @@ function frameFixture(overrides: Partial<AgentStateV1> = {}): AgentStateV1 {
 		...overrides,
 	};
 }
+
+describe('publishCapabilitiesMarker — group E activation switch', () => {
+	it('writes the marker shape the desktop reader gates on, atomically', () => {
+		const ws = mkdtempSync(join(tmpdir(), 'agent-state-caps-'));
+		try {
+			publishCapabilitiesMarker(ws, { now: () => 777 });
+			const doc = JSON.parse(readFileSync(voiceCapabilitiesPath(ws), 'utf-8'));
+			// The desktop supervisor requires STRICT `probeIsolation === true`.
+			assert.deepEqual(doc, { probeIsolation: true, at: 777 });
+			assert.deepEqual(readdirSync(join(ws, 'state')), ['voice-agent.capabilities.json']);
+		} finally { rmSync(ws, { recursive: true, force: true }); }
+	});
+
+	it('is failure-silent: an unwritable target reports via onError, never throws', () => {
+		const errs: unknown[] = [];
+		// A path whose parent is a FILE cannot gain a state/ subdirectory.
+		const ws = mkdtempSync(join(tmpdir(), 'agent-state-caps-ro-'));
+		try {
+			writeFileSync(join(ws, 'state'), 'occupied');
+			publishCapabilitiesMarker(ws, { onError: (e) => errs.push(e) });
+			assert.equal(errs.length, 1);
+		} finally { rmSync(ws, { recursive: true, force: true }); }
+	});
+});
 
 describe('publishLifecycleSnapshot — atomic temp+rename (A9)', () => {
 	it('writes the derived snapshot schema and leaves no temp files behind', () => {

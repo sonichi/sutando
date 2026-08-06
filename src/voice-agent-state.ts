@@ -182,6 +182,37 @@ export function voiceLifecyclePath(workspace: string): string {
 	return statusPath('voice-lifecycle.json', workspace);
 }
 
+export function voiceCapabilitiesPath(workspace: string): string {
+	return statusPath('voice-agent.capabilities.json', workspace);
+}
+
+/**
+ * Publish the capability marker the desktop supervisor gates its ws-upgrade
+ * probes on (`{"probeIsolation": true}` — the reader requires strict `true`).
+ * Written ONCE at agent startup: this build's bodhi pin ships the
+ * probe/verify/takeover connection roles, so a `?probe=1` upgrade is
+ * intercepted server-side and can never steal a live client slot. The pin
+ * bump and this marker land in the same change on purpose — the marker is
+ * the activation switch, so it must never precede the capability.
+ * Atomic temp+rename, failure-silent like the lifecycle snapshot: a marker
+ * write must never take the voice path down (probes just stay dormant).
+ */
+export function publishCapabilitiesMarker(
+	workspace: string,
+	opts?: { now?: () => number; onError?: (err: unknown) => void },
+): void {
+	const target = voiceCapabilitiesPath(workspace);
+	const doc = { probeIsolation: true, at: (opts?.now ?? Date.now)() };
+	const tmp = `${target}-tmp-${process.pid}-${++_tmpCounter}`;
+	try {
+		mkdirSync(dirname(target), { recursive: true });
+		writeFileSync(tmp, JSON.stringify(doc));
+		renameSync(tmp, target);
+	} catch (err) {
+		opts?.onError?.(err);
+	}
+}
+
 // Unique temp names: pid + monotonic counter — two writers (or one writer's
 // interleaved transitions) can never collide on the temp file, and rename()
 // is atomic on the same filesystem.

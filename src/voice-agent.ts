@@ -62,6 +62,7 @@ import {
 import {
 	createAgentStateProvider,
 	createIsolatedIdleRestore,
+	publishCapabilitiesMarker,
 	publishLifecycleSnapshot,
 	type AgentStateV1,
 } from './voice-agent-state.js';
@@ -950,6 +951,12 @@ async function main() {
 	// =========================================================================
 	let lastEmittedUpstream: string | null = null;
 	let lastLifecycleKey = '';
+	// Group E activation: this build's bodhi pin ships the probe/verify/
+	// takeover roles, so publish the capability marker the desktop
+	// supervisor's probe battery gates on. Once per process, at wiring init.
+	publishCapabilitiesMarker(WORKSPACE_DIR, {
+		onError: (err) => console.error(`${ts()} [AgentState] capabilities marker write failed: ${(err as Error)?.message ?? err}`),
+	});
 	const sendAgentStateFrame = (frame: AgentStateV1): void => {
 		try {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
