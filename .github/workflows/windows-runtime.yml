@@ -44,6 +44,12 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Load manifest tools through Windows file URLs
+        shell: pwsh
+        run: |
+          .\node_modules\.bin\tsx.cmd -e "import('./src/inline-tools.ts').then(m => { const names=m.inlineTools.map(t=>t.name); for (const n of ['summon','activate_screen_companion']) if (!names.includes(n)) throw new Error('missing manifest tool '+n); })"
+          if ($LASTEXITCODE -ne 0) { throw 'manifest tool import failed' }
+
       - name: Parse every PowerShell script
         shell: pwsh
         run: |

@@ -17,7 +17,7 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, extname, dirname, delimiter } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
@@ -1191,7 +1191,10 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 			const tier = manifest.access_tier === 'any_caller' ? 'any_caller' : 'owner';
 			try {
 				// @ts-ignore — dynamic relative import resolved at runtime by tsx
-				const mod = await import(toolsPath);
+				// Node's ESM loader rejects raw Windows drive paths (`Q:\...`)
+				// because it interprets the drive letter as a URL scheme. A
+				// file URL works on every platform and preserves spaces safely.
+				const mod = await import(pathToFileURL(toolsPath).href);
 				if (Array.isArray(mod.tools)) {
 					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
