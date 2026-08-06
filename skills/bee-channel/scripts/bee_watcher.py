@@ -27,6 +27,10 @@ per skills/MANIFEST.md read precedence):
                     (`vault set BEE_BROKER_TOKEN …`); env accepted.
   BEE_AGENT_ID      relay agent whose queue receives Bee tasks (dedicated
                     lane identity, same pattern as TEAMS_AGENT_ID).
+  BEE_CURSOR_FILE   explicit path for the resume cursor. REQUIRED in the
+                    headless container (no sutando workspace to resolve);
+                    point it at the pod's persistent volume. Unset → under
+                    the local workspace (OSS/local-core default).
   BEE_API_BASE      Bee CLOUD API base (e.g. https://app-api-developer.ce.
                     bee.amazon.dev). When set WITH BEE_API_TOKEN, the watcher
                     subscribes DIRECTLY to Bee's cloud stream with a bearer —
@@ -104,6 +108,13 @@ def _config(cli: argparse.Namespace) -> dict:
 
 
 def _cursor_path() -> Path:
+    # BEE_CURSOR_FILE is the container-portable override (the headless
+    # server-side runner has no sutando workspace): set it to a path on the
+    # pod's persistent volume. Unset → resolve under the local workspace, the
+    # OSS/local-core default.
+    _explicit = os.environ.get("BEE_CURSOR_FILE", "").strip()
+    if _explicit:
+        return Path(_explicit)
     from workspace_default import resolve_workspace
     return Path(resolve_workspace()) / "state" / "bee-watcher-cursor.json"
 

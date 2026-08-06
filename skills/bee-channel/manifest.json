@@ -13,6 +13,7 @@
     "BEE_BROKER_URL": "",
     "BEE_BROKER_TOKEN": "",
     "BEE_AGENT_ID": "bee-lane",
-    "BEE_SINK": "broker"
+    "BEE_SINK": "broker",
+    "BEE_CURSOR_FILE": ""
   }
 }

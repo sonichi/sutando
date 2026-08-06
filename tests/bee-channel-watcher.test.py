@@ -151,6 +151,29 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertNotIn("/", _Server.ingested[1]["task"]["id"])   # "f:9/x" hashed
         self.assertEqual(set(_Server.auth_seen), {"Bearer tok-abc"})
 
+    def test_bee_cursor_file_env_overrides_workspace(self):
+        # Container portability (roadmap: headless runner has no sutando
+        # workspace): BEE_CURSOR_FILE is honored verbatim, and workspace_default
+        # is never imported when it is set.
+        import types
+        explicit = Path(self.tmp.name) / "podvol" / "cursor.json"
+        explicit.parent.mkdir(parents=True, exist_ok=True)
+        # Poison workspace_default so any fallback import would fail loudly.
+        broken = types.ModuleType("workspace_default")
+        def _boom():
+            raise AssertionError("workspace_default must not be used when BEE_CURSOR_FILE set")
+        broken.resolve_workspace = _boom
+        self._patch.stop()  # lift the sandbox _cursor_path patch from setUp
+        try:
+            with patch.dict(os.environ, {"BEE_CURSOR_FILE": str(explicit)}), \
+                 patch.dict(sys.modules, {"workspace_default": broken}):
+                self.assertEqual(self.mod._cursor_path(), explicit)
+                self.mod._write_cursor("ev-42")
+                self.assertEqual(self.mod._read_cursor(), "ev-42")
+            self.assertIn("ev-42", explicit.read_text())
+        finally:
+            self._patch.start()
+
     def test_cursor_persists_and_replays_as_last_event_id(self):
         self.mod.run(self.cfg, once=True)
         cursor = json.loads(self._cursor.read_text())["last_event_id"]
