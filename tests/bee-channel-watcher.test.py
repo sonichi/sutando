@@ -72,10 +72,12 @@ class _Server(BaseHTTPRequestHandler):
     ingested: list = []
     auth_seen: list = []
     last_event_id_seen: list = []
+    stream_auth: list = []
 
     def do_GET(self):
         if self.path == "/v1/stream":
             _Server.last_event_id_seen.append(self.headers.get("Last-Event-ID"))
+            _Server.stream_auth.append(self.headers.get("Authorization"))
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -187,6 +189,30 @@ class TestBeeWatcher(unittest.TestCase):
             # proxy URL still required — exit 2 names ONLY the proxy
             rc = self.mod.main()
         self.assertEqual(rc, 2)
+
+    def test_headless_direct_api_mode_uses_bearer_no_proxy(self):
+        # BEE_API_BASE + BEE_API_TOKEN → subscribe to the cloud stream
+        # DIRECTLY with a bearer, no local proxy. The test server serves the
+        # SAME /v1/stream and records the auth header it received.
+        cfg = {**self.cfg, "BEE_PROXY_URL": "",
+               "BEE_API_BASE": self.base, "BEE_API_TOKEN": "cloud-bearer",
+               "BEE_EVENTS_PATH": "/v1/stream"}
+        _Server.stream_auth = []
+        rc = self.mod.run(cfg, once=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(_Server.stream_auth, ["Bearer cloud-bearer"])
+        self.assertTrue(_Server.ingested)           # still forwards to broker
+
+    def test_headless_mode_needs_no_proxy_url(self):
+        # main(): API base+token present, proxy absent → configured, exits 0
+        # via --once against the live test server.
+        argv = ["bee_watcher.py", "--once",
+                "--bee-api-base", self.base, "--bee-api-token", "t",
+                "--bee-events-path", "/v1/stream",
+                "--bee-broker-url", self.base, "--bee-broker-token", "b",
+                "--bee-agent-id", "bee-lane"]
+        with patch.object(sys, "argv", argv):
+            self.assertEqual(self.mod.main(), 0)
 
     def test_unconfigured_exits_2_not_crash(self):
         with patch.object(sys, "argv", ["bee_watcher.py"]):

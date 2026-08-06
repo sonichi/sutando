@@ -27,6 +27,17 @@ per skills/MANIFEST.md read precedence):
                     (`vault set BEE_BROKER_TOKEN …`); env accepted.
   BEE_AGENT_ID      relay agent whose queue receives Bee tasks (dedicated
                     lane identity, same pattern as TEAMS_AGENT_ID).
+  BEE_API_BASE      Bee CLOUD API base (e.g. https://app-api-developer.ce.
+                    bee.amazon.dev). When set WITH BEE_API_TOKEN, the watcher
+                    subscribes DIRECTLY to Bee's cloud stream with a bearer —
+                    NO local `bee proxy` needed. This is the headless mode for
+                    an always-on server-side container (verified 2026-08-06:
+                    the cloud API accepts direct bearer auth on /v1/me and
+                    /v1/stream). BEE_PROXY_URL is the alternative (local
+                    proxy) source; exactly one is used (API base wins).
+  BEE_API_TOKEN     bearer for BEE_API_BASE (vault-preferred). The headless
+                    server-side custody of the Bee token — see the DM room /
+                    always-on trade in the task-bridge thread.
   BEE_SINK          broker (default) | local. LOCAL is the fully-OSS mode
                     (owner question 2026-08-06: "the user does not need to
                     depend on ag2space's relay?"): events are written as
@@ -78,16 +89,17 @@ def _config(cli: argparse.Namespace) -> dict:
     cfg = {}
     for key in ("BEE_PROXY_URL", "BEE_EVENTS_PATH", "BEE_EVENT_TYPES",
                 "BEE_BROKER_URL", "BEE_BROKER_TOKEN", "BEE_AGENT_ID",
-                "BEE_SINK"):
+                "BEE_SINK", "BEE_API_BASE", "BEE_API_TOKEN"):
         cli_val = getattr(cli, key.lower(), None)
         cfg[key] = (cli_val if cli_val not in (None, "")
                     else os.environ.get(key, "").strip() or str(manifest.get(key, "")))
-    if not cfg["BEE_BROKER_TOKEN"]:
-        try:  # vault is the preferred home for the bearer
-            from vault_intercept import get_vault_key
-            cfg["BEE_BROKER_TOKEN"] = get_vault_key("BEE_BROKER_TOKEN")
-        except Exception:
-            pass
+    for _k in ("BEE_BROKER_TOKEN", "BEE_API_TOKEN"):
+        if not cfg[_k]:
+            try:  # vault is the preferred home for bearers
+                from vault_intercept import get_vault_key
+                cfg[_k] = get_vault_key(_k)
+            except Exception:
+                pass
     return cfg
 
 
@@ -222,11 +234,15 @@ def _sse_frames(resp):
 
 def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
     wanted = {t.strip() for t in cfg["BEE_EVENT_TYPES"].split(",") if t.strip()}
-    url = cfg["BEE_PROXY_URL"].rstrip("/") + cfg["BEE_EVENTS_PATH"]
+    _direct = bool(cfg.get("BEE_API_BASE") and cfg.get("BEE_API_TOKEN"))
+    _base = cfg["BEE_API_BASE"] if _direct else cfg["BEE_PROXY_URL"]
+    url = _base.rstrip("/") + cfg["BEE_EVENTS_PATH"]
     backoff, forwarded = 1, 0
     while True:
         headers = {"Accept": "text/event-stream",
                    "User-Agent": "sutando-bee-watcher/1.0"}
+        if _direct:
+            headers["Authorization"] = f"Bearer {cfg['BEE_API_TOKEN']}"
         cursor = _read_cursor()
         if cursor:
             headers["Last-Event-ID"] = cursor
@@ -276,16 +292,22 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     for key in ("bee_proxy_url", "bee_events_path", "bee_event_types",
                 "bee_broker_url", "bee_broker_token", "bee_agent_id",
-                "bee_sink"):
+                "bee_sink", "bee_api_base", "bee_api_token"):
         ap.add_argument(f"--{key.replace('_', '-')}", dest=key)
     ap.add_argument("--once", action="store_true",
                     help="process one stream connection, then exit (tests)")
     ap.add_argument("--max-events", type=int, default=0)
     args = ap.parse_args()
     cfg = _config(args)
-    required = (("BEE_PROXY_URL",) if cfg.get("BEE_SINK") == "local"
-                else ("BEE_PROXY_URL", "BEE_BROKER_URL", "BEE_BROKER_TOKEN"))
-    missing = [k for k in required if not cfg[k]]
+    _direct = bool(cfg.get("BEE_API_BASE") and cfg.get("BEE_API_TOKEN"))
+    _source_ok = _direct or cfg.get("BEE_PROXY_URL")
+    required = []
+    if not _source_ok:
+        # neither a local proxy nor a direct API source is configured
+        required = ["BEE_PROXY_URL (or BEE_API_BASE+BEE_API_TOKEN)"]
+    if cfg.get("BEE_SINK") != "local":
+        required += [k for k in ("BEE_BROKER_URL", "BEE_BROKER_TOKEN") if not cfg[k]]
+    missing = required
     if missing:
         _log(f"not configured ({', '.join(missing)} unset) — see "
              "skills/bee-channel/manifest.json; exiting")
