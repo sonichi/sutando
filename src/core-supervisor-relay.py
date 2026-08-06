@@ -42,6 +42,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 
@@ -189,7 +190,27 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
 # Surfaces task-progress notify.py can actually DELIVER to. Other values that
 # land in last-owner-activity.json ("voice", "github-commits", …) are activity
 # signals, not deliverable channels — never route an escalation to them.
+# Beyond the static set, any source with a configured channel dir
+# ($CLAUDE_CONFIG_DIR/channels/<source>/ containing a *.env) counts — that
+# mirrors notify.py's own resolution rule, so a NEW homeserver bridge (e.g.
+# "dev-ag2space") becomes routable by creating its config dir, no code change.
 _DELIVERABLE_SURFACES = {"discord", "slack", "telegram", "ag2space"}
+
+# Same slug shape notify.py enforces — keeps a malformed/hostile activity file
+# from steering the existence probe at an arbitrary path.
+_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _is_deliverable(source):
+    if source in _DELIVERABLE_SURFACES:
+        return True
+    if not source or not _SOURCE_SLUG_RE.match(source):
+        return False
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    try:
+        return any(n.endswith(".env") for n in os.listdir(os.path.join(base, "channels", source)))
+    except OSError:
+        return False
 
 
 def resolve_active_target(activity_path):
@@ -210,7 +231,7 @@ def resolve_active_target(activity_path):
         return "", ""
     source = str(data.get("channel", "")).strip()
     channel = str(data.get("channel_id", "")).strip()
-    if source in _DELIVERABLE_SURFACES and channel:
+    if _is_deliverable(source) and channel:
         return source, channel
     return "", ""
 

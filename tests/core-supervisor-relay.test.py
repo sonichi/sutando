@@ -298,6 +298,44 @@ class TestResolveActiveTarget(unittest.TestCase):
             p = self._write(td, {"channel": "voice", "channel_id": "x"})
             self.assertEqual(resolve_active_target(p), ("", ""))
 
+    def test_configured_channel_dir_makes_new_surface_deliverable(self):
+        # New-homeserver rule: a source outside the static set is deliverable
+        # iff $CLAUDE_CONFIG_DIR/channels/<source>/ holds a *.env (notify.py's
+        # own resolution rule) — adding a homeserver is config-only.
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg:
+            os.makedirs(os.path.join(cfg, "channels", "dev-ag2space"))
+            with open(os.path.join(cfg, "channels", "dev-ag2space", "relay-client.env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:dev.ag2.space"})
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            try:
+                self.assertEqual(resolve_active_target(p), ("dev-ag2space", "!r:dev.ag2.space"))
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_unconfigured_new_surface_stays_macos_only(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg:
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:dev.ag2.space"})
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            try:
+                self.assertEqual(resolve_active_target(p), ("", ""))
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_traversal_shaped_source_is_never_probed(self):
+        # The slug guard must reject path-shaped sources outright.
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {"channel": "../discord", "channel_id": "x"})
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
     def test_missing_file_is_macos_only(self):
         self.assertEqual(resolve_active_target("/no/such/activity.json"), ("", ""))
 
