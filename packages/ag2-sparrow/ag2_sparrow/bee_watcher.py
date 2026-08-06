@@ -241,7 +241,9 @@ def _write_local_task(task: dict) -> bool:
              f"channel_id: {task['channel_id']}", f"user_id: {task['user_id']}",
              "room_name: Bee", "priority: low", "access_tier: ambient"]
     dest = tasks_dir / f"{task['id']}.txt"
-    if dest.exists():
+    # Archive-aware dedupe: the core moves a consumed task to tasks/archive/,
+    # so a live-file-only check re-created already-processed events on replay.
+    if dest.exists() or (tasks_dir / "archive" / dest.name).exists():
         return True                     # same event redelivered — idempotent
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")

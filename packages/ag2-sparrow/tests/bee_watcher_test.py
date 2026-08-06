@@ -208,6 +208,30 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertNotIn("access_tier: owner", body)
         self.assertFalse(list(tasksdir.glob("*.tmp")))
 
+    def test_local_sink_dedupes_after_core_archives_the_task(self):
+        # Codex P1 (2026-08-06): live-file-only dedupe re-created an already-
+        # PROCESSED event after the core moved it to tasks/archive/ — a Bee
+        # replay then caused duplicate work. Mirror of the reviewer's probe:
+        # deliver → simulate core consume (mv live → archive/) → replay must
+        # NOT recreate a live task.
+        from ag2_sparrow import _dirs
+        tasksdir = Path(self.tmp.name) / "archivews" / "tasks"
+        _dirs.set_dirs(task_dir=str(tasksdir))
+        self.addCleanup(_dirs.set_dirs)
+        cfg = {**self.cfg, "BEE_SINK": "local",
+               "BEE_BROKER_URL": "", "BEE_BROKER_TOKEN": ""}
+        self.assertEqual(self.mod.run(cfg, once=True), 0)
+        live = sorted(tasksdir.glob("task-bee-*.txt"))
+        self.assertEqual(len(live), 2)
+        archive = tasksdir / "archive"
+        archive.mkdir()
+        for f in live:                               # core consumes + archives
+            f.rename(archive / f.name)
+        self.assertEqual(self.mod.run(cfg, once=True), 0)   # SSE replay
+        self.assertEqual(sorted(tasksdir.glob("task-bee-*.txt")), [],
+                         "replay after archive must not recreate live tasks")
+        self.assertEqual(len(list(archive.glob("task-bee-*.txt"))), 2)
+
     def test_inbox_sink_promotes_ambient_tasks_via_framework(self):
         # BEE_SINK=inbox: events land durably in the sink's OWN EventInbox and
         # the shared TaskifyHandler (threshold=1) promotes each into an ambient
