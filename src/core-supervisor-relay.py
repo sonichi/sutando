@@ -197,8 +197,10 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
 _DELIVERABLE_SURFACES = {"discord", "slack", "telegram", "ag2space"}
 
 # Same slug shape notify.py enforces — keeps a malformed/hostile activity file
-# from steering the existence probe at an arbitrary path.
-_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# from steering the existence probe at an arbitrary path. Dots allowed only
+# BETWEEN alphanumerics (domain-named lanes like dev.ag2.space); "..", leading
+# and trailing dots are all rejected. Keep in lockstep with notify.py's rule.
+_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9]))*$")
 
 
 def _is_deliverable(source):
