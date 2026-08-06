@@ -45,7 +45,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parents[2]
+# parents: [0]=scripts, [1]=bee-channel, [2]=skills, [3]=repo root. The
+# suite's cursor-path test imports through this for real — a wrong index
+# fails loudly there instead of silently degrading vault + cursor in prod.
+_REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "src"))
 
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,48}")
