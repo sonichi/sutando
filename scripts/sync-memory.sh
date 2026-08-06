@@ -393,7 +393,27 @@ fi
 # `git clone sutando-memory && cp -r machine-<hostname>/* ~/Desktop/sutando/`.
 # Other machines' machine-<other>/ dirs are read-only from this machine's
 # POV — NO pull-back in the sync → local section below.
-HOST="$(hostname | sed 's/\..*//')"
+# Per-host label MUST match the reader — src/util_paths.py `_private_machine_dir()`
+# → `_host_label()` resolves `machine-<host>/` scutil-LocalHostName-FIRST. A bare
+# `hostname` can drift under DHCP (e.g. a Comcast lease → `Chis-MBP` while the
+# stable Bonjour name is `Chis-MacBook-Pro`), which would back up the WRONG
+# `machine-<host>/` dir — split from where personal_path() actually reads it
+# (#1745). Use the canonical `sutando-config.sh host-label` shim (#1771; single
+# source of truth, precedence $SUTANDO_HOST_LABEL > scutil > short hostname);
+# fall back to that same precedence inline if the shim is unavailable so backup
+# never hard-depends on python being importable.
+HOST="$(bash "$SCRIPT_DIR/sutando-config.sh" host-label 2>/dev/null || true)"
+if [ -z "$HOST" ]; then
+    HOST="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+    # Blank-but-set is non-empty to `[ -z ]`, so it would become the label.
+    HOST="${HOST#"${HOST%%[![:space:]]*}"}"; HOST="${HOST%"${HOST##*[![:space:]]}"}"
+    if [ -z "$HOST" ]; then
+        if command -v scutil >/dev/null 2>&1; then
+            HOST="$(scutil --get LocalHostName 2>/dev/null)"
+        fi
+        [ -z "$HOST" ] && HOST="$(hostname | sed 's/\..*//')"
+    fi
+fi
 MACHINE_DIR="machine-$HOST"
 mkdir -p "$MACHINE_DIR/skills" "$MACHINE_DIR/data"
 
@@ -499,11 +519,17 @@ else
         exit 1
     fi
     git commit -m "Sync $(hostname) $(date +%Y-%m-%dT%H:%M)" 2>&1 | tee -a "$LOG" >/dev/null
-    if git push 2>&1 | tee -a "$LOG" >/dev/null; then
+    # NOTE: do not test a `cmd | tee` pipeline — without pipefail the if sees
+    # tee's exit status (always 0) and a FAILED push prints "Pushed changes"
+    # (observed 2026-07-28: 115-commit backlog reported as pushed while the
+    # origin was unreachable). tee's stdout went to /dev/null anyway, so a
+    # plain append-redirect keeps the log and tests git push itself.
+    if git push >>"$LOG" 2>&1; then
         log "Pushed changes"
         echo "Pushed changes from $(hostname)."
     else
         log "Push failed"
+        PUSH_FAILED=1
     fi
 fi
 
@@ -525,5 +551,10 @@ fi
 
 NOTES_COUNT=$(find notes -type f 2>/dev/null | wc -l | tr -d ' ')
 MEMORY_COUNT=$(ls memory/*.md 2>/dev/null | wc -l | tr -d ' ')
+if [ "${PUSH_FAILED:-0}" = "1" ]; then
+    log "Sync FAILED: git push failed ($MEMORY_COUNT memory, $NOTES_COUNT notes committed locally, NOT pushed)"
+    echo "Sync FAILED: git push failed — changes committed locally but NOT pushed. Memory: $MEMORY_COUNT files, Notes: $NOTES_COUNT files." >&2
+    exit 1
+fi
 log "Sync complete: $MEMORY_COUNT memory, $NOTES_COUNT notes"
 echo "Sync complete. Memory: $MEMORY_COUNT files, Notes: $NOTES_COUNT files."

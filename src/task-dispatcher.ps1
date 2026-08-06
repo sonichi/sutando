@@ -24,7 +24,10 @@
 # Output goes to <workspace>/logs/task-dispatcher.log.
 
 [CmdletBinding()]
-param([switch]$Background)
+param(
+    [switch]$Background,
+    [switch]$ValidateOnly
+)
 
 $ErrorActionPreference = 'Continue'
 
@@ -95,6 +98,12 @@ if (-not $claudeCmd) {
 }
 $CLAUDE = $claudeCmd.Source
 Log "task-dispatcher started. claude=$CLAUDE workspace=$WORKSPACE"
+
+if ($ValidateOnly) {
+    Remove-Item $pidFile -ErrorAction SilentlyContinue
+    Write-Host "Windows task-dispatcher validation passed."
+    exit 0
+}
 
 # --- Per-task processing -----------------------------------------------------
 

@@ -8,6 +8,7 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
+import { resolveCredential } from './credential-resolver.js';
 import { writeFileSync, unlinkSync, readFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -15,6 +16,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { isMacOS, macOSOnlyError } from './platform.js';
+import { readCaptureToken } from './util_paths.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -370,7 +372,7 @@ export const openUrlTool: ToolDefinition = {
 async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
 	// Prefer free-tier voice key (gemini-3.1-flash-lite-preview is free-tier eligible on REST
 	// generateContent — verified 2026-05-14). Falls back to paid GEMINI_API_KEY if voice key absent.
-	const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
 		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
@@ -434,7 +436,8 @@ export const describeScreenTool: ToolDefinition = {
 		try {
 			const { display } = (args || {}) as { display?: number };
 			const query = display ? `?display=${display}` : '?all=true';
-			const captureRes = await fetch(`http://localhost:7845/capture${query}`);
+			const _capTok = readCaptureToken();
+			const captureRes = await fetch(`http://localhost:7845/capture${query}`, _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
 			const captureData = await captureRes.json() as { status: string; path?: string; all_paths?: string[]; error?: string };
 			if (captureData.status !== 'ok' || !captureData.path) {
 				return { error: `Could not capture screen: ${captureData.error || 'unknown'}` };
@@ -545,7 +548,7 @@ export const pointAtTool: ToolDefinition = {
 		if (!isMacOS()) return macOSOnlyError('point_at');
 		// Free-tier eligible voice key preferred (the POC proved gemini-3-flash-preview
 		// works on it); falls back to the paid key. Same precedence as describe_screen.
-		const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+		const apiKey = resolveCredential('gemini-voice').key;
 		if (!apiKey) return { error: 'point_at unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)' };
 		if (!query?.trim()) return { error: 'point_at needs a query (what to point at)' };
 		try {
@@ -563,7 +566,8 @@ export const pointAtTool: ToolDefinition = {
 			// 1. capture the main display (single-display scope guard) via :7845.
 			// Timeout-bounded — point_at is on the sub-second inline lane and must
 			// never hang it if the capture server is wedged.
-			const capRes = await fetch('http://localhost:7845/capture?display=1', { signal: AbortSignal.timeout(8_000) });
+			const _capTok2 = readCaptureToken();
+			const capRes = await fetch('http://localhost:7845/capture?display=1', { signal: AbortSignal.timeout(8_000), headers: _capTok2 ? { 'X-Sutando-Capture-Token': _capTok2 } : {} });
 			if (!capRes.ok) return { error: `point_at capture HTTP ${capRes.status}` };
 			const cap = await capRes.json() as { status: string; path?: string; error?: string };
 			if (cap.status !== 'ok' || !cap.path) return { error: `point_at capture failed: ${cap.error || 'unknown'}` };
@@ -673,4 +677,3 @@ export {
 	onCallEnd,
 	startRecordingNarration,
 } from './recording-tools.js';
-

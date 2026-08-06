@@ -99,15 +99,24 @@ Prefer this for any "open X and do Y" task in a native app (Zoom join, Mail comp
 
 **Browser automation** — navigate, read, fill forms, screenshot web pages:
 
-Preferred (interactive): Use **Playwright MCP tools** (`mcp__playwright__*`) or **Chrome plugin** (`mcp__claude-in-chrome__*`). These provide real browser control with live DOM access, screenshots, and form interaction.
+In the ChatGPT/Codex desktop app, prefer its Browser or Chrome plugin. Those
+desktop browser backends are not available to a plain Codex CLI core, even
+when the plugin skill is installed. For the Codex CLI core, use Sutando's
+persistent Playwright profile below.
 
 **Default: navigate within the active tab when the next URL has the same origin (scheme + host + port) as the current tab.** Only spawn a new tab for cross-origin navigation, when an existing tab is the only context that holds the relevant state (a logged-in session, a long-running app), or when the user explicitly asks for a new tab. `localhost:7844` and `localhost:8080` are DIFFERENT origins — same hostname, but different ports → different services → don't share a tab. This keeps the browser tab count bounded during multi-step flows — without it, every `mcp__claude-in-chrome__navigate` opens a fresh tab and the user ends up with dozens of half-used tabs after a research session.
 
-Fallback (non-interactive / headless): `src/browser.mjs` for scripted or background use:
+Codex CLI and non-interactive use: `src/browser.mjs` uses a dedicated persistent
+Chrome profile at `<workspace>/data/browser-profile`. Run setup once, sign in to
+the sites Sutando may operate, and close the setup window. Later commands reuse
+those sessions without accessing the user's everyday Chrome profile:
 ```bash
+node src/browser.mjs setup                                      # one-time visible sign-in
+node src/browser.mjs profile                                    # show profile location
 node src/browser.mjs "https://example.com"                    # get page text
 node src/browser.mjs "https://example.com" screenshot         # full-page screenshot → path
 node src/browser.mjs "https://example.com" "fill:#email:me@x.com" "click:#submit"  # fill + click
+node src/browser.mjs "https://example.com" --headed           # watch automation live
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
 
@@ -136,6 +145,24 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 
 **Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
 
+**Trusted capability catalog** — discover, inspect, install, and update skills
+from the allowlisted repositories declared in
+`skills/trusted-capabilities/manifest.json`:
+```bash
+C=skills/trusted-capabilities/scripts/catalog.py
+python3 "$C" sources
+python3 "$C" search browser
+python3 "$C" inspect anthropic-skills skills/skill-creator
+python3 "$C" install anthropic-skills skills/skill-creator        # dry run
+# Review the dry-run output, then copy its exact commit into the write:
+python3 "$C" install anthropic-skills skills/skill-creator --commit <40-char-sha> --yes
+python3 "$C" update skill-creator                                 # dry run
+python3 "$C" update skill-creator --commit <40-char-sha> --yes
+```
+Skill installs are pinned to an upstream commit and record provenance for later
+updates. Tool repositories can be searched and inspected but are
+install-disabled because their setup and permissions are source-specific.
+
 **App launcher** — open any macOS app:
 ```bash
 open -a "Safari"                    # open by name
@@ -145,4 +172,4 @@ open "https://github.com"           # open URL in default browser
 
 **Context drop + shortcuts** — the Sutando menu bar app (`src/Sutando/`) provides global hotkeys. **Live config**: `~/.config/sutando/hotkeys.json` (per-user override) with defaults registered in `src/Sutando/main.swift:944` (`registerHotKey()` action list). When the user asks "what hotkeys do I have", read those sources — don't quote a static list from this file (it would drift behind the actual registration).
 
-Launches automatically via `startup.sh`. Check `tasks/` for dropped context.
+The menu-bar app is optional and is not built or launched by the headless core's `startup.sh`; compile and launch the app separately, including `bash skills/context-drop/build.sh` when enabling context-drop. Check `tasks/` for dropped context.

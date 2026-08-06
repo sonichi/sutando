@@ -7,6 +7,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { resolveCredential } from './credential-resolver.js';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
@@ -14,6 +15,7 @@ import { PLAYBACK_PATH, VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollPausedRef } from './recording-state.js';
 import { isMacOS, macOSOnlyError } from './platform.js';
+import { readCaptureToken } from './util_paths.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -307,7 +309,7 @@ function findRecording(version?: 'raw' | 'narrated' | 'subtitled'): string | nul
 async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
 	// Prefer free-tier voice key (gemini-3.1-flash-lite-preview is free-tier eligible on REST
 	// generateContent — verified 2026-05-14). Falls back to paid GEMINI_API_KEY if voice key absent.
-	const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
 		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
@@ -361,7 +363,8 @@ async function describeScreenshot(imagePath: string, previousDescs: string[] = [
 
 async function captureScreen(): Promise<string | null> {
 	try {
-		const res = await fetch('http://localhost:7845/capture');
+		const _capTok = readCaptureToken();
+		const res = await fetch('http://localhost:7845/capture', _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
 		const data = await res.json() as { status: string; path?: string };
 		return data.status === 'ok' && data.path ? data.path : null;
 	} catch { return null; }
@@ -425,7 +428,8 @@ export const scrollAndDescribeTool: ToolDefinition = {
 
 			// Capture + describe FIRST, then start recording.
 			// This way the vision API latency doesn't eat into recording time.
-			const captureRes = await fetch('http://localhost:7845/capture');
+			const _capTok2 = readCaptureToken();
+			const captureRes = await fetch('http://localhost:7845/capture', _capTok2 ? { headers: { 'X-Sutando-Capture-Token': _capTok2 } } : {});
 			const captureData = await captureRes.json() as { status: string; path?: string };
 			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
 			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
@@ -935,11 +939,10 @@ export function startRecordingNarration(session: any): void {
 			return;
 		}
 		// Inject the pre-captured description
-		let desc = nextDescRef.value!;
+		const desc = nextDescRef.value!;
 		nextDescRef.value = null;
 		lastDesc = desc;
 		previousDescs.push(desc);
-		const remaining = Math.round((durationMs - (Date.now() - startTime)) / 1000);
 		const lastSaid = lastSpokenRef.value || '(first description)';
 		narrationSpeakingRef.value = true;
 		lastPushTime = Date.now();

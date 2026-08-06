@@ -22,7 +22,8 @@ param(
     [switch]$SkipTelegram,
     [switch]$SkipDiscord,
     [switch]$SkipCore,
-    [switch]$SkipDispatcher
+    [switch]$SkipDispatcher,
+    [switch]$ValidateOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -211,6 +212,13 @@ $PY = Get-PythonCmd
 # here is enough — no per-call plumbing.
 $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONUTF8 = '1'
+
+if ($ValidateOnly) {
+    Write-Host "Windows startup validation passed."
+    Write-Host "  Workspace: $WORKSPACE"
+    Write-Host "  Python: $PY"
+    exit 0
+}
 
 # --- Install Sutando skills into ~/.claude/skills/ --------------------------
 # Required so the core Claude Code session can resolve /schedule-crons and

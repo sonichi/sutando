@@ -22,11 +22,17 @@ set -euo pipefail
 # candidate MUST use `sort -V | tail -1`, NOT a `*/bin` glob: glob order is
 # lexicographic, so with prepend-then-continue a box with v9 + v10 would pick v9
 # (`'1' < '9'` sorts v10 first, v9 last-wins) — an older node, not the latest.
+# REPO_ROOT is resolved HERE (before the loop) so the app-bundle node dir is
+# CONFIG-RESOLVED via sutando-config.sh app-node-dir (honors $SUTANDO_APP_NODE_DIR)
+# on the supervised launchd path too — not just src/startup.sh (Codex #2154).
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 for _node_cand in \
+    "${SUTANDO_NODE:-}" \
     /opt/homebrew/bin/node \
     /usr/local/bin/node \
     "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/node" \
-    "$HOME/.volta/bin/node"
+    "$HOME/.volta/bin/node" \
+    "$(bash "$REPO_ROOT/scripts/sutando-config.sh" app-node-dir)/node"
 do
     [ -x "$_node_cand" ] || continue
     _node_dir="$(dirname "$_node_cand")"
@@ -38,7 +44,8 @@ done
 # launchd plist exports it (claude-sutando installs); otherwise falls back to
 # ~/.claude. launchd itself doesn't inherit shell env, so this fallback is the
 # vanilla-claude default unless the plist's EnvironmentVariables sets it.
-PROXY_SCRIPT="$(bash "$(cd "$(dirname "$0")/../.." && pwd)/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+# (REPO_ROOT is resolved above, before the node-candidate loop.)
+PROXY_SCRIPT="$(bash "$REPO_ROOT/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
 
 # Resolve npx — launchd doesn't inherit the user's shell PATH.
 resolve_npx() {
@@ -54,15 +61,16 @@ resolve_npx() {
 }
 
 # Resolve tsx — prefer direct binary to avoid npx overhead on restart paths.
+# The repo's own node_modules/.bin/tsx comes FIRST: it's the version the repo
+# pins, and it's the only tsx on a host with no homebrew/nvm/volta node at all
+# (the app-bundle runtime ships bare `node` — the PATH heal above covers the
+# `#!/usr/bin/env node` re-exec).
 resolve_tsx() {
-    for p in \
-        /opt/homebrew/bin/tsx \
-        /usr/local/bin/tsx \
-        "$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin/tsx" \
-        "$HOME/.volta/bin/tsx"
-    do
-        [ -x "$p" ] && { echo "$p"; return; }
-    done
+    # Single source of truth: scripts/sutando-config.sh tsx-bin (repo-pinned
+    # node_modules/.bin/tsx first, then global locations). Prints the path or
+    # nothing; return 1 on empty lets the caller fall through to `npx tsx`.
+    _tsx="$(bash "$REPO_ROOT/scripts/sutando-config.sh" tsx-bin 2>/dev/null)"
+    [ -n "$_tsx" ] && { echo "$_tsx"; return 0; }
     return 1  # fall through to npx tsx
 }
 
@@ -87,6 +95,35 @@ kill_stale_holder() {
 }
 
 kill_stale_holder
+
+# G1.5 node-bundle (Codex re-review F1b): the wrapper enforces the SAME
+# resolver + fail-closed + mode contract as startup.sh. node-bin exits 1 on a
+# set-but-invalid SUTANDO_NODE — that is a desktop packaging error and the
+# job must FAIL (KeepAlive backs off on ThrottleInterval), never silently
+# slide to tsx/npx on whatever node the host has. Bundled context = explicit
+# env OR this wrapper running from the packaged engine copy (repo inside the
+# engine root that owns the at-rest runtime); in that context the dist
+# artifact is REQUIRED.
+NODE_BIN="$(bash "$REPO_ROOT/scripts/sutando-config.sh" node-bin)" || {
+    echo "credential-proxy-wrapper: SUTANDO_NODE set but invalid — desktop packaging error; fail-closed (no PATH/tsx fallback)" >&2
+    exit 78
+}
+_W_APP_NODE_DIR="$(bash "$REPO_ROOT/scripts/sutando-config.sh" app-node-dir)"
+_W_ENGINE_ROOT="${_W_APP_NODE_DIR%/node/bin}"; _W_ENGINE_ROOT="${_W_ENGINE_ROOT%/runtime}"
+_W_BUNDLED=0
+if [ -n "${SUTANDO_NODE:-}" ]; then
+    _W_BUNDLED=1
+elif [ -x "$_W_APP_NODE_DIR/node" ] && [ "${REPO_ROOT#"$_W_ENGINE_ROOT"/}" != "$REPO_ROOT" ]; then
+    _W_BUNDLED=1
+fi
+DIST_PROXY="$REPO_ROOT/dist/credential-proxy.js"
+if [ "$_W_BUNDLED" = "1" ]; then
+    if [ ! -f "$DIST_PROXY" ]; then
+        echo "credential-proxy-wrapper: bundled mode but $DIST_PROXY missing — desktop packaging error; fail-closed" >&2
+        exit 78
+    fi
+    exec "$NODE_BIN" "$DIST_PROXY"
+fi
 
 # Resolve and run.
 TSX_BIN=$(resolve_tsx 2>/dev/null) || true

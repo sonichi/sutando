@@ -1,0 +1,120 @@
+name: Windows runtime
+
+on:
+  pull_request:
+    branches: [main, staging-interaction-planes]
+  push:
+    branches: [main, staging-interaction-planes]
+
+jobs:
+  windows-runtime:
+    name: PowerShell + Windows runtime
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # bodhi-realtime-agent ships a prebuilt dist, but its git dependency
+      # postinstall uses POSIX `[ ... ]` syntax that cmd.exe cannot parse.
+      # Skipping lifecycle scripts is the Windows clean-install path; the next
+      # step fails closed if the required prebuilt package is absent.
+      - name: Install dependencies (Windows)
+        run: npm ci --ignore-scripts
+
+      - name: Verify prebuilt runtime dependency
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'node_modules/bodhi-realtime-agent/dist')) {
+            throw 'bodhi-realtime-agent prebuilt dist is missing'
+          }
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Parse every PowerShell script
+        shell: pwsh
+        run: |
+          $failed = @()
+          Get-ChildItem -Recurse -File -Filter '*.ps1' |
+            Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' } |
+            ForEach-Object {
+              $tokens = $null
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile(
+                $_.FullName, [ref]$tokens, [ref]$errors
+              )
+              foreach ($error in $errors) {
+                Write-Host "::error file=$($_.FullName),line=$($error.Extent.StartLineNumber)::$($error.Message)"
+                $failed += $_.FullName
+              }
+            }
+          if ($failed.Count) {
+            throw "$($failed.Count) PowerShell parse error(s)"
+          }
+
+      - name: Verify bash and PowerShell workspace resolvers agree
+        shell: pwsh
+        run: |
+          $git = (Get-Command git -ErrorAction Stop).Source
+          $gitRoot = Split-Path (Split-Path $git -Parent) -Parent
+          $gitBash = Join-Path $gitRoot 'bin\bash.exe'
+          if (-not (Test-Path $gitBash)) {
+            throw "Git Bash not found at $gitBash"
+          }
+          $bashWorkspace = (& $gitBash scripts/sutando-config.sh workspace).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $bashWorkspace) {
+            throw 'bash workspace resolver failed'
+          }
+          . .\src\workspace_default.ps1
+          $pwshWorkspace = Resolve-SutandoWorkspace
+          if ([IO.Path]::GetFullPath($bashWorkspace) -ne [IO.Path]::GetFullPath($pwshWorkspace)) {
+            throw "workspace mismatch: bash=$bashWorkspace pwsh=$pwshWorkspace"
+          }
+
+      - name: Verify Windows Python launcher fallback
+        shell: bash
+        run: bash tests/python-binary-windows.test.sh
+
+      - name: Validate startup and dispatcher with a Claude cmd shim
+        shell: pwsh
+        run: |
+          $shimDir = Join-Path $env:RUNNER_TEMP 'sutando-test-bin'
+          New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+          Set-Content -Path (Join-Path $shimDir 'claude.cmd') -Value '@exit /b 0' -Encoding ascii
+          $env:PATH = "$shimDir;$env:PATH"
+          Set-Content -Path '.env' -Value 'GEMINI_API_KEY=ci-placeholder' -Encoding ascii
+          & pwsh -NoProfile -File src/startup.ps1 -ValidateOnly
+          if ($LASTEXITCODE -ne 0) { throw "startup validation exited $LASTEXITCODE" }
+          & pwsh -NoProfile -File src/task-dispatcher.ps1 -ValidateOnly
+          if ($LASTEXITCODE -ne 0) { throw "dispatcher validation exited $LASTEXITCODE" }
+
+      - name: Run Windows process and lock regressions
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: |
+          python tests/find-pids.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'find-pids.test.py failed' }
+          python tests/single-instance.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
+
+      - name: Compile Windows Python entry points
+        run: >-
+          python -m py_compile
+          src/screen-capture-server.py
+          src/sutando_platform.py
+          src/health-check.py

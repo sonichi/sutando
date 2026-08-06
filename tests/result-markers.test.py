@@ -81,6 +81,56 @@ class TestRedirectMarker(unittest.TestCase):
         self.assertIn("[channel: 12345]", r.body)
 
 
+class TestDmOnlyMarker(unittest.TestCase):
+    """The `[dm-only]` privacy guard: forces DM, suppresses any [channel:]
+    redirect so private content (calendar/email briefing) can't be posted to a
+    shared channel. Added 2026-07-18 after a morning briefing leaked to a
+    channel via a [channel:] redirect."""
+
+    def test_dm_only_emits_action_and_strips_marker(self):
+        r = parse_markers("[dm-only]\nCalendar today: 7:30am write")
+        self.assertEqual(r.body, "Calendar today: 7:30am write")
+        self.assertEqual(first_action(r, "dm-only").kind, "dm-only")
+        # No literal marker leaks into the delivered body.
+        self.assertNotIn("[dm-only]", r.body)
+
+    def test_dm_only_suppresses_redirect_marker_first(self):
+        # BEFORE (no dm-only): the [channel:] redirect IS honored →
+        # private content would be posted to the channel.
+        before = parse_markers("[channel: 1527723291324842135]\nCalendar: 7:30am")
+        self.assertEqual(first_action(before, "redirect").value, "1527723291324842135")
+
+        # AFTER (dm-only present, redirect first): NO redirect action is
+        # emitted — the body stays in the owner's DM — and both markers are
+        # stripped so neither leaks.
+        after = parse_markers("[dm-only]\n[channel: 1527723291324842135]\nCalendar: 7:30am")
+        self.assertIsNone(first_action(after, "redirect"))
+        self.assertEqual(first_action(after, "dm-only").kind, "dm-only")
+        self.assertEqual(after.body, "Calendar: 7:30am")
+        self.assertNotIn("[channel:", after.body)
+        self.assertNotIn("[dm-only]", after.body)
+
+    def test_dm_only_suppresses_redirect_regardless_of_order(self):
+        # dm-only AFTER the channel marker still wins (matched anywhere).
+        r = parse_markers("[channel: 1527723291324842135]\nsecret [dm-only] stuff")
+        self.assertIsNone(first_action(r, "redirect"))
+        self.assertEqual(first_action(r, "dm-only").kind, "dm-only")
+        # The marker STAYS in the body here, on purpose: it is inline prose,
+        # and stripping it rewrote the owner's sentence ("secret  stuff").
+        # Only a standalone marker is stripped now. Detection is unchanged —
+        # the two assertions above, which are what this test is named for,
+        # still prove dm-only wins regardless of order.
+        self.assertIn("[dm-only]", r.body)
+        self.assertNotIn("[channel:", r.body)
+
+    def test_skip_still_beats_dm_only(self):
+        # A skipped body is delivered nowhere; dm-only is moot but must not
+        # break the terminal skip.
+        r = parse_markers("[no-send]\n[dm-only]\nnothing")
+        self.assertEqual(r.body, "")
+        self.assertEqual(r.actions[0].kind, "skip")
+
+
 class TestAttachMarkers(unittest.TestCase):
     def test_file_marker(self):
         r = parse_markers("here it is [file: /tmp/sutando-a.png]")

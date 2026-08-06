@@ -17,9 +17,8 @@
  */
 
 import { execSync, execFileSync, spawnSync } from 'node:child_process';
-import { writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdirSync, existsSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 export type SupportedPlatform = 'darwin' | 'win32' | 'linux';
 
@@ -184,7 +183,7 @@ export function isPortInUse(port: number): boolean {
  */
 export function captureScreen(outPath: string, format: 'png' | 'jpg' = 'png'): boolean {
 	try {
-		mkdirSync(require('node:path').dirname(outPath), { recursive: true });
+		mkdirSync(dirname(outPath), { recursive: true });
 	} catch {}
 	if (isMacOS()) {
 		const typeFlag = format === 'jpg' ? 'jpg' : 'png';

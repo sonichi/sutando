@@ -1,0 +1,81 @@
+# Sutando documentation
+
+This is the canonical map of Sutando's maintained documentation. Start with the
+path that matches what you are trying to do; feature-specific agent procedures
+remain colocated in `skills/*/SKILL.md` and are linked rather than duplicated.
+
+Machine-readable ownership and lifecycle metadata lives in
+[`catalog.json`](catalog.json). CI checks that every Markdown document under
+`docs/` is listed here and in the catalog, and that local Markdown links resolve.
+
+## Start here
+
+- [Configure a workspace](workspace-config.md) — defaults, overrides, and
+  resolver APIs.
+- [Run Codex as the core](codex-core.md) — core selection, setup, and rollback.
+- [Use built-in tools](built-in-tools.md) — authoritative capability catalog.
+- [External runtime dependencies](runtime-dependencies.md) — what must be
+  installed, what only a feature needs, and what to vendor when embedding.
+
+## Guides and examples
+
+- [Community use cases](community-use-cases/README.md)
+  - [Self-healing install](community-use-cases/self-healing-install.md)
+- [Set up automatic wire-list regeneration](regen-wire-list-setup.md)
+
+## Operations
+
+- [Release process and migrations](release-process.md)
+- [Workspace sync across machines](workspace-sync.md)
+- [Per-host workspace convention](workspace-hosts-convention.md)
+- [Per-host carried-path rules](workspace-per-host-paths.md)
+- [State-sync allowlist design](state-sync-allowlist.md)
+- [Testing and coverage](testing-coverage.md)
+- [Voice-agent test framework](voice-agent-test-framework.md)
+
+## Reference
+
+- [Host CLI bindings](host-cli-bindings.md)
+- [Remote gateway protocol](remote-gateway-protocol.md)
+- [Slack bridge](slack-bridge.md)
+- [Generated `src/` module map](src-map.md)
+- [Workspace operational contract](workspace-contract.md)
+
+## Architecture and decisions
+
+- [Architecture boundaries](architecture-boundaries.md)
+- [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
+- [Workspace two-space model](workspace-design.md)
+- [Core health verdict + severity gate](design-core-health-verdict.md)
+- [Pointer Teacher design](pointer-teacher-design.md)
+- [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
+- [ADR 0001: Pointer Teacher brain](adr/0001-pointer-teacher-brain.md)
+
+## Documentation contract
+
+Each `docs/**/*.md` file must:
+
+1. be linked from this index;
+2. have one entry in `docs/catalog.json` with `title`, `audience`, `status`,
+   `canonical_for`, and `last_verified`;
+3. use relative links for repository-local content;
+4. name one canonical document for a policy or contract instead of copying the
+   same normative text into multiple files.
+
+Allowed lifecycle statuses are:
+
+- `canonical` — authoritative for the named contract or policy;
+- `active` — maintained guidance or reference, but not the sole authority;
+- `draft` — under discussion and not operational policy;
+- `historical` — retained for context and not current guidance.
+
+`last_verified` is an ISO date when the document was checked against current
+behavior. It may be `null` for legacy documents not yet verified under this
+contract; release preparation must surface and resolve `null` for every document
+affected by that release.
+
+Run the audit locally:
+
+```bash
+python3 skills/release/scripts/docs_audit.py
+```

@@ -111,11 +111,36 @@ class _TempBridgeState:
         ws = Path(self._td) / "workspace"
         ws.mkdir()
         BRIDGE.WORKSPACE = str(ws)
+
+        # …and redirect the path write_owner_activity ACTUALLY writes.
+        #
+        # Two symbols, and only the second one matters. `STATE_DIR = REPO/"state"`
+        # (slack-bridge.py:98) is where you'd expect the write to resolve, but
+        # line 102 binds `OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"`
+        # **at import time**, and :177/:179 write through that constant. Rebinding
+        # STATE_DIR afterwards does not retroactively re-derive it — so patching
+        # STATE_DIR alone leaves the write pointed at the operator's real file
+        # (bassilkhilo-ag2, #2615). Both are rebound here; STATE_DIR because
+        # `mkdir(parents=True)` in the writer uses it, OWNER_ACTIVITY_FILE because
+        # it is the destination.
+        #
+        # Why it matters: that file is the presence signal the proactive loop
+        # reads to decide whether the owner is mid-conversation. Stamping it with
+        # `ts: now` made an idle machine look like the owner had just messaged —
+        # observed live, and it put a loop pass into conversation mode before it
+        # was traced back here.
+        self._orig_state = BRIDGE.STATE_DIR
+        self._orig_owner_file = BRIDGE.OWNER_ACTIVITY_FILE
+        BRIDGE.STATE_DIR = Path(self._td) / "state"
+        BRIDGE.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        BRIDGE.OWNER_ACTIVITY_FILE = BRIDGE.STATE_DIR / "last-owner-activity.json"
         return self
 
     def __exit__(self, *_):
         BRIDGE.ACCESS_FILE = self._orig_access
         BRIDGE.TASKS_DIR = self._orig_tasks
+        BRIDGE.STATE_DIR = self._orig_state
+        BRIDGE.OWNER_ACTIVITY_FILE = self._orig_owner_file
         BRIDGE._TOFU_ENROLLMENT_CODE = None
 
 
@@ -354,4 +379,25 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _rc = main()
+    # Quarantine an intermittent interpreter-teardown SIGSEGV (exit 139): the
+    # imported slack-bridge module pulls in single_instance/threading state that
+    # can segfault during CPython finalization AFTER all tests have already
+    # passed — a probabilistic flake that fails otherwise-green CI runs (hit
+    # #2118 twice + #2124 in the 2026-07-15 window). Flush, then os._exit to skip
+    # the finalization that crashes; the test result (_rc) is unaffected.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # os._exit() below skips atexit handlers — including coverage.py's data
+    # writer — so under `coverage run` this file would record 0% and its
+    # exercised src/slack-bridge.py lines show as uncovered in the diff gate
+    # (spurious failures on any slack-bridge PR). Flush the active coverage
+    # session explicitly before the hard exit.
+    try:
+        import coverage
+        _cov = coverage.Coverage.current()
+        if _cov is not None:
+            _cov.save()
+    except Exception:
+        pass
+    os._exit(_rc)

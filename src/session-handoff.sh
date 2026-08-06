@@ -42,7 +42,18 @@ else
     fi
 fi
 export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
-TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH
+TRANSCRIPT="$1"  # Optional explicit path (manual invocations)
+# Claude Code hooks pass transcript_path via stdin JSON ONLY — there is no
+# $TRANSCRIPT_PATH env var, so on a stock hook config $1 expands empty and the
+# conversation section silently degraded (john's #1909 review). Parse stdin
+# when it's piped ([ ! -t 0 ]); interactive/manual runs skip this and either
+# pass $1 or fall through to --latest at the extraction site below.
+# NOTE (rebase over #2077): the pre-rebase branch also set
+# STATE_FILE="$REPO/session-state.md" here — dropped; STATE_FILE is now
+# derived from the resolved workspace below, per the workspace contract.
+if [ -z "$TRANSCRIPT" ] && [ ! -t 0 ]; then
+  TRANSCRIPT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("transcript_path") or "")' 2>/dev/null || true)"
+fi
 
 # Workspace resolves via the shared post-M0 helper (src/workspace_resolve.sh).
 # Exports $WORKSPACE on success; exits non-zero with a diagnostic on failure
@@ -93,7 +104,24 @@ STATE_FILE="$WORKSPACE_DIR/session-state.md"
 
   # What's running
   echo "## System Status"
-  python3 "$REPO/src/health-check.py" 2>/dev/null | grep -E "✓|⚠|✗" | head -15
+  # Status glyphs are assigned in src/health-check.py: ✓ ok · ⚠ warn · ✗ down /
+  # missing / not_loaded · ♻ stale · ~ any other status. The previous pattern
+  # listed only ✓⚠✗, so a stale or unrecognised check could not appear here at
+  # all — and `~` is the catch-all for states nobody enumerated, which is
+  # exactly the set most worth carrying into the next session.
+  #
+  # `head -15` then truncated a 29-check run to 15, dropping non-ok lines purely
+  # by position. Both together meant this section could report an all-✓ system
+  # while a check was failing. Non-ok lines are now uncapped; ok lines are
+  # summarised as a count, since the successor needs the failures, not the roll.
+  _hc=$(python3 "$REPO/src/health-check.py" 2>/dev/null)
+  if [ -z "$_hc" ]; then
+    echo "(health-check produced no output — status UNKNOWN, not healthy)"
+  else
+    printf '%s\n' "$_hc" | grep -E '^ *[⚠✗♻~] ' || true
+    printf '%s\n' "$_hc" | grep -cE '^ *✓ ' | awk '{print "  (" $1 " checks ok)"}'
+  fi
+  unset _hc
   echo ""
 
   # Recent git activity (what was built)
@@ -118,9 +146,38 @@ from util_paths import personal_path
 from pathlib import Path
 print(personal_path('pending-questions.md', Path('$WORKSPACE_DIR')))
 " 2>/dev/null || echo "$WORKSPACE_DIR/hosts/${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-$(scutil --get LocalHostName 2>/dev/null | grep . || hostname | sed 's/\..*//')}}/pending-questions.md")
+  # Extract via the canonical parser (src/check-pending-questions.py) instead of
+  # a second, weaker pattern here. Its `^## ` section split matches all three
+  # heading formats in use — legacy `## Q1 — Title`, `## Title` + `**Status:**`,
+  # and the free-form dated headings the proactive loop actually writes. The
+  # previous `grep "^## Q"` matched only the legacy shape, so on a file using
+  # either newer format the section rendered EMPTY.
+  #
+  # Empty is the dangerous part: it reads as "nothing pending" rather than "not
+  # parsed", so the successor session is told there is nothing waiting on the
+  # owner. Note this is the SECOND fix to this same section — the comment above
+  # records a path-resolution fix, and repairing the path is what turned an
+  # honest "None" (file not found) into a silent "" (found, matched nothing).
+  # Hence the explicit parse-failure branch below: a broken extractor must never
+  # be indistinguishable from an empty queue.
   echo "## Pending Questions"
   if [ -f "$PQ_PATH" ]; then
-    grep -A1 "^## Q" "$PQ_PATH" | head -20
+    pq_out=$(python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('cpq', '$REPO/src/check-pending-questions.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+qs = m.get_waiting_questions()
+print('\n'.join('- ' + q['title'] for q in qs[:20]) if qs else 'None')
+" 2>/dev/null)
+    if [ -n "$pq_out" ]; then
+      echo "$pq_out"
+    else
+      # Name both inputs so the failure is reproducible by hand. stderr is
+      # dropped above to match the idiom of the sibling extractors in this
+      # function, which makes this line the only handle an operator gets.
+      echo "(could not parse $PQ_PATH via $REPO/src/check-pending-questions.py — section unavailable, NOT necessarily empty)"
+    fi
   else
     echo "None"
   fi
@@ -128,7 +185,35 @@ print(personal_path('pending-questions.md', Path('$WORKSPACE_DIR')))
 
   # Tasks in flight
   echo "## Tasks"
-  ls "$WORKSPACE_DIR/tasks/"*.txt 2>/dev/null | head -5 || echo "None pending"
+  # `ls … | head -5 || echo` never reached the fallback: `||` binds to the LAST
+  # command of a pipeline, and `head` exits 0 on empty input however `ls` fared.
+  # So "None pending" was unreachable and both "no tasks" and "the directory is
+  # gone" rendered as an empty section.
+  _tasks=$(ls "$WORKSPACE_DIR/tasks/"*.txt 2>/dev/null | head -5)
+  if [ -n "$_tasks" ]; then
+    printf '%s\n' "$_tasks"
+  elif [ -d "$WORKSPACE_DIR/tasks" ]; then
+    echo "None pending"
+  else
+    echo "(no tasks dir at $WORKSPACE_DIR/tasks — queue state UNKNOWN)"
+  fi
+  unset _tasks
+  echo ""
+
+  # Recent conversation — the PreCompact hook hands us $TRANSCRIPT but until
+  # now nothing used it: conversation content died on every compaction and
+  # only system status survived into the next session.
+  echo "## Recent Conversation (before compaction)"
+  if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+    python3 "$REPO/src/context_resume.py" "$TRANSCRIPT" --turns 12 --chars 6000 2>/dev/null \
+      || echo "(extraction failed — transcript at $TRANSCRIPT)"
+  else
+    # No exact path (manual run, or stdin JSON unavailable) — fall back to the
+    # newest transcript for this project; context_resume ships --latest for
+    # exactly this shape. Still fail-open: a one-line note, never a hard stop.
+    python3 "$REPO/src/context_resume.py" --latest --turns 12 --chars 6000 2>/dev/null \
+      || echo "(no transcript available — hook stdin empty and --latest found none)"
+  fi
   echo ""
 
   # Quota (with reset times)
@@ -152,7 +237,16 @@ print(f'5h: {d[\"utilization_5h\"]:.0%} (resets in {m5}min at {r5.strftime(\"%I:
 
   # Stars
   echo "## Repo Stats"
-  gh api repos/sonichi/sutando --jq '.stargazers_count, .forks_count' 2>/dev/null | tr '\n' ' ' | awk '{print $1 " stars, " $2 " forks"}' || echo "(couldn't fetch)"
+  # Same unreachable-fallback shape as the tasks section: `||` bound to `awk`,
+  # which exits 0 with no input records, so "(couldn't fetch)" never printed and
+  # a failed API call rendered as an empty line.
+  _stats=$(gh api repos/sonichi/sutando --jq '.stargazers_count, .forks_count' 2>/dev/null | tr '\n' ' ')
+  if [ -n "${_stats// /}" ]; then
+    printf '%s\n' "$_stats" | awk '{print $1 " stars, " $2 " forks"}'
+  else
+    echo "(couldn't fetch)"
+  fi
+  unset _stats
 
   # Relay notes — drain any unprocessed workspace/relay/*.md files written by
   # the proactive-loop (step 7) or /relay skill. These carry cross-session

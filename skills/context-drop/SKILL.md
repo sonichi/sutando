@@ -1,6 +1,6 @@
 # Context-Drop AX-Read
 
-Tiny Swift CLI that reads the focused app's text selection via the macOS Accessibility API. Sutando.app's ⌃C "drop context" hotkey shells out to this binary to capture what you have highlighted.
+Tiny Swift CLI that reads the focused app's text selection via the macOS Accessibility API. Sutando.app's "drop context" action (hotkey configurable via `state/hotkeys.json`) shells out to this binary to capture what you have highlighted.
 
 ## What it does
 
@@ -23,7 +23,7 @@ The Cmd+C fallback uses `NSPasteboard.changeCount` to distinguish "Cmd+C actuall
 bash skills/context-drop/build.sh
 ```
 
-Produces `skills/context-drop/ax-read`. `src/startup.sh` runs this automatically when the binary is missing or older than the source.
+Produces `skills/context-drop/ax-read`. The headless core's `src/startup.sh` does not build app-only helpers; compile this binary explicitly as part of the optional menu-bar app setup (or let the app packaging workflow build it).
 
 ## Why a separate binary instead of inlining in Sutando.app
 

@@ -67,15 +67,58 @@ class TestCheckCoreSupervisor(unittest.TestCase):
 
     def test_degraded_states_warn(self):
         with tempfile.TemporaryDirectory() as td:
-            for st in ("crashed", "hung", "gateway-down"):
+            for st in ("crashed", "hung"):
                 r = self._run(td, json.dumps({"state": st}))
                 self.assertEqual(r["status"], "warn", st)
                 self.assertIn("degraded", r["detail"])
+
+    def test_gateway_down_warns_WHEN_THE_GATEWAY_IS_CONFIGURED(self):
+        """The half that must keep warning: a configured gateway that is not running
+        really does mean undelivered mobile messages."""
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(hc, "_gateway_configured", return_value=True):
+                r = self._run(td, json.dumps({"state": "gateway-down"}))
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("degraded", r["detail"])
+
+    def test_gateway_down_is_OK_when_no_gateway_is_configured(self):
+        """A Sutando-only host never launches the bridge — startup.sh is
+        "deliberately silent when unconfigured" — so its absence is the designed
+        state, not a degradation. Warning here gave every such install a permanent
+        warn it could not clear, and check_gateway_bridge() already returns None
+        for exactly this case; the two probes disagreed."""
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(hc, "_gateway_configured", return_value=False):
+                r = self._run(td, json.dumps({"state": "gateway-down"}))
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn("degraded", r["detail"])
+        self.assertIn("not configured", r["detail"])
 
     def test_healthy_states_ok(self):
         with tempfile.TemporaryDirectory() as td:
             for st in ("running", "idle-ready", "blocked-known"):
                 self.assertEqual(self._run(td, json.dumps({"state": st}))["status"], "ok", st)
+
+    def test_default_restart_selects_provider_specific_model_env(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = pathlib.Path(td)
+            script = repo / "src" / "agent" / "start-cli.sh"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/bash\n")
+
+            for runtime, expects_model in (("claude", True), ("codex", False)):
+                captured = {}
+
+                def run(*args, **kwargs):
+                    captured.update(kwargs["env"])
+                    return mock.Mock(returncode=0)
+
+                with mock.patch.object(hc, "REPO_DIR", repo), \
+                     mock.patch.object(hc, "_resolve_launch_env", return_value={"PATH": "/bin"}), \
+                     mock.patch.object(hc, "resolve_core_runtime", return_value=runtime), \
+                     mock.patch.object(hc.subprocess, "run", side_effect=run):
+                    self.assertTrue(hc._default_core_restart(standard_context=True))
+                self.assertEqual(captured.get("SUTANDO_CORE_MODEL") == "opus", expects_model)
 
 
 if __name__ == "__main__":

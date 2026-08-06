@@ -10,7 +10,7 @@ import ApplicationServices
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     // Hotkeys are configurable via ~/.config/sutando/hotkeys.json.
-    // Defaults: drop_context=⌃C, drop_screenshot=⌃S, toggle_voice=⌃V, toggle_mute=⌃M
+    // Hotkey defaults are published in state/hotkeys.json (see PR #1920/#1924).
     var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
     var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
     var lastDropTime: Date = .distantPast
@@ -23,10 +23,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // fallback). The Swift loader twin lives at
     // src/Sutando/SutandoConfig.swift and matches src/sutando_config.{py,ts}
     // byte-for-byte. Resolution order:
-    //   1. $SUTANDO_WORKSPACE env var (legacy escape hatch; warn once)
-    //   2. sutando.config.local.json -> workspace.path (per-clone override)
-    //   3. sutando.config.json -> workspace.path (tracked defaults)
-    //   4. ${REPO_DIR}/workspace baked-in default
+    //   1. sutando.config.local.json -> workspace.path (per-clone override)
+    //   2. sutando.config.json -> workspace.path (tracked defaults)
+    //   3. ${REPO_DIR}/workspace baked-in default
+    // $SUTANDO_WORKSPACE is NOT in the order — removed in v0.8; a set env var
+    // only warns. This comment claims to match sutando_config.{py,ts}
+    // byte-for-byte, so it has to track that removal too.
     //
     // Pre-#762 main.swift wrote tasks/logs/state under the repo checkout via
     // CLAUDE.md walk-up. Post-#762 that dir no longer exists, so writeTask
@@ -226,7 +228,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// enough — a missed notification left no way to tell whether the
     /// recorder was still rolling.
     func setRecordingIndicator(_ on: Bool) {
+        // Keep the ⌃R toggle state in lockstep with the indicator so a recording
+        // started/stopped externally (observed via the Darwin notification) also
+        // updates behavioral state — otherwise the next ⌃R mis-computes `starting`
+        // and needs a double-press to stop. Written on the main queue alongside the
+        // menu update so notification callbacks never touch it off-main. (CR: john-the-dev)
         DispatchQueue.main.async {
+            self.isRecordingVideo = on
             guard let item = self.videoClipMenuItem else { return }
             let glyph = (item.representedObject as? String) ?? ""
             // Same leading-marker convention as the Mode rows (● = active):
@@ -234,6 +242,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             item.title = on ? "🔴 Drop Video Clip — recording… \(glyph)"
                             : "Drop Video Clip \(glyph)"
         }
+    }
+
+    /// Darwin-notification observers for recording state (push, not poll).
+    /// The capture server posts com.sutando.recording.on/.off via notifyutil
+    /// whenever recording starts or stops, whoever started it.
+    func registerRecordingStateObservers() {
+        let dn = CFNotificationCenterGetDarwinNotifyCenter()
+        let me = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(dn, me, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            Unmanaged<AppDelegate>.fromOpaque(observer).takeUnretainedValue().setRecordingIndicator(true)
+        }, "com.sutando.recording.on" as CFString, nil, .deliverImmediately)
+        CFNotificationCenterAddObserver(dn, me, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            Unmanaged<AppDelegate>.fromOpaque(observer).takeUnretainedValue().setRecordingIndicator(false)
+        }, "com.sutando.recording.off" as CFString, nil, .deliverImmediately)
     }
 
     func setupMenuBar() {
@@ -321,6 +345,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Force Restart Core CLI", action: #selector(forceRestartCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Stop Core CLI", action: #selector(stopCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Restart Sutando App", action: #selector(restartSelf), keyEquivalent: ""))
@@ -352,6 +378,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.checkWatcher()
         }
 
+        // Recording-indicator sync (Susan 2026-07-22, push not poll): the
+        // capture server Darwin-notifies com.sutando.recording.on/.off on
+        // every state change (⌃R, watcher-started sessions, watchdog
+        // auto-stop) — observe those and mirror onto the Drop Video Clip row.
+        registerRecordingStateObservers()
+
         // Contextual chips: every 120s, refresh contextual-chips.json from
         // cheap mechanical sources (open PRs, top pending question, recent
         // results). No LLM round-trip. Replaces the (never-shipped) draft
@@ -382,6 +414,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // rather than waiting 30min.
         DispatchQueue.global(qos: .background).async { [weak self] in
             self?.runHealthCheck()
+        }
+
+        // Easy-restart intent poller (sonichi#2401): every 5s, consume
+        // <workspace>/state/core-restart-requested.json (written by a bridge
+        // on the owner's "restart core" / "stop core" chat command — bridges
+        // survive core death, which is exactly when this matters) and run the
+        // action HERE, in the GUI login session, so the relaunch comes up
+        // authenticated (no SSH keychain wall — the 2026-07-29 outage class).
+        // Human-triggered only: nothing writes this file autonomously, and a
+        // consumed "stop" has no auto-restart anywhere. Consume-before-act +
+        // 10-min staleness drop mirror core_restart_intent.py exactly.
+        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.pollRestartIntent()
         }
 
         // Presenter mode: poll iclr-highlight server for on/off state.
@@ -558,8 +603,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // apart, so the throttle never gated. Flood-protection is now solely
         // the watcherKeystrokesQueued() check above + the Timer interval.)
 
-        // If Claude Code is running inside the `sutando-core` tmux session
-        // (launch via src/agent/claude/cli/start-cli.sh), send the word `watcher` to
+        // If the core CLI is running inside the `sutando-core` tmux session
+        // (launch via src/agent/start-cli.sh), send the word `watcher` to
         // its pane as if Chi typed it. The CLI parses that as a restart
         // prompt and starts the watcher via its own run_in_background Bash
         // — so the watcher's stdout routes through the task-notification
@@ -573,7 +618,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Fallback: Claude Code isn't in the expected tmux session.
         // Notify so Chi can restart manually.
-        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via src/agent/claude/cli/start-cli.sh)")
+        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via src/agent/start-cli.sh)")
         logToFile("watcher dead; notification fired (tmux session not found)")
     }
 
@@ -584,7 +629,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// per-host paths from the scutil-named Chis-MacBook-Pro subtree; #1745).
     func perHostLabel() -> String {
         let env = ProcessInfo.processInfo.environment
-        if let v = env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"], !v.isEmpty {
+        // `!v.isEmpty` is false for "   ", so a blank-but-set override became the
+        // label and produced `hosts/   /`. Trim first; blank means unset, same as
+        // the scutil branch below already does. Lockstep with util_paths.py/.ts.
+        if let v = (env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
             return v
         }
         if let lhn = runShell("/usr/sbin/scutil", ["--get", "LocalHostName"])?
@@ -1651,6 +1700,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = URL(string: "http://localhost:7845/capture") else { return }
         var req = URLRequest(url: url)
         req.timeoutInterval = 5
+        // /capture requires a shared token (same gate as /capture-video).
+        let tokenPath = NSString(string: "~/.config/sutando/screen-capture-token").expandingTildeInPath
+        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            req.setValue(token, forHTTPHeaderField: "X-Sutando-Capture-Token")
+        }
         URLSession.shared.dataTask(with: req) { [self] data, _, error in
             if let error = error {
                 notify("Sutando", "Screenshot drop failed: \(error.localizedDescription)")
@@ -1700,7 +1754,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let action = starting ? "start" : "stop"
         notify("Sutando", starting ? "● Recording screen + mic — press ⌃⇧R again to stop" : "Stopping recording…")
 
-        guard let url = URL(string: "http://localhost:7845/capture-video?action=\(action)") else { return }
+        // User-stopped recordings get the server's 4h cap, not the 600s default (#2279 added ?max; this caller never sent it).
+        let maxParam = starting ? "&max=14400" : ""
+        guard let url = URL(string: "http://localhost:7845/capture-video?action=\(action)\(maxParam)") else { return }
         var req = URLRequest(url: url)
         // /capture-video requires a shared token (the server writes it to a 0600
         // file a web page can't read; a browser also can't set a custom header on
@@ -1728,7 +1784,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if starting {
                 // Recording began — flip state; nothing to drop until stop.
                 if status == "recording" || status == "already_recording" {
-                    isRecordingVideo = true
                     setRecordingIndicator(true)
                     appendLog(logFile, "[\(timestamp)] dropVideoClip: recording started")
                 } else {
@@ -1738,7 +1793,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             // Stopping — flip state and drop the produced clip.
-            isRecordingVideo = false
             setRecordingIndicator(false)
             guard status == "ok", let path = json["path"] as? String else {
                 notify("Sutando", "Recording stopped, no clip (\(status))")
@@ -1832,20 +1886,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openCore() {
-        // Activate Terminal running Claude Code
-        let script = NSAppleScript(source: """
-        tell application "Terminal"
-            activate
-            -- Find the window running claude
-            repeat with w in windows
-                if name of w contains "claude" or name of w contains "sutando" then
-                    set index of w to 1
-                    exit repeat
-                end if
-            end repeat
-        end tell
-        """)
-        script?.executeAndReturnError(nil)
+        // Open a Terminal window ATTACHED to the core tmux session via a
+        // generated .command file + `open -a Terminal` — the TCC-free path
+        // (sonichi#2410). The old AppleScript raise-by-title was a no-op with
+        // the core detached (no window to find, title never matched, and it
+        // required an Automation grant most installs never made).
+        let socket = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SOCKET"] ?? "/tmp/sutando-tmux.sock"
+        let session = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SESSION"] ?? "sutando-core"
+        let cmdPath = workspace + "/state/attach-core.command"
+        let body = """
+        #!/bin/bash
+        # Auto-generated by Sutando.app Open Core CLI (sonichi#2410) — attaches
+        # this Terminal window to the core session. Safe to re-run; delete freely.
+        exec tmux -S '\(socket)' attach -t '\(session)'
+        """
+        do {
+            try FileManager.default.createDirectory(atPath: workspace + "/state",
+                                                    withIntermediateDirectories: true)
+            try body.write(toFile: cmdPath, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cmdPath)
+        } catch {
+            notify("Sutando", "Open Core CLI failed to prepare attach script: \(error.localizedDescription)")
+            return
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        proc.arguments = ["-a", "Terminal", cmdPath]
+        do { try proc.run() } catch {
+            notify("Sutando", "Open Core CLI failed to open Terminal: \(error.localizedDescription)")
+        }
     }
 
     @objc func openDashboard() {
@@ -2392,8 +2461,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Restart the Claude Code core session (sutando-core tmux session).
-    /// Invokes src/agent/claude/cli/start-cli.sh --restart which kills any existing
+    /// Restart the selected core CLI session (sutando-core tmux session).
+    /// Invokes src/agent/start-cli.sh --restart which kills any existing
     /// session and starts fresh detached. User can re-attach via
     /// "Open Core CLI" in the menu (or `tmux -S /tmp/sutando-tmux.sock
     /// attach -t sutando-core` from a terminal).
@@ -2407,13 +2476,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// self-invocation is not.
     ///
     /// Per Chi 2026-05-05: voice-agent restart explicitly excluded —
-    /// this only restarts the Claude Code CLI session.
+    /// this only restarts the selected core CLI session.
     @objc func restartCore() {
         notify("Sutando", "Restarting Core CLI…")
-        let script = repoRoot + "/src/agent/claude/cli/start-cli.sh"
+        let script = repoRoot + "/src/agent/start-cli.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [script, "--restart"]
+        proc.arguments = [script, "--restart", "--visible"]
         // Capture stderr so we can surface failures via notify rather than
         // silently swallowing (per Mini's #608 review nit #1). stdout still
         // discarded — script's success messages aren't useful to the user.
@@ -2436,6 +2505,91 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let preview = String(errStr.prefix(200))
                 self?.notify("Sutando", "Core restart failed (exit \(proc.terminationStatus)): \(preview)")
             }
+        }
+    }
+
+    /// Force-restart the core CLI: SIGTERM → SIGKILL escalation for a wedged /
+    /// unresponsive core that plain "Restart Core CLI" (graceful) refuses to
+    /// hammer. Separate menu item per sonichi's review — the default restart
+    /// never SIGKILLs a possibly-mid-task core; this one does, explicitly.
+    /// Same detached-bash + stderr-on-failure contract as restartCore.
+    @objc func forceRestartCore() {
+        notify("Sutando", "Force-restarting Core CLI…")
+        runCoreAction(script: repoRoot + "/src/agent/start-cli.sh", args: ["--force-restart"],
+                      okMessage: "Core force-restarted. Attach via Open Core CLI in menu.",
+                      failVerb: "Core force-restart")
+    }
+
+    /// Stop ONLY the core CLI session (sonichi#2401 "stop means stop"):
+    /// bridges and services keep running, and nothing relaunches the core
+    /// until the user asks (menu or chat command).
+    @objc func stopCore() {
+        notify("Sutando", "Stopping Core CLI…")
+        runCoreAction(script: repoRoot + "/src/agent/stop-core.sh", args: [],
+                      okMessage: "Core stopped. It stays stopped until you restart it.",
+                      failVerb: "Core stop")
+    }
+
+    /// Shared runner for core start/stop scripts: detached bash, stderr
+    /// surfaced via notify on failure (same contract as restartCore).
+    private func runCoreAction(script: String, args: [String],
+                               okMessage: String, failVerb: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script] + args
+        let errPipe = Pipe()
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = errPipe
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                try proc.run()
+            } catch {
+                self?.notify("Sutando", "\(failVerb) failed to start: \(error.localizedDescription)")
+                return
+            }
+            proc.waitUntilExit()
+            if proc.terminationStatus == 0 {
+                self?.notify("Sutando", okMessage)
+            } else {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8) ?? ""
+                let preview = String(errStr.prefix(200))
+                self?.notify("Sutando", "\(failVerb) failed (exit \(proc.terminationStatus)): \(preview)")
+            }
+        }
+    }
+
+    /// Consume <workspace>/state/core-restart-requested.json and perform the
+    /// requested action in THIS (GUI) session. Mirrors core_restart_intent.py:
+    /// delete-before-act, unknown/malformed/stale (>600s) intents dropped —
+    /// and the delete must SUCCEED before any dispatch: an undeletable file
+    /// would re-fire the same action every 5s poll, so fail closed instead
+    /// (qingyun review, #2408).
+    func pollRestartIntent() {
+        let path = workspace + "/state/core-restart-requested.json"
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        let raw = try? String(contentsOfFile: path, encoding: .utf8)
+        do {
+            try FileManager.default.removeItem(atPath: path)  // consume FIRST
+        } catch {
+            notify("Sutando", "Restart request file couldn't be consumed — NOT acting (would loop). Remove it manually: \(path)")
+            return
+        }
+        guard let raw = raw,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let action = obj["action"] as? String,
+              let requestedAt = obj["requested_at"] as? Double,
+              Date().timeIntervalSince1970 - requestedAt <= 600 else { return }
+        switch action {
+        case "restart":
+            notify("Sutando", "Chat-requested core restart — relaunching…")
+            restartCore()
+        case "stop":
+            notify("Sutando", "Chat-requested core stop.")
+            stopCore()
+        default:
+            return
         }
     }
 

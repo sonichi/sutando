@@ -5,7 +5,9 @@ Guards the DHCP-hostname-drift fix: a drifting `hostname` must not override the
 stable Bonjour LocalHostName on macOS. Run:
   python3 tests/host-label-scutil.test.py
 """
-import os, sys, unittest
+import os
+import sys
+import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 

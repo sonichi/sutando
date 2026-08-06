@@ -48,7 +48,7 @@ export async function resolveVoiceEndpoint(
 ): Promise<VoiceEndpoint | null> {
 	const timeoutMs = opts.timeoutMs ?? 2500;
 	for (const ep of candidates) {
-		let ok = false;
+		let ok: boolean;
 		try {
 			ok = await withTimeout(opts.probe(ep.url), timeoutMs);
 		} catch {

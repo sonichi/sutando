@@ -26,6 +26,7 @@ observer; it starts nothing and kills nothing.
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -41,6 +42,119 @@ TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
 # core-heartbeat ~90s); 90s tolerates a normal long step between status writes
 # while still catching a genuinely wedged loop (stale for far longer).
 STALE_STATUS_SECONDS = 90
+
+# The per-host core heartbeat (state/cores/<host>.alive) is rewritten every ~30s
+# by a SEPARATE process (src/core_heartbeat.py); >90s means it stopped beating.
+# Matches the documented staleness threshold every other reader of that file uses.
+HEARTBEAT_STALE_SECONDS = 90
+
+# ── Severity layer (design: docs/design-core-health-verdict.md) ──────────────
+# One authoritative, severity-tagged verdict every consumer reads, so "report
+# vs restart" is decided in ONE place instead of re-derived per consumer. This
+# is additive: derive()'s existing `health`/`detail` keys are unchanged; the
+# severity + signals + the gate are layered on top.
+#
+#   ok        working | idle           → no action
+#   escalate  needs_login              → tell the human; NEVER auto-restart
+#   critical  unknown(wedged) | offline→ restart, but only through severity_gate
+#   warn      (reserved: 'degraded' soft-warnings folded in a later slice)
+_SEVERITY = {
+    "working": "ok",
+    "idle": "ok",
+    "degraded": "warn",
+    "needs_login": "escalate",
+    "unknown": "critical",   # status-stale wedge
+    "offline": "critical",   # process/session gone
+}
+
+
+def severity_of(health):
+    """Map a derive() health state to its severity bucket. Unknown states are
+    treated as `critical` (fail toward noticing, not toward silence)."""
+    return _SEVERITY.get(health, "critical")
+
+
+def _host_label_safe():
+    try:
+        from util_paths import _host_label
+        return _host_label()
+    except Exception:
+        try:
+            return socket.gethostname().split(".")[0]
+        except OSError:
+            return None
+
+
+def _heartbeat_fresh(workspace):
+    """Independent liveness signal: the per-host core heartbeat
+    `<ws>/state/cores/<host>.alive`, rewritten every ~30s by a SEPARATE process
+    (src/core_heartbeat.py). Returns:
+        True   beating (mtime within HEARTBEAT_STALE_SECONDS) — core is alive
+        False  missing or stale — core stopped beating (dead)
+        None   host/path can't be resolved — can't tell (never a down-vote)
+
+    This is the process-INDEPENDENT corroborator the gate needs (qingyun CR on
+    #2527): a genuinely offline core stops beating (process=False AND
+    heartbeat=False → 2 votes → act), while a single mis-probe (e.g. bad PATH
+    making the pgrep read False on a live core) still beats (heartbeat fresh →
+    1 vote → report), so a lingering gateway can no longer make a dead core
+    unrecoverable, and a mis-probe still can't kill a live one.
+
+    The orphan-writer risk (a dead core leaving a fresh heartbeat because the
+    standalone core_heartbeat.py sidecar kept running) is resolved at the SOURCE:
+    core_heartbeat.py now binds to the core's tmux session and stops beating
+    (unlinking .alive) once the session it saw has gone away — so a fresh .alive
+    genuinely means the core lived within the window (qingyun CR on #2527, 2nd
+    P1)."""
+    host = _host_label_safe()
+    if not host:
+        return None
+    try:
+        p = os.path.join(workspace, "state", "cores", f"{host}.alive")
+        return (time.time() - os.path.getmtime(p)) <= HEARTBEAT_STALE_SECONDS
+    except OSError:
+        return False  # missing/unreadable .alive == not beating
+
+
+def severity_gate(verdict, *, confirm_min=2, freshly_booted=False):
+    """The ONE place that turns a verdict into an action. Returns one of:
+
+        none      severity ok — nothing to do
+        report    a soft (warn) issue — surface it, do not touch the core
+        escalate  a human-only blocker (needs_login) — notify the human, NEVER
+                  auto-restart (no seed/restart can clear a real /login)
+        act       restart is warranted — ONLY for a `critical` verdict that has
+                  (a) persisted >= confirm_min cycles, (b) >= 2 independent live
+                  signals agreeing it is down, and (c) is not freshly booted.
+                  Anything short of all three downgrades to `report` so a merely
+                  slow / idle / mis-probed (but alive) core is never killed.
+
+    This is the structural form of the owner's rule (2026-08-02): report health
+    issues, restart only when critical AND confirmed."""
+    sev = verdict.get("severity") or severity_of(verdict.get("health", ""))
+    if sev == "ok":
+        return "none"
+    if sev == "warn":
+        return "report"
+    if sev == "escalate":
+        return "escalate"
+    # critical
+    confirm = int(verdict.get("confirm") or 0)
+    signals = verdict.get("signals") or {}
+    # Corroboration: count the independent signals that positively indicate the
+    # core is NOT usefully alive. A single wrong probe (bad PATH, idle→unknown)
+    # must not be enough on its own — generalizes #2404's compound gate.
+    # `heartbeat_fresh` is process-independent (a separate writer), so a truly
+    # offline core (process=False AND heartbeat=False) clears the >=2 bar while a
+    # lone mis-probe on a still-beating core does not (qingyun CR on #2527).
+    down_votes = sum(1 for k in ("process", "status_fresh", "gateway", "heartbeat_fresh")
+                     if signals.get(k) is False)
+    if freshly_booted:
+        return "report"
+    if confirm >= confirm_min and down_votes >= 2:
+        return "act"
+    return "report"
+
 
 # Markers that mean the bundled claude CLI is sitting at its auth prompt and the
 # core therefore cannot act. Kept broad on purpose — the failure mode is a user
@@ -58,28 +172,75 @@ _LOGIN_MARKERS = (
 
 
 def _run(cmd):
-    """Run a command, returning (rc, stdout). Never raises."""
+    """Run a command, returning (rc, stdout). Never raises.
+
+    rc is None when the command could not be EXECUTED at all (binary missing,
+    broken PATH, timeout) — distinct from a command that ran and returned
+    non-zero. Callers must treat None as "unknown", never as a positive
+    negative observation (qingyun CR on #2527): collapsing an unexecutable probe
+    to a False "down" reading let a correlated probe outage masquerade as a dead
+    core."""
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
         return p.returncode, p.stdout
     except (OSError, subprocess.SubprocessError):
-        return 127, ""
+        return None, ""
 
 
 def _core_running():
-    # has-session returns non-zero (and _run yields 127 if tmux is absent), so a
-    # missing tmux or socket degrades cleanly to "not running".
+    # rc None = the probe itself could not run (tmux absent / PATH broken) → that
+    # is UNKNOWN, not "not running". A real has-session miss returns rc 1, which
+    # stays False. (qingyun CR on #2527: probe-unavailable must not be a down-vote.)
     rc, _ = _run(["tmux", "-S", TMUX_SOCKET, "has-session", "-t", SESSION])
+    if rc is None:
+        return None
     return rc == 0
 
 
+def _gateway_configured():
+    """Whether the ag2.space mobile gateway is provisioned on THIS host.
+
+    The gateway bridge only runs where a remote task token is configured (env or
+    channels/ag2space/.env). Returns True (configured), False (config readable,
+    no token), or None (can't tell — no CLAUDE_CONFIG_DIR / unreadable .env).
+    Mirrors health-check.check_gateway_bridge's detection."""
+    if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
+        return True
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg:
+        return None
+    try:
+        with open(os.path.join(cfg, "channels", "ag2space", ".env")) as f:
+            for ln in f:
+                if ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN=")):
+                    return True
+    except OSError:
+        return None
+    return False
+
+
 def _gateway_running():
+    # A host with no gateway provisioned has `remote-gateway-bridge` CORRECTLY
+    # absent — that is not-applicable, never a down-vote. Only a *configured*
+    # gateway that is missing counts as down, or the gate would restart a
+    # perfectly live core just for lacking an optional component (bassil CR on
+    # #2527, mirroring health-check.check_gateway_bridge + the #2554 comm-sweep
+    # single-owner-lane fix). Not-configured / can't-tell -> None.
+    if _gateway_configured() is not True:
+        return None
     rc, _ = _run(["pgrep", "-f", "remote-gateway-bridge"])
     if rc == 0:
         return True
     # Fallback: a window named "gateway" in the core session.
-    rc, out = _run(["tmux", "-S", TMUX_SOCKET, "list-windows", "-t", SESSION, "-F", "#{window_name}"])
-    return rc == 0 and any(w.strip() == "gateway" for w in out.splitlines())
+    rc2, out = _run(["tmux", "-S", TMUX_SOCKET, "list-windows", "-t", SESSION, "-F", "#{window_name}"])
+    if rc2 == 0 and any(w.strip() == "gateway" for w in out.splitlines()):
+        return True
+    # Neither probe confirmed the gateway. Only report "down" if at least one
+    # probe actually RAN; if BOTH were unavailable we cannot tell (None), so it is
+    # never counted as a down-vote (qingyun CR on #2527).
+    if rc is None and rc2 is None:
+        return None
+    return False
 
 
 def _pane_text():
@@ -129,15 +290,65 @@ def derive():
     core = _core_running()
     gateway = _gateway_running()
 
-    if not core:
+    # Raw signals, captured for the audited verdict. Defaults hold for the
+    # offline / unknown branches (core gone or unprobeable → status/login
+    # unknowable).
+    status_fresh = None
+    pane_login = False
+
+    if core is None:
+        # The process probe could not run (tmux/pgrep unavailable, broken PATH).
+        # This is NOT evidence the core is down — treat it as unknown and fail
+        # closed: no signal here is set False, so the gate sees zero down-votes
+        # from a correlated probe outage and can only report, never act
+        # (qingyun CR on #2527). Genuine down-signals from probes that DID run
+        # (e.g. a real gateway miss + stale heartbeat) still count normally.
+        health, authed, detail = "unknown", None, "Core liveness unknown (process probe unavailable)"
+    elif not core:
         health, authed, detail = "offline", None, "Agent is not running"
     else:
-        if needs_login(_pane_text()):
-            health, authed, detail = "needs_login", False, "Agent needs to sign in"
-        else:
-            status, ts = _core_status(workspace)
+        # Read the status FIRST. The login probe used to short-circuit ahead of
+        # this, so a false marker did not merely add noise — it REPLACED the
+        # wedged-core verdict, hiding the one signal that catches an
+        # unresponsive agent. That inverts the rationale stated above for
+        # tolerating false positives (#2456).
+        status, ts = _core_status(workspace)
+        stale = ts is not None and (time.time() - ts) > STALE_STATUS_SECONDS
+        # "Acting" needs POSITIVE evidence, not merely the absence of proof to
+        # the contrary. A missing `ts` cannot show freshness any more than it can
+        # show staleness (see the "no ts -> working (can't prove stale)" case),
+        # so it must NOT license overriding a login marker — that would be the
+        # same absence-of-evidence mistake in the other direction.
+        acting = status in ("running", "idle") and ts is not None and not stale
+        login = needs_login(_pane_text())
+        # status_fresh: True = advanced within the window, False = stale,
+        # None = no record to judge (can't prove either way).
+        status_fresh = None if ts is None else (not stale)
+        pane_login = login
+
+        if login and not acting:
+            # Marker AND no evidence of progress. A genuine sign-in prompt stops
+            # the loop, so a stale/unknown status is what a real one looks like —
+            # the two corroborate. Keep the staleness in the text so the wedge
+            # signal survives alongside the louder verdict rather than being
+            # erased by it.
+            health, authed = "needs_login", False
+            detail = "Agent needs to sign in"
+            if status == "running" and stale:
+                detail += " (status also stale — if the pane is clean, treat as possibly wedged)"
+        elif login and acting:
+            # The status says the agent advanced within the freshness window, so
+            # it is demonstrably acting. A sign-in prompt cannot be true at the
+            # same time; the marker is stale pane text or an unrelated log line.
+            # Reporting "needs to sign in" for a working agent is simply wrong,
+            # and the false-positive-is-cheap argument does not reach here — it
+            # was about an UNRESPONSIVE agent.
             authed = True
-            stale = ts is not None and (time.time() - ts) > STALE_STATUS_SECONDS
+            health = "working" if status == "running" else "idle"
+            detail = ("Agent is working" if status == "running" else "Agent is online and idle")
+            detail += " (login marker seen in pane but status is fresh — treating as a false positive)"
+        else:
+            authed = True
             if status == "running" and not stale:
                 health, detail = "working", "Agent is working"
             elif status == "running" and stale:
@@ -151,13 +362,44 @@ def derive():
 
     return {
         "health": health,
+        "severity": severity_of(health),
         "authenticated": authed,
         "core_running": core,
         "gateway_running": gateway,
         "tmux_socket": TMUX_SOCKET,
         "session": SESSION,
         "detail": detail,
+        # Raw inputs behind the verdict, so a wrong call is auditable instead of
+        # shipping as yet another "consumer disagreed" fix.
+        "signals": {
+            "process": core,
+            "gateway": gateway,
+            "status_fresh": status_fresh,
+            "pane_login": pane_login,
+            # Process-independent liveness (separate writer) — the offline
+            # corroborator that a lingering gateway can't fake (#2527 CR).
+            "heartbeat_fresh": _heartbeat_fresh(workspace),
+        },
     }
+
+
+def _confirm_count(state_dir, health, severity):
+    """How many consecutive cycles this (health, severity) has held, read from
+    the prior core-verdict.json. Powers the gate's persistence requirement so a
+    one-cycle blip can never reach `act`. Best-effort: any read failure resets to
+    a fresh count of 1 (fail toward re-confirming, not toward acting)."""
+    try:
+        with open(os.path.join(state_dir, "core-verdict.json")) as f:
+            prev = json.load(f)
+        # A malformed verdict (valid JSON but not an object — e.g. `[]`) must not
+        # crash the count: `.get` on a list raises AttributeError, which the
+        # OSError/ValueError guard below does NOT catch and would propagate out of
+        # main() (bassil CR on #2527). Non-dict -> treat as no prior, reset to 1.
+        if isinstance(prev, dict) and prev.get("health") == health and prev.get("severity") == severity:
+            return int(prev.get("confirm") or 0) + 1
+    except (OSError, ValueError):
+        pass
+    return 1
 
 
 def main():
@@ -171,6 +413,14 @@ def main():
         os.makedirs(state_dir, exist_ok=True)
         with open(os.path.join(state_dir, "runtime-health.json"), "w") as f:
             json.dump(result, f, indent=2)
+        # The authoritative verdict (design: docs/design-core-health-verdict.md):
+        # same facts as runtime-health.json plus the persistence count the gate
+        # needs. Additive — consumers migrate to this file one PR at a time.
+        verdict = dict(result)
+        verdict["ts"] = int(time.time())
+        verdict["confirm"] = _confirm_count(state_dir, result["health"], result["severity"])
+        with open(os.path.join(state_dir, "core-verdict.json"), "w") as f:
+            json.dump(verdict, f, indent=2)
     except OSError:
         pass
     print(json.dumps(result, indent=2))

@@ -208,6 +208,28 @@ def get_vault_key(key: str) -> str:
     return result.stdout.decode().strip()
 
 
+# Keys double as env-var names via the `env` verb / get_vault_key consumers, so
+# the public setter holds them to env-var-safe naming (the chat-interception
+# path has its own, looser matching + FP guards above).
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def set_vault_key(key: str, value: str) -> None:
+    """Store a secret in Keychain + manifest — the public, non-chat write path.
+
+    Same storage as the `vault set` chat interception (`security
+    add-generic-password -a sutando -s KEY -U` + manifest registration), for
+    callers that already hold the value programmatically (CLI `set` verb,
+    desktop Settings' BYO-key entry). Raises ValueError on an invalid key or
+    empty value; RuntimeError when the Keychain write fails.
+    """
+    if not _ENV_KEY_RE.match(key or ""):
+        raise ValueError(f"vault: invalid key name '{key}' (want [A-Za-z_][A-Za-z0-9_]*)")
+    if not value:
+        raise ValueError("vault: refusing to store an empty value")
+    _store_in_keychain(key, value)
+
+
 def intercept_vault_commands(text: str) -> InterceptResult:
     """Detect vault-set commands in `text`, store secrets, return sanitized text.
 
@@ -257,16 +279,30 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # pip-install (env mutation in a message handler) and no separate task:
                 # the refusal rides the normal task to core, channel context intact.
                 print(
-                    f"vault: detect-secrets not installed — refused unquoted "
-                    f"`vault set {key}` (can't validate). Core will install the dep; "
-                    f"quote the value to store immediately.",
+                    f"vault: detect-secrets not installed in {sys.executable} — refused "
+                    f"unquoted `vault set {key}` (can't validate). Quote the value to "
+                    f"store immediately; see the task text for the install command.",
                     flush=True,
                 )
                 failed.append(key)
+                # The install hint must name THIS interpreter (sys.executable),
+                # not a bare `python3`: the bridges are launched with whichever
+                # interpreter had their client library (see the probes in
+                # src/startup.sh), which is frequently NOT the `python3` first on
+                # PATH. Installing into the wrong one leaves the refusal in place
+                # and looks like the fix silently failed.
+                #
+                # The --break-system-packages fallback is required, not optional
+                # noise: on a stock Homebrew/macOS python both `pip install` AND
+                # `pip install --user` are refused by PEP 668, so the previous
+                # bare `python3 -m pip install detect-secrets` could not succeed
+                # on the most common Sutando host. Verified 2026-07-20.
                 return (
                     f"vault set {key} [vault: REFUSED — detect-secrets not installed, "
                     f"can't validate an unquoted value. AGENT: run "
-                    f"'python3 -m pip install detect-secrets', then tell the owner to "
+                    f"'{sys.executable} -m pip install detect-secrets' — if that fails "
+                    f"with 'externally-managed-environment' (PEP 668), retry the same "
+                    f"command with --break-system-packages. Then tell the owner to "
                     f"re-send this vault set (or quote the value next time). Never echo "
                     f"or ask for the value.]"
                 )
@@ -299,8 +335,12 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # entirely) to store it for real.
                 failed.append(key)
                 return (
-                    f"vault set {key} [vault: unrecognized value — NOT stored. "
-                    f"Resend quoted (e.g. vault set {key} \"value\") to store it.]"
+                    f"vault set {key} [vault: value not recognized as a secret, so it was "
+                    f"NOT STORED **and the text you sent has been discarded** — nothing was "
+                    f"kept anywhere, so you will need the value again. Resend it QUOTED: "
+                    f"vault set {key} \"value\" — quoting skips this classifier and "
+                    f"ATTEMPTS storage; you are stored only if the reply says "
+                    f"[STORED-IN-KEYCHAIN].]"
                 )
         try:
             _store_in_keychain(key, value)

@@ -62,6 +62,14 @@ class FakePopen:
         return 0
 
 
+class FailingStopProc:
+    def send_signal(self, sig):
+        pass
+
+    def wait(self, timeout=None):
+        raise RuntimeError("stop failed")
+
+
 class TestCaptureVideoRouting(unittest.TestCase):
     def setUp(self):
         self.mod = load_module()
@@ -83,10 +91,10 @@ class TestCaptureVideoRouting(unittest.TestCase):
         pp = mock.patch.object(self.mod.subprocess, "Popen", FakePopen)
         pp.start()
         self.addCleanup(pp.stop)
-        # Deterministic token so /capture-video auth is testable. Fresh module
-        # per test, so this assignment doesn't leak.
+        # Deterministic token so /capture and /capture-video auth is testable.
+        # Fresh module per test, so this assignment doesn't leak.
         self.token = "test-capture-token"
-        self.mod.CAPTURE_VIDEO_TOKEN = self.token
+        self.mod.CAPTURE_TOKEN = self.token
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.mod.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -113,7 +121,7 @@ class TestCaptureVideoRouting(unittest.TestCase):
 
     def test_capture_still_returns_png(self):
         # The screenshot branch still works for the plain /capture path.
-        status, body = self._get("/capture?silent=true")
+        status, body = self._get("/capture?silent=true", token=self.token)
         self.assertEqual(status, 200)
         self.assertTrue(body["path"].endswith(".png"),
                         f"/capture must return a .png, got {body['path']}")
@@ -157,6 +165,34 @@ class TestCaptureVideoRouting(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._get("/capture-video?action=start&silent=true", token="wrong-token")
         self.assertEqual(ctx.exception.code, 403)
+        ctx.exception.close()
+
+    def test_toggle_start_failure_uses_json_error_contract(self):
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=RuntimeError("start failed")):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._get("/capture-video?action=start&silent=true", token=self.token)
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertEqual(ctx.exception.headers.get_content_type(), "application/json")
+        self.assertEqual(
+            json.loads(ctx.exception.read()),
+            {"status": "error", "error": "start failed"},
+        )
+        ctx.exception.close()
+
+    def test_toggle_stop_failure_uses_json_error_contract(self):
+        self.mod._active_recording = {
+            "proc": FailingStopProc(),
+            "path": "/unused/failed-recording.mov",
+            "watchdog": None,
+        }
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/capture-video?action=stop&silent=true", token=self.token)
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertEqual(ctx.exception.headers.get_content_type(), "application/json")
+        self.assertEqual(
+            json.loads(ctx.exception.read()),
+            {"status": "error", "error": "stop failed"},
+        )
         ctx.exception.close()
 
     def test_routing_guard_present_in_source(self):

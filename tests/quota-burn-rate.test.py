@@ -7,7 +7,9 @@ Run: python3 tests/quota-burn-rate.test.py
 Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -157,6 +159,56 @@ class TestUpdateBurnRate(unittest.TestCase):
             round(result["estimated_passes_left"] * 5),
             delta=1,
         )
+
+
+class TestStalenessGuard(unittest.TestCase):
+    """PR #2154: read-quota.py flags quota-state.json older than 30 min as stale
+    (the proxy rewrites it on every response, so an old mtime = not current — a
+    confident 4-day-old reading once drove a full day of budget calls)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="quota-stale-test-"))
+        self.mod = _load_module(self.tmp)
+        self.quota_file = self.tmp / "state" / "quota-state.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _set_age(self, seconds: float):
+        t = time.time() - seconds
+        os.utime(self.quota_file, (t, t))
+
+    def _run(self, argv):
+        buf = io.StringIO()
+        with patch.object(sys, "argv", argv), contextlib.redirect_stdout(buf):
+            try:
+                self.mod.main()
+            except SystemExit:
+                pass
+        return buf.getvalue()
+
+    def test_stale_file_flagged_in_json(self):
+        self._set_age(2 * 3600)  # 2h old → stale
+        out = json.loads(self._run(["read-quota.py", "--json"]))
+        self.assertTrue(out["stale"])
+        self.assertGreaterEqual(out["state_age_seconds"], 3600)
+
+    def test_fresh_file_not_stale(self):
+        self._set_age(60)  # 1 min old → fresh
+        out = json.loads(self._run(["read-quota.py", "--json"]))
+        self.assertFalse(out["stale"])
+        self.assertLess(out["state_age_seconds"], 30 * 60)
+
+    def test_stale_warning_in_human_output(self):
+        self._set_age(3 * 3600)  # 3h old
+        out = self._run(["read-quota.py"])
+        self.assertIn("STALE", out)
+        self.assertIn("historical", out)
+
+    def test_fresh_no_warning(self):
+        self._set_age(10)
+        out = self._run(["read-quota.py"])
+        self.assertNotIn("STALE", out)
 
 
 if __name__ == "__main__":
