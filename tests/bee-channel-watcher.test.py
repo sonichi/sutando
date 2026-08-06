@@ -157,6 +157,37 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertEqual(_Server.last_event_id_seen[0], None)
         self.assertEqual(_Server.last_event_id_seen[1], "f:9/x")
 
+    def test_local_sink_writes_task_file_no_broker(self):
+        # BEE_SINK=local (the fully-OSS mode): events land as task FILES on
+        # the local file bridge — atomic, well-formed headers, idempotent on
+        # redelivery — and the broker is never contacted.
+        import types
+        wsmod = types.ModuleType("workspace_default")
+        wsdir = Path(self.tmp.name) / "localws"
+        wsmod.resolve_workspace = lambda: str(wsdir)
+        cfg = {**self.cfg, "BEE_SINK": "local",
+               "BEE_BROKER_URL": "", "BEE_BROKER_TOKEN": ""}
+        with patch.dict(sys.modules, {"workspace_default": wsmod}):
+            rc = self.mod.run(cfg, once=True)
+            rc2 = self.mod.run(cfg, once=True)      # redelivery: same files
+        self.assertEqual((rc, rc2), (0, 0))
+        self.assertEqual(_Server.ingested, [])       # broker untouched
+        files = sorted((wsdir / "tasks").glob("task-bee-*.txt"))
+        self.assertEqual(len(files), 2)              # 2 wanted events, deduped
+        body = files[0].read_text()
+        for needle in ("id: task-bee-todo-created-t1", "source: bee",
+                       "access_tier: owner", "priority: low",
+                       "task: [Bee todo-created] buy milk", "channel_id: c9"):
+            self.assertIn(needle, body)
+        self.assertFalse(list((wsdir / "tasks").glob("*.tmp")))
+
+    def test_local_sink_needs_no_broker_config(self):
+        with patch.object(sys, "argv",
+                          ["bee_watcher.py", "--once", "--bee-sink", "local"]):
+            # proxy URL still required — exit 2 names ONLY the proxy
+            rc = self.mod.main()
+        self.assertEqual(rc, 2)
+
     def test_unconfigured_exits_2_not_crash(self):
         with patch.object(sys, "argv", ["bee_watcher.py"]):
             rc = self.mod.main()

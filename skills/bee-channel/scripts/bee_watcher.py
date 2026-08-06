@@ -27,6 +27,14 @@ per skills/MANIFEST.md read precedence):
                     (`vault set BEE_BROKER_TOKEN …`); env accepted.
   BEE_AGENT_ID      relay agent whose queue receives Bee tasks (dedicated
                     lane identity, same pattern as TEAMS_AGENT_ID).
+  BEE_SINK          broker (default) | local. LOCAL is the fully-OSS mode
+                    (owner question 2026-08-06: "the user does not need to
+                    depend on ag2space's relay?"): events are written as
+                    task FILES into <workspace>/tasks/ — the same file
+                    bridge voice/Discord use — and the local core processes
+                    them; replies go out through the owner's existing
+                    channels. No broker URL/token needed. The relay adds
+                    hosted fan-in + the Bee DM room, not a dependency.
 
 Cursor: last delivered SSE event id persists to
 <workspace>/state/bee-watcher-cursor.json and is replayed as Last-Event-ID on
@@ -69,7 +77,8 @@ def _config(cli: argparse.Namespace) -> dict:
         manifest = {}
     cfg = {}
     for key in ("BEE_PROXY_URL", "BEE_EVENTS_PATH", "BEE_EVENT_TYPES",
-                "BEE_BROKER_URL", "BEE_BROKER_TOKEN", "BEE_AGENT_ID"):
+                "BEE_BROKER_URL", "BEE_BROKER_TOKEN", "BEE_AGENT_ID",
+                "BEE_SINK"):
         cli_val = getattr(cli, key.lower(), None)
         cfg[key] = (cli_val if cli_val not in (None, "")
                     else os.environ.get(key, "").strip() or str(manifest.get(key, "")))
@@ -146,6 +155,31 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
     }
 
 
+def _write_local_task(task: dict) -> bool:
+    """LOCAL sink: persist the event as a task file on the same file bridge
+    every local channel uses (atomic tmp+rename so the stream watcher never
+    sees a partial file). access_tier owner: the events come from the
+    OWNER's own device and feed the owner's own core — same trust stance as
+    voice tasks. priority low: ambient wearable events shouldn't preempt
+    direct asks."""
+    from workspace_default import resolve_workspace
+    import datetime
+    tasks_dir = Path(resolve_workspace()) / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [f"id: {task['id']}", f"timestamp: {ts}", f"task: {task['task']}",
+             "source: bee", "interaction_type: message",
+             f"channel_id: {task['channel_id']}", f"user_id: {task['user_id']}",
+             "room_name: Bee", "priority: low", "access_tier: owner"]
+    dest = tasks_dir / f"{task['id']}.txt"
+    if dest.exists():
+        return True                     # same event redelivered — idempotent
+    tmp = dest.with_suffix(".txt.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, dest)
+    return True
+
+
 def _post_task(cfg: dict, task: dict) -> bool:
     req = urllib.request.Request(
         cfg["BEE_BROKER_URL"].rstrip("/") + "/v1/ingest",
@@ -210,7 +244,9 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
                     except ValueError:
                         data = {"text": data_raw}
                     task = event_to_task(etype, eid or data_raw, data)
-                    if not _post_task(cfg, task):
+                    _deliver = (_write_local_task if cfg.get("BEE_SINK") == "local"
+                                else lambda t: _post_task(cfg, t))
+                    if not _deliver(task):
                         # Contiguous-prefix cursor discipline (review P1
                         # 2026-08-06): a failed delivery HALTS the stream.
                         # Processing a later event would advance the cursor
@@ -239,15 +275,17 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     for key in ("bee_proxy_url", "bee_events_path", "bee_event_types",
-                "bee_broker_url", "bee_broker_token", "bee_agent_id"):
+                "bee_broker_url", "bee_broker_token", "bee_agent_id",
+                "bee_sink"):
         ap.add_argument(f"--{key.replace('_', '-')}", dest=key)
     ap.add_argument("--once", action="store_true",
                     help="process one stream connection, then exit (tests)")
     ap.add_argument("--max-events", type=int, default=0)
     args = ap.parse_args()
     cfg = _config(args)
-    missing = [k for k in ("BEE_PROXY_URL", "BEE_BROKER_URL", "BEE_BROKER_TOKEN")
-               if not cfg[k]]
+    required = (("BEE_PROXY_URL",) if cfg.get("BEE_SINK") == "local"
+                else ("BEE_PROXY_URL", "BEE_BROKER_URL", "BEE_BROKER_TOKEN"))
+    missing = [k for k in required if not cfg[k]]
     if missing:
         _log(f"not configured ({', '.join(missing)} unset) — see "
              "skills/bee-channel/manifest.json; exiting")
