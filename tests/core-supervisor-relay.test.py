@@ -304,13 +304,32 @@ class TestResolveActiveTarget(unittest.TestCase):
         # own resolution rule) — adding a homeserver is config-only.
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg:
             os.makedirs(os.path.join(cfg, "channels", "dev-ag2space"))
-            with open(os.path.join(cfg, "channels", "dev-ag2space", "relay-client.env"), "w") as f:
+            with open(os.path.join(cfg, "channels", "dev-ag2space", ".env"), "w") as f:
                 f.write("REMOTE_TASK_TOKEN=x\n")
             p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:dev.ag2.space"})
             old = os.environ.get("CLAUDE_CONFIG_DIR")
             os.environ["CLAUDE_CONFIG_DIR"] = cfg
             try:
                 self.assertEqual(resolve_active_target(p), ("dev-ag2space", "!r:dev.ag2.space"))
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_relay_client_env_alone_is_not_deliverable(self):
+        # notify.py reads exactly channels/<source>/.env; a lane holding only
+        # relay-client.env would fail the actual send — must NOT be selected
+        # (the #2701 review P1 failure mode).
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg:
+            os.makedirs(os.path.join(cfg, "channels", "dev-ag2space"))
+            with open(os.path.join(cfg, "channels", "dev-ag2space", "relay-client.env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:dev.ag2.space"})
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            try:
+                self.assertEqual(resolve_active_target(p), ("", ""))
             finally:
                 if old is None:
                     del os.environ["CLAUDE_CONFIG_DIR"]

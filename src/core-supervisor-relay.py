@@ -207,10 +207,12 @@ def _is_deliverable(source):
     if not source or not _SOURCE_SLUG_RE.match(source):
         return False
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    try:
-        return any(n.endswith(".env") for n in os.listdir(os.path.join(base, "channels", source)))
-    except OSError:
-        return False
+    # Probe for exactly what notify.py's sender reads — channels/<source>/.env.
+    # A broader *.env glob would mark lanes deliverable that the sender then
+    # fails on (exit 1), losing the escalation AND blocking the debounce latch
+    # (review P1 on #2701). If notify.py ever learns more filenames (#2686's
+    # try-both), widen BOTH sides together.
+    return os.path.isfile(os.path.join(base, "channels", source, ".env"))
 
 
 def resolve_active_target(activity_path):
