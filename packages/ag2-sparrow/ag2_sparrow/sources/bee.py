@@ -114,8 +114,13 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
     if not text:
         text = json.dumps(data, separators=(",", ":"))[:500]
     text = confine_user_content(text)   # untrusted device content — defang
-    conv = str(data.get("conversation_uuid") or data.get("conversation_id")
-               or data.get("id") or event_id)[:120]
+    # The conversation id is ALSO device-controlled and lands in line-based
+    # task files as `channel_id:` — an identifier, so it gets a strict
+    # allowlist (kills header/fence forgery via embedded newlines outright,
+    # stronger than defang; Codex+bassil repro 2026-08-06).
+    conv_raw = str(data.get("conversation_uuid") or data.get("conversation_id")
+                   or data.get("id") or event_id)[:120]
+    conv = re.sub(r"[^A-Za-z0-9._:@-]", "-", conv_raw) or "unknown"
     stable = str(utt.get("id") or todo.get("id") or data.get("id") or event_id)
     # No access_tier: the broker path resolves it locally (REMOTE_TASK_TIER),
     # ignoring the wire — a hosted bee-lane MUST set that to team (no ambient there).
