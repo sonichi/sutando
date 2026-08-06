@@ -358,12 +358,22 @@ _GUARDED_PY_WRITERS = {
     # (utterance/todo body) before it enters the task body; the local-sink
     # writer then persists that already-defanged text. Bee events are
     # room/device-trust, never owner-trust (persistence inherits source trust).
-    "skills/bee-channel/scripts/bee_watcher.py",
+    # (Moved out of skills/ into the ag2-sparrow package 2026-08-06 — the
+    # packages/ scan root below exists so relocations can't silently exit.)
+    "packages/ag2-sparrow/ag2_sparrow/bee_watcher.py",
+    # Sparrow gateway bridge: guarded by a DIFFERENT documented mechanism —
+    # every interpolated value passes _one_line() (newline-strip; header
+    # forgery requires a newline) and the locally-decided access_tier is
+    # written LAST so it wins under parse_task_headers_trusted. Plus
+    # _strip_room_ops_meta quarantine + filter_chat_secrets before persist.
+    "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",
 }
 
 _TASK_FIELD_PATTERN = 'f"task: {'
 for _pyf in sorted(
-    list((REPO / "src").glob("*.py")) + list((REPO / "skills").rglob("*.py"))
+    list((REPO / "src").glob("*.py"))
+    + list((REPO / "skills").rglob("*.py"))
+    + list((REPO / "packages").rglob("*.py"))
 ):
     _rel = str(_pyf.relative_to(REPO))
     try:
