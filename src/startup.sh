@@ -984,105 +984,6 @@ if [ -d "$REPO/skills/portfolio-research" ]; then
   echo "  ✓ portfolio dashboard (port 8899)"
 fi
 
-# 5b. Sutando context drop app (hotkey configurable via state/hotkeys.json)
-SUT_SRC="$REPO/src/Sutando/main.swift"
-SUT_BIN="$REPO/src/Sutando/Sutando"
-
-# Build the public ax-read CLI if missing or older than any of its source
-# files. Sutando.app's resolveAxReadPath() prefers private personal-deictic
-# when installed; this public binary is the text-only fallback so public-repo
-# users still get the context-drop experience.
-#
-# Staleness widened (per Mini's PR #907 review): trigger a rebuild when
-# Package.swift / build.sh / any *.swift under Sources/ is newer than the
-# binary, not just the main entry-point. Build failures are surfaced loudly
-# (not >/dev/null 2>&1) — silent failure here was the exact regression class
-# this skill is meant to prevent.
-AXR_DIR="$REPO/skills/context-drop"
-AXR_BIN="$AXR_DIR/ax-read"
-AXR_NEWEST_SRC="$(find "$AXR_DIR/Sources" "$AXR_DIR/Package.swift" "$AXR_DIR/build.sh" -type f \( -name '*.swift' -o -name 'Package.swift' -o -name 'build.sh' \) 2>/dev/null | xargs -I{} stat -f '%m {}' {} 2>/dev/null | sort -rn | head -1 | awk '{print $2}')"
-if [ -n "$AXR_NEWEST_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_NEWEST_SRC" -nt "$AXR_BIN" ]; }; then
-  echo "  Compiling public ax-read (skills/context-drop)..."
-  if ! command -v swift >/dev/null 2>&1; then
-    echo "  ⚠ ax-read build skipped: 'swift' not in PATH"
-    echo "    → install Xcode Command Line Tools (xcode-select --install) for context drops on public-repo installs"
-  elif (cd "$AXR_DIR" && bash build.sh); then
-    echo "  ✓ ax-read built at $AXR_BIN"
-  else
-    echo "  ⚠ ax-read build FAILED — see Swift compiler output above"
-    echo "    → Sutando.app will fall back to legacy in-process AX (broken for Electron under LSUIElement context)"
-  fi
-fi
-
-# Rebuild if source is newer than binary, or binary is missing.
-# Kill any running instance so the fresh binary can take over.
-if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; }; then
-  echo "  Compiling Sutando (source newer than binary)..."
-  if (cd "$REPO/src/Sutando" && swiftc -O -o Sutando main.swift SutandoConfig.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null); then
-    echo "  ✓ Sutando compiled"
-
-    # Sync the fresh binary into the .app bundle if one exists, ensure the
-    # AppleEvents usage-description key is present, and re-sign so the
-    # cdhash matches. Without NSAppleEventsUsageDescription macOS silently
-    # denies AppleEvents — getFinderSelection() returns [] and the context
-    # drop handler logs "Nothing selected" with no permission prompt.
-    SUT_APP="$REPO/src/Sutando/Sutando.app"
-    if [ -d "$SUT_APP" ]; then
-      cp "$SUT_BIN" "$SUT_APP/Contents/MacOS/Sutando"
-      /usr/libexec/PlistBuddy \
-        -c "Add :NSAppleEventsUsageDescription string 'Sutando reads your Finder selection to drop files into the agent task queue.'" \
-        "$SUT_APP/Contents/Info.plist" 2>/dev/null || true
-      # Prefer a stable signing identity when one is installed so the TCC
-      # Accessibility grant survives rebuilds (cdhash churn). Falls back to
-      # ad-hoc when no such identity exists — public-repo users without a
-      # personal signing cert get the same behavior as before.
-      #
-      # The designated requirement is identifier-only on purpose: the
-      # grant binds to the bundle ID rather than cdhash, so a rebuild
-      # against the same identity satisfies the requirement without
-      # re-prompting. For installs without a cert, ad-hoc still requires
-      # re-grant on each rebuild — same as the legacy behavior.
-      SUT_SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Sutando Dev"/{print $2; exit}')"
-      if [ -n "$SUT_SIGN_ID" ]; then
-        codesign --force --sign "$SUT_SIGN_ID" --identifier com.sutando.menubar \
-          --requirements '=designated => identifier "com.sutando.menubar"' \
-          "$SUT_APP" 2>/dev/null || codesign --force --sign - "$SUT_APP" 2>/dev/null || true
-        echo "  ✓ Sutando.app synced + signed (Sutando Dev + identifier-only DR)"
-      else
-        codesign --force --sign - "$SUT_APP" 2>/dev/null || true
-        echo "  ✓ Sutando.app synced + signed (ad-hoc; install \"Sutando Dev\" cert for stable TCC)"
-      fi
-    fi
-
-    if pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
-      pkill -f "src/Sutando/Sutando" 2>/dev/null || true
-      # Wait for kernel cleanup to drain before relaunch — fixed sleep 1
-      # raced with slow shutdown on 2026-04-21, leaving dual Sutando.app
-      # instances with ghost menu-bar icons.
-      for _ in $(seq 1 30); do
-        pgrep -f "src/Sutando/Sutando" >/dev/null 2>&1 || break
-        sleep 0.1
-      done
-    fi
-  else
-    echo "  ⚠ Sutando compile failed — keeping existing binary if any"
-  fi
-fi
-
-if ! pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
-  if [ -f "$SUT_BIN" ]; then
-    echo "  Starting Sutando..."
-    "$SUT_BIN" > /dev/null 2>&1 &
-    echo "  ✓ Sutando (hotkeys via state/hotkeys.json)"
-  else
-    echo "  ⚠ Sutando binary missing — hotkeys disabled"
-  fi
-else
-  echo "  ✓ Sutando (already running)"
-fi
-
-echo ""
-
 # Vault scanner preflight, shared by the three bridges that intercept secrets
 # (telegram, discord, slack — all import src/vault_intercept.py).
 #
@@ -1417,7 +1318,6 @@ for port_name in $VERIFY_PORTS; do
   fi
 done
 echo ""
-open "http://localhost:$WEB_CLIENT_PORT"
 
 # Delegate to the runtime dispatcher — canonical sutando-core launch command.
 # Sutando.app and health recovery use this same Claude-or-Codex selection.
