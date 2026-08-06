@@ -368,42 +368,44 @@ $prompt
     # Default to whatever claude printed; we override below on parse success.
     $result = if ($stdout -is [array]) { $stdout -join "`n" } else { [string]$stdout }
 
-    if ($exitCode -ne 0) {
+    # --output-format json writes structured error results to STDOUT even when
+    # Claude exits non-zero (for example an API 500). Parse before applying the
+    # generic exit-code fallback so users see the actionable gateway/API error
+    # instead of the misleading "claude exited 1" with empty stderr.
+    $parsedJson = $false
+    try {
+        $obj = $result | ConvertFrom-Json -ErrorAction Stop
+        if ($obj.is_error) {
+            $errBody = if ($obj.result) { $obj.result } else { 'claude reported is_error=true' }
+            Log "${taskId}: claude reported is_error=true: $errBody"
+            $result = "task-dispatcher: claude error: $errBody"
+            $parsedJson = $true
+        } elseif ($null -ne $obj.result) {
+            $result = [string]$obj.result
+            $parsedJson = $true
+            # Capture the returned session_id - it should match what we sent.
+            if ($obj.session_id -and $obj.session_id -ne $sessionId) {
+                Log "${taskId}: session id rotated $sessionId -> $($obj.session_id)"
+                [System.Threading.Monitor]::Enter($sessionLock)
+                try {
+                    $script:sessions[$channel] = $obj.session_id
+                    Save-SessionMap $script:sessions
+                } finally {
+                    [System.Threading.Monitor]::Exit($sessionLock)
+                }
+            }
+        } else {
+            Log "${taskId}: JSON had no .result field, falling through to raw stdout"
+        }
+    } catch {
+        # Not JSON or malformed - keep the raw stdout we already assigned.
+        Log "${taskId}: stdout was not JSON ($_), passing through raw"
+    }
+
+    if ($exitCode -ne 0 -and -not $parsedJson) {
         $errMsg = if ($stderr) { $stderr.Trim() } else { "claude exited $exitCode" }
         Log "${taskId}: FAILED (exit=$exitCode): $errMsg"
         $result = "task-dispatcher: claude --print exited $exitCode. stderr:`n$errMsg"
-    } else {
-        # --output-format json emits a single-line JSON object with .result =
-        # the assistant's text and .session_id = the live session UUID. Parse
-        # and unwrap so consumers (web UI, bridges) see just the message.
-        try {
-            $obj = $result | ConvertFrom-Json -ErrorAction Stop
-            if ($obj.is_error) {
-                $errBody = if ($obj.result) { $obj.result } else { 'claude reported is_error=true' }
-                Log "${taskId}: claude reported is_error=true: $errBody"
-                $result = "task-dispatcher: claude error: $errBody"
-            } elseif ($null -ne $obj.result) {
-                $result = [string]$obj.result
-                # Capture the returned session_id - it should match what we
-                # sent. If claude rotated it (rare, but spec-allowed), persist
-                # the new id so the next turn resumes the right thread.
-                if ($obj.session_id -and $obj.session_id -ne $sessionId) {
-                    Log "${taskId}: session id rotated $sessionId -> $($obj.session_id)"
-                    [System.Threading.Monitor]::Enter($sessionLock)
-                    try {
-                        $script:sessions[$channel] = $obj.session_id
-                        Save-SessionMap $script:sessions
-                    } finally {
-                        [System.Threading.Monitor]::Exit($sessionLock)
-                    }
-                }
-            } else {
-                Log "${taskId}: JSON had no .result field, falling through to raw stdout"
-            }
-        } catch {
-            # Not JSON or malformed - keep the raw stdout we already assigned.
-            Log "${taskId}: stdout was not JSON ($_), passing through raw"
-        }
     }
 
     # Write result. Bridges/web UI watch results/task-<id>.txt. UTF-8 without

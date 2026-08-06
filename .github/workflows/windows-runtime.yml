@@ -110,18 +110,9 @@ jobs:
           & pwsh -NoProfile -File src/task-dispatcher.ps1 -ValidateOnly
           if ($LASTEXITCODE -ne 0) { throw "dispatcher validation exited $LASTEXITCODE" }
 
-          $timer = [Diagnostics.Stopwatch]::StartNew()
-          & pwsh -NoProfile -File src/task-dispatcher.ps1 -Background
-          if ($LASTEXITCODE -ne 0) { throw "dispatcher background launch exited $LASTEXITCODE" }
-          $timer.Stop()
-          if ($timer.Elapsed.TotalSeconds -gt 10) {
-            throw "dispatcher background launch did not detach ($($timer.Elapsed))"
-          }
-          Start-Sleep -Seconds 2
-          $pidFile = Join-Path $testWorkspace 'state\task-dispatcher.pid'
-          if (-not (Test-Path $pidFile)) { throw 'dispatcher did not publish its PID' }
-          $childPid = [int](Get-Content $pidFile)
-          Stop-Process -Id $childPid -Force
+      - name: Run dispatcher owner/non-owner live integration
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/windows-dispatcher-live.test.ps1
 
       - name: Run Windows process and lock regressions
         shell: pwsh
