@@ -1,31 +1,37 @@
 // skills/mentra-channel/scripts/server.ts — the Sutando MentraOS app server.
-// THIN wiring only: all decision logic lives in core.ts (pure, unit-tested);
-// this file owns the SDK session lifecycle + HTTP. Runs where a public URL
-// terminates: AG2 Space runs on EKS (owner correction 2026-08-06), so this
-// ships as a Deployment/Service with an ingress route for
-// https://chat.ag2.space/mentra — git-tracked manifests only; see
-// DESIGN.md "Registration / deployment".
+// THIN wiring: all decision logic lives in core.ts (pure, unit-tested); this
+// file owns the SDK AppServer lifecycle + broker HTTP. Deploys on the EKS
+// cluster (Deployment/Service + ingress for https://chat.ag2.space/mentra —
+// git-tracked manifests; see DESIGN.md "Registration / deployment").
 //
-//   MentraOS Cloud ── POST /webhook/session-start {sessionId, userId}
-//        └─ AppSession(packageName, apiKey) ── onTranscription(final)
-//              └─ gateTranscript(wake) → buildTask → POST <broker>/v1/ingest
-//                    └─ long-poll GET <broker>/v1/result/<id>
-//                          ├─ session live → layouts.showTextWall + audio.speak
-//                          └─ session gone → fallback room delivers (broker
-//                             INTEGRATION_FALLBACK_ROOM_MENTRA — config only)
+//   MentraOS Cloud ── /webhook (owned by the SDK AppServer) ── onSession()
+//        └─ session.events.onTranscription(final)
+//             └─ gateTranscript(wake) → buildTask → POST <broker>/v1/ingest
+//                   └─ delivery per core.deliveryMode (ONE owner):
+//                        room    → broker fallback room; glasses ack only
+//                        glasses → poll GET /v1/result/<id> → showTextWall
 //
-// Config (manifest `config` block; env overrides; see resolveConfig):
-//   MENTRA_PACKAGE_NAME  registered app package (owner registered: "sutando")
-//   MENTRA_API_KEY       from the vault (vault get MENTRAOS_API_KEY at launch)
-//   MENTRA_WAKE_PHRASE   default "hey sutando"
-//   MENTRA_BROKER_URL / MENTRA_BROKER_TOKEN / MENTRA_AGENT_ID  the lane
-//   MENTRA_PORT          local listen port Caddy proxies to (default 8093)
+// Config (manifest `config` block; env overrides; see core.resolveConfig):
+//   MENTRA_PACKAGE_NAME / MENTRA_API_KEY   console registration (key: vault)
+//   MENTRA_WAKE_PHRASE                     default "hey sutando"
+//   MENTRA_BROKER_URL / MENTRA_BROKER_TOKEN / MENTRA_AGENT_ID   the lane
+//   MENTRA_DELIVERY                        room (default) | glasses
+//   MENTRA_PORT                            AppServer listen port
 
-import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gateTranscript, buildTask, resolveConfig } from './core.ts';
+// @mentra/sdk ships CommonJS: named ESM imports type-check but fail at
+// runtime ('does not provide an export named'). Default-import the CJS
+// namespace for VALUES; types import separately (erased at runtime).
+import mentraSdk from '@mentra/sdk';
+import type { AppSession } from '@mentra/sdk';
+
+const { AppServer } = mentraSdk;
+import {
+  ackText, buildTask, deliveryMode, gateTranscript, resolveConfig,
+  shouldPollResults,
+} from './core.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -37,10 +43,12 @@ function loadManifestConfig(): Record<string, string> {
   }
 }
 
-const cfg = resolveConfig(process.env, loadManifestConfig());
-const seqBySession = new Map<string, number>();
+export function requiredConfigMissing(cfg: Record<string, string>): string[] {
+  return ['MENTRA_PACKAGE_NAME', 'MENTRA_API_KEY', 'MENTRA_BROKER_URL',
+          'MENTRA_BROKER_TOKEN'].filter((k) => !cfg[k]);
+}
 
-async function postIngest(task: object): Promise<boolean> {
+async function postIngest(cfg: Record<string, string>, task: object): Promise<boolean> {
   try {
     const r = await fetch(`${cfg.MENTRA_BROKER_URL.replace(/\/$/, '')}/v1/ingest`, {
       method: 'POST',
@@ -58,13 +66,16 @@ async function postIngest(task: object): Promise<boolean> {
   }
 }
 
-async function pollResult(taskId: string, timeoutS = 120): Promise<string | null> {
+async function pollResult(
+  cfg: Record<string, string>, taskId: string, timeoutS = 120,
+): Promise<string | null> {
   const deadline = Date.now() + timeoutS * 1000;
   while (Date.now() < deadline) {
     try {
       const r = await fetch(
         `${cfg.MENTRA_BROKER_URL.replace(/\/$/, '')}/v1/result/${encodeURIComponent(taskId)}?wait=25`,
-        { headers: { Authorization: `Bearer ${cfg.MENTRA_BROKER_TOKEN}`, 'User-Agent': 'sutando-mentra-app/1.0' } },
+        { headers: { Authorization: `Bearer ${cfg.MENTRA_BROKER_TOKEN}`,
+                     'User-Agent': 'sutando-mentra-app/1.0' } },
       );
       if (r.ok) {
         const body = (await r.json()) as { body?: string };
@@ -75,85 +86,79 @@ async function pollResult(taskId: string, timeoutS = 120): Promise<string | null
   return null;
 }
 
-// SDK import is dynamic + lazy so `--check` config validation and the pure
-// tests never require the dependency; the server refuses to start without it.
-async function startSession(sessionId: string, userId: string): Promise<void> {
-  const sdk = await import('@mentraos/sdk');
-  const session = new sdk.AppSession({
-    packageName: cfg.MENTRA_PACKAGE_NAME,
-    apiKey: cfg.MENTRA_API_KEY,
-    cloudUrl: 'wss://cloud.mentraos.com/app-ws',
-    sessionId,
-    userId,
-  });
-  session.events.onTranscription(async (t: { text: string; isFinal?: boolean }) => {
-    if (t.isFinal === false) return;                       // finals only (v1)
-    const gated = gateTranscript(t.text, cfg.MENTRA_WAKE_PHRASE);
-    if (!gated.text) return;
-    const seq = (seqBySession.get(sessionId) ?? 0) + 1;
-    seqBySession.set(sessionId, seq);
-    const task = buildTask(gated.text, userId, sessionId, seq);
-    session.layouts.showTextWall('Sutando: on it…');
-    if (!(await postIngest(task))) {
-      session.layouts.showTextWall('Sutando: could not reach the broker — try again.');
-      return;
-    }
-    const result = await pollResult(task.id);
-    if (result) {
-      session.layouts.showTextWall(result.slice(0, 400));
-      try { await session.audio.speak(result.slice(0, 280)); } catch { /* display-only glasses */ }
-    }
-    // No result before timeout: the broker's fallback room delivers it —
-    // stay quiet rather than showing a false failure.
-  });
-  console.log(`[mentra-app] session ${sessionId} up for ${userId}`);
-}
+/**
+ * The SDK owns /webhook + session lifecycle; we own per-session behavior.
+ * Exported (and construction side-effect free) so the test seam can import
+ * and instantiate it without starting network listeners.
+ */
+export class SutandoMentraServer extends AppServer {
+  private readonly cfg: Record<string, string>;
 
-export function requiredConfigMissing(): string[] {
-  return ['MENTRA_PACKAGE_NAME', 'MENTRA_API_KEY', 'MENTRA_BROKER_URL',
-          'MENTRA_BROKER_TOKEN'].filter((k) => !cfg[k]);
-}
+  private readonly bootNonce: string;
 
-if (process.argv.includes('--check')) {
-  const missing = requiredConfigMissing();
-  console.log(missing.length ? `not configured: ${missing.join(', ')}` : 'config ok');
-  process.exit(missing.length ? 2 : 0);
-}
+  private readonly seqBySession = new Map<string, number>();
 
-const missing = requiredConfigMissing();
-if (missing.length) {
-  console.error(`[mentra-app] not configured (${missing.join(', ')}) — see manifest.json`);
-  process.exit(2);
-}
-
-createServer(async (req, res) => {
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  // Caddy strips nothing: we serve under /mentra/* as registered.
-  if (req.method === 'POST' && url.pathname.endsWith('/webhook/session-start')) {
-    let raw = '';
-    req.on('data', (c) => { raw += c; });
-    req.on('end', () => {
-      try {
-        const { sessionId, userId } = JSON.parse(raw || '{}');
-        if (!sessionId || !userId) { res.writeHead(400).end('{"error":"missing ids"}'); return; }
-        void startSession(String(sessionId), String(userId));
-        res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
-      } catch {
-        res.writeHead(400).end('{"error":"bad json"}');
-      }
+  constructor(cfg: Record<string, string>) {
+    super({
+      packageName: cfg.MENTRA_PACKAGE_NAME,
+      apiKey: cfg.MENTRA_API_KEY,
+      port: Number(cfg.MENTRA_PORT || 8093),
     });
-    return;
+    this.cfg = cfg;
+    // Restart-safe id discriminator (core.taskId): a re-minted (session, seq)
+    // pair after a crash must never equal a pre-crash id, or broker enqueue
+    // idempotency silently drops the task.
+    this.bootNonce = Date.now().toString(36);
   }
-  if (url.pathname.endsWith('/webview')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(`<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Sutando</title><body style="font-family:system-ui;padding:1rem">
-<h3>Sutando on Mentra</h3><p>Sessions this boot: ${seqBySession.size}</p>
-<p>Say “${cfg.MENTRA_WAKE_PHRASE} …” and the reply lands on your glasses;
-if you take them off first, it lands in your Mentra room on ag2.space.</p>`);
-    return;
+
+  protected override async onSession(
+    session: AppSession, sessionId: string, userId: string,
+  ): Promise<void> {
+    const mode = deliveryMode(this.cfg.MENTRA_DELIVERY);
+    session.events.onTranscription(async (t: { text: string; isFinal: boolean }) => {
+      if (!t.isFinal) return;                              // finals only (v1)
+      const gated = gateTranscript(t.text, this.cfg.MENTRA_WAKE_PHRASE);
+      if (!gated.text) return;
+      const seq = (this.seqBySession.get(sessionId) ?? 0) + 1;
+      this.seqBySession.set(sessionId, seq);
+      const task = buildTask(gated.text, userId, sessionId, this.bootNonce, seq);
+      if (!(await postIngest(this.cfg, task))) {
+        session.layouts.showTextWall('Sutando: could not reach the broker — try again.');
+        return;
+      }
+      session.layouts.showTextWall(ackText(mode));
+      if (!shouldPollResults(mode)) return;                // room mode: broker owns delivery
+      const result = await pollResult(this.cfg, task.id);
+      if (result) {
+        session.layouts.showTextWall(result.slice(0, 400));
+      }
+      // glasses mode + no result before timeout: recorded server-side
+      // (GET /v1/result) — quiet here, no false failure on the HUD.
+    });
+    console.log(`[mentra-app] session ${sessionId} up for ${userId} (delivery=${mode})`);
   }
-  res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true,"app":"sutando-mentra"}');
-}).listen(Number(cfg.MENTRA_PORT || 8093), () => {
-  console.log(`[mentra-app] listening on :${cfg.MENTRA_PORT || 8093} (wake: "${cfg.MENTRA_WAKE_PHRASE}")`);
-});
+}
+
+export function buildServer(
+  env: Record<string, string | undefined> = process.env,
+): SutandoMentraServer {
+  const cfg = resolveConfig(env, loadManifestConfig());
+  const missing = requiredConfigMissing(cfg);
+  if (missing.length) {
+    throw new Error(`mentra-channel not configured (${missing.join(', ')}) — see manifest.json`);
+  }
+  return new SutandoMentraServer(cfg);
+}
+
+// Run only when executed directly (node/tsx scripts/server.ts) — importing
+// this module (tests, tooling) has no side effects.
+const invokedDirectly = process.argv[1]
+  && fileURLToPath(import.meta.url) === process.argv[1];
+if (invokedDirectly) {
+  try {
+    void buildServer().start();
+  } catch (e) {
+    console.error(`[mentra-app] ${(e as Error).message}`);
+    process.exit(2);
+  }
+}

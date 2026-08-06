@@ -7,7 +7,7 @@ to the Teams design doc (ag2space-backend#443).
 
 ## Verified SDK surface (cloud-docs.mentra.glass, checked 2026-08-06)
 
-- npm `@mentraos/sdk`; app = a self-hosted server holding an `AppSession`
+- npm `@mentra/sdk` (2.x; the docs page's `@mentraos/sdk` name is stale — verified against the registry + installed types); app = a self-hosted server holding an `AppSession`
   per user session: `new AppSession({ packageName, apiKey, cloudUrl:
   "wss://cloud.mentraos.com/app-ws" })`.
 - Session lifecycle is **webhook-initiated**: MentraOS Cloud POSTs
@@ -41,15 +41,15 @@ glasses ── MentraOS Cloud ──(webhook + WS)── mentra app server (ours
   POSTed to the broker's `/v1/ingest` as `source: "mentra"` tasks
   (`user_id` = MentraOS `userId`, `channel_id` = `sessionId`), exactly the
   Bee pattern. The broker needs zero changes for inbound.
-- **Outbound:** the app server long-polls `GET /v1/result/<task-id>` (the
-  broker already records + serves every result) and renders arrivals via
-  `showTextWall` + optional `audio.speak` while the session is live. This
-  keeps the native reply leg where the connection is, without inventing a
-  broker→app-server push channel.
-- **Offline fallback:** `INTEGRATION_FALLBACK_ROOM_MENTRA` (backend#444's
-  mechanism) as the delivery path when the session ended before the result
-  arrived — glasses off, answer lands in the Mentra DM room instead of
-  being dropped. Broker-side this is config only; no new code.
+- **Outbound — ONE owner, explicit (review P1 2026-08-06):** backend#444
+  sends every `source=mentra` result to `INTEGRATION_FALLBACK_ROOM_MENTRA`
+  the moment that env is set (the app server is not a broker deliverer), so
+  polling AND setting the room would double-deliver. `MENTRA_DELIVERY`
+  picks the owner per deployment: `room` (default — broker fallback room
+  owns all replies; glasses show an ack; safe with the room env set) or
+  `glasses` (app server long-polls `GET /v1/result/<id>` and renders via
+  `showTextWall`; the broker room env MUST stay unset). A future broker
+  claim/availability contract can make this dynamic per session.
 - **Trigger discipline:** unlike Bee todos, raw transcription is a firehose.
   v1 forwards ONLY wake-phrase-gated utterances ("hey sutando …" — exact
   phrase TBD with owner) + an explicit button/gesture if the hardware

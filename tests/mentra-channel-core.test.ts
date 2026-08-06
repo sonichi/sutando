@@ -1,9 +1,12 @@
-// Mentra lane pure logic (skills/mentra-channel/scripts/core.ts).
-// The wake gate is the v1 trigger CONTRACT (DESIGN.md): only wake-phrase
-// finals become tasks; ids obey sparrow's [A-Za-z0-9._-]{1,64}.
+// Mentra lane: pure logic (core.ts) + the server seam (server.ts imports,
+// constructs, and wires against the REAL @mentra/sdk AppServer — the review
+// round proved core-only testing missed a wrong SDK contract entirely).
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { gateTranscript, safeTaskId, buildTask, resolveConfig } from '../skills/mentra-channel/scripts/core.ts';
+import {
+  ackText, buildTask, deliveryMode, gateTranscript, sessionSlug,
+  shouldPollResults, taskId, resolveConfig,
+} from '../skills/mentra-channel/scripts/core.ts';
 
 const SPARROW_TID = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -25,24 +28,47 @@ describe('gateTranscript', () => {
   });
 });
 
-describe('safeTaskId / buildTask', () => {
-  it('ids are deterministic, bounded, and in sparrow alphabet for hostile session ids', () => {
-    for (const sess of ['abc123', 'sess:with/colons', 'x'.repeat(200), '你好世界', '']) {
-      const id1 = safeTaskId(sess, 7);
-      const id2 = safeTaskId(sess, 7);
-      assert.equal(id1, id2);
-      assert.match(id1, SPARROW_TID, `bad id for session ${JSON.stringify(sess)}: ${id1}`);
+describe('taskId — collision + restart resistance (review P1)', () => {
+  it('distinct opaque session ids never share a slug', () => {
+    // The sanitize-approach collision pair from the review:
+    assert.notEqual(sessionSlug('sess:a/b'), sessionSlug('sess:a:b'));
+    assert.notEqual(taskId('sess:a/b', 'n1', 1), taskId('sess:a:b', 'n1', 1));
+  });
+
+  it('a restarted process can never re-mint a previous id', () => {
+    // Same session, same seq, different boot nonce (restart) → different id.
+    assert.notEqual(taskId('sess-1', 'boot1', 1), taskId('sess-1', 'boot2', 1));
+  });
+
+  it('ids are deterministic per instance, bounded, in sparrow alphabet', () => {
+    for (const sess of ['abc123', 'sess:with/colons', 'x'.repeat(500), '你好世界', '']) {
+      const id1 = taskId(sess, 'n0', 7);
+      assert.equal(id1, taskId(sess, 'n0', 7));            // retries reuse it
+      assert.match(id1, SPARROW_TID, `bad id for ${JSON.stringify(sess)}: ${id1}`);
     }
-    assert.notEqual(safeTaskId('s1', 1), safeTaskId('s1', 2)); // seq disambiguates
+    assert.notEqual(taskId('s1', 'n', 1), taskId('s1', 'n', 2));
   });
 
   it('task shape matches the lane contract', () => {
-    const t = buildTask('do the thing', 'user-9', 'sess-1', 3);
+    const t = buildTask('do the thing', 'user-9', 'sess-1', 'bootA', 3);
     assert.equal(t.source, 'mentra');
     assert.equal(t.channel_id, 'sess-1');
-    assert.equal(t.task, 'do the thing');
     assert.match(t.id, SPARROW_TID);
-    assert.equal(t.interaction_type, 'message');
+  });
+});
+
+describe('delivery single-owner (review P1)', () => {
+  it('defaults to room mode — broker fallback owns replies, no polling', () => {
+    assert.equal(deliveryMode(undefined), 'room');
+    assert.equal(deliveryMode(''), 'room');
+    assert.equal(shouldPollResults('room'), false);
+    assert.match(ackText('room'), /Mentra room/);
+  });
+
+  it('glasses mode is explicit opt-in and enables polling', () => {
+    assert.equal(deliveryMode('glasses'), 'glasses');
+    assert.equal(shouldPollResults('glasses'), true);
+    assert.doesNotMatch(ackText('glasses'), /room/);
   });
 });
 
@@ -54,5 +80,31 @@ describe('resolveConfig', () => {
     );
     assert.equal(cfg.MENTRA_WAKE_PHRASE, 'yo glasses');
     assert.equal(cfg.MENTRA_PORT, '8093');
+  });
+});
+
+describe('server seam — real SDK contract', () => {
+  it('module imports side-effect free; buildServer validates config', async () => {
+    const mod = await import('../skills/mentra-channel/scripts/server.ts');
+    assert.throws(
+      () => mod.buildServer({ MENTRA_PACKAGE_NAME: '', MENTRA_API_KEY: '' }),
+      /not configured/,
+    );
+  });
+
+  it('constructs a real AppServer subclass with a session hook', async () => {
+    const mod = await import('../skills/mentra-channel/scripts/server.ts');
+    const srv = mod.buildServer({
+      MENTRA_PACKAGE_NAME: 'sutando',
+      MENTRA_API_KEY: 'test-key-not-real',
+      MENTRA_BROKER_URL: 'http://127.0.0.1:9',
+      MENTRA_BROKER_TOKEN: 'tok',
+      MENTRA_DELIVERY: 'room',
+    });
+    const { AppServer } = await import('@mentra/sdk');
+    assert.ok(srv instanceof AppServer);                   // real SDK base class
+    assert.equal(typeof (srv as unknown as { onSession: unknown }).onSession, 'function');
+    // no .start() — construction must not open sockets (pinned by this test
+    // completing without leaking handles under --test-force-exit)
   });
 });

@@ -1,10 +1,12 @@
 // skills/mentra-channel/scripts/core.ts — pure logic for the Mentra lane.
-// Design: skills/mentra-channel/DESIGN.md (PR #2707). This module has ZERO
-// imports so the repo's tsx test runner exercises it without installing the
-// MentraOS SDK; scripts/server.ts owns all SDK + network wiring and stays
-// thin. The v1 trigger contract: only FINAL transcriptions that start with
-// the wake phrase become tasks — raw transcription is a firehose and ambient
+// Design: skills/mentra-channel/DESIGN.md (this PR). SDK-free (node:crypto
+// only) so the repo's tsx suite exercises every decision here without the
+// MentraOS SDK; scripts/server.ts owns SDK + network wiring and stays thin.
+// The v1 trigger contract: only FINAL transcriptions that start with the
+// wake phrase become tasks — raw transcription is a firehose and ambient
 // mode is explicitly out of scope (see DESIGN.md).
+
+import { createHash } from 'node:crypto';
 
 export interface GateResult {
   /** The task text with the wake phrase stripped, or null when gated out. */
@@ -29,7 +31,6 @@ export function gateTranscript(text: string, wakePhrase: string): GateResult {
   for (const w of words) {
     const n = norm(rest);
     if (!n.startsWith(w)) return { text: null };
-    // consume the matched word from the ORIGINAL string (case-preserving tail)
     const idx = rest.toLowerCase().indexOf(w, rest.length - n.length);
     rest = rest.slice(idx + w.length);
   }
@@ -39,17 +40,22 @@ export function gateTranscript(text: string, wakePhrase: string): GateResult {
 
 // Sparrow's task-id contract ([A-Za-z0-9._-]{1,64}, _TID_RE in
 // remote_gateway_bridge.py) — same rule the Teams and Bee adapters enforce.
-const SAFE_RUN = /[^A-Za-z0-9._-]/g;
+//
+// Review P1 (2026-08-06): sanitizing the raw session id collides distinct
+// opaque ids ('sess:a/b' and 'sess:a:b' both slugged to sess_a_b), and an
+// in-memory seq resets on restart — under broker enqueue idempotency both
+// cases silently DROP tasks as duplicates. So: hash the ORIGINAL opaque
+// session id (the Bee adapter's approach) and include a per-process boot
+// nonce so a restarted server can never re-mint an old id. Ids stay
+// deterministic per utterance instance (ingest retries reuse them) without
+// being collidable.
+export function sessionSlug(sessionId: string): string {
+  return createHash('sha256').update(sessionId || 'nosession').digest('hex').slice(0, 16);
+}
 
-/**
- * Deterministic, in-alphabet, bounded task id: task-mentra-<session>-<seq>.
- * sessionId is sanitized (opaque MentraOS ids may carry any charset) and
- * truncated so the whole id stays under 64 chars even with a large seq.
- */
-export function safeTaskId(sessionId: string, seq: number): string {
-  const sess = (sessionId || 'nosession').replace(SAFE_RUN, '_').slice(0, 32);
-  const id = `task-mentra-${sess}-${seq}`;
-  return id.length <= 64 ? id : `task-mentra-${sess.slice(0, 64 - 13 - String(seq).length - 1)}-${seq}`;
+export function taskId(sessionId: string, bootNonce: string, seq: number): string {
+  const nonce = (bootNonce || '0').replace(/[^A-Za-z0-9]/g, '').slice(0, 10);
+  return `task-mentra-${sessionSlug(sessionId)}-${nonce}-${seq}`;
 }
 
 export interface MentraTask {
@@ -65,10 +71,11 @@ export interface MentraTask {
 
 /** Relay task shape for one gated utterance (same fields the other lanes emit). */
 export function buildTask(
-  gatedText: string, userId: string, sessionId: string, seq: number,
+  gatedText: string, userId: string, sessionId: string,
+  bootNonce: string, seq: number,
 ): MentraTask {
   return {
-    id: safeTaskId(sessionId, seq),
+    id: taskId(sessionId, bootNonce, seq),
     task: gatedText,
     source: 'mentra',
     user_id: userId || 'mentra-user',
@@ -77,6 +84,35 @@ export function buildTask(
     room_name: 'Mentra',
     interaction_type: 'message',
   };
+}
+
+// Review P1 (2026-08-06): result delivery must have ONE owner. Backend#444
+// sends every source=mentra result to INTEGRATION_FALLBACK_ROOM_MENTRA the
+// moment that env is set broker-side (this app server is not a broker
+// deliverer), so an app server that ALSO polls and renders would duplicate
+// every live answer into Matrix. The owner is therefore explicit config:
+//   room    (default) — the broker fallback room owns ALL replies; glasses
+//           show an acknowledgement only. Safe with the room env set.
+//   glasses — this app server owns replies (poll + render); the operator
+//           MUST leave INTEGRATION_FALLBACK_ROOM_MENTRA unset broker-side.
+//           Glasses-off before the poll window closes leaves the reply
+//           recorded server-side (GET /v1/result serves it) but unrendered.
+// A future broker claim/availability contract can make this dynamic; v1
+// pins one owner per deployment and tests both paths at the server seam.
+export type DeliveryMode = 'room' | 'glasses';
+
+export function deliveryMode(raw: string | undefined): DeliveryMode {
+  return raw === 'glasses' ? 'glasses' : 'room';
+}
+
+export function shouldPollResults(mode: DeliveryMode): boolean {
+  return mode === 'glasses';
+}
+
+export function ackText(mode: DeliveryMode): string {
+  return mode === 'glasses'
+    ? 'Sutando: on it…'
+    : 'Sutando: on it — reply lands in your Mentra room.';
 }
 
 /** Config resolution order (CLI handled by server argv): env > manifest. */

@@ -5,7 +5,7 @@
   "stability": "experimental",
   "enabled": true,
   "access_tier": "owner",
-  "description": "Sutando as a MentraOS glasses app (full-duplex channel): wake-phrase-gated live transcription becomes broker tasks (source=mentra via /v1/ingest), replies render on the glasses (text wall + TTS) with the broker's Mentra fallback room covering glasses-off delivery. Config-only manifest — run scripts/server.ts (node/tsx) on the public host; design in DESIGN.md / PR #2707.",
+  "description": "Sutando as a MentraOS glasses app (full-duplex channel): wake-phrase-gated live transcription becomes broker tasks (source=mentra via /v1/ingest). Reply delivery has ONE owner via MENTRA_DELIVERY: 'room' (default \u2014 broker's INTEGRATION_FALLBACK_ROOM_MENTRA owns all replies, glasses show an ack) or 'glasses' (app server polls /v1/result and renders; requires the broker fallback room env UNSET or replies duplicate). Config-only manifest \u2014 run scripts/server.ts (@mentra/sdk AppServer) on the public host; design in DESIGN.md.",
   "config": {
     "MENTRA_PACKAGE_NAME": "sutando",
     "MENTRA_API_KEY": "",
@@ -13,6 +13,7 @@
     "MENTRA_BROKER_URL": "",
     "MENTRA_BROKER_TOKEN": "",
     "MENTRA_AGENT_ID": "mentra-lane",
-    "MENTRA_PORT": "8093"
+    "MENTRA_PORT": "8093",
+    "MENTRA_DELIVERY": "room"
   }
 }
