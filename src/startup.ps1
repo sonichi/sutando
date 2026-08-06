@@ -118,6 +118,15 @@ function Test-Port($port) {
     return [bool]$r
 }
 
+function Wait-Port($port, $timeoutSeconds = 15) {
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    do {
+        if (Test-Port $port) { return $true }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
 # Detect a running bridge by command-line substring, in-process. The old
 # approach spawned `& powershell -Command "Get-CimInstance ..."` which, under
 # $ErrorActionPreference='Stop', threw NativeCommandExitException whenever the
@@ -304,7 +313,7 @@ Write-Host ""
 Write-Host "Verifying services..."
 $VERIFY = @{ '9900'='voice-agent'; '8080'='web-client'; '7844'='dashboard'; '7843'='agent-api'; '7845'='screen-capture' }
 foreach ($p in $VERIFY.Keys) {
-    if (Test-Port $p) {
+    if (Wait-Port $p) {
         Write-Host "  + $($VERIFY[$p]) (port $p)"
     } else {
         Write-Host "  X $($VERIFY[$p]) (port $p) - check $LOGS_DIR\$($VERIFY[$p]).log"
