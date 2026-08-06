@@ -7,6 +7,8 @@ import importlib.util
 import io
 import json
 import os
+import pathlib
+import shutil
 import subprocess
 import tempfile
 import sys
@@ -383,10 +385,38 @@ class TestSendRemoteGateway(unittest.TestCase):
         # clear them too (else an ambient AG2_REMOTE_TOKEN resolves and this passes).
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
         clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        # Pin the containment guard to a temp tree — see _hermetic_channels_root.
+        clean_env["CLAUDE_CONFIG_DIR"] = self._hermetic_channels_root()
+        clean_env.pop("CLAUDE_HOME", None)
         with patch.object(self.mod, "_env_file", return_value={}), \
              patch.dict(os.environ, clean_env, clear=True):
             result = self.mod.send_remote_gateway("someprovider", "!room:server", "hello")
         self.assertFalse(result)
+
+
+    def _hermetic_channels_root(self, source: str = "ag2space") -> str:
+        """A real channels/<source>/.env inside a temp dir, for CLAUDE_CONFIG_DIR.
+
+        `send_remote_gateway` applies a containment guard — the channel `.env` must
+        RESOLVE inside `<config>/channels/` — and it resolves the REAL filesystem,
+        before `_env_file` is patched. So any test that clears the gateway env vars
+        (forcing the guard to run) is implicitly asserting something about the HOST.
+
+        Not hypothetical: on a host where `channels/ag2space/.env` is a symlink out
+        of the channels dir, the guard correctly refuses and the two combined-token
+        tests below fail with `AssertionError: False is not true` — measured
+        2026-07-30 while CI was green. They passed only because CI's layout happens
+        to satisfy the guard.
+
+        Pointing CLAUDE_CONFIG_DIR at a temp tree makes the guard deterministic and
+        keeps these tests about what they claim to test: the `url|secret` form.
+        """
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        d = root / "channels" / source
+        d.mkdir(parents=True)
+        (d / ".env").write_text("")   # a real file, never a symlink
+        return str(root)
 
     def test_ag2_combined_token_only_delivers(self):
         """Regression for #2101 review (High): a channel provisioned with ONLY
@@ -407,6 +437,9 @@ class TestSendRemoteGateway(unittest.TestCase):
 
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
         clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        # Pin the containment guard to a temp tree — see _hermetic_channels_root.
+        clean_env["CLAUDE_CONFIG_DIR"] = self._hermetic_channels_root()
+        clean_env.pop("CLAUDE_HOME", None)
         with patch.object(self.mod, "_env_file",
                           return_value={"AG2_REMOTE_TOKEN": "https://gw.example/relay|sekret"}), \
              patch.dict(os.environ, clean_env, clear=True), \
@@ -436,6 +469,9 @@ class TestSendRemoteGateway(unittest.TestCase):
 
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
         clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        # Pin the containment guard to a temp tree — see _hermetic_channels_root.
+        clean_env["CLAUDE_CONFIG_DIR"] = self._hermetic_channels_root()
+        clean_env.pop("CLAUDE_HOME", None)
         with patch.object(self.mod, "_env_file",
                           return_value={"REMOTE_TASK_TOKEN": "https://gw.example/relay|sekret"}), \
              patch.dict(os.environ, clean_env, clear=True), \
