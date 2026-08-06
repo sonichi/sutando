@@ -42,7 +42,12 @@ def _load(name: str, ws: str):
     mod.TASKS_DIR = Path(ws) / "tasks"
     mod.RESULTS_DIR = Path(ws) / "results"
     mod.ARCHIVE_RESULTS_DIR = Path(ws) / "results" / "archive"
+    # Owner-presence file too — _write_task ends in _write_owner_activity, so
+    # without this the suite stomps the LIVE last-owner-activity.json (and the
+    # redaction tests below would assert against real state).
+    mod.OWNER_ACTIVITY_FILE = Path(ws) / "state" / "last-owner-activity.json"
     assert str(mod.TASKS_DIR).startswith(ws), "test dirs must be sandboxed"
+    assert str(mod.OWNER_ACTIVITY_FILE).startswith(ws), "presence file must be sandboxed"
     return mod
 
 
@@ -123,6 +128,47 @@ class TestVaultIntercept(unittest.TestCase):
         content = self._write(f"vault set K3 {SECRET}")
         self.assertNotIn(SECRET, content)
         self.assertIn("NOT stored", content)
+
+
+class TestOwnerActivityRedaction(TestVaultIntercept):
+    """bassil P1 2026-08-06: the presence summary (last-owner-activity.json)
+    re-derived from the RAW task dict, so an intercepted vault-set value that
+    never reached tasks/ still persisted here in plaintext. The summary must
+    ride the same redaction pipeline as the task body — shipped path AND the
+    direct-caller fallback. Inherits the sandboxed harness (incl. the
+    OWNER_ACTIVITY_FILE redirect) and its intercept cases keep passing."""
+
+    def _summary(self) -> str:
+        import json
+        return json.loads(
+            (self.ws / "state" / "last-owner-activity.json").read_text())["summary"]
+
+    def test_vault_set_never_reaches_presence_summary(self):
+        self.mod.VAULT_SINK = lambda k, v: True
+        self._write(f"vault set MS365_CLIENT_SECRET {SECRET}")
+        s = self._summary()
+        self.assertNotIn(SECRET, s)
+        self.assertIn("vault set MS365_CLIENT_SECRET", s)  # key stays legible
+
+    def test_summary_is_parity_with_persisted_task_body(self):
+        # The invariant is PARITY: the summary derives from the exact text the
+        # task file persisted (post vault-intercept + generic filter), never
+        # from the rawer pre-redaction dict. Pin it byte-for-byte at the
+        # 80-char summary cap.
+        self.mod.VAULT_SINK = lambda k, v: True
+        content = self._write(f"vault set K7 {SECRET}")
+        task_line = next(l for l in content.splitlines() if l.startswith("task: "))
+        self.assertEqual(self._summary(), task_line[len("task: "):][:80])
+
+    def test_direct_caller_fallback_redacts_too(self):
+        # A caller that skips _write_task must get the same guarantee.
+        self.mod._write_owner_activity(
+            {"task": f"vault set K9 {SECRET}", "user_id": "@qingyun:ag2.space",
+             "source": "ag2space", "channel_id": "!r:ag2.space"},
+            sender_tier="owner")
+        s = self._summary()
+        self.assertNotIn(SECRET, s)
+        self.assertIn("K9", s)
 
 
 class TestCanonicalSrcCopy(unittest.TestCase):

@@ -1389,7 +1389,8 @@ def _fleet_agent_ids() -> set[str]:
     return _fleet_agents_cache["ids"]
 
 
-def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
+def _write_owner_activity(task: dict, sender_tier: str | None = None,
+                          redacted_body: str | None = None) -> None:
     """Record that the owner was active on this transport right now — but only
     when THIS node resolves the SENDER to owner tier. Gated on the sender's
     resolved tier, NOT the gateway-wide LOCAL_TIER: in a shared room a
@@ -1428,13 +1429,27 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         return
     try:
         OWNER_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # The summary derives from the ALREADY-REDACTED body when the caller
+        # (`_write_task`) provides it — a single redaction pipeline, so this
+        # sink can never diverge from the task file (review P1 2026-08-06: it
+        # re-derived from the raw task dict, so an intercepted `vault set`
+        # value that never reached tasks/ still landed here in plaintext).
+        body = (redacted_body if redacted_body is not None
+                else (task.get("task") or "")).lstrip()
         # Strip a bracket prefix a gateway may add (e.g. "[Provider @user] body").
-        body = (task.get("task") or "").lstrip()
         if body.startswith("[") and "]" in body:
             body = body[body.index("]") + 1:].lstrip()
-        # #2267 parity: the presence summary is persisted state too — a pasted
-        # token must not survive in last-owner-activity.json either.
-        body = filter_chat_secrets(body).text
+        if redacted_body is None:
+            # Direct-caller fallback: run the SAME two-stage redaction the task
+            # writer uses. The vault-set replacement here is the summary-safe
+            # short form — storage state is unknown (and irrelevant) in a
+            # presence summary; what matters is the value never lands.
+            _kv = extract_vault_set(body)
+            if _kv:
+                body = f"vault set {_kv[0]} [REDACTED]"
+            # #2267 parity: the presence summary is persisted state too — a
+            # pasted token must not survive in last-owner-activity.json either.
+            body = filter_chat_secrets(body).text
         payload = {
             "ts": int(time.time()),
             "channel": task.get("source") or PROVIDER,
@@ -1511,6 +1526,7 @@ def _write_task(task: dict) -> str | None:
     sender_tier = _tier_for(task.get("user_id"))
     lines = []
     _secret_types: tuple = ()
+    _task_body_redacted: "str | None" = None  # threaded to _write_owner_activity
     for f in _TASK_FIELDS:
         if f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
@@ -1562,6 +1578,7 @@ def _write_task(task: dict) -> str | None:
                 _secret_types = tuple(_filtered.secret_types)
                 _log(f"redacted pasted secret(s) in {tid} body: "
                      f"{', '.join(sorted(_secret_types))}")
+            _task_body_redacted = _filtered.text
             lines.append(f"task: {_one_line(_filtered.text)}")
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
@@ -1614,7 +1631,7 @@ def _write_task(task: dict) -> str | None:
     _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
-    _write_owner_activity(task, sender_tier)
+    _write_owner_activity(task, sender_tier, redacted_body=_task_body_redacted)
     return tid
 
 
