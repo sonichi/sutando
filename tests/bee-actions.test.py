@@ -283,6 +283,36 @@ class TestBeeActions(unittest.TestCase):
                                      "BEE_API_BASE": "", "BEE_API_TOKEN": ""}):
             self.assertEqual(self.mod.main(), 1)
 
+    def _with_manifest(self, config):
+        mf = Path(self.tmpdir.name) / "manifest.json"
+        mf.write_text(json.dumps({"name": "bee-actions", "config": config}))
+        return patch.object(self.mod, "_MANIFEST", mf)
+
+    def test_manifest_config_reaches_the_script_runner(self):
+        # SKILL.md sends users to the manifest config block — a manifest-only
+        # install must work with no env and no CLI flags (the Codex P1).
+        with self._with_manifest({"BEE_PROXY_URL": self.base}), \
+             patch.object(sys, "argv", ["bee_actions.py", "list-todos"]), \
+             patch.dict(os.environ, {"BEE_PROXY_URL": "", "BEE_API_BASE": "",
+                                     "BEE_API_TOKEN": ""}):
+            self.assertEqual(self.mod.main(), 0)
+        self.assertEqual(_Server.calls[-1]["path"], "/v1/todos?limit=20")
+
+    def test_manifest_supplies_room_id_for_post_room(self):
+        with self._with_manifest({"BEE_ROOM_ID": "!frommanifest:ag2.space"}):
+            rc, _ = self._run_room("post-room", "hi")
+        self.assertEqual(rc, 0)
+        self.assertEqual(_Server.calls[-1]["body"]["room_id"], "!frommanifest:ag2.space")
+
+    def test_env_overrides_manifest(self):
+        # Precedence is CLI > env > manifest: a live env value must win over
+        # a conflicting manifest value.
+        with self._with_manifest({"BEE_PROXY_URL": "http://127.0.0.1:1"}), \
+             patch.object(sys, "argv", ["bee_actions.py", "list-todos"]), \
+             patch.dict(os.environ, {"BEE_PROXY_URL": self.base, "BEE_API_BASE": "",
+                                     "BEE_API_TOKEN": ""}):
+            self.assertEqual(self.mod.main(), 0)   # stub answered -> env won
+
     def test_room_state_path_resolves_under_workspace(self):
         # The real (unpatched) state-path helper must resolve to
         # <workspace>/state/bee-room.json via workspace_default.

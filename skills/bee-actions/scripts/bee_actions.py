@@ -17,7 +17,8 @@ Safety posture:
   - DELETE verbs are destructive on the owner's device data: they refuse
     without --yes, so the agent must surface the deletion for confirmation.
 
-Config (env; CLI flags override; bearer prefers the vault):
+Config — CLI > env > manifest.json `config` block (per skills/MANIFEST.md;
+empty strings are unset at every tier); bearer prefers the vault:
   BEE_PROXY_URL   local authed proxy (after `bee login`), e.g. http://127.0.0.1:4470
   BEE_API_BASE    Bee cloud API base — used with BEE_API_TOKEN when set (wins
                   over the proxy; same endpoints, bearer auth)
@@ -41,7 +42,7 @@ no notes field, so the text IS the record) — visible in the owner's Bee app.
 
 `post-room` is the ag2space half of the loop: Bee has no inbound reply surface,
 so Sutando's replies about Bee items go to a registered Bee room on ag2space.
-Room resolution: --room > BEE_ROOM_ID env > <workspace>/state/bee-room.json;
+Room resolution: --room > BEE_ROOM_ID env > manifest > <workspace>/state/bee-room.json;
 if none is registered and an owner is known (--invite / BEE_ROOM_OWNER), the
 room is auto-registered first: a private room with just the owner invited —
 effectively a DM thread — created via gateway op:create and persisted, so the
@@ -68,6 +69,28 @@ _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO / "shared"))
 
+_MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
+
+
+def _manifest_config() -> dict:
+    """The skill's manifest `config` block; {} when absent/unreadable."""
+    try:
+        cfg = json.loads(_MANIFEST.read_text()).get("config", {})
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cfg(args, attr: str, key: str) -> str:
+    """One setting under the skills/MANIFEST.md precedence the SKILL.md
+    documents: CLI > env > manifest (state stays each caller's last resort).
+    Empty strings are unset at every tier."""
+    for val in (getattr(args, attr, None), os.environ.get(key),
+                _manifest_config().get(key)):
+        if val and str(val).strip():
+            return str(val).strip()
+    return ""
+
 
 def _gateway_creds() -> "tuple[str, dict] | None":
     """(base_url, headers) for the ag2space gateway, or None if unconfigured."""
@@ -91,8 +114,8 @@ def _room_state_path() -> Path:
 
 
 def _bee_room(args) -> str:
-    """--room > BEE_ROOM_ID env > workspace state file. '' if unresolved."""
-    room = (getattr(args, "room", "") or os.environ.get("BEE_ROOM_ID", "")).strip()
+    """--room > BEE_ROOM_ID env > manifest > workspace state file. '' if unresolved."""
+    room = _cfg(args, "room", "BEE_ROOM_ID")
     if room:
         return room
     try:
@@ -129,8 +152,8 @@ def _fail(msg: str, code: int = 1) -> "int":
 
 def _resolve_base(args) -> "tuple[str, dict] | None":
     """(base_url, headers) — cloud bearer wins over local proxy, like the watcher."""
-    api_base = (args.api_base or os.environ.get("BEE_API_BASE", "")).strip()
-    token = (args.api_token or os.environ.get("BEE_API_TOKEN", "")).strip()
+    api_base = _cfg(args, "api_base", "BEE_API_BASE")
+    token = _cfg(args, "api_token", "BEE_API_TOKEN")
     if api_base and not token:
         try:  # vault is the preferred home for bearers
             from vault_intercept import get_vault_key
@@ -139,7 +162,7 @@ def _resolve_base(args) -> "tuple[str, dict] | None":
             token = ""
     if api_base and token:
         return api_base.rstrip("/"), {"Authorization": f"Bearer {token}"}
-    proxy = (args.proxy_url or os.environ.get("BEE_PROXY_URL", "")).strip()
+    proxy = _cfg(args, "proxy_url", "BEE_PROXY_URL")
     if proxy:
         return proxy.rstrip("/"), {}
     return None
@@ -201,7 +224,7 @@ def main() -> int:
             return _fail("no gateway configured: set GATEWAY_TOKEN / "
                          "REMOTE_TASK_TOKEN (combined url|secret ok)", 2)
         gbase, gheaders = gw
-        invite = (args.invite or os.environ.get("BEE_ROOM_OWNER", "")).strip()
+        invite = _cfg(args, "invite", "BEE_ROOM_OWNER")
         try:
             if args.verb == "register-room":
                 if args.room:  # user picked a room — record it, create nothing
