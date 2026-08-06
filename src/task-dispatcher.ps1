@@ -59,9 +59,17 @@ foreach ($d in $TASKS, $RESULTS, $ARCHIVE, $LOGS) {
 if ($Background) {
     # Self-relaunch in a hidden window; parent returns immediately.
     $psExe = (Get-Command pwsh -ErrorAction SilentlyContinue) ?? (Get-Command powershell -ErrorAction SilentlyContinue)
+    # Explicitly redirect the detached child's console handles. In a piped
+    # caller (CI, restart.ps1 output capture, service wrappers), inheriting
+    # stdout/stderr keeps the parent's pipe open indefinitely even after the
+    # launcher exits, so restart appears hung while services are already live.
+    $stdoutLog = Join-Path $LOGS 'task-dispatcher.stdout.log'
+    $stderrLog = Join-Path $LOGS 'task-dispatcher.stderr.log'
     Start-Process -FilePath $psExe.Source -ArgumentList @(
         '-NoProfile', '-File', $PSCommandPath
-    ) -WindowStyle Hidden | Out-Null
+    ) -WindowStyle Hidden `
+      -RedirectStandardOutput $stdoutLog `
+      -RedirectStandardError $stderrLog | Out-Null
     Write-Host "task-dispatcher launched in background. Log: $LOGFILE"
     exit 0
 }
