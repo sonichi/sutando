@@ -39,13 +39,23 @@ class _Server(BaseHTTPRequestHandler):
             "auth": self.headers.get("Authorization"),
             "body": parsed,
         })
+        if self.path.startswith("/gwfail") or self.path.endswith("/boom"):
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b'{"error": "stub failure"}')
+            return
         self.send_response(200)
         self.end_headers()
-        if self.command == "GET" and self.path.startswith("/v1/todos/"):
+        if self.path == "/v1/conversations/rawbody":
+            self.wfile.write(b"plain text, not json")
+        elif self.command == "GET" and self.path.startswith("/v1/todos/"):
             self.wfile.write(b'{"id": 42, "text": "stub todo", "completed": true}')
         elif self.path == "/v1/room" and isinstance(parsed, dict) \
                 and parsed.get("op") == "create":
-            self.wfile.write(b'{"room_id": "!created:stub"}')
+            if parsed.get("invite") == ["@noroom:stub"]:
+                self.wfile.write(b'{}')          # create "succeeds" without an id
+            else:
+                self.wfile.write(b'{"room_id": "!created:stub"}')
         else:
             self.wfile.write(b'{"ok": true, "todos": [{"id": 1, "completed": false},'
                              b' {"id": 2, "completed": true}]}')
@@ -209,6 +219,75 @@ class TestBeeActions(unittest.TestCase):
         persisted = json.loads((Path(self.tmpdir.name) / "bee-room.json").read_text())
         self.assertEqual(persisted["room_id"], "!mine:ag2.space")
         self.assertIn("existing", out)
+
+    def test_delete_fact_route_and_http_error_exit(self):
+        # delete-fact --yes hits its route; a server 5xx exits 1 via the
+        # HTTPError handler instead of crashing.
+        self.assertEqual(self._run("delete-fact", "6", "--yes"), 0)
+        c = _Server.calls[-1]
+        self.assertEqual((c["method"], c["path"]), ("DELETE", "/v1/facts/6"))
+        self.assertEqual(self._run("delete-fact", "boom", "--yes"), 1)
+        self.assertEqual(self._run("delete-todo", "boom", "--yes"), 1)
+
+    def test_non_json_response_wrapped_as_raw(self):
+        import io
+        buf = io.StringIO()
+        with patch.object(sys, "stdout", buf):
+            self.assertEqual(self._run("get-conversation", "rawbody"), 0)
+        self.assertEqual(json.loads(buf.getvalue()), {"raw": "plain text, not json"})
+
+    def test_vault_import_failure_falls_back_to_proxy(self):
+        import types
+        stub = types.ModuleType("vault_intercept")
+        def _boom(k):
+            raise RuntimeError("keychain unavailable")
+        stub.get_vault_key = _boom
+        with patch.dict(sys.modules, {"vault_intercept": stub}), \
+             patch.object(sys, "argv", ["bee_actions.py", "list-todos"]), \
+             patch.dict(os.environ, {"BEE_PROXY_URL": self.base,
+                                     "BEE_API_BASE": "https://cloud.example",
+                                     "BEE_API_TOKEN": ""}):
+            self.assertEqual(self.mod.main(), 0)
+        self.assertIsNone(_Server.calls[-1]["auth"])   # proxy path, no bearer
+
+    def test_room_verbs_without_gateway_creds_exit_2(self):
+        rc, _ = self._run_room("post-room", "msg",
+                               env={"REMOTE_TASK_TOKEN": "", "GATEWAY_TOKEN": "",
+                                    "RELAY_TOKEN": "", "AG2_REMOTE_TOKEN": ""})
+        self.assertEqual(rc, 2)
+        self.assertEqual(_Server.calls, [])
+
+    def test_register_room_create_without_id_exits_1(self):
+        rc, _ = self._run_room("register-room", "--invite", "@noroom:stub")
+        self.assertEqual(rc, 1)
+
+    def test_post_room_gateway_http_and_network_errors_exit_1(self):
+        rc, _ = self._run_room("post-room", "msg",
+                               env={"REMOTE_TASK_TOKEN": f"{self.base}/gwfail|tok",
+                                    "BEE_ROOM_ID": "!bee:ag2.space"})
+        self.assertEqual(rc, 1)                        # HTTPError branch
+        rc, _ = self._run_room("post-room", "msg",
+                               env={"REMOTE_TASK_TOKEN": "http://127.0.0.1:1|tok",
+                                    "BEE_ROOM_ID": "!bee:ag2.space"})
+        self.assertEqual(rc, 1)                        # URLError branch
+
+    def test_register_room_create_success_prints_created(self):
+        rc, out = self._run_room("register-room", "--invite", "@owner:ag2.space")
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), {"room_id": "!created:stub",
+                                           "registered": "created"})
+
+    def test_bee_api_network_error_exits_1(self):
+        with patch.object(sys, "argv", ["bee_actions.py", "list-todos"]), \
+             patch.dict(os.environ, {"BEE_PROXY_URL": "http://127.0.0.1:1",
+                                     "BEE_API_BASE": "", "BEE_API_TOKEN": ""}):
+            self.assertEqual(self.mod.main(), 1)
+
+    def test_room_state_path_resolves_under_workspace(self):
+        # The real (unpatched) state-path helper must resolve to
+        # <workspace>/state/bee-room.json via workspace_default.
+        p = self.mod._room_state_path()
+        self.assertTrue(str(p).endswith("state/bee-room.json"), p)
 
     def test_unconfigured_exits_2(self):
         with patch.object(sys, "argv", ["bee_actions.py", "list-todos"]), \
