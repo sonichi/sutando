@@ -7,11 +7,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveWorkspace } from './workspace_default.js';
-import { claudeHomePath } from './util_paths.js';
+import { claudeHomePath, claudeProjectSlug } from './util_paths.js';
 
 function defaultMemoryDir(): string {
     const repo = resolve(join(import.meta.dirname, '..'));
-    const slug = repo.replace(/\//g, '-');
+    const slug = claudeProjectSlug(repo);
     return claudeHomePath('projects', slug, 'memory');
 }
 

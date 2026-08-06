@@ -17,7 +17,7 @@ import { homedir, tmpdir } from 'node:os';
  */
 
 function bootstrapMemoryDir(workspaceDir: string, envOverride?: string): { memDir: string; created: boolean; error?: string } {
-	const slug = '-' + workspaceDir.replace(/\/$/, '').split('/').filter(Boolean).join('-');
+	const slug = workspaceDir.replace(/[\\/]+$/, '').replace(/[^a-zA-Z0-9]/g, '-');
 	const memDir = envOverride || join(homedir(), '.claude', 'projects', slug, 'memory');
 	let created = false;
 	try {
@@ -109,6 +109,12 @@ describe('bootstrapMemoryDir — env override', () => {
 	it('strips a trailing slash from the workspace dir before slugging', () => {
 		const out = bootstrapMemoryDir('/Users/test/GitHub/sutando/');
 		const expected = join(homedir(), '.claude', 'projects', '-Users-test-GitHub-sutando', 'memory');
+		assert.equal(out.memDir, expected);
+	});
+
+	it('replaces Windows drive and separator characters with dashes', () => {
+		const out = bootstrapMemoryDir('Q:\\Repos\\sutando');
+		const expected = join(homedir(), '.claude', 'projects', 'Q--Repos-sutando', 'memory');
 		assert.equal(out.memDir, expected);
 	});
 });

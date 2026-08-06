@@ -33,6 +33,11 @@ function expandHome(p: string): string {
 	return p.replace(/^~/, process.env.HOME || '');
 }
 
+/** Encode an absolute path the same way Claude Code names projects/<slug>. */
+export function claudeProjectSlug(path: string): string {
+	return path.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
 /**
  * Return the resolved memory-dir env value, preferring the new name.
  *

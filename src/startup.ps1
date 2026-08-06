@@ -23,6 +23,7 @@ param(
     [switch]$SkipDiscord,
     [switch]$SkipCore,
     [switch]$SkipDispatcher,
+    [switch]$NoBrowser,
     [switch]$ValidateOnly
 )
 
@@ -310,7 +311,9 @@ foreach ($p in $VERIFY.Keys) {
     }
 }
 Write-Host ""
-Start-Process "http://localhost:8080"
+if (-not $NoBrowser) {
+    Start-Process "http://localhost:8080"
+}
 
 # --- Core agent (Claude Code) -----------------------------------------------
 # The services above are the data plane (voice in/out, task storage, UI);
