@@ -6,7 +6,6 @@
 gateway surface: ``ag2_sparrow.remote_gateway_bridge._write_task`` emitted
 nothing, so ``task_processed{source="ag2space"}`` never existed and gateway
 activity was invisible in the product metrics (owner report 2026-07-30).
-
 Covers:
   1. a newly queued task fires task_processed with the task's `source` value
   2. a task with no source falls back to PROVIDER (same value the file header gets)
