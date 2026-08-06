@@ -187,8 +187,7 @@ from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
 from .result_ready import read_ready_result
-from .result_markers import dedup_holder_delivered
-from .local_task_protocol import find_archived_result
+from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -282,6 +281,9 @@ INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
 TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
+# Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
+# fresh local id, but the delivery it answers is still the original one.
+DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 # sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
@@ -1629,6 +1631,32 @@ def _write_task(task: dict) -> str | None:
     return tid
 
 
+def _load_dedup_aliases() -> dict[str, str]:
+    try:
+        return json.loads(DEDUP_ALIAS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_dedup_aliases(aliases: dict[str, str]) -> None:
+    try:
+        DEDUP_ALIAS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEDUP_ALIAS_FILE.write_text(json.dumps(aliases))
+    except OSError as exc:
+        _log(f"could not persist dedup aliases: {exc}")
+
+
+def _delivery_tid(tid: str) -> str:
+    """The id to POST under: a re-ask answers the original delivery."""
+    return _load_dedup_aliases().get(tid, tid)
+
+
+def _forget_dedup_alias(tid: str) -> None:
+    aliases = _load_dedup_aliases()
+    if aliases.pop(tid, None) is not None:
+        _save_dedup_aliases(aliases)
+
+
 def _load_task_rooms() -> dict[str, str]:
     """Restore the {task id → room id} sidecar map (fail-open to empty)."""
     try:
@@ -1751,18 +1779,25 @@ def _save_inflight(inflight: set[str]) -> None:
 _uploaded_attachments: set[tuple[str, str]] = set()
 
 
-def _dedup_holder_answered(holder_id: str | None) -> bool:
-    """Did the dedup holder actually deliver? Unknown holder counts as no."""
-    if not holder_id:
-        return False
-    archived = find_archived_result(RESULTS_DIR, holder_id.strip())
-    text = None
-    if archived is not None:
-        try:
-            text = archived.read_text()
-        except OSError:
-            text = None
-    return dedup_holder_delivered(text)
+def _dedup_plan(tid: str, holder_id: str | None):
+    """Shared dedup recovery, bound to this adapter's directories.
+
+    A requeue carries the delivery forward: the re-ask keeps the room, stays
+    in flight, and aliases back to the id the broker is waiting on. Without
+    that the re-ask is written and its answer is never looked for.
+    """
+    room = _load_task_rooms().get(tid, "")
+    action, payload = plan_dedup_recovery(
+        RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
+        f"task-{uuid.uuid4().hex[:18]}")
+    if action == "requeue":
+        rooms = _load_task_rooms()
+        rooms[payload] = room
+        _save_task_rooms(rooms)
+        aliases = _load_dedup_aliases()
+        aliases[payload] = _delivery_tid(tid)
+        _save_dedup_aliases(aliases)
+    return action, payload, room
 
 
 def _post_ready_results(inflight: set[str]) -> None:
@@ -1780,11 +1815,24 @@ def _post_ready_results(inflight: set[str]) -> None:
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
-        if skip and skip.value == "deduped" and not _dedup_holder_answered(skip.extra):
-            # The holder never delivered, so archiving here would strand the ask
-            # and every retry carrying the same marker.
-            _log(f"refusing dedup for {tid}: holder {skip.extra} delivered nothing")
-            continue
+        if skip and skip.value == "deduped":
+            action, payload, room = _dedup_plan(tid, skip.extra)
+            if action != "honour":
+                if action == "report" and room:
+                    try:
+                        _req("POST", "/v1/results",
+                             {"id": _broker_tid(_delivery_tid(tid)), "body": payload})
+                    except Exception as exc:  # noqa: BLE001 - never block the archive
+                        _log(f"dedup report failed for {tid}: {exc}")
+                _log(f"dedup {action} for {tid} (holder {skip.extra} delivered nothing)")
+                _archive_result(rfile, tid)
+                inflight.discard(tid)
+                _forget_task_room(tid)
+                _forget_dedup_alias(tid)
+                if action == "requeue":
+                    inflight.add(payload)
+                changed = True
+                continue
         if skip:
             # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
             # archive without POSTing (match the other bridges' semantics).
@@ -1826,7 +1874,8 @@ def _post_ready_results(inflight: set[str]) -> None:
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
         try:
-            _req("POST", "/v1/results", {"id": _broker_tid(tid), "body": out_body})
+            _req("POST", "/v1/results",
+                 {"id": _broker_tid(_delivery_tid(tid)), "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
@@ -1836,6 +1885,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         _archive_result(rfile, tid)
         inflight.discard(tid)
         _forget_task_room(tid)
+        _forget_dedup_alias(tid)
         changed = True
         _log(f"delivered result for {tid}")
     if changed:

@@ -476,14 +476,44 @@ def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
 
 
 def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
-    """Locate an archived result for `task_id` (`archive/<id>-<epoch>.txt`)."""
+    """Locate an archived result across BOTH layouts in use.
+
+    The messaging bridges archive as `archive/<YYYY-MM>/<id>.txt` via
+    `archive_path`; the gateway archives flat as `archive/<id>-<epoch>.txt`.
+    A locator that knows only one silently returns None for the other, which
+    reads as "this task never delivered" — the wrong answer for any caller
+    deciding whether a delivery happened.
+
+    Month scan mirrors `find_archived_task`: scandir, filter on NAME before
+    asking is_dir, newest month first. Rejects malformed ids rather than
+    globbing with them (traversal gate).
+    """
     if not valid_archive_lookup_id(task_id):
         return None
     archive = Path(results_dir) / "archive"
-    if not archive.is_dir():
-        return None
-    matches = sorted(archive.glob(f"{task_id}-*.txt"))
-    return matches[-1] if matches else None
+    fname = f"{task_id}.txt"
+
+    direct = archive / fname
+    if direct.is_file():
+        return direct
+
+    try:
+        with os.scandir(archive) as entries:
+            months = sorted((e.name for e in entries
+                             if _MONTH_DIR_RE.match(e.name) and e.is_dir()),
+                            reverse=True)
+    except (OSError, ValueError):
+        months = []
+    for month in months:
+        candidate = archive / month / fname
+        if candidate.is_file():
+            return candidate
+
+    try:
+        flat = sorted(archive.glob(f"{task_id}-*.txt"))
+    except (OSError, ValueError):
+        flat = []
+    return flat[-1] if flat else None
 
 
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:

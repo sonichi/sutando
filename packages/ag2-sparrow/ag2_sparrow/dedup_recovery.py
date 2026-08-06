@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Recovery for a `[deduped: <holder>]` result whose holder never answered.
+
+`result_markers.dedup_decision` decides; this binds that decision to a
+workspace and performs the filesystem half, so every adapter keeps only its
+own routing and notification.
+
+Returns a `(action, payload)` plan rather than acting on the channel itself:
+adapters differ in whether sending is sync or async, and keeping that at the
+edge makes the policy testable without a live bridge.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+# This file is bundled verbatim into ag2_sparrow, where its siblings are
+# package submodules; in src/ they are flat modules. Support both.
+try:  # pragma: no cover - exercised by whichever context imports it
+    from .local_task_protocol import find_archived_result
+    from .result_markers import (
+        build_requeued_task,
+        dedup_decision,
+        dedup_requeue_count,
+    )
+    from .task_archive import find_task_file
+except ImportError:  # pragma: no cover - flat src/ import path
+    from local_task_protocol import find_archived_result
+    from result_markers import (
+        build_requeued_task,
+        dedup_decision,
+        dedup_requeue_count,
+    )
+    from task_archive import find_task_file
+
+__all__ = ["plan_dedup_recovery", "REPORT_TEMPLATE"]
+
+REPORT_TEMPLATE = (
+    "⚠️ This was folded into `{holder}`, which delivered nothing, and "
+    "re-asking didn't recover it. It needs a direct answer."
+)
+
+
+def _read(path) -> str | None:
+    if path is None:
+        return None
+    try:
+        return path.read_text()
+    except OSError:
+        return None
+
+
+def plan_dedup_recovery(
+    results_dir: Path,
+    tasks_dir: Path,
+    task_id: str,
+    holder_id: str | None,
+    asking_channel,
+    new_task_id: str,
+) -> tuple[str, str | None]:
+    """Decide and perform the filesystem half of dedup recovery.
+
+    Returns one of:
+      ``("honour", None)``     — the holder answered; archive as before.
+      ``("requeue", new_id)``  — a re-ask was written; route its reply.
+      ``("report", message)``  — tell the asker; do not re-ask again.
+
+    The requeued task is written before returning, so a caller that only routes
+    cannot end up advertising a task that does not exist.
+    """
+    holder = (holder_id or "").strip()
+    orig_text = _read(find_task_file(Path(tasks_dir), task_id))
+    holder_text = _read(find_archived_result(Path(results_dir), holder)) if holder else None
+
+    decision = dedup_decision(holder_text, orig_text)
+    if decision == "honour":
+        return "honour", None
+
+    if decision == "requeue" and orig_text:
+        body = build_requeued_task(
+            orig_text, new_task_id, dedup_requeue_count(orig_text) + 1,
+            asking_channel, holder, reason="holder-empty",
+        )
+        try:
+            (Path(tasks_dir) / f"{new_task_id}.txt").write_text(body)
+        except OSError:
+            # Cannot re-ask; fall through to telling the asker rather than
+            # silently archiving against a delivery that never happened.
+            return "report", REPORT_TEMPLATE.format(holder=holder)
+        return "requeue", new_task_id
+
+    return "report", REPORT_TEMPLATE.format(holder=holder)

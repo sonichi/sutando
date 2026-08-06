@@ -17,7 +17,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from local_task_protocol import find_archived_result  # noqa: E402
-from result_markers import dedup_holder_delivered, parse_markers  # noqa: E402
+from result_markers import (  # noqa: E402
+    build_requeued_task, dedup_decision, dedup_holder_delivered, parse_markers,
+)
 
 HOLDER = "task-22d83e59601f3a1fef"
 
@@ -100,6 +102,42 @@ class DeadEndTest(unittest.TestCase):
             (arc / f"{HOLDER}-1785976425.txt").write_text("the real answer")
             archived = find_archived_result(Path(td), HOLDER)
             self.assertTrue(dedup_holder_delivered(archived.read_text()))
+
+
+class DecisionTest(unittest.TestCase):
+    """honour / requeue / report — the whole policy, in one place."""
+
+    def test_holder_answered_is_honoured(self):
+        self.assertEqual(dedup_decision("a real answer", "id: task-1"), "honour")
+
+    def test_holder_empty_is_requeued_first(self):
+        self.assertEqual(dedup_decision("", "id: task-1"), "requeue")
+
+    def test_second_failure_reports_instead_of_looping(self):
+        self.assertEqual(
+            dedup_decision("", "id: task-1\ndedup_requeue_count: 1"), "report")
+
+    def test_unknown_holder_is_requeued(self):
+        self.assertEqual(dedup_decision(None, "id: task-1"), "requeue")
+
+    def test_holder_that_skipped_is_requeued(self):
+        self.assertEqual(dedup_decision("[no-send]", "id: task-1"), "requeue")
+
+
+class RequeueReasonTest(unittest.TestCase):
+    def test_holder_empty_reason_tells_the_core_what_went_wrong(self):
+        body = build_requeued_task("id: task-1\ntask: q", "task-2", 1, "C1",
+                                   HOLDER, reason="holder-empty")
+        self.assertIn("delivered nothing", body)
+        self.assertIn("Answer THIS task directly", body)
+        self.assertIn("dedup_requeue_count: 1", body)
+        self.assertIn("id: task-2", body)
+
+    def test_default_reason_is_unchanged(self):
+        """The existing cross-channel caller must keep its wording."""
+        body = build_requeued_task("id: task-1\ntask: q", "task-2", 1, "C1", HOLDER)
+        self.assertIn("DIFFERENT channel", body)
+        self.assertNotIn("delivered nothing", body)
 
 
 if __name__ == "__main__":

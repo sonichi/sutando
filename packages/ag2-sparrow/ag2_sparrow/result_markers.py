@@ -312,8 +312,41 @@ def dedup_requeue_count(task_text: str | None) -> int:
     return int(m.group(1)) if m else 0
 
 
+def dedup_decision(holder_result_text: str | None, orig_task_text: str | None) -> str:
+    """What to do with a `[deduped: <holder>]` result.
+
+    ``"honour"``  — the holder answered; archive silently as before.
+    ``"requeue"`` — it did not; re-ask so the question actually gets answered.
+    ``"report"``  — re-asking already failed once; tell the owner instead of looping.
+
+    Pure. The caller supplies the holder's archived result text (None when the
+    archive has no record) and the original task text (for the loop guard).
+    """
+    if dedup_holder_delivered(holder_result_text):
+        return "honour"
+    if dedup_requeue_count(orig_task_text) >= 1:
+        return "report"
+    return "requeue"
+
+
+_REQUEUE_REASONS = {
+    "cross-channel": lambda holder_id, asking_channel: (
+        f"Your previous result used [deduped: {holder_id}], but that holder task is in a "
+        f"DIFFERENT channel. Dedup is per-channel only — a cross-channel dedup leaves this "
+        f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
+        "Do NOT [deduped:] across channels.\n"
+    ),
+    "holder-empty": lambda holder_id, asking_channel: (
+        f"Your previous result used [deduped: {holder_id}], but that holder delivered nothing, "
+        "so this question was never answered. Answer THIS task directly and in full. Only use "
+        "[deduped:] when the holder task carries the complete reply.\n"
+    ),
+}
+
+
 def build_requeued_task(
-    orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str
+    orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str,
+    reason: str = "cross-channel",
 ) -> str:
     """Rewrite an original task for re-processing after a REJECTED cross-channel
     dedup. Keeps the original fields (channel_id, access_tier, source, body, …)
@@ -343,11 +376,10 @@ def build_requeued_task(
         lines.append(f"dedup_requeue_count: {count}")
     note = (
         "\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-        f"Your previous result used [deduped: {holder_id}], but that holder task is in a "
-        f"DIFFERENT channel. Dedup is per-channel only — a cross-channel dedup leaves this "
-        f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
-        "Do NOT [deduped:] across channels.\n"
-        "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
+        + _REQUEUE_REASONS.get(reason, _REQUEUE_REASONS["cross-channel"])(
+            holder_id, asking_channel
+        )
+        + "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
     )
     return "\n".join(lines) + note
 
