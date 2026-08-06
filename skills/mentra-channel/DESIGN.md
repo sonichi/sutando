@@ -1,0 +1,84 @@
+# Mentra channel — design (pre-implementation)
+
+Owner directive 2026-08-06: wearables order is Bee → **Mentra** → Even
+Realities; she owns the hardware, so live E2E is available. This doc pins the
+verified SDK facts and the architecture before any code — sibling in spirit
+to the Teams design doc (ag2space-backend#443).
+
+## Verified SDK surface (cloud-docs.mentra.glass, checked 2026-08-06)
+
+- npm `@mentraos/sdk`; app = a self-hosted server holding an `AppSession`
+  per user session: `new AppSession({ packageName, apiKey, cloudUrl:
+  "wss://cloud.mentraos.com/app-ws" })`.
+- Session lifecycle is **webhook-initiated**: MentraOS Cloud POSTs
+  `https://<app-domain>/webhook/session-start` with `sessionId` + `userId`;
+  the app then opens the WebSocket for that session.
+- Inbound: `session.events.onTranscription()` → `{ text,
+  transcribeLanguage, … }` — live speech transcription pushed to us.
+- Outbound (native reply legs): `session.layouts.showTextWall()` /
+  `showReferenceCard()` / `showDashboardCard()` for the HUD;
+  `session.audio.speak()` (TTS) / `session.audio.play()` for speakers.
+- Full-duplex, event-push, per-user session binding. Works across MentraOS
+  hardware (Mentra Live, Even Realities G1, Vuzix Z100, …).
+
+## Architecture: where each piece lives
+
+```
+glasses ── MentraOS Cloud ──(webhook + WS)── mentra app server (ours, public URL)
+                                                  │  events → tasks     ▲ results
+                                                  ▼                     │
+                                    broker /v1/ingest (source=mentra)   │
+                                                  │                     │
+                              sparrow lane (mentra-lane agent) → core ──┘
+```
+
+- **The app server is a client-side adapter** (like the Bee watcher, unlike
+  the Teams broker module): MentraOS only talks to a server WE host over its
+  own webhook+WS protocol, so the adapter cannot live inside the broker.
+  New skill `skills/mentra-channel/` (TypeScript, `@mentraos/sdk`).
+- **Inbound:** utterance segments from `onTranscription` are debounced into
+  message-sized chunks (final-transcript boundaries, not per-word), then
+  POSTed to the broker's `/v1/ingest` as `source: "mentra"` tasks
+  (`user_id` = MentraOS `userId`, `channel_id` = `sessionId`), exactly the
+  Bee pattern. The broker needs zero changes for inbound.
+- **Outbound:** the app server long-polls `GET /v1/result/<task-id>` (the
+  broker already records + serves every result) and renders arrivals via
+  `showTextWall` + optional `audio.speak` while the session is live. This
+  keeps the native reply leg where the connection is, without inventing a
+  broker→app-server push channel.
+- **Offline fallback:** `INTEGRATION_FALLBACK_ROOM_MENTRA` (backend#444's
+  mechanism) as the delivery path when the session ended before the result
+  arrived — glasses off, answer lands in the Mentra DM room instead of
+  being dropped. Broker-side this is config only; no new code.
+- **Trigger discipline:** unlike Bee todos, raw transcription is a firehose.
+  v1 forwards ONLY wake-phrase-gated utterances ("hey sutando …" — exact
+  phrase TBD with owner) + an explicit button/gesture if the hardware
+  surfaces one. Everything else is dropped at the app server. A later
+  ambient mode can reuse the events-promotion (taskify) pipeline with
+  `access_tier: ambient` semantics; NOT in v1.
+
+## Registration / deployment (the non-code prerequisites)
+
+1. Mentra developer console account + app registration (`packageName`,
+   webhook URL, `MENTRAOS_API_KEY`) — needs an identity decision from the
+   owner (her account vs an agent account).
+2. A public HTTPS endpoint for the webhook + WS egress. Candidate: the EC2
+   box alongside the broker — **git-tracked deploy only** (owner hard rule
+   2026-07-16); a `deploy-mentra.yml` sibling of `deploy-broker.yml`.
+3. Secrets via vault: `MENTRAOS_API_KEY`, the lane's ingest bearer.
+
+## Test plan
+
+- Unit (no cloud): stub `AppSession` seam; pin debounce/wake-gate behavior,
+  ingest POST shape (source/user/channel/task-id alphabet — sparrow's
+  `[A-Za-z0-9._-]{1,64}` rule), result-poll → layout render, and
+  session-gone → no render (fallback room owns it).
+- Live E2E (owner wearing the device): wake phrase → task file on the lane →
+  core reply → text on glasses; then glasses-off → reply in the Mentra room.
+
+## Open items for the owner
+
+- Developer-account identity (her email vs agent email).
+- Wake phrase choice.
+- Which glasses to pair first (Mentra Live vs G1-under-MentraOS — the G1
+  answer interacts with the Even Hub track).
