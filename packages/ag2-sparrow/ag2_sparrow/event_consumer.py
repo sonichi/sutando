@@ -218,3 +218,5 @@ class EventConsumer:
         # crash re-drains them (no loss); the handler dedups them on re-drain.
         self._inbox.mark_consumed(settled)
         return {"seen": seen, "promoted": promoted, "consumed": len(settled)}
+
+# ci: re-trigger (squash-erased)
