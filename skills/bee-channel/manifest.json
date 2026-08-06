@@ -1,0 +1,14 @@
+{
+  "name": "bee-channel",
+  "enabled": true,
+  "access_tier": "owner",
+  "description": "Bee AI wearable as an inbound-only channel: a client-side watcher subscribes to the Bee local proxy's SSE event stream and posts selected events into the ag2space task broker via /v1/ingest (source=bee). Results route to the Bee fallback DM room broker-side (backend#444 asymmetric-channel rule). Config-only manifest — no runtime tools; run scripts/bee_watcher.py as a background process.",
+  "config": {
+    "BEE_PROXY_URL": "",
+    "BEE_EVENTS_PATH": "/v1/events",
+    "BEE_EVENT_TYPES": "todo-created,todo-updated",
+    "BEE_BROKER_URL": "",
+    "BEE_BROKER_TOKEN": "",
+    "BEE_AGENT_ID": "bee-lane"
+  }
+}
