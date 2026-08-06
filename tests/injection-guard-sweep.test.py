@@ -354,6 +354,11 @@ _GUARDED_PY_WRITERS = {
     "src/github-webhook.py",
     "src/agent-api.py",
     "src/cron-runner.py",
+    # Bee wearable lane: event_to_task confines the third-party device text
+    # (utterance/todo body) before it enters the task body; the local-sink
+    # writer then persists that already-defanged text. Bee events are
+    # room/device-trust, never owner-trust (persistence inherits source trust).
+    "skills/bee-channel/scripts/bee_watcher.py",
 }
 
 _TASK_FIELD_PATTERN = 'f"task: {'

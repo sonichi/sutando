@@ -76,6 +76,28 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "src"))
 
+# Bee events are THIRD-PARTY device content (a wearable's transcription/todo
+# text) — room-level trust, never the owner's. Their text is interpolated into
+# the task body the core reads and acts on, so it MUST be confined against
+# header/fence injection exactly like a Discord/Slack body. Import the shared
+# guard; if it is somehow unavailable (a stripped container), fail CLOSED with
+# an equivalent inline defang rather than persist raw untrusted text.
+try:
+    from task_body_guard import confine_user_content
+except Exception:  # pragma: no cover - only when src/ is absent
+    import re as _re
+    _ZWSP = "\u200b"
+    _INLINE_FORGE = _re.compile(r"^(={3,}|[\w-]+\s*:)")
+    _INLINE_SEP = _re.compile("\r\n|[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
+    def confine_user_content(text: str) -> str:
+        if not text:
+            return text
+        out = []
+        for line in _INLINE_SEP.sub("\n", text).split("\n"):
+            out.append(_ZWSP + line if _INLINE_FORGE.match(line.lstrip()) else line)
+        return "\n".join(out)
+
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,48}")
 _MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
 
@@ -163,6 +185,7 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
             break
     if not text:
         text = json.dumps(data, separators=(",", ":"))[:500]
+    text = confine_user_content(text)   # untrusted device content — defang
     conv = str(data.get("conversation_uuid") or data.get("conversation_id")
                or data.get("id") or event_id)[:120]
     stable = str(utt.get("id") or todo.get("id") or data.get("id") or event_id)
