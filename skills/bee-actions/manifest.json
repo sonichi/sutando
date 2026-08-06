@@ -9,6 +9,8 @@
   "config": {
     "BEE_PROXY_URL": "",
     "BEE_API_BASE": "",
-    "BEE_API_TOKEN": ""
+    "BEE_API_TOKEN": "",
+    "BEE_ROOM_ID": "",
+    "BEE_ROOM_OWNER": ""
   }
 }

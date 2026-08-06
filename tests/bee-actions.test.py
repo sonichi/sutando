@@ -33,15 +33,22 @@ class _Server(BaseHTTPRequestHandler):
     def _record(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n).decode() if n else ""
+        parsed = json.loads(body) if body else None
         _Server.calls.append({
             "method": self.command, "path": self.path,
             "auth": self.headers.get("Authorization"),
-            "body": json.loads(body) if body else None,
+            "body": parsed,
         })
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'{"ok": true, "todos": [{"id": 1, "completed": false},'
-                         b' {"id": 2, "completed": true}]}')
+        if self.command == "GET" and self.path.startswith("/v1/todos/"):
+            self.wfile.write(b'{"id": 42, "text": "stub todo", "completed": true}')
+        elif self.path == "/v1/room" and isinstance(parsed, dict) \
+                and parsed.get("op") == "create":
+            self.wfile.write(b'{"room_id": "!created:stub"}')
+        else:
+            self.wfile.write(b'{"ok": true, "todos": [{"id": 1, "completed": false},'
+                             b' {"id": 2, "completed": true}]}')
 
     do_GET = do_POST = do_PUT = do_DELETE = _record
 
@@ -61,8 +68,11 @@ class TestBeeActions(unittest.TestCase):
         cls.httpd.shutdown()
 
     def setUp(self):
+        import tempfile
         _Server.calls = []
         self.mod = _load()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
 
     def _run(self, *argv):
         with patch.object(sys, "argv", ["bee_actions.py", *argv]), \
@@ -136,6 +146,69 @@ class TestBeeActions(unittest.TestCase):
                                      "BEE_API_TOKEN": ""}):
             self.assertEqual(self.mod.main(), 0)
         self.assertEqual(_Server.calls[-1]["auth"], "Bearer tok-vault")
+
+    def test_complete_todo_how_appends_done_note(self):
+        # --how: complete first, then read the text, then rewrite it with the
+        # " — done:" record (Bee has no notes field; the text IS the record).
+        self.assertEqual(self._run("complete-todo", "42", "--how", "sent via Discord"), 0)
+        methods = [(c["method"], c["path"]) for c in _Server.calls]
+        self.assertEqual(methods, [("PUT", "/v1/todos/42"),
+                                   ("GET", "/v1/todos/42"),
+                                   ("PUT", "/v1/todos/42")])
+        self.assertEqual(_Server.calls[0]["body"], {"completed": True})
+        self.assertEqual(_Server.calls[2]["body"],
+                         {"text": "stub todo — done: sent via Discord"})
+
+    def _run_room(self, *argv, env=None):
+        import io
+        e = {"REMOTE_TASK_TOKEN": f"{self.base}|tok-gw",
+             "BEE_ROOM_ID": "", "BEE_ROOM_OWNER": ""}
+        e.update(env or {})
+        buf = io.StringIO()
+        with patch.object(sys, "argv", ["bee_actions.py", *argv]), \
+             patch.dict(os.environ, e), \
+             patch.object(self.mod, "_room_state_path",
+                          lambda: Path(self.tmpdir.name) / "bee-room.json"), \
+             patch.object(sys, "stdout", buf):
+            rc = self.mod.main()
+        return rc, buf.getvalue()
+
+    def test_post_room_posts_op_message_with_bearer(self):
+        rc, _out = self._run_room("post-room", "hello from sutando",
+                                  env={"BEE_ROOM_ID": "!bee:ag2.space"})
+        self.assertEqual(rc, 0)
+        c = _Server.calls[-1]
+        self.assertEqual((c["method"], c["path"]), ("POST", "/v1/room"))
+        self.assertEqual(c["auth"], "Bearer tok-gw")
+        self.assertEqual(c["body"], {"op": "message", "room_id": "!bee:ag2.space",
+                                     "body": "hello from sutando"})
+
+    def test_post_room_auto_registers_dm_room_when_owner_known(self):
+        # No room anywhere + BEE_ROOM_OWNER set -> op:create with the owner
+        # invited (the DM-by-default behavior), id persisted, then the message.
+        rc, _out = self._run_room("post-room", "first post",
+                                  env={"BEE_ROOM_OWNER": "@owner:ag2.space"})
+        self.assertEqual(rc, 0)
+        create, msg = _Server.calls[-2], _Server.calls[-1]
+        self.assertEqual(create["body"], {"op": "create", "name": "Sutando · Bee",
+                                          "invite": ["@owner:ag2.space"]})
+        self.assertEqual(msg["body"]["op"], "message")
+        self.assertEqual(msg["body"]["room_id"], "!created:stub")
+        persisted = json.loads((Path(self.tmpdir.name) / "bee-room.json").read_text())
+        self.assertEqual(persisted["room_id"], "!created:stub")
+
+    def test_post_room_without_room_or_owner_exits_2(self):
+        rc, _out = self._run_room("post-room", "orphan message")
+        self.assertEqual(rc, 2)
+        self.assertEqual(_Server.calls, [])
+
+    def test_register_room_records_user_picked_room(self):
+        rc, out = self._run_room("register-room", "--room", "!mine:ag2.space")
+        self.assertEqual(rc, 0)
+        self.assertEqual(_Server.calls, [])          # no create for existing
+        persisted = json.loads((Path(self.tmpdir.name) / "bee-room.json").read_text())
+        self.assertEqual(persisted["room_id"], "!mine:ag2.space")
+        self.assertIn("existing", out)
 
     def test_unconfigured_exits_2(self):
         with patch.object(sys, "argv", ["bee_actions.py", "list-todos"]), \

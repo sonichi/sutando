@@ -26,13 +26,28 @@ Config (env; CLI flags override; bearer prefers the vault):
 Usage:
   bee_actions.py list-todos [--limit N] [--all]
   bee_actions.py create-todo "text"
-  bee_actions.py complete-todo <id>
+  bee_actions.py complete-todo <id> [--how "how it was done"]
   bee_actions.py edit-todo <id> "new text"
   bee_actions.py delete-todo <id> --yes
   bee_actions.py list-conversations [--limit N]
   bee_actions.py get-conversation <id>
   bee_actions.py list-facts [--limit N]
   bee_actions.py delete-fact <id> --yes
+  bee_actions.py register-room [--room !id:server] [--invite @owner:server]
+  bee_actions.py post-room "message" [--room !id:server]
+
+`complete-todo --how` also appends " — done: <how>" to the todo text (Bee has
+no notes field, so the text IS the record) — visible in the owner's Bee app.
+
+`post-room` is the ag2space half of the loop: Bee has no inbound reply surface,
+so Sutando's replies about Bee items go to a registered Bee room on ag2space.
+Room resolution: --room > BEE_ROOM_ID env > <workspace>/state/bee-room.json;
+if none is registered and an owner is known (--invite / BEE_ROOM_OWNER), the
+room is auto-registered first: a private room with just the owner invited —
+effectively a DM thread — created via gateway op:create and persisted, so the
+user never has to register by hand. `register-room --room` records a room the
+user picked instead. Gateway creds via the shared contract (GATEWAY_TOKEN >
+RELAY_TOKEN > REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN; combined url|secret ok).
 
 Output is JSON on stdout (machine-readable for the calling agent); errors exit
 non-zero with a one-line reason on stderr.
@@ -49,7 +64,62 @@ import urllib.request
 from pathlib import Path
 
 # vault_intercept lives in <repo>/src; scripts/ -> bee-actions -> skills -> repo.
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+_REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO / "src"))
+sys.path.insert(0, str(_REPO / "shared"))
+
+
+def _gateway_creds() -> "tuple[str, dict] | None":
+    """(base_url, headers) for the ag2space gateway, or None if unconfigured."""
+    from ag2_gateway_credentials import normalize_credentials, resolve_alias_precedence
+    raw, _ = resolve_alias_precedence(
+        os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN",
+                     "AG2_REMOTE_TOKEN"))
+    url, _ = resolve_alias_precedence(
+        os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
+    creds = normalize_credentials(raw, explicit_url=url,
+                                  source="resolved" if raw else "none")
+    if not (creds.base_url and creds.token):
+        return None
+    return creds.base_url, {"Authorization": f"Bearer {creds.token}",
+                            "User-Agent": "sutando-bee-actions/1.0"}
+
+
+def _room_state_path() -> Path:
+    from workspace_default import resolve_workspace
+    return Path(resolve_workspace()) / "state" / "bee-room.json"
+
+
+def _bee_room(args) -> str:
+    """--room > BEE_ROOM_ID env > workspace state file. '' if unresolved."""
+    room = (getattr(args, "room", "") or os.environ.get("BEE_ROOM_ID", "")).strip()
+    if room:
+        return room
+    try:
+        return str(json.loads(_room_state_path().read_text())
+                   .get("room_id", "")).strip()
+    except Exception:
+        return ""
+
+
+def _persist_room(room_id: str) -> None:
+    p = _room_state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"room_id": room_id}) + "\n")
+
+
+def _register_room(gbase: str, gheaders: dict, invite: str) -> str:
+    """Create the Bee room (private, owner invited — a DM thread in practice),
+    persist its id, and return it. Raises HTTPError on gateway failure."""
+    payload = {"op": "create", "name": "Sutando · Bee"}
+    if invite:
+        payload["invite"] = [invite]
+    out = _call(gbase, gheaders, "POST", "/v1/room", body=payload)
+    room_id = str(out.get("room_id") or "").strip()
+    if not room_id:
+        raise RuntimeError(f"gateway create returned no room_id: {out}")
+    _persist_room(room_id)
+    return room_id
 
 
 def _fail(msg: str, code: int = 1) -> "int":
@@ -104,6 +174,7 @@ def main() -> int:
     p.add_argument("--all", action="store_true", help="include completed")
     p = sub.add_parser("create-todo"); p.add_argument("text")
     p = sub.add_parser("complete-todo"); p.add_argument("id")
+    p.add_argument("--how", help="append ' — done: <how>' to the todo text")
     p = sub.add_parser("edit-todo"); p.add_argument("id"); p.add_argument("text")
     p = sub.add_parser("delete-todo"); p.add_argument("id")
     p.add_argument("--yes", action="store_true")
@@ -112,7 +183,49 @@ def main() -> int:
     p = sub.add_parser("list-facts"); p.add_argument("--limit", type=int, default=50)
     p = sub.add_parser("delete-fact"); p.add_argument("id")
     p.add_argument("--yes", action="store_true")
+    p = sub.add_parser("post-room"); p.add_argument("text")
+    p.add_argument("--room", help="override BEE_ROOM_ID / state file")
+    p.add_argument("--invite", help="owner mxid for auto-registration")
+    p = sub.add_parser("register-room")
+    p.add_argument("--room", help="record this existing room instead of creating")
+    p.add_argument("--invite", help="owner mxid to invite on create")
     args = ap.parse_args()
+
+    # Room verbs talk to the ag2space gateway, not the Bee API — resolve and
+    # return before the Bee-base gate so they work with no Bee config at all.
+    if args.verb in ("post-room", "register-room"):
+        gw = _gateway_creds()
+        if not gw:
+            return _fail("no gateway configured: set GATEWAY_TOKEN / "
+                         "REMOTE_TASK_TOKEN (combined url|secret ok)", 2)
+        gbase, gheaders = gw
+        invite = (args.invite or os.environ.get("BEE_ROOM_OWNER", "")).strip()
+        try:
+            if args.verb == "register-room":
+                if args.room:  # user picked a room — record it, create nothing
+                    _persist_room(args.room.strip())
+                    print(json.dumps({"room_id": args.room.strip(),
+                                      "registered": "existing"}))
+                    return 0
+                room = _register_room(gbase, gheaders, invite)
+                print(json.dumps({"room_id": room, "registered": "created"}))
+                return 0
+            room = _bee_room(args)
+            if not room:
+                if not invite:
+                    return _fail(
+                        "no Bee room registered: run register-room, pass --room,"
+                        " or set BEE_ROOM_OWNER for auto-registration", 2)
+                room = _register_room(gbase, gheaders, invite)
+            out = _call(gbase, gheaders, "POST", "/v1/room",
+                        body={"op": "message", "room_id": room, "body": args.text})
+        except urllib.error.HTTPError as e:
+            return _fail(f"{args.verb} -> HTTP {e.code}: "
+                         f"{e.read(200).decode(errors='replace')}")
+        except (urllib.error.URLError, OSError, RuntimeError) as e:
+            return _fail(f"{args.verb} -> {e}")
+        print(json.dumps({"room_id": room, **out}, ensure_ascii=False))
+        return 0
 
     resolved = _resolve_base(args)
     if not resolved:
@@ -136,6 +249,13 @@ def main() -> int:
         elif args.verb == "complete-todo":
             out = _call(base, headers, "PUT", f"/v1/todos/{args.id}",
                         body={"completed": True})
+            if args.how:
+                # Bee todos have no notes field — the text IS the record.
+                cur = _call(base, headers, "GET", f"/v1/todos/{args.id}")
+                text = str(cur.get("text") or "").rstrip()
+                if text:
+                    out = _call(base, headers, "PUT", f"/v1/todos/{args.id}",
+                                body={"text": f"{text} — done: {args.how}"})
         elif args.verb == "edit-todo":
             out = _call(base, headers, "PUT", f"/v1/todos/{args.id}",
                         body={"text": args.text})
