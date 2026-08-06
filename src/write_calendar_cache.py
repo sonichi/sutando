@@ -74,7 +74,14 @@ def normalize_events(raw_events: list) -> list[dict]:
         else:
             raw, cal = str(ev).strip(), ""
         if raw:
-            events.append({"raw": raw, "calendar": cal})
+            ev_out = {"raw": raw, "calendar": cal}
+            # Optional and preserved only when the producer supplied it: piped
+            # events from the agent-side connector have no start, and must keep
+            # working exactly as before.
+            start = str(ev.get("start") or "").strip() if isinstance(ev, dict) else ""
+            if start:
+                ev_out["start"] = start
+            events.append(ev_out)
     return events
 
 
@@ -231,11 +238,15 @@ def events_from_gws(now: datetime | None = None, run=None) -> list[dict]:
             if ev.get("status") == "cancelled":
                 continue
             out.append({"raw": event_to_raw(ev), "calendar": cal["id"],
-                        "_sort": (ev.get("start") or {}).get("dateTime")
+                        "start": (ev.get("start") or {}).get("dateTime")
                                  or (ev.get("start") or {}).get("date") or ""})
-    out.sort(key=lambda e: e["_sort"])
-    for e in out:
-        e.pop("_sort", None)
+    out.sort(key=lambda e: e["start"])
+    # `start` is KEPT, not popped. It used to be a local sort key named `_sort`
+    # and was deleted right after sorting, so the one field that distinguishes
+    # "the day's first meeting" from "your next meeting" was computed and thrown
+    # away — and the briefing said "First up: <the day's first>" at any hour,
+    # naming a meeting that had already ended. Additive: the documented contract
+    # is {raw, calendar} and every reader ignores unknown keys.
     return out
 
 
