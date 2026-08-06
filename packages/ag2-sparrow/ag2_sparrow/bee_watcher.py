@@ -10,8 +10,8 @@ and POSTs them through the broker's authenticated inbound hop (/v1/ingest).
 Results route broker-side to the Bee fallback DM room — the asymmetric-channel
 rule shipped in backend#444 (`integrations/bee.py` + `fallback_room_for`).
 
-Config (manifest `config` block; env overrides manifest; CLI overrides env —
-per skills/MANIFEST.md read precedence):
+Config (CLI flag > BEE_* env > package default in _DEFAULTS). Run via the
+`sutando-bee-watcher` console entry point, or `python -m` the module:
   BEE_PROXY_URL     Bee local proxy base (e.g. http://127.0.0.1:<port>).
                     REQUIRED — empty means the skill is not configured and the
                     watcher exits 2 with a clear message instead of guessing.
@@ -99,7 +99,15 @@ except Exception:  # pragma: no cover - only when src/ is absent
         return "\n".join(out)
 
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,48}")
-_MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
+
+# Package-owned config defaults (was a skill manifest before this lane moved into
+# ag2-sparrow). Inline so the watcher is self-contained — no skill dir to resolve.
+_DEFAULTS = {
+    "BEE_EVENTS_PATH": "/v1/stream",              # verified live 2026-08-06
+    "BEE_EVENT_TYPES": "todo-created,todo-updated",  # conservative; utterances flood
+    "BEE_AGENT_ID": "bee-lane",
+    "BEE_SINK": "broker",
+}
 
 
 def _log(msg: str) -> None:
@@ -107,18 +115,14 @@ def _log(msg: str) -> None:
 
 
 def _config(cli: argparse.Namespace) -> dict:
-    """CLI > env > manifest, per the skill-config convention."""
-    try:
-        manifest = json.loads(_MANIFEST.read_text()).get("config", {})
-    except (OSError, ValueError):
-        manifest = {}
+    """CLI > env > package default."""
     cfg = {}
     for key in ("BEE_PROXY_URL", "BEE_EVENTS_PATH", "BEE_EVENT_TYPES",
                 "BEE_BROKER_URL", "BEE_BROKER_TOKEN", "BEE_AGENT_ID",
                 "BEE_SINK", "BEE_API_BASE", "BEE_API_TOKEN"):
         cli_val = getattr(cli, key.lower(), None)
         cfg[key] = (cli_val if cli_val not in (None, "")
-                    else os.environ.get(key, "").strip() or str(manifest.get(key, "")))
+                    else os.environ.get(key, "").strip() or _DEFAULTS.get(key, ""))
     for _k in ("BEE_BROKER_TOKEN", "BEE_API_TOKEN"):
         if not cfg[_k]:
             try:  # vault is the preferred home for bearers
@@ -137,8 +141,8 @@ def _cursor_path() -> Path:
     _explicit = os.environ.get("BEE_CURSOR_FILE", "").strip()
     if _explicit:
         return Path(_explicit)
-    from workspace_default import resolve_workspace
-    return Path(resolve_workspace()) / "state" / "bee-watcher-cursor.json"
+    from ag2_sparrow import _dirs
+    return _dirs.state_dir() / "bee-watcher-cursor.json"
 
 
 def _read_cursor() -> str:
@@ -220,9 +224,9 @@ def _write_local_task(task: dict) -> bool:
     `confine_user_content` (which defangs injection in the body) — that
     guards the text; this guards what the agent is allowed to DO with it.
     priority low: ambient wearable events shouldn't preempt direct asks."""
-    from workspace_default import resolve_workspace
+    from ag2_sparrow import _dirs
     import datetime
-    tasks_dir = Path(resolve_workspace()) / "tasks"
+    tasks_dir = _dirs.task_dir()
     tasks_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [f"id: {task['id']}", f"timestamp: {ts}", f"task: {task['task']}",
@@ -355,8 +359,8 @@ def main() -> int:
         required += [k for k in ("BEE_BROKER_URL", "BEE_BROKER_TOKEN") if not cfg[k]]
     missing = required
     if missing:
-        _log(f"not configured ({', '.join(missing)} unset) — see "
-             "skills/bee-channel/manifest.json; exiting")
+        _log(f"not configured ({', '.join(missing)} unset) — set via CLI flags "
+             "or BEE_* env (see this module's docstring); exiting")
         return 2
     return run(cfg, once=args.once, max_events=args.max_events)
 

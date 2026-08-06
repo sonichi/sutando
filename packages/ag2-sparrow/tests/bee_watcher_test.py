@@ -22,8 +22,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-_WATCHER = (Path(__file__).resolve().parent.parent
-            / "skills" / "bee-channel" / "scripts" / "bee_watcher.py")
+_PKG_ROOT = Path(__file__).resolve().parent.parent   # packages/ag2-sparrow
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))               # so the watcher's `from ag2_sparrow import _dirs` resolves
+_WATCHER = _PKG_ROOT / "ag2_sparrow" / "bee_watcher.py"
 
 SSE_BODY = (
     b"event: todo-created\n"
@@ -152,21 +154,18 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertEqual(set(_Server.auth_seen), {"Bearer tok-abc"})
 
     def test_bee_cursor_file_env_overrides_workspace(self):
-        # Container portability (roadmap: headless runner has no sutando
-        # workspace): BEE_CURSOR_FILE is honored verbatim, and workspace_default
-        # is never imported when it is set.
-        import types
+        # Container portability (headless runner has no local state dir):
+        # BEE_CURSOR_FILE is honored verbatim, and the _dirs fallback is never
+        # consulted when it is set.
+        from ag2_sparrow import _dirs
         explicit = Path(self.tmp.name) / "podvol" / "cursor.json"
         explicit.parent.mkdir(parents=True, exist_ok=True)
-        # Poison workspace_default so any fallback import would fail loudly.
-        broken = types.ModuleType("workspace_default")
         def _boom():
-            raise AssertionError("workspace_default must not be used when BEE_CURSOR_FILE set")
-        broken.resolve_workspace = _boom
+            raise AssertionError("_dirs fallback must not be used when BEE_CURSOR_FILE set")
         self._patch.stop()  # lift the sandbox _cursor_path patch from setUp
         try:
             with patch.dict(os.environ, {"BEE_CURSOR_FILE": str(explicit)}), \
-                 patch.dict(sys.modules, {"workspace_default": broken}):
+                 patch.object(_dirs, "state_dir", _boom):
                 self.assertEqual(self.mod._cursor_path(), explicit)
                 self.mod._write_cursor("ev-42")
                 self.assertEqual(self.mod._read_cursor(), "ev-42")
@@ -186,18 +185,17 @@ class TestBeeWatcher(unittest.TestCase):
         # BEE_SINK=local (the fully-OSS mode): events land as task FILES on
         # the local file bridge — atomic, well-formed headers, idempotent on
         # redelivery — and the broker is never contacted.
-        import types
-        wsmod = types.ModuleType("workspace_default")
-        wsdir = Path(self.tmp.name) / "localws"
-        wsmod.resolve_workspace = lambda: str(wsdir)
+        from ag2_sparrow import _dirs
+        tasksdir = Path(self.tmp.name) / "localws" / "tasks"
+        _dirs.set_dirs(task_dir=str(tasksdir))       # package injection, not a sutando workspace
+        self.addCleanup(_dirs.set_dirs)              # reset to env/defaults after this test
         cfg = {**self.cfg, "BEE_SINK": "local",
                "BEE_BROKER_URL": "", "BEE_BROKER_TOKEN": ""}
-        with patch.dict(sys.modules, {"workspace_default": wsmod}):
-            rc = self.mod.run(cfg, once=True)
-            rc2 = self.mod.run(cfg, once=True)      # redelivery: same files
+        rc = self.mod.run(cfg, once=True)
+        rc2 = self.mod.run(cfg, once=True)           # redelivery: same files
         self.assertEqual((rc, rc2), (0, 0))
         self.assertEqual(_Server.ingested, [])       # broker untouched
-        files = sorted((wsdir / "tasks").glob("task-bee-*.txt"))
+        files = sorted(tasksdir.glob("task-bee-*.txt"))
         self.assertEqual(len(files), 2)              # 2 wanted events, deduped
         body = files[0].read_text()
         for needle in ("id: task-bee-todo-created-t1", "source: bee",
@@ -208,7 +206,7 @@ class TestBeeWatcher(unittest.TestCase):
         # (a captured "email Sam" must route through the sandboxed/ambient
         # path, not become eligible for privileged execution). Regression pin.
         self.assertNotIn("access_tier: owner", body)
-        self.assertFalse(list((wsdir / "tasks").glob("*.tmp")))
+        self.assertFalse(list(tasksdir.glob("*.tmp")))
 
     def test_local_sink_needs_no_broker_config(self):
         with patch.object(sys, "argv",
@@ -371,7 +369,7 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(set(_Server.auth_seen), {"Bearer tok-cli"})
 
-    def test_config_vault_fallback_and_bad_manifest(self):
+    def test_config_vault_fallback_and_inline_defaults(self):
         import types
         stub = types.ModuleType("vault_intercept")
         stub.get_vault_key = lambda k: {"BEE_BROKER_TOKEN": "tok-vault"}[k]
@@ -382,11 +380,11 @@ class TestBeeWatcher(unittest.TestCase):
                                      "BEE_EVENT_TYPES", "BEE_BROKER_URL",
                                      "BEE_BROKER_TOKEN", "BEE_AGENT_ID")}
         with patch.dict(sys.modules, {"vault_intercept": stub}), \
-             patch.dict(os.environ, clean_env), \
-             patch.object(self.mod, "_MANIFEST", Path("/nonexistent/manifest.json")):
+             patch.dict(os.environ, clean_env):
             cfg = self.mod._config(ns)
-        self.assertEqual(cfg["BEE_BROKER_TOKEN"], "tok-vault")  # vault fallback
-        self.assertEqual(cfg["BEE_EVENTS_PATH"], "")            # manifest unreadable
+        self.assertEqual(cfg["BEE_BROKER_TOKEN"], "tok-vault")     # vault fallback
+        self.assertEqual(cfg["BEE_EVENTS_PATH"], "/v1/stream")     # inline package default
+        self.assertEqual(cfg["BEE_AGENT_ID"], "bee-lane")          # inline package default
 
     def test_cursor_path_shape(self):
         p = self.mod.__loader__  # noqa: F841 - keep module ref alive
