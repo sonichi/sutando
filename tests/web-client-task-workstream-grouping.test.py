@@ -21,6 +21,14 @@ def _helper_source() -> str:
     return SOURCE[start:end]
 
 
+def _visibility_policy_source() -> str:
+    marker = "function isOwnerVisibleTaskId"
+    assert marker in SOURCE, "owner task history has no internal-task visibility policy"
+    start = SOURCE.index(marker)
+    end = SOURCE.index("\n}", start) + 2
+    return SOURCE[start:end]
+
+
 def _run_helper_probe() -> dict:
     # Execute the exact browser helper source. A tiny DOM-free esc stand-in is
     # sufficient here because its contract is the same text-to-HTML escaping
@@ -38,7 +46,7 @@ function esc(value) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
-""" + _helper_source() + r"""
+""" + _visibility_policy_source() + _helper_source() + r"""
 const rows = [
   ['a1', {time: new Date(10), status: 'done', workstream_id: 'a', workstream_name: '<img src=x onerror=boom>'}],
   ['b1', {time: new Date(20), status: 'done', workstream_id: 'b', workstream_name: 'Mission B'}],
@@ -79,6 +87,38 @@ process.stdout.write(JSON.stringify({
         check=True,
     )
     return json.loads(result.stdout)
+
+
+def _run_visibility_probe() -> dict:
+    probe = r"""
+let taskWorkstreamNames = Object.create(null);
+const collapsedTaskWorkstreams = new Set();
+const seenTaskWorkstreams = new Set();
+function persistTaskWorkstreamDisplayState() {}
+function esc(value) { return String(value); }
+""" + _visibility_policy_source() + _helper_source() + r"""
+const display = groupedTaskDisplay([
+  ['task-owner-message', {time: new Date(30), status: 'working'}],
+  ['task-cron-main-loop-123', {time: new Date(20), status: 'working'}],
+  ['task-cron-daily-brief-456', {time: new Date(10), status: 'done'}],
+]);
+process.stdout.write(JSON.stringify({
+  entries: display.entries.map(function(entry) { return entry[0]; }),
+}));
+"""
+    result = subprocess.run(
+        ["node", "-e", probe],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def test_internal_main_loop_is_hidden_but_other_crons_remain() -> None:
+    data = _run_visibility_probe()
+    assert data["entries"] == ["task-owner-message", "task-cron-daily-brief-456"]
 
 
 def test_group_order_chronology_numbering_and_escaping() -> None:
@@ -131,8 +171,13 @@ def test_all_three_display_paths_share_order_and_history_is_quiet() -> None:
     assert "setTimeout(function()" in SOURCE[SOURCE.index("function scheduleTaskHistoryHydration"):SOURCE.index("async function hydrateTaskHistory")]
 
     # Both live update paths preserve the additive workstream metadata.
+    load = SOURCE[SOURCE.index("function loadPersistedTaskMap"):SOURCE.index("function loadPersistedExpanded")]
     update = SOURCE[SOURCE.index("function updateTask"):SOURCE.index("const expandedTasks")]
     poll = SOURCE[SOURCE.index("function startTaskPolling"):SOURCE.index("function stopTaskPolling")]
+    assert "!isOwnerVisibleTaskId(taskId)" in load
+    assert "if (!isOwnerVisibleTaskId(taskId)) return" in update
+    assert "!isOwnerVisibleTaskId(row.id)" in hydrate
+    assert poll.index("!isOwnerVisibleTaskId(t.id)") < poll.index("apiTasks.add(t.id)")
     assert "Object.assign({}, existing" in update
     assert "taskMap[t.id] = mergeTaskRow(existing, t)" in poll
     assert "if (taskHistoryInitialLoadComplete)" in poll
@@ -151,6 +196,7 @@ def test_all_three_display_paths_share_order_and_history_is_quiet() -> None:
 
 def main() -> None:
     tests = [
+        test_internal_main_loop_is_hidden_but_other_crons_remain,
         test_group_order_chronology_numbering_and_escaping,
         test_all_ungrouped_keeps_flat_appearance,
         test_all_three_display_paths_share_order_and_history_is_quiet,

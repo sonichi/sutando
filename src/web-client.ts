@@ -1186,6 +1186,14 @@ const PERSIST_KEY_TASKS = 'sutando-taskmap-v1';
 const PERSIST_KEY_EXPAND = 'sutando-expanded-v1';
 const PERSIST_KEY_SHOW_DONE = 'sutando-show-done-v1';
 const PERSIST_KEY_WORKSTREAM_DISPLAY = 'sutando-task-workstream-display-v1';
+// The Codex scheduler represents each silent proactive-loop tick as a task so
+// the durable runner can claim, retry, and audit it. Those bookkeeping rows are
+// not owner work and would otherwise accumulate in archive-backed task history.
+// Keep useful scheduled outputs (briefings, scans, etc.) visible by filtering
+// only the canonical internal main-loop task id.
+function isOwnerVisibleTaskId(taskId) {
+  return !String(taskId || '').startsWith('task-cron-main-loop-');
+}
 // Default-hide done tasks. With Tasks growing to top-30, completed work was
 // crowding out active items and the watcher-glance use case ("what's still
 // running?") got lost. Toggle persists across reloads.
@@ -1202,6 +1210,9 @@ function loadPersistedTaskMap() {
     const raw = localStorage.getItem(PERSIST_KEY_TASKS);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
+    Object.keys(parsed).forEach(function(taskId) {
+      if (!isOwnerVisibleTaskId(taskId)) delete parsed[taskId];
+    });
     // Reconstruct Date objects on time fields
     Object.values(parsed).forEach(t => { if (t && t.time) t.time = new Date(t.time); });
     return parsed;
@@ -1307,6 +1318,7 @@ function mergeTaskRow(existing, row) {
 }
 
 function updateTask(taskId, status, text, result) {
+  if (!isOwnerVisibleTaskId(taskId)) return;
   const existing = taskMap[taskId] || {};
   const isNew = !existing.status;
   taskMap[taskId] = Object.assign({}, existing, {
@@ -1462,7 +1474,9 @@ function summarizeTaskText(raw) {
 // canonical numbered display order used by rendering and voice expand:N.
 const UNGROUPED_WORKSTREAM_ID = '__ungrouped__';
 function groupedTaskDisplay(entries, limit) {
-  let chronological = entries.slice().sort(function(a, b) {
+  let chronological = entries.filter(function(entry) {
+    return isOwnerVisibleTaskId(entry[0]);
+  }).sort(function(a, b) {
     return b[1].time - a[1].time;
   });
   if (Number.isInteger(limit) && limit >= 0) chronological = chronological.slice(0, limit);
@@ -1526,7 +1540,9 @@ function renderTaskWorkstreamGroups(display, renderEntry) {
 
 function renderTasks() {
   const container = $('tasks');
-  const entries = Object.entries(taskMap);
+  const entries = Object.entries(taskMap).filter(function(entry) {
+    return isOwnerVisibleTaskId(entry[0]);
+  });
   window._drTaskCount = entries.length;
   const hdr = $('tasks-header');
   if (entries.length === 0) { container.innerHTML = ''; if (hdr) hdr.style.display = 'none'; return; }
@@ -1658,7 +1674,7 @@ async function hydrateTaskHistory() {
     const data = await resp.json();
     rememberTaskWorkstreams(data.workstreams);
     for (const row of (data.tasks || [])) {
-      if (!row || !row.id) continue;
+      if (!row || !row.id || !isOwnerVisibleTaskId(row.id)) continue;
       knownTaskIds.add(row.id);
       taskMap[row.id] = mergeTaskRow(taskMap[row.id] || {}, row);
       if (row.workstream_id) taskWorkstreamRefreshRequested.delete(row.id);
@@ -1690,6 +1706,7 @@ function startTaskPolling() {
       // Replace taskMap with API data (preserve expanded state and WebSocket-delivered results)
       const apiTasks = new Set();
       for (const t of (data.tasks || [])) {
+        if (!t || !isOwnerVisibleTaskId(t.id)) continue;
         apiTasks.add(t.id);
         const existing = taskMap[t.id] || {};
         if (t.workstream_id) {
