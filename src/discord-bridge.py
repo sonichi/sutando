@@ -5131,9 +5131,49 @@ async def poll_proactive():
                                 await dm.send(f"(file not allowed: {fpath})")
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
+                        f.unlink(missing_ok=True)
                     except Exception as e:
+                        # The unlink used to sit OUTSIDE this try, so it ran on
+                        # failure too: a DM Discord rejected was DESTROYED and
+                        # left only a log line. Observed live on this host —
+                        # `413 Payload Too Large (error code: 40005)` on an
+                        # over-long body — and that message is unrecoverable.
+                        # The channel-redirect branch above already gets this
+                        # right (it unlinks only after a successful send and
+                        # falls through otherwise); the DM branch did not.
+                        #
+                        # Quarantine rather than retry. A 413 never becomes a
+                        # 200, so leaving the file in place would re-poll it
+                        # every 3s forever and still never deliver, while
+                        # burying the log. Moving it aside stops the spin AND
+                        # keeps the body recoverable.
                         print(f"  [proactive] failed to DM {owner_id}: {e}")
-                    f.unlink(missing_ok=True)
+                        try:
+                            _undeliv = f.parent / "undelivered"
+                            _undeliv.mkdir(parents=True, exist_ok=True)
+                            # Drop the `.sending` claim suffix on the way out.
+                            # By this point `f` is the CLAIMED name (:4835), and
+                            # a quarantined `*.sending` reads like an in-flight
+                            # file rather than a parked one — the restart-safety
+                            # sweep at :2470 exists precisely because that suffix
+                            # means "someone is mid-send". Restore `.txt` so what
+                            # lands in undelivered/ is what was written.
+                            _name = f.with_suffix(".txt").name if f.suffix == ".sending" else f.name
+                            f.rename(_undeliv / _name)
+                            print(
+                                f"  [proactive] undelivered copy kept at "
+                                f"undelivered/{_name} — NOT deleted",
+                                flush=True,
+                            )
+                        except Exception as _mv_exc:
+                            # Last resort: leaving it in place means the poll
+                            # retries it, which is noisy — but noise is
+                            # recoverable and deletion is not.
+                            print(
+                                f"  [proactive] could not quarantine {f.name}: "
+                                f"{_mv_exc} — leaving it in place rather than losing it",
+                                flush=True,
+                            )
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
         await asyncio.sleep(3)
