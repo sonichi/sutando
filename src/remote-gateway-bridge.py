@@ -78,3 +78,19 @@ for _root in (
 _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
 exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
+
+# Sutando wiring: intercepted `vault set KEY VALUE` bodies store to the macOS
+# Keychain vault (skills/secret-vault) instead of persisting plaintext — the
+# same guarantee the Slack/Discord bridges give (owner gap-report 2026-08-06).
+# Assigned AFTER the exec so the canonical module's default (None) is replaced
+# in the very namespace the running code reads.
+def _keychain_vault_sink(key: str, value: str) -> bool:
+    import subprocess as _sp
+    _p = _sp.run(
+        [sys.executable, str(_REPO / "skills" / "secret-vault" / "secret-vault.py"),
+         "set", key],
+        input=value.encode(), capture_output=True, timeout=15)
+    return _p.returncode == 0
+
+
+VAULT_SINK = _keychain_vault_sink

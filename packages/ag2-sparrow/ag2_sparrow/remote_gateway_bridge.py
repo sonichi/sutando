@@ -181,7 +181,9 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 # the path (no repo-walking; the old triple-parent form predated the move into
 # src/ and pointed outside the repo).
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
-from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
+from .chat_secret_filter import (extract_vault_set, filter_chat_secrets,
+                                 secret_handling_instruction,
+                                 vault_set_replacement)
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
@@ -513,6 +515,13 @@ _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
+
+# Optional secret sink for intercepted `vault set KEY VALUE` bodies. The
+# transport is provider-neutral, so it does NOT assume a keychain: a launcher
+# (e.g. sutando's loader) assigns a callable (key, value) -> bool. With no
+# sink, the command body is still redacted before persistence — the value
+# never reaches disk either way; only storage is skipped.
+VAULT_SINK = None
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
@@ -1496,6 +1505,10 @@ def _write_task(task: dict) -> str | None:
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    # Resolved ONCE, before the field loop: the vault-set intercept inside the
+    # task branch needs the tier, and the access_tier header + owner-activity
+    # gate below reuse the same resolution (single source of truth preserved).
+    sender_tier = _tier_for(task.get("user_id"))
     lines = []
     _secret_types: tuple = ()
     for f in _TASK_FIELDS:
@@ -1526,6 +1539,24 @@ def _write_task(task: dict) -> str | None:
             # room message must never land on disk. Runs AFTER media
             # resolution so a signed media-proxy URL is consumed intact and
             # only the resolved text is filtered.
+            # Explicit `vault set KEY VALUE` bodies are INTERCEPTED, not just
+            # redacted (owner gap-report 2026-08-06: the MS365 client secret
+            # matched no fallback pattern and persisted in plaintext). Owner-
+            # tier only — a non-owner sender must not be able to write into
+            # the owner's vault — and only when the launcher wired a sink.
+            _vault_kv = extract_vault_set(_fetched)
+            if _vault_kv:
+                _vk, _vv = _vault_kv
+                _stored = False
+                if sender_tier == "owner" and VAULT_SINK is not None:
+                    try:
+                        _stored = bool(VAULT_SINK(_vk, _vv))
+                    except Exception as _e:  # sink failure must not lose the task
+                        _log(f"vault sink error for {tid}: {type(_e).__name__}")
+                _fetched = vault_set_replacement(
+                    _vk, stored=_stored, owner=(sender_tier == "owner"))
+                _log(f"vault-set intercepted in {tid}: key={_vk} "
+                     f"stored={_stored} tier={sender_tier}")
             _filtered = filter_chat_secrets(_fetched)
             if _filtered.secret_types:
                 _secret_types = tuple(_filtered.secret_types)
@@ -1567,8 +1598,8 @@ def _write_task(task: dict) -> str | None:
     # Resolve ONCE and reuse for both the task tier AND the owner-activity gate
     # below, so the two decisions can never diverge (a single source of truth,
     # no double read of the tierMap).
-    # user_id is broker-attested here — see the CONTRACT note in _tier_for.
-    sender_tier = _tier_for(task.get("user_id"))
+    # user_id is broker-attested here — see the CONTRACT note in _tier_for
+    # (sender_tier resolved once, above the field loop).
     lines.append(f"access_tier: {sender_tier}")
     # #2267 parity, second half: the other bridges append the in-band security
     # notice so the core neither reproduces nor re-requests the redacted value.
