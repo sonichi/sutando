@@ -278,6 +278,25 @@ def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None)
     return None
 
 
+def dedup_holder_delivered(holder_result_text: str | None) -> bool:
+    """Whether a `[deduped: task-X]` holder actually produced a user-facing reply.
+
+    A dedup is only valid if the holder answered. When the holder's own result
+    was empty or was itself a skip marker, honouring the dedup archives the
+    asking task against a delivery that never happened, and every retry carrying
+    the same marker is archived the same way — the ask can never be answered.
+
+    Pure: the caller supplies the holder's archived result text (None when the
+    archive has no record of it).
+    """
+    if holder_result_text is None:
+        return False
+    body = holder_result_text.strip()
+    if not body:
+        return False
+    return not any(a.kind == "skip" for a in parse_markers(body).actions)
+
+
 _REQUEUE_COUNT_RE = re.compile(r"^dedup_requeue_count:\s*(\d+)\s*$", re.MULTILINE)
 
 

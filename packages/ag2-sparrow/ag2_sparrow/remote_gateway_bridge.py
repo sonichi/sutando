@@ -187,6 +187,8 @@ from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
 from .result_ready import read_ready_result
+from .result_markers import dedup_holder_delivered
+from .local_task_protocol import find_archived_result
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -1749,6 +1751,20 @@ def _save_inflight(inflight: set[str]) -> None:
 _uploaded_attachments: set[tuple[str, str]] = set()
 
 
+def _dedup_holder_answered(holder_id: str | None) -> bool:
+    """Did the dedup holder actually deliver? Unknown holder counts as no."""
+    if not holder_id:
+        return False
+    archived = find_archived_result(RESULTS_DIR, holder_id.strip())
+    text = None
+    if archived is not None:
+        try:
+            text = archived.read_text()
+        except OSError:
+            text = None
+    return dedup_holder_delivered(text)
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -1764,6 +1780,11 @@ def _post_ready_results(inflight: set[str]) -> None:
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip and skip.value == "deduped" and not _dedup_holder_answered(skip.extra):
+            # The holder never delivered, so archiving here would strand the ask
+            # and every retry carrying the same marker.
+            _log(f"refusing dedup for {tid}: holder {skip.extra} delivered nothing")
+            continue
         if skip:
             # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
             # archive without POSTing (match the other bridges' semantics).

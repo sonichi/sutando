@@ -475,6 +475,17 @@ def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
     return base / "archive" / iso_timestamp[:7]
 
 
+def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
+    """Locate an archived result for `task_id` (`archive/<id>-<epoch>.txt`)."""
+    if not valid_archive_lookup_id(task_id):
+        return None
+    archive = Path(results_dir) / "archive"
+    if not archive.is_dir():
+        return None
+    matches = sorted(archive.glob(f"{task_id}-*.txt"))
+    return matches[-1] if matches else None
+
+
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
