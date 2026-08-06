@@ -254,6 +254,49 @@ class TestCanonicalSrcCopy(unittest.TestCase):
         self.assertIsNone(self.csf.extract_vault_set("vault set K v\nx"))
         self.assertIsNone(self.csf.extract_vault_set(""))
 
+    def test_extract_value_shapes_and_empty(self):
+        # quoted/backtick/= alternatives on the whole-body extractor
+        self.assertEqual(self.csf.extract_vault_set('vault set K "a b"'), ("K", "a b"))
+        self.assertEqual(self.csf.extract_vault_set("vault set K 'a b'"), ("K", "a b"))
+        self.assertEqual(self.csf.extract_vault_set("vault set K `a b`"), ("K", "a b"))
+        self.assertEqual(self.csf.extract_vault_set("vault set K=v1"), ("K", "v1"))
+        self.assertEqual(self.csf.extract_vault_set("vault set K = v1"), ("K", "v1"))
+        self.assertIsNone(self.csf.extract_vault_set('vault set K ""'))  # empty: no store
+
+    def test_scrub_embedded_all_value_shapes(self):
+        # every value alternative through the embedded scrub, deliberate key
+        for frag in ('vault set MID "a b"', "vault set MID 'a b'",
+                     "vault set MID `a b`", "vault set MID=abv", "vault set MID tok1"):
+            text, keys = self.csf.scrub_embedded_vault_sets(f"pre {frag} post")
+            self.assertEqual(keys, ("MID",), frag)
+            self.assertNotIn("a b", text, frag)
+            self.assertIn("NOT stored", text, frag)
+            self.assertTrue(text.startswith("pre ") and text.endswith(" post"), frag)
+
+    def test_scrub_guard_prose_vs_secret_shaped(self):
+        # prose: lowercase word key + plain value → untouched
+        t, k = self.csf.scrub_embedded_vault_sets("the vault set command works fine")
+        self.assertEqual(k, ())
+        self.assertIn("vault set command works", t)
+        # lowercase key BUT secret-shaped value (tokenish run) → scrubbed
+        tok = "A" * 24
+        t, k = self.csf.scrub_embedded_vault_sets(f"hey vault set apollo {tok} now")
+        self.assertEqual(k, ("apollo",))
+        self.assertNotIn(tok, t)
+        # lowercase key + curated-pattern value (OpenAI shape) → scrubbed
+        sk = "sk-proj-" + "x" * 34
+        t, k = self.csf.scrub_embedded_vault_sets(f"use vault set key {sk} ok")
+        self.assertEqual(k, ("key",))
+        self.assertNotIn(sk, t)
+        # multiple candidates in one body: both scrubbed
+        t, k = self.csf.scrub_embedded_vault_sets(
+            "vault set K1 v1secrettoken and vault set K2 v2secrettoken")
+        self.assertEqual(k, ("K1", "K2"))
+        self.assertNotIn("v1secrettoken", t)
+        self.assertNotIn("v2secrettoken", t)
+        # empty input passes through
+        self.assertEqual(self.csf.scrub_embedded_vault_sets(""), ("", ()))
+
     def test_replacement_branches_never_contain_value(self):
         for kwargs, marker in (
             (dict(stored=True, owner=True), "stored to the vault"),
