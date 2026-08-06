@@ -25,7 +25,14 @@
     "non-quarantined managed entry satisfies (env keys never silently satisfy",
     "it); byok => env only; quarantined entries are absent in EVERY mode.",
     "Files carry preferenceRevision/sessionRevision (amendment R15) and a",
-    "managed generation (S3) so every consumer proves it tolerates them."
+    "managed generation (S3) so every consumer proves it tolerates them.",
+    "Rows with managedFile: null exercise the FILE-ABSENT branch (every",
+    "pre-managed install): the harness materializes no managed-credentials.json",
+    "at all, and resolution must be byte-for-byte the legacy env chain.",
+    "noEntries.* rows keep the file present but capabilities empty, across",
+    "prefUnset/prefManaged/prefByok — an empty managed tier must never be",
+    "satisfied by an env key under 'managed', and must fall through to env",
+    "under unset/'byok'."
   ],
   "envKeyValue": "byo-mk",
   "rows": [
@@ -308,6 +315,44 @@
       }
     },
     {
+      "name": "noEntries.prefUnset.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "preferenceRevision": 4,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "env",
+        "resolvedKey": "byo-mk",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "byok",
+        "managedGatePresent": false,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noEntries.prefUnset.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "preferenceRevision": 4,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
       "name": "noEntries.prefManaged.envKey",
       "managedFile": {
         "version": 1,
@@ -336,6 +381,74 @@
         "preferenceRevision": 5,
         "sessionRevision": 2
       },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noEntries.prefByok.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "voicePreference": "byok",
+        "preferenceRevision": 6,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "env",
+        "resolvedKey": "byo-mk",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "byok",
+        "managedGatePresent": false,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noEntries.prefByok.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "voicePreference": "byok",
+        "preferenceRevision": 6,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noFile.envKey",
+      "managedFile": null,
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "env",
+        "resolvedKey": "byo-mk",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "byok",
+        "managedGatePresent": false,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noFile.noEnvKey",
+      "managedFile": null,
       "envKeyPresent": false,
       "expected": {
         "resolverSource": "none",
