@@ -219,6 +219,19 @@ class TestBeeWatcher(unittest.TestCase):
             rc = self.mod.main()
         self.assertEqual(rc, 2)
 
+    def test_safe_task_id_hashes_out_of_alphabet_ids(self):
+        # Directly exercise the sha256 branch of _safe_task_id (an event id
+        # outside [A-Za-z0-9._-]{1,48} — colons, spaces, over-length).
+        import re as _re
+        tid = _re.compile(r"[A-Za-z0-9._-]{1,64}")
+        for raw in ("f:9/x", "a b c", "Z" * 200):
+            got = self.mod._safe_task_id(raw)
+            self.assertTrue(got.startswith("task-bee-"))
+            self.assertTrue(tid.fullmatch(got), got)
+            self.assertEqual(got, self.mod._safe_task_id(raw))   # deterministic
+        # an in-alphabet short id passes through readable (the other branch)
+        self.assertEqual(self.mod._safe_task_id("todo42"), "task-bee-todo42")
+
     def test_event_normalizer_falls_back_to_compact_json(self):
         t = self.mod.event_to_task("todo-created", "e9", {"weird": {"nested": 1}})
         self.assertEqual(t["id"], "task-bee-todo-created-e9")
