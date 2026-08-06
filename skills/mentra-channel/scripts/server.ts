@@ -1,8 +1,10 @@
 // skills/mentra-channel/scripts/server.ts — the Sutando MentraOS app server.
 // THIN wiring only: all decision logic lives in core.ts (pure, unit-tested);
 // this file owns the SDK session lifecycle + HTTP. Runs where a public URL
-// terminates (EC2 behind Caddy at https://chat.ag2.space/mentra — deploy is
-// git-tracked; see DESIGN.md "Registration / deployment").
+// terminates: AG2 Space runs on EKS (owner correction 2026-08-06), so this
+// ships as a Deployment/Service with an ingress route for
+// https://chat.ag2.space/mentra — git-tracked manifests only; see
+// DESIGN.md "Registration / deployment".
 //
 //   MentraOS Cloud ── POST /webhook/session-start {sessionId, userId}
 //        └─ AppSession(packageName, apiKey) ── onTranscription(final)
