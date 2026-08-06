@@ -22,7 +22,7 @@ def _helper_source() -> str:
 
 
 def _visibility_policy_source() -> str:
-    marker = "function isOwnerVisibleTaskId"
+    marker = "function isOwnerVisibleTask"
     assert marker in SOURCE, "owner task history has no internal-task visibility policy"
     start = SOURCE.index(marker)
     end = SOURCE.index("\n}", start) + 2
@@ -98,9 +98,12 @@ function persistTaskWorkstreamDisplayState() {}
 function esc(value) { return String(value); }
 """ + _visibility_policy_source() + _helper_source() + r"""
 const display = groupedTaskDisplay([
-  ['task-owner-message', {time: new Date(30), status: 'working'}],
-  ['task-cron-main-loop-123', {time: new Date(20), status: 'working'}],
-  ['task-cron-daily-brief-456', {time: new Date(10), status: 'done'}],
+  ['task-owner-message', {time: new Date(60), status: 'working', source: 'discord'}],
+  ['task-owner-api', {time: new Date(50), status: 'done', source: 'api'}],
+  ['task-cron-main-loop-123', {time: new Date(40), status: 'working', source: 'cron'}],
+  ['task-cron-daily-brief-456', {time: new Date(30), status: 'done', source: 'cron'}],
+  ['task-health-789', {time: new Date(20), status: 'working', source: 'health-check'}],
+  ['task-discord-e2e-012', {time: new Date(10), status: 'done', source: 'discord'}],
 ]);
 process.stdout.write(JSON.stringify({
   entries: display.entries.map(function(entry) { return entry[0]; }),
@@ -116,9 +119,9 @@ process.stdout.write(JSON.stringify({
     return json.loads(result.stdout)
 
 
-def test_internal_main_loop_is_hidden_but_other_crons_remain() -> None:
+def test_internal_system_tasks_are_hidden_from_owner_history() -> None:
     data = _run_visibility_probe()
-    assert data["entries"] == ["task-owner-message", "task-cron-daily-brief-456"]
+    assert data["entries"] == ["task-owner-message", "task-owner-api"]
 
 
 def test_group_order_chronology_numbering_and_escaping() -> None:
@@ -174,10 +177,10 @@ def test_all_three_display_paths_share_order_and_history_is_quiet() -> None:
     load = SOURCE[SOURCE.index("function loadPersistedTaskMap"):SOURCE.index("function loadPersistedExpanded")]
     update = SOURCE[SOURCE.index("function updateTask"):SOURCE.index("const expandedTasks")]
     poll = SOURCE[SOURCE.index("function startTaskPolling"):SOURCE.index("function stopTaskPolling")]
-    assert "!isOwnerVisibleTaskId(taskId)" in load
-    assert "if (!isOwnerVisibleTaskId(taskId)) return" in update
-    assert "!isOwnerVisibleTaskId(row.id)" in hydrate
-    assert poll.index("!isOwnerVisibleTaskId(t.id)") < poll.index("apiTasks.add(t.id)")
+    assert "!isOwnerVisibleTask(taskId, parsed[taskId])" in load
+    assert "if (!isOwnerVisibleTask(taskId, null)) return" in update
+    assert "!isOwnerVisibleTask(row.id, row)" in hydrate
+    assert poll.index("!isOwnerVisibleTask(t.id, t)") < poll.index("apiTasks.add(t.id)")
     assert "Object.assign({}, existing" in update
     assert "taskMap[t.id] = mergeTaskRow(existing, t)" in poll
     assert "if (taskHistoryInitialLoadComplete)" in poll
@@ -196,7 +199,7 @@ def test_all_three_display_paths_share_order_and_history_is_quiet() -> None:
 
 def main() -> None:
     tests = [
-        test_internal_main_loop_is_hidden_but_other_crons_remain,
+        test_internal_system_tasks_are_hidden_from_owner_history,
         test_group_order_chronology_numbering_and_escaping,
         test_all_ungrouped_keeps_flat_appearance,
         test_all_three_display_paths_share_order_and_history_is_quiet,
