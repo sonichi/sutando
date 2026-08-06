@@ -49,6 +49,41 @@ _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----"
     )),
 )
+# The explicit vault-set command shape. The WHOLE body must be the command —
+# a command quoted inside prose is not an intent to store (and redacting it is
+# the generic filter's job when the value matches a known pattern). KEY is
+# env-var-shaped; VALUE is any non-whitespace run (client secrets and the like
+# have no reliable shape — see the 2026-08-06 MS365 secret, which matched no
+# fallback pattern and reached disk).
+VAULT_SET_RE = re.compile(
+    r"^\s*vault\s+set\s+([A-Za-z_][A-Za-z0-9_]*)\s+(\S+)\s*$"
+)
+
+
+def extract_vault_set(text: str) -> "tuple[str, str] | None":
+    """Return (key, value) when the entire body is a `vault set KEY VALUE`
+    command, else None."""
+    m = VAULT_SET_RE.match(text or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def vault_set_replacement(key: str, *, stored: bool, owner: bool) -> str:
+    """The persisted body replacing an intercepted vault-set command. Never
+    contains the value; tells the core exactly what happened so its reply to
+    the sender is truthful without re-requesting the secret."""
+    if stored:
+        return (f"vault set {key} [REDACTED — value stored to the vault by the "
+                "bridge; plaintext never persisted]. Confirm storage to the "
+                "sender briefly.")
+    if not owner:
+        return (f"vault set {key} [REDACTED — NOT stored: sender is not "
+                "owner-tier; only the owner may write vault keys]. Tell the "
+                "sender their request was declined.")
+    return (f"vault set {key} [REDACTED — NOT stored: this bridge has no vault "
+            "sink configured]. Ask the owner to store the key via a "
+            "vault-capable channel (Slack/Discord) or on the host directly.")
+
+
 _ENTROPY_TYPES = {"Base64 High Entropy String", "Hex High Entropy String"}
 _TOKENISH_RUN = re.compile(r"[A-Za-z0-9_+/=-]{20,}")
 
