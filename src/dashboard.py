@@ -237,16 +237,19 @@ def _quota_age_label(quota: dict) -> str:
     return f"{int(age*60)}m ago"
 
 def get_system_stats() -> dict:
-    import os
-    st = os.statvfs("/")
-    free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+    import shutil
+    free_gb = shutil.disk_usage(WORKSPACE_DIR).free / (1024 ** 3)
 
-    result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
-    battery_m = re.search(r'(\d+)%', result.stdout)
+    try:
+        result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
+        battery_output = result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        battery_output = ""
+    battery_m = re.search(r'(\d+)%', battery_output)
     if battery_m:
         battery = f"{battery_m.group(1)}%"
         # \b keeps "discharging" (battery power) from substring-matching "charging".
-        charging = bool(re.search(r'\bcharging\b', result.stdout.lower())) or "ac power" in result.stdout.lower()
+        charging = bool(re.search(r'\bcharging\b', battery_output.lower())) or "ac power" in battery_output.lower()
     else:
         # Battery-less Mac (mini / Studio / Pro): pmset reports "AC Power" with no
         # percentage line. The old "?" + charging=True combo rendered as "? ⚡".

@@ -4679,11 +4679,12 @@ def check_disk_space() -> dict:
     targets = {}
     for label, path in (("workspace", WORKSPACE_DIR), ("tmp", Path(tempfile.gettempdir()))):
         try:
-            st = os.statvfs(str(path))
+            device = path.stat().st_dev
+            free_gib = shutil.disk_usage(path).free / (1024 ** 3)
         except OSError as e:
             return {"name": name, "status": "error", "detail": f"cannot stat {label} ({path}): {e}"}
         # Key by device so the same volume isn't reported twice.
-        targets[st.f_fsid or label] = (label, path, st.f_bavail * st.f_frsize / (1024 ** 3))
+        targets[device or label] = (label, path, free_gib)
 
     worst_label, worst_path, worst_free = min(targets.values(), key=lambda t: t[2])
     where = f"{worst_free:.1f} GiB free on {worst_label} ({worst_path})"
