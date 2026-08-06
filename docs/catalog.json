@@ -3,7 +3,10 @@
   "documents": {
     "docs/design-credential-capability-resolver.md": {
       "title": "Credential resolution by capability, not key (G8)",
-      "audience": ["contributors", "maintainers"],
+      "audience": [
+        "contributors",
+        "maintainers"
+      ],
       "status": "draft",
       "canonical_for": "the capability-not-key credential-resolver contract: tier order, managed-file schema, source observability, and the reader-sweep migration plan",
       "last_verified": "2026-08-02"
@@ -144,7 +147,7 @@
       "last_verified": null
     },
     "docs/runtime/claude-hook-contract-v1.md": {
-      "title": "Claude Code Hook Contract \u2014 v1",
+      "title": "Claude Code Hook Contract — v1",
       "audience": [
         "contributors",
         "maintainers"
@@ -276,6 +279,17 @@
       "status": "draft",
       "canonical_for": "the single authoritative severity-tagged core-health verdict and the report-vs-restart severity gate",
       "last_verified": "2026-08-02"
+    },
+    "docs/bee-user-flows.md": {
+      "title": "Bee channel — user flows for both runtime modes",
+      "audience": [
+        "users",
+        "contributors",
+        "maintainers"
+      ],
+      "status": "draft",
+      "canonical_for": "the local vs server-side Bee onboarding flows (connect/credential/enable/disconnect skeleton) and their open product decisions",
+      "last_verified": "2026-08-06"
     }
   }
 }
