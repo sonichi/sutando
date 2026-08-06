@@ -141,5 +141,59 @@ class TestWriterKeepsStart(unittest.TestCase):
         self.assertEqual(out, [{"raw": "9:30am Standup", "calendar": ""}])
 
 
+class TestSpokenSentence(unittest.TestCase):
+    """Assert the sentence the owner actually hears.
+
+    The helper tests above prove the selection; these prove the wording that
+    reaches him, which is the thing that was wrong. `synthesize()` is a plain
+    function, so this needs no I/O.
+    """
+
+    def setUp(self):
+        self.mod = _load(SCRIPT, "morning_briefing")
+        self.now = datetime.now().astimezone()
+
+    def _say(self, events):
+        return self.mod.synthesize("60°F and clear, high of 70, low of 55",
+                                   events, [], [], [], [])
+
+    def _ev(self, offset_min, label, start=True):
+        ev = {"raw": label, "calendar": "work"}
+        if start:
+            ev["start"] = _iso(self.now + timedelta(minutes=offset_min))
+        return ev
+
+    def test_says_next_up_and_names_the_upcoming_meeting(self):
+        out = self._say([self._ev(-420, "12:30am AG2 Connect"),
+                         self._ev(45, "8am Yiran Wu's Zoom")])
+        self.assertIn("Next up: 8am Yiran Wu's Zoom", out)
+        self.assertNotIn("First up", out)
+        self.assertNotIn("AG2 Connect", out)
+
+    def test_all_past_says_so_instead_of_naming_a_finished_meeting(self):
+        out = self._say([self._ev(-300, "8am standup"), self._ev(-60, "11am sync")])
+        self.assertIn("all earlier", out)
+        self.assertNotIn("Next up", out)
+        self.assertNotIn("First up", out)
+
+    def test_without_start_times_the_wording_is_unchanged(self):
+        """The macOS fallback and piped connector events must read exactly as
+        they did before this change."""
+        out = self._say([self._ev(0, "9am standup", start=False),
+                         self._ev(0, "2pm review", start=False)])
+        self.assertIn("First up: 9am standup", out)
+        self.assertNotIn("Next up", out)
+
+    def test_single_meeting_wording_untouched(self):
+        out = self._say([self._ev(60, "8am Zoom")])
+        self.assertIn("One meeting today: 8am Zoom", out)
+
+    def test_empty_calendar_still_clear(self):
+        self.assertIn("clear today", self._say([]))
+
+    def test_unreadable_calendar_still_reported(self):
+        self.assertIn("couldn't read your calendar", self._say(None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
