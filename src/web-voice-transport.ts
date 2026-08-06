@@ -53,7 +53,12 @@
  *     a server that sends no frame within the legacy window simply behaves
  *     exactly as before the protocol existed;
  *   - every failed attempt is classified into the exported
- *     `VoiceConnectFailure` union exactly once via `onConnectFailure`.
+ *     `VoiceConnectFailure` union exactly once via `onConnectFailure`;
+ *   - teardown is awaitable (T8): `disconnect()`/`close()` return a promise
+ *     that resolves once the underlying socket's real close handshake
+ *     completes (bounded), so lease owners can await teardown before
+ *     releasing exclusivity — the synchronous `closed` status still fires
+ *     first, exactly as before.
  *
  * The DSP functions are pure and exported standalone so they unit-test in Node
  * (see tests/web-voice-transport.test.ts). The class is drivable from node:test
@@ -318,7 +323,9 @@ export interface VoiceTransportEvents {
    * every `'closed'` decoded from a WS close frame carries it, as do the
    * close-derived terminal states (`'error'` on 4409/pre-open closes,
    * `'superseded'` on 4410). A user-initiated `disconnect()` emits `'closed'`
-   * WITHOUT close info — no WS close frame is involved in that transition.
+   * WITHOUT close info — no WS close frame is involved in that transition
+   * (the promise `disconnect()` returns tracks the socket's real close
+   * handshake instead; the synchronous `closed` always fires first).
    */
   onStatus?(status: VoiceStatus, detail?: string, close?: VoiceCloseInfo): void;
   /**
@@ -370,6 +377,12 @@ export const CONNECT_TIMEOUT_MS = 6000;
  *  before the protocol existed. */
 export const AGENT_STATE_LEGACY_MS = 3000;
 
+/** Bound on the awaited close handshake in `disconnect()` (amendment T8): if
+ *  the socket's real `close` event never arrives within this window, the
+ *  returned teardown promise resolves anyway — a wedged handshake must not
+ *  hang lease release. */
+export const DISCONNECT_CLOSE_TIMEOUT_MS = 1500;
+
 export interface VoiceTransportOptions extends VoiceTransportEvents {
   /** Mic capture buffer size (ScriptProcessor). Default 2048, matching web-client. */
   captureBuf?: number;
@@ -383,6 +396,9 @@ export interface VoiceTransportOptions extends VoiceTransportEvents {
   connectTimeoutMs?: number;
   /** Legacy-detection window override (tests). Default AGENT_STATE_LEGACY_MS. */
   agentStateLegacyMs?: number;
+  /** Bound on disconnect()'s awaited close handshake (tests). Default
+   *  DISCONNECT_CLOSE_TIMEOUT_MS. */
+  disconnectCloseTimeoutMs?: number;
   /**
    * Socket factory seam so the state machine is drivable from node:test
    * without a browser. Default `new WebSocket(url)`. Fakes provide the
@@ -406,6 +422,7 @@ export class VoiceTransport {
   private playbackRate: number;
   private connectTimeoutMs: number;
   private agentStateLegacyMs: number;
+  private disconnectCloseTimeoutMs: number;
   private wsFactory: (url: string) => WebSocket;
 
   private ws: WebSocket | null = null;
@@ -461,6 +478,7 @@ export class VoiceTransport {
     this.playbackRate = opts.playbackRate ?? 1.0;
     this.connectTimeoutMs = opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
     this.agentStateLegacyMs = opts.agentStateLegacyMs ?? AGENT_STATE_LEGACY_MS;
+    this.disconnectCloseTimeoutMs = opts.disconnectCloseTimeoutMs ?? DISCONNECT_CLOSE_TIMEOUT_MS;
     this.wsFactory = opts.wsFactory ?? ((url: string) => new WebSocket(url));
   }
 
@@ -602,16 +620,57 @@ export class VoiceTransport {
    * in `connecting`/`live` forever. The terminal-ERROR cleanup path stays
    * separate: after a latched `error` (timeout / upstream-failed / mic),
    * disconnect() only cleans up and PRESERVES the latched error status.
+   *
+   * Amendment T8 (awaitable teardown): the RETURNED PROMISE resolves once the
+   * underlying WebSocket's real close handshake completes — i.e. the socket's
+   * own `close` event has fired — so lease owners can await teardown before
+   * releasing exclusivity. The synchronous behavior above is unchanged and the
+   * synchronous `closed` status always fires BEFORE the promise resolves. With
+   * no socket, or one already CLOSED, the promise resolves immediately; a
+   * wedged handshake is bounded by `disconnectCloseTimeoutMs` (default
+   * DISCONNECT_CLOSE_TIMEOUT_MS) so teardown can never hang.
    */
-  disconnect(): void {
+  disconnect(): Promise<void> {
     this.attemptGen++;
     this.clearConnectTimer();
     this.clearLegacyTimer();
     const emitClosed = this.attemptActive && !this.terminal;
     this.attemptActive = false;
-    if (this.ws) {
+    const ws = this.ws;
+    let completion: Promise<void>;
+    if (!ws || ws.readyState === WebSocket.CLOSED) {
+      // Nothing to hand-shake: no socket, or its close already completed.
+      completion = Promise.resolve();
+    } else {
+      // Listen for the socket's REAL close event — attached BEFORE close() is
+      // called and BEFORE this.ws is cleared. The wsFactory seam guarantees
+      // only the onopen/onmessage/onerror/onclose property surface (fakes
+      // provide no addEventListener), so wrap the current onclose handler:
+      // it is connect()'s generation-fenced closure, already a guaranteed
+      // no-op after the bump above, and close fires at most once.
+      completion = new Promise<void>((resolve) => {
+        let settled = false;
+        let fallback: ReturnType<typeof setTimeout> | null = null;
+        const settle = (): void => {
+          if (settled) return;
+          settled = true;
+          if (fallback) clearTimeout(fallback);
+          resolve();
+        };
+        fallback = setTimeout(settle, this.disconnectCloseTimeoutMs);
+        const prevOnClose = ws.onclose;
+        ws.onclose = (event: CloseEvent) => {
+          try {
+            if (prevOnClose) prevOnClose.call(ws, event);
+          } finally {
+            settle();
+          }
+        };
+      });
+    }
+    if (ws) {
       try {
-        this.ws.close();
+        ws.close();
       } catch {
         /* already closed */
       }
@@ -621,11 +680,13 @@ export class VoiceTransport {
     if (emitClosed) {
       this.status('closed', 'Disconnected');
     }
+    return completion;
   }
 
-  /** Alias for disconnect — teardown already closes the AudioContext. */
-  close(): void {
-    this.disconnect();
+  /** Alias for disconnect — teardown already closes the AudioContext. Returns
+   *  the same awaitable close-handshake completion (T8). */
+  close(): Promise<void> {
+    return this.disconnect();
   }
 
   /**

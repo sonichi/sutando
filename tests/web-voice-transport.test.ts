@@ -13,6 +13,7 @@ import {
 	CLOSE_CODE_SUPERSEDED_BY_TAKEOVER,
 	CONNECT_TIMEOUT_MS,
 	AGENT_STATE_LEGACY_MS,
+	DISCONNECT_CLOSE_TIMEOUT_MS,
 	VOICE_FAILURE_REMEDIATION,
 	type VoiceConnectFailure,
 	type VoiceTransportOptions,
@@ -496,6 +497,7 @@ describe('connect timeout (Step 18 — design 1e)', () => {
 	it('exports the 6s default; the constructor can override it', () => {
 		assert.equal(CONNECT_TIMEOUT_MS, 6000);
 		assert.equal(AGENT_STATE_LEGACY_MS, 3000);
+		assert.equal(DISCONNECT_CLOSE_TIMEOUT_MS, 1500);
 	});
 
 	it('no onopen within the window → latched error + timeout failure; the self-inflicted close never emits closed', async () => {
@@ -791,6 +793,82 @@ describe('user disconnect() (Step 18 / S6)', () => {
 			'error',
 			'S6: the terminal-error path stays separate — no closed overwrite',
 		);
+	});
+});
+
+describe('disconnect() awaitable teardown (T8 — teardown awaited before lease release)', () => {
+	it('over a live session: the promise resolves only after the socket\'s real close event', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		let resolved = false;
+		const p = h.t.disconnect().then(() => {
+			resolved = true;
+		});
+		assert.equal(
+			h.statuses[h.statuses.length - 1].status,
+			'closed',
+			'the synchronous closed status fires before the promise resolves',
+		);
+		await delay(10);
+		assert.equal(resolved, false, 'not resolved while the close handshake is still in flight');
+		s.serverClose(1000); // the async close handshake completes
+		await p;
+		assert.equal(resolved, true);
+		assert.equal(
+			h.statuses.filter((x) => x.status === 'closed').length,
+			1,
+			'the real close event resolves the promise but adds no second status (still fenced)',
+		);
+	});
+
+	it('close() alias returns the same awaitable completion', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		let resolved = false;
+		void h.t.close().then(() => {
+			resolved = true;
+		});
+		await delay(10);
+		assert.equal(resolved, false, 'alias also waits for the close handshake');
+		s.serverClose(1000);
+		await delay(0);
+		assert.equal(resolved, true);
+	});
+
+	it('with no socket: resolves immediately', async () => {
+		const t = new VoiceTransport();
+		let resolved = false;
+		void t.disconnect().then(() => {
+			resolved = true;
+		});
+		await delay(0);
+		assert.equal(resolved, true, 'no socket ⇒ nothing to await');
+	});
+
+	it('over an already-CLOSED socket: resolves immediately (no close event will ever fire)', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.readyState = 3; // CLOSED under the transport — its event already spent/fenced
+		let resolved = false;
+		void h.t.disconnect().then(() => {
+			resolved = true;
+		});
+		await delay(0);
+		assert.equal(resolved, true, 'already-CLOSED socket ⇒ immediate resolve');
+	});
+
+	it('a wedged handshake is bounded: the fallback resolves after disconnectCloseTimeoutMs', async () => {
+		const h = harness({ disconnectCloseTimeoutMs: 20 });
+		const s = await goLive(h);
+		let resolved = false;
+		void h.t.disconnect().then(() => {
+			resolved = true;
+		});
+		await delay(5);
+		assert.equal(resolved, false, 'still waiting on a close that never comes');
+		await delay(40); // past the injected bound
+		assert.equal(resolved, true, 'fallback fires — a wedged handshake cannot hang teardown');
+		void s; // the fake deliberately never emits close
 	});
 });
 
