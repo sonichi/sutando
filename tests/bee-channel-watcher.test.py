@@ -143,7 +143,7 @@ class TestBeeWatcher(unittest.TestCase):
             self.assertEqual(post["agent_id"], "bee-lane")
             self.assertEqual(post["task"]["source"], "bee")
             self.assertTrue(tid_re.fullmatch(post["task"]["id"]), post["task"]["id"])
-        self.assertEqual(_Server.ingested[0]["task"]["id"], "task-bee-e1")
+        self.assertEqual(_Server.ingested[0]["task"]["id"], "task-bee-todo-created-t1")
         self.assertEqual(_Server.ingested[0]["task"]["task"], "[Bee todo-created] buy milk")
         self.assertEqual(_Server.ingested[0]["task"]["channel_id"], "c9")
         self.assertNotIn("/", _Server.ingested[1]["task"]["id"])   # "f:9/x" hashed
@@ -164,8 +164,28 @@ class TestBeeWatcher(unittest.TestCase):
 
     def test_event_normalizer_falls_back_to_compact_json(self):
         t = self.mod.event_to_task("todo-created", "e9", {"weird": {"nested": 1}})
-        self.assertEqual(t["id"], "task-bee-e9")
+        self.assertEqual(t["id"], "task-bee-todo-created-e9")
         self.assertIn('{"weird":{"nested":1}}', t["task"])
+
+    def test_real_utterance_fixture_from_live_capture(self):
+        # VERBATIM shape from the first live capture (2026-08-06): nested
+        # utterance.text/id, conversation_uuid, NO SSE id field. The old
+        # normalizer put the whole JSON blob in channel_id and hashed the
+        # blob for the task id — pinned here against regression.
+        data = {"type": "new-utterance",
+                "conversation_uuid": "6ea107d4-9fc1-4cdb-b9c5-72544fa68934",
+                "utterance": {"id": 3091707244,
+                              "sample_id": "09c380f1-1813-4532-93a5-3f7f50332268",
+                              "start": 2.64, "end": 15.04,
+                              "text": "I need to send over to Chi about my travel plan",
+                              "spoken_at": "2026-08-06T14:48:28.000Z"}}
+        t = self.mod.event_to_task("new-utterance", "", data)
+        self.assertEqual(t["task"],
+                         "[Bee new-utterance] I need to send over to Chi about my travel plan")
+        self.assertEqual(t["channel_id"], "6ea107d4-9fc1-4cdb-b9c5-72544fa68934")
+        self.assertEqual(t["id"], "task-bee-new-utterance-3091707244")
+        # same utterance redelivered -> same id (broker dedupe works)
+        self.assertEqual(t["id"], self.mod.event_to_task("new-utterance", "", data)["id"])
 
     def test_sse_parser_edges_comment_nonjson_and_tail_frame(self):
         # comment lines skipped; non-dict JSON wrapped as {"value":…}; bad
@@ -201,7 +221,7 @@ class TestBeeWatcher(unittest.TestCase):
         with patch.object(self.mod, "_post_task", side_effect=flaky):
             rc = self.mod.run(self.cfg, once=True)
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, ["task-bee-e1"])   # halted: e2 never attempted
+        self.assertEqual(calls, ["task-bee-todo-created-t1"])  # halted: e2 never attempted
         self.assertFalse(self._cursor.exists())    # cursor untouched
         # Recovery: next connection (broker healthy) replays from the start
         # of the undelivered suffix and the cursor lands on the last event.

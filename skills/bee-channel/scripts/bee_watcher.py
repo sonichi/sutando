@@ -112,21 +112,30 @@ def _safe_task_id(raw: str) -> str:
 
 
 def event_to_task(etype: str, event_id: str, data: dict) -> dict:
-    """Normalize one SSE event into the relay task shape. Text extraction is
-    field-priority based (text > summary > name), falling back to compact
-    JSON, because Bee payload schemas are per-event-type; the fallback keeps
-    unknown shapes visible to the core instead of dropping them."""
+    """Normalize one SSE event into the relay task shape.
+
+    Field mapping VERIFIED against a live authenticated stream (2026-08-06,
+    first real capture): utterance events nest text under `utterance.text`
+    with the stable id at `utterance.id`; the conversation key is
+    `conversation_uuid` (not conversation_id); and the stream sends NO SSE
+    `id:` field, so the stable entity id inside the payload is the dedupe
+    key. Unknown shapes still fall back to compact JSON — visible to the
+    core rather than dropped."""
+    utt = data.get("utterance") if isinstance(data.get("utterance"), dict) else {}
+    todo = data.get("todo") if isinstance(data.get("todo"), dict) else {}
     text = ""
-    for f in ("text", "summary", "name", "title"):
-        v = data.get(f)
+    for v in (utt.get("text"), todo.get("text"), data.get("text"),
+              data.get("summary"), data.get("name"), data.get("title")):
         if isinstance(v, str) and v.strip():
             text = v.strip()
             break
     if not text:
         text = json.dumps(data, separators=(",", ":"))[:500]
-    conv = str(data.get("conversation_id") or data.get("id") or event_id)
+    conv = str(data.get("conversation_uuid") or data.get("conversation_id")
+               or data.get("id") or event_id)[:120]
+    stable = str(utt.get("id") or todo.get("id") or data.get("id") or event_id)
     return {
-        "id": _safe_task_id(event_id),
+        "id": _safe_task_id(f"{etype}-{stable}"),
         "task": f"[Bee {etype}] {text}",
         "source": "bee",
         "user_id": "bee",
