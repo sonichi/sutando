@@ -5811,6 +5811,73 @@ def _host_runs_comm_sweep(
     return False
 
 
+def _host_dynamic_loops(
+    workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
+) -> list[str]:
+    """Names of the `loop: "dynamic"` entries THIS host declares in its crons.json.
+
+    Same per-host, single-owner shape as `_host_runs_comm_sweep`: a dynamic loop
+    is launched by `/schedule-crons` on the host whose crons.json declares it, so
+    only that host has anything to monitor.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    host = host_label or _host_label()
+    try:
+        crons = json.loads((workspace / "hosts" / host / "crons.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(crons, list):
+        return []
+    names = []
+    for entry in crons:
+        if not isinstance(entry, dict) or entry.get("loop") != "dynamic":
+            continue
+        name = entry.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return names
+
+
+def _stamped_dynamic_loops(workspace_dir: Optional[Path] = None) -> list[str]:
+    """Loop names that have a `dynamic-loop-<name>.alive` sentinel ON DISK.
+
+    The counterpart to `_host_dynamic_loops`, and the reason enumeration is a
+    union of the two: a stall whose `crons.json` entry was edited away is still
+    a stall. Deriving the watch-list from config alone lets an unrelated config
+    edit un-declare a real one into invisibility.
+
+    Globs BOTH locations `status_read_path` reads from, so an un-migrated
+    install is enumerated the same way it is read. Never raises: an unreadable
+    state dir degrades to "nothing found here", and the declared names still
+    produce rows.
+    """
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    prefix, suffix = "dynamic-loop-", ".alive"
+    names: set[str] = set()
+    for base in (workspace / "state", workspace):
+        try:
+            for path in base.glob(f"{prefix}*{suffix}"):
+                stem = path.name[len(prefix):-len(suffix)].strip()
+                if stem:
+                    names.add(stem)
+        except OSError:
+            continue
+    return sorted(names)
+
+
+def _positive_seconds(value) -> Optional[float]:
+    """A sentinel field is only usable as a duration/timestamp if it is a finite
+    positive number. `bool` is an `int` in Python, so exclude it explicitly —
+    otherwise a `true` would read as 1 second and manufacture a false alarm.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = float(value)
+    if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds <= 0:
+        return None
+    return seconds
+
+
 def _as_list(value) -> list:
     """A settings file is hand-editable; anything not a list yields nothing to scan."""
     return value if isinstance(value, list) else []
@@ -6300,6 +6367,106 @@ def check_comm_sweep_freshness(
     return {"name": name, "status": "ok", "detail": f"last comm sweep {age_h:.1f}h ago"}
 
 
+#: Re-arm cadence assumed when a sentinel carries no usable `next_delay_s`.
+#: `/loop`'s dynamic mode is told to lean 1200-1800s for its fallback heartbeat;
+#: taking the slow end keeps a malformed stamp from manufacturing an alarm.
+_DYNAMIC_LOOP_DEFAULT_DELAY_S = 1800.0
+
+
+def check_dynamic_loop_freshness(
+    workspace_dir: Optional[Path] = None, host_label: Optional[str] = None
+) -> list[dict]:
+    """Liveness for `loop: "dynamic"` entries — the one scheduled thing nothing else sees.
+
+    A dynamic loop self-paces through ScheduleWakeup, so it is NOT a cron job
+    (absent from CronList, so the `session-crons` probe can't count it) and NOT
+    an OS process (invisible to pgrep, so no PID sentinel applies). Every other
+    liveness probe here keys off one of those two. A dynamic loop that stops
+    re-arming therefore pages nobody — which is not hypothetical: the
+    inbox-score loop died 2026-07-21 and owner-comm sweeps lapsed for days
+    before anyone noticed. `check_comm_sweep_freshness` above makes the
+    downstream symptom loud; this closes the same gap one layer up, at the loop.
+
+    The sentinel carries its OWN threshold. `/loop`'s body stamps
+    `state/dynamic-loop-<name>.alive` with `{ts, next_delay_s}` on every re-arm,
+    so the probe compares against the cadence the loop just chose rather than a
+    hardcoded one a self-pacing loop is free to change: warn past
+    `next_delay_s + 120`, down past `2*next_delay_s + 300`.
+
+    Age comes from the payload's `ts`, not mtime. `state/cores/*.alive` is
+    deliberately vault-EXCLUDED so a synced mtime can never fake liveness;
+    `state/dynamic-loop-*.alive` is NOT excluded, so its mtime can be rewritten
+    by a sync on an unrelated host. The self-reported `ts` is the honest clock;
+    mtime is a fallback for a payload that won't parse, and the detail says so.
+
+    Returns a LIST — one row per loop this host declares OR has a sentinel for,
+    and an EMPTY list on a host with neither. That is the lane-awareness lesson
+    from `check_comm_sweep_freshness`: a permanent warn on a host with nothing
+    to monitor is how a health output gets ignored, which would take this
+    probe's real alarms down with it.
+
+    Enumeration is the UNION of the two sources, and that is load-bearing.
+    Config gates the ABSENT branch only: `crons.json` can add a loop to watch
+    (declared-but-never-stamped ⇒ warn), but it can never remove one, because a
+    sentinel on disk is judged on its age no matter what the config says. An
+    earlier revision enumerated from `crons.json` alone, so deleting the entry
+    during an unrelated edit dropped a genuinely stalled loop out of
+    `run_all_checks()` entirely — a probe whose whole purpose is "a stall that
+    pages nobody" going silent in exactly that direction.
+    """
+    checks: list[dict] = []
+    loops = sorted(
+        set(_host_dynamic_loops(workspace_dir, host_label))
+        | set(_stamped_dynamic_loops(workspace_dir))
+    )
+    for loop in loops:
+        name = f"dynamic-loop:{loop}"
+        stem = f"dynamic-loop-{loop}.alive"
+        path = status_read_path(stem, workspace_dir or WORKSPACE_DIR)
+        if not path.exists():
+            checks.append({"name": name, "status": "warn",
+                           "detail": f"{loop} is declared `loop: \"dynamic\"` in crons.json but has "
+                                     f"never stamped {stem} — launched but not re-arming"})
+            continue
+        try:
+            raw = path.read_text()
+            mtime = path.stat().st_mtime
+        except OSError as exc:
+            checks.append({"name": name, "status": "warn",
+                           "detail": f"{stem} unreadable ({exc})"})
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = None
+        stamped = payload.get("ts") if isinstance(payload, dict) else None
+        declared = payload.get("next_delay_s") if isinstance(payload, dict) else None
+        ts = _positive_seconds(stamped)
+        delay = _positive_seconds(declared)
+        caveats = []
+        if ts is None:
+            ts = mtime
+            caveats.append("no usable `ts`, fell back to mtime (sync can rewrite it)")
+        if delay is None:
+            delay = _DYNAMIC_LOOP_DEFAULT_DELAY_S
+            caveats.append(f"no usable `next_delay_s`, assumed {int(delay // 60)}m")
+        note = f" [{'; '.join(caveats)}]" if caveats else ""
+        age = time.time() - ts
+        warn_at = delay + 120
+        down_at = 2 * delay + 300
+        seen = f"last re-arm {age / 60:.1f}m ago, cadence {delay / 60:.0f}m{note}"
+        if age > down_at:
+            checks.append({"name": name, "status": "down",
+                           "detail": f"{loop}: {seen} — past {down_at / 60:.0f}m; the loop has "
+                                     f"stopped re-arming and no cron or process check can see it"})
+        elif age > warn_at:
+            checks.append({"name": name, "status": "warn",
+                           "detail": f"{loop}: {seen} — past its own {warn_at / 60:.0f}m re-arm deadline"})
+        else:
+            checks.append({"name": name, "status": "ok", "detail": f"{loop}: {seen}"})
+    return checks
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -6358,6 +6525,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_node_runtime())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
+    checks.extend(check_dynamic_loop_freshness())
     # Vault name/secret divergence: list_vault_keys() advertising keys that
     # get_vault_key() cannot resolve — silent until an integration calls both.
     checks.append(check_vault_manifest_integrity())
