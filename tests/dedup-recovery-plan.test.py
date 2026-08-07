@@ -51,6 +51,10 @@ class _Space:
     def plan(self, holder_id=HOLDER):
         return plan_dedup_recovery(self.results, self.tasks, TID, holder_id, "C1", NEW)
 
+    def plan_with(self, commit, holder_id=HOLDER):
+        return plan_dedup_recovery(self.results, self.tasks, TID, holder_id, "C1", NEW,
+                                   commit_identity=commit)
+
 
 class PlanTest(unittest.TestCase):
     def test_holder_answered_is_honoured(self):
@@ -114,6 +118,40 @@ class PlanTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td); sp.orig()
             self.assertEqual(sp.plan(holder_id="../../etc/passwd")[0], "requeue")
+
+
+class CommitIdentityTest(unittest.TestCase):
+    """Routing must be committed before the re-ask becomes visible."""
+
+    def test_failed_commit_defers_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.holder(""); sp.orig()
+            self.assertEqual(sp.plan_with(lambda _id: False), ("defer", None))
+            self.assertFalse((sp.tasks / f"{NEW}.txt").exists(),
+                             "published a re-ask whose routing never committed")
+
+    def test_successful_commit_publishes(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.holder(""); sp.orig()
+            action, payload = sp.plan_with(lambda _id: seen.append(_id) or True)
+            self.assertEqual((action, payload), ("requeue", NEW))
+            self.assertEqual(seen, [NEW], "commit ran with the wrong id")
+            self.assertTrue((sp.tasks / f"{NEW}.txt").exists())
+
+    def test_commit_runs_before_the_task_exists(self):
+        """Ordering, asserted from inside the callback."""
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.holder(""); sp.orig()
+            observed = {}
+
+            def _commit(new_id):
+                observed["existed"] = (sp.tasks / f"{new_id}.txt").exists()
+                return True
+
+            sp.plan_with(_commit)
+            self.assertFalse(observed["existed"],
+                             "task file existed before its routing was committed")
 
 
 class UnreadableInputTest(unittest.TestCase):

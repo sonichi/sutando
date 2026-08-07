@@ -56,6 +56,7 @@ def plan_dedup_recovery(
     holder_id: str | None,
     asking_channel,
     new_task_id: str,
+    commit_identity=None,
 ) -> tuple[str, str | None]:
     """Decide and perform the filesystem half of dedup recovery.
 
@@ -63,9 +64,12 @@ def plan_dedup_recovery(
       ``("honour", None)``     — the holder answered; archive as before.
       ``("requeue", new_id)``  — a re-ask was written; route its reply.
       ``("report", message)``  — tell the asker; do not re-ask again.
+      ``("defer", None)``      — nothing was changed; retry on a later pass.
 
-    The requeued task is written before returning, so a caller that only routes
-    cannot end up advertising a task that does not exist.
+    ``commit_identity(new_task_id)`` runs BEFORE the task file is published and
+    must return True. A re-ask visible to the watcher without its routing
+    committed is executed anyway, so a failed commit would leave a live orphan
+    and the next pass would add another.
     """
     holder = (holder_id or "").strip()
     orig_text = _read(find_task_file(Path(tasks_dir), task_id))
@@ -76,6 +80,8 @@ def plan_dedup_recovery(
         return "honour", None
 
     if decision == "requeue" and orig_text:
+        if commit_identity is not None and not commit_identity(new_task_id):
+            return "defer", None
         body = build_requeued_task(
             orig_text, new_task_id, dedup_requeue_count(orig_text) + 1,
             asking_channel, holder, reason="holder-empty",

@@ -23,9 +23,8 @@ ROOM = "!room:ag2.space"
 
 
 class _Harness:
-    # DEDUP_ALIAS_FILE is a real path under the operator's ~/.ag2-sparrow
-    # state dir. Unisolated, these tests read and overwrite a LIVE bridge's
-    # delivery aliases, and alias persistence cannot be tested deterministically.
+    # DEDUP_ALIAS_FILE points at the operator's real state dir; unisolated,
+    # these tests would overwrite a live bridge's delivery aliases.
     _PATCH = ("RESULTS_DIR", "ARCHIVE_RESULTS_DIR", "TASKS_DIR", "DEDUP_ALIAS_FILE",
               "_req", "_save_inflight", "_forget_task_room", "_load_task_rooms",
               "_save_task_rooms")
@@ -211,6 +210,55 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
                                 "result archived after a failed report — ask is stranded")
                 self.assertEqual(list(h.gw.ARCHIVE_RESULTS_DIR.glob(f"{TID}-*.txt")), [],
                                  "archived after a failed report")
+
+    def test_corrupt_alias_ledger_defers_instead_of_guessing(self):
+        """An unreadable ledger must not fall back to the re-ask id."""
+        with tempfile.TemporaryDirectory() as td:
+            with _Harness(self.gw, Path(td)) as h:
+                h.seed("", ORIG, DEDUP)
+                inflight = {TID}
+                self.gw._post_ready_results(inflight)          # pass 1: re-ask
+                new_id = h.requeued_tasks()[0].stem
+                h.gw.DEDUP_ALIAS_FILE.write_text("{")           # corrupt it
+                (h.gw.RESULTS_DIR / f"{new_id}.txt").write_text("the recovered answer")
+                h.posts.clear()
+                self.gw._post_ready_results(inflight)          # pass 2
+
+                self.assertEqual(h.posts, [],
+                                 "POSTed under a guessed id with an unreadable ledger")
+                self.assertIn(new_id, inflight, "dropped the re-ask on a ledger failure")
+                self.assertTrue((h.gw.RESULTS_DIR / f"{new_id}.txt").exists(),
+                                "archived the recovered answer it could not address")
+
+    def test_failed_identity_commit_publishes_no_task(self):
+        """A re-ask must not exist before its routing does, or it orphans."""
+        with tempfile.TemporaryDirectory() as td:
+            with _Harness(self.gw, Path(td)) as h:
+                h.seed("", ORIG, DEDUP)
+                blocked = Path(td) / "blocked"
+                blocked.write_text("not a directory")
+                h.gw.DEDUP_ALIAS_FILE = blocked / "alias.json"
+
+                inflight = {TID}
+                self.gw._post_ready_results(inflight)
+                self.assertEqual(h.requeued_tasks(), [],
+                                 "published a re-ask whose routing never committed")
+                self.gw._post_ready_results(inflight)
+                self.assertEqual(len(h.requeued_tasks()), 0,
+                                 "second pass added another orphan re-ask")
+                self.assertIn(TID, inflight)
+
+    def test_report_is_sent_even_with_an_empty_room_map(self):
+        """The results endpoint is keyed by delivery id, not by room."""
+        with tempfile.TemporaryDirectory() as td:
+            with _Harness(self.gw, Path(td)) as h:
+                h.rooms = {}                                    # sidecar lost
+                h.seed("", ORIG + "dedup_requeue_count: 1\n", DEDUP)
+                inflight = {TID}
+                self.gw._post_ready_results(inflight)
+                self.assertEqual(len(h.posts), 1,
+                                 "report silently dropped when the room map was empty")
+                self.assertEqual(h.posts[0]["payload"]["id"], self.gw._broker_tid(TID))
 
     def test_unknown_holder_is_re_asked(self):
         """No archived record of the holder is not evidence that it answered."""

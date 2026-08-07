@@ -33,11 +33,11 @@ except ImportError:
     _d.Message = type("M", (), {})
     sys.modules["discord"] = _d
 
-# Isolate CLAUDE_CONFIG_DIR before any bridge import: the bridges resolve
-# channel access at module load and fall back to the real ~/.claude otherwise.
-# Always stub slack_bolt, present or not: the real `App()` performs a live
-# auth.test during construction, so importing the bridge would hit the network.
-# This test only drives `_dedup_recover`, never Bolt itself.
+# Bridges resolve channel access at import and fall back to the real
+# ~/.claude, so CLAUDE_CONFIG_DIR must be isolated first.
+
+# Stub slack_bolt regardless: the real App() runs a live auth.test at
+# construction, so importing the bridge would hit the network.
 _sb = types.ModuleType("slack_bolt")
 _sb.App = type("App", (), {"__init__": lambda self, **kw: None,
                            "event": lambda self, name: (lambda fn: fn),

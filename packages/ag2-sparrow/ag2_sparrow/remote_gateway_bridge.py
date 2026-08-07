@@ -1631,11 +1631,21 @@ def _write_task(task: dict) -> str | None:
     return tid
 
 
-def _load_dedup_aliases() -> dict[str, str]:
-    try:
-        return json.loads(DEDUP_ALIAS_FILE.read_text())
-    except (OSError, ValueError):
+def _load_dedup_aliases() -> "dict[str, str] | None":
+    """The alias map, or None when it exists but cannot be read.
+
+    None is not the same as empty: guessing "no alias" for an unreadable
+    ledger POSTs a recovered answer under the re-ask id, which the broker is
+    not waiting on.
+    """
+    if not DEDUP_ALIAS_FILE.exists():
         return {}
+    try:
+        loaded = json.loads(DEDUP_ALIAS_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        _log(f"dedup alias ledger unreadable ({exc}) — deferring")
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def _save_dedup_aliases(aliases: dict[str, str]) -> bool:
@@ -1655,13 +1665,16 @@ def _save_dedup_aliases(aliases: dict[str, str]) -> bool:
         return False
 
 
-def _delivery_tid(tid: str) -> str:
-    """The id to POST under: a re-ask answers the original delivery."""
-    return _load_dedup_aliases().get(tid, tid)
+def _delivery_tid(tid: str) -> "str | None":
+    """The id to POST under, or None when the ledger cannot be read."""
+    aliases = _load_dedup_aliases()
+    return None if aliases is None else aliases.get(tid, tid)
 
 
 def _forget_dedup_alias(tid: str) -> None:
     aliases = _load_dedup_aliases()
+    if aliases is None:
+        return
     if aliases.pop(tid, None) is not None:
         _save_dedup_aliases(aliases)  # cleanup: a stale entry is harmless
 
@@ -1796,19 +1809,24 @@ def _dedup_plan(tid: str, holder_id: str | None):
     that the re-ask is written and its answer is never looked for.
     """
     room = _load_task_rooms().get(tid, "")
+
+    def _commit(new_id: str) -> bool:
+        """Persist routing for the re-ask before it becomes visible."""
+        delivery = _delivery_tid(tid)
+        aliases = _load_dedup_aliases()
+        if delivery is None or aliases is None:
+            return False
+        aliases[new_id] = delivery
+        if not _save_dedup_aliases(aliases):
+            return False
+        rooms = _load_task_rooms()
+        rooms[new_id] = room
+        _save_task_rooms(rooms)
+        return True
+
     action, payload = plan_dedup_recovery(
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}")
-    if action == "requeue":
-        aliases = _load_dedup_aliases()
-        aliases[payload] = _delivery_tid(tid)
-        if not _save_dedup_aliases(aliases):
-            # Without the alias the recovered answer would POST under an id the
-            # broker is not waiting on. Leave everything as-is and retry.
-            return "defer", None, room
-        rooms = _load_task_rooms()
-        rooms[payload] = room
-        _save_task_rooms(rooms)
+        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
     return action, payload, room
 
 
@@ -1834,10 +1852,16 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _log(f"dedup deferred for {tid} — alias not committed")
                 continue
             if action != "honour":
-                if action == "report" and room:
+                if action == "report":
+                    # The results endpoint is keyed by delivery id; an empty
+                    # room map must not turn the report into a silent drop.
+                    _delivery = _delivery_tid(tid)
+                    if _delivery is None:
+                        _log(f"dedup report deferred for {tid} — ledger unreadable")
+                        continue
                     try:
                         _req("POST", "/v1/results",
-                             {"id": _broker_tid(_delivery_tid(tid)), "body": payload})
+                             {"id": _broker_tid(_delivery), "body": payload})
                     except (urllib.error.URLError, urllib.error.HTTPError,
                             TimeoutError) as exc:
                         # The report IS the delivery here. Archiving now would
@@ -1894,8 +1918,12 @@ def _post_ready_results(inflight: set[str]) -> None:
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
         try:
+            _delivery = _delivery_tid(tid)
+            if _delivery is None:
+                _log(f"delivery deferred for {tid} — alias ledger unreadable")
+                continue
             _req("POST", "/v1/results",
-                 {"id": _broker_tid(_delivery_tid(tid)), "body": out_body})
+                 {"id": _broker_tid(_delivery), "body": out_body})
         except urllib.error.HTTPError as e:
             _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
             continue
