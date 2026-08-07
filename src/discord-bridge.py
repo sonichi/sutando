@@ -5340,7 +5340,7 @@ async def poll_dm_fallback():
                     # A source in NEITHER set owns no consumer, so this skip is
                     # permanent loss, not deferral. Say so instead of dropping
                     # silently; delivery wiring is deliberately not done here.
-                    _orphan_ch = _orphan_channel_target(task_id)
+                    _orphan_ch = _orphan_channel_target(task_id)  # pragma: no cover — async poll-loop glue
                     if _orphan_ch is not None and _should_warn_undeliverable(task_id):  # pragma: no cover — print glue inside the async poll loop; both decisions (_orphan_channel_target, _should_warn_undeliverable) are unit-tested in tests/dm-fallback-undeliverable-source.test.py
                         print(
                             f"  [dm-fallback] UNDELIVERABLE {f.name}: source="

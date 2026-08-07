@@ -89,6 +89,33 @@ class TestUndeliverableSource(unittest.TestCase):
         self.assertFalse(self.db._should_warn_undeliverable(a))
         self.assertFalse(self.db._should_warn_undeliverable(b))
 
+    def test_channel_id_resolves_from_processed_dir(self):
+        # Artifact named this branch uncovered: a task already moved to
+        # processed/ must still resolve its channel.
+        tid = "task-inprocessed"
+        proc = self.tasks / "processed"
+        proc.mkdir(parents=True, exist_ok=True)
+        (proc / f"{tid}.txt").write_text(f"id: {tid}\nsource: news-radar\nchannel_id: 4242\n")
+        self.assertEqual(self.db._task_channel_id(tid), 4242)
+        self.assertEqual(self.db._orphan_channel_target(tid), 4242)
+
+    def test_channel_id_resolves_from_archive_dir(self):
+        tid = "task-inarchive"
+        arch = self.tasks / "archive" / "2026-08-07"
+        arch.mkdir(parents=True, exist_ok=True)
+        (arch / f"{tid}.txt").write_text(f"id: {tid}\nsource: news-radar\nchannel_id: 7171\n")
+        self.assertEqual(self.db._task_channel_id(tid), 7171)
+
+    def test_unreadable_task_file_returns_none(self):
+        # The OSError arm: a directory where a file is expected raises on read.
+        tid = "task-unreadable"
+        (self.tasks / f"{tid}.txt").mkdir()
+        self.assertIsNone(self.db._task_channel_id(tid))
+
+    def test_non_numeric_channel_id_returns_none(self):
+        tid = self._task("task-badchan", "news-radar", channel_id="not-a-number")
+        self.assertIsNone(self.db._task_channel_id(tid))
+
     def test_non_task_prefix_is_ignored(self):
         self._task("question-x", "news-radar")
         self.assertIsNone(self.db._orphan_channel_target("question-x"))
