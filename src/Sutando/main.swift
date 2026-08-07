@@ -2471,32 +2471,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Not a timeout — nothing is cancelled when it elapses.
     private static let busyNudgeAfterS: TimeInterval = 60
 
-    /// Waiter lifecycle. `starting` is not decoration: the process is published
-    /// here before `run()`, so a Force in that window must stop it launching.
-    private enum GracefulPhase { case idle, starting, waiting, killing }
-    private var gracefulPhase: GracefulPhase = .idle
-    private var gracefulProc: Process?
-    /// Bumped on every claim AND on every cancel, so an in-flight closure whose
-    /// epoch no longer matches knows it was superseded and must not run.
-    private var gracefulEpoch = 0
-    private let gracefulLock = NSLock()
+    /// Waiter lifecycle. Lives in RestartCoordinator.swift so the click orderings
+    /// are executable in tests; `starting` covers the window before `run()`.
+    private let graceful = RestartCoordinator()
 
     @objc func restartCore() {
-        // Refuse a second concurrent waiter. A single tracked slot would other-
-        // wise be overwritten and the first waiter left live and untrackable.
-        gracefulLock.lock()
-        guard gracefulPhase == .idle else {
-            let phase = gracefulPhase
-            gracefulLock.unlock()
-            notify("Sutando", phase == .killing
-                   ? "A restart is already past the kill phase — ignoring this click."
-                   : "A restart is already queued — ignoring this click.")
+        let epoch: Int
+        switch graceful.claimRestart() {
+        case .rejectedPastKill:
+            notify("Sutando", "A restart is already past the kill phase — ignoring this click.")
             return
+        case .rejectedAlreadyQueued:
+            notify("Sutando", "A restart is already queued — ignoring this click.")
+            return
+        case .accepted(let claimed):
+            epoch = claimed
         }
-        gracefulEpoch += 1
-        let epoch = gracefulEpoch
-        gracefulPhase = .starting
-        gracefulLock.unlock()
 
         notify("Sutando", "Restarting Core CLI — waiting for a safe moment…")
         let script = repoRoot + "/src/agent/graceful-restart.sh"
@@ -2510,42 +2500,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         proc.standardOutput = outPipe
         proc.standardError = errPipe
 
-        gracefulLock.lock()
-        gracefulProc = proc
-        gracefulLock.unlock()
+        graceful.track(proc, epoch: epoch)
 
         // Fires once if the gate is still waiting. Epoch-checked so a superseded
         // or cancelled waiter never nudges.
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.busyNudgeAfterS) { [weak self] in
             guard let self = self else { return }
-            self.gracefulLock.lock()
-            let mine = self.gracefulEpoch == epoch && self.gracefulPhase == .waiting
-            self.gracefulLock.unlock()
-            guard mine else { return }
+            guard self.graceful.nudgeApplies(epoch: epoch) else { return }
             self.notify("Sutando", "Core is still busy — restart is queued, not stuck. "
                                  + "Use Force Restart Core CLI to kill it now.")
         }
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
-            // THE force-before-run gate. Claim .waiting and launch under one
-            // lock acquisition, or abort: a Force that bumped the epoch wins.
-            self.gracefulLock.lock()
-            guard self.gracefulEpoch == epoch, self.gracefulPhase == .starting else {
-                self.gracefulLock.unlock()
+            switch self.graceful.launch(epoch: epoch, { try proc.run() }) {
+            case .aborted:
                 return                      // cancelled before we ever launched
-            }
-            do {
-                try proc.run()
-            } catch {
-                self.gracefulPhase = .idle
-                if self.gracefulProc === proc { self.gracefulProc = nil }
-                self.gracefulLock.unlock()
-                self.notify("Sutando", "Core restart failed to start: \(error.localizedDescription)")
+            case .failed(let reason):
+                self.notify("Sutando", "Core restart failed to start: \(reason)")
                 return
+            case .launched:
+                break
             }
-            self.gracefulPhase = .waiting
-            self.gracefulLock.unlock()
             // The script exec's start-cli.sh, so the stream survives the handoff
             // and EOF lands only once the relaunch is done.
             var pending = ""
@@ -2558,20 +2534,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     pending = String(pending[pending.index(after: nl)...])
                     guard let phase = Self.restartPhaseMessage(for: line) else { continue }
                     if line.contains("restarting core (") {
-                        self.gracefulLock.lock()
-                        if self.gracefulEpoch == epoch { self.gracefulPhase = .killing }
-                        self.gracefulLock.unlock()
+                        self.graceful.enterKilling(epoch: epoch)
                     }
                     self.notify("Sutando", phase)
                 }
             }
             proc.waitUntilExit()
             let status = proc.terminationStatus
-            self.gracefulLock.lock()
-            // Only OUR epoch may reset the lifecycle; a Force already moved it on.
-            if self.gracefulEpoch == epoch { self.gracefulPhase = .idle }
-            if self.gracefulProc === proc { self.gracefulProc = nil }
-            self.gracefulLock.unlock()
+            self.graceful.finish(epoch: epoch, proc: proc)
 
             switch status {
             case 0:
@@ -2624,30 +2594,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// SIGTERM -> SIGKILL escalation for a wedged core. "Restart Core CLI" waits
     /// for a quiet window and never SIGKILLs; this is the explicit escape hatch.
     @objc func forceRestartCore() {
-        // Bumping the epoch is what stops a .starting waiter that has not called
-        // run() yet: isRunning is false there, so an isRunning check misses it.
-        gracefulLock.lock()
-        let phase = gracefulPhase
-        let queued = gracefulProc
-        if phase == .killing {
-            gracefulLock.unlock()
+        let (claim, queued) = graceful.claimForce()
+        switch claim {
+        case .rejectedPastKill:
             // Past the kill it has exec'd start-cli.sh; signalling would abort a
             // relaunch already underway.
             notify("Sutando", "A graceful restart is already past the kill phase — "
                             + "not forcing on top of it.")
             return
-        }
-        gracefulEpoch += 1          // invalidates any in-flight waiter closure
-        gracefulPhase = .idle
-        gracefulProc = nil
-        gracefulLock.unlock()
-
-        switch phase {
-        case .starting:
+        case .cancelledBeforeLaunch:
             // It never launched, so there is nothing to signal — the epoch bump
-            // above makes its closure return before `run()`.
+            // inside claimForce makes its closure return before `run()`.
             notify("Sutando", "Cancelled the queued restart before it launched — forcing now.")
-        case .waiting:
+        case .cancelledWhileWaiting:
             if let queued = queued {
                 queued.terminate()
                 // Wait for the TERM trap to release the restart lock; forcing
@@ -2655,7 +2614,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 queued.waitUntilExit()
             }
             notify("Sutando", "Cancelled the queued graceful restart — forcing now.")
-        case .idle, .killing:
+        case .nothingToCancel:
             break
         }
 

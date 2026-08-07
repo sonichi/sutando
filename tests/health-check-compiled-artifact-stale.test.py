@@ -290,5 +290,57 @@ class BinaryIsCurrentTests(unittest.TestCase):
         self.assertFalse(hc._binary_is_current(self.binary, self.src))
 
 
+class NewestAppSourceTests(unittest.TestCase):
+    """`sutando_app_newest_source` picks the newest .swift, not a hardcoded name.
+
+    The app is built from several sources; a check naming only main.swift stops
+    noticing edits to its siblings.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name) / "Sutando"
+        self.d.mkdir(parents=True)
+        self.now = time.time()
+
+    def _write(self, name: str, age_h: float) -> Path:
+        p = self.d / name
+        p.write_text("// swift\n", encoding="utf-8")
+        _set_mtime(p, self.now - age_h * 3600)
+        return p
+
+    def test_picks_the_newest_sibling_not_main(self):
+        self._write("main.swift", 10)
+        newest = self._write("RestartCoordinator.swift", 1)
+        self.assertEqual(newest, hc.sutando_app_newest_source(self.d))
+
+    def test_picks_main_when_main_is_newest(self):
+        main = self._write("main.swift", 1)
+        self._write("RestartCoordinator.swift", 10)
+        self.assertEqual(main, hc.sutando_app_newest_source(self.d))
+
+    def test_falls_back_to_main_when_no_sources_exist(self):
+        self.assertEqual(self.d / "main.swift", hc.sutando_app_newest_source(self.d))
+
+    def test_ignores_non_swift_and_directories(self):
+        main = self._write("main.swift", 5)
+        (self.d / "notes.md").write_text("x", encoding="utf-8")
+        _set_mtime(self.d / "notes.md", self.now)
+        sub = self.d / "nested.swift"
+        sub.mkdir()
+        _set_mtime(sub, self.now)
+        self.assertEqual(main, hc.sutando_app_newest_source(self.d))
+
+    def test_missing_directory_falls_back_to_main(self):
+        gone = Path(self.tmp.name) / "absent"
+        self.assertEqual(gone / "main.swift", hc.sutando_app_newest_source(gone))
+
+    def test_defaults_to_the_repo_app_dir(self):
+        with patch.object(hc, "REPO_DIR", Path(self.tmp.name).parent):
+            got = hc.sutando_app_newest_source()
+        self.assertEqual("Sutando", got.parent.name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

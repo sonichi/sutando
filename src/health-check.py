@@ -3096,6 +3096,26 @@ def _filter_pids_this_checkout(pids: list) -> list:
     return kept
 
 
+def sutando_app_newest_source(app_dir: Optional[Path] = None) -> Path:
+    """Newest .swift under the app dir — the binary is stale if it predates any of them.
+
+    Globbed, not enumerated: the app is built from several sources now, and a
+    hardcoded list silently stops noticing the ones added after it was written.
+    """
+    d = app_dir if app_dir is not None else REPO_DIR / "src" / "Sutando"
+    main = d / "main.swift"
+    try:
+        srcs = [p for p in d.glob("*.swift") if p.is_file()]
+    except OSError:
+        return main
+    if not srcs:
+        return main
+    try:
+        return max(srcs, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return main
+
+
 def _binary_is_current(binary_path: Path, src_file: Path) -> bool:
     """True if `binary_path` was built from the content now in `src_file`.
 
@@ -6958,7 +6978,7 @@ def run_all_checks() -> list[dict]:
             if dev_bin.exists():
                 mark_stale_if_outdated(
                     check,
-                    REPO_DIR / "src" / "Sutando" / "main.swift",
+                    sutando_app_newest_source(),
                     "(Sutando|MacOS)/Sutando",
                     binary_path=dev_bin,
                 )
@@ -8429,7 +8449,7 @@ def main():
                     #      observed 3 concurrent on 2026-04-19), so we
                     #      defer that path to a manual rebuild + relaunch.
                     binary = REPO_DIR / "src" / "Sutando" / "Sutando"
-                    source = REPO_DIR / "src" / "Sutando" / "main.swift"
+                    source = sutando_app_newest_source()
                     if (
                         c.get("status") == "warn"
                         and "not running" in (c.get("detail") or "")
