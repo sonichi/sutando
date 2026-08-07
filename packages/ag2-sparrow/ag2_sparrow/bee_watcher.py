@@ -22,10 +22,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# The sources/ split: Bee's SUBSCRIBE + NORMALIZE specifics live in
-# ag2_sparrow/sources/bee.py; this module is the shared RUNNER (SSE parse,
-# resume cursor, sinks, halt-on-failure, backoff, CLI). Names re-exported
-# below keep the public surface (and tests) stable.
+# Shared runner; Bee's subscribe/normalize live in sources/bee.py.
+# Re-exports below keep the public surface (and tests) stable.
 from ag2_sparrow.sources import bee as _source
 
 confine_user_content = _source.confine_user_content
@@ -56,10 +54,8 @@ def _config(cli: argparse.Namespace) -> dict:
 
 
 def _cursor_path() -> Path:
-    # BEE_CURSOR_FILE is the container-portable override (the headless
-    # server-side runner has no sutando workspace): set it to a path on the
-    # pod's persistent volume. Unset → resolve under the local workspace, the
-    # OSS/local-core default.
+    # BEE_CURSOR_FILE overrides the resume-cursor path (required headless —
+    # no workspace to resolve); unset resolves under the local workspace.
     _explicit = os.environ.get("BEE_CURSOR_FILE", "").strip()
     if _explicit:
         return Path(_explicit)
@@ -219,14 +215,8 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
                     else:
                         ok = _post_task(cfg, task)
                     if not ok:
-                        # Contiguous-prefix cursor: a failed delivery
-                        # HALTS the stream (no skip-ahead on the cursor).
-                        # Processing a later event would advance the cursor
-                        # past this one, and the reconnect's Last-Event-ID
-                        # would tell Bee never to replay it — silent data
-                        # loss. Reconnect resumes from the last fully
-                        # delivered prefix; broker enqueue idempotency
-                        # absorbs any replays of already-accepted events.
+                        # Halt on failed delivery — advancing the cursor would
+                        # tell the reconnect (Last-Event-ID) never to replay it.
                         _log(f"halting stream at {task['id']} — delivery "
                              "failed; will reconnect from last good cursor")
                         break

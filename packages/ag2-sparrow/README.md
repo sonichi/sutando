@@ -64,11 +64,15 @@ fallback DM room); `local` writes task files onto the same file bridge voice
 and Discord use — the fully-OSS, no-broker mode; `inbox` delivers into the
 durable EventInbox and drains through the shared taskify consumer.
 
-Every Bee-derived task is stamped `access_tier: ambient`, never `owner`:
-device-captured speech is an observation the owner never consciously issued
-as a command, so privileged actions must surface for approval rather than
-execute. Tier is the authorization boundary; body-injection defang is
-separate and also applied.
+Access tier — device-captured speech is an observation the owner never
+consciously issued as a command, so it must never reach the privileged owner
+path. The `local` and `inbox` sinks stamp `access_tier: ambient` by
+construction. The `broker` sink does NOT put a tier on the wire — the
+receiving gateway assigns it from `REMOTE_TASK_TIER`, which defaults to
+`owner` for the personal-agent model. **A hosted/shared Bee lane MUST set
+`REMOTE_TASK_TIER=team` (or `other`) on the gateway** so Bee events land
+sandboxed; ambient is not available over the broker hop. Body-injection
+defang is applied on all three sinks regardless.
 
 | Env | Meaning |
 |---|---|
