@@ -5282,6 +5282,19 @@ def _should_warn_undeliverable(task_id: str) -> bool:
     return True
 
 
+def _undeliverable_warning_for(task_id: str, result_name: str):
+    """The line to log for a result nothing will deliver, or None.
+    Composes classification + one-shot so the whole decision is testable; only
+    the print remains loop glue."""
+    ch = _orphan_channel_target(task_id)
+    if ch is None or not _should_warn_undeliverable(task_id):
+        return None
+    return (f"  [dm-fallback] UNDELIVERABLE {result_name}: source="
+            f"{_task_source(task_id)!r} owns no consumer and is not DM-eligible; "
+            f"task names channel {ch} but nothing delivers there. "
+            f"This result will never be sent.")
+
+
 def _orphan_channel_target(task_id: str):
     """Channel a `task-` result must go to because NOTHING else will deliver it.
 
@@ -5340,15 +5353,9 @@ async def poll_dm_fallback():
                     # A source in NEITHER set owns no consumer, so this skip is
                     # permanent loss, not deferral. Say so instead of dropping
                     # silently; delivery wiring is deliberately not done here.
-                    _orphan_ch = _orphan_channel_target(task_id)  # pragma: no cover — async poll-loop glue
-                    if _orphan_ch is not None and _should_warn_undeliverable(task_id):  # pragma: no cover — print glue inside the async poll loop; both decisions (_orphan_channel_target, _should_warn_undeliverable) are unit-tested in tests/dm-fallback-undeliverable-source.test.py
-                        print(
-                            f"  [dm-fallback] UNDELIVERABLE {f.name}: source="
-                            f"{_task_source(task_id)!r} owns no consumer and is not "
-                            f"DM-eligible; task names channel {_orphan_ch} but nothing "
-                            f"delivers there. This result will never be sent.",
-                            flush=True,
-                        )
+                    _warn = _undeliverable_warning_for(task_id, f.name)
+                    if _warn:
+                        print(_warn, flush=True)  # pragma: no cover — print glue; the decision above is unit-tested
                     continue
                 # Grace window so voice-agent / telegram-bridge get first dibs.
                 try:

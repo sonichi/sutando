@@ -116,6 +116,33 @@ class TestUndeliverableSource(unittest.TestCase):
         tid = self._task("task-badchan", "news-radar", channel_id="not-a-number")
         self.assertIsNone(self.db._task_channel_id(tid))
 
+    # --- the COMPOSITION poll_dm_fallback actually calls (reviewers' finding:
+    # testing the helpers independently never exercises how they combine) ---
+
+    def test_composition_emits_once_then_none(self):
+        tid = self._task("task-compose", "news-radar")
+        first = self.db._undeliverable_warning_for(tid, "task-compose.txt")
+        self.assertIsNotNone(first)
+        self.assertIn("1509379092116672602", first)
+        self.assertIn("UNDELIVERABLE", first)
+        self.assertIn("news-radar", first)
+        self.assertIsNone(self.db._undeliverable_warning_for(tid, "task-compose.txt"))
+
+    def test_composition_returns_none_for_delivery_owning_source(self):
+        tid = self._task("task-compose-discord", "discord")
+        self.assertIsNone(self.db._undeliverable_warning_for(tid, "x.txt"))
+
+    def test_composition_returns_none_without_channel(self):
+        tid = self._task("task-compose-nochan", "news-radar", channel_id=None)
+        self.assertIsNone(self.db._undeliverable_warning_for(tid, "x.txt"))
+
+    def test_composition_does_not_consume_the_one_shot_when_not_eligible(self):
+        # Order matters: an ineligible task must NOT burn its one-shot slot, or a
+        # source later added to neither set would be silently pre-silenced.
+        tid = self._task("task-order", "discord")
+        self.assertIsNone(self.db._undeliverable_warning_for(tid, "x.txt"))
+        self.assertTrue(self.db._should_warn_undeliverable(tid))
+
     def test_non_task_prefix_is_ignored(self):
         self._task("question-x", "news-radar")
         self.assertIsNone(self.db._orphan_channel_target("question-x"))
