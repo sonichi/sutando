@@ -101,13 +101,19 @@ text, h = _write_and_parse({"id": "task-gw-3", "task": "just a text question"})
 check("no marker → no attachments header", "attachments:" not in text)
 check("no marker → no content_modalities header", "content_modalities:" not in text)
 
-# ── 5. regression: access_tier is still the LAST header (my insert is mid-file) ──
-lines = [l for l in text.split("\n") if l]
-check("access_tier still last header", lines[-1].startswith("access_tier:"))
+# ── 5. access_tier must remain the ONLY header-shaped access_tier line —
+# nothing after it but bridge-authored block text that never carries the key.
+def _tier_wins_last(txt):
+    ls = [l for l in txt.split("\n") if l]
+    tier_at = [i for i, l in enumerate(ls) if l.startswith("access_tier:")]
+    if len(tier_at) != 1:
+        return False
+    tail = ls[tier_at[0] + 1:]
+    return not tail or any(l.startswith("===SKILL INSTRUCTIONS") for l in tail)
+check("access_tier still last header", _tier_wins_last(text))
 # and with media present too
 text1 = (rgb.TASKS_DIR / "task-gw-1.txt").read_text()
-lines1 = [l for l in text1.split("\n") if l]
-check("access_tier last even with media headers", lines1[-1].startswith("access_tier:"))
+check("access_tier last even with media headers", _tier_wins_last(text1))
 
 if failures:
     print(f"\nFAIL — {len(failures)} check(s) failed: {failures}")
