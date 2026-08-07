@@ -303,20 +303,70 @@ check("every repair carries a type and a priority",
       all(clf(c).get("repair_type") and clf(c).get("priority") for c, _ in REPAIR_ARMS))
 
 # ── characterized pre-existing defect ────────────────────────────────────────
-print("── known defect (characterized, NOT fixed here) ──")
+print("── empty-events regression (fixed) ──")
 # `call.get("events", [{}])[0]` defaults only on a MISSING key, so a present-
 # but-empty list indexes out of range. Pre-existing on main; recorded here so
 # this extraction cannot silently change it. Fixing it is a separate PR.
-raised = False
+# Regression: `call.get("events", [{}])[0]` defaulted only on a MISSING key, so
+# a present-but-empty list indexed out of range. Both call sites now use
+# `(call.get("events") or [{}])[0]`.
+raised = None
 try:
     A.analyze_patterns_and_repair([call("empty", events=[])])
-except IndexError:
-    raised = True
-check("empty events[] still raises IndexError (pre-existing, unchanged)", raised)
+except IndexError as e:
+    raised = e
+check("empty events[] no longer raises IndexError", raised is None, str(raised))
+check("a mix of empty-events and normal calls is handled",
+      A.analyze_patterns_and_repair(
+          [call("empty", events=[]),
+           call("real", events=[ev(1, "call_started"), ev(3, "sutando: I'm recording")])]) is not None)
 check("a call with NO events key does not raise",
       A.analyze_patterns_and_repair([{"callSid": "x", "durationMs": 1, "toolCalls": []}]) is not None)
 
 # ── the renderer must delegate, not duplicate ────────────────────────────────
+# ── renderer path: the SECOND fixed crash site, actually executed ────────────
+# CR #2544 (qingyun-wu): the empty-events fix touches TWO independently
+# reachable sites — analyze_patterns_and_repair AND generate_tracker_html
+# (diagnose.py:418). The regression above only exercises the first; the
+# delegation section below only SCANS diagnose.py as text. A text scan cannot
+# catch a regression in the renderer, so this executes it for real.
+print("── renderer path (diagnose.py:418) ──")
+import importlib.util as _ilu
+import tempfile as _tf
+from pathlib import Path as _P
+
+_spec = _ilu.spec_from_file_location(
+    "cd_diagnose", REPO / "skills" / "call-diagnostics" / "scripts" / "diagnose.py")
+_D = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_D)
+
+_out = _P(_tf.mkdtemp(prefix="cd-render-")) / "tracker.html"
+_calls = [
+    {"callSid": "empty-events", "sessionId": "s0", "durationMs": 1000,
+     "events": [], "toolCalls": []},                      # the crash input
+    {"callSid": "normal", "sessionId": "s1", "durationMs": 60000,
+     "events": [ev(1, "call_started"), ev(3, "sutando: I'm recording")],
+     "toolCalls": [tc(2, "screen_record", 5)]},
+]
+_rendered = None
+try:
+    _D.generate_tracker_html(_calls, str(_out), source_type="phone")
+    _rendered = _out.read_text() if _out.exists() else ""
+except IndexError as e:
+    check("generate_tracker_html survives a present-but-empty events list", False, f"IndexError: {e}")
+
+if _rendered is not None:
+    check("generate_tracker_html survives a present-but-empty events list", True)
+    check("it wrote a non-empty tracker file", len(_rendered) > 0, f"{len(_rendered)} bytes")
+    check("the normal call still rendered alongside the empty one",
+          "normal" in _rendered, "expected the second callSid in the output")
+
+# A call with NO events key at all must also render (the other default path).
+_out2 = _P(_tf.mkdtemp(prefix="cd-render2-")) / "t.html"
+_D.generate_tracker_html([{"callSid": "no-key", "durationMs": 1, "toolCalls": []}],
+                         str(_out2), source_type="phone")
+check("a call with no events key renders too", _out2.exists() and _out2.stat().st_size > 0)
+
 print("── delegation ──")
 diag = (REPO / "skills" / "call-diagnostics" / "scripts" / "diagnose.py").read_text()
 check("diagnose.py imports the engine", "from analysis import" in diag)

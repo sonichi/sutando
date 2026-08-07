@@ -163,6 +163,14 @@ run_node_service() {
   fi
 }
 
+# Resolve the configured core BEFORE touching runtime-specific credentials or
+# running an auth probe. .env remains loaded at its established point below;
+# the helper consults it in a subshell only for SUTANDO_CORE_RUNTIME parity.
+# shellcheck source=startup-runtime.sh
+source "$REPO/src/startup-runtime.sh"
+core_runtime="$(resolve_startup_core_runtime)"
+[ -n "$core_runtime" ] || core_runtime="claude"
+
 # Export workspace-scoped CLAUDE_CONFIG_DIR before services launch. Without it,
 # init.sh + the bridge-launcher blocks below (L~262 proxy, L~429 telegram,
 # L~449 discord, L~473 slack) probe `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and
@@ -204,6 +212,7 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # entries keyed by absolute checkout path don't collide between hosts.
     # Followup: consider narrowing CLAUDE_CONFIG_DIR to a per-host non-synced
     # subdir.
+    if claude_auth_carry_enabled "$core_runtime"; then
     for _seed in .credentials.json .claude.json; do
       if [ ! -f "$_ccd/$_seed" ] && [ -f "$HOME/.claude/$_seed" ]; then
         # Mini 21:23Z: defensive log on cp failure (read-only target, disk full).
@@ -272,6 +281,7 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
         unset _env_token
       fi
     fi
+    fi
     export CLAUDE_CONFIG_DIR="$_ccd"
   else
     echo "startup: claude_sutando_config_dir invalid — refusing to start" >&2
@@ -282,15 +292,11 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
   rm -f "$_ccd_err"
 fi
 
-# Boot gate (#2396): verify the resolved CLAUDE_CONFIG_DIR can boot the CLI
-# authenticated BEFORE any service launches. A logged-out CLI (locked keychain
-# on SSH boots, fresh config dir) otherwise yields a half-up core — tmux +
-# bridges alive, CLI parked at /login, processing nothing (2026-07-30 outage).
-# The gate fails loud (stderr + notification + pending-questions + proactive
-# DM file) and aborts; SUTANDO_SKIP_AUTH_PREFLIGHT=1 is the escape hatch.
-if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-  bash "$REPO/src/auth-preflight-gate.sh" "$CLAUDE_CONFIG_DIR" || exit $?
-fi
+# Boot gate (#2396): verify the SELECTED core can boot authenticated BEFORE any
+# service launches. Claude retains its rich login-state gate; Codex checks the
+# configured CODEX_HOME with `codex login status`. The shared escape hatch is
+# SUTANDO_SKIP_AUTH_PREFLIGHT=1.
+preflight_selected_core_auth "$core_runtime" "${CLAUDE_CONFIG_DIR:-}" || exit $?
 
 # Git committer attribution: REMOVED (2026-05-21). This block used to set
 # committer.name/committer.email from stand-identity.json so `git log %cn`
@@ -323,8 +329,6 @@ git -C "$REPO" config --unset committer.email 2>/dev/null || true
 #  2) Voice needs a Gemini key, but the Codex core, text web UI, dashboard,
 #     API, and configured message bridges do not. Missing voice credentials
 #     disable only the voice service instead of blocking the whole product.
-# shellcheck source=startup-runtime.sh
-source "$REPO/src/startup-runtime.sh"
 configure_startup_runtime
 
 # v0.8 auto-migration helpers (PR #1440 safety hardening — Mini review).
@@ -527,8 +531,6 @@ if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; m
 # just printed that Python-backed services would be skipped (CR #2599,
 # @qingyun-wu). Tolerate the failure and fall back, so the skip actually
 # happens instead of being promised.
-core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || true)"
-[ -n "$core_runtime" ] || core_runtime="claude"
 if ! command -v "$core_runtime" > /dev/null 2>&1; then
   echo "  ✗ $core_runtime CLI not found — required by core.runtime"
   missing=1
@@ -979,105 +981,6 @@ if [ -d "$REPO/skills/portfolio-research" ]; then
   echo "  ✓ portfolio dashboard (port 8899)"
 fi
 
-# 5b. Sutando context drop app (hotkey configurable via state/hotkeys.json)
-SUT_SRC="$REPO/src/Sutando/main.swift"
-SUT_BIN="$REPO/src/Sutando/Sutando"
-
-# Build the public ax-read CLI if missing or older than any of its source
-# files. Sutando.app's resolveAxReadPath() prefers private personal-deictic
-# when installed; this public binary is the text-only fallback so public-repo
-# users still get the context-drop experience.
-#
-# Staleness widened (per Mini's PR #907 review): trigger a rebuild when
-# Package.swift / build.sh / any *.swift under Sources/ is newer than the
-# binary, not just the main entry-point. Build failures are surfaced loudly
-# (not >/dev/null 2>&1) — silent failure here was the exact regression class
-# this skill is meant to prevent.
-AXR_DIR="$REPO/skills/context-drop"
-AXR_BIN="$AXR_DIR/ax-read"
-AXR_NEWEST_SRC="$(find "$AXR_DIR/Sources" "$AXR_DIR/Package.swift" "$AXR_DIR/build.sh" -type f \( -name '*.swift' -o -name 'Package.swift' -o -name 'build.sh' \) 2>/dev/null | xargs -I{} stat -f '%m {}' {} 2>/dev/null | sort -rn | head -1 | awk '{print $2}')"
-if [ -n "$AXR_NEWEST_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_NEWEST_SRC" -nt "$AXR_BIN" ]; }; then
-  echo "  Compiling public ax-read (skills/context-drop)..."
-  if ! command -v swift >/dev/null 2>&1; then
-    echo "  ⚠ ax-read build skipped: 'swift' not in PATH"
-    echo "    → install Xcode Command Line Tools (xcode-select --install) for context drops on public-repo installs"
-  elif (cd "$AXR_DIR" && bash build.sh); then
-    echo "  ✓ ax-read built at $AXR_BIN"
-  else
-    echo "  ⚠ ax-read build FAILED — see Swift compiler output above"
-    echo "    → Sutando.app will fall back to legacy in-process AX (broken for Electron under LSUIElement context)"
-  fi
-fi
-
-# Rebuild if source is newer than binary, or binary is missing.
-# Kill any running instance so the fresh binary can take over.
-if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; }; then
-  echo "  Compiling Sutando (source newer than binary)..."
-  if (cd "$REPO/src/Sutando" && swiftc -O -o Sutando main.swift SutandoConfig.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null); then
-    echo "  ✓ Sutando compiled"
-
-    # Sync the fresh binary into the .app bundle if one exists, ensure the
-    # AppleEvents usage-description key is present, and re-sign so the
-    # cdhash matches. Without NSAppleEventsUsageDescription macOS silently
-    # denies AppleEvents — getFinderSelection() returns [] and the context
-    # drop handler logs "Nothing selected" with no permission prompt.
-    SUT_APP="$REPO/src/Sutando/Sutando.app"
-    if [ -d "$SUT_APP" ]; then
-      cp "$SUT_BIN" "$SUT_APP/Contents/MacOS/Sutando"
-      /usr/libexec/PlistBuddy \
-        -c "Add :NSAppleEventsUsageDescription string 'Sutando reads your Finder selection to drop files into the agent task queue.'" \
-        "$SUT_APP/Contents/Info.plist" 2>/dev/null || true
-      # Prefer a stable signing identity when one is installed so the TCC
-      # Accessibility grant survives rebuilds (cdhash churn). Falls back to
-      # ad-hoc when no such identity exists — public-repo users without a
-      # personal signing cert get the same behavior as before.
-      #
-      # The designated requirement is identifier-only on purpose: the
-      # grant binds to the bundle ID rather than cdhash, so a rebuild
-      # against the same identity satisfies the requirement without
-      # re-prompting. For installs without a cert, ad-hoc still requires
-      # re-grant on each rebuild — same as the legacy behavior.
-      SUT_SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Sutando Dev"/{print $2; exit}')"
-      if [ -n "$SUT_SIGN_ID" ]; then
-        codesign --force --sign "$SUT_SIGN_ID" --identifier com.sutando.menubar \
-          --requirements '=designated => identifier "com.sutando.menubar"' \
-          "$SUT_APP" 2>/dev/null || codesign --force --sign - "$SUT_APP" 2>/dev/null || true
-        echo "  ✓ Sutando.app synced + signed (Sutando Dev + identifier-only DR)"
-      else
-        codesign --force --sign - "$SUT_APP" 2>/dev/null || true
-        echo "  ✓ Sutando.app synced + signed (ad-hoc; install \"Sutando Dev\" cert for stable TCC)"
-      fi
-    fi
-
-    if pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
-      pkill -f "src/Sutando/Sutando" 2>/dev/null || true
-      # Wait for kernel cleanup to drain before relaunch — fixed sleep 1
-      # raced with slow shutdown on 2026-04-21, leaving dual Sutando.app
-      # instances with ghost menu-bar icons.
-      for _ in $(seq 1 30); do
-        pgrep -f "src/Sutando/Sutando" >/dev/null 2>&1 || break
-        sleep 0.1
-      done
-    fi
-  else
-    echo "  ⚠ Sutando compile failed — keeping existing binary if any"
-  fi
-fi
-
-if ! pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
-  if [ -f "$SUT_BIN" ]; then
-    echo "  Starting Sutando..."
-    "$SUT_BIN" > /dev/null 2>&1 &
-    echo "  ✓ Sutando (hotkeys via state/hotkeys.json)"
-  else
-    echo "  ⚠ Sutando binary missing — hotkeys disabled"
-  fi
-else
-  echo "  ✓ Sutando (already running)"
-fi
-
-echo ""
-
 # Vault scanner preflight, shared by the three bridges that intercept secrets
 # (telegram, discord, slack — all import src/vault_intercept.py).
 #
@@ -1213,7 +1116,17 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
     # leaving the success line outside it still reported a launch that never
     # happened — per named instance, on a configured remote-control surface.
     if [ -n "$PY" ]; then
+      # REMOTE_TASK_CHANNEL_DIR isolates this instance's channel config
+      # (.env fallback + access.json). Without it the named instance defaults
+      # to channels/ag2space/ and inherits PROD's credentials and tier map —
+      # the exact failure #2701 exists to prevent (review P1, bassil).
+      # Convention: instance "dev" → channels/dev-ag2space/; anything else →
+      # channels/<inst>-ag2space/ unless the operator overrides via
+      # REMOTE_TASK_CHANNEL_DIR_<INST>.
+      _gw_chdir_var="REMOTE_TASK_CHANNEL_DIR_${_gw_var#AG2_REMOTE_TOKEN_}"
+      _gw_chdir="${!_gw_chdir_var:-${_gw_inst}-ag2space}"
       SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+        REMOTE_TASK_CHANNEL_DIR="$_gw_chdir" \
         REMOTE_PROACTIVE_ROOM= \
         "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
       echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
@@ -1412,7 +1325,6 @@ for port_name in $VERIFY_PORTS; do
   fi
 done
 echo ""
-open "http://localhost:$WEB_CLIENT_PORT"
 
 # Delegate to the runtime dispatcher — canonical sutando-core launch command.
 # Sutando.app and health recovery use this same Claude-or-Codex selection.

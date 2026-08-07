@@ -66,6 +66,71 @@ def format_reply_chain_ids(ids: Sequence) -> str:
     return "reply_chain_ids: " + ",".join(reversed(clean)) + "\n"
 
 
+def should_fetch_reply_context(has_reference: bool, has_message_id: bool,
+                               is_forward: bool) -> bool:
+    """Whether the bridge should fetch the referenced message for reply context.
+
+    A FORWARD sets ``message.reference`` too, but the referenced message lives in
+    the SOURCE channel, so ``channel.fetch_message(reference.message_id)`` on the
+    receiving channel is guaranteed to 404 — one wasted network round trip and an
+    alarming ``[reply-context] fetch failed: 404 ... Unknown Message`` on every
+    forward the owner sends.
+
+    The forward's own body is NOT reply context and is not lost by skipping this:
+    it lives in ``message.message_snapshots`` and is extracted by the dedicated
+    forward handler earlier in the same path. Reply context answers "which
+    earlier message in THIS channel is being replied to", which a forward has no
+    answer to.
+
+    Split out as a predicate because the bridge is not unit-importable, so the
+    only way to prove the activated path is gated is to test the condition it
+    branches on (john-the-dev + bassilkhilo-ag2 on #2633: the first version
+    re-keyed the header and left this fetch executing, so the reported 404 was
+    still live).
+    """
+    return bool(has_reference and has_message_id and not is_forward)
+
+
+def format_parent_reference(message_id, is_forward: bool, source_channel_id=None) -> str:
+    """Format the reference header for a message that carries a ``reference``.
+
+    Discord sets ``message.reference`` for two different features, and only one
+    of them is a reply:
+
+      * a **reply** — the referenced message is in THIS channel, and
+        ``parent_message_id`` is a handle the agent can re-fetch. That is what
+        the key has always meant.
+      * a **forward** — the reference points at the original in its **source**
+        channel. Emitting that under ``parent_message_id`` claimed a
+        relationship that does not exist and produced an id that cannot be
+        resolved from the channel the task was written in. Observed
+        2026-08-04: a forward into ``#echo`` recorded
+        ``parent_message_id: 1534196303205105849``; that id 404s in ``#echo``
+        and resolves only in the channel it was forwarded FROM, so the bridge
+        also logged ``[reply-context] fetch failed: 404 Unknown Message``.
+
+    So a forward is re-keyed to ``forwarded_from_message_id`` and, when known,
+    ``forwarded_from_channel_id`` — the provenance is kept (Chi chose re-key
+    over dropping it) and made resolvable, since an id without its channel is
+    not a handle a consumer can act on.
+
+    ``is_forward`` is decided by the CALLER from ``message.message_snapshots``,
+    the payload a forward carries. That is deliberately not inferred from
+    ``reference.type`` here: the snapshot IS the forward, whereas the reference
+    type is a second-hand signal for the same fact.
+
+    Returns ``""`` when there is no id to emit.
+    """
+    if not message_id:
+        return ""
+    if not is_forward:
+        return f"parent_message_id: {message_id}\n"
+    line = f"forwarded_from_message_id: {message_id}\n"
+    if source_channel_id:
+        line += f"forwarded_from_channel_id: {source_channel_id}\n"
+    return line
+
+
 def format_reply_chain_truncation(reached_root: bool, oldest_walked_id) -> str:
     """Visible marker for when the id walk stopped BEFORE the thread's root.
 
