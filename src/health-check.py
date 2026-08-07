@@ -6467,6 +6467,96 @@ def check_dynamic_loop_freshness(
     return checks
 
 
+GLOBAL_PIN_SCOPE = "global"
+
+
+def _pin_scope_flag(scope: str) -> str:
+    """tmux addresses the global environment with -g, never with -t '=global'."""
+    return "-g" if scope == GLOBAL_PIN_SCOPE else f"-t '={scope}'"
+
+
+def _interpret_core_model_pin(pinned: list, socket: str) -> dict:
+    """Pure half of `check_core_model_pin`: interprets all collected tmux pins.
+    `pinned` is [(scope, value), ...] over every session plus `global`."""
+    name = "core-model-pin"
+    if not pinned:
+        return {"name": name, "status": "ok",
+                "detail": "no model pin on any session or the global env "
+                          "(core uses the default window)"}
+    where = ", ".join(f"{scope}={val!r}" for scope, val in pinned)
+    # Name the scope in the remedy: an operator copies the emitted line, and a
+    # `setenv -u` without -t/-g can clear a different scope than the pinned one.
+    fixes = "; ".join(
+        f"tmux -S {socket} setenv {_pin_scope_flag(scope)} -u SUTANDO_CORE_MODEL"
+        for scope, _ in pinned
+    )
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (
+            f"core is PINNED by wedge recovery ({where}) — an emergency downgrade that "
+            f"nothing clears and that survives every bare rerun. If the core did not just "
+            f"wedge, clear it: {fixes}. Clearing tmux alone is not durable: start-cli.sh "
+            f"re-supplies SUTANDO_CORE_MODEL from its own launching env on the next "
+            f"new-session, so the launching process has to be replaced too."
+        ),
+    }
+
+
+def _tmux_sessions(socket: str) -> list:  # pragma: no cover — thin tmux glue
+    res = subprocess.run(
+        ["tmux", "-S", socket, "list-sessions", "-F", "#{session_name}"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if res.returncode != 0:
+        # A failed enumeration is not an empty socket: returning [] here would
+        # report "no pin" without having inspected a single session.
+        raise subprocess.CalledProcessError(res.returncode, res.args, res.stdout, res.stderr)
+    return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+
+
+TMUX_UNSET_MARKER = "unknown variable"
+
+
+def _query_pin(socket: str, scope_args: list) -> str:
+    """Pinned value for one tmux env scope, or "" when tmux says unset.
+    Only tmux's marker means absence; any other nonzero is a FAILED query."""
+    res = subprocess.run(
+        ["tmux", "-S", socket, "show-environment", *scope_args, "SUTANDO_CORE_MODEL"],
+        capture_output=True, text=True, timeout=10,
+    )
+    out = (res.stdout or "").strip()
+    if res.returncode == 0:
+        return out.split("=", 1)[1] if out.startswith("SUTANDO_CORE_MODEL=") else ""
+    # The marker can arrive on either stream; accept both.
+    if TMUX_UNSET_MARKER in (out + " " + (res.stderr or "")):
+        return ""
+    raise subprocess.CalledProcessError(res.returncode, res.args, res.stdout, res.stderr)
+
+
+def check_core_model_pin() -> dict:
+    """Report a core running the wedge-recovery model downgrade. Queries every
+    session AND the global env, since tmux's implicit target is not reliable."""
+    name = "core-model-pin"
+    socket = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+    if not Path(socket).exists():
+        return {"name": name, "status": "ok", "detail": "no core tmux socket — skipped"}
+    try:
+        pinned = []
+        # -g first: a global pin needs no session to exist, and a per-session
+        # query never reports it, so enumerating sessions alone can miss it.
+        val = _query_pin(socket, ["-g"])
+        if val:
+            pinned.append((GLOBAL_PIN_SCOPE, val))
+        for sess in _tmux_sessions(socket):
+            val = _query_pin(socket, ["-t", f"={sess}"])
+            if val:
+                pinned.append((sess, val))
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"name": name, "status": "ok", "detail": f"could not query tmux env ({e}) — skipped"}
+    return _interpret_core_model_pin(pinned, socket)
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -6899,6 +6989,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
+    checks.append(check_core_model_pin())
     checks.append(check_disk_space())
 
     return checks
