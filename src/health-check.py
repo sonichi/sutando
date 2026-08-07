@@ -282,9 +282,13 @@ def managed_voice_credential_present(path: Optional[Path] = None) -> bool:
     """True when the managed-credentials file carries a usable voice key.
 
     Mirrors `_managed_voice_credential_present` in startup-runtime.sh, including
-    its fallback order (`CAPABILITY_FALLBACKS['gemini-voice']`) and its
-    malformed-file contract: an unreadable or malformed file SKIPS the tier
-    rather than raising, matching readManaged()'s try/catch.
+    its fallback order (`CAPABILITY_FALLBACKS['gemini-voice']`), its
+    malformed-file contract — an unreadable or malformed file SKIPS the tier
+    rather than raising, matching readManaged()'s try/catch — and the S1 truth
+    table (design 2b): a `quarantined: true` file's entries are ABSENT in every
+    mode, and an explicit `voicePreference: "byok"` skips the managed tier
+    entirely. Guards identical to the resolvers and the shell gate;
+    tests/voice-preference-consumers.test.sh pins the agreement.
 
     Deliberately NOT fail-closed, unlike the dotenv parsing above. The two cases
     differ: a malformed SKIP_VOICE means someone configured voice and we cannot
@@ -296,10 +300,13 @@ def managed_voice_credential_present(path: Optional[Path] = None) -> bool:
     if path is None:
         path = WORKSPACE_DIR / "state" / "auth" / "managed-credentials.json"
     try:
-        caps = (json.loads(Path(path).read_text()) or {}).get("capabilities") or {}
+        doc = json.loads(Path(path).read_text()) or {}
+        caps = doc.get("capabilities") or {}
         if not isinstance(caps, dict):
             return False
     except Exception:
+        return False
+    if doc.get("quarantined") is True or doc.get("voicePreference") == "byok":
         return False
     for slot in ("gemini-voice", "gemini-text"):
         entry = caps.get(slot)
@@ -307,6 +314,25 @@ def managed_voice_credential_present(path: Optional[Path] = None) -> bool:
         if isinstance(key, str) and key:
             return True
     return False
+
+
+def managed_voice_preference(path: Optional[Path] = None) -> str:
+    """The committed voice credential-source preference: managed | byok | unset.
+
+    Twin of `_voice_credential_preference` in startup-runtime.sh. Every failure
+    mode — missing file, malformed JSON, out-of-vocabulary value — reads as
+    "unset": the legacy resolution every pre-preference install runs under.
+    The byok/quarantine enforcement never rides on this helper alone;
+    managed_voice_credential_present re-checks the marker fields directly.
+    """
+    if path is None:
+        path = WORKSPACE_DIR / "state" / "auth" / "managed-credentials.json"
+    try:
+        doc = json.loads(Path(path).read_text())
+        pref = doc.get("voicePreference") if isinstance(doc, dict) else None
+    except Exception:
+        pref = None
+    return pref if pref in ("managed", "byok") else "unset"
 
 
 def resolve_voice_health_config(
@@ -366,7 +392,31 @@ def resolve_voice_health_config(
         return str(value).strip()
 
     skip_voice = effective("SKIP_VOICE")
+    # S1 truth table (design 2b): an explicit `voicePreference: managed` is
+    # decided by the managed gate ALONE — a present env key must NOT silently
+    # satisfy a managed preference (that is the logout-quarantine bypass:
+    # quarantined managed entries + a leftover BYO env key would otherwise
+    # report voice enabled off a source the resolver refuses). Same order as
+    # configure_startup_runtime; tests/voice-preference-consumers.test.sh pins
+    # launcher/health/resolver agreement per matrix row.
+    preference = managed_voice_preference()
+    if preference == "managed":
+        if managed_voice_credential_present():
+            return {"enabled": True, "detail": "managed voice credential configured"}
+        return {
+            "enabled": False,
+            "detail": (
+                "disabled (voicePreference=managed but no usable managed credential"
+                " — quarantined or missing; env keys do not satisfy a managed"
+                " preference; sign in to renew or switch to BYOK)"
+            ),
+        }
     if effective("GEMINI_VOICE_API_KEY") or effective("GEMINI_API_KEY"):
+        if preference == "byok":
+            return {
+                "enabled": True,
+                "detail": "Gemini voice credential configured (BYOK preference)",
+            }
         return {"enabled": True, "detail": "Gemini voice credential configured"}
     if skip_voice not in ("", "0", "1"):
         return {"enabled": True, "error": f"invalid SKIP_VOICE={skip_voice!r}"}
@@ -384,10 +434,23 @@ def resolve_voice_health_config(
     # inherited SKIP_VOICE=1" still had startup booting voice while health reported
     # disabled. The managed-only test could not catch it because it omits SKIP_VOICE.
     # (#2197 review blocker, john-the-dev 2026-07-31T05:37.)
+    # (Under `byok` or quarantine the gate is False by construction, so this
+    # branch cannot re-enable a source the resolver refuses.)
     if managed_voice_credential_present():
         return {"enabled": True, "detail": "managed voice credential configured"}
     if skip_voice == "1":
         return {"enabled": False, "detail": "disabled by SKIP_VOICE=1"}
+    if preference == "byok":
+        # Named reason, not a generic "no credential": a BYOK preference with
+        # managed entries on disk must read as *disabled with a reason*, never
+        # as "managed credential configured" (impl plan WS2 Step 4).
+        return {
+            "enabled": False,
+            "detail": (
+                "disabled (BYOK preference set (managed entries ignored); set"
+                " GEMINI_VOICE_API_KEY or GEMINI_API_KEY)"
+            ),
+        }
     return {"enabled": False, "detail": "disabled (no Gemini voice credential configured)"}
 
 
@@ -2780,13 +2843,34 @@ def fix_launchd(label: str) -> str:
         )
 
     uid = subprocess.run(["/usr/bin/id", "-u"], capture_output=True, text=True).stdout.strip()
-    # Try kickstart
-    result = subprocess.run(
-        ["/bin/launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if result.returncode == 0:
-        return f"restarted {label}"
+    if label == "com.sutando.voice-agent":
+        # Amendment T4 (kill-path inventory): NEVER a direct
+        # `launchctl kickstart -k` of voice-agent from here. kickstart -k is a
+        # kill-and-restart, so the pre-kickstart validation — identity of the
+        # running job pid, checked as ONE guarded `voice-lock.py takeover`
+        # transaction under the held fcntl guard — must precede it. The
+        # guarded wrapper scripts/restart-voice-agent.sh wraps exactly that
+        # (validate → TERM → wait → KILL → revalidate → unlink, then
+        # kickstart + etime verification). Identity mismatch ⇒
+        # takeover-blocked, nothing signaled; no usable interpreter ⇒ the
+        # wrapper fails closed (exit 6) before touching the lock or the
+        # process. The launchd `bootstrap` fallback below stays available —
+        # it loads a job without signaling anything.
+        wrapper = REPO_DIR / "scripts" / "restart-voice-agent.sh"
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            return f"restarted {label} (guarded restart wrapper)"
+    else:
+        # Try kickstart
+        result = subprocess.run(
+            ["/bin/launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return f"restarted {label}"
     # Try bootstrap
     result = subprocess.run(
         ["/bin/launchctl", "bootstrap", f"gui/{uid}", str(plist)],
