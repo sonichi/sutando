@@ -139,6 +139,12 @@ authentication gates, status/header emission, and JSON serialization belong in
 small handler helpers so every route uses one wire contract. Route branches retain
 endpoint-specific orchestration and payload construction. Refactors must preserve
 status codes, headers, and payload shapes with direct contract tests.
+### HTTP route boundaries
+
+HTTP route methods should remain dispatch layers: parse and authorize the request,
+call a named operation, then emit its result. Filesystem reconciliation and
+response assembly belong in module-level operations that can be tested without a
+socket. Protect both the operation contract and one route-wiring path.
 
 ## Current repository classification
 
@@ -343,3 +349,54 @@ core internals or maintain a long-lived core fork.
   gone.
 - Consider a separate public core repository only after the package boundary is
   proven inside this repository.
+
+## Events plane: resident transport vs on-demand capability (2026-08-05)
+
+Two components consume gateway room events. Ownership, ratified by the owner
+in the client-stack review (Feature Haul, 2026-08-05):
+
+**ag2-sparrow owns (resident plane):**
+- the resident SSE connection and its reconnect loop
+- durable cursor ownership
+- the SQLite inbox (`event_inbox.EventInbox`)
+- dedupe / exactly-once consumption
+- event → ambient task promotion (taskification)
+
+**agent-room-ops owns (on-demand plane):**
+- subscription configuration (`subscribe`/`unsubscribe`)
+- subscription inspection (`subscriptions`)
+- bounded ad-hoc `pull`
+- bounded, foreground, non-durable diagnostic streaming (debug-only; must be
+  bounded via `--max-events`/`--duration`-class limits, never a second
+  resident event client)
+- the event-acceptance policy the Agent applies
+
+**Grandfathered debt register** (discovered/confirmed by running the guard
+against main; frozen — may only shrink, never grow):
+- `skills/agent-room-ops/events.py:stream_with_resume` + its durable
+  `save_cursor` file: resident-lifecycle behavior (forever-reconnect with
+  durable cursor ownership) in the on-demand skill. Already over the
+  boundary; migrates to sparrow's event pump, after which the bounded
+  debug-only stream is what remains. (`room_ops.py`'s `events stream
+  --cursor-file` is this debt's CLI wiring; its `--once`/`--max-events`
+  bounded modes are the shape the surviving debug stream keeps.)
+- `skills/agent-room-ops/events_acceptance.py` imports
+  `ag2_sparrow.event_consumer` and performs taskification from the skill
+  side. Promotion of the taskify client to the sparrow plane is required
+  work; the import is frozen as-is until then.
+
+Sparrow-side debt (same register, same rules):
+- `human_action.py` posts question cards through the `/v1/room` envelope;
+  `remote_gateway_bridge.py` uploads media through the `/v1/rooms/{room}/media`
+  facade. Both are frozen; no NEW sparrow file may touch the room-verb
+  endpoint surface.
+
+Do not add to the skill: SQLite inboxes, forever reconnect loops, durable
+cursor ownership, background daemon lifecycles, or event taskification. Do
+not add on-demand room verbs to sparrow — enforced at the ENDPOINT surface
+(`/v1/room` envelope + `/v1/rooms/` facade, frozen to the two files above).
+Ad-hoc event pull shares sparrow's legitimate `/v1/events` consumption
+endpoint and is governed by review, not grep. All of this is pinned by
+`tests/events-plane-boundary.test.py` — allowlists frozen, shrink-only, and
+the collector excludes only real test artifacts (`tests/` dirs, `test_*.py`,
+`*.test.py`), never production filenames that merely contain "test".

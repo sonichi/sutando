@@ -34,6 +34,13 @@ Config (env / .env):
   REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
+  REMOTE_TASK_CHANNEL_DIR  name of this instance's config dir under
+                        $CLAUDE_CONFIG_DIR/channels/ (default "ag2space") —
+                        selects which .env fallback and access.json a bridge
+                        instance reads, so a second instance (e.g. a dev
+                        homeserver's "dev-ag2space") cannot inherit prod's
+                        credentials or tier map. Env-only by necessity: the
+                        .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
 
 Stdlib only (urllib) — no new dependencies.
@@ -178,6 +185,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .result_ready import read_ready_result
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -323,8 +331,11 @@ def _env_compat(new, old):
 # A %7C-separated token carries no literal "|", so a naive split leaves it a bare
 # secret with an empty URL and the bridge FATALs at startup — the core looks
 # "connected" (device-connect completed) but never responds, the Vidhu-onboarding
-# failure 2026-07-24.
-_SEPARATOR_RE = re.compile(r"\||%7[Cc]")
+# failure 2026-07-24. A literal "|" is PREFERRED over %7C/%7c when both appear:
+# a raw pipe cannot legally occur inside a URL, so when one exists it IS the
+# separator — keeps a URL half carrying an encoded %7C intact (#2679; same
+# rule as the shared credential contract until PR3 delegates this parser).
+_ENCODED_SEPARATOR_RE = re.compile(r"%7[Cc]")
 
 
 def _parse_onboarding_token(raw):
@@ -341,10 +352,19 @@ def _parse_onboarding_token(raw):
     """
     if not raw.lower().startswith(("http://", "https://")):
         return "", raw  # bare secret — opaque, never touched
-    m = _SEPARATOR_RE.search(raw)
+    i = raw.find("|")
+    if i != -1:
+        return raw[:i], raw[i + 1:]  # literal pipe wins; URL + secret verbatim
+    m = _ENCODED_SEPARATOR_RE.search(raw)
     if m is None:
         return "", raw  # scheme but no separator; the URL-less guard in main() speaks
     return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
+
+
+# Which channels/<dir>/ this instance reads (.env fallback + access.json).
+# Env-only — the .env file can't name its own directory. Default preserves the
+# historical single-instance layout.
+CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
 
 
 def _token_from_ag2space_env():
@@ -380,7 +400,7 @@ def _token_from_ag2space_env():
     candidates = [os.environ.get("AG2_DEVICE_ENV")]
     _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if _cfg:
-        candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
+        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
     for path in candidates:
         if not path:
             continue
@@ -528,6 +548,9 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
                 "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                # Room-membership context (gateway writer side, same contract):
+                # a capped one-line mxid list + the true joined total.
+                "room_members", "room_member_count",
                 "source_message_id", "user_id", "priority", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
@@ -588,7 +611,7 @@ if LOCAL_TIER not in ("owner", "team", "other"):
 # revoke them without a restart.
 def _ag2space_access_path():
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    return os.path.join(base, "channels", "ag2space", "access.json")
+    return os.path.join(base, "channels", CHANNEL_DIR, "access.json")
 
 
 # Known tier vocabulary. Also an ordering (higher == more privileged); kept for
@@ -1558,6 +1581,18 @@ def _write_task(task: dict) -> str | None:
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
+    # Anonymous product telemetry — #2274 parity for the gateway surface: one
+    # task_processed{source} per NEWLY queued task (the dedup/idempotent early
+    # returns above never reach here, so redeliveries aren't double-counted).
+    # Same fire-and-forget shape as the discord/slack/telegram bridges. The
+    # `telemetry` module lives in the host repo's src/, which the
+    # src/remote-gateway-bridge.py launcher puts on sys.path; a standalone
+    # PyPI install has no such module and this silently no-ops.
+    try:
+        from telemetry import task_processed
+        task_processed(_one_line(task.get("source") or PROVIDER))
+    except Exception:
+        pass
     _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
@@ -1695,9 +1730,9 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if not rfile.exists():
+        body = read_ready_result(rfile)
+        if body is None:
             continue
-        body = rfile.read_text().strip()
         # Route marker decisions through the unified parser (#873) like the
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)

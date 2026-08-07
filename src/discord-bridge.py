@@ -78,7 +78,7 @@ from util_paths import channel_access_path, claude_home_path, personal_path, sha
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -89,6 +89,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
+from result_ready import read_ready_result  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -3106,17 +3107,24 @@ async def _handle_discord_message(message, force=False):
             _ref = getattr(message, "reference", None)
             _ref_resolved = getattr(_ref, "resolved", None) if _ref is not None else None
             _ref_author = getattr(_ref_resolved, "author", None)
+            _self_id = getattr(client.user, "id", None)
+            _other_agent_mentioned = any(
+                getattr(u, "bot", False) and getattr(u, "id", None) != _self_id
+                for u in (getattr(message, "mentions", None) or [])
+            )
             if not is_addressed_in_shared_channel(
                 author_is_bot=bool(getattr(message.author, "bot", False)),
                 bot_mentioned=bot_mentioned,
                 role_mentioned=role_mentioned,
                 is_reply=_ref is not None,
                 reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
-                self_id=getattr(client.user, "id", None),
+                self_id=_self_id,
+                other_agent_mentioned=_other_agent_mentioned,
             ):
                 print(f"  [skip] shared channel: not addressed to me "
                       f"(author_bot={bool(getattr(message.author, 'bot', False))}, "
-                      f"reply={_ref is not None})", flush=True)
+                      f"reply={_ref is not None}, "
+                      f"other_agent_mentioned={_other_agent_mentioned})", flush=True)
                 return
 
         # Strip role mentions only. User mentions (this bot's and other
@@ -4438,8 +4446,8 @@ async def poll_results():
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 import re
-                reply_text = result_file.read_text().strip()
-                if not reply_text:
+                reply_text = read_ready_result(result_file)
+                if reply_text is None:
                     continue
                 channel = pending_replies.pop(task_id)
                 # Capture anchor BEFORE pop so the auto-thread block below
@@ -4972,9 +4980,9 @@ async def poll_proactive():
                     except FileNotFoundError:
                         continue
                     f = claim  # subsequent reads + unlink operate on the claim path
-                    text = f.read_text().strip()
-                    if not text:
-                        f.unlink(missing_ok=True)
+                    text = read_ready_result(f)
+                    if text is None:
+                        release_claim(f)
                         continue
                     # Resolve the DM recipient via discord_config.resolve_owner_id
                     # (#1147). The helper consults — in order — the env override,
@@ -5131,9 +5139,49 @@ async def poll_proactive():
                                 await dm.send(f"(file not allowed: {fpath})")
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
+                        f.unlink(missing_ok=True)
                     except Exception as e:
+                        # The unlink used to sit OUTSIDE this try, so it ran on
+                        # failure too: a DM Discord rejected was DESTROYED and
+                        # left only a log line. Observed live on this host —
+                        # `413 Payload Too Large (error code: 40005)` on an
+                        # over-long body — and that message is unrecoverable.
+                        # The channel-redirect branch above already gets this
+                        # right (it unlinks only after a successful send and
+                        # falls through otherwise); the DM branch did not.
+                        #
+                        # Quarantine rather than retry. A 413 never becomes a
+                        # 200, so leaving the file in place would re-poll it
+                        # every 3s forever and still never deliver, while
+                        # burying the log. Moving it aside stops the spin AND
+                        # keeps the body recoverable.
                         print(f"  [proactive] failed to DM {owner_id}: {e}")
-                    f.unlink(missing_ok=True)
+                        try:
+                            _undeliv = f.parent / "undelivered"
+                            _undeliv.mkdir(parents=True, exist_ok=True)
+                            # Drop the `.sending` claim suffix on the way out.
+                            # By this point `f` is the CLAIMED name (:4835), and
+                            # a quarantined `*.sending` reads like an in-flight
+                            # file rather than a parked one — the restart-safety
+                            # sweep at :2470 exists precisely because that suffix
+                            # means "someone is mid-send". Restore `.txt` so what
+                            # lands in undelivered/ is what was written.
+                            _name = f.with_suffix(".txt").name if f.suffix == ".sending" else f.name
+                            f.rename(_undeliv / _name)
+                            print(
+                                f"  [proactive] undelivered copy kept at "
+                                f"undelivered/{_name} — NOT deleted",
+                                flush=True,
+                            )
+                        except Exception as _mv_exc:
+                            # Last resort: leaving it in place means the poll
+                            # retries it, which is noisy — but noise is
+                            # recoverable and deletion is not.
+                            print(
+                                f"  [proactive] could not quarantine {f.name}: "
+                                f"{_mv_exc} — leaving it in place rather than losing it",
+                                flush=True,
+                            )
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
         await asyncio.sleep(3)

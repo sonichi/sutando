@@ -285,6 +285,10 @@ _KNOWN_SOURCES = frozenset({
     "twilio_voice", "twilio_sms", "twilio_voicemail",
     "cron", "health-check", "sync-memory", "sync-workspace",
     "github", "web", "push", "remote",
+    # Gateway (AG2 Space) surfaces — emitted by ag2_sparrow's _write_task:
+    # "ag2space" for direct room messages, "events-promotion" for taskify
+    # promotions, "remote" (above) as the REMOTE_TASK_PROVIDER default.
+    "ag2space", "events-promotion",
 })
 
 

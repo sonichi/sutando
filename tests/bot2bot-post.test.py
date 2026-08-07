@@ -64,7 +64,17 @@ def _install_mocks():
     b2b.load_token = lambda: "tok"
     b2b.load_access = lambda: ACCESS
     b2b.get_self_id = lambda token: MEMBER_SELF  # this bot is a channel member
-    b2b.post = lambda ch, txt, tok: _posted.update(channel=ch, text=txt) or {"id": "1"}
+    # `**kw` absorbs optional keyword args the real `post()` grows (e.g. the
+    # `overhead` hint the length guard passes). A fixed-arity mock turns any
+    # such addition into a TypeError in the TEST while production is fine —
+    # this exact stub broke that way when `overhead=` was added.
+    #
+    # It CAPTURES the kwargs rather than discarding them, so the handoff from
+    # main() can be asserted. Absorbing-and-dropping would keep the suite green
+    # while main() forwarded a wrong (or hardcoded) value.
+    b2b.post = lambda ch, txt, tok, **kw: (
+        _posted.update(channel=ch, text=txt, kwargs=kw) or {"id": "1"}
+    )
 
 
 def _restore():
@@ -92,6 +102,21 @@ try:
     b2b.main()
     check("main: --to member → posts to bot2bot channel", _posted.get("channel") == BOT2BOT)
     check("main: member post carries the mention", _posted.get("text", "").startswith(f"<@{MEMBER_B}> "))
+
+    # --- main() forwards the REAL overhead to the length guard ---------------
+    # The focused guard suite checks `check_length` arithmetic in isolation; it
+    # cannot see whether main() hands it the right number. Derive the expected
+    # value from the observed message and the body main() was given, so a
+    # hardcoded constant in main() (today's prefix happens to be 24 chars) fails
+    # here instead of shipping a guard that measures the wrong string.
+    _body = "shipped"
+    _sent = _posted.get("text", "")
+    _seen = _posted.get("kwargs", {})
+    check("main: forwards overhead= to post()", "overhead" in _seen)
+    check("main: overhead equals len(message) - len(body)",
+          _seen.get("overhead") == len(_sent) - len(_body))
+    check("main: overhead accounts for BOTH the mention and the kind tag",
+          _seen.get("overhead") == len(f"<@{MEMBER_B}> done: "))
 
     # --- multi-peer NO-GUESS (2026-07-29 double misfire regression) ---
     # With 2+ peer bots allowlisted and no --to, the old code picked

@@ -62,7 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -72,6 +72,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
+from result_ready import read_ready_result  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -951,6 +952,16 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         thread_ts = event.get("thread_ts") or event.get("ts")
     else:
         thread_ts = None
+    # Only an existing Slack thread is a valid target for the immediate
+    # progress update. A top-level mention still uses its message timestamp for
+    # final-result routing above, but must not make the progress update create a
+    # separate thread before the task result arrives.
+    event_thread_ts = event.get("thread_ts")
+    reply_thread_ts = (
+        event_thread_ts
+        if thread_ts and event_thread_ts and event_thread_ts != event.get("ts")
+        else None
+    )
 
     # Resolve access_tier from `tierMap`. The fail-closed rules live on
     # resolve_access_tier's docstring, and tests/slack-bridge-tier-map.test.py
@@ -1038,10 +1049,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
         if _notify_py.exists():
+            notify_thread_arg = (
+                f" --thread-ts {shlex.quote(str(reply_thread_ts))}"
+                if reply_thread_ts else ""
+            )
             notify_cmd = (
                 f"env CLAUDE_CONFIG_DIR={shlex.quote(str(_claude_config_dir))} "
                 f"python3 {shlex.quote(str(_notify_py))}"
                 f" --source slack --channel-id {channel}"
+                f"{notify_thread_arg}"
                 f' --message "On it — back in a moment."'
             )
             hints_lines.append(f"{step}. NOTIFY FIRST: {notify_cmd}")
@@ -1067,6 +1083,9 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     # third bridge; discord/telegram fold onto it in a follow-up dedup).
     media_headers = local_task_protocol.media_attachment_headers(  # pragma: no cover
         attachment_refs, bool(text and text.strip()))
+    reply_thread_header = (
+        f"reply_thread_ts: {reply_thread_ts}\n" if reply_thread_ts else ""
+    )
     pending_info = {
         "channel": channel,
         "thread_ts": thread_ts,
@@ -1081,6 +1100,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"interaction_type: message\n"
         f"{media_headers}"
         f"channel_id: {channel}\n"
+        f"{reply_thread_header}"
         f"user_id: {user_id}\n"
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
@@ -1411,8 +1431,8 @@ def result_watcher():
                 result_file = RESULTS_DIR / f"{task_id}.txt"
                 if not result_file.exists():
                     continue
-                reply_text = result_file.read_text().strip()
-                if not reply_text:
+                reply_text = read_ready_result(result_file)
+                if reply_text is None:
                     continue
                 with pending_replies_lock:
                     target = pending_replies.get(task_id)
@@ -1475,9 +1495,9 @@ def result_watcher():
                         f.rename(claim)
                     except FileNotFoundError:
                         continue
-                    text = claim.read_text().strip()
-                    if not text:
-                        claim.unlink(missing_ok=True)
+                    text = read_ready_result(claim)
+                    if text is None:
+                        release_claim(claim)
                         continue
                     try:
                         access_data = json.loads(ACCESS_FILE.read_text())

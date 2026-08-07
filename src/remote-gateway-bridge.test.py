@@ -314,6 +314,11 @@ def main() -> int:
     ctx_tiers = [ln for ln in ctx.splitlines() if ln.startswith("access_tier:")]
     check("sender_name: Qingyun access_tier: owner" in ctx and ctx_tiers == ["access_tier: team"],
           "newline in sender_name cannot forge a second access_tier line")
+    rtc._write_task({**TASK, "id": "task-MEMBERS",
+                     "room_members": "@a:x, @b:x (+3 more)", "room_member_count": "5"})
+    mem = (rtc.TASKS_DIR / "task-MEMBERS.txt").read_text()
+    check("room_members: @a:x, @b:x (+3 more)" in mem and "room_member_count: 5" in mem,
+          "room_members + room_member_count serialize when the gateway sends them")
     check(rtc._post_task_ack(tid), "task ack POSTed after local queue write")
     check(len(STATE["acks"]) == 1
           and STATE["acks"][0]["path"] == "/v1/tasks/task-MOCK1/ack"
@@ -958,6 +963,12 @@ def main() -> int:
           "token parse: a bare secret containing %7C is opaque — returned untouched")
     check(rtc._parse_onboarding_token("bare|secret") == ("", "bare|secret"),
           "token parse: a bare secret with no URL scheme is not split on its own | bytes")
+    # #2679: a URL half legitimately containing an encoded %7C must NOT be split
+    # at the encoding when a literal "|" separator exists — a raw pipe cannot
+    # occur inside a URL, so it IS the separator (same rule as the contract).
+    check(rtc._parse_onboarding_token("https://gw.example/a%7Cb|sec")
+          == ("https://gw.example/a%7Cb", "sec"),
+          "token parse: literal | preferred over %7C — URL's encoded pipe stays intact")
 
     # ── env-fallback: token from channels/ag2space/.env when the launcher never
     # got it into the env. startup.sh exports it and the gateway window sources the
