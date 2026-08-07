@@ -328,6 +328,114 @@ def get_status() -> dict:
     }
 
 
+def _active_task_rows() -> list[dict]:
+    """Reconcile task/result files into the ten most recent history rows."""
+    # Classifier tasks are machinery, not user work, so they stay out of the
+    # history the UI shows.
+    for task_file in sorted(
+        (
+            path
+            for path in TASK_DIR.glob("*.txt")
+            if not path.stem.startswith(
+                (
+                    task_workstreams.CLASSIFIER_TASK_PREFIX,
+                    task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
+                )
+            )
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:10]:
+        task_id = task_file.stem
+        content = task_file.read_text()
+        # First `source:` and `task:` regardless of field order; body
+        # lookalikes must not override the real headers.
+        task_line, source_line = _task_display_fields(content)
+        result_file = RESULT_DIR / task_file.name
+        existing = task_history.get(task_id, {})
+        # Priority: live file, then in-memory history, then archive. The
+        # archive lookup is what survives a restart, when history is empty.
+        archived_file = None
+        for month_dir in (RESULT_DIR / "archive").glob("*/"):
+            candidate = month_dir / task_file.name
+            if candidate.exists():
+                archived_file = candidate
+                break
+        if result_file.exists():
+            status = "done"
+            result_text = result_file.read_text().strip()
+        elif existing.get("status") == "done" or existing.get("result"):
+            status = "done"
+            result_text = existing.get("result", "")
+        elif archived_file is not None:
+            status = "done"
+            result_text = archived_file.read_text().strip()
+        else:
+            status = "working"
+            result_text = ""
+        task_history[task_id] = {
+            "status": status,
+            "text": task_line or existing.get("text", task_id),
+            "time": task_file.stat().st_mtime,
+            "result": result_text,
+            "source": source_line or existing.get("source", ""),
+        }
+
+    # Results may outlive their task files after bridge cleanup.
+    for result_file in sorted(
+        RESULT_DIR.glob("task-*.txt"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:10]:
+        _remember_done_result_file(result_file)
+
+    # Reconcile stale rows after the disk scans above.
+    import time as _time
+
+    stale_ids = []
+    for task_id, task_data in list(task_history.items()):
+        if task_data.get("status") != "working":
+            continue
+        task_file = TASK_DIR / f"{task_id}.txt"
+        result_file = RESULT_DIR / f"{task_id}.txt"
+        if result_file.exists():
+            task_data["status"] = "done"
+            task_data["result"] = result_file.read_text().strip()
+        elif not task_file.exists() and _time.time() - task_data.get("time", 0) > 300:
+            stale_ids.append(task_id)
+    for task_id in stale_ids:
+        del task_history[task_id]
+
+    recent = sorted(
+        task_history.items(), key=lambda item: item[1].get("time", 0), reverse=True
+    )[:10]
+    rows = [{"id": task_id, **task_data} for task_id, task_data in recent]
+    # Join inferred workstream metadata onto the rows; the classifier filter
+    # above is the other half of the same feature.
+    return task_workstreams.enrich_task_rows(WORKSPACE_DIR, rows)
+
+
+def _pending_question_rows() -> list[dict]:
+    """Return open questions without parser-only splice offsets."""
+    pending_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
+    if not pending_file.exists():
+        return []
+    return [
+        {key: value for key, value in question.items() if key not in ("start", "end")}
+        for question in parse_pending_questions(pending_file.read_text())
+    ]
+
+
+def _active_tasks_payload(watcher_ok: bool, core_ok: bool) -> dict:
+    """Build the stable response payload for GET /tasks/active."""
+    return {
+        "tasks": _active_task_rows(),
+        "watcher": watcher_ok,
+        "claude": core_ok,
+        "questions": _pending_question_rows(),
+    }
+
+
 def _safe_path(base_dir: Path, filename: str) -> Path:
     """Resolve a path safely under base_dir. Returns None if path escapes.
 
@@ -714,82 +822,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ).returncode == 0
             except OSError:
                 claude_ok = False
-            # Scan disk for active tasks, update history (preserve existing text)
-            live_task_files = [
-                f for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
-                if not f.stem.startswith((
-                    task_workstreams.CLASSIFIER_TASK_PREFIX,
-                    task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
-                ))
-            ][:10]
-            for f in live_task_files:
-                task_id = f.stem
-                content = f.read_text()
-                # Capture the first `source:` and first `task:` regardless of
-                # field order — voice/chat tasks put `source:` before `task:`,
-                # but discord/slack tasks put `task:` first. The `not …` guards
-                # keep the real header `source:` from being overridden by any
-                # `source:` line inside the task body (#1781 review, sonichi).
-                task_line, source_line = _task_display_fields(content)
-                result_file = RESULT_DIR / f.name
-                existing = task_history.get(task_id, {})
-                # Look for the result in three places, in priority order:
-                # (1) live results/ dir, (2) prior in-memory history (covers
-                # the case where the bridge has already archived the file),
-                # (3) results/archive/<YYYY-MM>/. Without (3), an agent-api
-                # restart loses every prior task's result and the web UI
-                # shows them all as "working" with no body.
-                archived_file = None
-                for month_dir in (RESULT_DIR / "archive").glob("*/"):
-                    candidate = month_dir / f.name
-                    if candidate.exists():
-                        archived_file = candidate
-                        break
-                if result_file.exists():
-                    status = "done"
-                    result_text = result_file.read_text().strip()
-                elif existing.get("status") == "done" or existing.get("result"):
-                    status = "done"
-                    result_text = existing.get("result", "")
-                elif archived_file is not None:
-                    status = "done"
-                    result_text = archived_file.read_text().strip()
-                else:
-                    status = "working"
-                    result_text = ""
-                task_history[task_id] = {"status": status, "text": task_line or existing.get("text", task_id), "time": f.stat().st_mtime, "result": result_text, "source": source_line or existing.get("source", "")}
-            # Also check for result files without task files (already cleaned up)
-            for f in sorted(RESULT_DIR.glob("task-*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
-                _remember_done_result_file(f)
-            # Reconcile stale entries: if task file is gone and result exists, mark done;
-            # if task file is gone, no result, and older than 5 min, remove from history
-            import time as _time
-            stale_ids = []
-            for tid, tdata in list(task_history.items()):
-                if tdata.get("status") == "working":
-                    task_file = TASK_DIR / f"{tid}.txt"
-                    result_file = RESULT_DIR / f"{tid}.txt"
-                    if result_file.exists():
-                        tdata["status"] = "done"
-                        tdata["result"] = result_file.read_text().strip()
-                    elif not task_file.exists() and _time.time() - tdata.get("time", 0) > 300:
-                        stale_ids.append(tid)
-            for tid in stale_ids:
-                del task_history[tid]
-            # Return most recent 10 from history
-            sorted_tasks = sorted(task_history.items(), key=lambda x: x[1].get("time", 0), reverse=True)[:10]
-            tasks = [{"id": tid, **tdata} for tid, tdata in sorted_tasks]
-            tasks = task_workstreams.enrich_task_rows(WORKSPACE_DIR, tasks)
-            # Parse pending questions. `start`/`end` are the writer's splice
-            # offsets — internal, not part of the wire format.
-            questions = []
-            pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
-            if pq_file.exists():
-                questions = [
-                    {k: v for k, v in q.items() if k not in ("start", "end")}
-                    for q in parse_pending_questions(pq_file.read_text())
-                ]
-            self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
+            self.send_json(200, _active_tasks_payload(watcher_ok, claude_ok))
         elif path == "/delegation/results":
             # TaskDelegationService relay backend (#1947): list results/ for
             # the split-host watcher. Read-only but bearer-gated like the
