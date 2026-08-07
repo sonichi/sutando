@@ -47,7 +47,7 @@ import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voi
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
 import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
 
-import { sharedPersonalPath, claudeHomePath } from './util_paths.js';
+import { sharedPersonalPath, claudeHomePath, claudeProjectSlug } from './util_paths.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -668,7 +668,7 @@ const mainAgent: MainAgent = {
 // ($CLAUDE_CONFIG_DIR/projects/-{slug}/memory). Failure-silent: a missing memory
 // dir should never block voice startup.
 function bootstrapMemoryDir(): void {
-	const slug = '-' + WORKSPACE_DIR.replace(/\/$/, '').split('/').filter(Boolean).join('-');
+	const slug = claudeProjectSlug(WORKSPACE_DIR.replace(/\/$/, ''));
 	const memDir = process.env.SUTANDO_MEMORY_DIR || claudeHomePath('projects', slug, 'memory');
 	try {
 		mkdirSync(memDir, { recursive: true });
