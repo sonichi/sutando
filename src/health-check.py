@@ -2780,13 +2780,34 @@ def fix_launchd(label: str) -> str:
         )
 
     uid = subprocess.run(["/usr/bin/id", "-u"], capture_output=True, text=True).stdout.strip()
-    # Try kickstart
-    result = subprocess.run(
-        ["/bin/launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if result.returncode == 0:
-        return f"restarted {label}"
+    if label == "com.sutando.voice-agent":
+        # Amendment T4 (kill-path inventory): NEVER a direct
+        # `launchctl kickstart -k` of voice-agent from here. kickstart -k is a
+        # kill-and-restart, so the pre-kickstart validation — identity of the
+        # running job pid, checked as ONE guarded `voice-lock.py takeover`
+        # transaction under the held fcntl guard — must precede it. The
+        # guarded wrapper scripts/restart-voice-agent.sh wraps exactly that
+        # (validate → TERM → wait → KILL → revalidate → unlink, then
+        # kickstart + etime verification). Identity mismatch ⇒
+        # takeover-blocked, nothing signaled; no usable interpreter ⇒ the
+        # wrapper fails closed (exit 6) before touching the lock or the
+        # process. The launchd `bootstrap` fallback below stays available —
+        # it loads a job without signaling anything.
+        wrapper = REPO_DIR / "scripts" / "restart-voice-agent.sh"
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            return f"restarted {label} (guarded restart wrapper)"
+    else:
+        # Try kickstart
+        result = subprocess.run(
+            ["/bin/launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return f"restarted {label}"
     # Try bootstrap
     result = subprocess.run(
         ["/bin/launchctl", "bootstrap", f"gui/{uid}", str(plist)],
