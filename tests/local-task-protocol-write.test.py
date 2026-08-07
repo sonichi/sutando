@@ -173,5 +173,39 @@ class TestHealthCheckDefaultRouting(unittest.TestCase):
                 len(list((Path(d) / "tasks").glob("task-health-*.txt"))), 1)
 
 
+class TestChangeAbsorption(unittest.TestCase):
+    """The design's core claim: the descriptor moves, the call site does not.
+    Same emit call, two descriptors — the task follows the descriptor, with
+    the REAL resolver picking the address both times."""
+
+    def test_descriptor_moves_call_site_does_not(self):
+        import types
+        import agent_endpoint as real_ae
+        spec = importlib.util.spec_from_file_location(
+            "hc3", REPO / "src" / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        with tempfile.TemporaryDirectory() as d:
+            for world in ("world-a", "world-b"):
+                ws = Path(d) / world
+                fake = types.ModuleType("agent_endpoint")
+                fake.load_descriptor = lambda ws=ws: {"workspace": str(ws)}
+                fake.resolve = real_ae.resolve
+                real = sys.modules.get("agent_endpoint")
+                sys.modules["agent_endpoint"] = fake
+                try:
+                    hc.emit_task_for_failures(
+                        [{"name": f"svc-{world}", "status": "down", "detail": "d"}],
+                        state_file=Path(d) / f"{world}-state.json", tasks_dir=None)
+                finally:
+                    if real is not None:
+                        sys.modules["agent_endpoint"] = real
+                    else:
+                        del sys.modules["agent_endpoint"]
+                self.assertEqual(
+                    len(list((ws / "tasks").glob("task-health-*.txt"))), 1,
+                    f"task did not follow the descriptor to {world}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
