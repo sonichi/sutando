@@ -73,6 +73,13 @@
       "canonical_for": "Codex core setup and rollback",
       "last_verified": "2026-08-04"
     },
+    "docs/design-mediated-capability-layer.md": {
+      "title": "Mediated capability layer",
+      "audience": ["contributors", "maintainers"],
+      "status": "draft",
+      "canonical_for": "proposed privileged-capability mediation, authorization, and audit model",
+      "last_verified": "2026-08-04"
+    },
     "docs/community-use-cases/README.md": {
       "title": "Community use cases",
       "audience": [
