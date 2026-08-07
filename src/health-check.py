@@ -6467,6 +6467,53 @@ def check_dynamic_loop_freshness(
     return checks
 
 
+def check_core_model_pin() -> dict:
+    """Report a core running the wedge-recovery model downgrade.
+
+    `recover_core_if_wedged`'s second stage sets SUTANDO_CORE_MODEL=opus so a
+    re-wedging core keeps working on the standard 200K window instead of looping
+    on an unanswerable gate. That escalation is sound. What was missing is any
+    way to notice it afterwards: the variable was written here and read nowhere,
+    it lives in the core's tmux SESSION env (so `start-cli --restart` inherits it
+    via `new-session -A`, which discards its own -e), and nothing expires it.
+
+    Observed: a peer core ran 17 days on the downgrade — 165 autocompactions in
+    25h, one every 9.1 min — and was found only because the owner noticed the
+    symptom. An emergency mode that neither expires nor announces itself is
+    indistinguishable from a deliberate configuration choice.
+
+    Reports only; clearing is `tmux -S <socket> setenv -t <session> -u
+    SUTANDO_CORE_MODEL` plus a restart, which is an operator action.
+    """
+    name = "core-model-pin"
+    socket = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+    if not Path(socket).exists():
+        return {"name": name, "status": "ok", "detail": "no core tmux socket — skipped"}
+    try:
+        res = subprocess.run(
+            ["tmux", "-S", socket, "show-environment", "SUTANDO_CORE_MODEL"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"name": name, "status": "ok", "detail": f"could not query tmux env ({e}) — skipped"}
+
+    out = (res.stdout or "").strip()
+    # tmux prints "unknown variable: X" (rc!=0) when unset, "X=value" when set.
+    if res.returncode != 0 or not out.startswith("SUTANDO_CORE_MODEL="):
+        return {"name": name, "status": "ok", "detail": "no model pin (core uses the default window)"}
+
+    value = out.split("=", 1)[1]
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (
+            f"core is PINNED to model '{value}' by wedge recovery — this is an emergency "
+            f"downgrade that nothing clears, and it survives every restart. If the core did "
+            f"not just wedge, clear it: tmux -S {socket} setenv -u SUTANDO_CORE_MODEL, then restart."
+        ),
+    }
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -6899,6 +6946,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_watcher())
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
+    checks.append(check_core_model_pin())
     checks.append(check_disk_space())
 
     return checks
