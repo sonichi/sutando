@@ -50,7 +50,7 @@ def _result(ok, messages=None, reason=None, room_id=None, complete=None):
 def _normalize(items):
     out = []
     for m in items or []:
-        out.append({
+        norm = {
             "sender": m.get("sender") or m.get("user_id") or m.get("from"),
             "ts": m.get("ts") or m.get("timestamp"),
             "body": m.get("body") or m.get("text") or m.get("message"),
@@ -60,7 +60,17 @@ def _normalize(items):
             # its own messages (reactions are never pushed as tasks — read is the
             # only surface). Always a list so consumers need no None-check.
             "reactions": m.get("reactions") or [],
-        })
+        }
+        # Media messages: carry the gateway's msgtype + mxc media_ref through so a
+        # reader can pass media_ref to `fetch` (op:media). Dropping them made every
+        # room attachment visible-but-unfetchable — the agent saw the filename in
+        # `body` but had no ref, so it fell back to the raw relay link (401).
+        # Additive + only when present (broker surfaces them since #85).
+        ref = m.get("media_ref")
+        if ref:
+            norm["media_ref"] = ref
+            norm["msgtype"] = m.get("msgtype")
+        out.append(norm)
     return out
 
 
