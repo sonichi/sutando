@@ -46,6 +46,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
             "src/local_task_protocol.py",
+            "src/result_markers.py",
             "src/task_priority.py",
             "src/task_workstreams.py",
             "src/util_paths.py",
