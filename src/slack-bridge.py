@@ -932,17 +932,11 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not text and not attachment_note:
         return None
 
-    # Owner-activity state is persisted before tier/vault handling below. Use a
-    # redacted preview so an ordinary pasted token never lands in state JSON.
+    # Redact first: a pasted token must never reach state JSON even in a preview.
     initial_secret_filter = filter_chat_secrets(text)
     detected_secret_types = set(initial_secret_filter.secret_types)
     safe_attachment = filter_chat_secrets(attachment_note)
     detected_secret_types.update(safe_attachment.secret_types)
-    write_owner_activity(
-        "slack",
-        initial_secret_filter.text or safe_attachment.text,
-        channel_id=event.get("channel"),
-    )
 
     channel = event.get("channel", "")
     # Reply in-thread for channel @mentions, top-level for DMs. parens for
@@ -969,6 +963,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     seeded_ok = _ensure_tier_map_seeded()
     tier_map = load_tier_map()
     access_tier = resolve_access_tier(user_id, tier_map, seeded_ok)
+
+    # Owner-only, as discord-bridge does: the proactive loop reads this file as
+    # owner PRESENCE, so a team/other sender stamping it fakes "owner is here".
+    if access_tier == "owner":
+        write_owner_activity(
+            "slack",
+            initial_secret_filter.text or safe_attachment.text,
+            channel_id=event.get("channel"),
+        )
 
     # Intercept vault commands before any disk write — must happen AFTER
     # access_tier is resolved so untrusted senders cannot write to Keychain.
