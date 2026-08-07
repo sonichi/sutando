@@ -129,6 +129,9 @@ class GrantStore:
 
     def mint_fresh(self, verb: str, principal: cp.Principal, args, task_id: str = "",
                    ttl_seconds: float = 300.0) -> Grant:
+        # A fresh grant SHOULD carry the originating task_id. If left empty it is
+        # unbound and consume_covering() will NEVER honor it (fail-closed) — it can
+        # never become a cross-task wildcard.
         g = Grant(grant_id="grant-" + secrets.token_hex(12), verb=verb,
                   tier=principal.tier, user_id=principal.user_id, source=principal.source,
                   task_id=str(task_id or ""), args_digest=digest_args(args),
@@ -175,8 +178,12 @@ class GrantStore:
             if g.source and g.source != principal.source:
                 continue
             if g.single_use and g.args_digest and g.args_digest == req.args_digest:
-                if g.task_id and g.task_id != (task_id or ""):
-                    continue   # fresh grant is bound to its originating task — no cross-task replay
+                # A FRESH grant MUST carry a non-empty originating task id and match
+                # the current one. An unbound grant (task_id="") NEVER covers — so
+                # omitting the bind at mint time fails closed instead of becoming a
+                # cross-task wildcard.
+                if not g.task_id or not task_id or g.task_id != task_id:
+                    continue
                 self._grants.pop(g.grant_id, None)   # atomic single-use consume
                 return g
             if (not g.single_use) and g.scope_pattern and cp._scope_matches(g.scope_pattern, req.scope):

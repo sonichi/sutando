@@ -219,22 +219,35 @@ with open(nd, "w", encoding="utf-8") as fh:
 check("escalation to a file with no divider still counts (file read-back)",
       cm.escalate_pending(nd, "Authorize something?") is True)
 
-# ── 10b. GrantStore.consume_covering fail-closed identity branches (direct).
+# ── 10b. GrantStore.consume_covering fail-closed branches (direct). A fresh
+#        grant is bound to a non-empty task id on BOTH sides (identity + task).
 _gs = cm.GrantStore(now=now)
 _alice = cp.Principal(tier="owner", user_id="alice", source="s")
-_gs.mint_fresh("github:merge", _alice, {"pr": 1})
+_gs.mint_fresh("github:merge", _alice, {"pr": 1}, task_id="task-alice")
 _req1 = cp.CapabilityRequest(verb="github:merge", args_digest=cm.digest_args({"pr": 1}))
+TA = "task-alice"
 check("consume: principal with no user_id -> None (fail-closed)",
-      _gs.consume_covering(_req1, cp.Principal(tier="owner", user_id="")) is None)
+      _gs.consume_covering(_req1, cp.Principal(tier="owner", user_id=""), TA) is None)
 check("consume: different tier -> None",
-      _gs.consume_covering(_req1, cp.Principal(tier="team", user_id="alice")) is None)
+      _gs.consume_covering(_req1, cp.Principal(tier="team", user_id="alice"), TA) is None)
 check("consume: different user_id -> None (no bearer replay)",
-      _gs.consume_covering(_req1, cp.Principal(tier="owner", user_id="mallory")) is None)
+      _gs.consume_covering(_req1, cp.Principal(tier="owner", user_id="mallory"), TA) is None)
 check("consume: different source -> None (source-pinned, fail-closed)",
-      _gs.consume_covering(_req1, cp.Principal(tier="owner", user_id="alice", source="other")) is None)
-check("consume: matching identity -> grant returned + consumed",
-      _gs.consume_covering(_req1, _alice) is not None and
-      _gs.consume_covering(_req1, _alice) is None)
+      _gs.consume_covering(_req1, cp.Principal(tier="owner", user_id="alice", source="other"), TA) is None)
+check("consume: matching identity + task -> grant returned + consumed",
+      _gs.consume_covering(_req1, _alice, TA) is not None and
+      _gs.consume_covering(_req1, _alice, TA) is None)
+# omitted-ID fail-closed (qingyun-wu CR round 3): an UNBOUND fresh grant (no
+# task_id at mint) NEVER covers, and a matching request with NO task_id never
+# consumes a bound grant. The unsafe default is fail-closed, not a wildcard.
+_gs2 = cm.GrantStore(now=now)
+_gs2.mint_fresh("github:merge", _alice, {"pr": 1})   # NOTE: no task_id (unbound)
+check("consume: UNBOUND fresh grant (minted without task_id) never covers",
+      _gs2.consume_covering(_req1, _alice, TA) is None)
+_gs3 = cm.GrantStore(now=now)
+_gs3.mint_fresh("github:merge", _alice, {"pr": 1}, task_id="task-alice")
+check("consume: bound grant + request with NO task_id -> None (fail-closed)",
+      _gs3.consume_covering(_req1, _alice, "") is None)
 
 # ── 11. IDENTITY BINDING (qingyun-wu + bassilkhilo-ag2 P1): a grant bound to one
 #        principal must NOT execute under a different principal, even same tier.
@@ -264,6 +277,18 @@ rA = med.mediate("github:merge", {"repo": "sonichi/sutando", "pr": 500}, h_taskA
 check("task-A (originating) CAN use its own fresh grant -> allow/succeeded",
       rA.decision == cp.ALLOW and rA.outcome == cm.SUCCEEDED)
 LIVE.append(("task-B replay of task-A's grant BLOCKED", rB.audit))
+
+# ── 13. OMITTED-ID fail-closed end-to-end (qingyun-wu CR round 3): a fresh grant
+#        minted WITHOUT a task_id (the unsafe default) is unbound and must NEVER
+#        be consumed — even by the same principal's own task. It escalates.
+h_taskC = contexts.mint(envelope("owner", tid="task-C"))
+grants.mint_fresh("github:merge", p_owner, {"repo": "sonichi/sutando", "pr": 700})  # NO task_id
+n_before2 = executed["n"]
+rC = med.mediate("github:merge", {"repo": "sonichi/sutando", "pr": 700}, h_taskC,
+                 executor=_exec, verifier=_verify, scope="sonichi/sutando")
+check("UNBOUND fresh grant (no task_id at mint) is never consumed -> escalated, executor NOT run",
+      rC.outcome == cm.ESCALATED and executed["n"] == n_before2)
+LIVE.append(("unbound fresh grant NOT honored (fail-closed)", rC.audit))
 
 print("\n================ LIVE TEST DATA (captured real artifacts) ================")
 for label, art in LIVE:
