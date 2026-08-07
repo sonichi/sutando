@@ -122,6 +122,21 @@ mechanics. For example, `src/presenter_mode.py` owns the presenter sentinel path
 and expiry semantics; Discord, Slack, Telegram, and notification jobs decide
 what delivery to suppress when that policy reports active.
 
+When several adapters publish the same mutable workspace record, the shared
+module also owns the record's schema, field bounds, atomic publication, and
+fail-open/fail-closed contract. Adapters inject the resolved path and their log
+sink; they do not reproduce the write recipe. Tests exercise the production
+writer directly under the relevant concurrency model, then separately pin each
+adapter's delegation. `src/owner_activity.py` is the reference pattern.
+
+Centralize only writers with the same policy. AG2 Sparrow's
+`remote_gateway_bridge._write_owner_activity` intentionally remains separate:
+before publishing the shared record it applies the sender-tier gate, excludes
+known fleet agents, strips gateway attribution, and redacts secrets. Those are
+gateway trust-boundary rules, not provider-neutral record-publication mechanics.
+Do not delegate that writer to `src/owner_activity.py` unless those controls and
+their tests move with it.
+
 ### Shared result-file lifecycle
 
 The task/result filesystem protocol is core infrastructure, including its

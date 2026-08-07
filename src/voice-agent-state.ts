@@ -33,6 +33,7 @@ import { dirname } from 'node:path';
 import { statusPath } from './workspace_default.js';
 import type { ProtocolFailure, ProtocolFailureCategory } from './voice-error-classifier.js';
 import type { ResolvedCredential } from './credential-resolver.js';
+import { credentialSourceLabel as resolverSourceLabel } from './credential-resolver.js';
 
 /** L3 upstream states (design readiness model). */
 export type UpstreamState = 'live' | 'idle' | 'connecting' | 'backoff' | 'failed';
@@ -53,15 +54,16 @@ export interface AgentStateV1 {
 
 /**
  * Map the resolver's source labels onto the frame's enum (amendment A10:
- * source comes from the EXISTING `voiceCredential.source`, labels mapped
- * here — `env` means a BYO key on the wire; `none` omits the field).
+ * source comes from the EXISTING `voiceCredential.source`). The vocabulary
+ * mapping itself ('env' means BYOK on the wire) has ONE definition — the
+ * resolver's `credentialSourceLabel` (WS2 Step 3); this wrapper only turns
+ * its 'none' into `undefined` because the frame OMITS the field.
  */
 export function credentialSourceLabel(
 	source: ResolvedCredential['source'],
 ): 'managed' | 'byok' | undefined {
-	if (source === 'managed') return 'managed';
-	if (source === 'env') return 'byok';
-	return undefined;
+	const label = resolverSourceLabel(source);
+	return label === 'none' ? undefined : label;
 }
 
 /** Inputs the provider polls at build time — all late-bound getters. */
