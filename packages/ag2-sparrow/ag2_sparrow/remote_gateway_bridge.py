@@ -185,6 +185,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .result_ready import read_ready_result
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -1729,9 +1730,9 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if not rfile.exists():
+        body = read_ready_result(rfile)
+        if body is None:
             continue
-        body = rfile.read_text().strip()
         # Route marker decisions through the unified parser (#873) like the
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
