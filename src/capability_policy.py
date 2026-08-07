@@ -141,23 +141,35 @@ class Decision(NamedTuple):
 
 
 def _covered_by_grant(req: CapabilityRequest, principal: Principal, grants) -> bool:
-    """True iff a covering grant exists (RFC "authorization grants"). A grant
-    covers when it matches the verb, the principal's authenticated identity, and
+    """True iff a covering grant exists, BOUND to the authenticated principal
+    (RFC "authorization grants": a grant binds the owner identity and source on
+    which approval arrived). A grant covers only when it matches the verb, the
+    principal's **tier AND user_id** (and source, if the grant pins one), and
     either the exact args_digest (fresh single-use grant) or a scope pattern
-    (standing grant). This module only CONSULTS grants; minting, nonce
-    consumption, and expiry live in the mediator (step 3). A grant object is any
-    mapping/attr-bag exposing verb, tier, scope/args_digest; unknown shapes never
-    match (fail-closed). Observed-content 'authorization' is not a grant and so
-    can never appear here.
+    (standing grant).
+
+    Fail-closed identity binding — an approval record is NOT a bearer token: a
+    grant that omits ``tier`` or ``user_id``, or names a different principal,
+    never covers, and a principal with no ``user_id`` can never be covered. This
+    is what stops one principal replaying another same-tier principal's grant.
+
+    This module only CONSULTS grants; minting, nonce consumption, and expiry live
+    in the mediator. Grant objects are mappings/attr-bags; unknown shapes never
+    match. Observed-content 'authorization' is not a grant and can never appear.
     """
-    if not grants:
+    if not grants or not principal.user_id:
         return False
     for g in grants:
-        gv = _g(g, "verb")
-        if gv != req.verb:
+        if _g(g, "verb") != req.verb:
             continue
         gt = _g(g, "tier")
-        if gt and gt != principal.tier:
+        if not gt or gt != principal.tier:          # missing/mismatched tier -> no cover
+            continue
+        gu = _g(g, "user_id")
+        if not gu or gu != principal.user_id:       # grant must name THIS principal
+            continue
+        gs = _g(g, "source")
+        if gs and gs != principal.source:           # if pinned, source must match too
             continue
         gd = _g(g, "args_digest")
         if gd and req.args_digest and gd == req.args_digest:

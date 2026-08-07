@@ -89,6 +89,8 @@ class Grant(NamedTuple):
     grant_id: str
     verb: str
     tier: str
+    user_id: str = ""          # the authenticated principal the approval was FOR
+    source: str = ""           # and the source it arrived on (RFC trust-root)
     args_digest: str = ""      # fresh single-use grant binds an exact digest
     scope_pattern: str = ""    # standing grant binds a scope pattern instead
     expires_at: float = 0.0
@@ -102,23 +104,28 @@ def digest_args(args) -> str:
 
 
 class GrantStore:
-    """Owner-minted, enumerable, revocable. A fresh grant is consumed (nonce)
-    before execution; a standing grant is not. Expiry is enforced on read."""
+    """Owner-minted, enumerable, revocable. A grant is BOUND to the principal the
+    approval was for (identity + source), so it is not a bearer token another
+    same-tier principal can replay. A fresh grant is consumed before execution;
+    a standing grant is not. Expiry is enforced on read."""
 
     def __init__(self, now: Callable[[], float] = time.time):
         self._now = now
         self._grants: dict = {}
 
-    def mint_fresh(self, verb: str, tier: str, args, ttl_seconds: float = 300.0) -> Grant:
-        g = Grant(grant_id="grant-" + secrets.token_hex(12), verb=verb, tier=tier,
+    def mint_fresh(self, verb: str, principal: cp.Principal, args,
+                   ttl_seconds: float = 300.0) -> Grant:
+        g = Grant(grant_id="grant-" + secrets.token_hex(12), verb=verb,
+                  tier=principal.tier, user_id=principal.user_id, source=principal.source,
                   args_digest=digest_args(args), expires_at=self._now() + ttl_seconds,
                   single_use=True)
         self._grants[g.grant_id] = g
         return g
 
-    def mint_standing(self, verb: str, tier: str, scope_pattern: str,
+    def mint_standing(self, verb: str, principal: cp.Principal, scope_pattern: str,
                       ttl_seconds: float = 30 * 86400.0) -> Grant:
-        g = Grant(grant_id="grant-" + secrets.token_hex(12), verb=verb, tier=tier,
+        g = Grant(grant_id="grant-" + secrets.token_hex(12), verb=verb,
+                  tier=principal.tier, user_id=principal.user_id, source=principal.source,
                   scope_pattern=scope_pattern, expires_at=self._now() + ttl_seconds,
                   single_use=False)
         self._grants[g.grant_id] = g
@@ -132,11 +139,22 @@ class GrantStore:
         return [g for g in self._grants.values() if g.expires_at > now]
 
     def consume_covering(self, req: cp.CapabilityRequest, principal: cp.Principal) -> Optional[Grant]:
-        """Find a LIVE covering grant and, if single-use, atomically consume it
-        BEFORE the caller executes. Returns the grant, or None. A standing grant
-        is returned without consumption (RFC)."""
+        """Find a LIVE covering grant BOUND to this principal and, if single-use,
+        atomically consume it BEFORE the caller executes. A grant covers only when
+        its verb, tier, AND user_id (and source, if pinned) match the principal —
+        an approval record is not a bearer token. Fail-closed: a principal with no
+        user_id, or a grant missing tier/user_id, never covers. Standing grants
+        are returned without consumption (RFC)."""
+        if not principal.user_id:
+            return None
         for g in self._live():
-            if g.verb != req.verb or g.tier != principal.tier:
+            if g.verb != req.verb:
+                continue
+            if not g.tier or g.tier != principal.tier:
+                continue
+            if not g.user_id or g.user_id != principal.user_id:
+                continue
+            if g.source and g.source != principal.source:
                 continue
             if g.single_use and g.args_digest and g.args_digest == req.args_digest:
                 self._grants.pop(g.grant_id, None)   # atomic single-use consume
