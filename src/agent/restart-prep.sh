@@ -1,17 +1,6 @@
 #!/bin/bash
-# Graceful-restart Phase-1 prep (design: notes/graceful-restart-design.md).
-#
-# Invoked DIRECTLY by graceful-restart.sh once its quiet gate opens (no
-# task-queue/LLM handoff — prep is mechanical). Runs the pre-kill work, then
-# writes a TERMINAL sentinel so the orchestrator can proceed:
-#   success -> state/restart-ready.json {restart_id, ts, synced, branch, dirty, queue}
-#   failure -> state/restart-prep-failed.json {restart_id, ts, reason}
-#
-# ALWAYS terminates (each step is bounded), so the orchestrator never waits on a
-# hung prep — a failed step becomes a `failed` sentinel, which the orchestrator
-# surfaces to the owner rather than killing the agent.
-#
-# Usage: restart-prep.sh <restart_id>
+# Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
+# ALWAYS terminates and ALWAYS writes a terminal ready/failed sentinel.
 set -uo pipefail
 
 RID="${1:?usage: restart-prep.sh <restart_id>}"
@@ -47,11 +36,8 @@ log "Phase-1 starting…"
 queue_n="$(ls "$WS/tasks/"task-*.txt 2>/dev/null | grep -v "task-restart-prep-" | wc -l | tr -d ' ')"
 log "checkpoint: $queue_n non-prep task(s) in queue"
 
-# Step 2 — sync workspace (push memory/notes/state before the kill). Bounded.
-# Production passes explicit argv (each element quoted), so a checkout path
-# containing spaces stays ONE argument — never word-split into fragments.
-# The GR_SYNC_CMD test seam is a single shell string run via `bash -c`, so a
-# test can also carry space-containing paths by quoting them inside the string.
+# Step 2 — sync workspace before the kill. Bounded. Production passes explicit
+# argv so a space-containing checkout path stays ONE argument.
 sync_ok=0
 if [ -n "${GR_SYNC_CMD:-}" ]; then                                # GR_SYNC_CMD: test-only override
   if bounded "$STEP_TIMEOUT" bash -c "$GR_SYNC_CMD" >/dev/null 2>&1; then sync_ok=1; fi

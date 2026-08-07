@@ -1,15 +1,6 @@
 #!/bin/bash
-# Graceful core-restart orchestrator (design: notes/graceful-restart-design.md).
-#
-# quiet gate -> prep -> exec start-cli.sh --restart. A "running" status older
-# than STATUS_TTL_S, or with no parseable ts, is wedged rather than busy.
-#
-# Exit: 0 restarted · 3 prep failed (core untouched) · 4 deferred to a peer.
-#
-# Usage:
-#   graceful-restart.sh              # real graceful restart
-#   graceful-restart.sh --dry-run    # run the WHOLE flow but SKIP the kill
-#                                     # (test the machinery without ending the session)
+# Graceful core-restart orchestrator. Flow, flags and rationale live in
+# notes/graceful-restart-design.md. Exit: 0 ok · 3 prep failed · 4 deferred.
 set -euo pipefail
 
 DRY_RUN=0

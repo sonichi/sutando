@@ -162,8 +162,8 @@ and re-run `python3 scripts/gen-src-map.py`.
 
 ## `src/agent/`
 
-- **`graceful-restart.sh`** — Graceful core-restart orchestrator (design: notes/graceful-restart-design.md).
-- **`restart-prep.sh`** — Graceful-restart Phase-1 prep (design: notes/graceful-restart-design.md).
+- **`graceful-restart.sh`** — Graceful core-restart orchestrator.
+- **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 
