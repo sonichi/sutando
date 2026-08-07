@@ -191,21 +191,29 @@ interface AgentHandle {
 	exited: Promise<number | null>;
 }
 
-function spawnAgent(ws: string, port: number, visionPort: number, extraEnv: Record<string, string> = {}): AgentHandle {
+function spawnAgent(
+	ws: string,
+	port: number,
+	visionPort: number,
+	extraEnv: Record<string, string> = {},
+	testMode = true,
+): AgentHandle {
 	// detached: own process group, so cleanup can kill npx + tsx worker
 	// together (the worker, not the npx parent, holds the lock and the port).
+	const env: NodeJS.ProcessEnv = {
+		...process.env,
+		SUTANDO_WORKSPACE: ws,
+		GEMINI_VOICE_API_KEY: FAKE_KEY,
+		PORT: String(port),
+		VISION_CONTROL_PORT: String(visionPort),
+		...extraEnv,
+	};
+	if (testMode) env.SUTANDO_TEST_MODE = '1';
+	else delete env.SUTANDO_TEST_MODE;
 	const child = spawn('npx', ['tsx', 'src/voice-agent.ts'], {
 		cwd: REPO_ROOT,
 		detached: true,
-		env: {
-			...process.env,
-			SUTANDO_WORKSPACE: ws,
-			SUTANDO_TEST_MODE: '1',
-			GEMINI_VOICE_API_KEY: FAKE_KEY,
-			PORT: String(port),
-			VISION_CONTROL_PORT: String(visionPort),
-			...extraEnv,
-		},
+		env,
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
 	children.push(child);
@@ -244,6 +252,14 @@ describe('voice-agent duplicate-instance + fail-closed lock (integration)', () =
 	after(async () => {
 		for (const c of children) await killAndWait(c);
 		for (const d of tempDirs) rmSync(d, { recursive: true, force: true });
+	});
+
+	it('non-test launch still refuses non-macOS', { skip: process.platform === 'darwin' }, async () => {
+		const ws = makeWorkspace('platform');
+		const agent = spawnAgent(ws, 19921, 19922, {}, false);
+		const code = await agent.exited;
+		assert.equal(code, 1);
+		assert.match(agent.stderr(), /Sutando requires macOS/);
 	});
 
 	it('duplicate spawn: loser exits 7 with the FATAL line; winner keeps a structured lock', async () => {
