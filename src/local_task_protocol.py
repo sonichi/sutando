@@ -509,10 +509,9 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
         if candidate.is_file():
             return candidate
 
-    try:
-        flat = sorted(archive.glob(f"{task_id}-*.txt"))
-    except (OSError, ValueError):
-        flat = []
+    # glob on a missing or non-directory path yields nothing rather than
+    # raising, so no guard is needed here.
+    flat = sorted(archive.glob(f"{task_id}-*.txt"))
     return flat[-1] if flat else None
 
 

@@ -116,6 +116,26 @@ class PlanTest(unittest.TestCase):
             self.assertEqual(sp.plan(holder_id="../../etc/passwd")[0], "requeue")
 
 
+class UnreadableInputTest(unittest.TestCase):
+    """A task or holder path that exists but cannot be read is 'no record',
+    not an exception into the delivery loop."""
+
+    def test_unreadable_original_task_is_treated_as_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td)
+            sp.holder("")
+            # A directory where the task file is expected: read_text raises.
+            (sp.tasks / f"{TID}.txt").mkdir()
+            self.assertEqual(sp.plan()[0], "report")
+
+    def test_unreadable_holder_result_is_treated_as_not_delivered(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td)
+            sp.orig()
+            (sp.results / "archive" / f"{HOLDER}-1785976425.txt").mkdir()
+            self.assertEqual(sp.plan()[0], "requeue")
+
+
 class ArchiveLocatorTest(unittest.TestCase):
     """Branches of find_archived_result the plan depends on."""
 

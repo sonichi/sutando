@@ -35,6 +35,20 @@ except ImportError:
 
 # Isolate CLAUDE_CONFIG_DIR before any bridge import: the bridges resolve
 # channel access at module load and fall back to the real ~/.claude otherwise.
+# Always stub slack_bolt, present or not: the real `App()` performs a live
+# auth.test during construction, so importing the bridge would hit the network.
+# This test only drives `_dedup_recover`, never Bolt itself.
+_sb = types.ModuleType("slack_bolt")
+_sb.App = type("App", (), {"__init__": lambda self, **kw: None,
+                           "event": lambda self, name: (lambda fn: fn),
+                           "client": None})
+sys.modules["slack_bolt"] = _sb
+sys.modules["slack_bolt.adapter"] = types.ModuleType("slack_bolt.adapter")
+_sm = types.ModuleType("slack_bolt.adapter.socket_mode")
+_sm.SocketModeHandler = type("SocketModeHandler", (),
+                             {"__init__": lambda self, *a, **k: None})
+sys.modules["slack_bolt.adapter.socket_mode"] = _sm
+
 _CFG = tempfile.mkdtemp(prefix="ccd-dedup-wrappers-")
 atexit.register(lambda: shutil.rmtree(_CFG, ignore_errors=True))
 os.environ["CLAUDE_CONFIG_DIR"] = _CFG
