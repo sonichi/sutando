@@ -60,9 +60,9 @@ for _i in $(seq 1 "$N_CONC"); do
   WS0="$TMP/ws0-$_i"; mkdir -p "$WS0/state/cores" "$WS0/tasks"
   printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS0/state/core-status.json"
   a_out="$TMP/conc-a-$_i.log"; b_out="$TMP/conc-b-$_i.log"
-  ( GR_WS="$WS0" GR_SYNC_CMD="true" GR_POLL_S=0 bash "$GR" --dry-run >"$a_out" 2>&1 ) &
+  ( GR_WS="$WS0" GR_SYNC_CMD="true" GR_POLL_S=0 GR_RETAIN_LOCK_ON_DECISION=1 bash "$GR" --dry-run >"$a_out" 2>&1 ) &
   pa=$!
-  ( GR_WS="$WS0" GR_SYNC_CMD="true" GR_POLL_S=0 bash "$GR" --dry-run >"$b_out" 2>&1 ) &
+  ( GR_WS="$WS0" GR_SYNC_CMD="true" GR_POLL_S=0 GR_RETAIN_LOCK_ON_DECISION=1 bash "$GR" --dry-run >"$b_out" 2>&1 ) &
   pb=$!
   ra=0; rb=0
   wait "$pa" || ra=$?
@@ -343,6 +343,33 @@ rc12="$(cat "$TMP/ws12.rc" 2>/dev/null || echo missing)"
   || say FAIL "TERM exits 143 (got $rc12) — set -e aborted the trap, or the re-fired EXIT trap overrode it"
 [ ! -d "$LOCK12" ] && say ok "our own lock is released on TERM" \
   || say FAIL "our own lock survived TERM — cleanup must not be skipped to make the exit code right"
+
+echo "13. a normal --dry-run must NOT self-block the next real run"
+# Verifying a destructive command before firing it is the natural operator
+# sequence, so a dry-run that keeps the lock blocks the real run for
+# LOCK_STALE_S (900s). Retention is still required for the concurrency model,
+# which now asks for it via GR_RETAIN_LOCK_ON_DECISION.
+WS13="$TMP/ws13"; mkws "$WS13"
+out13a="$(GR_WS="$WS13" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1 || true)"
+echo "$out13a" | grep -q "DRY-RUN — would exec" || say FAIL "dry-run did not reach a restart decision: $out13a"
+LOCK13="$WS13/state/locks/graceful-restart.lock"
+[ ! -d "$LOCK13" ] && say ok "a decided dry-run released its own lock" \
+  || say FAIL "dry-run retained the lock — the next real run self-blocks for LOCK_STALE_S"
+
+# The load-bearing assertion: the FOLLOWING run must not defer.
+out13b="$(GR_WS="$WS13" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)"; rc13b=$?
+[ "$rc13b" = 0 ] && say ok "the run immediately after a dry-run proceeds (rc 0)" \
+  || say FAIL "the run after a dry-run exited $rc13b (4 = self-deferred on its own stale lock)"
+echo "$out13b" | grep -q "another restart is in progress" \
+  && say FAIL "the following run deferred to its own predecessor's lock" \
+  || say ok "no self-deferral in the following run"
+
+# ...and the retain mode still works, or the concurrency case above is hollow.
+WS13c="$TMP/ws13c"; mkws "$WS13c"
+GR_WS="$WS13c" GR_SYNC_CMD="true" GR_POLL_S=1 GR_RETAIN_LOCK_ON_DECISION=1 bash "$GR" --dry-run >/dev/null 2>&1 || true
+[ -d "$WS13c/state/locks/graceful-restart.lock" ] \
+  && say ok "GR_RETAIN_LOCK_ON_DECISION=1 still retains (models production exec)" \
+  || say FAIL "retain mode did not retain — the concurrency test no longer models production"
 
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
