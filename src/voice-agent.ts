@@ -52,7 +52,19 @@ import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLoc
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
-import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
+import {
+	classifyTransportClose,
+	recordTerminalClassification,
+	lastTerminalClassification,
+	clearTerminalClassification,
+	type ClassifiedClose,
+} from './voice-error-classifier.js';
+import {
+	createAgentStateProvider,
+	createIsolatedIdleRestore,
+	publishLifecycleSnapshot,
+	type AgentStateV1,
+} from './voice-agent-state.js';
 
 import { sharedPersonalPath, claudeHomePath } from './util_paths.js';
 
@@ -787,6 +799,60 @@ async function main() {
 	}
 
 
+	// Bumped 5min into the future on every non-retryable transport close
+	// (set inside the classifier IIFE below). Read by the 30s health
+	// monitor — when the deadline is in the future, the monitor skips its
+	// reconnect-trigger so a permanent upstream failure (credits depleted,
+	// key invalid, quota exceeded) doesn't produce a tight 60s retry loop
+	// that spams logs + Gemini API requests until the user fixes things.
+	// Auto-recovery resumes ~5min after the last fatal close. Reset to 0
+	// when the session reaches ACTIVE so a transient close after recovery
+	// doesn't inherit a stale backoff window. (Declared BEFORE the
+	// VoiceSession construction so the agent.state provider below can read
+	// it — Step 12's `backoff` upstream mapping.)
+	let voiceFatalBackoffUntil = 0;
+
+	// =========================================================================
+	// `agent.state` v1 provider (design 1a′; impl plan WS1 Step 12,
+	// amendments R8/A9/A10/S3). All getters are late-bound: `sessionRef` is
+	// assigned right after the constructor, and no client (or probe) can
+	// reach the WS server before session.start() runs below.
+	// =========================================================================
+	let agentInitialized = false;
+	const agentStateProvider = createAgentStateProvider({
+		initialized: () => agentInitialized,
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		sessionState: () => String((sessionRef as any)?.sessionManager?.state ?? 'CREATED'),
+		// Real clients only — probe sockets never attach (Step 11's bodhi
+		// interception keeps them off `clientConnected`).
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		clientAttached: () => Boolean((sessionRef as any)?.clientConnected),
+		backoffUntil: () => voiceFatalBackoffUntil,
+		// R8: the persisted last terminal classification lives in the
+		// classifier module — one classifier, one store.
+		lastTerminalFailure: () => lastTerminalClassification(),
+		// A10: the EXISTING resolver result the agent loaded its key from —
+		// `voiceApiKey()`'s string signature is untouched; label mapping
+		// (env→byok) happens inside the provider. `credentialGeneration` is
+		// only ever REPORTED (Rust mints it; S3 plumbs it via the managed
+		// file / SUTANDO_VOICE_CREDENTIAL_GENERATION).
+		credential: () => voiceCredential,
+		// R17: echo launchdContract:1 only when the launchd contract env
+		// marker is present.
+		launchdContract: () => process.env.SUTANDO_VOICE_LAUNCHD_CONTRACT === '1',
+	});
+	const buildAgentState = (): AgentStateV1 => agentStateProvider.build();
+
+	// Feature-detect Step-11 probe support in the pinned bodhi. The
+	// `probeState` constructor option ships with the bodhi PR + pin bump
+	// (impl plan PR group E); until that pin lands the option would be
+	// silently ignored, so the detect keeps the wiring intent explicit and
+	// lets the pin bump activate it without touching this file. Detection:
+	// the bundled VoiceSession source must mention the option.
+	const bodhiSupportsProbeState = (() => {
+		try { return String(VoiceSession).includes('probeState'); } catch { return false; }
+	})();
+
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
@@ -799,6 +865,22 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		// Step 11/12: when the pinned bodhi supports `?probe=1` probe
+		// interception, hand it the agent.state builder — probes get one
+		// frame + close 1000 without ever touching `this.client`. The Z3
+		// isolated idle-restore arms here too: a probe is the only
+		// probe-shaped hook this repo controls until bodhi exposes a
+		// dedicated probe/verifier-close callback (seam documented on
+		// `createIsolatedIdleRestore().arm`).
+		...(bodhiSupportsProbeState
+			? {
+				probeState: (): AgentStateV1 => {
+					const frame = buildAgentState();
+					probeIdleRestore.arm();
+					return frame;
+				},
+			}
+			: {}),
 		hooks: {
 			onSessionStart: (e) => {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
@@ -856,6 +938,58 @@ async function main() {
 	});
 
 	sessionRef = session;
+
+	// =========================================================================
+	// `agent.state` emission + lifecycle snapshot (Step 12 + amendment A9).
+	// One emitter, three triggers: an immediate frame on every accepted real
+	// connection, a repeat frame on every upstream transition, and an atomic
+	// `state/voice-lifecycle.json` publish on every relevant transition
+	// (client attach/detach, initialized flip, upstream change). This module
+	// is the ONLY writer of the lifecycle file (A9) — WS2's control consumer
+	// reads it cross-process.
+	// =========================================================================
+	let lastEmittedUpstream: string | null = null;
+	let lastLifecycleKey = '';
+	const sendAgentStateFrame = (frame: AgentStateV1): void => {
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(session as any).clientTransport?.sendJsonToClient?.(frame);
+		} catch (err) {
+			console.error(`${ts()} [AgentState] frame send failed: ${(err as Error)?.message ?? err}`);
+		}
+	};
+	const emitAgentState = (opts: { immediate?: boolean } = {}): void => {
+		const frame = buildAgentState();
+		// A transition includes reason/category changes within 'failed'
+		// (e.g. auth-invalid → quota-exceeded after a key rotation) — those
+		// are meaningful upstream transitions even when the state name
+		// doesn't change.
+		const upstreamKey = `${frame.upstream}|${frame.reason ?? ''}|${frame.category ?? ''}`;
+		const upstreamChanged = upstreamKey !== lastEmittedUpstream;
+		lastEmittedUpstream = upstreamKey;
+		if (opts.immediate || upstreamChanged) sendAgentStateFrame(frame);
+		// A9: publish the lifecycle snapshot when any relevant field flipped
+		// (attach/detach, initialized, upstream) — atomic temp+rename with
+		// unique temp names inside publishLifecycleSnapshot; NOT the
+		// writeVoiceState plain-writeFileSync pattern.
+		const lifecycleKey = `${frame.clientAttached}|${frame.initialized}|${upstreamKey}`;
+		if (lifecycleKey !== lastLifecycleKey) {
+			lastLifecycleKey = lifecycleKey;
+			publishLifecycleSnapshot(WORKSPACE_DIR, frame, {
+				onError: (err) => console.error(`${ts()} [AgentState] lifecycle snapshot write failed: ${(err as Error)?.message ?? err}`),
+			});
+		}
+	};
+	// Upstream transitions: bodhi's sessionManager publishes
+	// `session.stateChange` on every transitionTo() — the same seam the
+	// health monitor's state reads observe. ACTIVE proves the credential
+	// works again, so it clears the persisted terminal classification (R8)
+	// before the frame is built.
+	session.eventBus.subscribe('session.stateChange', (e) => {
+		if ((e as { toState?: string })?.toState === 'ACTIVE') clearTerminalClassification();
+		emitAgentState();
+	});
+
 	// Wire vision streaming — the start_vision tool needs the live session
 	// to call session.transport.sendFile for each frame. Also boot the local
 	// HTTP control endpoint so the web-client Watch button can drive the
@@ -866,17 +1000,6 @@ async function main() {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	setSessionToolUpdater((tools) => (session as any).transport?.updateTools?.(tools), mainAgentTools);
 	startVisionControlServer();
-
-	// Bumped 5min into the future on every non-retryable transport close
-	// (set inside the classifier IIFE below). Read by the 30s health
-	// monitor — when the deadline is in the future, the monitor skips its
-	// reconnect-trigger so a permanent upstream failure (credits depleted,
-	// key invalid, quota exceeded) doesn't produce a tight 60s retry loop
-	// that spams logs + Gemini API requests until the user fixes things.
-	// Auto-recovery resumes ~5min after the last fatal close. Reset to 0
-	// when the session reaches ACTIVE so a transient close after recovery
-	// doesn't inherit a stale backoff window.
-	let voiceFatalBackoffUntil = 0;
 
 	// Wire voice-failure classifier: when the Gemini Live transport closes
 	// with a non-retryable reason (credits depleted, quota exceeded, key
@@ -895,12 +1018,19 @@ async function main() {
 		const notifiedCategories = new Set<string>();
 		const handleClose = (c: ClassifiedClose): void => {
 			if (c.retryable) return;
+			// R8: persist the terminal classification (one classifier, one
+			// store — voice-error-classifier.ts) so buildAgentState() reports
+			// `upstream:'failed'` with the stable reason/category between
+			// closes, then emit the upstream transition to any attached
+			// client + the lifecycle snapshot (Step 12).
+			recordTerminalClassification(c);
 			// Push the health-monitor reconnect window out by 5min on every
 			// non-retryable close — including repeats of an already-notified
 			// category — so the 60s retry loop doesn't keep firing while the
 			// upstream issue persists. Without this, a 1011 credit-depleted
 			// loop produces ~6 log lines / 60s indefinitely.
 			voiceFatalBackoffUntil = Date.now() + 5 * 60 * 1000;
+			emitAgentState();
 			if (notifiedCategories.has(c.category)) return;
 			notifiedCategories.add(c.category);
 			console.error(`${ts()} [VoiceFailure] ${c.category}: ${c.userMessage} (raw="${c.rawReason}")`);
@@ -941,6 +1071,26 @@ async function main() {
 		};
 		console.log(`${ts()} [VoiceFailure] classifier wired into transport.onClose`);
 	})();
+
+	// Test-only fault injection (SUTANDO_TEST_MODE only): synthesize an
+	// upstream transport close through the REAL wrapped `transport.onClose`
+	// seam above, so integration tests can drive classifier →
+	// recordTerminalClassification → agent.state 'failed' emission
+	// deterministically offline (no dependency on live Gemini responses).
+	// File-triggered so the test controls WHEN the close fires relative to
+	// its own client connection (boot timing on CI is unbounded).
+	// Format: SUTANDO_TEST_UPSTREAM_CLOSE="<triggerFile>|<code>|<reason>".
+	if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_UPSTREAM_CLOSE) {
+		const [trigger, codeRaw, ...reasonParts] = process.env.SUTANDO_TEST_UPSTREAM_CLOSE.split('|');
+		const poll = setInterval(() => {
+			if (!existsSync(trigger)) return;
+			clearInterval(poll);
+			try {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(session as any).transport?.onClose?.(Number(codeRaw) || 1011, reasonParts.join('|'));
+			} catch { /* test-only */ }
+		}, 250);
+	}
 
 	// Wire narration-tee: capture Gemini's outbound audio for screen recordings
 	try {
@@ -1110,6 +1260,22 @@ async function main() {
 	const IDLE_TEARDOWN_MS = Number(process.env.SUTANDO_VOICE_IDLE_TEARDOWN_MS) || 60_000;
 	let idleTeardownTimer: ReturnType<typeof setTimeout> | null = null;
 
+	// Shared teardown body — used by the one-shot idle timer below AND by the
+	// Z3 isolated idle-restore (probe/verifier fence). Re-checks real-client
+	// attachment at fire time so a client that connected while the timer was
+	// pending is never torn down under.
+	const teardownIdleUpstream = async (via: string) => {
+		if ((session as any).clientConnected) return;
+		const transport = (session as any).transport;
+		if (!transport?.disconnect) return;
+		console.log(`${ts()} [VoiceSession] Idle (${via}) — closing Gemini transport (no phantoms while CLOSED)`);
+		try {
+			await transport.disconnect();
+		} catch (err) {
+			console.error(`${ts()} [VoiceSession] Idle teardown failed: ${(err as Error)?.message ?? err}`);
+		}
+	};
+
 	const cancelIdleTeardown = () => {
 		if (idleTeardownTimer) {
 			clearTimeout(idleTeardownTimer);
@@ -1120,17 +1286,28 @@ async function main() {
 		cancelIdleTeardown();
 		idleTeardownTimer = setTimeout(async () => {
 			idleTeardownTimer = null;
-			if ((session as any).clientConnected) return;
-			const transport = (session as any).transport;
-			if (!transport?.disconnect) return;
-			console.log(`${ts()} [VoiceSession] Idle ${IDLE_TEARDOWN_MS / 1000}s — closing Gemini transport (no phantoms while CLOSED)`);
-			try {
-				await transport.disconnect();
-			} catch (err) {
-				console.error(`${ts()} [VoiceSession] Idle teardown failed: ${(err as Error)?.message ?? err}`);
-			}
+			await teardownIdleUpstream(`${IDLE_TEARDOWN_MS / 1000}s idle`);
 		}, IDLE_TEARDOWN_MS);
 	};
+
+	// Amendment Z3 — verifier/probe idle restoration. The initial idle timer
+	// above is one-shot and rearmed only by the REAL-client disconnect
+	// wrapper; a probe/verifier that closes after that timer already fired
+	// would otherwise leave a woken upstream connected forever (no real
+	// client will ever rearm it). The isolated restore timer arms on
+	// probe-role close with no real client attached and restores the prior
+	// idle state (upstream → CLOSED); a later real connection fences it
+	// (handleClientConnected wrapper below). SEAM: until the Step-11 bodhi
+	// pin exposes a probe/verifier-close hook, the only in-repo arm point is
+	// the `probeState` callback passed to the VoiceSession constructor —
+	// when bodhi's role close hook lands, wire it to `probeIdleRestore.arm()`
+	// directly.
+	const probeIdleRestore = createIsolatedIdleRestore({
+		delayMs: IDLE_TEARDOWN_MS,
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		clientAttached: () => Boolean((session as any).clientConnected),
+		teardown: () => teardownIdleUpstream('probe-idle-restore'),
+	});
 
 	// Flush metrics on client disconnect — bodhi's handleClientDisconnected()
 	// doesn't trigger onSessionEnd, so metrics would never be written. Also
@@ -1142,6 +1319,9 @@ async function main() {
 			recorder.flush();
 			writeVoiceState(false);
 			scheduleIdleTeardown();
+			// Step 12/A9: client detach is a lifecycle transition (and may
+			// flip upstream backoff→idle now that no client is attached).
+			emitAgentState();
 		};
 	}
 
@@ -1163,6 +1343,10 @@ async function main() {
 	if (origConnect) {
 		(session as any).handleClientConnected = () => {
 			cancelIdleTeardown();
+			// Z3 fence: a REAL connection invalidates any pending
+			// probe/verifier idle-restore — the restore must never tear the
+			// upstream down under this client.
+			probeIdleRestore.fence();
 			if (recorder.wasFlushed) {
 				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
 				recorder.reset();
@@ -1174,6 +1358,11 @@ async function main() {
 			}
 			writeVoiceState(true);
 			origConnect();
+			// Step 12: immediate `agent.state` frame on every accepted real
+			// connection (after origConnect so `clientAttached` reads true),
+			// then repeats ride the upstream-transition subscription. Also
+			// publishes the A9 lifecycle attach transition.
+			emitAgentState({ immediate: true });
 		};
 	}
 
@@ -1207,6 +1396,14 @@ async function main() {
 		} catch (err) { console.error(`${ts()} [CallResult] Error:`, err); }
 	}, 2000);
 
+	// L2 initialized (Step 12): tools are loaded, the VoiceSession is
+	// constructed, and the WS server is about to listen (session.start()
+	// binds the WS listener before the LLM transport, per bodhi internals) —
+	// set immediately before the start() try, per the readiness model, and
+	// publish the lifecycle flip (A9).
+	agentInitialized = true;
+	emitAgentState();
+
 	// Start session — don't let a transient Gemini failure kill the process.
 	// WS server starts *before* the LLM transport (per bodhi internals), so the
 	// listener on :PORT is already healthy; only the upstream Gemini connection is broken.
@@ -1217,6 +1414,12 @@ async function main() {
 		const msg = (err as Error)?.message || String(err);
 		console.error(`${ts()} [Startup] session.start() failed: ${msg}`);
 		console.error(`${ts()} [Startup] Staying alive — WS server on :${PORT}, will retry LLM transport on next client connect`);
+		// The regex below is a LOGGING HINT only (amendment R8) — the
+		// protocol classification seam is voice-error-classifier.ts: run the
+		// startup failure message through the same classifier as transport
+		// closes so a terminal cause (bad key, quota) is persisted for
+		// buildAgentState() and reported as upstream:'failed'.
+		recordTerminalClassification(classifyTransportClose(undefined, msg));
 		if (/credit|quota|billing|auth|401|403/i.test(msg)) {
 			console.error(`${ts()} [Startup] Likely cause: Gemini API key invalid or prepayment credits depleted`);
 			console.error(`${ts()} [Startup] Fix: top up at https://ai.studio/projects or rotate GEMINI_API_KEY in .env`);
@@ -1234,6 +1437,11 @@ async function main() {
 		} catch (e) {
 			console.error(`${ts()} [Startup] Could not transition to CLOSED (state=${session.sessionManager.state}): ${(e as Error)?.message ?? e}`);
 		}
+		// Belt-and-braces: the transitionTo above already emits via the
+		// stateChange subscription; when it throws (state already CLOSED)
+		// this still publishes the terminal classification (dedup makes a
+		// double call a no-op).
+		emitAgentState();
 	}
 
 	// Health monitor — runs regardless of whether initial start() succeeded.
