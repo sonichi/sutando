@@ -319,6 +319,46 @@ GR_WS="$WS13c" GR_SYNC_CMD="true" GR_POLL_S=1 GR_RETAIN_LOCK_ON_DECISION=1 bash 
   && say ok "GR_RETAIN_LOCK_ON_DECISION=1 still retains (models production exec)" \
   || say FAIL "retain mode did not retain — the concurrency test no longer models production"
 
+echo "14. trailing args are forwarded into the exec argv (menu-bar --visible)"
+# Reads the argv back rather than asserting the flag was "passed". The negative
+# control matters: a script that hardcoded --visible would pass without it.
+WS14x="$TMP/ws13"; mkws "$WS14x"
+out14="$(GR_WS="$WS14x" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run -- --visible 2>&1 || true)"
+echo "$out14" | grep -q "would exec 'start-cli.sh --restart --visible'" \
+  && say ok "--visible forwarded through to the exec argv" \
+  || say FAIL "--visible was NOT forwarded: $(echo "$out14" | grep 'would exec' | cut -c1-160)"
+
+WS15b="$TMP/ws13b"; mkws "$WS15b"
+out14b="$(GR_WS="$WS15b" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1 || true)"
+echo "$out14b" | grep -q "would exec 'start-cli.sh --restart'" \
+  && say ok "no trailing args → bare --restart (negative control)" \
+  || say FAIL "bare invocation did not produce a bare --restart argv: $(echo "$out14b" | grep 'would exec' | cut -c1-160)"
+
+echo "15. the REAL exec argv forwards the flag (not just the dry-run echo)"
+# Case 14 reads the dry-run log, and dry-run returns BEFORE the exec, so it
+# cannot see the production argv. This stubs GR_START_CLI and asserts that.
+WS15="$TMP/ws15"; mkws "$WS15"
+stub15="$TMP/stub-start-cli.sh"
+cat > "$stub15" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$@" > "$STUB_ARGV_OUT"
+STUB
+chmod +x "$stub15"
+STUB_ARGV_OUT="$TMP/ws15.argv" GR_START_CLI="$stub15" GR_WS="$WS15" GR_SYNC_CMD="true" \
+  GR_POLL_S=1 bash "$GR" -- --visible > "$TMP/ws15.out" 2>&1 || true
+argv15="$(tr '\n' ' ' < "$TMP/ws15.argv" 2>/dev/null || echo MISSING)"
+case "$argv15" in
+  *"--restart"*"--visible"*) say ok "real exec argv carried --restart --visible ($argv15)" ;;
+  *)                         say FAIL "real exec argv lost the flag: '$argv15'" ;;
+esac
+
+WS15b="$TMP/ws15b"; mkws "$WS15b"
+STUB_ARGV_OUT="$TMP/ws15b.argv" GR_START_CLI="$stub15" GR_WS="$WS15b" GR_SYNC_CMD="true" \
+  GR_POLL_S=1 bash "$GR" > "$TMP/ws15b.out" 2>&1 || true
+argv15b="$(tr -d '\n' < "$TMP/ws15b.argv" 2>/dev/null || echo MISSING)"
+[ "$argv15b" = "--restart" ] && say ok "bare invocation execs exactly --restart (negative control)" \
+  || say FAIL "bare invocation argv was '$argv15b', expected exactly '--restart'"
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else
