@@ -580,13 +580,23 @@ describe('agent.state emission (integration, spawned agent)', () => {
 			assert.equal(failedFrame.reason, 'quota-exceeded', 'stable protocol reason code (R8)');
 			assert.equal(failedFrame.credentialGeneration, GEN);
 
-			// Lifecycle mirrors the terminal upstream (A9 + S3 fields).
+			// Lifecycle mirrors the terminal upstream (A9 + S3 fields). NOT
+			// pinned to quota: the fake key's own startup auth close arrives
+			// through the SAME wrapped onClose seam and can land after the
+			// injected quota close, legitimately overwriting the category —
+			// R8 makes reason/category changes within 'failed' meaningful
+			// transitions, and the frame assertions above already pinned the
+			// quota mapping end-to-end. The file's invariant is that it
+			// mirrors the LATEST failed classification, so assert exactly
+			// that (captured live: the file read failed/auth at timeout while
+			// the quota frame sat in the frames array).
 			await waitFor(() => {
 				try {
 					const snap = JSON.parse(readFileSync(voiceLifecyclePath(ws), 'utf-8'));
-					return snap.upstream === 'failed' && snap.category === 'quota';
+					const lastFailed = [...frames].reverse().find((f) => f.upstream === 'failed');
+					return !!lastFailed && snap.upstream === 'failed' && snap.category === lastFailed.category;
 				} catch { return false; }
-			}, 10_000, 'lifecycle snapshot upstream=failed');
+			}, 10_000, 'lifecycle snapshot mirrors the latest failed classification');
 			const snap = JSON.parse(readFileSync(voiceLifecyclePath(ws), 'utf-8'));
 			assert.equal(typeof snap.at, 'number');
 			assert.equal(snap.clientAttached, true);
