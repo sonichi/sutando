@@ -1,13 +1,5 @@
 """The wedge-recovery model downgrade must be visible in health output.
-
-`recover_core_if_wedged` sets SUTANDO_CORE_MODEL=opus (200K) on a re-wedge. The
-value was written and read nowhere, lives in the core's tmux SESSION env, and
-nothing expires it — so a peer core ran 17 days downgraded, autocompacting every
-9.1 minutes, and health reported clean throughout.
-
-Exercised against a real tmux socket in both directions, because a probe that
-cannot answer both ways proves nothing.
-"""
+Exercised against a real tmux socket in both directions."""
 import importlib.util
 import os
 import shutil
@@ -59,15 +51,8 @@ class CoreModelPinProbe(unittest.TestCase):
         self.assertIn("core=", r["detail"])           # and which one is pinned
 
     def test_sibling_session_does_not_hide_a_pinned_core(self):
-        """THE REGRESSION. Two sessions, only the non-first one pinned.
-
-        Untargeted `show-environment` resolves to whichever session tmux picks.
-        With `notifier` created first, it picked the unpinned one, returned
-        "unknown variable" and the probe reported ok on an actively pinned core --
-        the exact silent miss it exists to prevent. Found independently by
-        qingyun-wu, bassilkhilo-ag2 and sonichi; this fails against the
-        untargeted implementation.
-        """
+        """Two sessions, only the non-first one pinned: an untargeted
+        `show-environment` picks a session and can miss a pinned core."""
         subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "notifier",
                         "sleep 120"], capture_output=True)
         subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "sutando-core",
@@ -105,16 +90,8 @@ class CoreModelPinProbe(unittest.TestCase):
 
 
 class InterpretPinNoTmuxNeeded(unittest.TestCase):
-    """The logic half, exercised WITHOUT tmux — these run on any runner.
-
-    The first version of this file gated every behavioural test on
-    `skipIf(tmux missing)`. On a CI runner without tmux they all skipped, so the
-    new lines were never executed. A test that cannot run where the merge is
-    gated does not cover that code.
-
-    `_interpret_core_model_pin` now takes the list of pinned (session, value)
-    pairs rather than one tmux result — the single-result form was the P1.
-    """
+    """`_interpret_core_model_pin` takes the collected (session, value) pairs,
+    not one tmux result, so the multi-session logic is testable without tmux."""
 
     def setUp(self):
         self.hc = _load()
@@ -145,7 +122,7 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                 self.hc._interpret_core_model_pin(pins, "/s")["name"], "core-model-pin")
 
     def test_absent_socket_is_ok_not_a_failure(self):
-        """Covers the IO half's early return — needs no tmux, so it runs in CI."""
+        """Covers the IO half's early return; needs no tmux."""
         import tempfile as _tf
         prev = os.environ.get("SUTANDO_TMUX_SOCKET")
         with _tf.TemporaryDirectory() as td:
@@ -162,10 +139,7 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
 
     def test_tmux_query_failure_is_ok_not_a_health_failure(self):
         """A probe that cannot query must not manufacture a red health check.
-
-        Needs no tmux: `.exists()` accepts any file, and subprocess.run is patched
-        to raise. This is the arm the diff-coverage gate reported uncovered.
-        """
+        Needs no tmux: `.exists()` accepts any file and subprocess.run is patched."""
         import tempfile as _tf
         from unittest import mock
         prev = os.environ.get("SUTANDO_TMUX_SOCKET")
@@ -183,6 +157,29 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("tmux exploded", r["detail"])
         self.assertIn("skipped", r["detail"])
+
+    def test_failed_enumeration_is_not_reported_as_no_pin(self):
+        """A nonzero `list-sessions` must not become an empty session list —
+        that would clear the probe without inspecting a single session."""
+        import tempfile as _tf
+        from unittest import mock
+        prev = os.environ.get("SUTANDO_TMUX_SOCKET")
+        with _tf.NamedTemporaryFile() as fake_socket:
+            os.environ["SUTANDO_TMUX_SOCKET"] = fake_socket.name
+            try:
+                with mock.patch.object(
+                    self.hc.subprocess, "run",
+                    return_value=subprocess.CompletedProcess(
+                        args=["tmux"], returncode=1, stdout="", stderr="no server running"),
+                ):
+                    r = self.hc.check_core_model_pin()
+            finally:
+                if prev is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = prev
+        self.assertIn("skipped", r["detail"], "must say it could not query, not that it found nothing")
+        self.assertNotIn("no model pin", r["detail"], r)
 
 
 if __name__ == "__main__":

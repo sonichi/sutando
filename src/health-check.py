@@ -6468,16 +6468,8 @@ def check_dynamic_loop_freshness(
 
 
 def _interpret_core_model_pin(pinned: list, socket: str) -> dict:
-    """Pure half of `check_core_model_pin`.
-
-    `pinned` is [(session_name, value), ...] for EVERY session that has the
-    variable set -- not one tmux result. Reviewers found the single-result form
-    could read a sibling session and report ok on a pinned core.
-
-    Split out so the logic is testable without tmux present: the earlier tests
-    were all `skipIf(tmux missing)`, so on a runner without tmux they skipped and
-    the new lines had zero coverage.
-    """
+    """Pure half of `check_core_model_pin`: interprets all collected tmux session pins.
+    `pinned` is [(session_name, value), ...] for EVERY session with the variable set."""
     name = "core-model-pin"
     if not pinned:
         return {"name": name, "status": "ok",
@@ -6499,39 +6491,21 @@ def _interpret_core_model_pin(pinned: list, socket: str) -> dict:
     }
 
 
-def _tmux_sessions(socket: str) -> list:  # pragma: no cover — thin tmux glue, covered by the two-session integration test
+def _tmux_sessions(socket: str) -> list:  # pragma: no cover — thin tmux glue
     res = subprocess.run(
         ["tmux", "-S", socket, "list-sessions", "-F", "#{session_name}"],
         capture_output=True, text=True, timeout=10,
     )
     if res.returncode != 0:
-        return []
+        # A failed enumeration is not an empty socket: returning [] here would
+        # report "no pin" without having inspected a single session.
+        raise subprocess.CalledProcessError(res.returncode, res.args, res.stdout, res.stderr)
     return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
 
 
 def check_core_model_pin() -> dict:
-    """Report a core running the wedge-recovery model downgrade.
-
-    `recover_core_if_wedged`'s second stage sets SUTANDO_CORE_MODEL=opus so a
-    re-wedging core keeps working on the standard 200K window instead of looping
-    on an unanswerable gate. That escalation is sound. What was missing is any
-    way to notice it afterwards: the variable was written here and read nowhere,
-    and it lives in the core's tmux SESSION env, where it survives every bare
-    rerun -- `new-session -A` attaches and discards its own -e, so the session
-    keeps the env it already had. A --restart DOES clear it (kill-session, then a
-    fresh create without -e), so the exposed core is the one nobody restarts.
-
-    Observed: a peer core ran 17 days on the downgrade — 165 autocompactions in
-    25h, one every 9.1 min — and was found only because the owner noticed the
-    symptom. An emergency mode that neither expires nor announces itself is
-    indistinguishable from a deliberate configuration choice.
-
-    Queries EVERY session on the socket, not tmux's implicit target: a socket can
-    carry sibling sessions, and an untargeted show-environment resolves to
-    whichever tmux picks -- reporting ok while the core is pinned.
-
-    Reports only; clearing is an operator action.
-    """
+    """Report a core running the wedge-recovery model downgrade. Queries every
+    session on the socket, since tmux's implicit target is not reliable."""
     name = "core-model-pin"
     socket = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
     if not Path(socket).exists():
