@@ -71,6 +71,24 @@ class TestUndeliverableSource(unittest.TestCase):
     def test_missing_task_file_fails_closed(self):
         self.assertIsNone(self.db._orphan_channel_target("task-absent"))
 
+    def test_warning_is_one_shot_across_repeated_polls(self):
+        # poll_dm_fallback rescans every 30s; an unguarded print would emit
+        # ~2880 identical lines/day per orphan. Two iterations, one signal.
+        tid = self._task("task-repeat", "news-radar")
+        self.assertTrue(self.db._should_warn_undeliverable(tid))
+        self.assertFalse(self.db._should_warn_undeliverable(tid))
+        self.assertFalse(self.db._should_warn_undeliverable(tid))
+
+    def test_distinct_orphans_each_warn_once(self):
+        # Control: one-shot must be PER TASK, not a global latch that silences
+        # every later orphan after the first.
+        a = self._task("task-orphan-a", "news-radar")
+        b = self._task("task-orphan-b", "news-radar")
+        self.assertTrue(self.db._should_warn_undeliverable(a))
+        self.assertTrue(self.db._should_warn_undeliverable(b))
+        self.assertFalse(self.db._should_warn_undeliverable(a))
+        self.assertFalse(self.db._should_warn_undeliverable(b))
+
     def test_non_task_prefix_is_ignored(self):
         self._task("question-x", "news-radar")
         self.assertIsNone(self.db._orphan_channel_target("question-x"))

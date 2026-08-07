@@ -5266,6 +5266,22 @@ def _task_channel_id(task_id: str):
     return None
 
 
+# Warned-once ledger for undeliverable results. poll_dm_fallback rescans every
+# 30s and this branch `continue`s before the retry cutoff, so an unguarded print
+# emits ~2880 identical lines/day per orphan — noise that gets tuned out.
+_UNDELIVERABLE_WARNED: set = set()
+
+
+def _should_warn_undeliverable(task_id: str) -> bool:
+    """True the FIRST time a task_id is seen this process, False after.
+    Per-process rather than durable on purpose: a restart should re-surface an
+    orphan that is still unresolved, and that is once per boot, not per scan."""
+    if task_id in _UNDELIVERABLE_WARNED:
+        return False
+    _UNDELIVERABLE_WARNED.add(task_id)
+    return True
+
+
 def _orphan_channel_target(task_id: str):
     """Channel a `task-` result must go to because NOTHING else will deliver it.
 
@@ -5325,7 +5341,7 @@ async def poll_dm_fallback():
                     # permanent loss, not deferral. Say so instead of dropping
                     # silently; delivery wiring is deliberately not done here.
                     _orphan_ch = _orphan_channel_target(task_id)
-                    if _orphan_ch is not None:
+                    if _orphan_ch is not None and _should_warn_undeliverable(task_id):
                         print(
                             f"  [dm-fallback] UNDELIVERABLE {f.name}: source="
                             f"{_task_source(task_id)!r} owns no consumer and is not "
