@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-197 modules indexed.
+198 modules indexed.
 
 ## `src/`
 
@@ -101,6 +101,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
 - **`result_channel_key.py`** — Per-channel pull path for task-result files in `results/`.
 - **`result_markers.py`** — Unified parsing for the result-body protocol markers used by every bridge (discord, slack, telegram, voice/task-bridge).
+- **`result_ready.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
 - **`result_router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
