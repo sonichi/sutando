@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,10 +62,20 @@ def parse_endpoint(endpoint: str) -> str:
 
 def load_descriptor() -> dict:
     """The live AgentRuntime descriptor. Callers in tests inject instead."""
+    # Anchor on the config loader's repo-root walk (symlink/bundle-safe),
+    # not a __file__ hop; sys.path guard covers spec_from_file_location loads.
+    src_dir = str(Path(__file__).resolve().parent)
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    from sutando_config import _find_repo_root
+    root = _find_repo_root()
+    if root is None:
+        raise ValueError(
+            "cannot locate the repo root (sutando.config.json); "
+            "cannot run sutando-config.sh runtime")
     out = subprocess.run(
         ["bash", "scripts/sutando-config.sh", "runtime"],
-        capture_output=True, text=True, timeout=15,
-        cwd=str(Path(__file__).resolve().parent.parent))
+        capture_output=True, text=True, timeout=15, cwd=str(root))
     return json.loads(out.stdout)
 
 
