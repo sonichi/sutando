@@ -617,7 +617,7 @@ def _takeover_owned(args):
             3,
         )
     pgid = args.pgid if args.pgid is not None else pid_pgid(root)
-    if pgid is None:
+    if pgid is None or pgid <= 0:
         _emit({"ok": False, "code": "takeover-blocked", "detail": "cannot establish pgid for pid %d" % root}, 3)
     # Descendant lock holder (dev tsx parent/worker topology): the lock's pid
     # must belong to the same owned process group.

@@ -9,7 +9,7 @@ with no start-time evidence); malformed/partial JSON = "unknown" and acquire
 refuses to clobber while live evidence exists; two concurrent acquires →
 exactly one winner; steal against a live owner refuses; guard-hold releases
 on holder death; takeover: graceful TERM (no KILL), TERM-ignored escalation,
-concurrent replacement, listener/entry mismatch → blocked with no signal
+concurrent replacement, listener/entry/PGID mismatch → blocked with no signal
 (U1), owned mode kills a non-listening process group (Z1).
 
 Run: python3 tests/voice-lock.test.py
@@ -44,12 +44,20 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-def run_helper(args, timeout=30):
+def helper_command(args):
+    command = [PY]
+    if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+        command += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
+    return command + [str(HELPER)] + [str(a) for a in args]
+
+
+def run_helper(args, timeout=30, start_new_session=False):
     return subprocess.run(
-        [PY, str(HELPER)] + [str(a) for a in args],
+        helper_command(args),
         capture_output=True,
         text=True,
         timeout=timeout,
+        start_new_session=start_new_session,
     )
 
 
@@ -229,8 +237,10 @@ def main():
         s2 = spawn_sleeper()
         procs = [
             subprocess.Popen(
-                [PY, str(HELPER), "acquire", "--pidfile", str(pidfile), "--guard", str(guard),
-                 "--pid", str(s.pid), "--entry", str(entry), "--workspace", str(ws)],
+                helper_command(
+                    ["acquire", "--pidfile", pidfile, "--guard", guard,
+                     "--pid", s.pid, "--entry", entry, "--workspace", ws]
+                ),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             for s in (s1, s2)
@@ -247,7 +257,7 @@ def main():
         # --- guard-hold: flock released on holder death ---
         print("guard-hold:")
         holder = subprocess.Popen(
-            [PY, str(HELPER), "guard-hold", "--guard", str(guard)],
+            helper_command(["guard-hold", "--guard", guard]),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
         )
         line = holder.stdout.readline()
@@ -344,9 +354,10 @@ def main():
         # Concurrent replacement: two takeovers, guard-serialized — exactly one
         # replaces; the other observes no lock; the process dies exactly once.
         structured_lock(pidfile, listener.pid, my_start_time_ms(listener.pid), entry, ws)
-        t_args = [PY, str(HELPER), "takeover", "--pidfile", str(pidfile), "--guard", str(guard),
-                  "--workspace", str(ws), "--mode", "adopted", "--port", str(port),
-                  "--entry", str(entry)]
+        t_args = helper_command(
+            ["takeover", "--pidfile", pidfile, "--guard", guard,
+             "--workspace", ws, "--mode", "adopted", "--port", port, "--entry", entry]
+        )
         tp = [subprocess.Popen(t_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
         results = []
         for proc in tp:
@@ -419,6 +430,24 @@ def main():
             alive_child = False
         check("whole process group terminated (worker too)", not alive_child)
         check("owned takeover unlinked the lock", not pidfile.exists())
+
+        # A caller-provided zero PGID must never target the helper's own group.
+        pgid_zero_target = subprocess.Popen(
+            [PY, "-c", "import time; time.sleep(120)", str(entry)],
+            start_new_session=True,
+        )
+        p = run_helper(
+            base("takeover")
+            + ["--workspace", ws, "--mode", "owned",
+               "--pid", pgid_zero_target.pid,
+               "--start-time-ms", my_start_time_ms(pgid_zero_target.pid),
+               "--pgid", 0, "--entry", entry],
+            start_new_session=True,
+        )
+        check("owned zero pgid → blocked", p.returncode == 3, p.stdout + p.stderr)
+        check("owned zero pgid sends no signal", pgid_zero_target.poll() is None)
+        pgid_zero_target.kill()
+        pgid_zero_target.wait()
 
         # Owned-mode start-time mismatch → blocked, nothing killed.
         loner = spawn_sleeper()
