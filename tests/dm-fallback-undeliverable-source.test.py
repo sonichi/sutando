@@ -21,6 +21,9 @@ os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-dmfallback-")
 _CFG = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
 _CFG.mkdir(parents=True, exist_ok=True)
 (_CFG / "access.json").write_text('{"allowFrom": []}')
+# The module `exit(1)`s at import when no token resolves, so CI (which has none)
+# cannot import it without this. Config isolation alone is not sufficient.
+os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 
 
 def _load():
