@@ -62,15 +62,61 @@ class CoreModelPinProbe(unittest.TestCase):
         r = self.hc.check_core_model_pin()
         self.assertEqual(r["status"], "ok", r)
 
-    def test_no_socket_is_not_a_failure(self):
-        os.environ["SUTANDO_TMUX_SOCKET"] = os.path.join(self.tmp, "absent.sock")
-        r = self.hc.check_core_model_pin()
-        self.assertEqual(r["status"], "ok", r)
-        self.assertIn("skipped", r["detail"])
-
     def test_probe_is_registered(self):
         src = (REPO / "src" / "health-check.py").read_text()
         self.assertIn("checks.append(check_core_model_pin())", src)
+
+
+class InterpretPinNoTmuxNeeded(unittest.TestCase):
+    """The logic half, exercised WITHOUT tmux — these run on any runner.
+
+    The first version of this file gated every behavioural test on
+    `skipIf(tmux missing)`. On a CI runner without tmux they all skipped, the new
+    lines got zero coverage, and `diff coverage >= 95%` failed. A test that cannot
+    run where the merge is gated does not cover that code.
+    """
+
+    def setUp(self):
+        self.hc = _load()
+
+    def test_set_warns_and_names_value_and_remedy(self):
+        r = self.hc._interpret_core_model_pin(0, "SUTANDO_CORE_MODEL=opus\n", "/tmp/s.sock")
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("opus", r["detail"])
+        self.assertIn("setenv -u SUTANDO_CORE_MODEL", r["detail"])
+        self.assertIn("/tmp/s.sock", r["detail"])
+
+    def test_unknown_variable_is_ok(self):
+        r = self.hc._interpret_core_model_pin(1, "unknown variable: SUTANDO_CORE_MODEL", "/tmp/s.sock")
+        self.assertEqual(r["status"], "ok")
+
+    def test_empty_output_is_ok(self):
+        self.assertEqual(self.hc._interpret_core_model_pin(0, "", "/tmp/s.sock")["status"], "ok")
+
+    def test_unrelated_line_is_ok(self):
+        """rc 0 with some other variable must not be read as a pin."""
+        r = self.hc._interpret_core_model_pin(0, "SOMETHING_ELSE=1", "/tmp/s.sock")
+        self.assertEqual(r["status"], "ok")
+
+    def test_absent_socket_is_ok_not_a_failure(self):
+        """Covers the IO half's early return — needs no tmux, so it runs in CI."""
+        import tempfile as _tf
+        prev = os.environ.get("SUTANDO_TMUX_SOCKET")
+        with _tf.TemporaryDirectory() as td:
+            os.environ["SUTANDO_TMUX_SOCKET"] = os.path.join(td, "absent.sock")
+            try:
+                r = self.hc.check_core_model_pin()
+            finally:
+                if prev is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = prev
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("skipped", r["detail"])
+
+    def test_name_is_stable(self):
+        for rc, out in ((0, "SUTANDO_CORE_MODEL=opus"), (1, "unknown variable: X")):
+            self.assertEqual(self.hc._interpret_core_model_pin(rc, out, "/s")["name"], "core-model-pin")
 
 
 if __name__ == "__main__":

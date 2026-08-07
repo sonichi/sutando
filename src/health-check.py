@@ -6467,6 +6467,33 @@ def check_dynamic_loop_freshness(
     return checks
 
 
+def _interpret_core_model_pin(returncode: int, stdout: str, socket: str) -> dict:
+    """Pure half of `check_core_model_pin` — interprets one tmux show-environment result.
+
+    Split out so the logic is testable without tmux present. The probe's earlier
+    tests were all `skipIf(tmux missing)`, so on a runner without tmux every one
+    of them skipped and the new lines had zero coverage — the diff-coverage gate
+    caught it. A test that cannot run on the machine that gates the merge is not
+    a test of that code.
+    """
+    name = "core-model-pin"
+    out = (stdout or "").strip()
+    # tmux prints "unknown variable: X" (rc != 0) when unset, "X=value" when set.
+    if returncode != 0 or not out.startswith("SUTANDO_CORE_MODEL="):
+        return {"name": name, "status": "ok",
+                "detail": "no model pin (core uses the default window)"}
+    value = out.split("=", 1)[1]
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (
+            f"core is PINNED to model '{value}' by wedge recovery — this is an emergency "
+            f"downgrade that nothing clears, and it survives every restart. If the core did "
+            f"not just wedge, clear it: tmux -S {socket} setenv -u SUTANDO_CORE_MODEL, then restart."
+        ),
+    }
+
+
 def check_core_model_pin() -> dict:
     """Report a core running the wedge-recovery model downgrade.
 
@@ -6496,22 +6523,7 @@ def check_core_model_pin() -> dict:
         )
     except (OSError, subprocess.SubprocessError) as e:
         return {"name": name, "status": "ok", "detail": f"could not query tmux env ({e}) — skipped"}
-
-    out = (res.stdout or "").strip()
-    # tmux prints "unknown variable: X" (rc!=0) when unset, "X=value" when set.
-    if res.returncode != 0 or not out.startswith("SUTANDO_CORE_MODEL="):
-        return {"name": name, "status": "ok", "detail": "no model pin (core uses the default window)"}
-
-    value = out.split("=", 1)[1]
-    return {
-        "name": name,
-        "status": "warn",
-        "detail": (
-            f"core is PINNED to model '{value}' by wedge recovery — this is an emergency "
-            f"downgrade that nothing clears, and it survives every restart. If the core did "
-            f"not just wedge, clear it: tmux -S {socket} setenv -u SUTANDO_CORE_MODEL, then restart."
-        ),
-    }
+    return _interpret_core_model_pin(res.returncode, res.stdout, socket)
 
 
 def run_all_checks() -> list[dict]:
