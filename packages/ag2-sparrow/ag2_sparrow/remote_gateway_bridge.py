@@ -1581,16 +1581,12 @@ def _write_task(task: dict) -> str | None:
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
-    # Anonymous product telemetry — #2274 parity for the gateway surface: one
-    # task_processed{source} per NEWLY queued task (the dedup/idempotent early
-    # returns above never reach here, so redeliveries aren't double-counted).
-    # Same fire-and-forget shape as the discord/slack/telegram bridges. The
-    # `telemetry` module lives in the host repo's src/, which the
-    # src/remote-gateway-bridge.py launcher puts on sys.path; a standalone
-    # PyPI install has no such module and this silently no-ops.
+    # #2274 parity: one task_processed per NEWLY queued task (idempotent early
+    # returns never reach here), bucketed to this gateway's own "remote" surface
+    # when the source label isn't an allowlisted bucket so activity isn't lost.
     try:
-        from telemetry import task_processed
-        task_processed(_one_line(task.get("source") or PROVIDER))
+        from telemetry import bucket_source, task_processed
+        task_processed(bucket_source(_one_line(task.get("source") or PROVIDER), "remote"))
     except Exception:
         pass
     _record_task_room(tid, str(task.get("channel_id") or ""))
