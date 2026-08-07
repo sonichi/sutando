@@ -271,6 +271,13 @@ class TestBeeActions(unittest.TestCase):
                                     "BEE_ROOM_ID": "!bee:ag2.space"})
         self.assertEqual(rc, 1)                        # URLError branch
 
+    def test_register_room_zero_args_refuses_ownerless_create(self):
+        # The review repro: no --room, no --invite, no BEE_ROOM_OWNER must
+        # fail BEFORE any HTTP call — an uninvited room is owner-invisible.
+        rc, _ = self._run_room("register-room")
+        self.assertEqual(rc, 2)
+        self.assertEqual(_Server.calls, [])
+
     def test_register_room_create_success_prints_created(self):
         rc, out = self._run_room("register-room", "--invite", "@owner:ag2.space")
         self.assertEqual(rc, 0)

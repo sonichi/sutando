@@ -232,6 +232,11 @@ def main() -> int:
                     print(json.dumps({"room_id": args.room.strip(),
                                       "registered": "existing"}))
                     return 0
+                if not invite:
+                    return _fail(
+                        "refusing to create a room with no owner to invite: "
+                        "pass --invite or set BEE_ROOM_OWNER (an uninvited "
+                        "room would be invisible to you)", 2)
                 room = _register_room(gbase, gheaders, invite)
                 print(json.dumps({"room_id": room, "registered": "created"}))
                 return 0
