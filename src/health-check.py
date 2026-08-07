@@ -5852,9 +5852,8 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
       log, so it only counts if no event has actually been processed since
       it last fired (checked via a subsequent "Wrote task-" line) — otherwise
       Event Subscriptions clearly ARE enabled and it's a stale false alarm.
-    telegram-bridge: a 409 Conflict is a competing getUpdates poller; Telegram
-      splits updates between them, so messages land on whichever host wins the
-      race. Only counts if no message was received after the last conflict.
+    telegram-bridge: a 409 Conflict is a competing getUpdates poller splitting
+      updates. Only counts if no message arrived after the last conflict.
     """
     if name == "discord-bridge":
         if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
@@ -6983,8 +6982,8 @@ def run_all_checks() -> list[dict]:
         # slack-bridge: "60s elapsed" hint means Socket Mode connected but
         #   events aren't routing (Slack app Event Subscriptions disabled).
         #   Only overrides "ok" — stale/dead-inode are higher priority.
-        # telegram-bridge: a 409 Conflict means a second poller is taking a
-        #   share of the updates. Only overrides "ok".
+        # telegram-bridge: a 409 Conflict is a second poller taking a share of
+        #   the updates. Only overrides "ok".
         if (log_file.exists() and name in ("discord-bridge", "slack-bridge", "telegram-bridge")
                 and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:

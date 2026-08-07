@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for the telegram-bridge branch of bridge_log_content_status().
-
-Incident (2026-08-07): telegram-bridge logged 1,736 consecutive
-`API error 409: Conflict: terminated by other getUpdates request` lines while
-health-check reported `telegram-bridge ok — running` throughout. Telegram hands
-each update to exactly one getUpdates caller, so a second poller on another host
-takes a share of the owner's messages — but nothing detected it:
-
-  - Check 2 (log freshness) can't: a bridge erroring in a loop keeps its log
-    FRESH, so the failure mode silences the check that would catch it.
-  - Check 3 (heartbeat) can't: the heartbeat is gated on `result.get("ok")` and
-    one won poll per 60s refreshes it, however many were lost.
-  - Check 6 (log content) has per-bridge signatures, but the call site gated on
-    `name in ("discord-bridge", "slack-bridge")` — telegram was excluded
-    entirely, so a branch alone would have been dead code.
-
-The wiring guards below are the ones that matter: they exercise run_all_checks()
-and fail if the call-site tuple stops including telegram-bridge.
-
-Run: python3 tests/health-check-telegram-poll-conflict.test.py
+"""Telegram 409 conflicts warn only until this host receives a later update, and
+run_all_checks() must include telegram-bridge in the log-content gate.
 """
 from __future__ import annotations
 
