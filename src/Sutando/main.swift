@@ -2054,16 +2054,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let logPath = workspace + "/logs/health-check.log"
         let scriptPath = repoRoot + "/src/health-check.py"
-        // Resolve an interpreter that will actually run: $SUTANDO_PY -> the
-        // bundle-vendored runtime -> the system python3 only when developer
-        // tools are installed. See SutandoConfig.resolvePython.
-        //
-        // This previously probed a hardcoded homebrew python@3.11 and fell back
-        // to `/usr/bin/env python3`. That fallback is the Xcode-CLT stub on a
-        // machine without developer tools, and this Timer fires every 60s — so
-        // a clean install got the "install command line developer tools" dialog
-        // over and over. Skipping is correct: a health check must never be able
-        // to raise a modal system dialog.
+        // $SUTANDO_PY -> bundled runtime -> system python3 only when the
+        // developer tools are present; skip rather than raise a modal dialog.
         guard let pythonPath = SutandoConfig.resolvePython(repoRoot: repoRoot) else {
             logToFile("runHealthCheck: no runnable python3 "
                 + "(no $SUTANDO_PY, no bundled runtime, no developer tools) — skipping")
@@ -2076,9 +2068,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // health failures the trio's coverage scanner suppresses by cooldown
         // (or the LLM step archives by judgment) still reach the agent. Per
         // Chi 2026-05-07 PT.
-        // resolvePython always returns a real interpreter path (never the
-        // `/usr/bin/env` indirection), so the argv no longer needs a special
-        // case that prepends "python3".
+        // resolvePython returns a real interpreter path, so argv no longer
+        // needs the "python3" prepend the `/usr/bin/env` form required.
         let arguments: [String] = [scriptPath, "--fix", "--emit-task"]
 
         DispatchQueue.global(qos: .background).async { [weak self] in
