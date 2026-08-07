@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
-"""Only an owner-tier Slack sender may stamp the owner-PRESENCE signal.
-
-`state/last-owner-activity.json` is not telemetry: the proactive loop reads it to
-decide "owner active in the last ~5min, do not pre-empt" and "away >30min, staying
-quiet is fine". A team/other sender writing it makes the loop treat a peer's message
-as the owner sitting at his desk. discord-bridge already gates on
-`access_tier == "owner"`; slack-bridge wrote before the tier was resolved.
+"""Every write_owner_activity() call in slack-bridge sits under an
+`access_tier == "owner"` equality gate, after tier resolution and after redaction.
 """
 from __future__ import annotations
 
@@ -29,6 +24,30 @@ def _line_of(p: Path, needle: str, skip_def: bool = True) -> int:
     raise AssertionError(f"{needle!r} not found in {p.name}")
 
 
+def _is_owner_eq_gate(test: "ast.expr") -> bool:
+    """True only for a positive `access_tier == "owner"` equality.
+
+    The first version of this file matched `ast.unparse(test)` for the substrings
+    "access_tier" and "owner", which `access_tier != "owner"` also satisfies.
+    """
+    for n in ast.walk(test):
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+            return False
+        if isinstance(n, ast.BoolOp) and isinstance(n.op, ast.Or):
+            return False
+        if isinstance(n, ast.Compare) and any(not isinstance(o, ast.Eq) for o in n.ops):
+            return False
+    for n in ast.walk(test):
+        if not isinstance(n, ast.Compare) or len(n.ops) != 1:
+            continue
+        left, right = n.left, n.comparators[0]
+        names = {getattr(left, "id", None), getattr(right, "id", None)}
+        consts = {getattr(left, "value", None), getattr(right, "value", None)}
+        if "access_tier" in names and "owner" in consts:
+            return True
+    return False
+
+
 class SlackOwnerPresenceGate(unittest.TestCase):
     def test_the_write_happens_after_the_tier_is_resolved(self):
         resolved = _line_of(SLACK, "access_tier = resolve_access_tier")
@@ -46,9 +65,9 @@ class SlackOwnerPresenceGate(unittest.TestCase):
         for node in ast.walk(tree):
             if not isinstance(node, ast.If):
                 continue
-            cond = ast.unparse(node.test)
-            if "access_tier" not in cond or "owner" not in cond:
+            if not _is_owner_eq_gate(node.test):
                 continue
+            cond = ast.unparse(node.test)
             for inner in ast.walk(node):
                 if (isinstance(inner, ast.Call)
                         and getattr(inner.func, "id", "") == "write_owner_activity"):
@@ -62,8 +81,7 @@ class SlackOwnerPresenceGate(unittest.TestCase):
         tree = ast.parse(SLACK.read_text())
         gated = set()
         for node in ast.walk(tree):
-            cond = ast.unparse(node.test) if isinstance(node, ast.If) else ""
-            if "access_tier" in cond and "owner" in cond:
+            if isinstance(node, ast.If) and _is_owner_eq_gate(node.test):
                 for inner in ast.walk(node):
                     if (isinstance(inner, ast.Call)
                             and getattr(inner.func, "id", "") == "write_owner_activity"):
@@ -92,5 +110,26 @@ class SlackOwnerPresenceGate(unittest.TestCase):
         self.assertTrue(ok, "discord-bridge no longer gates its presence write on owner tier")
 
 
+class OwnerEqPredicate(unittest.TestCase):
+    """The predicate must reject exactly what the substring version accepted."""
+
+    def _t(self, src: str) -> "ast.expr":
+        return ast.parse(src, mode="eval").body
+
+    def test_accepts_the_positive_equality(self):
+        self.assertTrue(_is_owner_eq_gate(self._t('access_tier == "owner"')))
+        self.assertTrue(_is_owner_eq_gate(self._t('access_tier == "owner" and fresh')))
+
+    def test_rejects_the_inversion(self):
+        self.assertFalse(_is_owner_eq_gate(self._t('access_tier != "owner"')))
+        self.assertFalse(_is_owner_eq_gate(self._t('not (access_tier == "owner")')))
+
+    def test_rejects_a_widening_or(self):
+        self.assertFalse(_is_owner_eq_gate(self._t('access_tier == "owner" or True')))
+
+    def test_rejects_a_membership_test(self):
+        self.assertFalse(_is_owner_eq_gate(self._t('"owner" in access_tier')))
+
 if __name__ == "__main__":
     unittest.main()
+
