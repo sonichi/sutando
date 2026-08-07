@@ -50,6 +50,12 @@ from ag2_sparrow.event_consumer import TaskifyHandler  # noqa: E402
 # Deterministic local trust default regardless of the host's REMOTE_LOCAL_TIER.
 rgb.LOCAL_TIER = "owner"
 
+# The REAL bucket_source (pure) so fake-telemetry cases exercise the SAME
+# source-bucketing the production caller uses, not a divergent passthrough.
+_REAL_TEL_SPEC = importlib.util.spec_from_file_location("telemetry", REPO / "src" / "telemetry.py")
+_REAL_TEL = importlib.util.module_from_spec(_REAL_TEL_SPEC)
+_REAL_TEL_SPEC.loader.exec_module(_REAL_TEL)
+
 failures = []
 
 
@@ -94,6 +100,7 @@ class _FakeTelemetry:
                 raise RuntimeError("telemetry backend down")
 
         self.mod.task_processed = task_processed
+        self.mod.bucket_source = _REAL_TEL.bucket_source
 
     def __enter__(self):
         self._prev = sys.modules.get("telemetry")
@@ -300,14 +307,19 @@ check("taskify emit tagged events-promotion",
       bool(tp) and tp[0]["properties"].get("source") == "events-promotion",
       repr(tp and tp[0]["properties"]))
 
-# 7c. the allowlist still collapses junk — adding gateway sources must not
-#     open the cardinality/leak gate the allowlist exists for.
+# 7c. leak/cardinality guard preserved under the fix: a secret-ish source is
+#     never emitted as-is. It now collapses to this gateway's "remote" surface
+#     bucket (not "unknown"), and the raw identifier appears NOWHERE in the
+#     payload — the cardinality/leak posture the allowlist exists for is intact.
 _t, payloads = _write_with_real_telemetry(
     {"id": "task-telem7c", "task": "x", "source": "secret-user-identifier-123"})
 tp = [p for p in payloads if p.get("event") == "task_processed"]
-check("unknown source still collapses to unknown",
-      bool(tp) and tp[0]["properties"].get("source") == "unknown",
+check("secret-ish gateway source buckets to remote (surface, not unknown)",
+      bool(tp) and tp[0]["properties"].get("source") == "remote",
       repr(tp and tp[0]["properties"]))
+check("raw secret value never reaches the payload",
+      bool(tp) and "secret-user-identifier-123" not in repr(tp[0]),
+      repr(tp and tp[0]))
 
 # 7d. hostile-tier control (P1-2 regression pin): with the CONTROLLED temp
 #     access.json down-tiering the fixture sender to "team", production must
@@ -339,6 +351,29 @@ check("hostile tier: task written with access_tier team",
       "access_tier: team" in (tmp7d / "tasks" / "task-telem7d.txt").read_text())
 check("hostile tier: owner-activity stamp suppressed for non-owner",
       not (tmp7d / "state" / "last-owner-activity.json").exists())
+
+# 7e. REGRESSION (#2432 aftermath): a gateway task whose source is neither
+#     `ag2space` nor `events-promotion` (e.g. a custom REMOTE_TASK_PROVIDER, or
+#     any label the core allowlist doesn't recognize) was recorded as
+#     source="unknown" — burying real gateway activity as the single largest
+#     bucket fleet-wide. It must now count as this gateway's own surface,
+#     "remote", not "unknown".
+_t, payloads = _write_with_real_telemetry(
+    {"id": "task-telem7e", "task": "x", "source": "acme-cloud-deployment"})
+tp = [p for p in payloads if p.get("event") == "task_processed"]
+check("non-allowlisted gateway source buckets to remote, not unknown",
+      bool(tp) and tp[0]["properties"].get("source") == "remote",
+      repr(tp and tp[0]["properties"]))
+
+# 7f. bucket_source unit: known source kept; unknown falls to the given default;
+#     a non-allowlisted default can't itself smuggle cardinality (→ unknown).
+import telemetry as _tel  # the REAL module (src/ on sys.path from the header)
+check("bucket_source keeps a known source",
+      _tel.bucket_source("slack", "remote") == "slack")
+check("bucket_source falls back to a known default",
+      _tel.bucket_source("acme-cloud", "remote") == "remote")
+check("bucket_source rejects a bad default (no cardinality via default)",
+      _tel.bucket_source("acme-cloud", "acme-default") == "unknown")
 
 print()
 if failures:
