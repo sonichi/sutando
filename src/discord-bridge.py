@@ -3107,17 +3107,24 @@ async def _handle_discord_message(message, force=False):
             _ref = getattr(message, "reference", None)
             _ref_resolved = getattr(_ref, "resolved", None) if _ref is not None else None
             _ref_author = getattr(_ref_resolved, "author", None)
+            _self_id = getattr(client.user, "id", None)
+            _other_agent_mentioned = any(
+                getattr(u, "bot", False) and getattr(u, "id", None) != _self_id
+                for u in (getattr(message, "mentions", None) or [])
+            )
             if not is_addressed_in_shared_channel(
                 author_is_bot=bool(getattr(message.author, "bot", False)),
                 bot_mentioned=bot_mentioned,
                 role_mentioned=role_mentioned,
                 is_reply=_ref is not None,
                 reply_author_id=(getattr(_ref_author, "id", None) if _ref_author is not None else None),
-                self_id=getattr(client.user, "id", None),
+                self_id=_self_id,
+                other_agent_mentioned=_other_agent_mentioned,
             ):
                 print(f"  [skip] shared channel: not addressed to me "
                       f"(author_bot={bool(getattr(message.author, 'bot', False))}, "
-                      f"reply={_ref is not None})", flush=True)
+                      f"reply={_ref is not None}, "
+                      f"other_agent_mentioned={_other_agent_mentioned})", flush=True)
                 return
 
         # Strip role mentions only. User mentions (this bot's and other

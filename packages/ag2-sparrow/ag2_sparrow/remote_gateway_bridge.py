@@ -34,6 +34,13 @@ Config (env / .env):
   REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
+  REMOTE_TASK_CHANNEL_DIR  name of this instance's config dir under
+                        $CLAUDE_CONFIG_DIR/channels/ (default "ag2space") —
+                        selects which .env fallback and access.json a bridge
+                        instance reads, so a second instance (e.g. a dev
+                        homeserver's "dev-ag2space") cannot inherit prod's
+                        credentials or tier map. Env-only by necessity: the
+                        .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
 
 Stdlib only (urllib) — no new dependencies.
@@ -354,6 +361,12 @@ def _parse_onboarding_token(raw):
     return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
 
 
+# Which channels/<dir>/ this instance reads (.env fallback + access.json).
+# Env-only — the .env file can't name its own directory. Default preserves the
+# historical single-instance layout.
+CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+
+
 def _token_from_ag2space_env():
     """Fallback token source when the launcher didn't export it into the env.
 
@@ -387,7 +400,7 @@ def _token_from_ag2space_env():
     candidates = [os.environ.get("AG2_DEVICE_ENV")]
     _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if _cfg:
-        candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
+        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
     for path in candidates:
         if not path:
             continue
@@ -598,7 +611,7 @@ if LOCAL_TIER not in ("owner", "team", "other"):
 # revoke them without a restart.
 def _ag2space_access_path():
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    return os.path.join(base, "channels", "ag2space", "access.json")
+    return os.path.join(base, "channels", CHANNEL_DIR, "access.json")
 
 
 # Known tier vocabulary. Also an ordering (higher == more privileged); kept for
@@ -1568,6 +1581,18 @@ def _write_task(task: dict) -> str | None:
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
+    # Anonymous product telemetry — #2274 parity for the gateway surface: one
+    # task_processed{source} per NEWLY queued task (the dedup/idempotent early
+    # returns above never reach here, so redeliveries aren't double-counted).
+    # Same fire-and-forget shape as the discord/slack/telegram bridges. The
+    # `telemetry` module lives in the host repo's src/, which the
+    # src/remote-gateway-bridge.py launcher puts on sys.path; a standalone
+    # PyPI install has no such module and this silently no-ops.
+    try:
+        from telemetry import task_processed
+        task_processed(_one_line(task.get("source") or PROVIDER))
+    except Exception:
+        pass
     _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).

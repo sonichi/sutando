@@ -48,7 +48,9 @@ Each pass, in order:
 
    **`step` is an owner-facing live message, not internal telemetry.** With `SUTANDO_PROGRESS_STREAM=1` (ON in the running bridge) the Discord bridge renders it to the owner verbatim as `⏳ <step> (Ns)` while he waits on an owner task, via `progress_stream.format_progress`. A generic placeholder ("Starting pass...", "running") shows up in his DM as noise; when processing an owner task, `step` should say what he is waiting on. Rewrite it on every pivot — a stale `step` actively lies to him. See memory `feedback_rich_core_status_step`. (This template previously read `"Starting pass..."` — the exact string that memory names as the anti-pattern, which is why the mistake kept recurring across compactions: this file is loaded every pass, the memory only when recalled.)
 
-0.5. **Check quota.** Run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
+0.5. **Check quota (runtime-conditional — pick the branch for the core you are).**
+
+   **Claude core** — run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
    **Tier EACH window by its OWN rule, then take the MOST RESTRICTIVE TIER.** `read-quota.py`
    reports two windows and they are scored differently — do not apply one window's thresholds to the
    other, and do not pick a window by largest `burn`. Those select differently: a short window can show a huge `burn`
@@ -85,8 +87,13 @@ Each pass, in order:
    Quote `sustainable_vs_current` when reporting pace, and **name the denominator** — "0.45x even
    pace" and "0.27x current pace" are the same state and differ by 1.67x.
 
+   **Codex core** — run `python3 skills/proactive-loop/scripts/codex-quota-gate.py --json` (the Claude-only `quota-tracker` state is not a Codex signal). It reads the Codex CLI's weekly rate-limit snapshots and conservatively uses the least remaining percentage among recorded weekly limit lanes; missing or entirely stale telemetry fails closed to `LIGHT`.
+   - **>20% remaining → FULL**: subagents, code, and heavier research are fair game.
+   - **5–20% remaining → MEDIUM**: monitoring and bounded code fixes; no subagents.
+   - **1–<5% remaining → LIGHT**: task processing, pending questions, and health checks only.
+   - **0% remaining or unavailable/stale → LIGHT**: owner tasks, health, and the build-log update only.
 
-   Budget informs the **depth** of step 6 — not whether to do it. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the only legitimate reasons step 6 may be skipped.
+   Either way: budget informs the **depth** of step 6 — not whether to do it when quota permits. When the branch resolves to `LIGHT`/`MINIMAL`, skip autonomous self-development/research in step 6 even if the self-development policy is enabled; owner-requested tasks, pending questions, health/service recovery, watcher maintenance, and the build-log update remain active. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the other legitimate reasons step 6 may be skipped.
 
 0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `<workspace>/hosts/<hostname>/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id>`), per-host `pending-questions.md`, the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `<workspace>/hosts/<hostname>/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
 
