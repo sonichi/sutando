@@ -592,6 +592,34 @@ def test_workstream_context_has_a_total_serialized_byte_cap() -> None:
     assert 0 < len(context["prior_tasks"]) < workstreams.CONTEXT_MAX_TASKS
 
 
+def test_remembered_context_history_keeps_only_the_newest_entries() -> None:
+    store = workstreams._empty_store()
+    workstream_id = "workstream-bounded"
+    count = workstreams.CONTEXT_INDEX_TASKS + 5
+    for index in range(count):
+        workstreams._remember_context_entry(
+            store,
+            workstream_id,
+            workstreams.TaskRecord(
+                id=f"task-{index:03d}",
+                text=f"task {index}",
+                time=float(index),
+                source="discord",
+                status="done",
+                result=f"result {index}",
+                access_tier="owner",
+                input_sha256=f"hash-{index}",
+            ),
+        )
+
+    history = store["context_history"][workstream_id]
+    assert len(history) == workstreams.CONTEXT_INDEX_TASKS
+    assert [entry["id"] for entry in history] == [
+        f"task-{index:03d}"
+        for index in range(count - 1, count - workstreams.CONTEXT_INDEX_TASKS - 1, -1)
+    ]
+
+
 def test_workstream_context_index_fail_open_edges() -> None:
     workspace = fixture_workspace()
     store_path = workspace / "data" / "task-workstreams.json"
@@ -682,6 +710,7 @@ def main() -> None:
         test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,
         test_workstream_context_is_prior_owner_only_bounded_and_untrusted,
         test_workstream_context_has_a_total_serialized_byte_cap,
+        test_remembered_context_history_keeps_only_the_newest_entries,
         test_workstream_context_index_fail_open_edges,
         test_concurrent_inheritance_keeps_every_assignment,
     ]
