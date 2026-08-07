@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 import re
 import secrets
 import shutil
@@ -46,6 +45,7 @@ except Exception:  # pragma: no cover — bridge must keep running
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -177,26 +177,14 @@ def extract_forward_note(msg: dict) -> str:
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
-    """Record owner activity — see src/discord-bridge.py for schema."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "ts": int(time.time()),
-            "channel": channel,
-            "summary": summary[:80],
-        }
-        if channel_id:
-            payload["channel_id"] = str(channel_id)
-        # Per-PID staging name: this file is written by four processes (this
-        # bridge + slack/discord/sparrow). A shared ".json.tmp" name lets two
-        # concurrent writers truncate and interleave the same temp file, so the
-        # rename can publish torn JSON. A per-PID temp is never shared, and
-        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, OWNER_ACTIVITY_FILE)
-    except Exception as e:
-        print(f"  [owner-activity] write failed: {e}")
+    """Record owner activity using the shared provider-neutral schema."""
+    _write_owner_activity_shared(
+        OWNER_ACTIVITY_FILE,
+        channel,
+        summary,
+        channel_id,
+        on_error=lambda exc: print(f"  [owner-activity] write failed: {exc}"),
+    )
 
 
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
