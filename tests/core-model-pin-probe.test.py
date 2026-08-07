@@ -114,6 +114,30 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("skipped", r["detail"])
 
+    def test_tmux_query_failure_is_ok_not_a_health_failure(self):
+        """A probe that cannot query must not manufacture a red health check.
+
+        Needs no tmux: `.exists()` accepts any file, and subprocess.run is patched
+        to raise. This is the arm the diff-coverage gate reported uncovered.
+        """
+        import tempfile as _tf
+        from unittest import mock
+        prev = os.environ.get("SUTANDO_TMUX_SOCKET")
+        with _tf.NamedTemporaryFile() as fake_socket:
+            os.environ["SUTANDO_TMUX_SOCKET"] = fake_socket.name
+            try:
+                with mock.patch.object(self.hc.subprocess, "run",
+                                       side_effect=OSError("tmux exploded")):
+                    r = self.hc.check_core_model_pin()
+            finally:
+                if prev is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = prev
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("tmux exploded", r["detail"])
+        self.assertIn("skipped", r["detail"])
+
     def test_name_is_stable(self):
         for rc, out in ((0, "SUTANDO_CORE_MODEL=opus"), (1, "unknown variable: X")):
             self.assertEqual(self.hc._interpret_core_model_pin(rc, out, "/s")["name"], "core-model-pin")
