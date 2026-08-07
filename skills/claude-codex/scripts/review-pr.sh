@@ -40,6 +40,18 @@ DIFF="$(gh pr diff "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff $PR\` 
 
 OUT="$(mktemp -t review-pr.XXXXXX)"
 trap 'rm -f "$OUT"' EXIT   # clean up even on interrupt / non-zero exit, not just the happy path
+
+# Mechanical checks first — the deterministic, guide-driven scanners (today:
+# hardcoded paths) via the shared runner (supersedes the baked-in scanner from
+# #2229; the patterns live in REVIEW.md, not here). Surfaced ahead
+# of the codex verdict so the mechanical findings are never buried. Best-effort:
+# the runner's own exit code doesn't fail the review.
+CHECKS_SH="$(cd "$HERE/../../.." && pwd)/scripts/review-checks.sh"
+MECH=""
+if [[ -x "$CHECKS_SH" ]]; then
+    MECH="$(printf '%s' "$DIFF" | bash "$CHECKS_SH" 2>&1 || true)"
+fi
+[[ -n "$MECH" ]] && printf 'Mechanical checks (review-checks.sh):\n%s\n\n' "$MECH"
 bash "$HERE/codex-bounded.sh" --stall "$STALL" --max "$MAX" -- \
     codex exec --sandbox read-only -o "$OUT" -- "Concisely review this PR diff. List only real bugs, correctness issues, or security problems as bullets; if there are none, say 'no blocking issues'. Be specific (file + what's wrong).
 

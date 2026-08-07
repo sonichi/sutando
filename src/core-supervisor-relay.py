@@ -41,6 +41,8 @@ import argparse
 import hashlib
 import json
 import os
+import platform
+import re
 import subprocess
 import sys
 
@@ -73,6 +75,14 @@ def should_escalate(signal: dict, last_hash):
     return True, h
 
 
+def _is_login_class(signal: dict) -> bool:
+    """Auth blockers need a GUI /login on the host — no reply or app tap can
+    clear them (sonichi#2397). Root cause per #2402: a fresh CLAUDE_CONFIG_DIR
+    always requires /login; a locked keychain (SSH spawn) only blocks
+    completing it — hence the remedy must run from a GUI context."""
+    return signal.get("state") == "logged-out" or signal.get("kind") == "login"
+
+
 def compose_message(signal: dict) -> str:
     """The owner-facing 'action needed' line: what's stuck + a prompt excerpt."""
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
@@ -86,7 +96,13 @@ def compose_message(signal: dict) -> str:
     msg = " ".join(parts)
     if excerpt:
         msg += f": {excerpt[:160]}"
-    msg += " — reply here or open the app to resolve."
+    if _is_login_class(signal):
+        host = platform.node().split(".")[0] or "the host"
+        msg += (f" — needs GUI /login on {host}: open Terminal there, run"
+                " `bash src/restart.sh` from the repo, then complete /login."
+                " A chat reply can't resolve this.")
+    else:
+        msg += " — reply here or open the app to resolve."
     return msg
 
 
@@ -174,7 +190,39 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
 # Surfaces task-progress notify.py can actually DELIVER to. Other values that
 # land in last-owner-activity.json ("voice", "github-commits", …) are activity
 # signals, not deliverable channels — never route an escalation to them.
+# Beyond the static set, any source with a configured channel dir
+# ($CLAUDE_CONFIG_DIR/channels/<source>/ containing a *.env) counts — that
+# mirrors notify.py's own resolution rule, so a NEW homeserver bridge (e.g.
+# "dev-ag2space") becomes routable by creating its config dir, no code change.
 _DELIVERABLE_SURFACES = {"discord", "slack", "telegram", "ag2space"}
+
+# Same slug shape notify.py enforces — keeps a malformed/hostile activity file
+# from steering the existence probe at an arbitrary path.
+_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _is_deliverable(source):
+    if source in _DELIVERABLE_SURFACES:
+        return True
+    if not source or not _SOURCE_SLUG_RE.match(source):
+        return False
+    # Probe for exactly what notify.py's sender reads, mirroring its FULL
+    # resolution contract (review P1 x2 on #2701 — filename alone was not
+    # enough): (1) same three-tier base, CLAUDE_CONFIG_DIR -> CLAUDE_HOME ->
+    # ~/.claude; (2) same realpath containment — a channel entry symlinked
+    # OUTSIDE channels/ is one the sender refuses, so probing it deliverable
+    # would recreate the selected-then-send-fails class via a different
+    # mismatch. If notify.py ever learns more filenames (#2686's try-both),
+    # widen BOTH sides together.
+    base = (os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
+            or os.path.join(os.path.expanduser("~"), ".claude"))
+    channels_dir = os.path.join(base, "channels")
+    env_path = os.path.join(channels_dir, source, ".env")
+    if not os.path.isfile(env_path):
+        return False
+    real_env = os.path.realpath(env_path)
+    real_root = os.path.realpath(channels_dir)
+    return real_env.startswith(real_root + os.sep)
 
 
 def resolve_active_target(activity_path):
@@ -195,7 +243,7 @@ def resolve_active_target(activity_path):
         return "", ""
     source = str(data.get("channel", "")).strip()
     channel = str(data.get("channel_id", "")).strip()
-    if source in _DELIVERABLE_SURFACES and channel:
+    if _is_deliverable(source) and channel:
         return source, channel
     return "", ""
 

@@ -16,6 +16,11 @@
 set -e
 
 LABEL="com.sutando.credential-proxy"
+# Logical `cd` (no -P, no realpath) is load-bearing: tests/credential-proxy-bundled-install.test.sh
+# runs the installer from a staged repo whose src/ is a SYMLINK to the real src/, and relies on
+# `$STAGE/src/..` resolving to $STAGE (not the symlink target) so the test only ever touches a
+# scratch dist/. If you change this to `cd -P`/`realpath`, that test will silently start writing
+# the real dist/credential-proxy.js — a production file on a bundled host. Keep it logical.
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$REPO/src/launchd/$LABEL.plist"
 DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -68,11 +73,34 @@ case "$cmd" in
             echo "ERROR: template not found: $TEMPLATE" >&2
             exit 1
         fi
-        _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
-        if [ ! -f "$_PROXY_SCRIPT" ]; then
-            echo "ERROR: quota-tracker skill not found at $_PROXY_SCRIPT" >&2
-            echo "  Install it first — credential-proxy.ts is the proxy target." >&2
-            exit 1
+        # Validate the target the WRAPPER will actually use. In bundled mode the
+        # wrapper execs dist/credential-proxy.js and never reads the TS source
+        # (credential-proxy-wrapper.sh), so gating on the TS source there would
+        # reject a correctly-packaged host: a pristine bundled install ships dist
+        # only, has no quota-tracker skill dir, and would end up with no proxy at
+        # all. Detect bundled mode exactly as the wrapper does.
+        _I_APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
+        _I_ENGINE_ROOT="${_I_APP_NODE_DIR%/node/bin}"; _I_ENGINE_ROOT="${_I_ENGINE_ROOT%/runtime}"
+        _I_BUNDLED=0
+        if [ -n "${SUTANDO_NODE:-}" ]; then
+            _I_BUNDLED=1
+        elif [ -x "$_I_APP_NODE_DIR/node" ] && [ "${REPO#"$_I_ENGINE_ROOT"/}" != "$REPO" ]; then
+            _I_BUNDLED=1
+        fi
+        if [ "$_I_BUNDLED" = "1" ]; then
+            _PROXY_SCRIPT="$REPO/dist/credential-proxy.js"
+            if [ ! -f "$_PROXY_SCRIPT" ]; then
+                echo "ERROR: bundled mode but $_PROXY_SCRIPT missing — desktop packaging error" >&2
+                echo "  The wrapper fail-closes on this too (exit 78); build:bundle must emit it." >&2
+                exit 1
+            fi
+        else
+            _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+            if [ ! -f "$_PROXY_SCRIPT" ]; then
+                echo "ERROR: quota-tracker skill not found at $_PROXY_SCRIPT" >&2
+                echo "  Install it first — credential-proxy.ts is the proxy target." >&2
+                exit 1
+            fi
         fi
         BREW_BIN="$(resolve_brew_bin)"
         echo "Installing $LABEL"
@@ -81,10 +109,17 @@ case "$cmd" in
         echo "  brew bin:  $BREW_BIN"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
+        # SUTANDO_NODE is caller-controlled and lands inside plist XML via sed
+        # (external review on #2182): XML-encode &<> then escape sed's \ & and
+        # the | delimiter so hostile-looking paths can't corrupt the plist.
+        _node_xml="$(printf '%s' "${SUTANDO_NODE:-}" \
+            | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+        _node_sed="$(printf '%s' "$_node_xml" | sed -e 's/[\\&|]/\\&/g')"
         sed \
             -e "s|__REPO__|$REPO|g" \
             -e "s|__WORKSPACE__|$WORKSPACE|g" \
             -e "s|__BREW_BIN__|$BREW_BIN|g" \
+            -e "s|__SUTANDO_NODE__|${_node_sed}|g" \
             -e "s|__HOME__|$HOME|g" \
             "$TEMPLATE" > "$DEST"
         bootout_if_loaded

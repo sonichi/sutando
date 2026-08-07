@@ -30,6 +30,22 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
   When found, the bridge delivers the body to <channel-id> instead of the
   task's originating channel. The body is the text AFTER this line.
 
+  DM-ONLY marker — anywhere in the body:
+    [dm-only]
+  Privacy guard: suppresses any [channel:] redirect on the same body (no
+  redirect action is emitted), so a body carrying private data can never be
+  redirected out to a shared channel. It emits a dm-only action but does NOT
+  by itself route to the owner's DM — that stays the consumer's job. In
+  practice the private producer (the morning briefing's calendar + email) is
+  emitted as a proactive result (results/proactive-*.txt), which every bridge
+  already delivers to the owner's DM; dm-only reinforces that by guaranteeing
+  no stray [channel:] redirect can override it. A STANDALONE marker (alone on
+  its line) is stripped from the delivered text; an INLINE mention is left
+  verbatim, because rewriting prose that merely discusses the marker silently
+  corrupts owner-facing text. Detection is unaffected — it still matches
+  anywhere, so the order-independence guarantee holds. dm-only overrides redirect regardless of marker order;
+  it does NOT override a SKIP (a skipped body is delivered nowhere anyway).
+
   ATTACH markers — anywhere in the body:
     [file: /path]
     [send: /path]
@@ -61,7 +77,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-ActionKind = Literal["skip", "redirect", "attach"]
+ActionKind = Literal["skip", "redirect", "attach", "dm-only"]
 
 
 @dataclass
@@ -116,6 +132,22 @@ _D7_HEADER_RE = re.compile(
 # Attach markers — file/send/attach are aliases.
 _ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
 
+# DM-only privacy marker — matched ANYWHERE in the body (not anchored) so it
+# suppresses a [channel:] redirect regardless of which came first. All
+# occurrences are DETECTED anywhere; only STANDALONE ones are stripped.
+_DMONLY_RE = re.compile(r"\[dm-only\]\s*\n?", re.IGNORECASE)
+
+#: STRIPPING is narrower than DETECTION, deliberately. Detection stays
+#: `search()`-anywhere so the privacy guard cannot be defeated by marker
+#: ORDER (see the docstring). But removing every occurrence also removed
+#: the literal from PROSE that merely discusses the marker, mangling
+#: owner-facing text with no indication:
+#:     in   - #2170 [dm-only]: closes the leak vector
+#:     out  - #2170 : closes the leak vector
+#: Routing over-triggering fails SAFE; silently editing the body does not.
+#: So only a STANDALONE marker — alone on its line — is stripped.
+_DMONLY_STRIP_RE = re.compile(r"^[ \t]*\[dm-only\][ \t]*\r?\n?", re.IGNORECASE | re.MULTILINE)
+
 
 def parse_markers(text: str) -> ParseResult:
     """Parse a result-body string and return body + action list.
@@ -124,9 +156,12 @@ def parse_markers(text: str) -> ParseResult:
       1. SKIP first. If any skip marker matches at body start, return
          immediately with a single skip action — no redirect, no attach.
          (The bridge archives the task and delivers nothing.)
-      2. REDIRECT next. If the body starts with `[channel: <id>]`, strip
-         that line and add a redirect action.
-      3. ATTACH last. Scan the remaining body for `[file:|send:|attach:]`
+      2. DM-ONLY next. If `[dm-only]` appears anywhere, add a dm-only action,
+         strip it, and suppress any `[channel:]` redirect (privacy guard —
+         the body can't be redirected out to a shared channel).
+      3. REDIRECT next. If the body starts with `[channel: <id>]`, strip
+         that line and add a redirect action — UNLESS dm-only suppressed it.
+      4. ATTACH last. Scan the remaining body for `[file:|send:|attach:]`
          markers, collect paths in document order, strip from body.
 
     Returns:
@@ -165,11 +200,33 @@ def parse_markers(text: str) -> ParseResult:
             # No further parsing — skip is terminal.
             return ParseResult(body="", actions=actions)
 
-    # 2. REDIRECT — must be the first non-empty line (after any D7 header).
+    # 2. DM-ONLY — privacy guard, checked BEFORE redirect so it can suppress
+    # it. DETECTION and STRIPPING are deliberately different scopes:
+    #   detect  — anywhere (not anchored), so `[dm-only]` overrides a
+    #             `[channel:]` redirect no matter which appears first. That is
+    #             what makes the guard undefeatable by marker ORDER, and
+    #             over-triggering it fails SAFE (a reply goes to the DM).
+    #   strip   — standalone only (`_DMONLY_STRIP_RE`, marker alone on its
+    #             line). Stripping every occurrence rewrote the owner's own
+    #             prose: a result DISCUSSING the marker had it silently
+    #             excised, which is not a routing outcome and does not fail
+    #             safe. An inline mention is detected but delivered verbatim.
+    # A bridge that sees the dm-only action (or, equivalently, the ABSENCE of a
+    # redirect action) delivers to the DM.
+    dm_only = bool(_DMONLY_RE.search(body))
+    if dm_only:
+        actions.append(Action(kind="dm-only", value=""))
+        body = _DMONLY_STRIP_RE.sub("", body)
+
+    # 3. REDIRECT — must be the first non-empty line (after any D7 header).
+    # Suppressed entirely when dm-only is set: strip a leading `[channel:]`
+    # marker so it can't leak into the DM, but emit NO redirect action so the
+    # private body stays in the owner's DM.
     redirect_match = _REDIRECT_RE.match(body)
     if redirect_match:
-        channel = redirect_match.group(1).strip()
-        actions.append(Action(kind="redirect", value=channel))
+        if not dm_only:
+            channel = redirect_match.group(1).strip()
+            actions.append(Action(kind="redirect", value=channel))
         body = body[redirect_match.end():]
 
     # Restore D7 header so it appears in the user-facing body. (It was only

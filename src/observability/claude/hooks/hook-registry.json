@@ -1,0 +1,148 @@
+{
+  "schemaVersion": 1,
+  "provider": "claude-code",
+  "contract": "docs/runtime/claude-hook-contract-v1.md",
+  "registeredBy": "src/observability/claude/hooks/build-hook-settings.mjs",
+  "mappedBy": "src/observability/claude/hook-map.ts",
+  "ingestRoute": "/ingest/claude-code-hooks",
+  "delivery": "best_effort",
+  "events": {
+    "UserPromptSubmit": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": ["cc.prompt"],
+      "visibility": "diagnostic",
+      "persisted": ["prompt (truncated)"],
+      "sensitive": true
+    },
+    "UserPromptExpansion": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": ["cc.prompt_expansion"],
+      "visibility": "diagnostic",
+      "persisted": ["all non-envelope fields (shape unverified upstream)"],
+      "sensitive": true
+    },
+    "MessageDisplay": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": [],
+      "statefulKinds": ["cc.message"],
+      "visibility": "diagnostic",
+      "persisted": ["delta chunks accumulated to one message by the stateful normalizer"],
+      "sensitive": true
+    },
+    "PreToolUse": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": ["tool.call"],
+      "visibility": "diagnostic",
+      "persisted": ["tool_name", "tool_input (truncated)"],
+      "sensitive": true
+    },
+    "PostToolUse": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": ["tool.result"],
+      "pairedKinds": ["file.read", "file.change"],
+      "visibility": "diagnostic",
+      "persisted": ["tool_name", "tool_input (truncated)", "tool_response (truncated)", "error"],
+      "sensitive": true
+    },
+    "PostToolUseFailure": {
+      "registered": false,
+      "modeled": true,
+      "normalizedKinds": ["tool.result"],
+      "pairedKinds": ["file.read", "file.change"],
+      "visibility": "diagnostic",
+      "persisted": ["tool_name", "tool_input (truncated)", "tool_response (truncated)", "error"],
+      "sensitive": true,
+      "notes": "modeled defensively; NOT in the registered settings today — tool failures currently arrive only if the CLI routes them through the PostToolUse registration"
+    },
+    "Stop": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": ["cc.hook.stop"],
+      "visibility": "diagnostic",
+      "persisted": [],
+      "sensitive": false
+    },
+    "SessionStart": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": ["cc.hook.session_start"],
+      "visibility": "diagnostic",
+      "persisted": ["source", "model"],
+      "sensitive": false
+    },
+    "SessionEnd": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": ["cc.hook.session_end"],
+      "visibility": "diagnostic",
+      "persisted": ["end_reason"],
+      "sensitive": false
+    },
+    "PreCompact": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": ["cc.hook.pre_compact"],
+      "visibility": "diagnostic",
+      "persisted": ["trigger"],
+      "sensitive": false
+    },
+    "Notification": {
+      "registered": true,
+      "modeled": true,
+      "normalizedKinds": ["cc.hook.notification"],
+      "visibility": "diagnostic",
+      "persisted": ["notification_type"],
+      "sensitive": false
+    },
+    "SubagentStart": {
+      "registered": false,
+      "modeled": true,
+      "normalizedKinds": ["cc.hook.subagent_start"],
+      "visibility": "diagnostic",
+      "persisted": ["agent_type"],
+      "sensitive": false
+    },
+    "SubagentStop": {
+      "registered": false,
+      "modeled": true,
+      "normalizedKinds": ["cc.hook.subagent_stop"],
+      "visibility": "diagnostic",
+      "persisted": ["agent_type"],
+      "sensitive": false
+    },
+    "TaskCreated": {
+      "registered": false,
+      "modeled": true,
+      "normalizedKinds": ["cc.hook.task_created"],
+      "visibility": "diagnostic",
+      "persisted": ["task_id", "task_title"],
+      "sensitive": false
+    },
+    "TaskCompleted": {
+      "registered": false,
+      "modeled": true,
+      "normalizedKinds": ["cc.hook.task_completed"],
+      "visibility": "diagnostic",
+      "persisted": ["task_id"],
+      "sensitive": false
+    }
+  },
+  "unknownEvent": {
+    "normalizedKindPattern": "cc.hook.<snake(hook_event_name)>",
+    "visibility": "diagnostic",
+    "persisted": ["all non-envelope fields"],
+    "sensitive": true
+  },
+  "sideChannels": {
+    "skill-usage-telemetry": {
+      "registration": "PostToolUse matcher=Skill",
+      "pipeline": "PostHog product telemetry (hooks/skill-usage-telemetry.py)",
+      "notes": "separate from the obs collector; anonymous feature counter only"
+    }
+  }
+}

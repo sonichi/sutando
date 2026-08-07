@@ -138,6 +138,148 @@ def main() -> int:
           "invalid REMOTE_TASK_TIER fails CLOSED to team (never silently owner)")
     os.environ.pop("REMOTE_TASK_TIER", None)
 
+    # ── GATEWAY_INSTANCE (multi-gateway): named instance suffixes the per-bridge
+    # state files + lock role; unset stays byte-identical to legacy ─────────────
+    os.environ["GATEWAY_INSTANCE"] = "dev"
+    _gspec = importlib.util.spec_from_file_location("rtc_inst", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _grtc = importlib.util.module_from_spec(_gspec)
+    _gspec.loader.exec_module(_grtc)
+    check(_grtc.INFLIGHT_FILE.name == "remote-task-inflight.dev.json",
+          "GATEWAY_INSTANCE=dev suffixes the inflight ledger")
+    check(_grtc.TASK_ROOMS_FILE.name == "remote-task-rooms.dev.json",
+          "GATEWAY_INSTANCE=dev suffixes the task-rooms sidecar")
+    check(_grtc.GATEWAY_STATUS_FILE.name == "gateway-status.dev.json",
+          "GATEWAY_INSTANCE=dev suffixes gateway-status")
+    check(_grtc._LOCK_ROLE == "gateway-bridge.dev",
+          "GATEWAY_INSTANCE=dev gets its OWN singleton lock role (per-gateway dual-poller guard)")
+    # A >32-char instance must refuse at import — the bound must equal
+    # _LOCAL_TID_RE's instance segment or a legal-looking env config accepts
+    # tasks, ACKs them, and silently strands their results (review P1, round 5).
+    os.environ["GATEWAY_INSTANCE"] = "a" * 33
+    _ospec = importlib.util.spec_from_file_location("rtc_overlong", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _ortc = importlib.util.module_from_spec(_ospec)
+    try:
+        _ospec.loader.exec_module(_ortc)
+        check(False, "GATEWAY_INSTANCE longer than 32 chars refuses at import")
+    except SystemExit:
+        check(True, "GATEWAY_INSTANCE longer than 32 chars refuses at import")
+    # A Unicode-letter instance must refuse at import — str.isalnum() accepted
+    # é/中 while the ASCII local-id regex rejected them: same strand class as
+    # the length bug, closed by deriving BOTH checks from one _INSTANCE_RE
+    # (review P1, round 6).
+    os.environ["GATEWAY_INSTANCE"] = "é"
+    _uspec = importlib.util.spec_from_file_location("rtc_unicode", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _urtc = importlib.util.module_from_spec(_uspec)
+    try:
+        _uspec.loader.exec_module(_urtc)
+        check(False, "Unicode-letter GATEWAY_INSTANCE refuses at import")
+    except SystemExit:
+        check(True, "Unicode-letter GATEWAY_INSTANCE refuses at import")
+    # A path-shaped instance name must refuse at import (it lands in filenames).
+    os.environ["GATEWAY_INSTANCE"] = "../evil"
+    _bspec = importlib.util.spec_from_file_location("rtc_badinst", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _brtc = importlib.util.module_from_spec(_bspec)
+    try:
+        _bspec.loader.exec_module(_brtc)
+        check(False, "GATEWAY_INSTANCE with path characters refuses at import")
+    except SystemExit:
+        check(True, "GATEWAY_INSTANCE with path characters refuses at import")
+    os.environ.pop("GATEWAY_INSTANCE", None)
+    _lspec = importlib.util.spec_from_file_location("rtc_legacy", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+    _lrtc = importlib.util.module_from_spec(_lspec)
+    _lspec.loader.exec_module(_lrtc)
+    check(_lrtc.INFLIGHT_FILE.name == "remote-task-inflight.json"
+          and _lrtc.TASK_ROOMS_FILE.name == "remote-task-rooms.json"
+          and _lrtc.GATEWAY_STATUS_FILE.name == "gateway-status.json"
+          and _lrtc._LOCK_ROLE == "gateway-bridge",
+          "GATEWAY_INSTANCE unset keeps every legacy filename + lock role byte-identical")
+
+    # ── P1 regression (john, PR #2503 review): two gateways minting the SAME
+    # broker id must not share a local task/result file. Prod (legacy module)
+    # and dev (named instance) both receive broker id task-COLLIDE against the
+    # SAME workspace; the local bus must keep them distinct, and the dev
+    # instance's result POST must carry the BROKER id back on the wire. ──────
+    check(_grtc._local_tid("task-COLLIDE") == "task-dev~task-COLLIDE"
+          and _grtc._broker_tid("task-dev~task-COLLIDE") == "task-COLLIDE"
+          and _lrtc._local_tid("task-COLLIDE") == "task-COLLIDE",
+          "local/broker id mapping round-trips (dev) and is identity (legacy)")
+    # P1 (review #2): the mapping must be INJECTIVE across instances INCLUDING
+    # the unsuffixed primary. The old dotted scheme collided: primary broker id
+    # task-dev.COLLIDE == dev's mapping of task-COLLIDE. Under ~-encoding the
+    # ranges are disjoint (broker ids cannot contain ~), so the ambiguous
+    # primary id maps to itself and differs from dev's encoding — and a wire id
+    # carrying ~ is refused outright.
+    check(_lrtc._local_tid("task-dev.COLLIDE") == "task-dev.COLLIDE"
+          and _grtc._local_tid("task-COLLIDE") != "task-dev.COLLIDE",
+          "prefix-overlap case is collision-free (primary task-dev.X vs dev task-X)")
+    check(not _lrtc._valid_tid("task-dev~task-X"),
+          "the ~ encoding is unreachable from the wire (broker id charset excludes it)")
+    # P1 (review #1): a MAX-LENGTH broker id (64 chars) must survive the whole
+    # named-instance path — queue, ack, result POST — even though the local
+    # encoding exceeds the 64-char wire bound. Previously the ack refused it and
+    # _post_ready_results dropped it from inflight with the result stranded.
+    _maxid = "task-" + "M" * 59
+    check(_lrtc._valid_tid(_maxid), "max-length broker id is wire-valid (precondition)")
+    _mt = _grtc._write_task({"id": _maxid, "timestamp": "2026-08-02T00:00:00Z",
+                             "task": "MAXLEN", "source": "remote-gateway",
+                             "channel_id": "!p:example.org", "user_id": "@q:example.org"})
+    check(_mt == f"task-dev~{_maxid}" and (_grtc.TASKS_DIR / f"{_mt}.txt").exists(),
+          "max-length broker id queues under the instance encoding")
+    check(_grtc._valid_local_tid(_mt) and not _lrtc._valid_tid(_mt),
+          "local validator accepts the over-64 encoding the wire validator refuses")
+    _ab = len(STATE["acks"])
+    check(_grtc._post_task_ack(_mt) is True
+          and STATE["acks"][-1]["body"]["id"] == _maxid,
+          "ack posts the WIRE id for the max-length task (no local-form refusal)")
+    (_grtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    (_grtc.RESULTS_DIR / f"{_mt}.txt").write_text("maxlen answer")
+    _rb2 = len(STATE["results"])
+    _mi = {_mt}
+    _grtc._post_ready_results(_mi)
+    check(len(STATE["results"]) == _rb2 + 1
+          and STATE["results"][-1]["id"] == _maxid
+          and STATE["results"][-1]["body"] == "maxlen answer",
+          "max-length result POSTs with the broker id — not silently dropped from inflight")
+    STATE["results"].pop(); STATE["acks"].pop()
+    for _f in (f"{_mt}.txt",):
+        try: (_grtc.TASKS_DIR / _f).unlink()
+        except FileNotFoundError: pass
+    try: (_grtc.ARCHIVE_RESULTS_DIR / f"{_mt}.txt").unlink()
+    except FileNotFoundError: pass
+    _collide = {"id": "task-COLLIDE", "timestamp": "2026-08-02T00:00:00Z",
+                "task": "PROD TASK", "source": "remote-gateway",
+                "channel_id": "!p:example.org", "user_id": "@qingyun:example.org"}
+    _pt = _lrtc._write_task(dict(_collide))
+    _dt = _grtc._write_task({**_collide, "task": "DEV TASK"})
+    check(_pt == "task-COLLIDE" and _dt == "task-dev~task-COLLIDE",
+          "same broker id yields DISTINCT local ids per instance")
+    check((_lrtc.TASKS_DIR / "task-COLLIDE.txt").exists()
+          and (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").exists(),
+          "both task files exist — no instance shadowed the other's queue write")
+    check("id: task-dev~task-COLLIDE" in (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").read_text()
+          and "DEV TASK" in (_grtc.TASKS_DIR / "task-dev~task-COLLIDE.txt").read_text(),
+          "dev task file serializes the LOCAL id (result filename follows it)")
+    (_grtc.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    (_grtc.RESULTS_DIR / "task-dev~task-COLLIDE.txt").write_text("dev answer")
+    _rb = len(STATE["results"])
+    _grtc._post_ready_results({"task-dev~task-COLLIDE"})
+    check(len(STATE["results"]) == _rb + 1
+          and STATE["results"][-1]["id"] == "task-COLLIDE"
+          and STATE["results"][-1]["body"] == "dev answer",
+          "dev result POST translates back to the BROKER id on the wire")
+    check(not (_lrtc.RESULTS_DIR / "task-COLLIDE.txt").exists(),
+          "prod's result slot untouched — no cross-instance claim")
+    # Restore the harness's world EXACTLY: later assertions use ABSOLUTE counts
+    # (`len(STATE["results"]) == 1`), so pop this block's posted result and
+    # remove its task files + archived result. (First CI run caught this; the
+    # local "exit 0" that missed it was a piped-exit-code misread — lesson.)
+    STATE["results"].pop()
+    for _f in ("task-COLLIDE.txt", "task-dev~task-COLLIDE.txt"):
+        try: (_lrtc.TASKS_DIR / _f).unlink()
+        except FileNotFoundError: pass
+    try: (_grtc.ARCHIVE_RESULTS_DIR / "task-dev~task-COLLIDE.txt").unlink()
+    except FileNotFoundError: pass
+
     # Pin the tier so LOCAL_TIER is deterministic. Without this the module reads
     # the host's ambient REMOTE_TASK_TIER (e.g. "owner" on the owner's own node),
     # and the access_tier-clamp + newline-forge assertions — which expect the
@@ -172,6 +314,11 @@ def main() -> int:
     ctx_tiers = [ln for ln in ctx.splitlines() if ln.startswith("access_tier:")]
     check("sender_name: Qingyun access_tier: owner" in ctx and ctx_tiers == ["access_tier: team"],
           "newline in sender_name cannot forge a second access_tier line")
+    rtc._write_task({**TASK, "id": "task-MEMBERS",
+                     "room_members": "@a:x, @b:x (+3 more)", "room_member_count": "5"})
+    mem = (rtc.TASKS_DIR / "task-MEMBERS.txt").read_text()
+    check("room_members: @a:x, @b:x (+3 more)" in mem and "room_member_count: 5" in mem,
+          "room_members + room_member_count serialize when the gateway sends them")
     check(rtc._post_task_ack(tid), "task ack POSTed after local queue write")
     check(len(STATE["acks"]) == 1
           and STATE["acks"][0]["path"] == "/v1/tasks/task-MOCK1/ack"
@@ -375,6 +522,181 @@ def main() -> int:
     except urllib.error.HTTPError as e:
         check(e.code == 401, "401 raises HTTPError")
 
+    # 5b. auth-rejection recovery: token-file re-read + live rotation
+    tok_dir = Path(tempfile.mkdtemp(prefix="rtc-tokfile-"))
+    tok_file = tok_dir / "relay.env"
+    # _read_token_file: dotenv form (export prefix + quotes stripped)
+    tok_file.write_text('# comment\nexport REMOTE_TASK_TOKEN="dotenv-secret"\nOTHER=x\n')
+    check(rtc._read_token_file(str(tok_file)) == "dotenv-secret",
+          "_read_token_file parses dotenv form (export + quotes)")
+    # raw onboarding-string form (no KEY=)
+    tok_file.write_text("# note\nhttp://u.example|raw-secret\n")
+    check(rtc._read_token_file(str(tok_file)) == "http://u.example|raw-secret",
+          "_read_token_file falls back to raw onboarding string")
+    check(rtc._read_token_file(str(tok_dir / "missing.env")) == "",
+          "_read_token_file missing file → empty (no-rotation)")
+    # mixed-alias precedence: a stale legacy AG2_REMOTE_TOKEN line ABOVE the
+    # canonical REMOTE_TASK_TOKEN must NOT win (file order is irrelevant;
+    # REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN, matching startup.sh).
+    tok_file.write_text("AG2_REMOTE_TOKEN=legacy-stale\nREMOTE_TASK_TOKEN=current-secret\n")
+    check(rtc._read_token_file(str(tok_file)) == "current-secret",
+          "canonical key wins over an EARLIER legacy line (mixed-alias env)")
+    tok_file.write_text("REMOTE_TASK_TOKEN=current-secret\nAG2_REMOTE_TOKEN=legacy-stale\n")
+    check(rtc._read_token_file(str(tok_file)) == "current-secret",
+          "canonical key wins over a LATER legacy line too")
+    tok_file.write_text("AG2_REMOTE_TOKEN=legacy-only\n")
+    check(rtc._read_token_file(str(tok_file)) == "legacy-only",
+          "legacy alias still honored when canonical absent")
+    # _reload_rotated_token: no TOKEN_FILE configured → False (FATAL path kept)
+    rtc.TOKEN_FILE = ""
+    check(rtc._reload_rotated_token() is False, "no TOKEN_FILE → no rotation")
+    check(rtc._recover_auth(401) is False,
+          "_recover_auth without TOKEN_FILE → False (caller keeps FATAL exit)")
+    # same secret as the running one → no rotation
+    rtc.TOKEN_FILE = str(tok_file)
+    tok_file.write_text(f"REMOTE_TASK_TOKEN={rtc.TOKEN}\n")
+    check(rtc._reload_rotated_token() is False, "unchanged token → no rotation")
+    # a rotated combined url|secret form (SAME gateway) swaps the secret;
+    # URL is never moved by rotation.
+    old_url = rtc.URL
+    tok_file.write_text(f"REMOTE_TASK_TOKEN={old_url}|rotated-secret\n")
+    check(rtc._reload_rotated_token() is True
+          and rtc.TOKEN == "rotated-secret"
+          and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer rotated-secret",
+          "rotated token swapped into TOKEN + shared _AUTH_HEADERS")
+    # a combined form naming a DIFFERENT gateway is REFUSED outright — honoring
+    # it would split the process across bases (poller on new, SSE/cards on old,
+    # carrying the fresh bearer to the old endpoint). Nothing changes.
+    tok_file.write_text("REMOTE_TASK_TOKEN=https://other.example/relay|other-secret\n")
+    check(rtc._reload_rotated_token() is False
+          and rtc.TOKEN == "rotated-secret"
+          and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer rotated-secret",
+          "URL-changing rotation refused — no partial gateway move")
+    # a rotation written in the URL-ENCODED form (https://url%7Csecret — the
+    # desktop connect flow writes this) must parse identically to the literal
+    # "|" form: extract just the secret, never set the bearer to the whole URL
+    # string. Regression guard for #2323: _reload_rotated_token used a literal
+    # "|" split, so an encoded rotation was mis-read as a bare secret and the
+    # bearer became "Bearer https://...%7C<secret>", failing auth after a valid
+    # rotation. Now it routes through _parse_onboarding_token (handles %7C).
+    tok_file.write_text(f"REMOTE_TASK_TOKEN={old_url}%7Cencoded-secret\n")
+    check(rtc._reload_rotated_token() is True
+          and rtc.TOKEN == "encoded-secret"
+          and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer encoded-secret",
+          "%7C-encoded rotation swaps just the secret (not the whole URL string)")
+    # SPLIT-layout rotation (bare REMOTE_TASK_TOKEN + a separate REMOTE_TASK_URL
+    # line — the documented persistent form) must get the SAME cross-gateway
+    # guard as the combined url|secret form. #2323 credential-boundary follow-up:
+    # _read_token_file drops the file URL, so before the fix a split file
+    # re-pointed by connect to a NEW gateway was mis-read as a same-gateway
+    # rotation → the new bearer went to the OLD running URL (bearer leak).
+    tok_file.write_text(f"REMOTE_TASK_TOKEN=split-same\nREMOTE_TASK_URL={old_url}\n")
+    check(rtc._reload_rotated_token() is True
+          and rtc.TOKEN == "split-same" and rtc.URL == old_url,
+          "split-layout rotation (same gateway URL) still hot-swaps the secret")
+    tok_file.write_text("REMOTE_TASK_TOKEN=split-other\n"
+                        "REMOTE_TASK_URL=https://other.example/relay\n")
+    check(rtc._reload_rotated_token() is False
+          and rtc.TOKEN == "split-same" and rtc.URL == old_url
+          and rtc._AUTH_HEADERS["Authorization"] == "Bearer split-same",
+          "split-layout rotation to a DIFFERENT gateway refused (no cross-gateway bearer move)")
+    # _recover_auth immediate path: file already rotated again → True, no wait
+    tok_file.write_text("REMOTE_TASK_TOKEN=rotated-secret-2\n")
+    check(rtc._recover_auth(401) is True and rtc.TOKEN == "rotated-secret-2",
+          "_recover_auth resumes immediately when file already rotated")
+    # _recover_auth wait-loop path: rotation lands during the re-check sleep
+    slept = []
+
+    def _sleep_and_rotate(secs):
+        slept.append(secs)
+        tok_file.write_text("REMOTE_TASK_TOKEN=rotated-secret-3\n")
+    real_sleep, real_emit = rtc.time.sleep, rtc._emit_gateway_status
+    real_hb = rtc._heartbeat_singleton
+    rtc.time.sleep, rtc._emit_gateway_status = _sleep_and_rotate, lambda *a, **k: None
+    # The suite never ran main()'s _acquire_singleton, so a real heartbeat here
+    # would read as "lost ownership"; stub it — held-lock behavior is what the
+    # production loop has.
+    rtc._heartbeat_singleton = lambda: True
+    try:
+        check(rtc._recover_auth(403) is True and rtc.TOKEN == "rotated-secret-3"
+              and slept == [rtc.AUTH_RECHECK_INTERVAL],
+              "_recover_auth wait-loop picks up rotation after one re-check")
+    finally:
+        rtc.time.sleep, rtc._emit_gateway_status = real_sleep, real_emit
+        rtc._heartbeat_singleton = real_hb
+    # restore the suite's token so later sections keep authenticating
+    rtc.TOKEN = "testtoken"
+    rtc._AUTH_HEADERS["Authorization"] = "Bearer testtoken"
+    rtc.TOKEN_FILE = ""
+
+    # 5a-bis. Consumer-boundary BY-REFERENCE contract (#2323 review suggestion).
+    # Rotation reaches the long-lived consumers ONLY because they hold
+    # _AUTH_HEADERS by reference. Every producer-side assert above would still
+    # pass if a consumer __init__ copied the dict (the module dict is still
+    # mutated) while rotation silently stopped reaching that consumer — a
+    # bridge that keeps 401ing after rotation, the exact symptom this PR
+    # removes. Identity is the contract; assert it with `is`, constructed the
+    # way the bridge wires them (remote_gateway_bridge.py EventChannel/
+    # CardPoster call sites pass _AUTH_HEADERS itself).
+    from ag2_sparrow.event_channel import EventChannel as _ECBoundary
+    from ag2_sparrow.human_action import CardPoster as _CPBoundary
+
+    class _StubInbox:  # EventChannel.__init__ reads the durable cursor
+        def durable_cursor(self):
+            return ""
+    _bch = _ECBoundary(_StubInbox(), "https://gw", rtc._AUTH_HEADERS)
+    check(_bch._headers is rtc._AUTH_HEADERS,
+          "EventChannel holds _AUTH_HEADERS BY REFERENCE (is, not copy)")
+    _bcp = _CPBoundary(None, "https://gw", rtc._AUTH_HEADERS, "!room:x")
+    check(_bcp._headers is rtc._AUTH_HEADERS,
+          "CardPoster holds _AUTH_HEADERS BY REFERENCE (is, not copy)")
+    rtc._AUTH_HEADERS["Authorization"] = "Bearer boundary-rotated"
+    check(dict(_bch._headers)["Authorization"] == "Bearer boundary-rotated"
+          and {**_bcp._headers}["Authorization"] == "Bearer boundary-rotated",
+          "rotation reaches both consumers' per-request copies")
+    rtc._AUTH_HEADERS["Authorization"] = "Bearer testtoken"
+
+    # 5b. DESKTOP recovery-arming regression (#2323): in the desktop-spawned case
+    # startup.sh is skipped and ONLY AG2_DEVICE_ENV reaches the bridge — no
+    # REMOTE_TASK_TOKEN and no REMOTE_TASK_TOKEN_FILE. A fresh import must not only
+    # resolve TOKEN/URL from that file but also set TOKEN_FILE to it, or the whole
+    # auth-recovery path stays DISABLED exactly on the desktop (auth_retry=bool(
+    # TOKEN_FILE), _reload_rotated_token/_recover_auth return False on ""). Before
+    # the fix TOKEN_FILE came only from REMOTE_TASK_TOKEN_FILE → "" here.
+    _dev_env = Path(tmp) / "device.env"
+    _dev_env.write_text("REMOTE_TASK_TOKEN=desktoptoken\n"
+                        "REMOTE_TASK_URL=https://gw.example/relay\n")
+    _saved = {k: os.environ.get(k) for k in
+              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN_FILE",
+               "REMOTE_TASK_URL", "AG2_REMOTE_URL", "AG2_DEVICE_ENV")}
+    for _k in _saved:
+        os.environ.pop(_k, None)
+    os.environ["AG2_DEVICE_ENV"] = str(_dev_env)      # the ONLY thing the desktop passes
+    try:
+        _spec = importlib.util.spec_from_file_location(
+            "rtc_desktop", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _desk = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_desk)
+        check(_desk.TOKEN == "desktoptoken" and _desk.URL == "https://gw.example/relay",
+              "desktop AG2_DEVICE_ENV import resolves TOKEN + URL")
+        check(_desk.TOKEN_FILE == str(_dev_env),
+              "desktop import ARMS TOKEN_FILE from AG2_DEVICE_ENV (not left empty)")
+        check(bool(_desk.TOKEN_FILE) is True,
+              "→ SSE event-channel auth_retry=bool(TOKEN_FILE) is armed on desktop")
+        # and the recovery path actually fires on that file: a rotation swaps in live.
+        _dev_env.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay|desktop-rotated\n")
+        check(_desk._reload_rotated_token() is True and _desk.TOKEN == "desktop-rotated",
+              "desktop _reload_rotated_token re-reads AG2_DEVICE_ENV → live rotation")
+    finally:
+        for _k, _v in _saved.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
     # 6. inbound media marker → local file rewrite (network mocked)
     fetched = []
     real_download = rtc._download_bytes
@@ -566,6 +888,222 @@ def main() -> int:
     _ro_only = (rtc.TASKS_DIR / "task-ROPSONLY.txt").read_text()
     check("AGENTS.md" not in _ro_only and "room-ops metadata" not in _ro_only.lower(),
           "metadata-only task file carries no injected block (empty task body)")
+
+    # #2267 parity: a token pasted into a room message must never persist —
+    # not in the task file, not in the owner-presence summary.
+    _secret = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2  # GitHub-token shaped
+    rtc._write_task({**TASK, "id": "task-SECRET",
+                     "task": f"[AG2Space @qingyun] deploy with {_secret} please"})
+    _sec_body = (rtc.TASKS_DIR / "task-SECRET.txt").read_text()
+    check(_secret not in _sec_body and "deploy with" in _sec_body,
+          "pasted GitHub token REDACTED from persisted task body (#2267 parity)")
+    check("REDACTED" in _sec_body or "[" in _sec_body,
+          "redaction leaves an explicit placeholder, not silent deletion")
+    _oa = getattr(rtc, "OWNER_ACTIVITY_FILE", None)
+    if _oa is not None and _oa.exists():
+        check(_secret not in _oa.read_text(),
+              "pasted token never reaches last-owner-activity summary")
+    # #2267 parity second half: the in-band security notice rides the task so
+    # the core neither reproduces nor re-requests the value — and stays absent
+    # from clean tasks. access_tier must still parse as the LAST header line.
+    check("SUTANDO SECURITY NOTICE" in _sec_body,
+          "security notice appended when a secret was redacted")
+    # Fine-grained PATs use a different prefix the legacy pattern misses
+    # (review P1): github_pat_ + 22-char id + _ + 59-char body in the wild;
+    # any 36+ [A-Za-z0-9_] run after the prefix must redact.
+    _fg = "github_pat_" + "11AAAAAAA" + "0" * 13 + "_" + "a" * 40
+    rtc._write_task({**TASK, "id": "task-FGPAT",
+                     "task": f"[AG2Space @qingyun] use {_fg} for the repo"})
+    _fg_body = (rtc.TASKS_DIR / "task-FGPAT.txt").read_text()
+    check(_fg not in _fg_body and "github_pat_" not in _fg_body.replace(
+              "GitHub Fine-Grained PAT", ""),
+          "fine-grained github_pat_ token REDACTED from persisted body")
+    check("SUTANDO SECURITY NOTICE" in _fg_body,
+          "fine-grained PAT redaction also carries the security notice")
+    # Relay/onboarding tokens carry the separator in BOTH forms — the desktop
+    # connect flow writes the URL-encoded one — so redaction must match what
+    # `_SEPARATOR_RE` accepts. Matching only the literal `|` let a valid
+    # `…/relay%7C<secret>` paste reach disk unredacted (review blocker).
+    for _sep_label, _sep in (("literal", "|"), ("upper", "%7C"), ("lower", "%7c")):
+        _rt = "https://chat.ag2.space/relay" + _sep + ("a" * 24)
+        rtc._write_task({**TASK, "id": f"task-RELAY{_sep_label.upper()}",
+                         "task": f"[AG2Space @qingyun] token is {_rt}"})
+        _rt_body = (rtc.TASKS_DIR / f"task-RELAY{_sep_label.upper()}.txt").read_text()
+        check(_rt not in _rt_body and "SUTANDO SECURITY NOTICE" in _rt_body,
+              f"relay token with {_sep_label} separator REDACTED from persisted body")
+    rtc._write_task({**TASK, "id": "task-CLEANBODY",
+                     "task": "[AG2Space @qingyun] plain request, nothing secret"})
+    check("SUTANDO SECURITY NOTICE" not in
+          (rtc.TASKS_DIR / "task-CLEANBODY.txt").read_text(),
+          "no security notice on clean tasks")
+    _hdrs = [ln for ln in _sec_body.split("\n") if ln.startswith("access_tier: ")]
+    check(len(_hdrs) == 1, "notice introduces no second access_tier line")
+    # Onboarding-token parse: the combined "url|secret" form, and the %7C-encoded
+    # separator the desktop connect flow emits (ag2space-cinny-desktop#231). A
+    # %7C token must decode so URL is populated — otherwise it parses as a bare
+    # secret with empty URL and FATALs at startup (the Vidhu "connected but not
+    # responding" failure, 2026-07-24).
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay|deadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: literal | splits into (url, secret)")
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7Cdeadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: %7C-encoded separator decodes to (url, secret)")
+    check(rtc._parse_onboarding_token("https://chat.ag2.space/relay%7cdeadbeef")
+          == ("https://chat.ag2.space/relay", "deadbeef"),
+          "token parse: lowercase %7c also decodes")
+    check(rtc._parse_onboarding_token("baresecret") == ("", "baresecret"),
+          "token parse: bare secret yields empty url (REMOTE_TASK_URL supplies it)")
+    check(rtc._parse_onboarding_token("https://gw|a|b") == ("https://gw", "a|b"),
+          "token parse: splits on the FIRST separator only (secret may contain |)")
+    # #2307 review: never mutate token bytes — the secret is returned verbatim.
+    check(rtc._parse_onboarding_token("https://gw|AB%7CCD") == ("https://gw", "AB%7CCD"),
+          "token parse: %7C INSIDE the secret is preserved, not decoded (split on the literal |)")
+    check(rtc._parse_onboarding_token("AB%7CCD") == ("", "AB%7CCD"),
+          "token parse: a bare secret containing %7C is opaque — returned untouched")
+    check(rtc._parse_onboarding_token("bare|secret") == ("", "bare|secret"),
+          "token parse: a bare secret with no URL scheme is not split on its own | bytes")
+    # #2679: a URL half legitimately containing an encoded %7C must NOT be split
+    # at the encoding when a literal "|" separator exists — a raw pipe cannot
+    # occur inside a URL, so it IS the separator (same rule as the contract).
+    check(rtc._parse_onboarding_token("https://gw.example/a%7Cb|sec")
+          == ("https://gw.example/a%7Cb", "sec"),
+          "token parse: literal | preferred over %7C — URL's encoded pipe stays intact")
+
+    # ── env-fallback: token from channels/ag2space/.env when the launcher never
+    # got it into the env. startup.sh exports it and the gateway window sources the
+    # file once at launch — but a supervisor-spawned core reliably hits neither, so
+    # without this the bridge sees an empty env token and never connects (every new
+    # desktop-only user reproduces it — mark, 2026-07-26). Read the file directly.
+    # Save/clear BOTH the current names and their legacy aliases (the production URL
+    # chain reads AG2_REMOTE_URL too), so an ambient value can't contaminate these
+    # imports.
+    _saved = {k: os.environ.get(k) for k in
+              ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
+               "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV", "REMOTE_MEDIA_MARKER")}
+    try:
+        for _k in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
+                   "CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV", "REMOTE_MEDIA_MARKER"):
+            os.environ.pop(_k, None)
+        _cfg = tempfile.mkdtemp()
+        _chan = Path(_cfg) / "channels" / "ag2space"
+        _chan.mkdir(parents=True)
+        # connect writes AG2_REMOTE_TOKEN='<url|secret>' (quoted) — lib.rs CONNECT_ENV_KEY.
+        (_chan / ".env").write_text("# relay onboarding\nAG2_REMOTE_TOKEN='https://gw.example/relay|s3cr3t'\n")
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg
+        _fspec = importlib.util.spec_from_file_location(
+            "rtc_fallback", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _frtc = importlib.util.module_from_spec(_fspec)
+        _fspec.loader.exec_module(_frtc)
+        check(_frtc.TOKEN == "s3cr3t",
+              "env-fallback: token read from channels/ag2space/.env (quote-stripped, legacy alias) when env empty")
+        check(_frtc.URL == "https://gw.example/relay",
+              "env-fallback: URL comes from the file token's url|secret form")
+
+        # negative: no env token AND no file → empty token, no crash at import.
+        os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()
+        _nspec = importlib.util.spec_from_file_location(
+            "rtc_nofile", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _nrtc = importlib.util.module_from_spec(_nspec)
+        _nspec.loader.exec_module(_nrtc)
+        check(_nrtc.TOKEN == "",
+              "env-fallback: no env token and no file yields empty token (no crash)")
+
+        # env token still wins over the file when both are present.
+        os.environ["REMOTE_TASK_TOKEN"] = "https://env.example/relay|envwins"
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg
+        _wspec = importlib.util.spec_from_file_location(
+            "rtc_envwins", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _wrtc = importlib.util.module_from_spec(_wspec)
+        _wspec.loader.exec_module(_wrtc)
+        check(_wrtc.TOKEN == "envwins",
+              "env-fallback: env token takes precedence over the file fallback")
+
+        # The desktop case: CLAUDE_CONFIG_DIR is NOT passed into the gateway
+        # window (launch-sutando.sh passes only SUTANDO_APP_SUPPORT / SUTANDO_PY /
+        # AG2_DEVICE_ENV), so the fallback MUST resolve via AG2_DEVICE_ENV — the
+        # absolute path the launcher lays in. This is the scenario the fix targets.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ["AG2_DEVICE_ENV"] = str(_chan / ".env")
+        _dspec2 = importlib.util.spec_from_file_location(
+            "rtc_deviceenv", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _drtc2 = importlib.util.module_from_spec(_dspec2)
+        _dspec2.loader.exec_module(_drtc2)
+        check(_drtc2.TOKEN == "s3cr3t",
+              "env-fallback: AG2_DEVICE_ENV resolves the token when CLAUDE_CONFIG_DIR is absent (desktop case)")
+
+        # AG2_DEVICE_ENV wins over CLAUDE_CONFIG_DIR when both point at a token.
+        _cfg2 = tempfile.mkdtemp()
+        _chan2 = Path(_cfg2) / "channels" / "ag2space"
+        _chan2.mkdir(parents=True)
+        (_chan2 / ".env").write_text("AG2_REMOTE_TOKEN='https://cfg.example/relay|cfgtok'\n")
+        os.environ["CLAUDE_CONFIG_DIR"] = _cfg2
+        os.environ["AG2_DEVICE_ENV"] = str(_chan / ".env")  # still points at s3cr3t
+        _pspec = importlib.util.spec_from_file_location(
+            "rtc_devpriority", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _prtc = importlib.util.module_from_spec(_pspec)
+        _pspec.loader.exec_module(_prtc)
+        check(_prtc.TOKEN == "s3cr3t",
+              "env-fallback: AG2_DEVICE_ENV takes precedence over CLAUDE_CONFIG_DIR")
+
+        # split-key layout: bare REMOTE_TASK_TOKEN + a SEPARATE REMOTE_TASK_URL
+        # (not the combined url|secret token). The fallback must carry the URL too,
+        # else the bridge gets a token but URL='' and fatals on "no gateway URL" —
+        # the exact failure for a split-layout desktop .env in the target scenario.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("REMOTE_TASK_URL", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        _split_chan = Path(tempfile.mkdtemp()) / "channels" / "ag2space"
+        _split_chan.mkdir(parents=True)
+        (_split_chan / ".env").write_text(
+            "REMOTE_TASK_TOKEN='splitsecret'\nREMOTE_TASK_URL='https://split.example/relay'\n")
+        os.environ["AG2_DEVICE_ENV"] = str(_split_chan / ".env")
+        _sspec = importlib.util.spec_from_file_location(
+            "rtc_split", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _srtc = importlib.util.module_from_spec(_sspec)
+        _sspec.loader.exec_module(_srtc)
+        check(_srtc.TOKEN == "splitsecret" and _srtc.URL == "https://split.example/relay",
+              "env-fallback: split-layout file (bare token + REMOTE_TASK_URL) resolves BOTH token and URL")
+
+        # REMOTE_MEDIA_MARKER carried from the channel .env on a bare/desktop launch.
+        # The bridge derives MEDIA_MARKER_TAG from os.environ at import; a desktop
+        # launch reaches config ONLY through this file (never startup.sh's env
+        # exports, the one place the AG2 marker default is otherwise set), so
+        # without carrying it the tag falls back to the provider-neutral default and
+        # never matches the gateway's `[ag2space-media: …]` — inbound media URLs stay
+        # unresolved (owner-reported 2026-08-03). Provider-neutral: the value lives
+        # in the .env, not this package.
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ.pop("REMOTE_MEDIA_MARKER", None)
+        _mm_chan = Path(tempfile.mkdtemp()) / "channels" / "ag2space"
+        _mm_chan.mkdir(parents=True)
+        (_mm_chan / ".env").write_text(
+            "AG2_REMOTE_TOKEN='https://gw.example/relay|mmsecret'\nREMOTE_MEDIA_MARKER=ag2space-media\n")
+        os.environ["AG2_DEVICE_ENV"] = str(_mm_chan / ".env")
+        _mmspec = importlib.util.spec_from_file_location(
+            "rtc_marker", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _mmrtc = importlib.util.module_from_spec(_mmspec)
+        _mmspec.loader.exec_module(_mmrtc)
+        check(_mmrtc.MEDIA_MARKER_TAG == "ag2space-media",
+              "env-fallback: REMOTE_MEDIA_MARKER carried from the channel .env sets the marker tag (bare/desktop launch)")
+
+        # env still wins: an explicit REMOTE_MEDIA_MARKER is not overridden by the file.
+        os.environ["REMOTE_MEDIA_MARKER"] = "env-marker"
+        os.environ["AG2_DEVICE_ENV"] = str(_mm_chan / ".env")
+        _mmwspec = importlib.util.spec_from_file_location(
+            "rtc_marker_envwins", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        _mmwrtc = importlib.util.module_from_spec(_mmwspec)
+        _mmwspec.loader.exec_module(_mmwrtc)
+        check(_mmwrtc.MEDIA_MARKER_TAG == "env-marker",
+              "env-fallback: explicit REMOTE_MEDIA_MARKER in env wins over the channel .env value")
+    finally:
+        for _k, _v in _saved.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
 
     srv.shutdown()
     if FAILS:

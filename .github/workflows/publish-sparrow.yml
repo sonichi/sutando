@@ -1,0 +1,86 @@
+# Publish ag2-sparrow to PyPI — tag-triggered, Trusted Publishing (OIDC).
+#
+# Release flow:
+#   1. bump packages/ag2-sparrow/ag2_sparrow/__init__.py __version__ (PR, merge)
+#   2. tag the merge commit:  git tag sparrow-v<version> && git push origin sparrow-v<version>
+#   3. this workflow builds sdist+wheel from packages/ag2-sparrow and publishes.
+#
+# Guards:
+#   - the tag MUST equal the packaged __version__ (fail loudly on mismatch);
+#   - the version MUST NOT already exist on PyPI (no silent re-upload);
+#   - the package test suites + src-drift guard run before any upload.
+#
+# One-time PyPI setup (owner): project ag2-sparrow → Publishing → add GitHub
+# Trusted Publisher (owner: sonichi, repo: sutando, workflow:
+# publish-sparrow.yml, environment: pypi). No API token is stored anywhere.
+#
+# The version-drift job below is PR-time advisory: it warns (never fails) when
+# a PR changes packages/ag2-sparrow/** without moving __version__ past the
+# published PyPI release — the "main is silently ahead of PyPI" signal.
+name: publish-sparrow
+
+on:
+  push:
+    tags: ["sparrow-v*"]
+  pull_request:
+    paths: ["packages/ag2-sparrow/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  version-drift:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with: {python-version: "3.11"}
+      - name: Warn when package changes ride an already-published version
+        run: |
+          set -e
+          LOCAL=$(python3 -c "import sys; sys.path.insert(0, 'packages/ag2-sparrow'); import ag2_sparrow; print(ag2_sparrow.__version__)")
+          PYPI=$(python3 -c "import json,urllib.request; print(json.load(urllib.request.urlopen('https://pypi.org/pypi/ag2-sparrow/json'))['info']['version'])" || echo unknown)
+          echo "local __version__=$LOCAL  pypi latest=$PYPI"
+          if [ "$LOCAL" = "$PYPI" ]; then
+            echo "::warning title=ag2-sparrow version not bumped::This PR changes packages/ag2-sparrow/** but __version__ ($LOCAL) equals the published PyPI release — after merge, main will be ahead of PyPI with no release signal. Bump __version__ (and tag sparrow-v<version> after merge) when this change should ship."
+          fi
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/sparrow-v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # OIDC for PyPI Trusted Publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with: {python-version: "3.11"}
+      - name: Tag must match the packaged version
+        run: |
+          set -e
+          TAG="${GITHUB_REF#refs/tags/sparrow-v}"
+          VER=$(python3 -c "import sys; sys.path.insert(0, 'packages/ag2-sparrow'); import ag2_sparrow; print(ag2_sparrow.__version__)")
+          echo "tag=$TAG  __version__=$VER"
+          [ "$TAG" = "$VER" ] || { echo "::error::tag sparrow-v$TAG != __version__ $VER"; exit 1; }
+      - name: Refuse re-publishing an existing PyPI version
+        run: |
+          set -e
+          VER=$(python3 -c "import sys; sys.path.insert(0, 'packages/ag2-sparrow'); import ag2_sparrow; print(ag2_sparrow.__version__)")
+          if python3 -c "import json,sys,urllib.request; d=json.load(urllib.request.urlopen('https://pypi.org/pypi/ag2-sparrow/json')); sys.exit(0 if '$VER' in d['releases'] else 1)"; then
+            echo "::error::version $VER already on PyPI — bump __version__"; exit 1
+          fi
+      - name: Test before publish (package suites + src-drift guard)
+        run: |
+          set -e
+          for t in packages/ag2-sparrow/tests/test_*.py; do python3 "$t"; done
+          python3 packages/ag2-sparrow/tools/test_no_drift.py
+      - name: Build sdist + wheel
+        run: |
+          python3 -m pip install --quiet build
+          python3 -m build packages/ag2-sparrow --outdir dist/
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

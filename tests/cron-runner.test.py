@@ -17,10 +17,36 @@ from __future__ import annotations
 
 import calendar
 import importlib.util
+import os
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+# This suite drives the real `run()` tick, which emits cron telemetry via
+# `_emit_cron_telemetry` -> `task_processed(..., flush=True)`. The flush path is
+# a BLOCKING `urlopen` to the PostHog host, so without this every tick here
+# makes a real network request and the suite's timing becomes a function of an
+# external service. `test_run_acquires_shared_state_lock` gives the worker
+# `join(2)`; a tick measured at 0.72-0.82s against that 2s ceiling is a ~2x
+# margin, which holds on an idle laptop and intermittently does not on a shared
+# clean-install runner:
+#
+#   0.716s run()
+#    └─ 0.713s _emit_cron_telemetry
+#        └─ 0.678s urllib.request.urlopen        <- real network
+#
+# Opting out drops the tick to 0.001-0.002s (~1100x margin) and makes the suite
+# hermetic. `opted_out()` is re-read on every capture and never cached, so
+# setting it here covers every test in the file. Same lever, and the same
+# clean-install motivation, as agent-api-task-field-injection.test.py and
+# github-webhook-access-tier.test.py.
+#
+# The two tests that assert telemetry DOES fire are unaffected: one replaces
+# `telemetry.task_processed` wholesale, the other runs a subprocess against a
+# fake `telemetry.py` that never consults the opt-out.
+os.environ["SUTANDO_TELEMETRY"] = "0"
 
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("cron_runner", REPO / "src" / "cron-runner.py")
@@ -148,6 +174,14 @@ def _epoch(y, mo, d, h, mi):
     return int(time.mktime((y, mo, d, h, mi, 0, 0, 0, -1)))
 
 
+def _mark_core_alive(root: Path, now: int) -> None:
+    cr.CORE_ALIVE_FILE = root / "state" / "cores" / "test.alive"
+    cr.CORE_ALIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    cr.CORE_ALIVE_FILE.write_text("{}")
+    import os
+    os.utime(cr.CORE_ALIVE_FILE, (now, now))
+
+
 def test_due_since_catchup():
     fire = _epoch(2026, 7, 2, 6, 2)  # 06:02 digest fire
     # Machine "woke" at 06:10; last recorded fire was yesterday 06:03.
@@ -180,6 +214,63 @@ def test_emit_task_prompt():
         check("user_id: cron-runner" in body, "user_id is cron-runner")
         check("access_tier: owner" in body, "access_tier owner")
         check("priority: low" in body, "priority low")
+
+
+def test_emit_task_emits_cron_telemetry():
+    # PR #2274 CR (liususan091219): the telemetry allowlist added `cron`, but
+    # emit_task never emitted task_processed, so DAU/WAU under-counted
+    # cron-driven activity and the bucket could never fire. Assert the emit now
+    # fires with source "cron" exactly once at the write site.
+    import telemetry
+    calls: list[str] = []
+    orig = telemetry.task_processed
+    telemetry.task_processed = lambda source, **kw: calls.append(source)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            cr.TASKS_DIR = Path(d)
+            cr.emit_task("digest", {"prompt": "do the thing"})
+        check(calls == ["cron"], f"emit_task fires task_processed('cron') once (got {calls})")
+    finally:
+        telemetry.task_processed = orig
+
+
+def test_cron_telemetry_survives_runner_exit():
+    # Regression for the one-shot launchd lifecycle: the default telemetry
+    # sender uses a daemon thread, which dies with cron-runner. A subprocess
+    # stub records a receipt only for the bounded synchronous path, then the
+    # parent verifies the receipt after that process has exited.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        receipt = root / "receipt.txt"
+        (root / "telemetry.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "def task_processed(source, *, flush=False):\n"
+            "    if flush:\n"
+            "        Path(os.environ['CRON_TELEMETRY_RECEIPT']).write_text(source)\n"
+        )
+        code = (
+            "import importlib.util,sys\n"
+            f"sys.path.insert(0, {str(root)!r})\n"
+            "import telemetry\n"
+            f"spec=importlib.util.spec_from_file_location('cron_runner', {str(REPO / 'src' / 'cron-runner.py')!r})\n"
+            "mod=importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "mod._emit_cron_telemetry()\n"
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(root)
+        env["CRON_TELEMETRY_RECEIPT"] = str(receipt)
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=REPO,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        check(proc.returncode == 0, f"cron telemetry subprocess exits cleanly ({proc.stderr})")
+        check(receipt.read_text() == "cron",
+              "synchronous cron telemetry receipt exists after runner exits")
 
 
 def test_emit_task_prompt_skill():
@@ -256,6 +347,7 @@ def test_run_only_fires_launchd_entries():
             "digest": _epoch(2026, 7, 2, 6, 1),
             "session-loop": _epoch(2026, 7, 2, 6, 1),
         }))
+        _mark_core_alive(root, now)
         emitted = cr.run(now_epoch=now)
         check(emitted == ["digest"], "only the launchd entry fires, session entry skipped")
         files = list(cr.TASKS_DIR.glob("task-cron-*.txt"))
@@ -353,9 +445,102 @@ def test_run_no_state_catches_up():
         cr.CRONS_FILE.write_text(json.dumps([
             {"name": "daily", "cron": "0 6 * * *", "prompt": "brief", "launchd": True},
         ]))
+        _mark_core_alive(root, now)
         # No state file → first run; must catch up within MAX_CATCHUP_SECONDS.
         emitted = cr.run(now_epoch=now)
         check(emitted == ["daily"], "no-state first run catches up the missed daily cron")
+
+
+def test_run_does_not_queue_for_dead_core_and_recovers_recent_slot():
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.CORE_ALIVE_FILE = root / "state" / "cores" / "test.alive"
+        now = _epoch(2026, 7, 2, 6, 2)
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        prior = _epoch(2026, 7, 2, 6, 1)
+        cr.STATE_FILE.write_text(json.dumps({"digest": prior}))
+
+        emitted = cr.run(now_epoch=now)
+        check(emitted == [], "dead core receives no cron task")
+        check(not cr.TASKS_DIR.exists(), "dead core leaves no queued task file")
+        check(
+            json.loads(cr.STATE_FILE.read_text())["digest"] == prior,
+            "dead-core tick preserves boundary for short catch-up",
+        )
+
+        _mark_core_alive(root, now + 60)
+        emitted = cr.run(now_epoch=now + 60)
+        check(emitted == ["digest"], "recent missed slot recovers after core returns")
+
+
+def test_run_drops_stale_catchup_slot():
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        fire = _epoch(2026, 7, 2, 6, 0)
+        now = fire + cr.MAX_EMIT_LATENESS_SECONDS + 60
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({"briefing": fire - 60}))
+        _mark_core_alive(root, now)
+        stderr = io.StringIO()
+        import contextlib
+        with contextlib.redirect_stderr(stderr):
+            emitted = cr.run(now_epoch=now)
+        check(emitted == [], "stale catch-up slot is not emitted")
+        check("dropping stale slot for briefing" in stderr.getvalue(),
+              "stale drop is observable")
+        check(not cr.TASKS_DIR.exists(), "stale slot leaves no task file")
+
+
+def test_run_acquires_shared_state_lock():
+    """run() must take the shared state lock around its read-modify-write, so a
+    concurrent Codex reconciler can neither clobber the tick's state write-back
+    nor have its just-seeded migration boundary dropped. Proven by holding the
+    same lock and observing run() block until it is released."""
+    import json
+    import threading
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        now = _epoch(2026, 7, 2, 6, 2)
+        _mark_core_alive(root, now)
+        completed = threading.Event()
+
+        def tick():
+            cr.run(now_epoch=now)
+            completed.set()
+
+        # Hold the shared lock; run() must block before it can read/write state.
+        with cr._state_lock(cr.STATE_FILE):
+            worker = threading.Thread(target=tick)
+            worker.start()
+            check(not completed.wait(0.3),
+                  "run() blocks while the shared state lock is held")
+        worker.join(2)
+        check(completed.is_set(), "run() completes once the shared lock is released")
+        # And the tick still did its job once unblocked.
+        files = list(cr.TASKS_DIR.glob("task-cron-*.txt"))
+        check(len(files) == 1, "run() emits the due entry after acquiring the lock")
 
 
 def _run_all():

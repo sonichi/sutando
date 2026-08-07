@@ -28,10 +28,33 @@ except ImportError:
     stub.Message = type("Message", (), {})
     sys.modules["discord"] = stub
 
-_channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
-if not _channels_env.exists():
-    _channels_env.parent.mkdir(parents=True, exist_ok=True)
-    _channels_env.write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
+# Give the bridge a token in an ISOLATED config dir, never the operator's real one.
+#
+# This block used to write `DISCORD_BOT_TOKEN=test-token-not-real` into
+# `~/.claude/channels/discord/.env` whenever that file was absent. On a host where
+# it already exists the write is a no-op, which is why it survived: the damage only
+# appears on a machine that has LOST its token — precisely the machine you least
+# want a fake one planted on. A peer host hit exactly that on 2026-06-08 when one
+# operation rewrote the channel `.env` files and telegram's came out 1 byte.
+#
+# The planted value is worse than inert, because it looks real to every gate:
+# `startup.sh` admits the bridge on `grep -q "DISCORD_BOT_TOKEN="`, and the vault
+# fallback added in #2638 only fires when NO `.env` value is present — so a fake
+# token silently disables `vault set` as a recovery path.
+#
+# Isolating also stops the import from reading the real `channels/discord/access.json`:
+# `channel_access_path()` falls back to the legacy real-home copy when the canonical
+# one is missing, so pointing CLAUDE_CONFIG_DIR at an EMPTY dir is not enough — the
+# allowlist has to be seeded too. Both are module-level and before the import, which
+# is what `scripts/lint-hermetic-bridge-tests.py` requires.
+import os
+import tempfile
+
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-file-markers-")
+_cfg_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_cfg_discord.mkdir(parents=True, exist_ok=True)
+(_cfg_discord / "access.json").write_text('{"allowFrom": []}')
+(_cfg_discord / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
 
 
 def _load(name: str, path: Path):

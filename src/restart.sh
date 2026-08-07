@@ -16,6 +16,12 @@ pkill -f "telegram-bridge" 2>/dev/null
 pkill -f "discord-bridge" 2>/dev/null
 pkill -f "slack-bridge" 2>/dev/null
 pkill -f "remote-gateway-bridge" 2>/dev/null
+# The deprecated `remote-relay-bridge.py` stub runpy-execs the gateway bridge
+# IN-PROCESS, so its argv keeps the OLD filename while it runs the NEW code.
+# `pkill -f remote-gateway-bridge` therefore cannot see it: measured on a peer
+# host 2026-08-03, a stub-launched instance had been up 39 DAYS, survived every
+# restart, and kept stamping tasks from 39-day-old code. Kill both names.
+pkill -f "remote-relay-bridge" 2>/dev/null
 pkill -f "observability/boot" 2>/dev/null
 pkill -f "watch-tasks" 2>/dev/null
 pkill -f "conversation-server" 2>/dev/null
@@ -59,7 +65,7 @@ fi
 STOP_PATTERNS=(
     "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
     "screen-capture-server" "telegram-bridge" "discord-bridge" "slack-bridge"
-    "remote-gateway-bridge" "observability/boot" "watch-tasks"
+    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot" "watch-tasks"
     "conversation-server" "ngrok" "src/Sutando/Sutando"
 )
 for _ in $(seq 1 30); do

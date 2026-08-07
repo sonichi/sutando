@@ -25,9 +25,24 @@
 # simplification (versus the earlier canonical-id translation-layer design).
 #
 # User-configurable carrier set: vault.sync.{include, exclude} in
-# sutando.config.{json,local.json}. Include adds to default; exclude
-# subtracts (rsync semantics, exclude wins on conflict). Currently
-# defaults-only (config-merge tracked for follow-up).
+# sutando.config.{json,local.json}.
+#
+# `include` REPLACES the default list wholesale — it does NOT add to it.
+# Config merging is `_deep_merge` (src/sutando_config.py), whose contract is
+# "dicts merge; everything else (lists, scalars, None) is REPLACED by the
+# override", and that behaviour is pinned by
+# tests/sutando-config.test.py::test_local_replaces_arrays_wholesale.
+#
+# This matters more than an ordinary doc nit because the carrier set is a
+# WHITELIST: _compose_exclude_content() emits `*` (ignore everything) and then
+# un-ignores exactly the include list. So setting vault.sync.include to add one
+# path silently DROPS every default path — notes/, hosts/*/ and the whole
+# .claude-sutando/projects/*/memory/ corpus — out of the backup, while this
+# script goes on printing "pushed to <branch>" on every run. To add a path you
+# must restate the full carrier set.
+#
+# `exclude` subtracts, carving subpaths out of an included parent (emitted after
+# the includes so gitignore's last-match-wins applies).
 #
 # Usage:
 #   bash scripts/sync-workspace.sh                # default: pull + push (one tick)
@@ -207,6 +222,12 @@ _host() {
     # Comcast → Chis-MBP) and split per-host paths/branches from the stable
     # LocalHostName (Chis-MacBook-Pro). 2026-06-22 incident.
     local env="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+    # Trim first: `[ -n "  " ]` is true, so a blank-but-set override became the
+    # host label and produced a whitespace-named branch/dir. Lockstep with
+    # _host_label()'s strip() — trim the ENDS only, so an (unusual but legal)
+    # label containing a space is preserved rather than silently compacted.
+    env="${env#"${env%%[![:space:]]*}"}"
+    env="${env%"${env##*[![:space:]]}"}"
     if [ -n "$env" ]; then
         printf '%s\n' "$env"
         return
@@ -359,6 +380,34 @@ _emit_exclude_lines() {
     fi
 }
 
+# Return success only for a literal host label that is safe to compare as a
+# path segment. In particular, reject gitignore glob metacharacters and dot
+# segments: vault.sync.include intentionally accepts patterns, and those are
+# operator customizations rather than legacy per-host labels.
+_is_literal_host_label() {
+    local label="$1"
+    [ "$label" != "." ] \
+        && [ "$label" != ".." ] \
+        && [[ "$label" =~ ^[[:alnum:]_.-]+$ ]]
+}
+
+# A pre-multi-host local config may still scope the carrier to exactly this
+# machine's `hosts/<label>/` directory. That shape is unsafe now that peer
+# subtrees form one durable aggregate: after a pull, carrier enforcement
+# interprets every peer path as newly excluded and propagates its deletion.
+# Widen only the literal validated current host label; gitignore patterns and
+# nested paths retain their explicit operator-authored meaning.
+_normalize_include_path() {
+    local path="$1" own_host
+    own_host="$(_host)"
+    if _is_literal_host_label "$own_host" \
+        && [ "$path" = "hosts/$own_host/" ]; then
+        printf '%s\n' "hosts/*/"
+        return 0
+    fi
+    printf '%s\n' "$path"
+}
+
 # Compose the sync rule set written to `<workspace>/.git/info/exclude`.
 #
 # Why `.git/info/exclude` and not `<workspace>/.gitignore`:
@@ -393,6 +442,7 @@ _compose_exclude_content() {
         echo "# Carrier set — from vault.sync.include"
         while IFS= read -r path; do
             [ -z "$path" ] && continue
+            path="$(_normalize_include_path "$path")"
             _emit_include_lines "$path"
         done <<<"$include_list"
     fi
@@ -431,6 +481,30 @@ _compose_exclude_content() {
     echo "*.ppk"
     echo "*.keystore"
     echo "*.jks"
+}
+
+# Return success only when an existing generated rule set differs from the
+# desired one solely because one or more legacy `!hosts/<label>/` entries need
+# widening to `!hosts/*/`. This narrow comparison preserves the existing
+# operator-edit protection while allowing the #2391 safety migration to heal
+# automatically on the next sync tick.
+_is_safe_legacy_host_scope_widening() {
+    local existing="$1" desired="$2" own_host
+    own_host="$(_host)"
+    _is_literal_host_label "$own_host" || return 1
+    cmp -s <(
+        awk -v host="$own_host" '
+            $0 == "!hosts/" host "/" {
+                print "!hosts/*/"
+                next
+            }
+            $0 == "!hosts/" host "/**" {
+                print "!hosts/*/**"
+                next
+            }
+            { print }
+        ' "$existing"
+    ) "$desired"
 }
 
 # Write `<workspace>/.git/info/exclude` from the composed content. Also
@@ -493,6 +567,9 @@ generate_exclude() {
         # operator-customized" and overwrite without prompting.
         if ! grep -qE '^[^#]' "$exclude_path" 2>/dev/null; then
             log "generate_exclude: existing $exclude_path is stock comments only; overwriting"
+        elif _is_safe_legacy_host_scope_widening "$exclude_path" "$tmp_path"; then
+            log "generate_exclude: safely widened legacy hosts/<label>/ carrier rules to hosts/*/"
+            color_warn "sync-workspace: widened legacy hosts/<label>/ carrier rules to hosts/*/ so peer host state remains durable"
         elif [ "$FORCE_GITIGNORE" != "1" ]; then
             color_warn "sync-workspace: $exclude_path EXISTS and DIFFERS from the generated content."
             color_warn "Refusing to overwrite (operator-authored content may block carrier-set paths)."
@@ -585,12 +662,47 @@ _refuse_staged_secrets() {
     return 0
 }
 
-# Snapshot the per-host config that LIVES at $CLAUDE_CONFIG_DIR into
+# A host owns its own hosts/<label>/ subtree. This deletion-focused guard
+# refuses any staged removal below a foreign label before commit/push,
+# including the source side of a rename. It catches both stale carrier rules
+# and future writers that accidentally treat absence as permission to delete a
+# peer's durable state. In-place foreign-file modifications are outside this
+# guard's #2391 deletion scope. The existing explicit force switch remains the
+# operator escape hatch for intentional recovery.
+_refuse_foreign_host_deletions() {
+    [ "${SUTANDO_FORCE_SYNC:-0}" = "1" ] && return 0
+
+    local own_host foreign_hits=0 path relative path_host first_path=""
+    own_host="$(_host)"
+    while IFS= read -r -d '' path; do
+        case "$path" in
+            hosts/*/*)
+                relative="${path#hosts/}"
+                path_host="${relative%%/*}"
+                if [ -n "$path_host" ] && [ "$path_host" != "$own_host" ]; then
+                    foreign_hits=$((foreign_hits + 1))
+                    [ -z "$first_path" ] && first_path="$path"
+                fi
+                ;;
+        esac
+    done < <(git diff --cached --no-renames --name-only --diff-filter=D -z)
+
+    if [ "$foreign_hits" -eq 0 ]; then
+        return 0
+    fi
+
+    log "_refuse_foreign_host_deletions: ABORT — would delete $foreign_hits foreign host file(s); first=$first_path own_host=$own_host"
+    echo "sync-workspace: refusing push — would delete $foreign_hits foreign host file(s) (first: $first_path). Only '$own_host' may write its hosts/<label>/ subtree. Restore/pull the peer state, or set SUTANDO_FORCE_SYNC=1 for an intentional recovery." >&2
+    git reset -q
+    return 1
+}
+
+# Snapshot the per-host config from the canonical Claude config dir into
 # <workspace>/hosts/<host>/ so it's carried by the hosts/*/ vault glob and
-# survives a rebuild. settings.json and channel access.json are owned by Claude
-# Code / the bridges at $CLAUDE_CONFIG_DIR — they can't be relocated, so they're
-# *backed up* here (the live readers keep reading $CLAUDE_CONFIG_DIR; hosts/<host>/
-# is a pure backup → no read/write skew).
+# survives a rebuild. Startup exports this same path as CLAUDE_CONFIG_DIR for
+# Claude Code / the bridges. Resolve it from config here because launchd/cron
+# does not reliably inherit that export; falling back to ~/.claude would copy
+# stale pre-migration access state over the live backup.
 #
 # NOT snapshotted: PERSONAL_CLAUDE.md / stand-identity.json / tab-aliases.json —
 # those follow the RELOCATION model (migrator one-time move + personal_path /
@@ -602,7 +714,7 @@ _refuse_staged_secrets() {
 # returns 0, so a snapshot hiccup can never block the push.
 _snapshot_per_host_config() {
     local _cfg
-    _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path)" || return 0
+    _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-sutando-config-dir)" || return 0
     local _host_dir="$WORKSPACE_DIR/hosts/$(_host)"
     mkdir -p "$_host_dir" 2>/dev/null || return 0
 
@@ -887,11 +999,130 @@ cmd_pull_only() {
     _pull_only_impl
 }
 
+# Resolve every unmerged path by keeping OUR side — after preserving THEIRS.
+#
+# `--ours` is right for host-local state and lossy for anything both hosts
+# append to. On 2026-07-31 it silently dropped two MEMORY.md index lines
+# (merge 64dec1b2) and a WIRE episode-index entry (merge 258c349b); the second
+# stayed missing for ~2 days. Neither surfaced: the log named the PEER but
+# never which files lost their incoming version, and `git log -- FILE` cannot
+# show a change destroyed IN a merge, because history simplification hides
+# merge commits — so the normal way of looking finds nothing.
+#
+# Stage 3 is "theirs". The copy goes under state/, which the sync excludes
+# (0 tracked files there), so a backup can never itself become a conflicting
+# tracked file. Best-effort throughout: a failure to preserve must never block
+# the merge, and a DD conflict (both sides deleted) has no stage 3 to save.
+#
+# Extracted from the caller so the behaviour can be tested against a REAL
+# conflicted index rather than a re-implementation of this loop — a test that
+# rebuilds the loop it checks passes just as happily against the unfixed script.
+_resolve_conflicts_keep_ours() {
+    local peer="${1:-peer}" backup_root="${2:-}" f
+    # Default location is INSIDE the git dir, not under state/. `state/` looked
+    # safe because it currently has 0 tracked files — but that is an observation
+    # of one config, not an invariant: `vault.sync.include` is user-configurable
+    # and _compose_exclude_content emits includes before excludes (last match
+    # wins), so a supported `state/` include un-ignores `state/**` and the next
+    # push would stage these backups. Anything under the git dir is never
+    # tracked by construction, whatever the carrier set says. `rev-parse
+    # --git-dir` resolves correctly for a worktree too, where .git is a file.
+    # (john-the-dev, #2476 review blocker 2.)
+    if [ -z "$backup_root" ]; then
+        local _gitdir; _gitdir="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+        backup_root="$_gitdir/sutando-sync-conflicts/$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%s' "$peer" | tr '/' '_')"
+    fi
+    # Counted, not assumed: the summary below must be a FUNCTION of what
+    # actually got written. v1 logged only on success and then claimed "each
+    # discarded incoming file is preserved" whenever the directory merely
+    # existed — so a failed mkdir/write discarded the peer's version silently
+    # while telling the operator it was recoverable (blocker 1, reproduced by
+    # the reviewer by making backup/dir a regular file).
+    local saved=0 failed=0 failed_list=""
+    while IFS= read -r -d '' f; do
+        if git show ":3:$f" >/dev/null 2>&1; then
+            if mkdir -p "$backup_root/$(dirname "$f")" 2>/dev/null &&
+               git show ":3:$f" > "$backup_root/$f" 2>/dev/null; then
+                saved=$((saved + 1))
+                log "_resolve_conflicts_keep_ours: discarded incoming $f -> $backup_root/$f"
+            else
+                failed=$((failed + 1))
+                failed_list="${failed_list:+$failed_list, }$f"
+                # Loud per-file: this one is genuinely unrecoverable.
+                log "_resolve_conflicts_keep_ours: FAILED to preserve $f — incoming version is LOST"
+                color_warn "sync-workspace: could NOT preserve the incoming version of $f (backup write failed under $backup_root) — that version is discarded unrecoverably"
+            fi
+        else
+            log "_resolve_conflicts_keep_ours: discarded incoming $f (no stage-3 blob to preserve)"
+        fi
+        # `--ours` fails on DD-conflicts (both sides deleted) — the file isn't
+        # on our side either. Fall back to `git rm` so the merge can complete
+        # cleanly. Surfaced by Mini #1445 v3 Test 12. Preservation stays
+        # best-effort: a backup failure must never block the merge.
+        if git checkout --ours -- "$f" 2>/dev/null; then
+            git add -- "$f"
+        else
+            git rm -f -- "$f" 2>/dev/null || true
+        fi
+    done < <(git diff --name-only --diff-filter=U -z)
+    if [ "$failed" -gt 0 ]; then
+        color_warn "sync-workspace: kept the local version on conflict with $peer; $saved incoming file(s) preserved under $backup_root, $failed NOT saved ($failed_list)"
+    elif [ "$saved" -gt 0 ]; then
+        color_warn "sync-workspace: kept the local version on conflict with $peer; all $saved discarded incoming file(s) preserved under $backup_root"
+    fi
+}
+
+# Pre-pull anchor migration (#2567). `state/current-track.md` is per-host state
+# that used to be carried at a shared flat path; that path is removed from the
+# carrier set in this change. On any vault where the file is still TRACKED,
+# `_enforce_carrier_set_pre` will untrack it and COMMIT that deletion — and a
+# peer pulls the deletion before its own enforcement ever runs (the pull half of
+# `cmd_default_bidirectional` precedes the push half). Without this helper that
+# peer loses its anchor.
+#
+# Same-commit migration on the PUSHING host does not fix it: that host can only
+# add ITS OWN `hosts/<label>/current-track.md`, which is not the puller's anchor.
+# The guarantee therefore has to be local and to run BEFORE the fetch/merge —
+# each host rescues its own copy. Same placement and contract as
+# `_migrate_flat_branch` above.
+#
+# Called from BOTH entry points, and the reason is worth stating because the
+# pull-side rationale above does not imply it. The hazard is not the merge; it
+# is `_enforce_carrier_set_pre`, which untracks newly-excluded files and lets
+# the caller commit that deletion. `--push-only` runs that enforcement without
+# ever passing through `_pull_only_impl`, so a pull-only call site leaves the
+# explicit push mode able to delete the sole carried copy of an anchor it never
+# replaced. Idempotent, so calling it twice in the default bidirectional path
+# costs one `[ -e ]`. Idempotent: a no-op once the per-host file
+# exists, so it costs one `[ -e ]` per tick thereafter.
+_migrate_flat_anchor() {
+    local _flat _dest
+    _flat="$WORKSPACE_DIR/state/current-track.md"
+    _dest="$WORKSPACE_DIR/hosts/$(_host)/current-track.md"
+    [ -f "$_flat" ] || return 0
+    [ -e "$_dest" ] && return 0
+    # DRY_RUN is checked HERE, not only at the call site: this helper runs before
+    # _pull_only_impl's dry-run early return (it must, to beat an incoming
+    # deletion), so the guard has to live with the mutation it protects. A future
+    # caller cannot reintroduce the violation by placing the call differently.
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "DRY-RUN: would migrate state/current-track.md -> hosts/$(_host)/current-track.md (#2567)" >&2
+        return 0
+    fi
+    mkdir -p "$(dirname "$_dest")" || return 0
+    cp "$_flat" "$_dest" || return 0
+    log "_migrate_flat_anchor: copied state/current-track.md -> hosts/$(_host)/current-track.md before pull (#2567)"
+    echo "sync-workspace: migrated the per-host anchor to hosts/$(_host)/current-track.md (was at the shared flat path; #2567)" >&2
+}
+
 _pull_only_impl() {
     cd "$WORKSPACE_DIR" || die "pull-only: cannot cd to $WORKSPACE_DIR"
     [ -d ".git" ] || die "pull-only: $WORKSPACE_DIR is not a git repo; run --init first"
 
     _assert_sync_initialized "pull-only"
+
+    # Rescue this host's anchor BEFORE any peer deletion can merge in (#2567).
+    _migrate_flat_anchor
 
     if [ "$DRY_RUN" = "1" ]; then
         echo "DRY-RUN: would fetch + merge peer branches" >&2
@@ -972,16 +1203,7 @@ _pull_only_impl() {
             # conflicts were never resolved — the merge stayed open while the
             # run still reported success, wedging every later sync behind
             # "You have not concluded your merge". Review #2 finding (2026-06-11).
-            while IFS= read -r -d '' f; do
-                # `--ours` fails on DD-conflicts (both sides deleted) — the file
-                # isn't on our side either. Fall back to `git rm` so the merge
-                # can complete cleanly. Surfaced by Mini #1445 v3 Test 12.
-                if git checkout --ours -- "$f" 2>/dev/null; then
-                    git add -- "$f"
-                else
-                    git rm -f -- "$f" 2>/dev/null || true
-                fi
-            done < <(git diff --name-only --diff-filter=U -z)
+            _resolve_conflicts_keep_ours "$peer"
             git -c core.editor=true commit --no-edit 2>/dev/null || true
             # Verify the merge actually concluded — unmerged entries here mean
             # the resolution above missed something; abort rather than leave a
@@ -1067,9 +1289,20 @@ _push_only_impl() {
     # access.json) into hosts/<host>/ before staging, so it's carried + survives
     # a rebuild. Non-fatal: never blocks the push.
     _snapshot_per_host_config || color_warn "sync-workspace: per-host config snapshot failed (non-fatal); push continues"
+    # Rescue this host's anchor BEFORE carrier enforcement can untrack it
+    # (#2567/#2607). `--push-only` never reaches `_pull_only_impl`, so without
+    # this call the enforcement below regenerates the exclude, untracks the
+    # now-uncarried flat `state/current-track.md`, and COMMITS that deletion —
+    # on a host whose anchor exists only at the flat path that removes the sole
+    # carried copy and writes no replacement. Pull-side placement alone is not
+    # enough: the hazard is carrier enforcement, and both entry points run it.
+    _migrate_flat_anchor
     _enforce_carrier_set_pre
     git add -A
     _refuse_staged_secrets
+    if ! _refuse_foreign_host_deletions; then
+        return 1
+    fi
     if git diff --cached --quiet; then
         log "_push_only_impl: nothing to commit"
         # A clean tree does NOT mean "done": a prior push may have failed (auth

@@ -44,24 +44,64 @@ This resolves through `bash scripts/sutando-config.sh workspace`, which reads `s
 
 Each pass, in order:
 
-0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to `$WORKSPACE/state/core-status.json` (with `WORKSPACE` resolved as above). The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
+0. **Signal loop start.** Write `{"status":"running","step":"<short description of what you are actually doing>","ts":DATE_NOW}` to `$WORKSPACE/state/core-status.json` (with `WORKSPACE` resolved as above). The session cwd is the repo, so a bare `core-status.json` lands in `<repo>/` where no reader looks (`health-check.py` and the web UI resolve `<workspace>/state/core-status.json` via `status_read_path`). Update the `step` field as you progress through each step; write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
 
-0.5. **Check quota.** Run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
-   - **Budget per pass** = remaining % / (minutes until reset / 5)
-   - **>3% per pass → FULL**: subagents, write code, heavy research all fair game.
-   - **1-3% per pass → MEDIUM**: code fixes, monitoring, no subagents.
-   - **<1% per pass → LIGHT**: task processing + health checks only.
-   - **0% remaining → MINIMAL**: process owner tasks + health + update log.
+   **`step` is an owner-facing live message, not internal telemetry.** With `SUTANDO_PROGRESS_STREAM=1` (ON in the running bridge) the Discord bridge renders it to the owner verbatim as `⏳ <step> (Ns)` while he waits on an owner task, via `progress_stream.format_progress`. A generic placeholder ("Starting pass...", "running") shows up in his DM as noise; when processing an owner task, `step` should say what he is waiting on. Rewrite it on every pivot — a stale `step` actively lies to him. See memory `feedback_rich_core_status_step`. (This template previously read `"Starting pass..."` — the exact string that memory names as the anti-pattern, which is why the mistake kept recurring across compactions: this file is loaded every pass, the memory only when recalled.)
 
-   Budget informs the **depth** of step 6 — not whether to do it. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the only legitimate reasons step 6 may be skipped.
+0.5. **Check quota (runtime-conditional — pick the branch for the core you are).**
 
-0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `state/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id>`), per-host `pending-questions.md`, the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `state/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
+   **Claude core** — run `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py`. Note remaining % and exact reset time.
+   **Tier EACH window by its OWN rule, then take the MOST RESTRICTIVE TIER.** `read-quota.py`
+   reports two windows and they are scored differently — do not apply one window's thresholds to the
+   other, and do not pick a window by largest `burn`. Those select differently: a short window can show a huge `burn`
+   from one early burst while still holding more headroom than the window that actually limits you.
+   `5h` at 19% used / 2% elapsed gives `burn 9.50, headroom 0.827` (MEDIUM); `7d` at 90% used / 70%
+   elapsed gives `burn 1.29, headroom 0.333` (LIGHT). Selecting on `burn` picks the 5h window and
+   authorises MEDIUM work while the 7d pool — which cannot refill for days — is already LIGHT.
+   `burn` explains *how you got here*; `headroom` is what constrains what you may still do.
+
+   **Why 7d needs its own rule:** the absolute per-pass thresholds are a *constant* on it. Every
+   reachable 7d input yields LIGHT — 100% remaining over a full week gives 0.0496%/pass, 1% remaining
+   gives 0.0005%/pass, and even 1% remaining with one hour to reset gives 0.083%/pass. Reaching
+   MEDIUM would require 2016% remaining. A rule whose best case and worst case agree is not
+   measuring anything. So 7d is paced against its own even pace, as a ratio:
+
+   ```
+   elapsed  = (now - window_start) / (window_reset - window_start)
+   burn     = used% / elapsed           # >1 means ahead of even pace
+   headroom = remaining% / (1 - elapsed)  # <1 means the rest must be slower than even pace
+   sustainable_vs_current = headroom / burn
+   ```
+   **7d window — tier by `headroom`:**
+   - **headroom ≥ 1.5 → FULL**: subagents, write code, heavy research all fair game.
+   - **headroom 0.8–1.5 → MEDIUM**: code fixes, monitoring, no subagents.
+   - **headroom < 0.8 → LIGHT**: task processing + health checks only.
+
+   **5h window — tier by its retained absolute budget**, `remaining % / (minutes to reset / 5)`:
+   >3% FULL / 1–3% MEDIUM / <1% LIGHT. These were calibrated for this window; they are NOT
+   interchangeable with the headroom bands and must not be applied to 7d (there they are a constant).
+
+   **Then adopt the more restrictive of the two tiers** (FULL > MEDIUM > LIGHT), and name which
+   window bound it. **0% remaining on either window → MINIMAL**: owner tasks + health + log only.
+
+   Quote `sustainable_vs_current` when reporting pace, and **name the denominator** — "0.45x even
+   pace" and "0.27x current pace" are the same state and differ by 1.67x.
+
+   **Codex core** — run `python3 skills/proactive-loop/scripts/codex-quota-gate.py --json` (the Claude-only `quota-tracker` state is not a Codex signal). It reads the Codex CLI's weekly rate-limit snapshots and conservatively uses the least remaining percentage among recorded weekly limit lanes; missing or entirely stale telemetry fails closed to `LIGHT`.
+   - **>20% remaining → FULL**: subagents, code, and heavier research are fair game.
+   - **5–20% remaining → MEDIUM**: monitoring and bounded code fixes; no subagents.
+   - **1–<5% remaining → LIGHT**: task processing, pending questions, and health checks only.
+   - **0% remaining or unavailable/stale → LIGHT**: owner tasks, health, and the build-log update only.
+
+   Either way: budget informs the **depth** of step 6 — not whether to do it when quota permits. When the branch resolves to `LIGHT`/`MINIMAL`, skip autonomous self-development/research in step 6 even if the self-development policy is enabled; owner-requested tasks, pending questions, health/service recovery, watcher maintenance, and the build-log update remain active. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the other legitimate reasons step 6 may be skipped.
+
+0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `<workspace>/hosts/<hostname>/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id>`), per-host `pending-questions.md`, the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `<workspace>/hosts/<hostname>/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
 
 ## Skip conditions for step 6 (the ONLY legitimate reasons)
 
 Skip step 6 (end the pass early after step 3) if and only if one of these applies:
 
-- **(a) Quota**: per-pass budget is below the LIGHT threshold (<1%).
+- **(a) Quota**: the selected tier from step 0.5 is MINIMAL (i.e. the most-restrictive window has 0% remaining). A LIGHT tier does NOT skip step 6 — it caps its depth.
 - **(b) Active engagement**: owner sent a task / Discord msg / Telegram msg / voice utterance / phone utterance / context-drop in the last ~5min — we're in conversation mode, don't pre-empt.
 - **(c) Presenter/meeting mode**: `state/presenter-mode.sentinel` is active (set via `bash scripts/presenter-mode.sh start N`).
 - **(d) Explicit pause**: `state/loop-paused-until.sentinel` is active (future-dated).
@@ -79,6 +119,25 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
+
+3.5. **Apply the self-development policy gate.** Run:
+
+   ```bash
+   python3 skills/proactive-loop/scripts/self-development-enabled.py
+   ```
+
+   The command prints `enabled` or `disabled`. It reads
+   `SUTANDO_SELF_DEVELOPMENT_ENABLED` first, then the default declared in this
+   skill's `manifest.json`. The shipped default is enabled (`1`). Product
+   deployments can set the environment variable to `0`.
+
+   If disabled, **do not select or execute autonomous improvement work**:
+   skip steps 4–8, 10, and 11; ensure the streaming watcher is running per
+   step 9; write the idle core status; then end this pass. Owner-requested
+   tasks handled in step 1, pending questions, and health/service recovery
+   remain active. Disabling self-development does not turn Sutando off and
+   does not prevent the owner from explicitly asking it to change code.
+   Manual `/proactive-loop` invocation does not override the policy.
 
 4. **Read the build log** (`$WORKSPACE/build_log.md`) — understand what exists. Do not rebuild what works.
 
@@ -124,6 +183,16 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    This bakes the auto-trigger into the existing build_log update step rather than a separate auto-refresh subsystem. Event-triggered, not time-triggered — fires only on natural beat points where something worth relaying actually happened.
 
 8. **If blocked, ask.** Write the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; create the `hosts/<hostname>/` dir if absent) — send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
+
+   **⚠ INSERT ABOVE THE `# Resolved` DIVIDER, NEVER `>>` AT EOF (2026-08-02, twice in one session).** Every reader — `check-pending-questions.py`, morning-briefing, agent-api, friction-detector, dashboard — counts only the text ABOVE the file's top-level `# Resolved` line; everything below it is the audit trail. `cat >> "$PQ"` appends at EOF, which on this host is **500 lines below the divider**, so the question lands in the archive and is never counted.
+
+   I filed two questions this way on 2026-08-02 (the ep007 spine pick, and an ag2space room-join request) and **both were invisible**: the reader stayed at 22 while the file grew. Moving them above the divider took it to 24. **This is the exact defect PR #2521 fixes in `auth-preflight-gate.sh`** — which I reviewed, fixed an ABA race in, and pushed the same afternoon I committed the bug by hand, twice.
+
+   It reports success in every cheap way: bytes land, the path is right, nothing errors, the file grows. **Only calling the reader shows the zero.** So after writing, assert it:
+   ```bash
+   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=[str(x) for x in m.get_waiting_questions()];print(any('<a distinctive phrase from your question>' in x for x in q))"
+   ```
+   A `True` is the only proof the question exists for anyone but you.
 
 9. **Ensure the streaming watcher is running.** PID-check the watcher sentinel: if `"$WORKSPACE/state/watch-tasks-stream.pid"` is missing OR its PID is dead (`pid=$(cat "$WORKSPACE/state/watch-tasks-stream.pid" 2>/dev/null); ! kill -0 "$pid" 2>/dev/null`), restart it with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. When notifications arrive (`TASK_FILE: <basename>`), Read the named file. Each event represents one new task — process all queued tasks before continuing. Don't use `pgrep -f watch-tasks` here for the same reason as `/schedule-crons` step 5 — pgrep's `-f` matches the bash wrapper's argv (which contains the literal search string) and false-positively returns a transient self-match. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 1 above.
 

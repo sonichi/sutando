@@ -62,6 +62,14 @@ class FakePopen:
         return 0
 
 
+class FailingStopProc:
+    def send_signal(self, sig):
+        pass
+
+    def wait(self, timeout=None):
+        raise RuntimeError("stop failed")
+
+
 class TestCaptureVideoRouting(unittest.TestCase):
     def setUp(self):
         self.mod = load_module()
@@ -157,6 +165,34 @@ class TestCaptureVideoRouting(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._get("/capture-video?action=start&silent=true", token="wrong-token")
         self.assertEqual(ctx.exception.code, 403)
+        ctx.exception.close()
+
+    def test_toggle_start_failure_uses_json_error_contract(self):
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=RuntimeError("start failed")):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._get("/capture-video?action=start&silent=true", token=self.token)
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertEqual(ctx.exception.headers.get_content_type(), "application/json")
+        self.assertEqual(
+            json.loads(ctx.exception.read()),
+            {"status": "error", "error": "start failed"},
+        )
+        ctx.exception.close()
+
+    def test_toggle_stop_failure_uses_json_error_contract(self):
+        self.mod._active_recording = {
+            "proc": FailingStopProc(),
+            "path": "/unused/failed-recording.mov",
+            "watchdog": None,
+        }
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/capture-video?action=stop&silent=true", token=self.token)
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertEqual(ctx.exception.headers.get_content_type(), "application/json")
+        self.assertEqual(
+            json.loads(ctx.exception.read()),
+            {"status": "error", "error": "stop failed"},
+        )
         ctx.exception.close()
 
     def test_routing_guard_present_in_source(self):
