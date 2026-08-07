@@ -5266,16 +5266,14 @@ def _task_channel_id(task_id: str):
     return None
 
 
-# Warned-once ledger for undeliverable results. poll_dm_fallback rescans every
-# 30s and this branch `continue`s before the retry cutoff, so an unguarded print
-# emits ~2880 identical lines/day per orphan — noise that gets tuned out.
+# poll_dm_fallback rescans every 30s and this branch continues before the retry
+# cutoff, so an unguarded print emits ~2880 lines/day per orphan.
 _UNDELIVERABLE_WARNED: set = set()
 
 
 def _should_warn_undeliverable(task_id: str) -> bool:
     """True the FIRST time a task_id is seen this process, False after.
-    Per-process rather than durable on purpose: a restart should re-surface an
-    orphan that is still unresolved, and that is once per boot, not per scan."""
+    Per-process by design: a restart re-surfaces an unresolved orphan once."""
     if task_id in _UNDELIVERABLE_WARNED:
         return False
     _UNDELIVERABLE_WARNED.add(task_id)
@@ -5283,9 +5281,8 @@ def _should_warn_undeliverable(task_id: str) -> bool:
 
 
 def _undeliverable_warning_for(task_id: str, result_name: str):
-    """The line to log for a result nothing will deliver, or None.
-    Composes classification + one-shot so the whole decision is testable; only
-    the print remains loop glue."""
+    """The line to log for a result nothing will deliver, or None. Composed here
+    so the decision is testable; only the print is loop glue."""
     ch = _orphan_channel_target(task_id)
     if ch is None or not _should_warn_undeliverable(task_id):
         return None
@@ -5296,12 +5293,8 @@ def _undeliverable_warning_for(task_id: str, result_name: str):
 
 
 def _orphan_channel_target(task_id: str):
-    """Channel a `task-` result must go to because NOTHING else will deliver it.
-
-    None unless the source owns no consumer (not in either source set) AND the
-    task names a channel. Fail-closed: an unknown source with no channel_id is
-    left alone rather than guessed at.
-    """
+    """Channel for a `task-` result nothing else will deliver, else None.
+    Requires: source in NEITHER set, AND the task names a channel. Fail-closed."""
     if not task_id.startswith("task-"):
         return None
     src = _task_source(task_id)
@@ -5351,8 +5344,7 @@ async def poll_dm_fallback():
                 # source is NOT eligible (see _dm_fallback_eligible).
                 if task_id.startswith("task-") and not _dm_fallback_eligible(task_id):
                     # A source in NEITHER set owns no consumer, so this skip is
-                    # permanent loss, not deferral. Say so instead of dropping
-                    # silently; delivery wiring is deliberately not done here.
+                    # permanent loss, not deferral. Delivery is not wired here.
                     _warn = _undeliverable_warning_for(task_id, f.name)
                     if _warn:
                         print(_warn, flush=True)  # pragma: no cover — print glue; the decision above is unit-tested

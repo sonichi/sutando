@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
-"""A source owning no consumer must be classified, not silently skipped.
-
-`poll_dm_fallback` skips a `task-` result whose source is not DM-eligible, on
-the stated grounds that "its own consumer" will drain it. A source in neither
-DM_FALLBACK_SOURCES nor DELIVERY_OWNING_SOURCES has no consumer, so that skip
-loses the reply permanently.
-"""
+"""A source in neither source set has no consumer, so skipping its result loses
+the reply permanently. Rationale and evidence live in the PR."""
 import importlib.util
 import os
 import sys
@@ -116,8 +111,8 @@ class TestUndeliverableSource(unittest.TestCase):
         tid = self._task("task-badchan", "news-radar", channel_id="not-a-number")
         self.assertIsNone(self.db._task_channel_id(tid))
 
-    # --- the COMPOSITION poll_dm_fallback actually calls (reviewers' finding:
-    # testing the helpers independently never exercises how they combine) ---
+    # The COMPOSITION poll_dm_fallback calls. Testing the helpers alone never
+    # exercises how they combine, which is where ordering bugs live.
 
     def test_composition_emits_once_then_none(self):
         tid = self._task("task-compose", "news-radar")
