@@ -1,0 +1,11 @@
+# Microsoft 365 connectivity via Microsoft Graph.
+# python-o365 (Apache-2.0). Capped at <2.1.3: O365 2.1.3 added an import of
+# typing.TypeAlias (O365/utils/query.py), which does not exist on Python 3.9, so
+# `from O365 import Account` raises there. 2.1.2 is the last release that actually
+# imports under Sutando's supported stock Python 3.9 runtime — VERIFIED by a real
+# full-install import on Python 3.9.22 (not just py_compile), reaching MSAL's live
+# tenant_discovery on `auth`. (Its Requires-Python says >=3.9, but that metadata
+# is wrong from 2.1.3 on — the runtime import is the real test.) The 2.0.26 floor
+# keeps the Account/mailbox/schedule/storage/teams API used by scripts/ms365.py;
+# the auth call falls back from requested_scopes= (2.1+) to scopes= (2.0.x).
+O365>=2.0.26,<2.1.3

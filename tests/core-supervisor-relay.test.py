@@ -298,6 +298,106 @@ class TestResolveActiveTarget(unittest.TestCase):
             p = self._write(td, {"channel": "voice", "channel_id": "x"})
             self.assertEqual(resolve_active_target(p), ("", ""))
 
+    def test_configured_channel_dir_makes_new_surface_deliverable(self):
+        # New-homeserver rule: a source outside the static set is deliverable
+        # iff $CLAUDE_CONFIG_DIR/channels/<source>/ holds a *.env (notify.py's
+        # own resolution rule) — adding a homeserver is config-only.
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg:
+            os.makedirs(os.path.join(cfg, "channels", "dev-ag2space"))
+            with open(os.path.join(cfg, "channels", "dev-ag2space", ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:dev.ag2.space"})
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            try:
+                self.assertEqual(resolve_active_target(p), ("dev-ag2space", "!r:dev.ag2.space"))
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_relay_client_env_alone_is_not_deliverable(self):
+        # notify.py reads exactly channels/<source>/.env; a lane holding only
+        # relay-client.env would fail the actual send — must NOT be selected
+        # (the #2701 review P1 failure mode).
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg:
+            os.makedirs(os.path.join(cfg, "channels", "dev-ag2space"))
+            with open(os.path.join(cfg, "channels", "dev-ag2space", "relay-client.env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:dev.ag2.space"})
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            try:
+                self.assertEqual(resolve_active_target(p), ("", ""))
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_unconfigured_new_surface_stays_macos_only(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg:
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:dev.ag2.space"})
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            try:
+                self.assertEqual(resolve_active_target(p), ("", ""))
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_symlinked_out_channel_dir_is_not_deliverable(self):
+        # notify.py's sender REFUSES a channel entry that resolves outside
+        # channels/ (realpath containment); the probe must agree or we recreate
+        # selected-then-send-fails via the symlink mismatch (#2701 review P1).
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg, \
+             tempfile.TemporaryDirectory() as outside:
+            os.makedirs(os.path.join(cfg, "channels"), exist_ok=True)
+            with open(os.path.join(outside, ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            os.symlink(outside, os.path.join(cfg, "channels", "sneaky"))
+            p = self._write(td, {"channel": "sneaky", "channel_id": "!r:s"})
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            try:
+                self.assertEqual(resolve_active_target(p), ("", ""))
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def test_claude_home_tier_is_honored(self):
+        # notify.py resolves CLAUDE_CONFIG_DIR -> CLAUDE_HOME -> ~/.claude; the
+        # probe must walk the SAME tiers (a CLAUDE_HOME-only env previously
+        # made probe and sender disagree — #2701 review P1).
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, "channels", "dev-ag2space"))
+            with open(os.path.join(home, "channels", "dev-ag2space", ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            old_cfg = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            old_home = os.environ.get("CLAUDE_HOME")
+            os.environ["CLAUDE_HOME"] = home
+            try:
+                self.assertEqual(resolve_active_target(p), ("dev-ag2space", "!r:d"))
+            finally:
+                if old_cfg is not None:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old_cfg
+                if old_home is None:
+                    del os.environ["CLAUDE_HOME"]
+                else:
+                    os.environ["CLAUDE_HOME"] = old_home
+
+    def test_traversal_shaped_source_is_never_probed(self):
+        # The slug guard must reject path-shaped sources outright.
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {"channel": "../discord", "channel_id": "x"})
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
     def test_missing_file_is_macos_only(self):
         self.assertEqual(resolve_active_target("/no/such/activity.json"), ("", ""))
 
