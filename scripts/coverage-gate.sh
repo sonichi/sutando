@@ -95,7 +95,7 @@ skipped_total=0
 fully_skipped=()
 partly_skipped=()
 while IFS= read -r f; do
-    if ! output=$(python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1); then
+    if ! output=$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1); then
         echo "✖ test failed under instrumentation: $f"
         echo "$output"
         failed=1
