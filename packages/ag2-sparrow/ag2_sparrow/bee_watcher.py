@@ -7,17 +7,16 @@ no webhooks, so the ag2space broker cannot receive from Bee directly; this
 watcher runs where the bee credentials live, subscribes to the proxy's SSE
 stream, normalizes selected events into the relay task shape (`source: bee`),
 and POSTs them through the broker's authenticated inbound hop (/v1/ingest).
-Results route broker-side to the Bee fallback DM room — the asymmetric-channel
-rule shipped in backend#444 (`integrations/bee.py` + `fallback_room_for`).
+Results route broker-side to the Bee fallback DM room (the broker's
+asymmetric-channel rule: inbound-only sources reply via a fallback room).
 
 Config (CLI flag > BEE_* env > package default in _DEFAULTS). Run via the
 `sutando-bee-watcher` console entry point, or `python -m` the module:
   BEE_PROXY_URL     Bee local proxy base (e.g. http://127.0.0.1:<port>).
                     REQUIRED — empty means the skill is not configured and the
                     watcher exits 2 with a clear message instead of guessing.
-  BEE_EVENTS_PATH   SSE endpoint path on the proxy (default /v1/stream —
-                    VERIFIED against a live authenticated proxy 2026-08-06;
-                    /v1/events, the docs-derived guess, 404s).
+  BEE_EVENTS_PATH   SSE endpoint path on the proxy (default /v1/stream;
+                    /v1/events, the docs-derived guess, 404s live).
   BEE_EVENT_TYPES   comma-list of SSE event types to forward
                     (default todo-created,todo-updated — conservative; the
                     per-utterance stream would flood the task queue).
@@ -34,14 +33,12 @@ Config (CLI flag > BEE_* env > package default in _DEFAULTS). Run via the
   BEE_API_BASE      Bee CLOUD API base (e.g. https://app-api-developer.ce.
                     bee.amazon.dev). When set WITH BEE_API_TOKEN, the watcher
                     subscribes DIRECTLY to Bee's cloud stream with a bearer —
-                    NO local `bee proxy` needed. This is the headless mode for
-                    an always-on server-side container (verified 2026-08-06:
-                    the cloud API accepts direct bearer auth on /v1/me and
-                    /v1/stream). BEE_PROXY_URL is the alternative (local
-                    proxy) source; exactly one is used (API base wins).
-  BEE_API_TOKEN     bearer for BEE_API_BASE (vault-preferred). The headless
-                    server-side custody of the Bee token — see the DM room /
-                    always-on trade in the task-bridge thread.
+                    NO local `bee proxy` needed — the headless mode for an
+                    always-on server-side container. BEE_PROXY_URL is the
+                    alternative (local proxy) source; exactly one is used
+                    (API base wins).
+  BEE_API_TOKEN     bearer for BEE_API_BASE (vault-preferred) — server-side
+                    custody of the Bee token.
   BEE_INBOX_FILE    sqlite path for the inbox sink's OWN EventInbox (default
                     <state>/bee-events.db). Never point it at the gateway
                     channel's inbox — MAX(cursor) there is its resume anchor.
@@ -49,14 +46,9 @@ Config (CLI flag > BEE_* env > package default in _DEFAULTS). Run via the
                     ag2-sparrow's durable EventInbox and drains through the
                     shared TaskifyHandler (threshold=1), which stamps every
                     promoted task access_tier: ambient — the framework path.
-                    LOCAL is the fully-OSS mode
-                    (owner question 2026-08-06: "the user does not need to
-                    depend on ag2space's relay?"): events are written as
-                    task FILES into <workspace>/tasks/ — the same file
-                    bridge voice/Discord use — and the local core processes
-                    them; replies go out through the owner's existing
-                    channels. No broker URL/token needed. The relay adds
-                    hosted fan-in + the Bee DM room, not a dependency.
+                    LOCAL is the fully-OSS mode: events land as task FILES
+                    in <workspace>/tasks/ (the same file bridge voice/Discord
+                    use); no broker URL/token needed.
 
 Cursor: last delivered SSE event id persists to
 <workspace>/state/bee-watcher-cursor.json and is replayed as Last-Event-ID on
@@ -295,8 +287,8 @@ def run(cfg: dict, once: bool = False, max_events: int = 0) -> int:
                     else:
                         ok = _post_task(cfg, task)
                     if not ok:
-                        # Contiguous-prefix cursor discipline (review P1
-                        # 2026-08-06): a failed delivery HALTS the stream.
+                        # Contiguous-prefix cursor: a failed delivery
+                        # HALTS the stream (no skip-ahead on the cursor).
                         # Processing a later event would advance the cursor
                         # past this one, and the reconnect's Last-Event-ID
                         # would tell Bee never to replay it — silent data

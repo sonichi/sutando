@@ -1,6 +1,6 @@
 """sources/bee.py — the Bee AI wearable as a watcher SOURCE.
 
-The sources/ split (owner ask 2026-08-07): an integration contributes only its
+The sources/ registry: an integration contributes only its
 SUBSCRIBE specifics (where the event stream lives, how to authenticate) and its
 NORMALIZE fn (provider payload -> the one relay task shape). Everything else —
 SSE parsing, resume cursor, sink selection (local/inbox/broker), halt-on-failed-
@@ -30,7 +30,7 @@ VAULT_KEYS = ("BEE_BROKER_TOKEN", "BEE_API_TOKEN")
 
 # Package-owned defaults (was a skill manifest before the ag2-sparrow move).
 DEFAULTS = {
-    "BEE_EVENTS_PATH": "/v1/stream",              # verified live 2026-08-06
+    "BEE_EVENTS_PATH": "/v1/stream",
     "BEE_EVENT_TYPES": "todo-created,todo-updated",  # conservative; utterances flood
     "BEE_AGENT_ID": "bee-lane",
     "BEE_SINK": "broker",
@@ -39,12 +39,8 @@ DEFAULTS = {
 _REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(_REPO / "src"))
 
-# Bee events are THIRD-PARTY device content (a wearable's transcription/todo
-# text) — room-level trust, never the owner's. Their text is interpolated into
-# the task body the core reads and acts on, so it MUST be confined against
-# header/fence injection exactly like a Discord/Slack body. Import the shared
-# guard; if it is somehow unavailable (a stripped container), fail CLOSED with
-# an equivalent inline defang rather than persist raw untrusted text.
+# Third-party device content: confine the body against header/fence
+# injection; if the shared guard is missing, fail CLOSED with an inline defang.
 try:
     from task_body_guard import confine_user_content
 except Exception:  # pragma: no cover - only when src/ is absent
@@ -96,7 +92,7 @@ def source_configured(cfg: dict) -> bool:
 def event_to_task(etype: str, event_id: str, data: dict) -> dict:
     """NORMALIZE half: one SSE event into the relay task shape.
 
-    Field mapping VERIFIED against a live authenticated stream (2026-08-06,
+    Field mapping pinned against a live authenticated stream (fixtures:
     first real capture): utterance events nest text under `utterance.text`
     with the stable id at `utterance.id`; the conversation key is
     `conversation_uuid` (not conversation_id); and the stream sends NO SSE
@@ -114,10 +110,8 @@ def event_to_task(etype: str, event_id: str, data: dict) -> dict:
     if not text:
         text = json.dumps(data, separators=(",", ":"))[:500]
     text = confine_user_content(text)   # untrusted device content — defang
-    # The conversation id is ALSO device-controlled and lands in line-based
-    # task files as `channel_id:` — an identifier, so it gets a strict
-    # allowlist (kills header/fence forgery via embedded newlines outright,
-    # stronger than defang; Codex+bassil repro 2026-08-06).
+    # The conversation id is device-controlled and lands as a header line:
+    # strict allowlist, so embedded newlines can never forge headers.
     conv_raw = str(data.get("conversation_uuid") or data.get("conversation_id")
                    or data.get("id") or event_id)[:120]
     conv = re.sub(r"[^A-Za-z0-9._:@-]", "-", conv_raw) or "unknown"
