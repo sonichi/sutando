@@ -101,11 +101,8 @@ text, h = _write_and_parse({"id": "task-gw-3", "task": "just a text question"})
 check("no marker → no attachments header", "attachments:" not in text)
 check("no marker → no content_modalities header", "content_modalities:" not in text)
 
-# ── 5. regression: access_tier still wins a last-occurrence parse (the media
-# headers insert mid-file). Since #2686 the owner-tier ===SKILL INSTRUCTIONS===
-# block follows access_tier, so "last header" means: exactly one header-shaped
-# access_tier line, with nothing after it but bridge-authored block text that
-# never carries the key.
+# ── 5. access_tier must remain the ONLY header-shaped access_tier line —
+# nothing after it but bridge-authored block text that never carries the key.
 def _tier_wins_last(txt):
     ls = [l for l in txt.split("\n") if l]
     tier_at = [i for i, l in enumerate(ls) if l.startswith("access_tier:")]

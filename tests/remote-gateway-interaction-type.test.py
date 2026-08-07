@@ -72,11 +72,8 @@ for v in sorted(rgb._INTERACTION_TYPES):
     h = _headers({"id": f"task-it-{v}", "task": "x", "interaction_type": v})
     check(f"vocab round-trip: {v}", h.get("interaction_type") == v)
 
-# 5. access_tier still wins a last-occurrence parse (regression guard: the new
-# branch must not disturb the ordering the tier defense relies on). Since #2686
-# the owner-tier ===SKILL INSTRUCTIONS=== block follows access_tier, so the
-# invariant is: exactly one header-shaped access_tier line, with nothing after
-# it but bridge-authored block text that never carries the key.
+# 5. access_tier must remain the ONLY header-shaped access_tier line — nothing
+# after it but bridge-authored block text that never carries the key.
 body = (rgb.TASKS_DIR / "task-it-1.txt").read_text()
 lines = [l for l in body.split("\n") if l]
 _tier_at = [i for i, l in enumerate(lines) if l.startswith("access_tier:")]
