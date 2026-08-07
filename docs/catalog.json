@@ -6,7 +6,7 @@
       "audience": ["contributors", "maintainers"],
       "status": "draft",
       "canonical_for": "the capability-not-key credential-resolver contract: tier order, managed-file schema, source observability, and the reader-sweep migration plan",
-      "last_verified": "2026-08-02"
+      "last_verified": "2026-08-05"
     },
     "docs/runtime-dependencies.md": {
       "title": "External runtime dependencies",
@@ -71,6 +71,13 @@
       ],
       "status": "active",
       "canonical_for": "Codex core setup and rollback",
+      "last_verified": "2026-08-04"
+    },
+    "docs/design-mediated-capability-layer.md": {
+      "title": "Mediated capability layer",
+      "audience": ["contributors", "maintainers"],
+      "status": "draft",
+      "canonical_for": "proposed privileged-capability mediation, authorization, and audit model",
       "last_verified": "2026-08-04"
     },
     "docs/community-use-cases/README.md": {
