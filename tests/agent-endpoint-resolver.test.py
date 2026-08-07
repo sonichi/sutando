@@ -78,5 +78,33 @@ class TestModeVocabulary(unittest.TestCase):
         self.assertEqual(MODES, ("durable", "realtime", "local-control"))
 
 
+class TestLoadDescriptor(unittest.TestCase):
+    def test_parses_the_subprocess_descriptor(self):
+        import agent_endpoint
+
+        class FakeCompleted:
+            stdout = '{"workspace": "/ws", "runtimeSocket": "/s"}'
+
+        real_run = agent_endpoint.subprocess.run
+        agent_endpoint.subprocess.run = lambda *a, **k: FakeCompleted()
+        try:
+            d = agent_endpoint.load_descriptor()
+        finally:
+            agent_endpoint.subprocess.run = real_run
+        self.assertEqual(d["runtimeSocket"], "/s")
+
+    def test_missing_repo_root_fails_loud(self):
+        import agent_endpoint
+        import sutando_config
+
+        real = sutando_config._find_repo_root
+        sutando_config._find_repo_root = lambda *a, **k: None
+        try:
+            with self.assertRaises(ValueError):
+                agent_endpoint.load_descriptor()
+        finally:
+            sutando_config._find_repo_root = real
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
