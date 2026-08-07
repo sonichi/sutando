@@ -140,6 +140,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`vision-tools.ts`** — Vision pipeline — pipe JPEG frames from a source (screen, webcam) into the Gemini Live voice session.
 - **`vision_push.py`** — Small helper for posting one-shot vision frames to the active voice session.
 - **`voice-agent-config.ts`** — Voice agent tuned-prompt configuration — step 5a-1 of the interaction-planes refactor (LiveAgentRuntime extraction, slice 1).
+- **`voice-agent-state.ts`** — `agent.state` v1 protocol provider + lifecycle snapshot publisher (design 1a′; impl plan WS1 Step 12, amendments R8/A9/A10/S3/Z3).
 - **`voice-agent.ts`** — Sutando — Voice Interface
 - **`voice-config-switch.ts`** — Voice tool: switch voice-agent's model + googleSearch preset at runtime.
 - **`voice-config.ts`** — Per-surface voice configuration loader.
