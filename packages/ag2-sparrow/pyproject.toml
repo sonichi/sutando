@@ -33,7 +33,7 @@ ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
 sutando-bee-watcher = "ag2_sparrow.bee_watcher:main"
 
 [tool.setuptools]
-packages = ["ag2_sparrow"]
+packages = ["ag2_sparrow", "ag2_sparrow.sources"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }
