@@ -55,7 +55,44 @@ class CoreModelPinProbe(unittest.TestCase):
         r = self.hc.check_core_model_pin()
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("opus", r["detail"])
-        self.assertIn("setenv -u", r["detail"])   # names the remedy
+        self.assertIn("setenv -t '=core' -u", r["detail"])  # remedy names the SESSION
+        self.assertIn("core=", r["detail"])           # and which one is pinned
+
+    def test_sibling_session_does_not_hide_a_pinned_core(self):
+        """THE REGRESSION. Two sessions, only the non-first one pinned.
+
+        Untargeted `show-environment` resolves to whichever session tmux picks.
+        With `notifier` created first, it picked the unpinned one, returned
+        "unknown variable" and the probe reported ok on an actively pinned core --
+        the exact silent miss it exists to prevent. Found independently by
+        qingyun-wu, bassilkhilo-ag2 and sonichi; this fails against the
+        untargeted implementation.
+        """
+        subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "notifier",
+                        "sleep 120"], capture_output=True)
+        subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "sutando-core",
+                        "-e", "SUTANDO_CORE_MODEL=opus", "sleep 120"], capture_output=True)
+        r = self.hc.check_core_model_pin()
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("sutando-core", r["detail"], "must name WHICH session is pinned")
+        self.assertIn("opus", r["detail"])
+
+    def test_creation_order_cannot_hide_it_either(self):
+        """Same two sessions, pinned one created FIRST — order must not matter."""
+        subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "sutando-core",
+                        "-e", "SUTANDO_CORE_MODEL=opus", "sleep 120"], capture_output=True)
+        subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "notifier",
+                        "sleep 120"], capture_output=True)
+        r = self.hc.check_core_model_pin()
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("sutando-core", r["detail"])
+
+    def test_two_unpinned_sessions_stay_ok(self):
+        """The control: the multi-session path must not invent a pin."""
+        for n in ("notifier", "sutando-core"):
+            subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", n,
+                            "sleep 120"], capture_output=True)
+        self.assertEqual(self.hc.check_core_model_pin()["status"], "ok")
 
     def test_unpinned_core_ok(self):
         self._session()
@@ -71,32 +108,41 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
     """The logic half, exercised WITHOUT tmux — these run on any runner.
 
     The first version of this file gated every behavioural test on
-    `skipIf(tmux missing)`. On a CI runner without tmux they all skipped, the new
-    lines got zero coverage, and `diff coverage >= 95%` failed. A test that cannot
-    run where the merge is gated does not cover that code.
+    `skipIf(tmux missing)`. On a CI runner without tmux they all skipped, so the
+    new lines were never executed. A test that cannot run where the merge is
+    gated does not cover that code.
+
+    `_interpret_core_model_pin` now takes the list of pinned (session, value)
+    pairs rather than one tmux result — the single-result form was the P1.
     """
 
     def setUp(self):
         self.hc = _load()
 
-    def test_set_warns_and_names_value_and_remedy(self):
-        r = self.hc._interpret_core_model_pin(0, "SUTANDO_CORE_MODEL=opus\n", "/tmp/s.sock")
+    def test_no_pins_is_ok(self):
+        self.assertEqual(self.hc._interpret_core_model_pin([], "/tmp/s.sock")["status"], "ok")
+
+    def test_one_pin_warns_and_names_session_value_and_remedy(self):
+        r = self.hc._interpret_core_model_pin([("sutando-core", "opus")], "/tmp/s.sock")
         self.assertEqual(r["status"], "warn")
         self.assertIn("opus", r["detail"])
-        self.assertIn("setenv -u SUTANDO_CORE_MODEL", r["detail"])
+        self.assertIn("sutando-core", r["detail"])
+        self.assertIn("setenv -t '=sutando-core' -u SUTANDO_CORE_MODEL", r["detail"])
         self.assertIn("/tmp/s.sock", r["detail"])
 
-    def test_unknown_variable_is_ok(self):
-        r = self.hc._interpret_core_model_pin(1, "unknown variable: SUTANDO_CORE_MODEL", "/tmp/s.sock")
-        self.assertEqual(r["status"], "ok")
+    def test_remedy_is_per_session_when_several_are_pinned(self):
+        """A single untargeted setenv would clear only one — emit one fix each."""
+        r = self.hc._interpret_core_model_pin(
+            [("sutando-core", "opus"), ("second", "sonnet")], "/tmp/s.sock")
+        self.assertEqual(r["status"], "warn")
+        for sess in ("sutando-core", "second"):
+            self.assertIn(f"setenv -t '={sess}' -u SUTANDO_CORE_MODEL", r["detail"])
+        self.assertIn("sonnet", r["detail"])
 
-    def test_empty_output_is_ok(self):
-        self.assertEqual(self.hc._interpret_core_model_pin(0, "", "/tmp/s.sock")["status"], "ok")
-
-    def test_unrelated_line_is_ok(self):
-        """rc 0 with some other variable must not be read as a pin."""
-        r = self.hc._interpret_core_model_pin(0, "SOMETHING_ELSE=1", "/tmp/s.sock")
-        self.assertEqual(r["status"], "ok")
+    def test_name_is_stable(self):
+        for pins in ([], [("core", "opus")]):
+            self.assertEqual(
+                self.hc._interpret_core_model_pin(pins, "/s")["name"], "core-model-pin")
 
     def test_absent_socket_is_ok_not_a_failure(self):
         """Covers the IO half's early return — needs no tmux, so it runs in CI."""
@@ -137,10 +183,6 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("tmux exploded", r["detail"])
         self.assertIn("skipped", r["detail"])
-
-    def test_name_is_stable(self):
-        for rc, out in ((0, "SUTANDO_CORE_MODEL=opus"), (1, "unknown variable: X")):
-            self.assertEqual(self.hc._interpret_core_model_pin(rc, out, "/s")["name"], "core-model-pin")
 
 
 if __name__ == "__main__":

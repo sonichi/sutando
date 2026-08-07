@@ -6467,31 +6467,46 @@ def check_dynamic_loop_freshness(
     return checks
 
 
-def _interpret_core_model_pin(returncode: int, stdout: str, socket: str) -> dict:
-    """Pure half of `check_core_model_pin` — interprets one tmux show-environment result.
+def _interpret_core_model_pin(pinned: list, socket: str) -> dict:
+    """Pure half of `check_core_model_pin`.
 
-    Split out so the logic is testable without tmux present. The probe's earlier
-    tests were all `skipIf(tmux missing)`, so on a runner without tmux every one
-    of them skipped and the new lines had zero coverage — the diff-coverage gate
-    caught it. A test that cannot run on the machine that gates the merge is not
-    a test of that code.
+    `pinned` is [(session_name, value), ...] for EVERY session that has the
+    variable set -- not one tmux result. Reviewers found the single-result form
+    could read a sibling session and report ok on a pinned core.
+
+    Split out so the logic is testable without tmux present: the earlier tests
+    were all `skipIf(tmux missing)`, so on a runner without tmux they skipped and
+    the new lines had zero coverage.
     """
     name = "core-model-pin"
-    out = (stdout or "").strip()
-    # tmux prints "unknown variable: X" (rc != 0) when unset, "X=value" when set.
-    if returncode != 0 or not out.startswith("SUTANDO_CORE_MODEL="):
+    if not pinned:
         return {"name": name, "status": "ok",
-                "detail": "no model pin (core uses the default window)"}
-    value = out.split("=", 1)[1]
+                "detail": "no model pin on any session (core uses the default window)"}
+    where = ", ".join(f"{sess}={val!r}" for sess, val in pinned)
+    # Name the session in the remedy: an operator copies the emitted line, and a
+    # `setenv -u` without -t can clear a different session than the pinned one.
+    fixes = "; ".join(
+        f"tmux -S {socket} setenv -t '={sess}' -u SUTANDO_CORE_MODEL" for sess, _ in pinned
+    )
     return {
         "name": name,
         "status": "warn",
         "detail": (
-            f"core is PINNED to model '{value}' by wedge recovery — this is an emergency "
-            f"downgrade that nothing clears, and it survives every restart. If the core did "
-            f"not just wedge, clear it: tmux -S {socket} setenv -u SUTANDO_CORE_MODEL, then restart."
+            f"core is PINNED by wedge recovery ({where}) — an emergency downgrade that "
+            f"nothing clears and that survives every bare rerun. If the core did not just "
+            f"wedge, clear it: {fixes}, then restart."
         ),
     }
+
+
+def _tmux_sessions(socket: str) -> list:  # pragma: no cover — thin tmux glue, covered by the two-session integration test
+    res = subprocess.run(
+        ["tmux", "-S", socket, "list-sessions", "-F", "#{session_name}"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if res.returncode != 0:
+        return []
+    return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
 
 
 def check_core_model_pin() -> dict:
@@ -6511,21 +6526,30 @@ def check_core_model_pin() -> dict:
     symptom. An emergency mode that neither expires nor announces itself is
     indistinguishable from a deliberate configuration choice.
 
-    Reports only; clearing is `tmux -S <socket> setenv -t <session> -u
-    SUTANDO_CORE_MODEL` plus a restart, which is an operator action.
+    Queries EVERY session on the socket, not tmux's implicit target: a socket can
+    carry sibling sessions, and an untargeted show-environment resolves to
+    whichever tmux picks -- reporting ok while the core is pinned.
+
+    Reports only; clearing is an operator action.
     """
     name = "core-model-pin"
     socket = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
     if not Path(socket).exists():
         return {"name": name, "status": "ok", "detail": "no core tmux socket — skipped"}
     try:
-        res = subprocess.run(
-            ["tmux", "-S", socket, "show-environment", "SUTANDO_CORE_MODEL"],
-            capture_output=True, text=True, timeout=10,
-        )
+        pinned = []
+        for sess in _tmux_sessions(socket):
+            res = subprocess.run(
+                ["tmux", "-S", socket, "show-environment", "-t", f"={sess}",
+                 "SUTANDO_CORE_MODEL"],
+                capture_output=True, text=True, timeout=10,
+            )
+            out = (res.stdout or "").strip()
+            if res.returncode == 0 and out.startswith("SUTANDO_CORE_MODEL="):
+                pinned.append((sess, out.split("=", 1)[1]))
     except (OSError, subprocess.SubprocessError) as e:
         return {"name": name, "status": "ok", "detail": f"could not query tmux env ({e}) — skipped"}
-    return _interpret_core_model_pin(res.returncode, res.stdout, socket)
+    return _interpret_core_model_pin(pinned, socket)
 
 
 def run_all_checks() -> list[dict]:
