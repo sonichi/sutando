@@ -264,31 +264,48 @@ class TestBeeWatcher(unittest.TestCase):
         self.assertIn("buy milk", joined)            # captured text reaches the body
 
     def test_local_redelivery_after_claim_rename_is_not_duplicated(self):
-        # Reviewer's deterministic interleaving: the core claims (renames) the
-        # live task file between deliveries; an SSE replay must NOT create a
-        # second executable copy. The O_EXCL delivery ledger closes the window.
+        # Reviewer's interleaving: the core claims the live task by renaming it
+        # in place to the REAL claimed name (task-<id>.claimed-core-N.txt); an
+        # SSE replay must NOT create a second executable copy. find_task_file
+        # recognizes the claimed variant, so redelivery is skipped.
         from ag2_sparrow import _dirs
         ws = Path(self.tmp.name) / "racews"
         tasksdir = ws / "tasks"
-        statedir = ws / "state"
-        _dirs.set_dirs(task_dir=str(tasksdir), state_dir=str(statedir))
+        _dirs.set_dirs(task_dir=str(tasksdir))
         self.addCleanup(_dirs.set_dirs)
         task = self.mod.event_to_task(
             "todo-created", "evt-race",
             {"todo": {"text": "buy milk", "id": "todo-race"}})
-        # First delivery writes the live file.
         self.assertEqual(self.mod._write_local_task(task), True)
         live = tasksdir / f"{task['id']}.txt"
         self.assertTrue(live.exists())
-        # Core claims it: rename out of the live name (still executing).
-        claimed = tasksdir / f"{task['id']}.claimed-1.txt"
-        live.rename(claimed)
-        # SSE replay of the same stable event.
-        self.assertEqual(self.mod._write_local_task(task), True)
-        # No fresh live copy — only the claimed one exists.
+        claimed = tasksdir / f"{task['id']}.claimed-core-1.txt"
+        live.rename(claimed)                                 # core's in-place claim
+        self.assertEqual(self.mod._write_local_task(task), True)   # SSE replay
         self.assertFalse(live.exists(), "duplicate live task file created")
         copies = list(tasksdir.glob(f"{task['id']}*.txt"))
         self.assertEqual([c.name for c in copies], [claimed.name])
+
+    def test_local_write_crash_before_publish_re_delivers(self):
+        # Codex data-loss probe: if the write dies before os.replace, no task
+        # artifact exists, so a replay MUST re-create it (at-least-once). The
+        # task file is the only delivery record — nothing strands the event.
+        from ag2_sparrow import _dirs
+        ws = Path(self.tmp.name) / "crashws"
+        tasksdir = ws / "tasks"
+        _dirs.set_dirs(task_dir=str(tasksdir))
+        self.addCleanup(_dirs.set_dirs)
+        task = self.mod.event_to_task(
+            "todo-created", "evt-crash",
+            {"todo": {"text": "pay rent", "id": "todo-crash"}})
+        # Simulate a crash mid-write: a leftover .tmp, no published task file.
+        tasksdir.mkdir(parents=True, exist_ok=True)
+        (tasksdir / f"{task['id']}.txt.tmp").write_text("partial")
+        self.assertFalse((tasksdir / f"{task['id']}.txt").exists())
+        # Replay re-delivers — no ledger sentinel to falsely report success.
+        self.assertEqual(self.mod._write_local_task(task), True)
+        self.assertTrue((tasksdir / f"{task['id']}.txt").exists(),
+                        "crash before publish must re-deliver, not strand")
 
     def test_local_sink_needs_no_broker_config(self):
         with patch.object(sys, "argv",

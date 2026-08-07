@@ -94,35 +94,20 @@ def _write_local_task(task: dict) -> bool:
              f"channel_id: {task['channel_id']}", f"user_id: {task['user_id']}",
              "room_name: Bee", "priority: low", "access_tier: ambient"]
     dest = tasks_dir / f"{task['id']}.txt"
-    # Archive-aware pre-skip: covers ids already live/archived from a prior
-    # run (before the delivery ledger existed).
+    # Dedup against the DURABLE task artifact across its whole lifecycle:
+    # find_task_file catches the live name AND the core's in-place claim rename
+    # (task-<id>.claimed-core-N.txt); find_archived_task catches the flat and
+    # month-partitioned archives. The task file IS the delivery record, so a
+    # crash before os.replace leaves no artifact and the halted stream simply
+    # re-delivers (at-least-once) — no separate ledger to strand.
+    from ag2_sparrow.task_archive import find_task_file
     from ag2_sparrow.local_task_protocol import find_archived_task
-    if find_archived_task(tasks_dir, task["id"]) is not None:
-        return True
-    # Delivery ledger: an O_EXCL sentinel is the atomic dedup gate, owned by
-    # the watcher and independent of the core's live->claimed->archived rename.
-    # A replay after the core claimed (renamed) the file finds the sentinel and
-    # skips — closing the TOCTOU that let one event become two task files.
-    from ag2_sparrow import _dirs
-    ledger = _dirs.state_dir() / "bee-delivered"
-    ledger.mkdir(parents=True, exist_ok=True)
-    sentinel = ledger / task["id"]
-    try:
-        fd = os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        os.close(fd)
-    except FileExistsError:
+    if (find_task_file(tasks_dir, task["id"]) is not None
+            or find_archived_task(tasks_dir, task["id"]) is not None):
         return True                     # already delivered — idempotent
-    try:
-        tmp = dest.with_suffix(".txt.tmp")
-        tmp.write_text("\n".join(lines) + "\n")
-        os.replace(tmp, dest)
-    except Exception:
-        # Un-mark so the halted stream re-delivers on reconnect (at-least-once).
-        try:
-            sentinel.unlink()
-        except OSError:
-            pass
-        raise
+    tmp = dest.with_suffix(".txt.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, dest)
     return True
 
 
