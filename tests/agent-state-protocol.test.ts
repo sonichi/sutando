@@ -250,8 +250,10 @@ describe('publishCapabilitiesMarker — group E activation switch', () => {
 		try {
 			publishCapabilitiesMarker(ws, { now: () => 777 });
 			const doc = JSON.parse(readFileSync(voiceCapabilitiesPath(ws), 'utf-8'));
-			// The desktop supervisor requires STRICT `probeIsolation === true`.
-			assert.deepEqual(doc, { probeIsolation: true, at: 777 });
+			// The desktop supervisor requires STRICT `probeIsolation === true` AND
+			// marker.pid === the live lock holder's pid (stale-marker rollback
+			// defense) — the publisher's own pid is the lock winner's by ordering.
+			assert.deepEqual(doc, { probeIsolation: true, at: 777, pid: process.pid });
 			assert.deepEqual(readdirSync(join(ws, 'state')), ['voice-agent.capabilities.json']);
 		} finally { rmSync(ws, { recursive: true, force: true }); }
 	});

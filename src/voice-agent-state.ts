@@ -194,6 +194,13 @@ export function voiceCapabilitiesPath(workspace: string): string {
  * intercepted server-side and can never steal a live client slot. The pin
  * bump and this marker land in the same change on purpose — the marker is
  * the activation switch, so it must never precede the capability.
+ * `pid` binds the marker to the process that published it. The file itself
+ * is a one-way latch (older builds neither write nor delete it), so after an
+ * engine rollback a stale `true` would otherwise keep arming the reader
+ * against a build without probe isolation. The publisher runs strictly after
+ * `acquirePidLock()` (a lock loser exits 7 first), so marker.pid equals the
+ * live lock holder's pid exactly when the marker describes the running
+ * build — the reader requires that equality and fails closed on mismatch.
  * Atomic temp+rename, failure-silent like the lifecycle snapshot: a marker
  * write must never take the voice path down (probes just stay dormant).
  */
@@ -202,7 +209,7 @@ export function publishCapabilitiesMarker(
 	opts?: { now?: () => number; onError?: (err: unknown) => void },
 ): void {
 	const target = voiceCapabilitiesPath(workspace);
-	const doc = { probeIsolation: true, at: (opts?.now ?? Date.now)() };
+	const doc = { probeIsolation: true, at: (opts?.now ?? Date.now)(), pid: process.pid };
 	const tmp = `${target}-tmp-${process.pid}-${++_tmpCounter}`;
 	try {
 		mkdirSync(dirname(target), { recursive: true });
