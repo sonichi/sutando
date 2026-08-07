@@ -1638,12 +1638,21 @@ def _load_dedup_aliases() -> dict[str, str]:
         return {}
 
 
-def _save_dedup_aliases(aliases: dict[str, str]) -> None:
+def _save_dedup_aliases(aliases: dict[str, str]) -> bool:
+    """Atomically persist the alias map. Returns False if it did not commit.
+
+    Unlike the neighbouring sidecars this one is delivery-critical, so the
+    caller must not retire the original delivery until it returns True.
+    """
     try:
         DEDUP_ALIAS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        DEDUP_ALIAS_FILE.write_text(json.dumps(aliases))
-    except OSError as exc:
-        _log(f"could not persist dedup aliases: {exc}")
+        tmp = DEDUP_ALIAS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(aliases, sort_keys=True))
+        os.replace(tmp, DEDUP_ALIAS_FILE)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log(f"dedup alias persist FAILED ({exc}) — keeping original delivery")
+        return False
 
 
 def _delivery_tid(tid: str) -> str:
@@ -1654,7 +1663,7 @@ def _delivery_tid(tid: str) -> str:
 def _forget_dedup_alias(tid: str) -> None:
     aliases = _load_dedup_aliases()
     if aliases.pop(tid, None) is not None:
-        _save_dedup_aliases(aliases)
+        _save_dedup_aliases(aliases)  # cleanup: a stale entry is harmless
 
 
 def _load_task_rooms() -> dict[str, str]:
@@ -1791,12 +1800,15 @@ def _dedup_plan(tid: str, holder_id: str | None):
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
         f"task-{uuid.uuid4().hex[:18]}")
     if action == "requeue":
+        aliases = _load_dedup_aliases()
+        aliases[payload] = _delivery_tid(tid)
+        if not _save_dedup_aliases(aliases):
+            # Without the alias the recovered answer would POST under an id the
+            # broker is not waiting on. Leave everything as-is and retry.
+            return "defer", None, room
         rooms = _load_task_rooms()
         rooms[payload] = room
         _save_task_rooms(rooms)
-        aliases = _load_dedup_aliases()
-        aliases[payload] = _delivery_tid(tid)
-        _save_dedup_aliases(aliases)
     return action, payload, room
 
 
@@ -1817,13 +1829,21 @@ def _post_ready_results(inflight: set[str]) -> None:
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
         if skip and skip.value == "deduped":
             action, payload, room = _dedup_plan(tid, skip.extra)
+            if action == "defer":
+                # Nothing was retired; the next pass retries the whole decision.
+                _log(f"dedup deferred for {tid} — alias not committed")
+                continue
             if action != "honour":
                 if action == "report" and room:
                     try:
                         _req("POST", "/v1/results",
                              {"id": _broker_tid(_delivery_tid(tid)), "body": payload})
-                    except Exception as exc:  # noqa: BLE001 - never block the archive
-                        _log(f"dedup report failed for {tid}: {exc}")
+                    except (urllib.error.URLError, urllib.error.HTTPError,
+                            TimeoutError) as exc:
+                        # The report IS the delivery here. Archiving now would
+                        # strand the ask exactly as the unreported dedup did.
+                        _log(f"dedup report POST failed for {tid}: {exc} — will retry")
+                        continue
                 _log(f"dedup {action} for {tid} (holder {skip.extra} delivered nothing)")
                 _archive_result(rfile, tid)
                 inflight.discard(tid)

@@ -23,8 +23,11 @@ ROOM = "!room:ag2.space"
 
 
 class _Harness:
-    _PATCH = ("RESULTS_DIR", "ARCHIVE_RESULTS_DIR", "TASKS_DIR", "_req",
-              "_save_inflight", "_forget_task_room", "_load_task_rooms",
+    # DEDUP_ALIAS_FILE is a real path under the operator's ~/.ag2-sparrow
+    # state dir. Unisolated, these tests read and overwrite a LIVE bridge's
+    # delivery aliases, and alias persistence cannot be tested deterministically.
+    _PATCH = ("RESULTS_DIR", "ARCHIVE_RESULTS_DIR", "TASKS_DIR", "DEDUP_ALIAS_FILE",
+              "_req", "_save_inflight", "_forget_task_room", "_load_task_rooms",
               "_save_task_rooms")
 
     def __init__(self, gw, tmp: Path):
@@ -39,6 +42,9 @@ class _Harness:
         (results / "archive").mkdir(parents=True)
         tasks.mkdir(parents=True)
         gw.RESULTS_DIR, gw.ARCHIVE_RESULTS_DIR, gw.TASKS_DIR = results, results / "archive", tasks
+        state = self.tmp / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        gw.DEDUP_ALIAS_FILE = state / "remote-dedup-alias.json"
         gw._req = lambda m, p, payload=None, **k: (
             self.posts.append({"path": p, "payload": payload}) or {})
         gw._save_inflight = lambda *a, **k: None
@@ -157,6 +163,54 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
                     self.gw._delivery_tid(new_id), self.gw._delivery_tid(TID),
                     "alias did not persist — after a restart the recovered answer "
                     "would POST under an id the broker does not know")
+
+    def test_alias_write_failure_keeps_the_original_delivery(self):
+        """The alias is delivery-critical: if it cannot commit, retire nothing.
+
+        Reviewer scenario — a failing alias save previously still returned
+        `requeue`, so the original was archived and the recovered answer POSTed
+        under an id the broker was not waiting on.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            with _Harness(self.gw, Path(td)) as h:
+                h.seed("", ORIG, DEDUP)
+                # Unwritable alias path: parent is a file, so mkdir/replace fail.
+                blocked = Path(td) / "blocked"
+                blocked.write_text("not a directory")
+                self.gw.DEDUP_ALIAS_FILE = blocked / "alias.json"
+
+                inflight = {TID}
+                self.gw._post_ready_results(inflight)
+
+                self.assertIn(TID, inflight,
+                              "original delivery retired despite an uncommitted alias")
+                self.assertTrue((h.gw.RESULTS_DIR / f"{TID}.txt").exists(),
+                                "result archived despite an uncommitted alias")
+                self.assertEqual(list(h.gw.ARCHIVE_RESULTS_DIR.glob(f"{TID}-*.txt")), [],
+                                 "archived an unrecoverable dedup")
+                self.assertEqual(h.posts, [], "posted despite deferring")
+
+    def test_failed_report_post_is_retried_not_dropped(self):
+        """The report IS the delivery. A failed POST must not archive the ask."""
+        with tempfile.TemporaryDirectory() as td:
+            with _Harness(self.gw, Path(td)) as h:
+                h.seed("", ORIG + "dedup_requeue_count: 1\n", DEDUP)  # -> report
+
+                import urllib.error
+
+                def _offline(*a, **k):
+                    raise urllib.error.URLError("offline")
+
+                h.gw._req = _offline
+                inflight = {TID}
+                self.gw._post_ready_results(inflight)
+
+                self.assertIn(TID, inflight,
+                              "task dropped from in-flight after a failed report")
+                self.assertTrue((h.gw.RESULTS_DIR / f"{TID}.txt").exists(),
+                                "result archived after a failed report — ask is stranded")
+                self.assertEqual(list(h.gw.ARCHIVE_RESULTS_DIR.glob(f"{TID}-*.txt")), [],
+                                 "archived after a failed report")
 
     def test_unknown_holder_is_re_asked(self):
         """No archived record of the holder is not evidence that it answered."""
