@@ -330,12 +330,8 @@ def get_status() -> dict:
 
 def _active_task_rows() -> list[dict]:
     """Reconcile task/result files into the ten most recent history rows."""
-    # Scan disk for active tasks, updating history while preserving known text.
-    # Workstream-classifier tasks are machinery, not user work, so they stay out
-    # of the history the UI shows (#2586). This filter landed on main while this
-    # extraction was in review; it belongs here now that the scan lives here,
-    # and dropping it during the rebase would have silently reintroduced
-    # classifier rows into /tasks/active.
+    # Classifier tasks are machinery, not user work, so they stay out of the
+    # history the UI shows.
     for task_file in sorted(
         (
             path
@@ -352,22 +348,13 @@ def _active_task_rows() -> list[dict]:
     )[:10]:
         task_id = task_file.stem
         content = task_file.read_text()
-        # Capture the first `source:` and first `task:` regardless of field
-        # order. The guards in _task_display_fields keep body lookalikes from
-        # overriding the real headers (#1781 review, sonichi).
+        # First `source:` and `task:` regardless of field order; body
+        # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
         result_file = RESULT_DIR / task_file.name
         existing = task_history.get(task_id, {})
-        # Results are checked in priority order: (1) live file, (2) prior
-        # in-memory history — which is what covers the bridge having already
-        # archived the file within this process run — then (3) archive.
-        #
-        # (3) is what survives an agent-api RESTART: history is empty then, and
-        # without it every prior task renders "working" with an empty body.
-        # Naming the wrong reason here is expensive, because (3) globs
-        # results/archive/*/ per task per poll — a reader who believes it is
-        # redundant with (2) has a documented reason to delete it, and the
-        # breakage only appears after a restart.
+        # Priority: live file, then in-memory history, then archive. The
+        # archive lookup is what survives a restart, when history is empty.
         archived_file = None
         for month_dir in (RESULT_DIR / "archive").glob("*/"):
             candidate = month_dir / task_file.name
@@ -423,9 +410,8 @@ def _active_task_rows() -> list[dict]:
         task_history.items(), key=lambda item: item[1].get("time", 0), reverse=True
     )[:10]
     rows = [{"id": task_id, **task_data} for task_id, task_data in recent]
-    # Join inferred workstream metadata onto the rows (#2586). This is the
-    # second half of that feature — the classifier filter above is the first —
-    # and both lived inside the inline block this function replaced.
+    # Join inferred workstream metadata onto the rows; the classifier filter
+    # above is the other half of the same feature.
     return task_workstreams.enrich_task_rows(WORKSPACE_DIR, rows)
 
 
