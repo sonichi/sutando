@@ -94,12 +94,8 @@ def _write_local_task(task: dict) -> bool:
              f"channel_id: {task['channel_id']}", f"user_id: {task['user_id']}",
              "room_name: Bee", "priority: low", "access_tier: ambient"]
     dest = tasks_dir / f"{task['id']}.txt"
-    # Dedup against the DURABLE task artifact across its whole lifecycle:
-    # find_task_file catches the live name AND the core's in-place claim rename
-    # (task-<id>.claimed-core-N.txt); find_archived_task catches the flat and
-    # month-partitioned archives. The task file IS the delivery record, so a
-    # crash before os.replace leaves no artifact and the halted stream simply
-    # re-delivers (at-least-once) — no separate ledger to strand.
+    # Dedup on the task artifact (the delivery record) across its lifecycle:
+    # find_task_file = live + claimed-core-N; find_archived_task = archives.
     from ag2_sparrow.task_archive import find_task_file
     from ag2_sparrow.local_task_protocol import find_archived_task
     if (find_task_file(tasks_dir, task["id"]) is not None
