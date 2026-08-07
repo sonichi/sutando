@@ -176,6 +176,7 @@ const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
  * (impl plan WS1 Steps 2/8). The EADDRINUSE fatal path exits 7 for the same
  * reason (see `classifyFatalExitCode`).
  */
+let voiceLockId: string | undefined;
 function acquirePidLock(): void {
 	const myPid = process.pid;
 	const guard = voiceLockGuardPath(WORKSPACE_DIR);
@@ -208,6 +209,10 @@ function acquirePidLock(): void {
 		console.error(`${ts()} [Startup] Fix the lock helper (scripts/voice-lock.py + its python3), then restart. Exiting.`);
 		process.exit(1);
 	}
+	// This acquisition's unique token (vl1-<uuid4> from the structured lock).
+	// The capability marker binds to it so a stale marker can never match a
+	// later run — even one that reuses this pid (see publishCapabilitiesMarker).
+	voiceLockId = res.lockId;
 	// Guarded release on clean exit — NON-BLOCKING fire-and-forget (amendment
 	// S4: a blocking release can deadlock against the helper that just TERM'd
 	// us). Skipped entirely on the fatal path (amendment R1): a stale
@@ -955,6 +960,7 @@ async function main() {
 	// takeover roles, so publish the capability marker the desktop
 	// supervisor's probe battery gates on. Once per process, at wiring init.
 	publishCapabilitiesMarker(WORKSPACE_DIR, {
+		lockId: voiceLockId,
 		onError: (err) => console.error(`${ts()} [AgentState] capabilities marker write failed: ${(err as Error)?.message ?? err}`),
 	});
 	const sendAgentStateFrame = (frame: AgentStateV1): void => {

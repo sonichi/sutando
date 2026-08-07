@@ -248,13 +248,25 @@ describe('publishCapabilitiesMarker — group E activation switch', () => {
 	it('writes the marker shape the desktop reader gates on, atomically', () => {
 		const ws = mkdtempSync(join(tmpdir(), 'agent-state-caps-'));
 		try {
-			publishCapabilitiesMarker(ws, { now: () => 777 });
+			publishCapabilitiesMarker(ws, { now: () => 777, lockId: 'vl1-test-token' });
 			const doc = JSON.parse(readFileSync(voiceCapabilitiesPath(ws), 'utf-8'));
 			// The desktop supervisor requires STRICT `probeIsolation === true` AND
-			// marker.pid === the live lock holder's pid (stale-marker rollback
-			// defense) — the publisher's own pid is the lock winner's by ordering.
-			assert.deepEqual(doc, { probeIsolation: true, at: 777, pid: process.pid });
+			// marker.{pid,lockId} === the live lock holder's (stale-marker rollback
+			// defense; lockId defeats pid reuse) — the publisher's own pid/token
+			// are the lock winner's by ordering.
+			assert.deepEqual(doc, { probeIsolation: true, at: 777, pid: process.pid, lockId: 'vl1-test-token' });
 			assert.deepEqual(readdirSync(join(ws, 'state')), ['voice-agent.capabilities.json']);
+		} finally { rmSync(ws, { recursive: true, force: true }); }
+	});
+
+	it('publishes UNBOUND (no lockId field) when no acquisition token is available', () => {
+		const ws = mkdtempSync(join(tmpdir(), 'agent-state-caps-unbound-'));
+		try {
+			publishCapabilitiesMarker(ws, { now: () => 777 });
+			const doc = JSON.parse(readFileSync(voiceCapabilitiesPath(ws), 'utf-8'));
+			// No token → no lockId field. The desktop reader requires the token,
+			// so an unbound marker never arms the probe battery (fail closed).
+			assert.deepEqual(doc, { probeIsolation: true, at: 777, pid: process.pid });
 		} finally { rmSync(ws, { recursive: true, force: true }); }
 	});
 
