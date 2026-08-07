@@ -93,26 +93,13 @@ MEDIA_FORMS = frozenset({"attachment", "live_stream"})
 PRIORITIES = ("urgent", "normal", "low")
 
 # ── Durable Work Model ───────────────────────────────────────────────────────
-# The permanent semantics of durable agent work, independent of storage:
-#   task identity (id/source/provenance) · access tier · dedupe · lifecycle ·
-#   audit · result identity (a result answers exactly one task id).
-# Files under tasks/ + results/ are the CURRENT materialization of this model,
-# not the model itself. Two invariants (design session 2026-08-07):
-#   1. Transport carries interaction; it never defines authority or durable
-#      semantics.
-#   2. Durable work survives transport changes — swapping files for SQLite or
-#      an embedded log must not change any semantic named here.
 
-# Lifecycle a task observably moves through today. PENDING = file present in
-# tasks/; RESULT_WRITTEN = same-id file in results/ (the canonical completion
-# marker); ARCHIVED = moved under tasks/archive/ (flat legacy or YYYY-MM/).
+# pending = file in tasks/; result_written = same-id result file (the
+# canonical completion marker); archived = under tasks/archive/.
 LIFECYCLE_STATES = ("pending", "result_written", "archived")
 
-# Access tiers (CLAUDE.md access-control sections). `owner` is full
-# processing; team/other are sandboxed; `ambient` is taskify-promoted room
-# observation — sandboxed like team/other, never instructions. A missing
-# header reads as owner for legacy local files — that default belongs to
-# consumers, not this module.
+# `ambient` is sandboxed observation, never instructions. The
+# missing-header-defaults-to-owner rule belongs to consumers, not here.
 ACCESS_TIERS = ("owner", "team", "other", "ambient")
 
 # The header vocabulary: every key observed in the real archive corpus
