@@ -30,7 +30,7 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { inlineTools } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
@@ -40,8 +40,15 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
+function assertMacOS() {
+	if (process.platform !== 'darwin' && process.env.SUTANDO_TEST_MODE !== '1') {
+		console.error('Sutando requires macOS');
+		process.exit(1);
+	}
+}
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
+import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndExit, EXIT_CODE_DUPLICATE_INSTANCE } from './crash-only.js';
+import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
@@ -119,6 +126,10 @@ const HOST = process.env.HOST || '127.0.0.1';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
 const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
+/** Bounded primitive-only crash record — shared by BOTH fatal paths (the
+ * uncaught handler and `main().catch`), which obey identical crash-only
+ * rules (design 1d; amendments R1/R2). */
+const CRASH_RECORD_PATH = join(WORKSPACE_DIR, 'logs', 'voice-agent.crash.json');
 const SESSION_ID = `session_${Date.now()}`;
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
@@ -136,44 +147,64 @@ const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
  * binds, no watchers wired, no `setVisionSession`) — it exits before the
  * `VoiceSession` constructor runs.
  *
- * Stale pidfiles (SIGKILL / crash without `process.on('exit')` firing) are
- * detected via `process.kill(pid, 0)` and overwritten. The rare race between
- * two simultaneous startups is backstopped by the EADDRINUSE branch in
- * `uncaughtException` below.
+ * The lock is a STRUCTURED JSON record `{v:1, lockId, pid, startTimeMs,
+ * entry, workspace}` created/validated/replaced exclusively by the guarded
+ * bundled-Python helper `scripts/voice-lock.py` under an advisory
+ * `fcntl.flock` on `.voice-agent.lock.guard` — the single implementation
+ * shared with the Node supervisor and `restart-voice-agent.sh` (design 1b).
+ * Stale locks (dead pid, or PID reuse detected via a `ps -o lstart=`
+ * mismatch) are replaced under the guard; a live lock is never removed. If
+ * the helper's interpreter is unavailable, lock operations FAIL CLOSED with
+ * an actionable error (amendment R3) — there is no unguarded legacy writer.
+ *
+ * EXIT CODE 7 = duplicate lock/port: "another instance owns the singleton
+ * resource; my exit is the expected outcome of a race". The supervisor's
+ * exit-7 grace window keys on it to distinguish a lost race from a crash
+ * (impl plan WS1 Steps 2/8). The EADDRINUSE fatal path exits 7 for the same
+ * reason (see `classifyFatalExitCode`).
  */
-function isProcessAlive(pid: number): boolean {
-	try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
 function acquirePidLock(): void {
 	const myPid = process.pid;
-	try {
-		// Atomic create-or-fail (O_EXCL). If another voice-agent is starting
-		// concurrently, exactly one open() wins; the other gets EEXIST.
-		const fd = openSync(PIDFILE, 'wx');
-		try { writeSync(fd, Buffer.from(`${myPid}\n`)); }
-		finally { closeSync(fd); }
-	} catch (e) {
-		if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-		let raw = '';
-		try { raw = readFileSync(PIDFILE, 'utf-8').trim(); } catch {}
-		const oldPid = Number.parseInt(raw, 10);
-		if (oldPid && oldPid !== myPid && isProcessAlive(oldPid)) {
-			console.error(`${ts()} [Startup] FATAL: voice-agent already running (pid ${oldPid}) for ${WORKSPACE_DIR}`);
-			console.error(`${ts()} [Startup] Kill it first or remove ${PIDFILE}. Exiting.`);
-			process.exit(1);
-		}
-		console.warn(`${ts()} [Startup] Stale pidfile (pid=${raw || 'empty'} not alive) — overwriting.`);
-		writeFileSync(PIDFILE, `${myPid}\n`);
+	const guard = voiceLockGuardPath(WORKSPACE_DIR);
+	let entry = process.argv[1] ?? fileURLToPath(import.meta.url);
+	try { entry = realpathSync(entry); } catch { /* keep the unresolved path */ }
+	const py = resolveLockPython();
+	if (!py.ok) {
+		// Fail closed (amendment R3): never fall back to an unguarded bare-pid
+		// writer — a second writer implementation would reopen the lock races
+		// the guarded helper exists to close.
+		console.error(`${ts()} [Startup] FATAL: cannot resolve a usable python3 for the voice lock helper — ${py.detail}`);
+		console.error(`${ts()} [Startup] Lock operations fail closed. Fix: install python3 (brew install python), set SUTANDO_PY to a working interpreter, or run xcode-select --install. Exiting.`);
+		process.exit(1);
 	}
-	// Only unlink if WE still own the pidfile — protects against a race where
-	// a restart-driven successor overwrote it between our exit signal and
-	// this handler running.
+	const res = acquireVoiceLock({
+		pidfile: PIDFILE,
+		guard,
+		pid: myPid,
+		entry,
+		workspace: WORKSPACE_DIR,
+		pythonBin: py.bin,
+	});
+	if (res.status === 'held') {
+		console.error(`${ts()} [Startup] FATAL: voice-agent already running (pid ${res.holderPid ?? 'unknown'}) for ${WORKSPACE_DIR}`);
+		console.error(`${ts()} [Startup] Kill it first or remove ${PIDFILE}. Exiting.`);
+		process.exit(EXIT_CODE_DUPLICATE_INSTANCE);
+	}
+	if (res.status !== 'acquired') {
+		console.error(`${ts()} [Startup] FATAL: voice lock acquisition failed (fail closed): ${res.detail}`);
+		console.error(`${ts()} [Startup] Fix the lock helper (scripts/voice-lock.py + its python3), then restart. Exiting.`);
+		process.exit(1);
+	}
+	// Guarded release on clean exit — NON-BLOCKING fire-and-forget (amendment
+	// S4: a blocking release can deadlock against the helper that just TERM'd
+	// us). Skipped entirely on the fatal path (amendment R1): a stale
+	// structured lock is left for the supervisor to replace safely under the
+	// guard.
 	process.on('exit', () => {
-		try {
-			const raw = readFileSync(PIDFILE, 'utf-8').trim();
-			if (Number.parseInt(raw, 10) === myPid) unlinkSync(PIDFILE);
-		} catch {}
+		releaseOnExitUnlessFatal(
+			{ pidfile: PIDFILE, guard, pid: myPid, pythonBin: py.bin },
+			isFatalExit,
+		);
 	});
 }
 
@@ -690,6 +721,14 @@ async function main() {
 	// so a duplicate exits without stranding `:7847` with a dead session.
 	acquirePidLock();
 
+	// Test-only fault injection (SUTANDO_TEST_MODE only): throw AFTER the lock
+	// is acquired so the crash-only contract of `main().catch` — bounded crash
+	// record, static-string logging, R1 release suppression (the stale lock
+	// stays for the supervisor) — is provable end-to-end.
+	if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_FAIL_MAIN) {
+		throw new Error(process.env.SUTANDO_TEST_FAIL_MAIN);
+	}
+
 	// --- Voice agent observability ---
 	// Same format as phone agent's call-metrics.jsonl so diagnose.py can
 	// analyze both. State + flush + usage-ticker management moved to
@@ -1002,25 +1041,56 @@ async function main() {
 	};
 	process.on('SIGINT', shutdown);
 	process.on('SIGTERM', shutdown);
-	process.on('uncaughtException', (err) => {
-		// EADDRINUSE on the WS port means another voice-agent (typically the
-		// launchd-managed one) already owns it. The existing process is the
-		// one with the live Gemini transport — the duplicate that tripped
-		// this handler has already bound the vision control port and would
-		// happily answer /vision/start with a dead sessionRef, breaking
-		// push-mode screen sharing for the active session. Release the
-		// control port and exit so the launchd voice-agent (or the next
-		// restart) can claim 7847 with a live session.
-		if ((err as NodeJS.ErrnoException)?.code === 'EADDRINUSE') {
+	// Crash-only fatal handlers (design 1d; impl plan WS1 Step 1). The
+	// 2026-08-04 incident (pid 14059, ~5 h outage) spun INSIDE the old
+	// `console.error(…, err)` reporting path (`TriggerUncaughtException` →
+	// `InspectorConsoleCall` / `ErrorStackGetter`) while staying alive and
+	// holding :9900. New invariant: a fatal TERMINATES, promptly, via a
+	// bounded primitive-only crash record — no logger, no recorder, no
+	// SQLite, no `err.stack`, no object inspection. `recorder.flush()` stays
+	// ONLY in the graceful shutdown path above; richer crash metadata is the
+	// supervisor's job when it reaps the exit.
+	const crashRecordPath = CRASH_RECORD_PATH;
+	const onFatal = (err: unknown) => {
+		// One-shot guard: a second fatal while handling the first goes
+		// straight to process.exit(1). markFatalExit() also suppresses the
+		// exit-time Python lock release (amendment R1) — the helper can block
+		// on the guard; the stale lock is replaced safely by the supervisor.
+		if (markFatalExit()) {
+			process.exit(1);
+			return;
+		}
+		if (classifyFatalExitCode(err) === EXIT_CODE_DUPLICATE_INSTANCE) {
+			// EADDRINUSE on the WS port means another voice-agent (typically
+			// the launchd-managed one) already owns it — duplicate-instance
+			// semantics, exit 7 (impl plan WS1 Step 2 / amendment R2), same as
+			// the duplicate-lock exit. Release the vision control port so the
+			// live agent (or the next restart) can claim 7847.
 			console.error(`${ts()} [FATAL] EADDRINUSE on :${PORT} — another voice-agent is listening; exiting so the live one keeps the vision control port.`);
 			try { stopVisionControlServer(); } catch {}
-			process.exit(1);
+			process.exit(EXIT_CODE_DUPLICATE_INSTANCE);
+			return;
 		}
-		console.error(`${ts()} [FATAL] uncaught exception (staying alive):`, err);
-	});
-	process.on('unhandledRejection', (err) => {
-		console.error(`${ts()} [FATAL] unhandled rejection (staying alive):`, err);
-	});
+		// Static string only — never interpolate or inspect `err` here.
+		console.error(`${ts()} [FATAL] uncaught fatal — crash-only exit (record: ${crashRecordPath})`);
+		writeCrashRecordAndExit(err, crashRecordPath, { exit: (code) => process.exit(code) });
+	};
+	process.on('uncaughtException', onFatal);
+	process.on('unhandledRejection', onFatal);
+
+	// Test-only fault injection (SUTANDO_TEST_MODE only): raise an uncaught
+	// exception AFTER the fatal handlers are installed so tests can pin the
+	// uncaughtException path directly — e.g. EADDRINUSE → exit 7 through
+	// `onFatal`, not only through `main().catch` (amendment R2).
+	if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_RAISE_UNCAUGHT) {
+		const raiseCode = process.env.SUTANDO_TEST_RAISE_UNCAUGHT;
+		setTimeout(() => {
+			throw Object.assign(
+				new Error(`test uncaught ${raiseCode}`),
+				raiseCode === 'EADDRINUSE' ? { code: raiseCode } : {},
+			);
+		}, 250);
+	}
 
 	voiceSessionRef = session;
 
@@ -1237,12 +1307,30 @@ async function main() {
 }
 
 main().catch((err) => {
-	if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+	// This is a FATAL path and obeys the SAME crash-only rules as the
+	// uncaught handler above (design 1d; amendments R1/R2): markFatalExit()
+	// FIRST, so the exit-time lock release skips the (potentially
+	// guard-blocked) Python helper and a second fatal while handling this
+	// one goes straight to process.exit(1); never `console.error(err)` —
+	// object inspection inside error reporting was the 2026-08-04 incident's
+	// spin — only static strings + the bounded primitive-only crash record.
+	if (markFatalExit()) {
+		process.exit(1);
+		return;
+	}
+	// Centralized exit classification (amendment R2): EADDRINUSE reaches
+	// exit 7 on BOTH fatal paths — the uncaught handler above AND this one —
+	// so the supervisor's exit-7 grace window sees every duplicate-instance
+	// race, whichever path the bind error takes.
+	const code = classifyFatalExitCode(err);
+	if (code === EXIT_CODE_DUPLICATE_INSTANCE) {
 		console.error(`\nError: port ${PORT} is already in use.`);
 		console.error(`Kill the existing process: kill $(lsof -ti :${PORT})`);
 		console.error('Then run pnpm start again.\n');
-	} else {
-		console.error('Fatal:', err);
+		process.exit(code);
+		return;
 	}
-	process.exit(1);
+	// Static string only — the crash record replaces `'Fatal:', err`.
+	console.error(`[FATAL] main() failed — crash-only exit (record: ${CRASH_RECORD_PATH})`);
+	writeCrashRecordAndExit(err, CRASH_RECORD_PATH, { exit: (c) => process.exit(c) });
 });

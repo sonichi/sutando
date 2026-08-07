@@ -288,17 +288,16 @@ esac
   && echo "  ok  ...and the bundled interpreter actually executes" \
   || fail "python-bin returned a bundled path that does not run: $got"
 
-# CONTROL: remove the bundled runtime, change nothing else. Resolution must fall
-# through to tier 3 — otherwise the assertion above could be matching a path that
-# gets returned regardless of whether the runtime is really there.
+# CONTROL: remove the bundled runtime; python-bin must not keep claiming it.
+# A loud failure is expected when no verified later tier exists.
 rm -f "$BUNDLE/runtime/python/bin/python3"
 got_none="$(env -i PATH="$STUBBIN:/usr/bin:/bin" \
-            bash "$BUNDLE/sutando/scripts/sutando-config.sh" python-bin 2>/dev/null)"
+            bash "$BUNDLE/sutando/scripts/sutando-config.sh" python-bin 2>/dev/null)" || true
 case "$got_none" in
   */runtime/python/bin/python3)
     fail "python-bin still claims the bundled runtime after it was removed (got: $got_none)" ;;
   *)
-    echo "  ok  control: with no bundled runtime it falls through to a later tier" ;;
+    echo "  ok  control: with no bundled runtime it never claims it" ;;
 esac
 
 # Summary last: printing PASS before the tier-2 assertions below would have
