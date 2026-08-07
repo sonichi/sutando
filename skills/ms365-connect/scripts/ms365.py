@@ -153,13 +153,30 @@ def _owner_only_backend(FileSystemTokenBackend, token_dir, filename=_TOKEN_FILEN
     return _OwnerOnlyTokenBackend(token_path=token_dir, token_filename=filename)
 
 
+def _auth_flow() -> str:
+    """"credentials" (confidential client, id+secret — the default) or "public"
+    (native/public client, id only). Env-selected because Azure decides this at
+    the app registration: an app whose redirect lives under "Mobile and desktop
+    applications" is a PUBLIC client, and presenting a client_secret to it fails
+    the token exchange with AADSTS700025 ("Client is public so neither
+    'client_assertion' nor 'client_secret' should be presented") — hit live on
+    2026-08-06. Set MS365_AUTH_FLOW=public for such registrations."""
+    flow = (os.environ.get("MS365_AUTH_FLOW") or "credentials").strip().lower()
+    if flow not in ("credentials", "public"):
+        sys.stderr.write(
+            f"Invalid MS365_AUTH_FLOW {flow!r}: use 'credentials' or 'public'.\n")
+        sys.exit(2)
+    return flow
+
+
 def _require_credentials():
-    """Return (client_id, client_secret, tenant_id) or exit if any is unset."""
-    missing = [
-        name
-        for name in ("MS365_CLIENT_ID", "MS365_CLIENT_SECRET", "MS365_TENANT_ID")
-        if not os.environ.get(name)
-    ]
+    """Return (client_id, client_secret, tenant_id) or exit if any required one
+    is unset. In public flow the client secret is NOT required (and never sent);
+    client_secret comes back as None there."""
+    required = ["MS365_CLIENT_ID", "MS365_TENANT_ID"]
+    if _auth_flow() == "credentials":
+        required.insert(1, "MS365_CLIENT_SECRET")
+    missing = [name for name in required if not os.environ.get(name)]
     if missing:
         sys.stderr.write(
             "Missing required environment variable(s): "
@@ -169,7 +186,7 @@ def _require_credentials():
         sys.exit(2)
     return (
         os.environ["MS365_CLIENT_ID"],
-        os.environ["MS365_CLIENT_SECRET"],
+        os.environ.get("MS365_CLIENT_SECRET") or None,
         os.environ["MS365_TENANT_ID"],
     )
 
@@ -182,12 +199,23 @@ def _build_account():  # pragma: no cover  (live Graph calls; not unit-testable)
     token_dir = _secure_dir(_token_dir())
     token_backend = _owner_only_backend(FileSystemTokenBackend, token_dir)
 
-    account = Account(
-        credentials=(client_id, client_secret),
-        auth_flow_type="authorization",  # confidential client (id + secret)
-        tenant_id=tenant_id,
-        token_backend=token_backend,
-    )
+    if _auth_flow() == "public":
+        # Native/public client: id only; O365 runs the same authorization-code
+        # flow but never presents a secret (matches an app registered under
+        # "Mobile and desktop applications" — see _auth_flow).
+        account = Account(
+            credentials=client_id,
+            auth_flow_type="public",
+            tenant_id=tenant_id,
+            token_backend=token_backend,
+        )
+    else:
+        account = Account(
+            credentials=(client_id, client_secret),
+            auth_flow_type="authorization",  # confidential client (id + secret)
+            tenant_id=tenant_id,
+            token_backend=token_backend,
+        )
     return account
 
 

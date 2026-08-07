@@ -1116,7 +1116,17 @@ if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channel
     # leaving the success line outside it still reported a launch that never
     # happened — per named instance, on a configured remote-control surface.
     if [ -n "$PY" ]; then
+      # REMOTE_TASK_CHANNEL_DIR isolates this instance's channel config
+      # (.env fallback + access.json). Without it the named instance defaults
+      # to channels/ag2space/ and inherits PROD's credentials and tier map —
+      # the exact failure #2701 exists to prevent (review P1, bassil).
+      # Convention: instance "dev" → channels/dev-ag2space/; anything else →
+      # channels/<inst>-ag2space/ unless the operator overrides via
+      # REMOTE_TASK_CHANNEL_DIR_<INST>.
+      _gw_chdir_var="REMOTE_TASK_CHANNEL_DIR_${_gw_var#AG2_REMOTE_TOKEN_}"
+      _gw_chdir="${!_gw_chdir_var:-${_gw_inst}-ag2space}"
       SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
+        REMOTE_TASK_CHANNEL_DIR="$_gw_chdir" \
         REMOTE_PROACTIVE_ROOM= \
         "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
       echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"

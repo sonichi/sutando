@@ -34,6 +34,13 @@ Config (env / .env):
   REMOTE_TASK_URL        gateway base URL (only needed with a bare secret)
   REMOTE_TASK_URL/_TOKEN  legacy aliases
   REMOTE_TASK_PROVIDER  label used for the task `source:` field (default "remote")
+  REMOTE_TASK_CHANNEL_DIR  name of this instance's config dir under
+                        $CLAUDE_CONFIG_DIR/channels/ (default "ag2space") —
+                        selects which .env fallback and access.json a bridge
+                        instance reads, so a second instance (e.g. a dev
+                        homeserver's "dev-ag2space") cannot inherit prod's
+                        credentials or tier map. Env-only by necessity: the
+                        .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
 
 Stdlib only (urllib) — no new dependencies.
@@ -178,6 +185,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
+from .result_ready import read_ready_result
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -353,6 +361,12 @@ def _parse_onboarding_token(raw):
     return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
 
 
+# Which channels/<dir>/ this instance reads (.env fallback + access.json).
+# Env-only — the .env file can't name its own directory. Default preserves the
+# historical single-instance layout.
+CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+
+
 def _token_from_ag2space_env():
     """Fallback token source when the launcher didn't export it into the env.
 
@@ -386,7 +400,7 @@ def _token_from_ag2space_env():
     candidates = [os.environ.get("AG2_DEVICE_ENV")]
     _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if _cfg:
-        candidates.append(os.path.join(_cfg, "channels", "ag2space", ".env"))
+        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
     for path in candidates:
         if not path:
             continue
@@ -597,7 +611,7 @@ if LOCAL_TIER not in ("owner", "team", "other"):
 # revoke them without a restart.
 def _ag2space_access_path():
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-    return os.path.join(base, "channels", "ag2space", "access.json")
+    return os.path.join(base, "channels", CHANNEL_DIR, "access.json")
 
 
 # Known tier vocabulary. Also an ordering (higher == more privileged); kept for
@@ -1716,9 +1730,9 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if not rfile.exists():
+        body = read_ready_result(rfile)
+        if body is None:
             continue
-        body = rfile.read_text().strip()
         # Route marker decisions through the unified parser (#873) like the
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
