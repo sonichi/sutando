@@ -5197,6 +5197,9 @@ async def poll_proactive():
 # allowlist, not a denylist: a newly-added source is non-eligible by default
 # and can never leak into DM unless deliberately added.
 DM_FALLBACK_SOURCES = {"voice", "phone"}
+# Sources whose own consumer drains `results/task-*.txt`. Anything in NEITHER
+# set has no consumer at all, so skipping it loses the reply permanently.
+DELIVERY_OWNING_SOURCES = {"discord", "telegram", "slack", "chat", "api", "gateway", "whatsapp"}
 
 
 def _task_source(task_id: str):
@@ -5239,6 +5242,45 @@ def _dm_fallback_eligible(task_id: str) -> bool:
     return _task_source(task_id) in DM_FALLBACK_SOURCES
 
 
+def _task_channel_id(task_id: str):
+    """`channel_id:` of a task file as an int, or None when absent/unparseable.
+    Same file resolution as `_task_source` — live, processed, then archived."""
+    tf = find_task_file(TASKS_DIR, task_id)
+    if not tf:
+        processed = TASKS_DIR / "processed" / f"{task_id}.txt"
+        if processed.exists():
+            tf = processed
+    if not tf:
+        archived = sorted((TASKS_DIR / "archive").glob(f"*/{task_id}.txt"))
+        if archived:
+            tf = archived[-1]
+    if not tf:
+        return None
+    try:
+        for line in tf.read_text(errors="replace").splitlines():
+            if line.startswith("channel_id:"):
+                raw = line.split(":", 1)[1].strip()
+                return int(raw) if raw.isdigit() else None
+    except OSError:
+        return None
+    return None
+
+
+def _orphan_channel_target(task_id: str):
+    """Channel a `task-` result must go to because NOTHING else will deliver it.
+
+    None unless the source owns no consumer (not in either source set) AND the
+    task names a channel. Fail-closed: an unknown source with no channel_id is
+    left alone rather than guessed at.
+    """
+    if not task_id.startswith("task-"):
+        return None
+    src = _task_source(task_id)
+    if src in DM_FALLBACK_SOURCES or src in DELIVERY_OWNING_SOURCES:
+        return None
+    return _task_channel_id(task_id)
+
+
 async def poll_dm_fallback():
     """Fallback path for task/question/briefing results that no other
     consumer is going to handle.
@@ -5279,6 +5321,18 @@ async def poll_dm_fallback():
                 # this gate and stay eligible. FAIL-CLOSED: a missing/unreadable
                 # source is NOT eligible (see _dm_fallback_eligible).
                 if task_id.startswith("task-") and not _dm_fallback_eligible(task_id):
+                    # A source in NEITHER set owns no consumer, so this skip is
+                    # permanent loss, not deferral. Say so instead of dropping
+                    # silently; delivery wiring is deliberately not done here.
+                    _orphan_ch = _orphan_channel_target(task_id)
+                    if _orphan_ch is not None:
+                        print(
+                            f"  [dm-fallback] UNDELIVERABLE {f.name}: source="
+                            f"{_task_source(task_id)!r} owns no consumer and is not "
+                            f"DM-eligible; task names channel {_orphan_ch} but nothing "
+                            f"delivers there. This result will never be sent.",
+                            flush=True,
+                        )
                     continue
                 # Grace window so voice-agent / telegram-bridge get first dibs.
                 try:
