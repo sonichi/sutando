@@ -49,6 +49,7 @@ import react as _react  # noqa: E402
 # than carrying a parallel copy (the previous EventAccumulator duplicated it,
 # and contract fixes had to land twice — e.g. the fsync order fix).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "src"))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "packages", "ag2-sparrow"))
 from ag2_sparrow.event_consumer import (  # noqa: E402
     MEANINGFUL_TYPES, TaskifyHandler,

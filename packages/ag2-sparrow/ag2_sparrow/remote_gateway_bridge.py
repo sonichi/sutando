@@ -323,8 +323,11 @@ def _env_compat(new, old):
 # A %7C-separated token carries no literal "|", so a naive split leaves it a bare
 # secret with an empty URL and the bridge FATALs at startup — the core looks
 # "connected" (device-connect completed) but never responds, the Vidhu-onboarding
-# failure 2026-07-24.
-_SEPARATOR_RE = re.compile(r"\||%7[Cc]")
+# failure 2026-07-24. A literal "|" is PREFERRED over %7C/%7c when both appear:
+# a raw pipe cannot legally occur inside a URL, so when one exists it IS the
+# separator — keeps a URL half carrying an encoded %7C intact (#2679; same
+# rule as the shared credential contract until PR3 delegates this parser).
+_ENCODED_SEPARATOR_RE = re.compile(r"%7[Cc]")
 
 
 def _parse_onboarding_token(raw):
@@ -341,7 +344,10 @@ def _parse_onboarding_token(raw):
     """
     if not raw.lower().startswith(("http://", "https://")):
         return "", raw  # bare secret — opaque, never touched
-    m = _SEPARATOR_RE.search(raw)
+    i = raw.find("|")
+    if i != -1:
+        return raw[:i], raw[i + 1:]  # literal pipe wins; URL + secret verbatim
+    m = _ENCODED_SEPARATOR_RE.search(raw)
     if m is None:
         return "", raw  # scheme but no separator; the URL-less guard in main() speaks
     return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
@@ -528,6 +534,9 @@ _TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
                 # them (absent for other sources); each newline-stripped by
                 # _one_line so a room/display name can't forge an extra line.
                 "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                # Room-membership context (gateway writer side, same contract):
+                # a capped one-line mxid list + the true joined total.
+                "room_members", "room_member_count",
                 "source_message_id", "user_id", "priority", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
@@ -1558,6 +1567,18 @@ def _write_task(task: dict) -> str | None:
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
+    # Anonymous product telemetry — #2274 parity for the gateway surface: one
+    # task_processed{source} per NEWLY queued task (the dedup/idempotent early
+    # returns above never reach here, so redeliveries aren't double-counted).
+    # Same fire-and-forget shape as the discord/slack/telegram bridges. The
+    # `telemetry` module lives in the host repo's src/, which the
+    # src/remote-gateway-bridge.py launcher puts on sys.path; a standalone
+    # PyPI install has no such module and this silently no-ops.
+    try:
+        from telemetry import task_processed
+        task_processed(_one_line(task.get("source") or PROVIDER))
+    except Exception:
+        pass
     _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
