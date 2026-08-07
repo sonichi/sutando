@@ -303,3 +303,65 @@ esac
 # Summary last: printing PASS before the tier-2 assertions below would have
 # announced success for checks that had not run yet.
 echo "PASS: interpreter precedence (SUTANDO_PY / bundled) is honoured by the gate"
+
+# --- S1 truth table: voicePreference / quarantined (design 2b, WS2 Step 4) ----
+#     The launcher implements the SHARED credential-source table (amendment S1)
+#     alongside the TS/python resolvers, health-check.py and the desktop
+#     supervisor's spawn-env gate; tests/voice-preference-consumers.test.sh
+#     drives all the engine-side consumers over one fixture matrix — these
+#     cases pin the launcher's own decision + its user-facing reasons.
+
+# 8. BYOK preference: managed entries must NOT enable voice (the resolver would
+#    refuse them, so booting off them here would resurrect the disagreement
+#    this whole suite exists to prevent).
+write_managed '{"capabilities":{"gemini-voice":{"key":"managed-v"},"gemini-text":{"key":"managed-t"}},"voicePreference":"byok"}'
+out="$(run_gate)"
+grep -q 'SKIP_VOICE=1' <<<"$out" || fail "byok preference still booted voice off a managed entry: $out"
+grep -q 'BYOK preference set (managed entries ignored)' <<<"$out" \
+  || fail "byok-with-no-env-key must read as disabled WITH the preference named: $out"
+grep -q 'GEMINI_VOICE_API_KEY' <<<"$out" || fail "byok-disabled message must name the env escape hatch: $out"
+
+# 9. BYOK preference + env key -> enabled (env is the only satisfying source).
+out="$(run_gate byo-main-key)"
+grep -q 'SKIP_VOICE=0' <<<"$out" || fail "byok preference + env key should enable voice: $out"
+
+# 10. Quarantined entries are absent in EVERY mode (signed-out quarantine):
+#     no preference marker, quarantined file, no env key -> disabled.
+write_managed '{"capabilities":{"gemini-voice":{"key":"managed-v"}},"quarantined":true}'
+out="$(run_gate)"
+grep -q 'SKIP_VOICE=1' <<<"$out" || fail "quarantined managed entry still booted voice: $out"
+
+# 11. ...but quarantine only hides the MANAGED tier: an env key still enables
+#     under an unset preference (legacy walk).
+grep -q 'SKIP_VOICE=0' <<<"$(run_gate byo-main-key)" \
+  || fail "quarantine must not disable a BYO env key under an unset preference"
+
+# 12. Managed preference + usable managed entry -> enabled via the managed tier.
+write_managed '{"capabilities":{"gemini-voice":{"key":"managed-v"}},"voicePreference":"managed"}'
+out="$(run_gate)"
+grep -q 'SKIP_VOICE=0' <<<"$out" || fail "managed preference + managed entry did not enable voice: $out"
+grep -q 'managed credentials' <<<"$out" || fail "managed-preference enable must credit the managed tier: $out"
+
+# 13. S1's load-bearing row: managed preference + env key + QUARANTINED managed
+#     entries -> voice stays OFF. A present env key must not silently satisfy a
+#     managed preference — that is the logout-quarantine bypass.
+write_managed '{"capabilities":{"gemini-voice":{"key":"managed-v"}},"voicePreference":"managed","quarantined":true}'
+out="$(run_gate byo-main-key byo-voice-key)"
+grep -q 'SKIP_VOICE=1' <<<"$out" \
+  || fail "S1 VIOLATION: env key satisfied a managed preference with quarantined entries: $out"
+grep -q 'voicePreference=managed' <<<"$out" \
+  || fail "managed-preference disable must name the preference: $out"
+
+# 14. Same with the managed entries MISSING outright.
+write_managed '{"capabilities":{},"voicePreference":"managed"}'
+out="$(run_gate byo-main-key)"
+grep -q 'SKIP_VOICE=1' <<<"$out" \
+  || fail "S1 VIOLATION: env key satisfied a managed preference with no managed entry: $out"
+
+# 15. Marker-free file (with only the R15 revision fields) -> byte-identical
+#     legacy behavior: the managed entry boots voice. Regression pin.
+write_managed '{"capabilities":{"gemini-voice":{"key":"managed-v"}},"preferenceRevision":7,"sessionRevision":3}'
+out="$(run_gate)"
+grep -q 'SKIP_VOICE=0' <<<"$out" || fail "marker-free managed file regressed (revisions must be ignored): $out"
+
+echo "PASS: launcher honours the S1 voicePreference/quarantine truth table"
