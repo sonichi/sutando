@@ -5180,6 +5180,9 @@ async def poll_proactive():
 # allowlist, not a denylist: a newly-added source is non-eligible by default
 # and can never leak into DM unless deliberately added.
 DM_FALLBACK_SOURCES = {"voice", "phone"}
+# Sources whose own consumer drains `results/task-*.txt`. Anything in NEITHER
+# set has no consumer at all, so skipping it loses the reply permanently.
+DELIVERY_OWNING_SOURCES = {"discord", "telegram", "slack", "chat", "api", "gateway", "whatsapp"}
 
 
 def _task_source(task_id: str):
@@ -5222,6 +5225,67 @@ def _dm_fallback_eligible(task_id: str) -> bool:
     return _task_source(task_id) in DM_FALLBACK_SOURCES
 
 
+def _task_channel_id(task_id: str):
+    """`channel_id:` of a task file as an int, or None when absent/unparseable.
+    Same file resolution as `_task_source` — live, processed, then archived."""
+    tf = find_task_file(TASKS_DIR, task_id)
+    if not tf:
+        processed = TASKS_DIR / "processed" / f"{task_id}.txt"
+        if processed.exists():
+            tf = processed
+    if not tf:
+        archived = sorted((TASKS_DIR / "archive").glob(f"*/{task_id}.txt"))
+        if archived:
+            tf = archived[-1]
+    if not tf:
+        return None
+    try:
+        for line in tf.read_text(errors="replace").splitlines():
+            if line.startswith("channel_id:"):
+                raw = line.split(":", 1)[1].strip()
+                return int(raw) if raw.isdigit() else None
+    except OSError:
+        return None
+    return None
+
+
+# poll_dm_fallback rescans every 30s and this branch continues before the retry
+# cutoff, so an unguarded print emits ~2880 lines/day per orphan.
+_UNDELIVERABLE_WARNED: set = set()
+
+
+def _should_warn_undeliverable(task_id: str) -> bool:
+    """True the FIRST time a task_id is seen this process, False after.
+    Per-process by design: a restart re-surfaces an unresolved orphan once."""
+    if task_id in _UNDELIVERABLE_WARNED:
+        return False
+    _UNDELIVERABLE_WARNED.add(task_id)
+    return True
+
+
+def _undeliverable_warning_for(task_id: str, result_name: str):
+    """The line to log for a result nothing will deliver, or None. Composed here
+    so the decision is testable; only the print is loop glue."""
+    ch = _orphan_channel_target(task_id)
+    if ch is None or not _should_warn_undeliverable(task_id):
+        return None
+    return (f"  [dm-fallback] UNDELIVERABLE {result_name}: source="
+            f"{_task_source(task_id)!r} owns no consumer and is not DM-eligible; "
+            f"task names channel {ch} but nothing delivers there. "
+            f"This result will never be sent.")
+
+
+def _orphan_channel_target(task_id: str):
+    """Channel for a `task-` result nothing else will deliver, else None.
+    Requires: source in NEITHER set, AND the task names a channel. Fail-closed."""
+    if not task_id.startswith("task-"):
+        return None
+    src = _task_source(task_id)
+    if src in DM_FALLBACK_SOURCES or src in DELIVERY_OWNING_SOURCES:
+        return None
+    return _task_channel_id(task_id)
+
+
 async def poll_dm_fallback():
     """Fallback path for task/question/briefing results that no other
     consumer is going to handle.
@@ -5262,6 +5326,11 @@ async def poll_dm_fallback():
                 # this gate and stay eligible. FAIL-CLOSED: a missing/unreadable
                 # source is NOT eligible (see _dm_fallback_eligible).
                 if task_id.startswith("task-") and not _dm_fallback_eligible(task_id):
+                    # A source in NEITHER set owns no consumer, so this skip is
+                    # permanent loss, not deferral. Delivery is not wired here.
+                    _warn = _undeliverable_warning_for(task_id, f.name)
+                    if _warn:
+                        print(_warn, flush=True)  # pragma: no cover — print glue; the decision above is unit-tested
                     continue
                 # Grace window so voice-agent / telegram-bridge get first dibs.
                 try:
