@@ -79,6 +79,23 @@ class CoreModelPinProbe(unittest.TestCase):
                             "sleep 120"], capture_output=True)
         self.assertEqual(self.hc.check_core_model_pin()["status"], "ok")
 
+    def test_global_env_pin_is_not_invisible(self):
+        """A pin set with `setenv -g` is absent from every per-session query, so
+        enumerating sessions alone reports ok on a globally pinned socket."""
+        self._session()
+        subprocess.run(["tmux", "-S", self.sock, "setenv", "-g",
+                        "SUTANDO_CORE_MODEL", "opus"], capture_output=True)
+        probe = subprocess.run(["tmux", "-S", self.sock, "show-environment",
+                                "-t", "=core", "SUTANDO_CORE_MODEL"],
+                               capture_output=True, text=True)
+        self.assertNotIn("SUTANDO_CORE_MODEL=opus", probe.stdout,
+                         "premise: the session query must NOT see the global pin")
+        r = self.hc.check_core_model_pin()
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("opus", r["detail"])
+        self.assertIn("setenv -g -u SUTANDO_CORE_MODEL", r["detail"],
+                      "the remedy must use -g; `-t '=global'` addresses no session")
+
     def test_unpinned_core_ok(self):
         self._session()
         r = self.hc.check_core_model_pin()
@@ -115,6 +132,19 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         for sess in ("sutando-core", "second"):
             self.assertIn(f"setenv -t '={sess}' -u SUTANDO_CORE_MODEL", r["detail"])
         self.assertIn("sonnet", r["detail"])
+
+    def test_global_scope_uses_g_not_a_session_target(self):
+        r = self.hc._interpret_core_model_pin([("global", "opus")], "/tmp/s.sock")
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("tmux -S /tmp/s.sock setenv -g -u SUTANDO_CORE_MODEL", r["detail"])
+        self.assertNotIn("-t '=global'", r["detail"], r)
+
+    def test_remedy_warns_the_unset_is_not_durable(self):
+        """A restart re-supplies the pin from the launcher's env, so an operator
+        told only to `setenv -u` and restart would see it come straight back."""
+        r = self.hc._interpret_core_model_pin([("sutando-core", "opus")], "/s")
+        self.assertIn("start-cli.sh", r["detail"])
+        self.assertNotIn("then restart.", r["detail"], "restart alone re-supplies it")
 
     def test_name_is_stable(self):
         for pins in ([], [("core", "opus")]):
