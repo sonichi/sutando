@@ -10,6 +10,25 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def release_claim(claim: Path) -> bool:
+    """Return a ``.sending`` claim to the polling stream. True if released.
+
+    For a claim whose file is not ready yet. Deleting it instead discards a
+    message that is still being written.
+    """
+    target = claim.with_suffix(".txt")
+    try:
+        if target.exists():
+            return False
+        claim.rename(target)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        print(f"  [proactive] could not release claim {claim.name}: {exc}", flush=True)
+        return False
+
+
 def recover_orphan_sending_files(results_dir: Path) -> int:
     """Restore orphan ``proactive-*.sending`` claims to the polling stream."""
     if not results_dir.exists():
