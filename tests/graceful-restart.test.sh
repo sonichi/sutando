@@ -1,15 +1,6 @@
 #!/bin/bash
-# Regression tests for the deterministic graceful-restart flow (sonichi#2334).
-#
-# Covers the review blockers:
-#   1. Deterministic handoff — the orchestrator itself produces a terminal
-#      sentinel (ready/failed) with NO task-queue/LLM step in the loop.
-#   2. Space-path safety — restart-prep.sh works from a checkout path
-#      containing spaces (production argv path), and the GR_SYNC_CMD test
-#      seam carries space-containing paths.
-# Plus the gate branches: quiet, busy-then-idle, wedged (stale status), dead.
-#
-# All runs are --dry-run: the machinery executes end-to-end, the kill is skipped.
+# Regression tests for the deterministic graceful-restart flow. Unless a case
+# says otherwise, runs are --dry-run: the flow executes, the kill is skipped.
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -36,27 +27,14 @@ mkws() {  # fresh workspace with a live heartbeat + idle status
   printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$ws/state/core-status.json"
 }
 
-echo "0. CONCURRENT double-click → EXACTLY ONE restart decision (sonichi#2334 review)"
-# The sentinels are per-WORKSPACE and every run clears them at startup, so two
-# orchestrators could each validate a sentinel carrying their OWN rid and both
-# reach the destructive restart — the second killing the core the first just
-# relaunched. Measured on the pre-fix script: 50/50 iterations restarted twice.
-#
-# NOT a timing-luck test: the two processes are started before either can
-# finish, and the assertion is on the INVARIANT (exactly one decision), so a
-# scheduler that serializes them still fails the run if both decide.
-# ITERATE. A single pair is timing-dependent: verified that with a live+idle
-# core one unfixed pair often lets only one through by luck, so a 1-shot check
-# PASSES against the broken script and proves nothing. N pairs, and the run
-# fails if ANY pair produced two decisions.
+echo "0. CONCURRENT double-click → EXACTLY ONE restart decision"
+# Asserts the INVARIANT (exactly one decision), not timing. Iterated: one pair
+# can pass against the broken script by luck, so a 1-shot check proves nothing.
 N_CONC="${GR_TEST_CONC_ITERS:-10}"
 doubles=0; deferrals=0; reaped=0; bad_sentinel=0; rc_bad=0
 for _i in $(seq 1 "$N_CONC"); do
-  # DEAD core (no .alive): this is where the double-restart actually races.
-  # With a live+idle core the pre-fix failure mode is STARVATION instead —
-  # one run deletes the other's sentinel and the loser exits 3 — so a
-  # live-core fixture reports "exactly one" against the BROKEN script and
-  # the assertion proves nothing. Verified both ways before choosing this.
+  # DEAD core (no .alive) is where the double-restart races. A live+idle fixture
+  # fails by STARVATION instead and reports "exactly one" against a broken script.
   WS0="$TMP/ws0-$_i"; mkdir -p "$WS0/state/cores" "$WS0/tasks"
   printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS0/state/core-status.json"
   a_out="$TMP/conc-a-$_i.log"; b_out="$TMP/conc-b-$_i.log"
@@ -67,12 +45,8 @@ for _i in $(seq 1 "$N_CONC"); do
   ra=0; rb=0
   wait "$pa" || ra=$?
   wait "$pb" || rb=$?
-  # Exit codes matter as much as stdout. A peer that DIES (set -e on a bad
-  # arithmetic operand, say) also fails to restart, so the "exactly one
-  # decision" count alone cannot distinguish a correct deferral from a crash.
-  # Not hypothetical: CI caught exactly that when `stat -f %m` (BSD) emitted a
-  # filesystem dump on GNU/Linux, the arithmetic died under `set -euo pipefail`,
-  # and the peer vanished silently while "exactly one" still reported PASS.
+  # Check exit codes too: a peer that CRASHES also fails to restart, so the
+  # decision count alone cannot tell a correct deferral from a dead process.
   case "$ra:$rb" in
     0:4|4:0) : ;;
     *) rc_bad=$((${rc_bad:-0} + 1)) ;;
@@ -90,18 +64,15 @@ for _i in $(seq 1 "$N_CONC"); do
 done
 [ "$doubles" = 0 ] \
   && say ok "exactly one restart decision in all $N_CONC concurrent pairs" \
-  || say FAIL "$doubles/$N_CONC pairs BOTH restarted — the #2334 race"
+  || say FAIL "$doubles/$N_CONC pairs BOTH restarted — the serialization race"
 [ "$deferrals" = "$N_CONC" ] \
   && say ok "the losing peer deferred with a reason every time" \
   || say FAIL "peer deferred with a reason in only $deferrals/$N_CONC pairs"
 [ "$rc_bad" = 0 ] \
   && say ok "winner exited 0 and loser exited 4 in every pair" \
   || say FAIL "$rc_bad/$N_CONC pairs had an unexpected exit-code pair (a CRASHED peer is indistinguishable from a deferring one by count alone)"
-# A LIVE lock must never be reaped: an unreadable age has to fail CLOSED. The
-# first cut of this fix wrote the holder ts AFTER mkdir, so a peer landing in
-# that gap read no ts, computed age=now-0, called a 1s-old lock stale and reaped
-# it — both then restarted. Age now comes from the lock dir's own mtime, which
-# mkdir sets atomically as part of claiming the lock.
+# A LIVE lock must never be reaped, so an unreadable age fails CLOSED. Age comes
+# from the lock dir's own mtime, which mkdir sets atomically with the claim.
 [ "$reaped" = 0 ] \
   && say ok "no live lock was reaped in $N_CONC pairs" \
   || say FAIL "$reaped/$N_CONC pairs reaped a LIVE lock (ts-written-after-mkdir race)"
@@ -185,17 +156,10 @@ grep -q '"restart_id":"seam-rid"' "$WS7/state/restart-ready.json" 2>/dev/null \
 
 echo
 
-# --- GNU-style `stat -f` must not break alive_age() (qingyun review, 2026-08-02) --------
-# On GNU/Linux `stat -f` means --file-system: it prints a multi-line dump AND
-# EXITS 0. Selecting the fallback on EXIT STATUS therefore never reaches
-# `stat -c` on Linux, and a digit guard alone turns that into a CONFIDENT WRONG
-# answer: every mtime reads unreadable, so alive_age() returns 999999 and EVERY
-# core is classified DEAD.
-#
-# The first version of this case asserted only "does not crash / does not hang".
-# A dead-reporting alive_age() satisfies all of that, so the case passed on macOS
-# while CI went red. The assertion that matters is that a FRESH heartbeat is
-# still read as FRESH under GNU-shaped stat — correctness, not absence of noise.
+# --- GNU-style `stat -f` must not break alive_age() ------------------------------------
+
+# GNU `stat -f` is --file-system: it dumps and EXITS 0, so selecting on exit
+# status never reaches `stat -c` and every core reads DEAD.
 echo "8. GNU-style stat -f: a FRESH .alive must still read fresh (not DEAD)"
 WS7="$TMP/ws7"; mkws "$WS7"                       # mkws touches a live .alive
 printf '{"status":"running","step":"busy","ts":%s}\n' "$(date +%s)" > "$WS7/state/core-status.json"
@@ -208,10 +172,8 @@ if [ "${1:-}" = "-f" ]; then
   exit 0
 fi
 if [ "${1:-}" = "-c" ]; then
-  # Return the REAL mtime. The HOST's /usr/bin/stat may itself be GNU (CI) or
-  # BSD (macOS), so this fallback cannot hardcode either syntax — an earlier
-  # revision hardcoded `-f %m` and the fixture silently yielded nothing on
-  # ubuntu-latest, tripping this very test. Same output-shape rule as mtime_of.
+  # Return the REAL mtime without hardcoding either syntax: the host's own stat
+  # may be GNU or BSD, so a hardcoded flag yields nothing on the other.
   _f="${3:-}"
   for _real in "-c %Y" "-f %m"; do
     _o="$(/usr/bin/stat $_real "$_f" 2>/dev/null || true)"
@@ -224,9 +186,8 @@ STATEOF
 chmod +x "$FAKEBIN/stat"
 out="$(PATH="$FAKEBIN:$PATH" GR_WS="$WS7" GR_SYNC_CMD="true" GR_POLL_S=1 GR_STATUS_TTL_S=30 \
        GR_BUSY_MAX_S=3 bash "$GR" --dry-run 2>&1)"; rc=$?
-# THE load-bearing assertion: the heartbeat is seconds old, so the run must not
-# declare the core dead. Pre-fix (BSD-only) and mid-fix (digit-guard-only) both
-# fail here; only output-shape selection passes.
+# Load-bearing: a seconds-old heartbeat must not read as dead. Only output-shape
+# selection passes; BSD-only and digit-guard-only both fail here.
 echo "$out" | grep -q "core is DEAD" \
   && say FAIL "fresh .alive must NOT read as DEAD under GNU-shaped stat: $out" \
   || say ok "fresh .alive still reads fresh under GNU-shaped stat"
@@ -235,12 +196,9 @@ echo "$out" | grep -qiE 'integer expression|unbound variable|File:' \
   || say ok "no arithmetic/unbound diagnostic"
 [ "$rc" = 0 ] && say ok "exit 0 under GNU-style stat" || say FAIL "exit 0 under GNU-style stat (got $rc): $out"
 
-echo "9. A LIVE holder waiting longer than LOCK_STALE_S must NOT be reaped (qingyun review, #2334)"
-# The quiet gate is deliberately unbounded on a healthy core, but lock staleness
-# is judged from $LOCKDIR's mtime, which `mkdir` stamps ONCE. So a holder that
-# waits past LOCK_STALE_S looked abandoned, and a peer reaped a LIVE lock and
-# entered the restart decision concurrently — two destructive restarts.
-# Here the wait (5s) deliberately exceeds LOCK_STALE_S (2s).
+echo "9. A LIVE holder waiting longer than LOCK_STALE_S must NOT be reaped"
+# The gate is unbounded but `mkdir` stamps $LOCKDIR's mtime ONCE, so a holder
+# waiting past LOCK_STALE_S can be reaped alive. Wait (5s) exceeds it (2s).
 WS9="$TMP/ws9"; mkws "$WS9"
 printf '{"status":"running","ts":%s}\n' "$(date +%s)" > "$WS9/state/core-status.json"
 # Keep the core convincingly ALIVE and BUSY so the holder never exits the gate.
@@ -264,11 +222,9 @@ else
   say FAIL "peer REAPED a live holder's lock (rc=$b_rc) — concurrent destructive restart: $(printf '%s' "$b_out" | grep -i 'reap\|deferr' | tail -1)"
 fi
 
-echo "10. A holder that LOSES its lease must defer, not restart alongside the reaper (qingyun #2334)"
-# His repro: A waits in the healthy gate; A stalls past LOCK_STALE_S (SIGSTOP models
-# a scheduler stall); B legitimately reaps the now-stale lock and acquires it; A
-# resumes. Before the ownership check, A touched B's lock and walked on to prep —
-# both A and B exited 0 and both logged "would exec". Exactly one may decide.
+echo "10. A holder that LOSES its lease must defer, not restart alongside the reaper"
+# A stalls past LOCK_STALE_S (SIGSTOP models a scheduler stall), B reaps and
+# acquires, A resumes. Exactly one may decide.
 WS10="$TMP/ws10"; mkws "$WS10"
 printf '{"status":"running","ts":%s}\n' "$(date +%s)" > "$WS10/state/core-status.json"
 ( for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
@@ -301,10 +257,8 @@ else
 fi
 
 echo "11. lost-lease holder → exit 4 (NOT 1), and the foreign lock is PRESERVED"
-# cleanup_lock used to end in `own_lock && rm -rf "$LOCKDIR"`, whose status IS the
-# function's status. On the lease-loss path the lock is no longer ours, so that is
-# FALSE, and bash takes the EXIT trap's status as the script's — turning the
-# documented `exit 4` defer into 1. A supervisor branching on 4 sees a crash.
+# cleanup_lock's own status must not become the script's: on lease-loss the lock
+# is not ours, so a bare `own_lock && rm -rf` turns a documented exit 4 into 1.
 WS11="$TMP/ws11"; mkws "$WS11"
 printf '{"status":"running","step":"busy","ts":%s}\n' "$(date +%s)" > "$WS11/state/core-status.json"
 ( GR_WS="$WS11" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run > "$TMP/ws11.out" 2>&1; echo $? > "$TMP/ws11.rc" ) &
@@ -322,12 +276,8 @@ grep -q "lost the restart lease" "$TMP/ws11.out" \
   || say FAIL "the foreign lock was deleted — a run that lost the lease must not free the new holder's lock"
 
 echo "12. direct TERM → exit 143 (NOT 1), while still removing our OWN lock"
-# Two distinct failures met here, and the second is why an owned-lock fixture is
-# required: (a) `trap 'cleanup_lock; exit 143' TERM` under `set -e` aborts at a
-# non-zero cleanup_lock, so `exit 143` is never reached; (b) even when cleanup
-# SUCCEEDS, `exit 143` re-fires the EXIT trap, which runs cleanup_lock a SECOND
-# time against a lock it just deleted — own_lock is now false, status 1, and it
-# overrides the 143. Verified 1 -> 143 across this exact fixture.
+# Two failures meet here: set -e aborts the TERM trap before `exit 143`, and the
+# re-fired EXIT trap runs cleanup_lock again and overrides 143 with 1.
 WS12="$TMP/ws12"; mkws "$WS12"
 printf '{"status":"running","step":"busy","ts":%s}\n' "$(date +%s)" > "$WS12/state/core-status.json"
 ( GR_WS="$WS12" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run > "$TMP/ws12.out" 2>&1; echo $? > "$TMP/ws12.rc" ) &
@@ -345,10 +295,8 @@ rc12="$(cat "$TMP/ws12.rc" 2>/dev/null || echo missing)"
   || say FAIL "our own lock survived TERM — cleanup must not be skipped to make the exit code right"
 
 echo "13. a normal --dry-run must NOT self-block the next real run"
-# Verifying a destructive command before firing it is the natural operator
-# sequence, so a dry-run that keeps the lock blocks the real run for
-# LOCK_STALE_S (900s). Retention is still required for the concurrency model,
-# which now asks for it via GR_RETAIN_LOCK_ON_DECISION.
+# Verify-then-fire is the natural operator sequence, so a dry-run that keeps the
+# lock blocks the real run. The concurrency model opts into retention explicitly.
 WS13="$TMP/ws13"; mkws "$WS13"
 out13a="$(GR_WS="$WS13" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1 || true)"
 echo "$out13a" | grep -q "DRY-RUN — would exec" || say FAIL "dry-run did not reach a restart decision: $out13a"

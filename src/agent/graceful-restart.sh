@@ -1,18 +1,8 @@
 #!/bin/bash
 # Graceful core-restart orchestrator (design: notes/graceful-restart-design.md).
 #
-#   Phase 1 — QUIET GATE:
-#       dead   (.alive stale > STALE_S)  -> prep best-effort, then restart
-#       busy   (core-status "running" + fresh ts) -> wait, no give-up timer
-#       quiet  (anything else)           -> proceed
-#     A "running" status older than STATUS_TTL_S is wedged, not busy, and must
-#     not hold the restart off forever; same for a status with no parseable ts.
-#   Phase 2 — PREP, invoked directly (self-bounded; see restart-prep.sh):
-#       state/restart-ready.json        -> proceed
-#       state/restart-prep-failed.json  -> surface + exit 3, do NOT kill
-#     A dead core's prep failure does not block the restart.
-#   Phase 3 — exec start-cli.sh --restart. The kill is owned HERE, external to
-#     the core: an agent cannot --restart itself without dying mid-task.
+# quiet gate -> prep -> exec start-cli.sh --restart. A "running" status older
+# than STATUS_TTL_S, or with no parseable ts, is wedged rather than busy.
 #
 # Exit: 0 restarted · 3 prep failed (core untouched) · 4 deferred to a peer.
 #
@@ -41,23 +31,18 @@ POLL_S="${GR_POLL_S:-2}"                       # test override
 log() { echo "graceful-restart[$RID]: $*"; }
 
 # ---- Phase 0: serialize -------------------------------------------------
-# The sentinels are per-WORKSPACE and every run clears them, so without a lock
-# two orchestrators each see a sentinel carrying their own rid and both restart.
-# `mkdir` is the atomic primitive (fails if the path exists; unlike flock it is
-# on macOS). Taken BEFORE clearing sentinels and held through the decision, so
-# check and act cannot be split by a peer.
+
+# Sentinels are per-WORKSPACE and every run clears them, so without a lock two
+# orchestrators both restart. Held from before that clear through the decision.
 LOCKDIR="$WS/state/locks/graceful-restart.lock"
 LOCK_STALE_S="${GR_LOCK_STALE_S:-900}"          # test override; a real run is seconds
 mkdir -p "$WS/state/locks"
 
-# A holder that died before its trap ran would wedge restarts forever, so an
-# old lock is reapable — same liveness reasoning as workspace_lock.py, which
-# keys on freshness rather than pid (pids recycle; a hung holder should lose it).
+# An old lock is reapable: freshness, not pid, is the liveness signal (pids
+# recycle, and a holder that died before its trap would wedge restarts forever).
 mtime_of() {  # epoch mtime, or EMPTY if no variant yields a numeric answer
-  # `-f %m` is BSD, `-c %Y` GNU — but GNU's `-f` is --file-system and EXITS 0
-  # with a dump, so select on all-digit OUTPUT, never on exit status.
-  # Callers pick opposite fail-safes: lock age unreadable -> LIVE (never kill
-  # blind); .alive age unreadable -> STALE (never let a dead core hide).
+  # GNU's `-f` is --file-system and EXITS 0 with a dump, so select on all-digit
+  # OUTPUT, never exit status. Callers pick opposite fail-safes on EMPTY.
   local _ts
   for _fmt in "-f %m" "-c %Y"; do
     # _fmt is two intentional argv words, so it must stay unquoted.
@@ -72,8 +57,8 @@ mtime_of() {  # epoch mtime, or EMPTY if no variant yields a numeric answer
 }
 
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
-  # Age MUST come from the directory's own mtime, which mkdir sets atomically
-  # with the claim. A separate ts file written after mkdir reopens the race.
+  # Age MUST come from the directory's own mtime (mkdir sets it atomically with
+  # the claim); a ts file written after mkdir reopens the race.
   held_ts="$(mtime_of "$LOCKDIR")"
   if [ -z "$held_ts" ]; then
     # Unreadable age -> assume LIVE and defer: fail closed, since the
@@ -95,17 +80,14 @@ printf '%s' "$RID" > "$LOCKDIR/rid"
 # Release only OUR lock. Guarded by the rid so a reaper's lock is never removed.
 RESTART_DECIDED=0
 cleanup_lock() {
-  # A production restart ends in `exec`, so this trap never runs and the lock
-  # outlives the process structurally — that is what stops a peer from killing
-  # the core we just relaunched. A dry-run DOES reach here, and retaining would
-  # self-block the operator's next real run for LOCK_STALE_S.
+  # Production ends in `exec` so this never runs and retention is structural.
+  # A dry-run DOES reach here; retaining would self-block the next real run.
   if [ "$RESTART_DECIDED" = 1 ] && \
      { [ "$DRY_RUN" != 1 ] || [ "${GR_RETAIN_LOCK_ON_DECISION:-0}" = 1 ]; }; then
     return 0
   fi
   own_lock && rm -rf "$LOCKDIR"
-  # Always succeed: a lock already gone or owned by a reaper is normal, and this
-  # status would otherwise override the caller's exit code from an EXIT/TERM trap.
+  # Always succeed, or this status overrides the caller's exit code via the trap.
   return 0
 }
 
@@ -115,8 +97,8 @@ own_lock() {
   [ "$(cat "$LOCKDIR/rid" 2>/dev/null || echo '')" = "$RID" ]
 }
 
-# A signal handler MUST exit explicitly: cleanup_lock alone returns and bash
-# resumes the quiet-gate loop with the lock already released. 128+signo.
+# A handler MUST exit explicitly: cleanup_lock alone returns and bash resumes
+# the gate loop with the lock released. 128+signo.
 trap cleanup_lock EXIT
 trap 'cleanup_lock; exit 130' INT
 trap 'cleanup_lock; exit 143' TERM
@@ -128,9 +110,8 @@ rm -f "$READY" "$FAILED"
 alive_age() {
   [ -f "$ALIVE" ] || { echo 999999; return; }
   local _ts; _ts="$(mtime_of "$ALIVE")"
-  # Unreadable mtime -> report STALE, same as a missing heartbeat. Opposite of
-  # the lock's fail-closed: a dead core with a fresh core-status.json must not
-  # be able to hide behind an unreadable .alive and stay in the busy wait.
+  # Unreadable -> STALE (opposite of the lock's fail-closed): a dead core must
+  # not hide behind an unreadable .alive and stay in the busy wait.
   [ -n "$_ts" ] || { echo 999999; return; }
   echo "$(( $(date +%s) - _ts ))"
 }
@@ -171,10 +152,8 @@ else
     fi
     i=$((i + 1))
     [ $((i % 15)) -eq 0 ] && log "still busy — waiting (no give-up timer on a healthy core)…"
-    # RENEW: this wait is unbounded but mkdir stamps $LOCKDIR's mtime ONCE, so an
-    # unrenewed holder looks abandoned and a peer reaps it mid-wait. Touch the
-    # DIRECTORY — the reaper reads that clock, not a sibling ts file. Only while
-    # we still own it: renewing a foreign lock walks us into a concurrent restart.
+    # RENEW the DIRECTORY's mtime (the clock the reaper reads): mkdir stamps it
+    # once, so an unrenewed holder gets reaped mid-wait. Only while we own it.
     if ! own_lock; then
       log "lost the restart lease while waiting (holder is now $(cat "$LOCKDIR/rid" 2>/dev/null || echo 'gone')) — deferring, NOT restarting"
       exit 4
@@ -184,9 +163,8 @@ else
   done
 fi
 
-# Re-check ownership after the gate and before anything destructive. The wait
-# may have ended by the core going idle rather than by a renewal tick, so the
-# loop's check is not sufficient on its own.
+# Re-check ownership after the gate: the wait can end via the core going idle
+# rather than a renewal tick, so the loop's own check is not sufficient.
 if ! own_lock; then
   log "lost the restart lease before prep (holder is now $(cat "$LOCKDIR/rid" 2>/dev/null || echo 'gone')) — deferring, NOT restarting"
   exit 4
@@ -198,8 +176,9 @@ prep_rc=0
 bash "$REPO/src/agent/restart-prep.sh" "$RID" || prep_rc=$?
 
 # ---- Phase 3: decide -----------------------------------------------------
-# Read the sentinel ONCE and decide from that snapshot: grep-then-cat is two
-# reads of a shared path, so the logged body may not be the one validated.
+
+# Read the sentinel ONCE: grep-then-cat is two reads, so the logged body may not
+# be the one validated.
 ready_body="$(cat "$READY" 2>/dev/null || true)"
 case "$ready_body" in
   *"$RID"*)
