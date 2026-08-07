@@ -6,6 +6,10 @@ on:
   push:
     branches: [main, staging-interaction-planes]
 
+# Tests must never emit product telemetry (no PostHog writes from CI).
+env:
+  SUTANDO_TELEMETRY: "0"
+
 jobs:
   typecheck-and-test:
     name: tsc + tests (clean install)
