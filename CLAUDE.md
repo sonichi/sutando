@@ -23,7 +23,9 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 - **Shared result-file lifecycle policy has one implementation.** Claim, recovery, collision, and retry rules for the common task/result protocol belong in dependency-light `src/` helpers. Adapters bind their resolved directories and retain provider-specific delivery only; do not copy filesystem state machines between bridges. Pin both the shared contract and every adapter's delegation in tests.
 
 - **HTTP handlers centralize transport mechanics.** Put repeated authentication gates, status/header emission, and JSON encoding in handler helpers; route branches own endpoint behavior. Protect status codes, headers, and payload shapes with direct contract tests when refactoring handlers.
+- **HTTP route methods are dispatch layers.** Move filesystem reconciliation and response assembly into named module functions; route methods should parse the request, call one unit, and emit its result. Test the extracted behavior directly plus one route-wiring path.
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
+- **Code comments: at most 2 lines, and only what the code cannot state itself.** Give the constraint or the non-obvious reason. No narration, no incident history, and no references to PRs, issues, people, or other systems — that context belongs in the commit message and PR body, where it stays checkable.
 
 ### Where does new code belong? (decision guide — issue #222)
 
@@ -35,7 +37,14 @@ Walk this list top-to-bottom and stop at the first match:
 4. **Is it a self-contained feature (recording, image generation, skill discovery, etc.)?** → new skill under `skills/<name>/`. Each skill is optional — core must still boot if it's removed.
 5. **Is it core infrastructure shared by multiple skills (task bridge, health check, memory sync)?** → `src/`.
 
-If two layers seem to fit, prefer the more specific one (skill > core). If you're patching a bug, keep the patch in the layer where the bug lives — don't smuggle a refactor into a fix commit.
+If two layers seem to fit, prefer the more specific one (skill > core).
+
+**Fix a bug where the policy lives, not where the symptom surfaced.** "Don't smuggle a refactor into a fix commit" means don't bundle *unrelated* cleanup. It does not license copying the same patch into every adapter — when one defect exists in several places because the policy is duplicated, the duplication is the defect:
+
+- A shared owner already exists → fix it there; adapters keep only their own I/O.
+- No shared owner exists → create one. Extract the policy into a dependency-light `src/` module, point every copy at it, and pin the contract and each adapter's delegation in tests. That is the fix, not a follow-up to it.
+- Do not add a copy, and do not leave one behind because the extraction looked large. A large extraction measures how much drift has already accumulated, not a reason to add more.
+- Duplicated policy is a defect in its own right, whether or not it is currently misbehaving. Copies drift, and the copy nobody remembers is the one that ships the bug.
 
 **Destructive/legacy schema migrations live apart from the live writer.** `conversation-store.ts` owns current schema initialization and live write APIs. Destructive or legacy SQLite transformations belong in `conversation-store-migrations.ts`, are idempotent, transaction-tested and invoked before views/statements are prepared. Do not place migration SQL in a live record function. Enforced by `tests/conversation-store-migration-delegation.test.ts`.
 
