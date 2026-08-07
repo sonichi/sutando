@@ -6519,9 +6519,8 @@ TMUX_UNSET_MARKER = "unknown variable"
 
 
 def _query_pin(socket: str, scope_args: list) -> str:
-    """Return the pinned value for one tmux env scope, or "" when tmux says unset.
-    tmux reports unset as nonzero too, so only its marker means absence — anything
-    else nonzero is a failed query and must not read as "not pinned"."""
+    """Pinned value for one tmux env scope, or "" when tmux says unset.
+    Only tmux's marker means absence; any other nonzero is a FAILED query."""
     res = subprocess.run(
         ["tmux", "-S", socket, "show-environment", *scope_args, "SUTANDO_CORE_MODEL"],
         capture_output=True, text=True, timeout=10,
@@ -6529,7 +6528,7 @@ def _query_pin(socket: str, scope_args: list) -> str:
     out = (res.stdout or "").strip()
     if res.returncode == 0:
         return out.split("=", 1)[1] if out.startswith("SUTANDO_CORE_MODEL=") else ""
-    # tmux puts the marker on stderr; a reviewer's harness saw it on stdout. Accept either.
+    # The marker can arrive on either stream; accept both.
     if TMUX_UNSET_MARKER in (out + " " + (res.stderr or "")):
         return ""
     raise subprocess.CalledProcessError(res.returncode, res.args, res.stdout, res.stderr)
