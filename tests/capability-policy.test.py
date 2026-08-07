@@ -68,6 +68,14 @@ check("UNCLASSIFIED carries no capability request (fail-closed)",
 # a recognized request classifies to its verb
 check("'review the PR' classifies to github:read",
       cp.classify("please review the PR").outcome == "github:read")
+# classifier NOT overbroad (qingyun-wu CR): ordinary "use the ..." prose is
+# UNCLASSIFIED, not the credential lane; only explicit secret/key usage matches.
+check("'use the blue theme' is UNCLASSIFIED (not credential:use)",
+      cp.classify("please use the blue theme for this doc").outcome == cp.UNCLASSIFIED)
+check("'use the search bar' is UNCLASSIFIED (not credential:use)",
+      cp.classify("use the search bar to find it").outcome == cp.UNCLASSIFIED)
+check("'use the api key' DOES classify to credential:use",
+      cp.classify("use the api key to call it").outcome == "credential:use")
 
 
 # ── 3. Decision behavior — RFC motivating examples.

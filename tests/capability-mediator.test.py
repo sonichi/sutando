@@ -67,14 +67,15 @@ reader = _load_pending_reader(PQ)
 med = cm.Mediator(contexts, grants, audit, pq_path=PQ, pq_reader=reader)
 
 
-def envelope(tier):
-    return {"access_tier": tier, "source": "ag2space", "user_id": "@rui:ag2.space"}
+def envelope(tier, tid="task-main"):
+    return {"access_tier": tier, "source": "ag2space", "user_id": "@rui:ag2.space", "id": tid}
 
 
 # ── 1. trust root: a principal is derived from the handle, never submitted.
 h_owner = contexts.mint(envelope("owner"))
 h_team = contexts.mint(envelope("team"))
 p_owner = contexts.derive_principal(h_owner)
+t_main = contexts.derive_task_id(h_owner)
 check("context handle derives the owner principal",
       contexts.derive_principal(h_owner).tier == cp.OWNER)
 check("an unknown handle derives no principal (fail-closed)",
@@ -109,7 +110,7 @@ def _exec(req):  # a real executor stand-in that "creates" something
 def _verify(req, raw):  # independent postcondition: the id came back
     return isinstance(raw, dict) and bool(raw.get("created_id"))
 
-g = grants.mint_fresh("github:merge", p_owner, {"repo": "sonichi/sutando", "pr": 2})
+g = grants.mint_fresh("github:merge", p_owner, {"repo": "sonichi/sutando", "pr": 2}, task_id=t_main)
 r = med.mediate("github:merge", {"repo": "sonichi/sutando", "pr": 2}, h_owner,
                 executor=_exec, verifier=_verify, scope="sonichi/sutando")
 check("covering fresh grant -> allow + executed + verified succeeded",
@@ -124,7 +125,7 @@ check("single-use grant consumed — second identical request re-escalates",
 
 # ── 5. verified-outcome: a truthy executor return is NOT success without the
 #      verifier confirming the postcondition (motivating failure #3).
-g2 = grants.mint_fresh("config:write", p_owner, {"rule": "x"})
+g2 = grants.mint_fresh("config:write", p_owner, {"rule": "x"}, task_id=t_main)
 def _swallow(req):   # returns {ok:true} but the write silently didn't happen
     return {"ok": True}
 def _verify_false(req, raw):   # postcondition read-back finds nothing
@@ -133,13 +134,13 @@ r = med.mediate("config:write", {"rule": "x"}, h_owner,
                 executor=_swallow, verifier=_verify_false)
 check("truthy return + failing postcondition verifier -> FAILED, not success",
       r.outcome == cm.FAILED)
-g3 = grants.mint_fresh("config:write", p_owner, {"rule": "y"})
+g3 = grants.mint_fresh("config:write", p_owner, {"rule": "y"}, task_id=t_main)
 r = med.mediate("config:write", {"rule": "y"}, h_owner, executor=_swallow)  # no verifier
 check("no verifier -> UNKNOWN outcome, never success",
       r.outcome == cm.UNKNOWN)
 
 # ── 6. prohibited overlay: human-only, no grant satisfies, even owner.
-grants.mint_fresh("financial:move", p_owner, {"amt": 1})
+grants.mint_fresh("financial:move", p_owner, {"amt": 1}, task_id=t_main)
 r = med.mediate("financial:move", {"amt": 1}, h_owner, executor=_exec)
 check("financial:move -> prohibited (human-only), executor NEVER ran",
       r.decision == cp.PROHIBITED and executed["n"] == 1)  # still 1 from case 4
@@ -200,12 +201,12 @@ check("owner info:read, no executor -> allow/succeeded (allow-only)",
       rna.decision == cp.ALLOW and rna.outcome == cm.SUCCEEDED)
 
 # executor raises -> FAILED ; verifier raises -> UNKNOWN
-grants.mint_fresh("config:write", p_owner, {"rule": "boom"})
+grants.mint_fresh("config:write", p_owner, {"rule": "boom"}, task_id=t_main)
 def _boom(req):
     raise RuntimeError("mutation blew up")
 rboom = med.mediate("config:write", {"rule": "boom"}, h_owner, executor=_boom, verifier=_verify)
 check("executor raising -> FAILED (never success)", rboom.outcome == cm.FAILED)
-grants.mint_fresh("config:write", p_owner, {"rule": "vraise"})
+grants.mint_fresh("config:write", p_owner, {"rule": "vraise"}, task_id=t_main)
 def _vraise(req, raw):
     raise RuntimeError("verifier blew up")
 rvr = med.mediate("config:write", {"rule": "vraise"}, h_owner, executor=lambda r: {"ok": 1}, verifier=_vraise)
@@ -229,6 +230,8 @@ check("consume: different tier -> None",
       _gs.consume_covering(_req1, cp.Principal(tier="team", user_id="alice")) is None)
 check("consume: different user_id -> None (no bearer replay)",
       _gs.consume_covering(_req1, cp.Principal(tier="owner", user_id="mallory")) is None)
+check("consume: different source -> None (source-pinned, fail-closed)",
+      _gs.consume_covering(_req1, cp.Principal(tier="owner", user_id="alice", source="other")) is None)
 check("consume: matching identity -> grant returned + consumed",
       _gs.consume_covering(_req1, _alice) is not None and
       _gs.consume_covering(_req1, _alice) is None)
@@ -236,13 +239,31 @@ check("consume: matching identity -> grant returned + consumed",
 # ── 11. IDENTITY BINDING (qingyun-wu + bassilkhilo-ag2 P1): a grant bound to one
 #        principal must NOT execute under a different principal, even same tier.
 executed["n_before_mallory"] = executed["n"]
-grants.mint_fresh("github:merge", p_owner, {"repo": "sonichi/sutando", "pr": 99})  # for @rui
+grants.mint_fresh("github:merge", p_owner, {"repo": "sonichi/sutando", "pr": 99}, task_id=t_main)  # for @rui
 h_mallory = contexts.mint({"access_tier": "owner", "source": "discord", "user_id": "mallory"})
 rm = med.mediate("github:merge", {"repo": "sonichi/sutando", "pr": 99}, h_mallory,
                  executor=_exec, verifier=_verify, scope="sonichi/sutando")
 check("mallory CANNOT execute @rui's grant (same tier, diff user_id) -> escalated, executor NOT run",
       rm.outcome == cm.ESCALATED and executed["n"] == executed["n_before_mallory"])
 LIVE.append(("mallory replay of @rui's grant BLOCKED", rm.audit))
+
+# ── 12. TASK BINDING (qingyun-wu CR round 2): a fresh grant approved for task-A
+#        must NOT be consumable by task-B (same principal, same verb+args).
+h_taskA = contexts.mint(envelope("owner", tid="task-A"))
+h_taskB = contexts.mint(envelope("owner", tid="task-B"))
+grants.mint_fresh("github:merge", p_owner, {"repo": "sonichi/sutando", "pr": 500},
+                  task_id="task-A")
+n_before = executed["n"]
+rB = med.mediate("github:merge", {"repo": "sonichi/sutando", "pr": 500}, h_taskB,
+                 executor=_exec, verifier=_verify, scope="sonichi/sutando")
+check("task-B CANNOT consume task-A's fresh grant -> escalated, executor NOT run",
+      rB.outcome == cm.ESCALATED and executed["n"] == n_before)
+# and task-A (the originating task) CAN use it
+rA = med.mediate("github:merge", {"repo": "sonichi/sutando", "pr": 500}, h_taskA,
+                 executor=_exec, verifier=_verify, scope="sonichi/sutando")
+check("task-A (originating) CAN use its own fresh grant -> allow/succeeded",
+      rA.decision == cp.ALLOW and rA.outcome == cm.SUCCEEDED)
+LIVE.append(("task-B replay of task-A's grant BLOCKED", rB.audit))
 
 print("\n================ LIVE TEST DATA (captured real artifacts) ================")
 for label, art in LIVE:

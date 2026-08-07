@@ -47,36 +47,49 @@ import capability_policy as cp
 # ── Trusted context handles (RFC "Trust root") ───────────────────────────────
 class _Context(NamedTuple):
     principal: cp.Principal
+    task_id: str            # immutable originating task/request identity (RFC)
     expires_at: float
     closed: bool
 
 
 class ContextRegistry:
-    """Mints opaque handles bound to a derived principal. A handle is process-
-    local (cross-process handles are rejected by construction — they never exist
-    in this registry) and single-registry; unknown/expired/closed -> None."""
+    """Mints opaque handles bound to a derived principal AND the originating
+    task/request identity. A handle is process-local (cross-process handles are
+    rejected by construction — they never exist in this registry) and
+    single-registry; unknown/expired/closed -> None."""
 
     def __init__(self, now: Callable[[], float] = time.time):
         self._now = now
         self._by_handle: dict = {}
 
     def mint(self, envelope: dict, ttl_seconds: float = 900.0) -> str:
-        """Mint a handle from an authenticated task ENVELOPE. The principal is
-        derived here (tier normalized); a caller can never inject a tier."""
+        """Mint a handle from an authenticated task ENVELOPE. The principal AND
+        the originating task id are derived here; a caller can never inject a
+        tier, and the task id is retained so a fresh grant can bind to it."""
+        env = envelope or {}
         principal = cp.Principal(
-            tier=cp.normalize_tier((envelope or {}).get("access_tier")),
-            source=str((envelope or {}).get("source", "")),
-            user_id=str((envelope or {}).get("user_id", "")),
+            tier=cp.normalize_tier(env.get("access_tier")),
+            source=str(env.get("source", "")),
+            user_id=str(env.get("user_id", "")),
         )
+        task_id = str(env.get("id") or env.get("task_id") or "")
         handle = "cap-ctx-" + secrets.token_hex(16)
-        self._by_handle[handle] = _Context(principal, self._now() + ttl_seconds, False)
+        self._by_handle[handle] = _Context(principal, task_id, self._now() + ttl_seconds, False)
         return handle
 
-    def derive_principal(self, handle: str) -> Optional[cp.Principal]:
+    def _live_context(self, handle: str) -> Optional[_Context]:
         ctx = self._by_handle.get(handle)
         if ctx is None or ctx.closed or self._now() >= ctx.expires_at:
             return None
-        return ctx.principal
+        return ctx
+
+    def derive_principal(self, handle: str) -> Optional[cp.Principal]:
+        ctx = self._live_context(handle)
+        return ctx.principal if ctx else None
+
+    def derive_task_id(self, handle: str) -> Optional[str]:
+        ctx = self._live_context(handle)
+        return ctx.task_id if ctx else None
 
     def close(self, handle: str) -> None:
         ctx = self._by_handle.get(handle)
@@ -91,6 +104,7 @@ class Grant(NamedTuple):
     tier: str
     user_id: str = ""          # the authenticated principal the approval was FOR
     source: str = ""           # and the source it arrived on (RFC trust-root)
+    task_id: str = ""          # a FRESH grant also binds the originating task/request
     args_digest: str = ""      # fresh single-use grant binds an exact digest
     scope_pattern: str = ""    # standing grant binds a scope pattern instead
     expires_at: float = 0.0
@@ -113,12 +127,12 @@ class GrantStore:
         self._now = now
         self._grants: dict = {}
 
-    def mint_fresh(self, verb: str, principal: cp.Principal, args,
+    def mint_fresh(self, verb: str, principal: cp.Principal, args, task_id: str = "",
                    ttl_seconds: float = 300.0) -> Grant:
         g = Grant(grant_id="grant-" + secrets.token_hex(12), verb=verb,
                   tier=principal.tier, user_id=principal.user_id, source=principal.source,
-                  args_digest=digest_args(args), expires_at=self._now() + ttl_seconds,
-                  single_use=True)
+                  task_id=str(task_id or ""), args_digest=digest_args(args),
+                  expires_at=self._now() + ttl_seconds, single_use=True)
         self._grants[g.grant_id] = g
         return g
 
@@ -138,13 +152,17 @@ class GrantStore:
         now = self._now()
         return [g for g in self._grants.values() if g.expires_at > now]
 
-    def consume_covering(self, req: cp.CapabilityRequest, principal: cp.Principal) -> Optional[Grant]:
-        """Find a LIVE covering grant BOUND to this principal and, if single-use,
-        atomically consume it BEFORE the caller executes. A grant covers only when
-        its verb, tier, AND user_id (and source, if pinned) match the principal —
-        an approval record is not a bearer token. Fail-closed: a principal with no
-        user_id, or a grant missing tier/user_id, never covers. Standing grants
-        are returned without consumption (RFC)."""
+    def consume_covering(self, req: cp.CapabilityRequest, principal: cp.Principal,
+                         task_id: str = "") -> Optional[Grant]:
+        """Find a LIVE covering grant BOUND to this principal and, for a FRESH
+        grant, to the originating task — and if single-use, atomically consume it
+        BEFORE the caller executes. A grant covers only when its verb, tier, AND
+        user_id (and source, if pinned) match the principal; a FRESH grant must
+        ALSO match the current task_id (fail-closed if the grant carries a task_id
+        the request doesn't match) — so a grant approved for task-A cannot be
+        replayed by task-B. An approval record is neither a bearer token nor
+        reusable across requests. Standing grants stay scope-based (no task bind)
+        and are returned without consumption (RFC)."""
         if not principal.user_id:
             return None
         for g in self._live():
@@ -157,6 +175,8 @@ class GrantStore:
             if g.source and g.source != principal.source:
                 continue
             if g.single_use and g.args_digest and g.args_digest == req.args_digest:
+                if g.task_id and g.task_id != (task_id or ""):
+                    continue   # fresh grant is bound to its originating task — no cross-task replay
                 self._grants.pop(g.grant_id, None)   # atomic single-use consume
                 return g
             if (not g.single_use) and g.scope_pattern and cp._scope_matches(g.scope_pattern, req.scope):
@@ -274,6 +294,7 @@ class Mediator:
             d = cp.Decision(cp.DENY, "unknown", "invalid/expired/closed context handle")
             row = self.audit.record(cp.Principal(tier=cp.OTHER), req, d, DENIED)
             return MediationResult(cp.DENY, DENIED, None, row, "no valid context handle")
+        task_id = self.contexts.derive_task_id(handle) or ""  # bind a fresh grant to THIS task
 
         # Base decision, grants NOT applied here — the GrantStore is the single
         # place a live grant is consulted AND atomically consumed (below), so the
@@ -294,7 +315,7 @@ class Mediator:
                                    "run under codex --sandbox read-only, no mutation")
 
         if decision.decision == cp.NEEDS_AUTH:
-            grant = self.grants.consume_covering(req, principal)  # single-use consumed here
+            grant = self.grants.consume_covering(req, principal, task_id)  # single-use consumed here
             if grant is not None:
                 allowed = cp.Decision(cp.ALLOW, decision.capability_class,
                                       f"{decision.capability_class}/{principal.tier} "
