@@ -63,6 +63,7 @@ from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -167,26 +168,16 @@ def _is_path_sendable(fpath: str) -> bool:
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
-    """Record owner activity — same schema as src/discord-bridge.py."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "ts": int(time.time()),
-            "channel": channel,
-            "summary": summary[:80],
-        }
-        if channel_id:
-            payload["channel_id"] = str(channel_id)
-        # Per-PID staging name: this file is written by four processes (this
-        # bridge + discord/telegram/sparrow). A shared ".json.tmp" name lets two
-        # concurrent writers truncate and interleave the same temp file, so the
-        # rename can publish torn JSON. A per-PID temp is never shared, and
-        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, OWNER_ACTIVITY_FILE)
-    except Exception as e:
-        print(f"  [owner-activity] write failed: {e}", flush=True)
+    """Record owner activity using the shared provider-neutral schema."""
+    _write_owner_activity_shared(
+        OWNER_ACTIVITY_FILE,
+        channel,
+        summary,
+        channel_id,
+        on_error=lambda exc: print(
+            f"  [owner-activity] write failed: {exc}", flush=True
+        ),
+    )
 
 
 def archive_file(src: Path, kind: str, task_id: str) -> None:
@@ -1190,12 +1181,6 @@ def handle_message(event, say):
     username = _resolve_username(user_id)
     text = (event.get("text") or "").strip()
     _write_task(event, "Slack DM", text, username)
-
-
-# Markers that the bridge handles specially in result bodies. Same set as
-# discord-bridge.py + telegram-bridge.py — see CLAUDE.md "Result-body
-# protocol markers".
-FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
 
 
 def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
