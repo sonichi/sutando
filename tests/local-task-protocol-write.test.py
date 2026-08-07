@@ -115,5 +115,63 @@ class TestHealthCheckWriterGolden(unittest.TestCase):
             hc.time.strftime = real_strftime
 
 
+class TestHealthCheckDefaultRouting(unittest.TestCase):
+    """The tasks_dir=None default routes through the endpoint resolver,
+    falling back locally on any resolver failure (crash-path writer)."""
+
+    def _load_hc(self):
+        spec = importlib.util.spec_from_file_location(
+            "hc2", REPO / "src" / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        return hc
+
+    def _emit(self, hc, state):
+        hc.emit_task_for_failures(
+            [{"name": "svc-x", "status": "down", "detail": "d"}],
+            state_file=state, tasks_dir=None)
+
+    def test_default_tasks_dir_comes_from_the_resolver(self):
+        import types
+        hc = self._load_hc()
+        with tempfile.TemporaryDirectory() as d:
+            routed = Path(d) / "routed-tasks"
+            fake = types.ModuleType("agent_endpoint")
+            fake.load_descriptor = lambda: {"workspace": d}
+            fake.resolve = lambda *a, **k: types.SimpleNamespace(address=str(routed))
+            real = sys.modules.get("agent_endpoint")
+            sys.modules["agent_endpoint"] = fake
+            try:
+                self._emit(hc, Path(d) / "state.json")
+            finally:
+                if real is not None:
+                    sys.modules["agent_endpoint"] = real
+                else:
+                    del sys.modules["agent_endpoint"]
+            self.assertEqual(len(list(routed.glob("task-health-*.txt"))), 1)
+
+    def test_resolver_failure_falls_back_to_workspace(self):
+        import types
+        hc = self._load_hc()
+        with tempfile.TemporaryDirectory() as d:
+            fake = types.ModuleType("agent_endpoint")
+            def boom():
+                raise RuntimeError("descriptor unavailable")
+            fake.load_descriptor = boom
+            fake.resolve = lambda *a, **k: None
+            real = sys.modules.get("agent_endpoint")
+            sys.modules["agent_endpoint"] = fake
+            hc.WORKSPACE_DIR = Path(d)
+            try:
+                self._emit(hc, Path(d) / "state.json")
+            finally:
+                if real is not None:
+                    sys.modules["agent_endpoint"] = real
+                else:
+                    del sys.modules["agent_endpoint"]
+            self.assertEqual(
+                len(list((Path(d) / "tasks").glob("task-health-*.txt"))), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
