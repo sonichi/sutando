@@ -66,6 +66,7 @@ Secrets are read from the environment (populate them from the Sutando vault;
 | `MS365_CLIENT_ID` | Azure AD application (client) ID |
 | `MS365_CLIENT_SECRET` | Azure AD client secret value |
 | `MS365_TENANT_ID` | Directory (tenant) ID, or `common` / `organizations` |
+| `MS365_AUTH_FLOW` | `credentials` (default; confidential client, id+secret) or `public` (native client, id only — required when the app's redirect is registered under "Mobile and desktop applications"; symptom of the mismatch: `AADSTS700025` on token exchange). In `public` flow `MS365_CLIENT_SECRET` is not required. |
 
 If any is unset, the CLI exits with a clear message naming the missing variable.
 
