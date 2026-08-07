@@ -22,28 +22,34 @@ import local_task_protocol as ltp  # noqa: E402
 
 
 def _grep_stamped_values(key: str) -> set:
-    """Every literal value producers stamp for `key:` across live writer code.
+    """Every literal value producers stamp for `key:` across live writer
+    code, Python AND TypeScript (the TS bridges are live stampers too).
 
-    Two write signatures only — a quoted value assignment ("access_tier":
-    "ambient") or a header-line write inside a string literal ("access_tier:
-    ambient\\n"). Prose in comments and `key: type` annotations match
-    neither, which is what keeps this a producer census rather than a word
-    search."""
+    Write signatures only — quoted-key assignment ("access_tier":
+    "ambient"), header-line writes inside string literals ("access_tier:
+    ambient\\n" or backtick-terminated `access_tier: owner`), and unquoted
+    object-literal keys with quoted values (access_tier: 'owner'). Prose in
+    comments, `key: Type` annotations, and `.key === 'x'` comparisons match
+    none of these, which is what keeps this a producer census rather than a
+    word search."""
     pat = re.compile(
         rf"""["']{key}["']\s*[:=]\s*f?["']([a-z_]+)["']"""
-        rf"""|{key}:\s*([a-z_]+)\\n""")
+        rf"""|{key}:\s*([a-z_]+)\\n"""
+        rf"""|{key}:\s*([a-z_]+)`"""
+        rf"""|(?<![.\w"'`]){key}\s*:\s*['"]([a-z_]+)['"]""")
     found = set()
     roots = [REPO / "src", REPO / "skills", REPO / "packages"]
     for root in roots:
-        for py in root.rglob("*.py"):
-            if "node_modules" in str(py) or "/tests/" in str(py):
-                continue
-            try:
-                text = py.read_text(errors="ignore")
-            except OSError:
-                continue
-            for m in pat.finditer(text):
-                found.add(m.group(1) or m.group(2))
+        for suffix in ("*.py", "*.ts", "*.tsx"):
+            for f in root.rglob(suffix):
+                if "node_modules" in str(f) or "/tests/" in str(f):
+                    continue
+                try:
+                    text = f.read_text(errors="ignore")
+                except OSError:
+                    continue
+                for m in pat.finditer(text):
+                    found.add(next(g for g in m.groups() if g))
     return found - {None}
 
 

@@ -8,7 +8,8 @@ transport appears (the remote-realtime session gateway, a SQLite durable
 store), it lights up here and zero call sites change.
 
 Inputs are the AgentRuntime descriptor (`sutando-config.sh runtime` emits it:
-runtimeSocket, call_tiers with live reachability, workspace) — injected for
+runtimeSocket, workspace; call_tiers are voice/Web endpoints, deliberately
+NOT a durable route) — injected for
 tests, subprocess-loaded by default. Stdlib-only, no daemon, no lock service:
 the resolver must answer under total daemon death (same R1 constraint as the
 task protocol, because the durable lane is the crash path).
@@ -46,8 +47,8 @@ class UnsupportedLane(Exception):
 
 @dataclass(frozen=True)
 class Route:
-    transport: str   # "filesystem" | "uds" | "gateway"
-    address: str     # tasks dir, socket path, or gateway base URL
+    transport: str   # "filesystem" | "uds" ("gateway" reserved for the remote lanes)
+    address: str     # tasks dir or socket path
     endpoint: str    # normalized bare agent id
     mode: str
 
@@ -84,10 +85,12 @@ def resolve(endpoint: str, mode: str, descriptor: dict, *,
     """Pick the transport for (endpoint, mode) from the runtime descriptor.
 
     `self_id` names the local agent; endpoint == self_id (or the literal
-    "self") routes locally. Anything else is a remote agent and rides the
-    gateway for durable work. v0 scope: local durable/local-control/realtime
-    + remote durable; remote realtime raises UnsupportedLane until the
-    session gateway exists.
+    "self") routes locally; anything else is a remote agent. v0 scope: local
+    durable/local-control/realtime
+    only; every remote lane raises UnsupportedLane — realtime until the
+    session gateway exists, durable until the descriptor carries a real
+    task-gateway coordinate (call_tiers advertise the voice/Web endpoints,
+    which do not speak the durable task protocol).
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {MODES}")
@@ -109,13 +112,13 @@ def resolve(endpoint: str, mode: str, descriptor: dict, *,
         return Route("uds", socket, bare, mode)
 
     if mode == "durable":
-        # Remote durable work rides the gateway (sparrow's lane). Prefer the
-        # first reachable call tier's base; the gateway resolves the rest.
-        for tier in descriptor.get("call_tiers", []):
-            if tier.get("reachable") and tier.get("url"):
-                return Route("gateway", tier["url"], bare, mode)
-        raise ValueError(f"no reachable gateway tier for remote agent {bare!r}")
+        # call_tiers are the voice/Web direct endpoints — a reachable tier is
+        # NOT a durable task gateway. Loud until the descriptor names one.
+        raise UnsupportedLane(
+            f"remote durable to {bare!r}: the descriptor has no task-gateway "
+            "coordinate (call_tiers are voice/Web endpoints, not the durable "
+            "task API) — add a gateway field to the runtime descriptor first")
 
     raise UnsupportedLane(
         f"remote {mode} to {bare!r}: no session gateway exists yet — "
-        "submit durable work instead, or build the session gateway lane")
+        "build the session gateway lane first")
