@@ -123,6 +123,36 @@ out="$(GR_WS="$WS4" GR_SYNC_CMD="false" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)";
 echo "$out" | grep -q "DRY-RUN — would exec" && say FAIL "must NOT restart" || say ok "did not restart"
 [ -f "$WS4/state/restart-prep-failed.json" ] && say ok "failed sentinel written" || say FAIL "failed sentinel written"
 
+echo "4b. prep sync FAILURE is diagnosable: nonzero exit vs timeout, with command output"
+WS4B="$TMP/ws4b"; mkws "$WS4B"
+GR_WS="$WS4B" GR_STEP_TIMEOUT=2 GR_SYNC_CMD="printf 'boom-detail\n' >&2; exit 7" \
+  bash "$REPO/src/agent/restart-prep.sh" t4b >/dev/null 2>&1
+r4b="$(cat "$WS4B/state/restart-prep-failed.json" 2>/dev/null || echo '')"
+case "$r4b" in
+  *"exited 7"*)     say ok "fast failure reports its exit status" ;;
+  *)                say FAIL "fast failure reports its exit status: $r4b" ;;
+esac
+case "$r4b" in
+  *boom-detail*)    say ok "fast failure preserves command output" ;;
+  *)                say FAIL "fast failure preserves command output: $r4b" ;;
+esac
+case "$r4b" in
+  *"timed out"*)    say FAIL "fast failure must NOT claim a timeout: $r4b" ;;
+  *)                say ok "fast failure does not claim a timeout" ;;
+esac
+
+WS4C="$TMP/ws4c"; mkws "$WS4C"
+GR_WS="$WS4C" GR_STEP_TIMEOUT=1 GR_SYNC_CMD="sleep 5" bash "$REPO/src/agent/restart-prep.sh" t4c >/dev/null 2>&1
+r4c="$(cat "$WS4C/state/restart-prep-failed.json" 2>/dev/null || echo '')"
+case "$r4c" in
+  *"timed out after 1s"*) say ok "timeout says so, with the bound" ;;
+  *)                      say FAIL "timeout says so, with the bound: $r4c" ;;
+esac
+case "$r4c" in
+  *"exited "*)      say FAIL "timeout must NOT be reported as an ordinary exit: $r4c" ;;
+  *)                say ok "timeout is not reported as an ordinary exit" ;;
+esac
+
 echo "5. DEAD core (stale .alive) → no wait; restart even if prep fails"
 WS5="$TMP/ws5"; mkws "$WS5"
 rm -f "$WS5/state/cores/$HOST.alive"
