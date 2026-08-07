@@ -1,60 +1,13 @@
 #!/usr/bin/env python3
 """Bee → broker watcher: the client half of the Bee inbound-only channel.
 
-Bee's developer surface (docs.bee.computer) is an authenticated LOCAL proxy —
-REST + an SSE event stream bound to 127.0.0.1 after `bee login`. Bee pushes
-no webhooks, so the ag2space broker cannot receive from Bee directly; this
-watcher runs where the bee credentials live, subscribes to the proxy's SSE
-stream, normalizes selected events into the relay task shape (`source: bee`),
-and POSTs them through the broker's authenticated inbound hop (/v1/ingest).
-Results route broker-side to the Bee fallback DM room (the broker's
-asymmetric-channel rule: inbound-only sources reply via a fallback room).
-
-Config (CLI flag > BEE_* env > package default in _DEFAULTS). Run via the
-`sutando-bee-watcher` console entry point, or `python -m` the module:
-  BEE_PROXY_URL     Bee local proxy base (e.g. http://127.0.0.1:<port>).
-                    REQUIRED — empty means the skill is not configured and the
-                    watcher exits 2 with a clear message instead of guessing.
-  BEE_EVENTS_PATH   SSE endpoint path on the proxy (default /v1/stream;
-                    /v1/events, the docs-derived guess, 404s live).
-  BEE_EVENT_TYPES   comma-list of SSE event types to forward
-                    (default todo-created,todo-updated — conservative; the
-                    per-utterance stream would flood the task queue).
-  BEE_BROKER_URL    broker base (e.g. https://chat.ag2.space/relay). REQUIRED.
-  BEE_BROKER_TOKEN  bearer for /v1/ingest — the caller's agent record must be
-                    flagged `"ingest": true`. REQUIRED. Prefer the vault
-                    (`vault set BEE_BROKER_TOKEN …`); env accepted.
-  BEE_AGENT_ID      relay agent whose queue receives Bee tasks (dedicated
-                    lane identity, same pattern as TEAMS_AGENT_ID).
-  BEE_CURSOR_FILE   explicit path for the resume cursor. REQUIRED in the
-                    headless container (no sutando workspace to resolve);
-                    point it at the pod's persistent volume. Unset → under
-                    the local workspace (OSS/local-core default).
-  BEE_API_BASE      Bee CLOUD API base (e.g. https://app-api-developer.ce.
-                    bee.amazon.dev). When set WITH BEE_API_TOKEN, the watcher
-                    subscribes DIRECTLY to Bee's cloud stream with a bearer —
-                    NO local `bee proxy` needed — the headless mode for an
-                    always-on server-side container. BEE_PROXY_URL is the
-                    alternative (local proxy) source; exactly one is used
-                    (API base wins).
-  BEE_API_TOKEN     bearer for BEE_API_BASE (vault-preferred) — server-side
-                    custody of the Bee token.
-  BEE_INBOX_FILE    sqlite path for the inbox sink's OWN EventInbox (default
-                    <state>/bee-events.db). Never point it at the gateway
-                    channel's inbox — MAX(cursor) there is its resume anchor.
-  BEE_SINK          broker (default) | local | inbox. INBOX delivers into
-                    ag2-sparrow's durable EventInbox and drains through the
-                    shared TaskifyHandler (threshold=1), which stamps every
-                    promoted task access_tier: ambient — the framework path.
-                    LOCAL is the fully-OSS mode: events land as task FILES
-                    in <workspace>/tasks/ (the same file bridge voice/Discord
-                    use); no broker URL/token needed.
-
-Cursor: last delivered SSE event id persists to
-<workspace>/state/bee-watcher-cursor.json and is replayed as Last-Event-ID on
-reconnect, so a restart never re-forwards history the broker already has (and
-HUB.enqueue is idempotent by task id as the second line of defense).
-"""
+Subscribes to Bee's SSE stream (local authenticated proxy, or cloud-direct
+when BEE_API_BASE+BEE_API_TOKEN are set), normalizes selected events into the
+relay task shape (`source: bee`), and delivers via the configured sink
+(broker /v1/ingest | local task files | durable EventInbox). Config
+reference: the package README, "Bee wearable source". The last delivered SSE
+id persists and replays as Last-Event-ID on reconnect — restarts never
+re-forward history; a failed delivery halts the stream (no skip-ahead)."""
 
 from __future__ import annotations
 
@@ -130,22 +83,11 @@ def _write_cursor(event_id: str) -> None:
 
 
 def _write_local_task(task: dict) -> bool:
-    """LOCAL sink: persist the event as a task file on the same file bridge
-    every local channel uses (atomic tmp+rename so the stream watcher never
-    sees a partial file).
+    """LOCAL sink: persist the event as a task file (atomic tmp+rename).
 
-    access_tier `ambient`, NOT `owner`: tier is an AUTHORIZATION boundary,
-    not a trust-of-content one. Voice is the owner DELIBERATELY addressing
-    the agent; a Bee event is DEVICE-CAPTURED (a passing utterance, an
-    auto-extracted todo) that the owner never consciously issued as a
-    command. Stamping it `owner` would make a captured "email Sam the deck"
-    or "cancel the booking" eligible for privileged/irreversible execution.
-    `ambient` (CLAUDE.md "Ambient access control") routes it through the
-    sandboxed path: act on the observation, but surface any privileged
-    action to the owner instead of executing it. This is orthogonal to
-    `confine_user_content` (which defangs injection in the body) — that
-    guards the text; this guards what the agent is allowed to DO with it.
-    priority low: ambient wearable events shouldn't preempt direct asks."""
+    access_tier ambient, never owner — device-captured speech is an
+    observation, not a command; privileged actions must surface, not
+    execute. priority low: ambient events don't preempt direct asks."""
     from ag2_sparrow import _dirs
     import datetime
     tasks_dir = _dirs.task_dir()
@@ -168,22 +110,12 @@ def _write_local_task(task: dict) -> bool:
 
 
 class _InboxSink:
-    """BEE_SINK=inbox: deliver events into ag2-sparrow's durable EventInbox and
-    drain them through the shared TaskifyHandler (threshold=1 — Bee events are
-    discrete captures, not room chatter to batch). The consumer stamps every
-    promoted task `access_tier: ambient` with the in-band observation block, so
-    this sink inherits the framework's authorization posture by construction.
+    """BEE_SINK=inbox: deliver into the durable EventInbox, drained via the
+    shared TaskifyHandler (threshold=1); promoted tasks are ambient-tier.
 
-    The inbox lives in its OWN sqlite file (default <state>/bee-events.db,
-    override BEE_INBOX_FILE): the gateway EventChannel resumes from
-    MAX(cursor) of ITS inbox, so a second source must never share that file
-    or it corrupts the resume anchor. Cursor here is a local monotonic int;
-    the Bee-side SSE resume stays the existing BEE_CURSOR_FILE string id.
-
-    Delivery contract: insert() committing IS delivery (durable, at-least-once
-    downstream); drain/promotion failures are retried on later drains and never
-    halt the stream. A duplicate replay after reconnect returns False from
-    insert() but is already durable — treated as delivered."""
+    Must use its OWN sqlite file — sharing the gateway inbox corrupts that
+    channel's MAX(cursor) resume anchor. insert() committing IS delivery;
+    drain failures retry on later drains and never halt the stream."""
 
     def __init__(self, types: set):
         from ag2_sparrow import _dirs

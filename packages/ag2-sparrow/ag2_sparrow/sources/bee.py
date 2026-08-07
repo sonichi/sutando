@@ -1,14 +1,9 @@
 """sources/bee.py — the Bee AI wearable as a watcher SOURCE.
 
-The sources/ registry: an integration contributes only its
-SUBSCRIBE specifics (where the event stream lives, how to authenticate) and its
-NORMALIZE fn (provider payload -> the one relay task shape). Everything else —
-SSE parsing, resume cursor, sink selection (local/inbox/broker), halt-on-failed-
-delivery, reconnect/backoff, CLI — is the shared runner (bee_watcher.py today;
-gains --source dispatch via sources.SOURCES when integration #2 lands).
-
-Adding integration N = one module like this + a registry entry.
-"""
+A source contributes only its SUBSCRIBE specifics (stream location, auth)
+and a NORMALIZE fn (provider payload -> the relay task shape); the shared
+runner owns SSE parsing, cursor, sinks, reconnect, and the CLI. Adding
+integration N = one module like this + a registry entry."""
 
 from __future__ import annotations
 

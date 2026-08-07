@@ -46,6 +46,46 @@ task delivery — a channel failure never affects the task loop.
 | `SPARROW_HA_ROOM` | room id where question cards are posted (with `SPARROW_HA_OWNER`) |
 | `SPARROW_HA_A2UI` | `1` attaches interactive A2UI blocks to cards (default off; requires a client that renders them) |
 
+
+## Optional: Bee wearable source (0.3.0)
+
+`sutando-bee-watcher` subscribes to the [Bee](https://bee.computer) developer
+surface and turns selected events into tasks. Bee pushes no webhooks; its
+surface is an authenticated local proxy (after `bee login`) or the cloud API —
+so the watcher runs client-side, where the credentials live, and dials out.
+
+Two subscription modes (exactly one is used; API base wins): the local proxy
+(`BEE_PROXY_URL`), or direct-to-cloud with a bearer (`BEE_API_BASE` +
+`BEE_API_TOKEN`) for an always-on headless container.
+
+Three delivery sinks (`BEE_SINK`): `broker` posts through the AG2 Space
+broker's authenticated inbound hop (`/v1/ingest`; results route to the Bee
+fallback DM room); `local` writes task files onto the same file bridge voice
+and Discord use — the fully-OSS, no-broker mode; `inbox` delivers into the
+durable EventInbox and drains through the shared taskify consumer.
+
+Every Bee-derived task is stamped `access_tier: ambient`, never `owner`:
+device-captured speech is an observation the owner never consciously issued
+as a command, so privileged actions must surface for approval rather than
+execute. Tier is the authorization boundary; body-injection defang is
+separate and also applied.
+
+| Env | Meaning |
+|---|---|
+| `BEE_PROXY_URL` | Bee local proxy base (required unless `BEE_API_BASE` set; empty → exit 2) |
+| `BEE_EVENTS_PATH` | SSE path on the proxy (default `/v1/stream`) |
+| `BEE_EVENT_TYPES` | comma-list of SSE types to forward (default `todo-created,todo-updated`; the per-utterance stream would flood the queue) |
+| `BEE_API_BASE` / `BEE_API_TOKEN` | cloud-direct mode (vault-preferred token) |
+| `BEE_BROKER_URL` / `BEE_BROKER_TOKEN` | broker sink target + bearer (agent record needs `"ingest": true`) |
+| `BEE_AGENT_ID` | relay agent whose queue receives Bee tasks |
+| `BEE_CURSOR_FILE` | resume-cursor path (required headless; defaults under the local workspace) |
+| `BEE_INBOX_FILE` | inbox sink's OWN sqlite (never share the gateway channel's inbox — its `MAX(cursor)` is that channel's resume anchor) |
+| `BEE_SINK` | `broker` (default) \| `local` \| `inbox` |
+
+Resume: the last delivered SSE event id persists and replays as
+`Last-Event-ID` on reconnect; a failed delivery halts the stream rather than
+skipping ahead, and enqueue is idempotent by task id.
+
 ## Directories & single source
 
 The client's filesystem contract is three dirs — set them (or take the defaults):
