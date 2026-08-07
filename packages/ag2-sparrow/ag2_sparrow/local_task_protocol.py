@@ -120,6 +120,9 @@ KNOWN_HEADER_KEYS = (
     "author_id", "chat_id",
     "thread_ts", "reply_to_event", "reply_to_me", "callSid", "caller",
     "from", "call_sid", "hint", "instructions", "transcript",
+    # Stamped by the codex scheduler on every enqueued slot; listing them
+    # promotes them to headers and auto-defangs forgeries via the guard.
+    "schedule_name", "schedule_slot",
     # interaction-model 4D, step 1.5 — structured media metadata. Listing them
     # here promotes them to headers AND (via the guard's shared import) defangs
     # them in untrusted bodies, so a forged `attachments:` body line can never

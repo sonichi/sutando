@@ -207,7 +207,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'sender_name|room_name|parent_message_id|reply_chain_ids|reminder|' +
 	'author_name|author_id|' +
 	'chat_id|thread_ts|reply_to_event|reply_to_me|callSid|caller|from|' +
-	'call_sid|hint|instructions|transcript|content_modalities|media_form|' +
+	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
 	'attachments|platform_card)\\s*:',
 	'i',
 );
