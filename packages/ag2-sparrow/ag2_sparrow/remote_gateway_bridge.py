@@ -1582,9 +1582,8 @@ def _write_task(task: dict) -> str | None:
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":
         _chan = _one_line(task.get("channel_id") or "")
-        # shlex.quote, not a manual f"'{_chan}'" wrap: a provider-controlled
-        # channel id containing a quote would otherwise close the shell string
-        # early and turn the remainder into executable shell syntax.
+        # shlex.quote: an unescaped quote in _chan must not close the shell
+        # string early and turn the remainder into executable shell syntax.
         _chan_q = shlex.quote(_chan)
         _step = 1
         _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]

@@ -159,15 +159,8 @@ def test_write_task_drops_unsafe_and_idless():
 
 
 def test_write_task_shell_quotes_channel_id_in_skill_instructions():
-    """A provider-controlled channel_id must not break out of the shell
-    commands embedded in the owner-tier SKILL INSTRUCTIONS block — a naive
-    single-quote wrap lets an embedded quote close early and turn the
-    remainder into a second shell command (P1 finding on #2686's review).
-    A raw substring check can't tell safe-but-visually-similar text apart
-    from real injection, so this parses the embedded command with shlex —
-    on the pre-fix code shlex.split raises `No closing quotation` (proving
-    the shell quoting was genuinely unbalanced); on fixed code it must
-    round-trip to the channel id as exactly one argument."""
+    """A malicious channel_id must not break the shell commands embedded in
+    the SKILL INSTRUCTIONS block; shlex must round-trip it as one argument."""
     with tempfile.TemporaryDirectory() as d:
         base = pathlib.Path(d)
         m = _load(base)
