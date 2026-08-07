@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import local_task_protocol
+from result_markers import parse_markers
 from workspace_default import status_read_path
 
 
@@ -548,14 +549,10 @@ def _legacy_context_entries(
 
 def _context_result(result: str) -> str:
     """Drop bridge-control-only results; they are not user work context."""
-    text = str(result or "").strip()
-    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-    if (
-        first_line.casefold() in {"[no-send]", "[replied]"}
-        or re.fullmatch(r"\[deduped:\s*[^\]]+\]", first_line, re.IGNORECASE)
-    ):
+    parsed = parse_markers(str(result or ""))
+    if any(action.kind in {"skip", "dm-only"} for action in parsed.actions):
         return ""
-    return text[:CONTEXT_RESULT_CHARS]
+    return parsed.body[:CONTEXT_RESULT_CHARS]
 
 
 def _candidate_rows(workspace: Path, rows: Optional[list[TaskRecord]] = None) -> list[TaskRecord]:

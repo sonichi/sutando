@@ -490,6 +490,8 @@ def test_workstream_context_is_prior_owner_only_bounded_and_untrusted() -> None:
     assert all(path.read_bytes() == contents for path, contents in before.items())
     assert workstreams._context_result("[deduped: task-other]\nstale") == ""
     assert workstreams._context_result("\n[REPLIED]\nalready sent") == ""
+    assert workstreams._context_result("[no-send] internal routing note") == ""
+    assert workstreams._context_result("[dm-only]\nprivate briefing") == ""
     assert [row["id"] for row in workstreams.build_workstream_context(
         workspace, "task-current", limit=1,
     )["prior_tasks"]] == ["task-a2"]
