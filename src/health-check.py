@@ -5211,6 +5211,31 @@ def check_proactive_quarantine() -> dict:
     }
 
 
+def _ps_snapshot() -> "str | None":
+    """One `ps -Ao pid,ppid,args` for callers classifying several pids at once."""
+    try:
+        return subprocess.run(["ps", "-Ao", "pid,ppid,args"],
+                              capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":
+    """PPID of `pid` as a string, or None if it cannot be read."""
+    if ps_output is None:
+        try:
+            out = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+            return out.split()[0] if out else None
+        except Exception:  # noqa: BLE001
+            return None
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0] == str(pid):
+            return parts[1]
+    return None
+
+
 def _proc_argv(pid: int) -> str:
     """argv of `pid`, or "" if no such process.
 
@@ -5321,6 +5346,19 @@ def check_task_watcher() -> dict:
             # nothing supervises them, and each new start adds another (observed
             # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
             # duplicate processing, not a stalled queue).
+            ps_out = _ps_snapshot()
+            # A KNOWN parent that is not init: its spawning session still owns it.
+            # Unknown parentage cannot support that claim, so it stays an orphan.
+            parents = {r: _pid_parent(r, ps_out) for r in roots}
+            supervised = [r for r, pp in parents.items() if pp and pp != "1"]
+            if len(roots) == 1 and supervised:
+                # Its session is still its parent, so it IS supervised and there is
+                # no second tree to duplicate work. Killing it is what opens a gap.
+                return {"name": name, "status": "warn",
+                        "detail": f"watcher pid {roots[0]} runs under a live session "
+                                  f"(ppid {parents[roots[0]]}) but wrote no PID "
+                                  "sentinel, so health-check cannot track it. Do NOT stop it — "
+                                  "it IS draining tasks/. Restart cleanly only when tasks/ is empty."}
             return {"name": name, "status": "warn",
                     "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
                               f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
