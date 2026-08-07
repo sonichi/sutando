@@ -25,6 +25,7 @@ unreadable status file yields `unknown`, never a crash. This is a read-only
 observer; it starts nothing and kills nothing.
 """
 import json
+import math
 import os
 import socket
 import subprocess
@@ -243,6 +244,210 @@ def _gateway_running():
     return False
 
 
+
+# The AG2 Space desktop app runs its own engine runtime under
+# `space.ag2.app/engine`, and that engine is what serves the Station connector
+# gateway (sutando.ag2.space). Station connectors are therefore available only
+# while AG2 Space is running; when it is not, Station calls fail with a bare
+# ENOTFOUND. Surfacing this lets any reader (health-check, dashboard, the agent)
+# attribute a Station failure to "AG2 Space not running" rather than guess.
+_AG2SPACE_APP_MARKER = "AG2 Space.app/Contents/MacOS"
+_STATION_GATEWAY_HOST = "sutando.ag2.space"
+
+
+def _ag2space_app_running():
+    """Tri-state: is the AG2 Space desktop app (its UI binary) running?
+
+    Matches ONLY the app bundle's MacOS executable, NOT the broad
+    `space.ag2.app/engine` tree (which every bundled Sutando process shares —
+    credential-proxy, web-client, voice-agent, the core tmux, etc.; qingyun CR
+    on #2680). This is a narrow "the app is open" signal and does NOT by itself
+    imply the Station gateway is reachable — see _station_available. rc None
+    (pgrep unexecutable) → None (unknown), never a False down-vote.
+    """
+    rc, _ = _run(["pgrep", "-f", _AG2SPACE_APP_MARKER])
+    if rc is None:
+        return None
+    return rc == 0
+
+
+_STATION_CONNECT_TIMEOUT = 1.0   # hard per-connect bound (seconds)
+
+
+def _probe_station(timeout=_STATION_CONNECT_TIMEOUT):
+    """BLOCKING, BOUNDED tri-state reachability probe of the Station gateway.
+
+    One getaddrinfo plus a SINGLE connect to the first resolved address, bounded
+    by `timeout`. Returns True when that address accepts a TLS-port TCP
+    connection, False when it resolves but the connect is refused/times out, and
+    None on a DNS/resolver or socket error — UNKNOWN rather than a positive
+    "unavailable" (same tri-state discipline as _run). Bounded to one connect
+    (the earlier version tried every resolved address sequentially, up to
+    N×timeout). Must only be reached via the file-cached _station_available().
+    """
+    try:
+        addrs = socket.getaddrinfo(_STATION_GATEWAY_HOST, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return None
+    if not addrs:
+        return None
+    family, socktype, proto, _canon, sockaddr = addrs[0]
+    s = socket.socket(family, socktype, proto)
+    s.settimeout(timeout)
+    try:
+        s.connect(sockaddr)
+        return True
+    except (socket.timeout, OSError):
+        return False
+    finally:
+        s.close()
+
+
+# Station reachability is FILE-cached, and the network probe is kept ENTIRELY off
+# derive()'s hot path (qingyun CR #2680). derive() runs every ~3s in
+# core-input-watch's IN-PROCESS liveness loop, so it must NEVER touch the network:
+# _station_cached() only READS the on-disk verdict and returns instantly (a hung
+# resolver can't stall the supervisor tick). The probe runs only from the one-shot
+# `runtime-health.py main()` (`sutando-config.sh runtime`), via _refresh_station(),
+# which bounds the whole DNS+connect in a KILLABLE subprocess with a hard deadline
+# — a real cancellable boundary (socket.settimeout doesn't bound getaddrinfo, so a
+# subprocess we can kill is the only way to cap a hung resolver). No threads => no
+# worker accumulation. Wall-clock time is used because the cache is shared across
+# processes (monotonic clocks have per-process origins).
+_STATION_TTL = 60.0               # a refresh older than this is stale
+_STATION_ATTEMPT_COOLDOWN = 15.0  # after an attempt, don't re-probe this soon
+_STATION_PROBE_DEADLINE = 3.0     # hard end-to-end cap on the killable probe
+_STATION_CACHE_NAME = "station-available.json"
+
+
+def _station_cache_file(workspace):
+    return os.path.join(workspace, "state", _STATION_CACHE_NAME)
+
+
+def _read_station_cache(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_station_cache(path, data):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _cache_ts(x):
+    """A cache timestamp as a FINITE number, or None if missing/malformed. The
+    cache is a mutable workspace state file — it can be corrupted, synced, or
+    hand-edited — so NEVER do arithmetic on a value straight out of it (qingyun
+    CR #2680: a `"bad"` value_ts raised TypeError in derive(), which
+    core-input-watch calls unguarded every ~3s → killed the supervisor). bool is
+    an int subclass in Python, so exclude it explicitly. NaN/±inf are floats but
+    poison every comparison — `(now - NaN) >= ttl` is always False, so a
+    `value_ts: NaN` would read as permanently FRESH and freeze the verdict
+    forever (qingyun CR #2680 round 2) — so require math.isfinite too."""
+    return (x if isinstance(x, (int, float)) and not isinstance(x, bool)
+            and math.isfinite(x) else None)
+
+
+def _cache_verdict(v):
+    """A tri-state verdict (True/False/None); anything else reads as None. Use
+    IDENTITY, not `in (True, False, None)`: `1 == True` and `0 == False` in
+    Python, so membership would let an integer `1`/`0` masquerade as the bool
+    verdict and be returned unchanged, violating the bool|null field contract
+    (qingyun CR #2680 round 2)."""
+    return v if (v is True or v is False or v is None) else None
+
+
+def _fresh_age(now, value_ts, ttl):
+    """`now - value_ts` when the timestamp is plausibly fresh, else None.
+
+    "Fresh" = within `ttl` AND not implausibly in the future. The cache is synced
+    across hosts with independent clocks, so a corrupt/skewed record can carry a
+    far-future `value_ts`; a naive `(now - value_ts) < ttl` reads that as fresh
+    (age is very negative) and freezes the verdict indefinitely (qingyun CR #2680:
+    "revive an indefinitely stale availability verdict"). A small negative age is
+    tolerated as benign clock skew; anything more than `ttl` in the future is
+    treated as not-fresh (unknown)."""
+    age = now - value_ts
+    if age >= ttl or age < -ttl:
+        return None
+    return age
+
+
+def _station_cached(workspace, *, now=None, ttl=_STATION_TTL):
+    """READ-ONLY tri-state Station verdict from the on-disk cache — NEVER probes,
+    so it is safe on derive()'s ~3s supervisor loop (always returns instantly).
+
+    Returns the persisted value only while it is FRESH (younger than `ttl`); an
+    expired, absent, OR malformed verdict reads as None (unknown) rather than a
+    stale confident True/False or a raised exception. Without the freshness check
+    a last-known `True` would keep reporting `station_available: true` forever
+    after Station went down; without the schema guard a corrupt cache record
+    would crash core-input-watch (qingyun CR #2680). The value is refreshed
+    off-loop by the one-shot main() via _refresh_station."""
+    cache = _read_station_cache(_station_cache_file(workspace))
+    value_ts = _cache_ts(cache.get("value_ts"))
+    if value_ts is None:
+        return None  # missing or malformed timestamp -> unknown
+    t = now if now is not None else time.time()
+    if _fresh_age(t, value_ts, ttl) is None:
+        return None  # expired OR implausibly-future -> unknown, not a stale verdict
+    return _cache_verdict(cache.get("value"))
+
+
+def _probe_station_bounded(connect_timeout=_STATION_CONNECT_TIMEOUT,
+                           deadline=_STATION_PROBE_DEADLINE, argv=None):
+    """Run the blocking probe inside a KILLABLE subprocess with a hard end-to-end
+    `deadline`. Because socket.settimeout does not bound getaddrinfo, this is the
+    only way to cap a hung resolver: on timeout the child is killed and the result
+    is None (unknown). Child prints 'true'/'false'/'' (see the --probe-station
+    entrypoint). `argv` is injectable for tests."""
+    argv = argv or [sys.executable, os.path.abspath(__file__),
+                    "--probe-station", str(connect_timeout)]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=deadline)
+    except (subprocess.TimeoutExpired, OSError):
+        return None  # hung/failed resolver — killed at the deadline, UNKNOWN
+    out = (proc.stdout or "").strip()
+    return {"true": True, "false": False}.get(out, None)
+
+
+def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
+                     deadline=_STATION_PROBE_DEADLINE,
+                     cooldown=_STATION_ATTEMPT_COOLDOWN, probe=None):
+    """Probe the gateway (bounded, cancellable) and persist the verdict. Called
+    ONLY from the one-shot main() — never from derive()/the 3s loop. Honors the
+    TTL (a still-fresh verdict is not re-probed) and an attempt cooldown (a hung
+    resolver is not re-entered by a separate one-shot caller). `probe`/`now`
+    injectable."""
+    now = now if now is not None else time.time()
+    path = _station_cache_file(workspace)
+    cache = _read_station_cache(path)
+    value_ts = _cache_ts(cache.get("value_ts"))
+    if value_ts is not None and _fresh_age(now, value_ts, ttl) is not None:
+        return _cache_verdict(cache.get("value"))  # still FRESH — no re-probe
+    attempt_ts = _cache_ts(cache.get("attempt_ts"))
+    if attempt_ts is not None and _fresh_age(now, attempt_ts, cooldown) is not None:
+        return _cache_verdict(cache.get("value"))  # a recent attempt in flight
+    _write_station_cache(path, {**cache, "attempt_ts": now})
+    runner = probe or (lambda: _probe_station_bounded(deadline=deadline))
+    try:
+        result = runner()
+    except Exception:
+        result = None  # best-effort: never a spurious False
+    _write_station_cache(path, {"value": result, "value_ts": time.time(), "attempt_ts": now})
+    return result
+
+
 def _pane_text():
     rc, out = _run(["tmux", "-S", TMUX_SOCKET, "capture-pane", "-p", "-t", SESSION])
     return out if rc == 0 else ""
@@ -289,6 +494,8 @@ def derive():
 
     core = _core_running()
     gateway = _gateway_running()
+    ag2space_app = _ag2space_app_running()
+    station = _station_cached(workspace)  # READ-ONLY: never probes on the 3s loop
 
     # Raw signals, captured for the audited verdict. Defaults hold for the
     # offline / unknown branches (core gone or unprobeable → status/login
@@ -366,6 +573,9 @@ def derive():
         "authenticated": authed,
         "core_running": core,
         "gateway_running": gateway,
+        "ag2space_app_running": ag2space_app,
+        # Real reachability of the Station gateway (tri-state); None = unknown.
+        "station_available": station,
         "tmux_socket": TMUX_SOCKET,
         "session": SESSION,
         "detail": detail,
@@ -403,12 +613,20 @@ def _confirm_count(state_dir, health, severity):
 
 
 def main():
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ws = _resolve_workspace(repo)  # has its own repo/workspace fallback; never raises
+    # Refresh the Station verdict OFF the supervisor loop: this one-shot process
+    # (not core-input-watch's 3s derive() loop) is the only place the network
+    # probe runs, and it's bounded in a killable subprocess so a hung resolver
+    # can't freeze even this caller. derive() below then READS the fresh cache.
+    try:
+        _refresh_station(ws)
+    except Exception:
+        pass  # a refresh failure must never block the health read
     result = derive()
     # Best-effort persist so anything (app, dashboard) can read the latest without
     # re-probing; failure to write must not fail the read.
     try:
-        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ws = _resolve_workspace(repo)
         state_dir = os.path.join(ws, "state")
         os.makedirs(state_dir, exist_ok=True)
         with open(os.path.join(state_dir, "runtime-health.json"), "w") as f:
@@ -426,5 +644,14 @@ def main():
     print(json.dumps(result, indent=2))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI dispatch; logic tested via _probe_station
+    # `--probe-station <timeout>`: the child of _probe_station_bounded — runs the
+    # blocking probe once and prints its tri-state ('true'/'false'/'' for None) so
+    # the parent can bound it in a killable subprocess. Kept tiny and side-effect
+    # free (no cache writes, no health output).
+    if len(sys.argv) >= 2 and sys.argv[1] == "--probe-station":
+        _t = float(sys.argv[2]) if len(sys.argv) > 2 else _STATION_CONNECT_TIMEOUT
+        _r = _probe_station(_t)
+        print("" if _r is None else ("true" if _r else "false"))
+        sys.exit(0)
     main()
