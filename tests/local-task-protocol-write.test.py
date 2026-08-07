@@ -59,6 +59,16 @@ class TestWriteTaskFile(unittest.TestCase):
             with self.assertRaises(ValueError):
                 write_task_file(d, "../escape", [("id", "task-w-2")], "x")
 
+    def test_id_header_is_owned_by_the_helper(self):
+        with tempfile.TemporaryDirectory() as d:
+            # missing id header -> prepended from task_id
+            p = write_task_file(d, "task-own-1", [("source", "chat")], "x")
+            self.assertEqual(p.read_text(),
+                             "id: task-own-1\nsource: chat\ntask: x\n")
+            # mismatched supplied id -> identity split, refused
+            with self.assertRaises(ValueError):
+                write_task_file(d, "task-a-1", [("id", "task-b-1")], "x")
+
 
 class TestHealthCheckWriterGolden(unittest.TestCase):
     """The adopted writer must produce the exact pre-adoption bytes."""

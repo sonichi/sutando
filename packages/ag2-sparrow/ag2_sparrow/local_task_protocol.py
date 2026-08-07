@@ -584,8 +584,16 @@ def write_task_file(tasks_dir: "Path | str", task_id: str,
     enters the Durable Work Model's `pending` state the moment this returns."""
     if not valid_task_id(task_id):
         raise ValueError(f"not a canonical task id: {task_id!r}")
+    hdrs = list(headers)
+    supplied = [v for k, v in hdrs if k == "id"]
+    if any(v != task_id for v in supplied):
+        raise ValueError(
+            f"id header {supplied!r} disagrees with task_id {task_id!r} — "
+            "the filesystem key and the in-band id must be the same identity")
+    if not supplied:
+        hdrs.insert(0, ("id", task_id))
     d = Path(tasks_dir)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{task_id}.txt"
-    path.write_text(serialize_task_last(headers, task_body))
+    path.write_text(serialize_task_last(hdrs, task_body))
     return path
