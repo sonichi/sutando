@@ -214,14 +214,8 @@ def send_telegram(chat_id: str, message: str) -> bool:
     )
 
 
-# Gateway provider names come from task files, i.e. from OUTSIDE the trust
-# boundary — a `source` like `../evil` must never become a path segment
-# (traversal reads an arbitrary .env-shaped file and posts its bearer to the
-# URL named in that same file). Safe slug only. Dots are allowed so channel
-# lanes can be named by homeserver domain (owner convention 2026-08-06:
-# `ag2.space`, `dev.ag2.space`), but every dot must sit BETWEEN alphanumerics
-# — no leading/trailing dot, no "..", so every traversal shape is rejected
-# before the realpath containment check below even runs.
+# `source` is untrusted input that becomes a path segment: safe slug only, dots
+# only BETWEEN alphanumerics, so every traversal shape is rejected up front.
 _SOURCE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9]))*$")
 
 
