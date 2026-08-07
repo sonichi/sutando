@@ -188,6 +188,44 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertIn("tmux exploded", r["detail"])
         self.assertIn("skipped", r["detail"])
 
+    def test_failed_scope_query_is_not_reported_as_unset(self):
+        """A nonzero `show-environment` that is NOT tmux's unset marker is a failed
+        query; reading it as "not pinned" clears the probe on an uninspected scope."""
+        import tempfile as _tf
+        from unittest import mock
+        unset = subprocess.CompletedProcess(
+            args=["tmux"], returncode=1, stdout="",
+            stderr="unknown variable: SUTANDO_CORE_MODEL")
+        sessions = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="core\n", stderr="")
+        broken = subprocess.CompletedProcess(
+            args=["tmux"], returncode=1, stdout="", stderr="server lost")
+        prev = os.environ.get("SUTANDO_TMUX_SOCKET")
+        with _tf.NamedTemporaryFile() as fake_socket:
+            os.environ["SUTANDO_TMUX_SOCKET"] = fake_socket.name
+            try:
+                # global unset -> sessions ok -> the session's own query FAILS
+                with mock.patch.object(self.hc.subprocess, "run",
+                                       side_effect=[unset, sessions, broken]):
+                    r = self.hc.check_core_model_pin()
+            finally:
+                if prev is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = prev
+        self.assertIn("skipped", r["detail"], "an uninspected scope must not read as clear")
+        self.assertNotIn("no model pin", r["detail"], r)
+
+    def test_unset_marker_on_either_stream_still_means_unset(self):
+        """The control: tmux's own unset shape must stay a clean ok, not an error."""
+        for stream in ("stdout", "stderr"):
+            kw = {stream: "unknown variable: SUTANDO_CORE_MODEL"}
+            kw.setdefault("stdout", ""), kw.setdefault("stderr", "")
+            res = subprocess.CompletedProcess(args=["tmux"], returncode=1, **kw)
+            from unittest import mock
+            with mock.patch.object(self.hc.subprocess, "run", return_value=res):
+                self.assertEqual(self.hc._query_pin("/s", ["-g"]), "", stream)
+
     def test_failed_enumeration_is_not_reported_as_no_pin(self):
         """A nonzero `list-sessions` must not become an empty session list —
         that would clear the probe without inspecting a single session."""
