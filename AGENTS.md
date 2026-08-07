@@ -23,6 +23,7 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 - **Shared result-file lifecycle policy has one implementation.** Claim, recovery, collision, and retry rules for the common task/result protocol belong in dependency-light `src/` helpers. Adapters bind their resolved directories and retain provider-specific delivery only; do not copy filesystem state machines between bridges. Pin both the shared contract and every adapter's delegation in tests.
 
 - **HTTP handlers centralize transport mechanics.** Put repeated authentication gates, status/header emission, and JSON encoding in handler helpers; route branches own endpoint behavior. Protect status codes, headers, and payload shapes with direct contract tests when refactoring handlers.
+- **HTTP route methods are dispatch layers.** Move filesystem reconciliation and response assembly into named module functions; route methods should parse the request, call one unit, and emit its result. Test the extracted behavior directly plus one route-wiring path.
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 - **Code comments: at most 2 lines, and only what the code cannot state itself.** Give the constraint or the non-obvious reason. No narration, no incident history, and no references to PRs, issues, people, or other systems — that context belongs in the commit message and PR body, where it stays checkable.
 
