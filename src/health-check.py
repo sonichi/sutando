@@ -6501,8 +6501,10 @@ def check_core_model_pin() -> dict:
     re-wedging core keeps working on the standard 200K window instead of looping
     on an unanswerable gate. That escalation is sound. What was missing is any
     way to notice it afterwards: the variable was written here and read nowhere,
-    it lives in the core's tmux SESSION env (so `start-cli --restart` inherits it
-    via `new-session -A`, which discards its own -e), and nothing expires it.
+    and it lives in the core's tmux SESSION env, where it survives every bare
+    rerun -- `new-session -A` attaches and discards its own -e, so the session
+    keeps the env it already had. A --restart DOES clear it (kill-session, then a
+    fresh create without -e), so the exposed core is the one nobody restarts.
 
     Observed: a peer core ran 17 days on the downgrade — 165 autocompactions in
     25h, one every 9.1 min — and was found only because the owner noticed the
