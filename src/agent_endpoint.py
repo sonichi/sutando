@@ -1,7 +1,7 @@
 """Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
 
 The four-concept model (design session 2026-08-07): callers name WHO they
-want (`agent://<id>`) and WHICH interaction lane (durable | realtime |
+want (`sutando://<id>`) and WHICH interaction lane (durable | realtime |
 local-control); this module picks the transport. Call sites must never
 hardcode a socket path, gateway URL, or task directory again — when a new
 transport appears (the remote-realtime session gateway, a SQLite durable
@@ -26,7 +26,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEME = "agent://"
+SCHEME = "sutando://"
 
 # Interaction lanes (concept #2). `durable` = submit work that must survive
 # crashes and transport changes; `realtime` = interactive session (stream,
@@ -53,10 +53,10 @@ class Route:
 
 
 def parse_endpoint(endpoint: str) -> str:
-    """`agent://qingyun-001` or bare `qingyun-001` → validated bare id."""
+    """`sutando://qingyun-001` or bare `qingyun-001` → validated bare id."""
     bare = endpoint[len(SCHEME):] if endpoint.startswith(SCHEME) else endpoint
     if not _ID_RE.match(bare):
-        raise ValueError(f"not an agent endpoint: {endpoint!r}")
+        raise ValueError(f"not a sutando endpoint: {endpoint!r}")
     return bare
 
 

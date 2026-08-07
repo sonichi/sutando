@@ -24,18 +24,18 @@ DESCRIPTOR = {
 
 class TestParse(unittest.TestCase):
     def test_scheme_and_bare_forms_normalize_identically(self):
-        self.assertEqual(parse_endpoint("agent://qingyun-001"), "qingyun-001")
+        self.assertEqual(parse_endpoint("sutando://qingyun-001"), "qingyun-001")
         self.assertEqual(parse_endpoint("qingyun-001"), "qingyun-001")
 
     def test_junk_is_rejected(self):
-        for bad in ("agent://", "agent://../x", "a b", "", "agent://UPPER"):
+        for bad in ("sutando://", "sutando://../x", "a b", "", "sutando://UPPER"):
             with self.assertRaises(ValueError):
                 parse_endpoint(bad)
 
 
 class TestSelfRoutes(unittest.TestCase):
     def test_durable_routes_to_the_task_filesystem(self):
-        r = resolve("agent://qingyun-001", "durable", DESCRIPTOR, self_id="qingyun-001")
+        r = resolve("sutando://qingyun-001", "durable", DESCRIPTOR, self_id="qingyun-001")
         self.assertEqual(r, Route("filesystem", "/ws/tasks", "qingyun-001", "durable"))
 
     def test_local_control_and_realtime_route_to_the_uds(self):
@@ -52,13 +52,13 @@ class TestSelfRoutes(unittest.TestCase):
 
 class TestRemoteRoutes(unittest.TestCase):
     def test_remote_durable_prefers_the_first_reachable_tier(self):
-        r = resolve("agent://wu-air", "durable", DESCRIPTOR, self_id="qingyun-001")
+        r = resolve("sutando://wu-air", "durable", DESCRIPTOR, self_id="qingyun-001")
         self.assertEqual((r.transport, r.address), ("gateway", "http://10.0.0.2:8080"))
 
     def test_no_reachable_tier_fails_loud(self):
         dead = dict(DESCRIPTOR, call_tiers=[{"tier": "t", "url": "u", "reachable": False}])
         with self.assertRaises(ValueError):
-            resolve("agent://wu-air", "durable", dead, self_id="qingyun-001")
+            resolve("sutando://wu-air", "durable", dead, self_id="qingyun-001")
 
     def test_remote_realtime_is_a_loud_gap_not_a_silent_fallback(self):
         # The named gap from the model: no session gateway exists. This must
@@ -66,7 +66,7 @@ class TestRemoteRoutes(unittest.TestCase):
         # built and this pin should be updated alongside it.
         for mode in ("realtime", "local-control"):
             with self.assertRaises(UnsupportedLane):
-                resolve("agent://wu-air", mode, DESCRIPTOR, self_id="qingyun-001")
+                resolve("sutando://wu-air", mode, DESCRIPTOR, self_id="qingyun-001")
 
 
 class TestModeVocabulary(unittest.TestCase):
