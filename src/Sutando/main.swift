@@ -2492,7 +2492,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let script = repoRoot + "/src/agent/graceful-restart.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [script, "--", "--visible"]
+        // SUTANDO_RESTART_REHEARSE=1 exercises this AppKit path with the kill skipped.
+        // NOT side-effect-free: --dry-run still runs prep, including a real sync.
+        proc.arguments = GracefulRestartInvocation.args(
+            script: script, env: ProcessInfo.processInfo.environment)
         // stdout is the phase stream, not noise: on a busy core it is the only
         // sign the click did anything. stderr stays for the failure preview.
         let outPipe = Pipe()

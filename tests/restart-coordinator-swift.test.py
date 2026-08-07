@@ -144,6 +144,17 @@ case "launch-failure-resets":
     print("phase=" + name(c.currentPhase))
     print("claim2=" + show(c.claimRestart()))
 
+case "invocation-default":
+    print(GracefulRestartInvocation.args(script: "/s/gr.sh", env: [:]).joined(separator: " "))
+
+case "invocation-rehearse":
+    print(GracefulRestartInvocation.args(script: "/s/gr.sh",
+          env: ["SUTANDO_RESTART_REHEARSE": "1"]).joined(separator: " "))
+
+case "invocation-rehearse-off":
+    print(GracefulRestartInvocation.args(script: "/s/gr.sh",
+          env: ["SUTANDO_RESTART_REHEARSE": "0"]).joined(separator: " "))
+
 default:
     fatalError("unknown scenario \(scenario)")
 }
@@ -232,6 +243,20 @@ class TestRestartCoordinator(unittest.TestCase):
         self.assertIn("launch1=failed(boom)", out)
         self.assertIn("phase=idle", out)
         self.assertIn("claim2=accepted(2)", out)
+
+    def test_default_invocation_has_no_dry_run(self):
+        out = self.run_scenario("invocation-default")
+        self.assertEqual(["/s/gr.sh -- --visible"], out)
+
+    def test_rehearse_puts_dry_run_BEFORE_the_double_dash(self):
+        out = self.run_scenario("invocation-rehearse")
+        # after `--` the script stops reading its own flags, so a trailing
+        # --dry-run would be handed to start-cli.sh and silently ignored
+        self.assertEqual(["/s/gr.sh --dry-run -- --visible"], out)
+
+    def test_rehearse_requires_exactly_1(self):
+        out = self.run_scenario("invocation-rehearse-off")
+        self.assertEqual(["/s/gr.sh -- --visible"], out)
 
 
 if __name__ == "__main__":

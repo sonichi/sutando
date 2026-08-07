@@ -130,3 +130,16 @@ final class RestartCoordinator {
         }
     }
 }
+
+
+/// argv for graceful-restart.sh.
+enum GracefulRestartInvocation {
+    /// Rehearsal skips only the kill — prep still runs for real, sync included.
+    /// `--dry-run` must precede `--`: that is where the script stops reading its own
+    /// flags, so a trailing one is passed through to start-cli.sh and silently ignored.
+    static func args(script: String, env: [String: String]) -> [String] {
+        let rehearse = (env["SUTANDO_RESTART_REHEARSE"] ?? "") == "1"
+        return rehearse ? [script, "--dry-run", "--", "--visible"]
+                        : [script, "--", "--visible"]
+    }
+}
