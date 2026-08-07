@@ -359,6 +359,39 @@ argv15b="$(tr -d '\n' < "$TMP/ws15b.argv" 2>/dev/null || echo MISSING)"
 [ "$argv15b" = "--restart" ] && say ok "bare invocation execs exactly --restart (negative control)" \
   || say FAIL "bare invocation argv was '$argv15b', expected exactly '--restart'"
 
+echo "16. TERM during the wait must produce ZERO restart decisions (nudge->force = exactly one)"
+# The nudge points at Force Restart while a waiter is still in the gate: if TERM
+# leaves it able to reach the exec, force and waiter both restart the core.
+WS16="$TMP/ws16"; mkws "$WS16"
+printf '{"status":"running","step":"busy","ts":%s}\n' "$(date +%s)" > "$WS16/state/core-status.json"
+stub16="$TMP/stub16.sh"
+cat > "$stub16" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$@" >> "$STUB_ARGV_OUT"
+STUB
+chmod +x "$stub16"
+: > "$TMP/ws16.argv"
+( STUB_ARGV_OUT="$TMP/ws16.argv" GR_START_CLI="$stub16" GR_WS="$WS16" GR_SYNC_CMD="true" \
+    GR_POLL_S=1 bash "$GR" -- --visible > "$TMP/ws16.out" 2>&1; echo $? > "$TMP/ws16.rc" ) &
+w16=$!
+LOCK16="$WS16/state/locks/graceful-restart.lock"
+for _ in $(seq 1 60); do [ -f "$LOCK16/rid" ] && break; sleep 0.2; done
+gr16="$(pgrep -P "$w16" -f "graceful-restart.sh" | head -1)"
+[ -n "$gr16" ] && kill -TERM "$gr16" 2>/dev/null
+# Simulate the force making the core un-busy, which is what used to let the
+# surviving waiter proceed.
+mv "$WS16/state/core-status.json" "$WS16/state/core-status.json.aside" 2>/dev/null
+wait "$w16" 2>/dev/null || true
+sleep 1
+# Count via wc, not `grep -c || echo 0`: grep -c on an empty file prints 0 AND
+# exits 1, so the fallback also fires and the value becomes "0\n0".
+decisions16=$(grep -- "--restart" "$TMP/ws16.argv" 2>/dev/null | wc -l | tr -d ' ')
+[ "$decisions16" = 0 ] \
+  && say ok "TERM'd waiter reached NO exec (0 restart decisions), so force+waiter cannot double" \
+  || say FAIL "$decisions16 restart decision(s) survived TERM — force + waiter would restart twice"
+[ ! -d "$LOCK16" ] && say ok "TERM'd waiter released the lock, so the forced replacement won't defer" \
+  || say FAIL "lock survived TERM — a forced restart would hit exit 4"
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else

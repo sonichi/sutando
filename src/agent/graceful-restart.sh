@@ -134,8 +134,7 @@ do_restart() {
   fi
   log "restarting core ($reason)…"
   # The `+` guard keeps an empty array valid under `set -u` on bash 3.2.
-  # GR_START_CLI is a test seam: dry-run returns before this line, so it is the
-  # only way to assert the production argv without killing a core.
+  # GR_START_CLI is a test seam: dry-run never reaches this line.
   exec bash "${GR_START_CLI:-$REPO/src/agent/start-cli.sh}" --restart ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"}
 }
 
