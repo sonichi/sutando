@@ -51,14 +51,18 @@ class TestSelfRoutes(unittest.TestCase):
 
 
 class TestRemoteRoutes(unittest.TestCase):
-    def test_remote_durable_prefers_the_first_reachable_tier(self):
-        r = resolve("sutando://wu-air", "durable", DESCRIPTOR, self_id="qingyun-001")
-        self.assertEqual((r.transport, r.address), ("gateway", "http://10.0.0.2:8080"))
+    def test_reachable_call_tier_is_not_a_durable_route(self):
+        # The review pin: call_tiers advertise voice/Web endpoints — a
+        # reachable tier must NEVER be returned as a durable task gateway.
+        # DESCRIPTOR has a reachable tier, and remote durable still raises.
+        self.assertTrue(any(t["reachable"] for t in DESCRIPTOR["call_tiers"]))
+        with self.assertRaises(UnsupportedLane):
+            resolve("sutando://wu-air", "durable", DESCRIPTOR, self_id="qingyun-001")
 
-    def test_no_reachable_tier_fails_loud(self):
-        dead = dict(DESCRIPTOR, call_tiers=[{"tier": "t", "url": "u", "reachable": False}])
-        with self.assertRaises(ValueError):
-            resolve("sutando://wu-air", "durable", dead, self_id="qingyun-001")
+    def test_remote_durable_names_the_missing_coordinate(self):
+        with self.assertRaises(UnsupportedLane) as ctx:
+            resolve("sutando://wu-air", "durable", DESCRIPTOR, self_id="qingyun-001")
+        self.assertIn("task-gateway", str(ctx.exception))
 
     def test_remote_realtime_is_a_loud_gap_not_a_silent_fallback(self):
         # The named gap from the model: no session gateway exists. This must
