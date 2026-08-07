@@ -7,12 +7,20 @@ DM_FALLBACK_SOURCES nor DELIVERY_OWNING_SOURCES has no consumer, so that skip
 loses the reply permanently.
 """
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# The bridge resolves channel config at MODULE level, so isolation has to happen
+# before exec_module or the import reads the operator's real allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-dmfallback-")
+_CFG = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_CFG.mkdir(parents=True, exist_ok=True)
+(_CFG / "access.json").write_text('{"allowFrom": []}')
 
 
 def _load():
