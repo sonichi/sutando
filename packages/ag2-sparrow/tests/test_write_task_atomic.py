@@ -7,6 +7,7 @@ the two properties the at-least-once broker contract leans on at the worker edge
 """
 import os
 import importlib
+import shlex
 import sys
 import pathlib
 import tempfile
@@ -49,10 +50,8 @@ def test_write_task_publishes_atomically_and_completely():
         assert list(m.TASKS_DIR.glob("task-*.txt")) == [dest]
         body = dest.read_text()
         assert body.endswith("\n")
-        # The anti-spoof invariant survives the owner-tier ===SKILL INSTRUCTIONS===
-        # block (#2686): access_tier is the ONLY header-shaped access_tier line,
-        # and everything after it is bridge-generated block text that never
-        # carries the key — so a last-occurrence parser still can't be tricked.
+        # access_tier stays the ONLY header-shaped access_tier line even with the
+        # owner-tier block appended — a last-occurrence parser still can't be tricked.
         lines = body.rstrip().splitlines()
         tier_at = [i for i, ln in enumerate(lines) if ln.startswith("access_tier:")]
         assert len(tier_at) == 1
@@ -159,10 +158,40 @@ def test_write_task_drops_unsafe_and_idless():
         print("PASS test_write_task_drops_unsafe_and_idless")
 
 
+def test_write_task_shell_quotes_channel_id_in_skill_instructions():
+    """A provider-controlled channel_id must not break out of the shell
+    commands embedded in the owner-tier SKILL INSTRUCTIONS block — a naive
+    single-quote wrap lets an embedded quote close early and turn the
+    remainder into a second shell command (P1 finding on #2686's review).
+    A raw substring check can't tell safe-but-visually-similar text apart
+    from real injection, so this parses the embedded command with shlex —
+    on the pre-fix code shlex.split raises `No closing quotation` (proving
+    the shell quoting was genuinely unbalanced); on fixed code it must
+    round-trip to the channel id as exactly one argument."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        malicious_chan = "!room'; touch /tmp/ag2sparrow_pwned; #"
+        t = _task("task-1784500000020")
+        t["channel_id"] = malicious_chan
+        tid = m._write_task(t)
+        body = (m.TASKS_DIR / f"{tid}.txt").read_text()
+        context_line = next(ln for ln in body.splitlines() if "room_ops.py read" in ln)
+        context_cmd = context_line.split("`python3 ", 1)[1].split("`", 1)[0]
+        context_args = shlex.split("python3 " + context_cmd)
+        assert malicious_chan in context_args
+        notify_line = next(ln for ln in body.splitlines() if "--channel-id" in ln)
+        notify_cmd = notify_line.split("2. NOTIFY FIRST (if task takes >60s): ", 1)[1]
+        notify_args = shlex.split(notify_cmd)
+        assert malicious_chan in notify_args
+        print("PASS test_write_task_shell_quotes_channel_id_in_skill_instructions")
+
+
 if __name__ == "__main__":
     test_write_task_publishes_atomically_and_completely()
     test_write_task_never_leaves_partial_file_on_publish_crash()
     test_write_task_is_idempotent_under_redelivery()
     test_write_task_does_not_reexecute_a_completed_task()
     test_write_task_drops_unsafe_and_idless()
+    test_write_task_shell_quotes_channel_id_in_skill_instructions()
     print("ALL PASS test_write_task_atomic")
