@@ -4080,16 +4080,20 @@ async def poll_approved():
                         # valid, so an un-deleted marker would re-fail forever and
                         # bury the log. Same resolution as sonichi#2626.
                         print(f"  Failed to send approval to {sender_id}: {e}")
-                        if send_failure_policy.is_transient(e):  # pragma: no cover
-                            # An unreachable API is not an invalid chat_id. Leave the
-                            # marker in place so the next poll retries; the obligation
-                            # this file represents outlives one 503.
-                            print(  # pragma: no cover
-                                f"  [approved] transient failure — leaving {f.name} "
-                                f"in place to retry",
+                        # Bounded, like the proactive branch: unbounded retry turns a
+                        # sustained outage into a 3s hot loop the quarantine prevents.
+                        _ak = f.name  # pragma: no cover
+                        _an = _transient_send_attempts.get(_ak, 0)  # pragma: no cover
+                        if send_failure_policy.should_retry(e, _an):  # pragma: no cover
+                            _transient_send_attempts[_ak] = _an + 1
+                            print(
+                                f"  [approved] transient failure "
+                                f"({_an + 1}/{send_failure_policy.MAX_TRANSIENT_ATTEMPTS})"
+                                f" — leaving {f.name} in place to retry",
                                 flush=True,
                             )
-                            continue  # pragma: no cover
+                            continue
+                        _transient_send_attempts.pop(_ak, None)  # pragma: no cover
                         try:
                             _undeliv = f.parent / "undelivered"
                             _undeliv.mkdir(parents=True, exist_ok=True)
@@ -5108,9 +5112,13 @@ async def poll_proactive():
                             # Fall through to DM with marker INTACT — the
                             # visible `[channel: <id>]` is the loud-failure
                             # signal. Don't strip it here.
+                        # Zero-progress guard: this except wraps the chunk loop AND the
+                        # attachment loop, so a retry after any successful send repeats it.
+                        _sent_any = False  # pragma: no cover — live send path
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
                                 await dm.send(chunk)
+                                _sent_any = True  # pragma: no cover
                             try:
                                 import outbox_log
                                 _user_name = getattr(user, "name", None)
@@ -5128,15 +5136,17 @@ async def poll_proactive():
                             fpath = os.path.expanduser(fpath.strip())
                             if _is_path_sendable(fpath):
                                 await dm.send(file=discord.File(fpath))
+                                _sent_any = True  # pragma: no cover
                             elif not os.path.isfile(fpath):
                                 # See poll_results — log only, no user noise.
                                 print(f"  [proactive] file marker, file not found: {fpath}", flush=True)
                             else:
                                 await dm.send(f"(file not allowed: {fpath})")
+                                _sent_any = True  # pragma: no cover
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
                         f.unlink(missing_ok=True)
-                    except Exception as e:
+                    except Exception as e:  # pragma: no cover — live send path
                         # The unlink used to sit OUTSIDE this try, so it ran on
                         # failure too: a DM Discord rejected was DESTROYED and
                         # left only a log line. Observed live on this host —
@@ -5149,13 +5159,13 @@ async def poll_proactive():
                         # Quarantine rather than retry — but ONLY for a failure a
                         # retry cannot fix. A 413 never becomes a 200; a 503 does,
                         # on the very next poll, so parking it strands the body.
-                        print(f"  [proactive] failed to DM {owner_id}: {e}")
+                        print(f"  [proactive] failed to DM {owner_id}: {e}")  # pragma: no cover — live send path
                         # Glue only. The decision AND the file move are one unit in
                         # send_failure_policy.resolve_failed_send (covered by
                         # tests/send-failure-policy.test.py); the bridge is not
                         # unit-imported, same reason as the imports at :99-100.
                         _outcome = send_failure_policy.resolve_failed_send(  # pragma: no cover
-                            f, e, _transient_send_attempts)
+                            f, e, _transient_send_attempts, progressed=_sent_any)
                         print(f"  [proactive] send failure -> {_outcome}: "  # pragma: no cover
                               f"{f.with_suffix('.txt').name}", flush=True)
                         if _outcome == "retried":  # pragma: no cover

@@ -137,5 +137,78 @@ class TestResolveFailedSend(unittest.TestCase):
             self.assertEqual(self.attempts["proactive-y.txt"], expected)
 
 
+class TestPartialDeliveryNeverRetries(unittest.TestCase):
+    """A retry is only safe from ZERO progress.
+
+    The bridge's except wraps the chunk loop AND the attachment loop, so releasing
+    the claim after any successful send resends the whole body and repeats what
+    already reached the owner — the duplicate-delivery failure claim-by-rename
+    exists to prevent. Reviewer reproduced it: released_after_partial=True,
+    first_chunk_duplicated=True.
+    """
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.claim = self.d / "proactive-x.sending"
+        self.claim.write_text("chunk1 chunk2")
+        self.attempts = {}
+
+    def test_transient_AFTER_a_partial_send_parks_instead_of_retrying(self):
+        out = sfp.resolve_failed_send(self.claim, FakeHTTPException(503),
+                                      self.attempts, progressed=True)
+        self.assertEqual(out, "parked", "a partly-delivered body must never be re-sent")
+        self.assertFalse((self.d / "proactive-x.txt").exists(),
+                         "released .txt would be re-polled and re-sent in full")
+        self.assertTrue((self.d / "undelivered" / "proactive-x.txt").is_file())
+
+    def test_transient_with_ZERO_progress_still_retries(self):
+        out = sfp.resolve_failed_send(self.claim, FakeHTTPException(503),
+                                      self.attempts, progressed=False)
+        self.assertEqual(out, "retried")
+        self.assertTrue((self.d / "proactive-x.txt").is_file())
+
+    def test_progressed_defaults_to_false_so_callers_opt_IN_to_parking(self):
+        # A new caller that forgets the flag keeps the old retry behaviour rather
+        # than silently parking every transient failure.
+        self.assertEqual(sfp.resolve_failed_send(self.claim, FakeHTTPException(503),
+                                                 self.attempts), "retried")
+
+    def test_a_permanent_failure_parks_regardless_of_progress(self):
+        for progressed in (True, False):
+            d = Path(tempfile.mkdtemp())
+            c = d / "proactive-y.sending"
+            c.write_text("b")
+            self.assertEqual(
+                sfp.resolve_failed_send(c, FakeHTTPException(413, 40005), {},
+                                        progressed=progressed), "parked", progressed)
+
+
+class TestApprovalMarkerCapIsEnforced(unittest.TestCase):
+    """The approval branch used is_transient with no cap — unbounded 3s hot loop.
+
+    Reviewer reproduced 7 transient failures against a cap of 5 with the marker
+    still hot. The bridge now uses should_retry with per-marker accounting, so the
+    contract is the same one the policy already enforces.
+    """
+
+    def test_should_retry_stops_at_the_cap_for_a_marker_key(self):
+        exc = FakeHTTPException(503)
+        attempts = {}
+        key = "approved-123"
+        fired = 0
+        for _ in range(9):
+            if sfp.should_retry(exc, attempts.get(key, 0)):
+                attempts[key] = attempts.get(key, 0) + 1
+                fired += 1
+        self.assertEqual(fired, sfp.MAX_TRANSIENT_ATTEMPTS,
+                         "an outage must stop retrying, not loop forever")
+
+    def test_the_bridge_uses_should_retry_not_bare_is_transient_for_approvals(self):
+        src = (Path(__file__).resolve().parent.parent / "src" / "discord-bridge.py").read_text()
+        window = src.split("Failed to send approval to", 1)[1][:900]
+        self.assertIn("should_retry", window, "the approval branch must be capped")
+        self.assertIn("MAX_TRANSIENT_ATTEMPTS", window, "and must say so in its log")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

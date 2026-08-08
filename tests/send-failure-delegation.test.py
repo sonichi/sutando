@@ -32,9 +32,21 @@ class TestDelegation(unittest.TestCase):
         self.assertIn("import send_failure_policy", BRIDGE)
 
     def test_both_quarantine_sites_consult_the_policy(self):
-        # The proactive DM site and the approval-marker site carry the same rule.
+        # The proactive site delegates the whole transition; the approval site keeps
+        # its own file (the marker IS the obligation) but must still take the CAP
+        # from the policy — a bare is_transient there was an unbounded 3s hot loop.
         self.assertIn("send_failure_policy.resolve_failed_send", BRIDGE)
-        self.assertIn("send_failure_policy.is_transient", BRIDGE)
+        self.assertIn("send_failure_policy.should_retry", BRIDGE)
+
+    def test_no_site_retries_without_a_cap(self):
+        # `is_transient` alone answers "could a retry work", never "how many times".
+        # Using it as a retry gate is what made the approval branch unbounded.
+        for line in BRIDGE.splitlines():
+            t = line.strip()
+            if t.startswith("#") or "is_transient" not in t:
+                continue
+            self.assertNotRegex(t, r"^if .*is_transient\(",
+                                f"uncapped retry gate: {t}")
 
     def test_no_site_reimplements_status_classification(self):
         # An inline comparison against a transient status is the drift signature.

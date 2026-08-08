@@ -11,14 +11,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# 429 is rate-limiting and 5xx is the server's own fault; both clear on their own.
-# 408/425 are request-timing, equally retryable. Every other 4xx is a rejection of
-# this specific payload or recipient (413 too large, 403 cannot DM, 400 malformed)
-# and will fail identically forever.
+# 429 and 5xx clear on their own; 408/425 are request-timing. Every other 4xx
+# rejects this payload or recipient and will fail identically forever.
 TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
-# Bound the retry so a multi-hour outage parks the message instead of re-polling
-# it every 3s until the log is unreadable.
+# Bound the retry: a multi-hour outage must park rather than re-poll every 3s.
 MAX_TRANSIENT_ATTEMPTS = 5
 
 # Connection-level failures carry no HTTP status. Matched by name so this module
@@ -39,9 +36,8 @@ _TRANSIENT_EXC_NAMES = frozenset({
 def failure_status(exc: BaseException) -> int | None:
     """The HTTP status of a failed send, or None.
 
-    Reads `.status` only. `discord.HTTPException` also carries `.code` — the
-    Discord *error* code (40005, 50035) — which shares no numbering with HTTP
-    status and would misclassify if treated as one.
+    Reads `.status` only: `.code` is a Discord error code sharing no numbering
+    with HTTP status, so treating it as one would misclassify.
     """
     status = getattr(exc, "status", None)
     return status if isinstance(status, int) and not isinstance(status, bool) else None
@@ -67,7 +63,7 @@ def should_retry(exc: BaseException, attempts: int,
 
 
 def resolve_failed_send(claim: Path, exc: BaseException,
-                        attempts: "dict[str, int]") -> str:
+                        attempts: "dict[str, int]", progressed: bool = False) -> str:
     """Decide and CARRY OUT what happens to a body whose send failed.
 
     Returns "retried" (claim released, poll will pick it up again), "parked"
@@ -81,7 +77,9 @@ def resolve_failed_send(claim: Path, exc: BaseException,
     """
     key = claim.with_suffix(".txt").name
     tried = attempts.get(key, 0)
-    if should_retry(exc, tried):
+    # `progressed` means part of the body already reached the recipient. Re-sending
+    # from the start would repeat it, so a partial delivery parks instead.
+    if not progressed and should_retry(exc, tried):
         # release_claim refuses to clobber a `.txt` written since the claim, so a
         # False here means a newer body exists — park this one rather than drop it.
         from proactive_recovery import release_claim
