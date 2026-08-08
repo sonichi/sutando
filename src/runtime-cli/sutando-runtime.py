@@ -144,6 +144,12 @@ async def _chat_async(activity: bool = False) -> None:
                                   "method": method, "params": params},
                                  ensure_ascii=False) + "\n").encode("utf-8"))
 
+    prompt = "\033[33myou ›\033[0m "
+
+    def _show_prompt():
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+
     _send("task.subscribe", {"activity": activity}, "chat-sub")
     await writer.drain()
     print("sutando chat — type a task, press enter; results stream back inline. "
@@ -152,6 +158,7 @@ async def _chat_async(activity: bool = False) -> None:
 
     async def pump_stdin():
         while True:
+            _show_prompt()
             line = await loop.run_in_executor(None, sys.stdin.readline)
             if not line:  # EOF (Ctrl-D)
                 break
@@ -180,6 +187,7 @@ async def _chat_async(activity: bool = False) -> None:
                     print(f"\n\033[36m╭─ agent · {p.get('taskId')}\033[0m\n"
                           f"{p.get('result', '').rstrip()}\n"
                           f"\033[36m╰─\033[0m\n", flush=True)
+                    _show_prompt()  # restore the input prompt under the reply
                 elif m == "activity":                        # ⚙ step feed
                     print(f"  \033[2m⚙ {msg.get('params', {}).get('step')}\033[0m",
                           flush=True)
