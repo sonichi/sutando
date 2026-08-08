@@ -237,6 +237,8 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
     orow = [2]  # next output row; transcript fills TOP-down (like Claude Code)
     lvl = [int(level)]  # 0 quiet · 1 steps · 2 per-tool; toggled by /quiet /activity /verbose
     compose_h = [0]  # current compose-box height (rows); 0 forces the first layout
+    esc = bytearray()   # in-progress ANSI escape sequence (arrow keys, paste markers)
+    pasting = [False]   # inside a bracketed paste (\033[200~ … \033[201~)
 
     def dims():
         s = shutil.get_terminal_size((80, 24))
@@ -369,12 +371,40 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
                 done.set_result(None)
             return
         for b in data:
+            if esc:                               # collecting an escape sequence
+                esc.append(b)
+                eb = bytes(esc)
+                if eb == b"\x1b[200~":            # bracketed paste START
+                    pasting[0] = True; esc.clear(); continue
+                if eb == b"\x1b[201~":            # bracketed paste END
+                    pasting[0] = False; esc.clear(); draw_input(); continue
+                if len(esc) >= 3 and esc[1] == 0x5b and 0x40 <= b <= 0x7e:
+                    esc.clear(); continue         # other CSI (arrow key etc) → ignore
+                if len(esc) > 8:
+                    esc.clear()
+                continue
+            if b == 0x1b and not pend:            # ESC → start an escape sequence
+                esc.append(b); continue
             if pend:
                 pend.append(b)
                 try:
                     add(pend.decode()); pend.clear()
                 except UnicodeDecodeError:
                     pass
+                continue
+            if pasting[0]:                        # inside a paste: literal, no submit
+                if b in (0x0d, 0x0a, 0x09):
+                    add(" ")                      # collapse newlines/tabs → one line
+                elif b < 0x20:
+                    pass
+                elif b < 0x80:
+                    add(chr(b))
+                else:
+                    pend.append(b)
+                    try:
+                        add(pend.decode()); pend.clear()
+                    except UnicodeDecodeError:
+                        pass
                 continue
             if b in (0x0d, 0x0a):                 # Enter
                 on_enter()
@@ -431,7 +461,7 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
 
     tty.setcbreak(fd)                             # raw-ish; keeps Ctrl-C signal off (we read 0x03)
     rows, cols = dims()
-    out.write("\033[2J\033[H")                    # clear + home
+    out.write("\033[2J\033[H\033[?2004h")         # clear + home + bracketed paste on
     # Fixed header (row 1, outside the scroll region so it never scrolls away).
     hdr = " sutando · chat"
     who = f"  \033[2m{agent_id}\033[0m" if agent_id else ""
@@ -446,7 +476,7 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
     finally:
         loop.remove_reader(fd)
         ps.cancel()
-        out.write("\033[r")                       # reset scroll region
+        out.write("\033[?2004l\033[r")            # bracketed paste off + reset region
         out.write(f"\033[{dims()[0]};1H\r\n")
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         out.flush()
