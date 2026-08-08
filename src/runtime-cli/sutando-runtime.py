@@ -206,6 +206,7 @@ async def _chat_tui(reader, writer, _send) -> None:
     buf: list[str] = []
     pend = bytearray()
     done = loop.create_future()
+    orow = [2]  # next output row; transcript fills TOP-down (like Claude Code)
 
     def dims():
         s = shutil.get_terminal_size((80, 24))
@@ -217,10 +218,19 @@ async def _chat_tui(reader, writer, _send) -> None:
         out.flush()
 
     def emit(line):
+        # Transcript region = rows 2..(rows-2). Fill from the top; only once the
+        # region is full do we scroll. Explicit per-row positioning renders
+        # multi-line replies reliably (the old scroll-per-line trick dropped
+        # all but the last line).
         rows, _ = dims()
+        bot = rows - 2
+        text = line.replace("\n", " ")
         out.write("\0337")                       # save cursor (DECSC)
-        out.write(f"\033[{rows - 2};1H\n")        # bottom of scroll region + LF => scroll up
-        out.write(line.replace("\n", " "))        # text on the fresh bottom line
+        if orow[0] <= bot:
+            out.write(f"\033[{orow[0]};1H\033[K" + text)
+            orow[0] += 1
+        else:
+            out.write(f"\033[{bot};1H\n\033[K" + text)  # region full → scroll up 1
         out.write("\0338")                       # restore cursor (DECRC)
         draw_input()
 
@@ -308,15 +318,17 @@ async def _chat_tui(reader, writer, _send) -> None:
     tty.setcbreak(fd)                             # raw-ish; keeps Ctrl-C signal off (we read 0x03)
     rows, cols = dims()
     out.write("\033[2J\033[H")                    # clear + home
-    out.write(f"\033[1;{rows - 2}r")               # scroll region = rows 1..rows-2
-    out.write(f"\033[{rows - 1};1H" + "─" * cols)   # fixed separator row
+    # Fixed header (row 1, outside the scroll region so it never scrolls away).
+    hdr = " sutando · chat"
+    hint = "Ctrl-D exit · --activity steps · --raw firehose"
+    out.write(f"\033[1;1H\033[K\033[1m{hdr}\033[0m  \033[2m{hint}\033[0m")
+    out.write(f"\033[2;{rows - 2}r")               # scroll region = rows 2..rows-2
+    out.write(f"\033[{rows - 1};1H" + "─" * cols)   # fixed separator above compose
     draw_input()
     out.flush()
     loop.add_reader(fd, on_key)
     ps = asyncio.ensure_future(pump_socket())
     try:
-        emit("sutando chat — type below; your messages + results appear here. "
-             "Ctrl-D to exit.")
         await done
     finally:
         loop.remove_reader(fd)
