@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """Tests for skills/observe/default_policy_pack.py — the factory-default
-subscription pack for the events/observe lane.
-
-Covers: connect-time seeding across member rooms, idempotent re-seed, per-room
-record shape (concrete room_id + pack provenance + observe/notify-only), reuse
-of observe_policy's standing-approval boundary (fail-closed on non-owner /
-out-of-scope room), owner disable→cancel + re-enable→re-seed (generation bump),
-join-time incremental seeding, deterministic id shape. Exit 0/1."""
+subscription pack for the events/observe lane. Exit 0/1."""
 import os
 import sys
 import tempfile
@@ -72,11 +66,8 @@ def test_seed_is_idempotent():
 
 
 def test_reseed_does_not_resurrect_owner_cancelled_record():
-    # Regression for John #2320: after seeding, the owner directly cancels ONE
-    # room's record (same generation — NOT a pack disable/re-enable). A
-    # reconnect reseed must NOT flip it back to active; that would silently undo
-    # the owner's cancellation. The prior guard only skipped `active` records,
-    # so it re-seeded + re-activated the cancelled one.
+    # A reconnect reseed must not flip an owner-cancelled same-generation
+    # record back to active.
     d = _store()
     dpp.seed_defaults(d, OWNER, ROOMS)
     pid = op.SubscriptionStore(d).list(status="active")[0]["policy_id"]
@@ -92,12 +83,8 @@ def test_reseed_does_not_resurrect_owner_cancelled_record():
 
 
 def test_reseed_resumes_crash_interrupted_draft():
-    # Regression (#2320, my inline finding): seed_room does store.save() then a
-    # SEPARATE store.transition(active). A crash between them leaves a
-    # non-terminal DRAFT for this (entry, generation, room). The any-state-exists
-    # guard returned "skipped", so reconnect found the deterministic draft and
-    # left the room UNSUBSCRIBED FOREVER. Reconnect must RESUME the draft to
-    # active (self-heal), distinct from skipping terminal cancelled above.
+    # A crash between save() and transition(active) leaves a non-terminal draft;
+    # reconnect must RESUME it to active, not skip it forever.
     d = _store()
     entry = dpp._entry("react_baseline")
     room = ROOMS[0]
@@ -251,14 +238,8 @@ def test_default_store_dir_resolves():
 
 
 def _aggregate(d):
-    """Sum the evals/day of every ACTIVE pack record, computed from the store on
-    disk rather than by calling dpp.committed_evals_per_day().
-
-    Deliberate: using the module's own accounting to verify the module's own
-    budget would be self-referential — if that helper miscounted, the assertion
-    would agree with it and the suite would go green on a broken budget. This
-    reads the persisted records directly, so the test and the code can disagree.
-    """
+    """Sum evals/day of ACTIVE pack records straight from the store on disk —
+    independent of committed_evals_per_day(), so test and code can disagree."""
     total = 0
     for rec in op.SubscriptionStore(d).list(status="active"):
         if not (rec.get("pack") or {}).get("entry"):
@@ -270,10 +251,8 @@ def _aggregate(d):
 
 
 def test_multi_room_fanout_stays_inside_the_aggregate_budget():
-    """john-the-dev's #2320 blocker. evaluate_standing_approval() checks ONE
-    draft's cap, so N rooms each at the default cap all pass individually while
-    the total the owner authorized grows to N x default. Reproduced on 144ea820:
-    three rooms -> caps [2,2,2], aggregate 6, advertised default 2."""
+    """N rooms each pass the per-draft cap individually while the authorized
+    total grows to N x default; the aggregate budget must bound the fan-out."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(15)]
     res = dpp.seed_defaults(d, OWNER, rooms)
@@ -289,17 +268,15 @@ def test_multi_room_fanout_stays_inside_the_aggregate_budget():
           "aggregate equals the sum of what was actually activated")
     check(len(refused) > 0,
           "rooms beyond the budget are REFUSED, not silently activated")
-    # The refusal must be legible. A bare "refused" would leave the owner unable
-    # to tell a budget stop from a scope or mode rejection, which are different
-    # problems with different fixes.
+    # The refusal must name the budget — a bare "refused" is indistinguishable
+    # from a scope or mode rejection.
     check(refused and "aggregate budget" in refused[0]["reason"],
           f"refusal names the budget as the cause: {refused[0]['reason'] if refused else 'n/a'}")
 
 
 def test_a_later_join_cannot_widen_a_pre_blessed_aggregate():
-    """The second half of the blocker: on_room_join() runs long after connect,
-    so an unbounded per-room grant means the authorized total keeps growing with
-    no policy edit and no renewed approval."""
+    """on_room_join() runs long after connect; an unbounded per-room grant would
+    keep widening the authorized total with no renewed approval."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(15)]
     dpp.seed_defaults(d, OWNER, rooms)
@@ -313,9 +290,8 @@ def test_a_later_join_cannot_widen_a_pre_blessed_aggregate():
 
 
 def test_a_join_under_budget_still_seeds():
-    """CALIBRATION. Both assertions above are satisfied by a blanket refusal, so
-    they would still pass if the budget check rejected everything and broke the
-    feature outright. Pin the positive case: under budget, a join still works."""
+    """CALIBRATION: the refusal assertions above would pass on a blanket refusal;
+    pin the positive case — under budget, a join still seeds."""
     d = _store()
     dpp.seed_defaults(d, OWNER, ["!x:ag2.space"])
     before = _aggregate(d)
@@ -328,9 +304,8 @@ def test_a_join_under_budget_still_seeds():
 
 
 def test_reseeding_does_not_double_count_the_budget():
-    """The budget sums ACTIVE records, and re-seed is idempotent, so a reconnect
-    must not consume budget a second time — otherwise repeated reconnects would
-    starve the pack out of its own allowance."""
+    """A reconnect reseed is idempotent and must not consume budget again, or
+    repeated reconnects would starve the pack of its own allowance."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(5)]
     dpp.seed_defaults(d, OWNER, rooms)
@@ -342,9 +317,8 @@ def test_reseeding_does_not_double_count_the_budget():
 
 
 def test_budget_counts_only_pack_provenance_records():
-    """An explicitly owner-approved policy must not shrink the pack's automatic
-    allowance — approving something should never make the next automatic grant
-    harder. Only records carrying pack provenance count."""
+    """An owner-approved policy must not shrink the pack's automatic allowance;
+    only records carrying pack provenance count toward the budget."""
     d = _store()
     store = op.SubscriptionStore(d)
     draft, errs = op.validate_draft({
@@ -360,14 +334,8 @@ def test_budget_counts_only_pack_provenance_records():
 
 
 def test_over_budget_room_leaves_an_APPROVABLE_record():
-    """john-the-dev's follow-up [P1] on #2320. The refusal copy says explicit
-    approval is required; that sentence must be backed by a record. Before the
-    fix, seed_room() returned before store.save(), so the deterministic policy_id
-    did not exist, transition(pid,'active') had nothing to act on, and the result
-    carried none of the fields a confirmation card needs. Verified on 08cedd9c:
-    11 rooms -> 10 seeded, 1 refused, store.get(refused) is None. Rooms past the
-    budget were then neither auto-subscribed NOR owner-actionable — the silent
-    drop the budget exists to prevent."""
+    """The over-budget refusal promises explicit approval; that must be backed
+    by a persisted draft the owner can transition to active."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(11)]
     res = dpp.seed_defaults(d, OWNER, rooms)
@@ -379,7 +347,7 @@ def test_over_budget_room_leaves_an_APPROVABLE_record():
           f"the over-budget policy is persisted as a draft (got {rec and rec.get('status')})")
     check("draft" in refused[0] and refused[0].get("awaiting") == "owner-approval",
           "the refusal result carries the draft + an explicit awaiting marker")
-    # The grammar the reviewer showed was broken must now work end to end.
+    # The approval path must work end to end.
     check(store.transition(refused[0]["policy_id"], "active", note="owner approved") is True,
           "transition(pid,'active') now has a record to act on")
     # A draft must not consume budget, or the refusal would shrink the allowance
@@ -391,10 +359,8 @@ def test_over_budget_room_leaves_an_APPROVABLE_record():
 
 
 def test_a_persisted_draft_does_not_self_activate_while_over_budget():
-    """CONTROL for the fix above. seed_room() treats an existing draft as a
-    crash-interrupted seed and RESUMES it, so persisting one over budget could
-    have created a back door that activates on the next reconnect. The resume
-    path re-runs the same budget check, so it must stay refused."""
+    """CONTROL: the resume path re-runs the budget check, so a persisted
+    over-budget draft must not self-activate on the next reconnect."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(11)]
     dpp.seed_defaults(d, OWNER, rooms)
@@ -407,10 +373,8 @@ def test_a_persisted_draft_does_not_self_activate_while_over_budget():
 
 
 def test_the_draft_resumes_once_budget_frees_up():
-    """CALIBRATION. The control above is satisfied by a draft that can NEVER
-    activate, which would make the 'awaiting approval' state a dead end. Cancel
-    one active room and the queued draft must take the freed allowance on the
-    next seed — self-healing rather than requiring an owner re-seed dance."""
+    """CALIBRATION: the queued draft must take freed allowance on the next seed
+    — self-healing, not a dead end."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(11)]
     dpp.seed_defaults(d, OWNER, rooms)
@@ -425,15 +389,8 @@ def test_the_draft_resumes_once_budget_frees_up():
 
 
 def test_disable_revokes_pending_drafts_so_a_stale_card_cannot_activate():
-    """john-the-dev's follow-up [P1] on #2320, created BY the previous fix.
-
-    set_enabled(False) cancelled only ACTIVE records. The over-budget draft is
-    not active, so it survived the disable — and `draft -> active` is a legal
-    transition, so an approval card minted before the disable still activated a
-    room afterwards. Reproduced on adbd1b56: after_disable=draft,
-    activate_stale=True, final_status=active, while the entry read enabled=False.
-    The owner's disable was advisory, which is the one thing a disable must not be.
-    """
+    """Disable must revoke pending over-budget drafts too: draft->active is a
+    legal transition, so a stale approval card could otherwise activate a room."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(11)]
     res = dpp.seed_defaults(d, OWNER, rooms)
@@ -447,18 +404,16 @@ def test_disable_revokes_pending_drafts_so_a_stale_card_cannot_activate():
     check(dpp.is_enabled(d, "react_baseline") is False, "entry reads disabled")
     check(store.get(pid)["status"] == "cancelled",
           f"disable REVOKES the pending draft (got {store.get(pid)['status']})")
-    # The real assertion is the consequence, not the status: a late click on a
-    # card minted before the disable must not resurrect the room. `cancelled` is
-    # terminal in the store, so the guard lives in the state machine rather than
-    # in a caller that could forget to ask.
+    # The consequence is the real assertion: `cancelled` is terminal, so a late
+    # click on a stale card must not resurrect the room.
     check(store.transition(pid, "active", note="stale card clicked after disable") is False,
           "a stale approval CANNOT activate a room after the owner disabled the entry")
     check(store.get(pid)["status"] == "cancelled", "...and the record stays cancelled")
 
 
 def test_disable_then_reenable_still_seeds_a_fresh_generation():
-    """CALIBRATION. The guard above is satisfied by a disable that destroys the
-    entry permanently, which would be a worse bug. Re-enabling must still seed."""
+    """CALIBRATION: the guard above is satisfied by a disable that destroys the
+    entry permanently; re-enabling must still seed."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(11)]
     dpp.seed_defaults(d, OWNER, rooms)
@@ -472,20 +427,8 @@ def test_disable_then_reenable_still_seeds_a_fresh_generation():
 
 
 def test_a_seed_racing_the_disable_cannot_survive_it():
-    """john-the-dev's TOCTOU follow-up on #2320, in BOTH variants.
-
-    The sweep added by the previous fix read the draft list, then cancelled, then
-    committed disabled=True. A seed already in flight could persist a record into
-    that gap: absent from the sweep, and not yet gated by the flag.
-
-    Reproduced on 4d50448b two ways from one root cause:
-      over budget  -> persisted as `draft`, survived, and a late approval click
-                      ACTIVATED it (activate_late True) on a disabled entry;
-      under budget -> the sweep had already freed allowance, so the racing seed
-                      went straight to `active` and needed no click at all.
-    The second is worse and ordering alone cannot catch it, which is why the fix
-    is ordering (commit the flag first) PLUS revalidation at every persist point.
-    """
+    """A seed in flight during a disable must be refused in both variants: over
+    budget (stranded draft) and under budget (straight to active, no click)."""
     entry = dpp._entry("react_baseline")
     rooms = [f"!r{i}:ag2.space" for i in range(11)]
 
@@ -537,11 +480,8 @@ def test_a_seed_racing_the_disable_cannot_survive_it():
 
 
 def test_disable_commits_its_flag_before_sweeping():
-    """The ordering half, asserted directly rather than inferred from the race.
-
-    If the flag were still written last, a reader observing mid-sweep would see
-    the entry as ENABLED while its records were already being cancelled.
-    """
+    """If the flag were written last, a mid-sweep reader would see the entry as
+    ENABLED while its records were already being cancelled."""
     d = _store()
     dpp.seed_defaults(d, OWNER, [f"!r{i}:ag2.space" for i in range(3)])
     seen = []
@@ -559,15 +499,8 @@ def test_disable_commits_its_flag_before_sweeping():
 
 
 def test_owner_approval_does_not_consume_the_automatic_allowance():
-    """Found by enumerating the lifecycles rather than waiting for a review.
-
-    committed_evals_per_day()'s own docstring says approving something must
-    never make the next automatic grant harder. But an over-budget draft kept
-    plain pack provenance, so approving it counted against the pack's budget.
-    Measured on df4b7b3b: approving 3 queued rooms took the aggregate to 26/20
-    and then refused EVERY subsequent auto-seed — permanently, even after a room
-    was cancelled. The pack could never auto-seed again.
-    """
+    """Approving an over-budget draft must not count against the pack's budget,
+    or approvals would permanently starve subsequent auto-seeds."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(13)]      # 10 fit the budget, 3 do not
     res = dpp.seed_defaults(d, OWNER, rooms)
@@ -595,8 +528,8 @@ def test_owner_approval_does_not_consume_the_automatic_allowance():
 
 
 def test_the_cap_still_bounds_AUTOMATIC_grants():
-    """CALIBRATION. The guard above is satisfied by removing the budget entirely,
-    which would undo the original blocker. The cap must still bind auto-seeds."""
+    """CALIBRATION: the guard above is satisfied by removing the budget entirely;
+    the cap must still bind automatic seeds."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(13)]
     res = dpp.seed_defaults(d, OWNER, rooms)
@@ -608,15 +541,8 @@ def test_the_cap_still_bounds_AUTOMATIC_grants():
 
 
 def test_list_pack_shows_rooms_awaiting_the_owners_approval():
-    """Continued lifecycle enumeration — the `list_pack` (owner-view) cell.
-
-    The over-budget refusal says the room "surfaces as an explicit card the owner
-    can approve". The one view built for her listed only `active_rooms`, so the
-    rooms actually awaiting her decision were invisible in it. Same defect
-    already fixed once on this PR at the RECORD layer (a promise of approval with
-    nothing approvable behind it), reappearing at the VIEW layer: a decision she
-    cannot see is not a decision she has.
-    """
+    """Rooms awaiting approval must be visible in the owner view — a decision
+    the owner cannot see is not a decision the owner has."""
     d = _store()
     rooms = [f"!r{i}:ag2.space" for i in range(13)]
     res = dpp.seed_defaults(d, OWNER, rooms)
@@ -647,22 +573,8 @@ def test_list_pack_shows_rooms_awaiting_the_owners_approval():
 
 
 def test_seed_racing_a_disable_after_its_live_check_never_activates():
-    """The after-check/before-save window (peer re-review of head 9539d430).
-
-    `_entry_still_live()` is a READ; the persist and activate that follow it are
-    SEPARATE writes. An owner disable landing in between is missed by the sweep
-    (there is no record yet to cancel) and then the in-flight seed writes and
-    activates one AFTER the revocation.
-
-    Reachable across PROCESSES, which is what makes it a real defect rather than
-    a synthetic interleaving: this module ships a CLI (`disable`) that runs
-    against the same store dir while the core handles a room join, so
-    observe_policy's "single-writer (the core), so no lock protocol needed" does
-    not hold for this path.
-
-    Worst case prevented: a factory policy the owner has disabled keeps
-    observing a newly joined room.
-    """
+    """A disable landing between _entry_still_live() (a read) and the following
+    save/activate writes must never leave the seed active."""
     d = _store()
     entry = dpp._entry("react_baseline")
     rooms = [f"!r{i}:ag2.space" for i in range(2)]
@@ -699,16 +611,8 @@ def test_seed_racing_a_disable_after_its_live_check_never_activates():
 
 
 def test_over_budget_draft_racing_a_disable_is_not_left_live():
-    """Same after-check/before-save window on the OVER-BUDGET branch.
-
-    Fixing only the activate path would be fixing one instance, not the class:
-    the over-budget branch also does `_entry_still_live()` (a READ) and then
-    `store.save()` (a WRITE) with nothing in between re-verifying. A disable
-    landing there strands a DRAFT on a disabled entry -- and this module's own
-    set_enabled() comment records why that is not benign: `draft -> active` is a
-    legal transition, so a stale approval card minted before the disable can
-    still activate the room afterwards (reproduced on adbd1b56).
-    """
+    """Same after-check/before-save window on the over-budget branch: a disable
+    there must not strand a live draft (draft->active stays legal)."""
     d = _store()
     entry = dpp._entry("react_baseline")
     # Fill the aggregate budget so the next room takes the over-budget branch.
@@ -736,11 +640,8 @@ def test_over_budget_draft_racing_a_disable_is_not_left_live():
         dpp._entry_still_live = real
 
     check(bool(fired), "control: the disable injection fired on the over-budget path")
-    # Branch-independent control. Asserting on the RESULT here is worthless once
-    # the fix lands: the refusal reason flips from the budget message to the
-    # disabled message, so any "status == refused" check passes without proving
-    # the over-budget branch was ever reached. Assert the precondition instead --
-    # the aggregate really was exhausted before the racing seed ran.
+    # A "status == refused" check cannot prove the over-budget branch ran;
+    # assert the precondition — the aggregate was exhausted before the seed.
     check(committed_before == dpp.PACK_AGGREGATE_EVALS_PER_DAY,
           f"control: budget really was exhausted first (got {committed_before}/"
           f"{dpp.PACK_AGGREGATE_EVALS_PER_DAY})")
@@ -753,20 +654,8 @@ def test_over_budget_draft_racing_a_disable_is_not_left_live():
 
 
 def test_resume_reports_refused_when_the_record_was_cancelled_mid_flight():
-    """The RESUME branch must honour transition()'s return value.
-
-    Found by review, and my own shape-grep missed it honestly: the sweep matched
-    check-then-FIRST-write, and here the check precedes an idempotent RE-save of a
-    record that already exists.
-
-    Reachability, asked explicitly before treating it as a defect: the primary
-    race is already closed on this path -- the draft PRE-EXISTS, so a concurrent
-    disable's sweep sees and cancels it. What survives is the TRUTHFULNESS half.
-    `cancelled` is terminal, so transition(pid, "active") returns False, and the
-    branch then reported "resumed" for a record that is actually cancelled. The
-    room is not subscribed (good) but every caller is told it is (bad) -- exactly
-    the sub-defect the main path's fix comment names.
-    """
+    """The resume branch must honour transition()'s return value: a record
+    cancelled mid-flight must not be reported as resumed."""
     d = _store()
     entry = dpp._entry("react_baseline")
     room = ROOMS[0]
@@ -801,10 +690,8 @@ def test_resume_reports_refused_when_the_record_was_cancelled_mid_flight():
         dpp._entry_still_live = real
 
     check(bool(fired), "control: the disable injection fired on the resume path")
-    # NOT "the sweep cancelled it" -- that was true for a moment and then the
-    # re-save overwrote it. The invariant that actually matters is the end state:
-    # a disabled entry must never be left with a live record, however many writers
-    # touched it on the way.
+    # Assert the end state: a disabled entry must never be left with a live
+    # record, however many writers touched it on the way.
     check(store.get(pid)["status"] != "active",
           f"a disabled entry is never left ACTIVE by the resume path "
           f"(got {store.get(pid)['status']!r})")
@@ -813,19 +700,8 @@ def test_resume_reports_refused_when_the_record_was_cancelled_mid_flight():
 
 
 def test_resume_branch_holds_the_store_lock_for_its_budget_check():
-    """The RESUME branch has its OWN budget check; it must be inside the lock too.
-
-    Wrapping only the first-seed reservation fixed a call site, not the class:
-    `seed_room()` calls `_budget_allows()` twice, and the `status == "draft"`
-    resume path had its own unlocked copy. Two crash-interrupted drafts both
-    passed at 18/20 and both activated -> committed 22.
-
-    Asserted CROSS-PROCESS, for the same reason as the fork test in
-    tests/observe-policy.test.py: an in-process synchronous injection is a nested
-    same-thread call, which the re-entrant lock lets through by design. The
-    reachable race is core-vs-CLI, so the property is "another PROCESS cannot
-    enter while this branch is between its budget check and its activation".
-    """
+    """The resume branch's own budget check must run under the store lock,
+    asserted cross-process — a nested in-process call passes by design."""
     import json as _json
     import subprocess
     import textwrap
@@ -882,21 +758,8 @@ def test_resume_branch_holds_the_store_lock_for_its_budget_check():
 
 
 def test_owner_cancel_racing_a_resume_cannot_resurrect_the_record():
-    """Direct owner cancellation racing a crash-draft resume (review, 5th instance).
-
-    `existing = store.get(pid)` is read BEFORE the lock, only to choose this
-    branch. `transition()` now correctly holds the lock, so a cancel can complete
-    FIRST and the resume branch then proceeds on a stale `draft` view: the blind
-    save rewrites `cancelled` -> `draft` and the activation legally succeeds.
-
-    Why every existing guard misses it: `_entry_still_live()` checks the pack
-    ENTRY (enabled + generation); this is a per-RECORD cancellation, so the entry
-    stays enabled and the check passes. The record's own status is the only thing
-    that changed, and nothing inside the lock was re-reading it.
-
-    Measured at 3572d094: transition_cancelled True, result "resumed",
-    stored_status ACTIVE.
-    """
+    """A direct cancellation landing after the resume's pre-lock read must not
+    be resurrected by its blind save; the record is re-read inside the lock."""
     d = _store()
     entry = dpp._entry("react_baseline")
     dpp.seed_defaults(d, OWNER, ["!r0:ag2.space"])
@@ -940,21 +803,8 @@ def test_owner_cancel_racing_a_resume_cannot_resurrect_the_record():
 
 
 def test_concurrent_seed_of_the_same_room_is_idempotent_not_a_downgrade():
-    """Same-policy idempotency must be serialized WITH the write (review 12:06).
-
-    `existing = store.get(pid)` is read before the lock only to choose a branch.
-    Two writers racing the same room both see None and both reach the first-seed
-    section; the first activates at the final budget slot, and the second — now
-    over budget — blind-saves the SAME deterministic policy_id as an over_budget
-    draft. A working subscription is silently DOWNGRADED while the first writer
-    has already returned "seeded", and the freed aggregate can fund another grant.
-
-    `_entry_still_live()` cannot catch it: it validates pack authority and
-    generation, never whether another writer created this policy_id.
-
-    Measured at 3572d094: results ['seeded','refused'], record_status 'draft',
-    over_budget True, aggregate back to 18.
-    """
+    """Two writers racing one room both read None pre-lock; the loser must skip,
+    not blind-save the same policy_id and downgrade the winner's active record."""
     d = _store()
     entry = dpp._entry("react_baseline")
     n = (dpp.PACK_AGGREGATE_EVALS_PER_DAY // op.DEFAULT_EVALS_PER_DAY) - 1   # 18/20

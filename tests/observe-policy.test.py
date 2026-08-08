@@ -205,21 +205,8 @@ def test_render_card_a2ui_real_contract():
 
 
 def test_store_lock_serializes_a_SEPARATE_PROCESS():
-    """The lock must exclude another PROCESS, because that is the reachable race.
-
-    `default_policy_pack` ships a CLI (enable/disable/seed) that writes this store
-    while the core is running, so core-vs-CLI is a genuine concurrent-writer pair.
-    An in-process synchronous "injection" is NOT that: it is a nested same-thread
-    call, which the re-entrant lock lets through by design. So this asserts the
-    property that actually closes the P1 races, and does it across a real fork.
-
-    Three controls, because two of them can pass on a lock that is simply always
-    refusing or always granting:
-      A. parent NOT holding  -> child must ACQUIRE   (proves it can say yes)
-      B. parent holding      -> child must be REFUSED
-      C. parent inside a real transition()  -> child REFUSED (proves the SHIPPED
-         path takes it, not just a hand-rolled `with` in the test)
-    """
+    """The lock must exclude another PROCESS — a nested in-process call passes by
+    design (re-entrancy), so the property is asserted across a real fork."""
     import json as _json
     import subprocess
     import textwrap
