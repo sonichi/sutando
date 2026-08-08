@@ -26,6 +26,11 @@ v0 methods:
   sutando.status        {}
   sutando.owner         {}
   sutando.allowlist     {}
+  task.submit           {task, priority?}
+  task.status           {taskId}
+  task.get_result       {taskId}
+  task.details          {taskId}
+  task.cancel           {taskId}
 
 Error codes follow JSON-RPC: -32700 parse, -32600 invalid request,
 -32601 unknown method, -32602 invalid params, -32000 server error.
@@ -51,6 +56,11 @@ METHODS = (
     "sutando.status",
     "sutando.owner",
     "sutando.allowlist",
+    "task.submit",
+    "task.status",
+    "task.get_result",
+    "task.details",
+    "task.cancel",
 )
 
 

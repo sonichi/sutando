@@ -47,6 +47,7 @@ from rundir import socket_path  # noqa: E402
 from dispatcher import RuntimeDispatcher  # noqa: E402
 from agents_view import AgentsView  # noqa: E402
 from identity_view import IdentityView  # noqa: E402
+from tasks_view import TasksView  # noqa: E402
 
 def _state_dir() -> Path:
     ws = os.environ.get("SUTANDO_RUNTIME_STATE")
@@ -112,7 +113,11 @@ class RuntimeServer:
             identity_view=(IdentityView(state_dir, self.actor_id,
                                         channels_dir=_channels_dir(),
                                         host_label=_host_label())
-                           if state_dir else None))
+                           if state_dir else None),
+            tasks_view=(TasksView(Path(state_dir).parent / "tasks",
+                                  Path(state_dir).parent / "results",
+                                  self.actor_id)
+                        if state_dir else None))
 
     # ── transport ──────────────────────────────────────────────────────────
     async def client(self, reader: asyncio.StreamReader,

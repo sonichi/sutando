@@ -115,15 +115,16 @@ class RuntimeDispatcher:
     def __init__(self, store: RequestStore, human_actions: HumanActionAdapter,
                  actor_id: str,
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
-                 agents_view=None, identity_view=None):
+                 agents_view=None, identity_view=None, tasks_view=None):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
         self.executors = executors
-        # Read-only discovery/identity views — injected like executors so
-        # tests compose tmp-dir views; None = those methods unavailable.
+        # Discovery/identity/task views — injected like executors so tests
+        # compose tmp-dir views; None = those methods unavailable.
         self.agents = agents_view
         self.identity = identity_view
+        self.tasks = tasks_view
         # request_id → ha action_id, rebuilt at boot for crash recovery.
         self._ha_of: dict = {}
 
@@ -216,6 +217,39 @@ class RuntimeDispatcher:
                   "sutando.allowlist": self.identity.allowlist}.get(method)
             if fn is not None:
                 return fn()
+        if method.startswith("task."):
+            return self._task(method, params)
+        raise ProtocolError(-32601, f"unknown method {method}")
+
+    def _task(self, method: str, params: dict) -> dict:
+        if self.tasks is None:
+            raise ProtocolError(-32601,
+                                "task pipeline is not configured on this daemon")
+        try:
+            if method == "task.submit":
+                if not params.get("task"):
+                    raise ProtocolError(-32602, "missing required param: task")
+                return self.tasks.submit(params["task"],
+                                         priority=params.get("priority") or "normal")
+            tid = params.get("taskId")
+            if not tid:
+                raise ProtocolError(-32602, "missing required param: taskId")
+            if method == "task.status":
+                return self.tasks.status(tid)
+            if method == "task.get_result":
+                out = self.tasks.get_result(tid)
+                if out is None:
+                    raise ProtocolError(-32602, f"no result for task: {tid!r}")
+                return out
+            if method == "task.details":
+                out = self.tasks.details(tid)
+                if out is None:
+                    raise ProtocolError(-32602, f"unknown task: {tid!r}")
+                return out
+            if method == "task.cancel":
+                return self.tasks.cancel(tid)
+        except ValueError as e:
+            raise ProtocolError(-32602, str(e)) from e
         raise ProtocolError(-32601, f"unknown method {method}")
 
     def _agents(self):

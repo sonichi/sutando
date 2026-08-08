@@ -511,6 +511,30 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         a10 = cli("sutando", "allowlist")
         check(isinstance(a10.get("channels"), dict),
               "sutando allowlist answers with a channels map")
+
+        # 11. task pipeline (task.*) through the real daemon + CLI: submit
+        # lands a canonical task file, status tracks it, a result completes
+        # it, cancel is a CANCEL_INSTRUCTION signal task.
+        t11 = cli("task", "submit", "e2e: do the thing", "--priority", "low")
+        tid11 = t11["taskId"]
+        check(t11["state"] == "pending", "task submit returns pending")
+        tf = Path(TMP) / "tasks" / f"{tid11}.txt"
+        check(tf.is_file() and "access_tier: owner" in tf.read_text()
+              and "task: e2e: do the thing" in tf.read_text(),
+              "submit wrote a canonical owner-tier task file")
+        d11 = cli("task", "details", tid11)
+        check(d11["task"] == "e2e: do the thing" and d11["priority"] == "low",
+              "task details round-trips through the real parser")
+        Path(TMP, "results").mkdir(exist_ok=True)
+        Path(TMP, "results", f"{tid11}.txt").write_text("all done")
+        s11 = cli("task", "status", tid11)
+        check(s11["state"] == "done", "a result file completes the task")
+        r11 = cli("task", "get-result", tid11)
+        check(r11["result"] == "all done", "task get-result returns the body")
+        t12 = cli("task", "submit", "cancel me")
+        c12 = cli("task", "cancel", t12["taskId"])
+        check(c12["cancelled"] == "requested" and c12.get("cancelTaskId"),
+              "cancel emits a CANCEL_INSTRUCTION signal task")
     finally:
         daemon.terminate()
         try:
