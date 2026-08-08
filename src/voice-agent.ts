@@ -57,6 +57,8 @@ import {
 	recordTerminalClassification,
 	lastTerminalClassification,
 	clearTerminalClassification,
+	formatVoiceOfflineNotification,
+	formatVoiceRecoveryNotification,
 	type ClassifiedClose,
 } from './voice-error-classifier.js';
 import {
@@ -812,6 +814,37 @@ async function main() {
 	// it — Step 12's `backoff` upstream mapping.)
 	let voiceFatalBackoffUntil = 0;
 
+	// Non-retryable close categories the owner has already been shown an OS
+	// banner for. Declared HERE rather than inside the classifier IIFE below so
+	// the health monitor (further down, a different closure) can answer "was he
+	// told voice is down?" and emit a recovery notice when it comes back.
+	// Needed because a delivered notification cannot be withdrawn — see the
+	// dated-message comment at the emission site. A "voice is back" banner is
+	// the only counter-signal the platform allows.
+	const voiceNotifiedCategories = new Set<string>();
+
+	/** Announce recovery, and re-arm the offline alert. No-op if nothing was shown.
+	 *
+	 * Two jobs, both consequences of the same platform limit — a delivered
+	 * notification cannot be withdrawn:
+	 *   1. Post a dated "voice is back" banner, the only counter-signal available.
+	 *   2. Clear the notified-category set, so a LATER failure of the same
+	 *      category alerts again. Without this the throttle is once-per-process,
+	 *      and on a long-lived agent the second outage is silent — which is the
+	 *      more dangerous half of the bug.
+	 */
+	const notifyVoiceRecovered = (): void => {
+		if (voiceNotifiedCategories.size === 0) return;
+		const had = [...voiceNotifiedCategories].join(', ');
+		voiceNotifiedCategories.clear();
+		console.log(`${ts()} [VoiceRecovered] ACTIVE after ${had} — notifying owner + re-arming alerts`);
+		try {
+			execFileSync('osascript', ['-e',
+				`display notification "${formatVoiceRecoveryNotification(new Date())}" with title "Sutando — voice online"`,
+			], { stdio: 'ignore' });
+		} catch {}
+	};
+
 	// =========================================================================
 	// `agent.state` v1 provider (design 1a′; impl plan WS1 Step 12,
 	// amendments R8/A9/A10/S3). All getters are late-bound: `sessionRef` is
@@ -986,7 +1019,15 @@ async function main() {
 	// works again, so it clears the persisted terminal classification (R8)
 	// before the frame is built.
 	session.eventBus.subscribe('session.stateChange', (e) => {
-		if ((e as { toState?: string })?.toState === 'ACTIVE') clearTerminalClassification();
+		if ((e as { toState?: string })?.toState === 'ACTIVE') {
+			clearTerminalClassification();
+			// A delivered offline banner cannot be retracted, so recovery is
+			// announced instead. Event-driven on the ACTIVE transition rather
+			// than polled in the health monitor: same seam the classification
+			// clear already uses, so there is ONE recovery site, and the owner
+			// hears about it immediately instead of up to 30s later.
+			notifyVoiceRecovered();
+		}
 		emitAgentState();
 	});
 
@@ -1015,7 +1056,10 @@ async function main() {
 		const origOnClose = typeof transport.onClose === 'function'
 			? transport.onClose.bind(transport)
 			: null;
-		const notifiedCategories = new Set<string>();
+		// Hoisted (see notifiedCategories declaration above this IIFE) so the
+		// health monitor can tell whether the owner was ever shown an offline
+		// banner, and therefore whether a recovery notice is owed.
+		const notifiedCategories = voiceNotifiedCategories;
 		const handleClose = (c: ClassifiedClose): void => {
 			if (c.retryable) return;
 			// R8: persist the terminal classification (one classifier, one
@@ -1051,8 +1095,24 @@ async function main() {
 			// single-quotes or other shell metacharacters is needed. The
 			// double-quote stripping below protects the AppleScript string
 			// literal itself (not the shell).
+			//
+			// The message is DATED, and that is the point. A delivered
+			// notification cannot be retracted: AppleScript `display
+			// notification` returns no handle and has no remove verb, and the
+			// banner belongs to Script Editor (the osascript host), not to us.
+			// So it sits in Notification Center until the user swipes it, long
+			// after the condition clears — and an undated "Voice is offline"
+			// is indistinguishable from a live one.
+			//
+			// The owner hit exactly this on 2026-08-08: he asked why Script
+			// Editor was telling him the Gemini key was invalid. It was a
+			// banner from 2026-08-06 14:12:33, emitted by a voice process that
+			// no longer existed, while the key and the Live API were both fine.
+			// Since the alert cannot be withdrawn, it must at least say when it
+			// fired. Stamped rather than superseded, because superseding is the
+			// thing the platform will not let us do.
 			try {
-				const safe = c.userMessage.replace(/["\\]/g, '');
+				const safe = formatVoiceOfflineNotification(c.userMessage, new Date());
 				execFileSync('osascript', ['-e', `display notification "${safe}" with title "Sutando — voice offline"`], { stdio: 'ignore' });
 			} catch {}
 		};

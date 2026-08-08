@@ -188,3 +188,48 @@ export function lastTerminalClassification(): ProtocolFailure | null {
 export function clearTerminalClassification(): void {
 	_lastTerminal = null;
 }
+
+// ── User-facing notification text ─────────────────────────────────────────────
+// These live beside the `userMessage` strings they wrap, and are pure so a test
+// exercises THIS code rather than a copy of the format.
+//
+// Why any of this exists: a macOS notification delivered via AppleScript
+// `display notification` cannot be withdrawn. The call returns no handle, there
+// is no remove verb, and the banner belongs to the osascript host (Script
+// Editor) rather than to Sutando. So it sits in Notification Center until the
+// user dismisses it — long after the condition clears.
+//
+// The owner hit this on 2026-08-08: he asked why Script Editor was telling him
+// his Gemini key was invalid. The banner was from 2026-08-06 14:12:33, emitted
+// by a voice process that no longer existed, while the key and the Live API were
+// both verified working. An undated "Voice is offline" is indistinguishable from
+// a live one, so the alert must at least say when it fired.
+
+/** Strip characters that would break the AppleScript string literal.
+ *
+ * Not shell escaping — the caller uses execFileSync, so no shell is involved.
+ * This protects the `display notification "..."` literal itself.
+ */
+function appleScriptSafe(s: string): string {
+	return s.replace(/["\\]/g, '');
+}
+
+/** Short local date+time stamp, e.g. "Aug 8, 10:34 PM". */
+export function formatNotificationTimestamp(at: Date): string {
+	return at.toLocaleString(undefined, {
+		month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+	});
+}
+
+/** Offline banner text — always dated, because it cannot be retracted. */
+export function formatVoiceOfflineNotification(userMessage: string, at: Date): string {
+	return appleScriptSafe(`${userMessage} (detected ${formatNotificationTimestamp(at)})`);
+}
+
+/** Recovery banner text — the only counter-signal to a stale offline banner. */
+export function formatVoiceRecoveryNotification(at: Date): string {
+	return appleScriptSafe(
+		`Voice is back online (recovered ${formatNotificationTimestamp(at)}). `
+		+ 'Any earlier offline alert no longer applies.',
+	);
+}
