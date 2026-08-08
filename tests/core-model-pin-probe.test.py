@@ -186,8 +186,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertIn("ALSO pinned", r["detail"])
 
     def test_unreadable_argv_WARNS_because_status_is_the_machine_channel(self):
-        """INVERTED from asserting ok: emit_task_for_failures() gates on status, so a
-        caveat carried only in `detail` reaches the human channel and nothing else."""
+        """emit_task_for_failures() gates on status, so a caveat carried only in
+        `detail` reaches the human channel and leaves the machine channel silent."""
         r = self.hc._interpret_core_model_pin([], "/s", [("sutando-core", None)])
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("could not read argv", r["detail"])
@@ -299,8 +299,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(self.hc._interpret_core_model_pin([], "/s", rows)["status"], "ok")
 
     def test_a_FAILED_ps_read_is_unknown_not_a_missing_pin(self):
-        """A transient or permission-denied `ps` made the collector return [], reporting a
-        still-pinned live core as healthy. rc!=0 is unknown, not an absent pin."""
+        """A `ps` exiting nonzero read nothing, so the pane is unknown. Treating it as
+        an absent pin would report a still-pinned live core as healthy."""
         with mock.patch.object(self.hc.subprocess, "run") as m:
             m.side_effect = [mock.Mock(stdout="4242\n", returncode=0),   # list-panes ok
                              mock.Mock(stdout="", returncode=1)]          # ps FAILED
@@ -326,8 +326,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertNotIn("LIVE core", r["detail"])
 
     def test_a_session_that_ENUMERATES_NOTHING_is_unknown_not_skipped(self):
-        """REVERSED: a vanishing session exits nonzero (`can't find window`) and is handled
-        above, so rc 0 with no pids is an enumeration that read nothing, not a skip."""
+        """A vanishing session exits nonzero and is handled above, so rc 0 with no pids
+        is an enumeration that read nothing rather than a session to skip."""
         with mock.patch.object(self.hc.subprocess, "run",
                                return_value=mock.Mock(stdout="\n", returncode=0)):
             self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]),
