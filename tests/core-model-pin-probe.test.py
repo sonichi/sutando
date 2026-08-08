@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 # A tmux server inherits its GLOBAL env from whoever starts it, so an ambient pin
@@ -193,6 +194,40 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         r = self.hc._interpret_core_model_pin([], "/s", [])
         self.assertEqual(r["status"], "ok")
         self.assertNotIn("LIVE core", r["detail"])
+
+    def test_a_session_with_no_panes_is_skipped_not_reported_unreadable(self):
+        """tmux can answer with no pane_pids (a session going away). That is not the
+        same as a core whose argv could not be read, and must not be reported as one."""
+        with mock.patch.object(self.hc.subprocess, "run",
+                               return_value=mock.Mock(stdout="\n")):
+            self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]), [])
+
+    def test_a_tmux_or_ps_failure_reports_unreadable_rather_than_clean(self):
+        """Fail-safe direction: an exception must not read as "no pin found"."""
+        with mock.patch.object(self.hc.subprocess, "run", side_effect=OSError("boom")):
+            self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]),
+                             [("sutando-core", None)])
+
+    def test_check_survives_a_later_session_listing_failure(self):
+        """The argv pass re-lists sessions; that call raising must not propagate out of
+        the always-on health run. First call succeeds, second raises."""
+        with tempfile.TemporaryDirectory() as td:
+            sock = os.path.join(td, "exists.sock")
+            Path(sock).write_text("")
+            prev = os.environ.get("SUTANDO_TMUX_SOCKET")
+            os.environ["SUTANDO_TMUX_SOCKET"] = sock
+            try:
+                with mock.patch.object(self.hc, "_tmux_sessions",
+                                       side_effect=[[], OSError("boom")]), \
+                     mock.patch.object(self.hc, "_query_pin", return_value=None):
+                    r = self.hc.check_core_model_pin()
+            finally:
+                if prev is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = prev
+        self.assertEqual(r["name"], "core-model-pin")
+        self.assertEqual(r["status"], "ok", r)
 
     def test_WIRING_check_core_model_pin_actually_inspects_argv(self):
         """Drives the real entry point: the pure-function tests above pass even if
