@@ -106,11 +106,76 @@ def case_tmux_defaults_clear_both_scopes() -> list[str]:
     return fails
 
 
+def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
+    """BEHAVIOURAL: driving the real script on its tmux path clears both scopes.
+
+    Uses a scratch socket, never the live core's. The static case above only
+    proves the commands are present; this proves they run and take effect.
+    """
+    import shutil
+    import signal
+    tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    if not tmux:
+        return ["tmux-launch) tmux not found — cannot exercise the tmux path"]
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        bind = td / "bin"
+        bind.mkdir()
+        (td / "home").mkdir()
+        sock = td / "scratch-tmux.sock"
+        for stub, body in (("claude", "exit 0\n"), ("pgrep", "exit 1\n")):
+            f = bind / stub
+            f.write_text("#!/bin/bash\n" + body)
+            f.chmod(0o755)
+
+        def tm(*args, **kw):
+            return subprocess.run([tmux, "-S", str(sock), *args],
+                                  capture_output=True, text=True, **kw)
+
+        try:
+            tm("new-session", "-d", "-s", "sutando-core",
+               "-e", "SUTANDO_CORE_MODEL=opus", "sleep 300")
+            tm("setenv", "-g", "SUTANDO_CORE_MODEL", "opus")
+            if "SUTANDO_CORE_MODEL=opus" not in tm("show-environment", "-g",
+                                                   "SUTANDO_CORE_MODEL").stdout:
+                return ["tmux-launch) could not stage the pin — fixture is unrepresentative"]
+
+            env = {
+                "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin",
+                "HOME": str(td / "home"),
+                "SUTANDO_TMUX_SOCKET": str(sock),
+            }
+            # The script may exec `tmux attach` and block; that is fine. Kill the
+            # whole group after the clear has had its chance to run.
+            proc = subprocess.Popen(
+                ["/bin/bash", str(SCRIPT)], env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True)
+            try:
+                out = proc.communicate(timeout=45)[0] or ""
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                out = proc.communicate()[0] or ""
+            if "tmux not found" in out:
+                return ["tmux-launch) script skipped its tmux path — fixture never reached the clear"]
+
+            for scope_args, label in ((["-g"], "global"),
+                                      (["-t", "=sutando-core"], "session")):
+                got = tm("show-environment", *scope_args, "SUTANDO_CORE_MODEL").stdout
+                if "SUTANDO_CORE_MODEL=opus" in got:
+                    fails.append(f"tmux-launch) {label} scope still pinned after launch: {got.strip()!r}")
+        finally:
+            tm("kill-server")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("default", case_default_no_model_flag),
         ("env-ignored", case_env_set_is_ignored),
         ("tmux-clear", case_tmux_defaults_clear_both_scopes),
+        ("tmux-launch", case_tmux_launch_clears_a_pinned_socket),
     ]
     all_failures = []
     for label, fn in cases:
