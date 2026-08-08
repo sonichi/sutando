@@ -192,10 +192,57 @@ def _socket_alive(path: str, timeout: float = 1.0) -> bool:
         s.close()
 
 
-def start_instance(agent_id: str, wait_s: float = 10.0) -> dict:
-    """Start a registered instance via its manifest launcher. Idempotent on a
-    live instance (already_running). Launches ONLY the structured executable
-    recorded in the 0600 manifest — never a shell string."""
+def _rpc_probe(sock_path: str, method: str, timeout: float = 2.0):
+    """One argless JSON-RPC call to a socket; None on any failure."""
+    import socket as _socket
+    frame = ('{"jsonrpc":"2.0","id":"probe","method":"%s","params":{}}\n'
+             % method).encode()
+    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path)
+        s.sendall(frame)
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return (json.loads(buf.decode()) or {}).get("result")
+    except (OSError, ValueError):
+        return None
+    finally:
+        s.close()
+
+
+def attachable(manifest: dict) -> dict:
+    """The owner's readiness definition: an instance is attachable only when
+    the runtime socket is reachable AND sutando.info reports the SAME instance
+    identity AND the core is live (runtime.health online/degraded). A bare
+    socket file — or a socket answering with the wrong identity — is NOT
+    attachable (that is exactly the 'start says ok, attach fails' trap)."""
+    agent_id = (manifest.get("identity") or {}).get("agent_id")
+    endpoint = (manifest.get("endpoint") or {}).get("path")
+    if not endpoint or not _socket_alive(endpoint):
+        return {"attachable": False, "stage": "server", "endpoint": endpoint}
+    info = _rpc_probe(endpoint, "sutando.info")
+    if not info or info.get("agentId") != agent_id:
+        return {"attachable": False, "stage": "identity", "endpoint": endpoint}
+    health = _rpc_probe(endpoint, "runtime.health") or {}
+    if health.get("state") not in ("online", "degraded"):
+        return {"attachable": False, "stage": "core", "endpoint": endpoint}
+    return {"attachable": True, "endpoint": endpoint}
+
+
+def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable) -> dict:
+    """Start a registered instance via its manifest launcher and wait until it
+    is ATTACHABLE (not merely socket-present). Idempotent, serialized by a
+    per-instance start lock so two concurrent starts spawn ONE launcher. The
+    launcher runs as a structured executable+args (never a shell string), in
+    its declared working directory, with instance-identifying env injected
+    FROM THE MANIFEST — not inherited from the calling shell. `_ready` is the
+    readiness probe (injectable for tests)."""
+    import fcntl
     import subprocess
     p = _manifest_path(agent_id)
     try:
@@ -203,30 +250,84 @@ def start_instance(agent_id: str, wait_s: float = 10.0) -> dict:
     except (OSError, ValueError):
         return {"ok": False, "error": f"not_registered: no manifest for {agent_id!r}"}
     endpoint = (m.get("endpoint") or {}).get("path")
-    if endpoint and _socket_alive(endpoint):
+    if _ready(m).get("attachable"):
         return {"ok": True, "state": "already_running", "endpoint": endpoint}
+
     launcher = m.get("launcher") or {}
-    exe, args = launcher.get("executable"), launcher.get("args") or []
-    if launcher.get("type") != "command" or not exe:
-        return {"ok": False, "error": "manifest has no usable command launcher"}
+    exe = launcher.get("executable")
+    if launcher.get("type") not in ("process", "command") or not exe:
+        return {"ok": False, "error": "manifest has no usable structured launcher"}
     if not os.access(exe, os.X_OK):
-        return {"ok": False, "error": f"launcher executable missing or not executable: {exe}"}
-    proc = subprocess.Popen([exe, *args], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            start_new_session=True)
-    deadline = time.time() + wait_s
-    while time.time() < deadline:
-        if endpoint and _socket_alive(endpoint):
-            write_desired_state(agent_id, "running", reason="start verb")
-            return {"ok": True, "state": "started", "pid": proc.pid,
-                    "endpoint": endpoint}
-        if proc.poll() is not None:
-            return {"ok": False,
-                    "error": f"launcher exited rc={proc.returncode} before the "
-                             "endpoint came up"}
-        time.sleep(0.2)
-    return {"ok": False, "error": f"endpoint not ready within {wait_s}s "
-                                  "(launcher still running)", "pid": proc.pid}
+        return {"ok": False, "error": f"launcher not executable: {exe}"}
+
+    # Per-instance start lock: two concurrent starts must invoke ONE launcher.
+    lock_fd = None
+    if endpoint:
+        run_dir = Path(endpoint).parent
+        run_dir.mkdir(parents=True, exist_ok=True)
+        lock_fd = open(run_dir / "start.lock", "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_fd.close()
+            return {"ok": False, "error": "another start is in progress "
+                                          "(start lock held)"}
+    try:
+        # Re-check under the lock — a racing start may have finished.
+        if _ready(m).get("attachable"):
+            return {"ok": True, "state": "already_running", "endpoint": endpoint}
+
+        env = {**os.environ, "SUTANDO_INSTANCE_ID": agent_id}
+        rt = m.get("runtime") or {}
+        for var, val in (("SUTANDO_RUNTIME_SOCKET", endpoint),
+                         ("SUTANDO_TMUX_SOCKET", rt.get("tmux_socket")),
+                         ("SUTANDO_TMUX_SESSION", rt.get("session")),
+                         ("CLAUDE_CONFIG_DIR",
+                          (m.get("claude") or {}).get("config_dir")),
+                         ("SUTANDO_INSTANCE_DIR", m.get("instance_dir"))):
+            if val:
+                env[var] = val
+
+        cwd = launcher.get("working_directory") or None
+        log_fh = subprocess.DEVNULL
+        if endpoint:
+            logs = Path(endpoint).parent / "logs"
+            try:
+                logs.mkdir(parents=True, exist_ok=True)
+                log_fh = open(logs / "startup.log", "a")
+            except OSError:
+                log_fh = subprocess.DEVNULL
+
+        proc = subprocess.Popen(
+            [exe, *(launcher.get("args") or [])], cwd=cwd, env=env,
+            stdin=subprocess.DEVNULL, stdout=log_fh, stderr=subprocess.STDOUT,
+            start_new_session=True)
+
+        deadline = time.time() + wait_s
+        last = {"stage": "server"}
+        while time.time() < deadline:
+            r = _ready(m)
+            if r.get("attachable"):
+                write_desired_state(agent_id, "running", reason="start verb")
+                return {"ok": True, "state": "started", "pid": proc.pid,
+                        "endpoint": endpoint}
+            last = r
+            if proc.poll() is not None:
+                return {"ok": False, "state": "launcher_exited",
+                        "error": f"launcher exited rc={proc.returncode} before "
+                                 "the instance became attachable"}
+            time.sleep(0.3)
+        stage = last.get("stage", "server")
+        msg = {"server": "Runtime API socket did not become reachable",
+               "identity": "socket answered with the WRONG instance identity",
+               "core": "Server became ready but Core did not become attachable"}
+        return {"ok": False, "state": "timeout", "stage": stage, "pid": proc.pid,
+                "error": f"{msg.get(stage, 'not attachable')} within {wait_s}s"
+                         + (f" — Log: {Path(endpoint).parent / 'logs' / 'startup.log'}"
+                            if endpoint else "")}
+    finally:
+        if lock_fd is not None:
+            lock_fd.close()
 
 
 # ── attach (v1: connect to the native tmux Claude Code TUI) ──────────────────

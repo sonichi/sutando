@@ -141,6 +141,8 @@ ENV = {**os.environ,
        "SUTANDO_INSTANCE_REGISTRY": str(Path(TMP) / "instances"),
        "SUTANDO_TMUX_SOCKET": "/tmp/e2e-tmux.sock",
        "SUTANDO_TMUX_SESSION": "e2e-core",
+       "SUTANDO_LAUNCHER_EXECUTABLE": str(REPO / "bin" / "sutando"),
+       "SUTANDO_LAUNCHER_ARGS": '["serve"]',
        "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
        "REMOTE_TASK_TOKEN": "test-bearer"}
 
@@ -678,7 +680,11 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
           "restarted instance answers with the same identity")
     st18b = cli("instance", "start", "@test-agent:example.org")
     check(st18b.get("state") == "already_running",
-          "start verb is idempotent on a live instance")
+          "start verb is idempotent on a live instance (attachable, not just socket)")
+    # the started instance must be ATTACHABLE: identity verified over its socket
+    i18b = cli("sutando", "info")
+    check(i18b.get("agentId") == "@test-agent:example.org",
+          "started instance is attachable — identity verified over its socket")
     import signal as _signal
     os.kill(st18["pid"], _signal.SIGTERM)
     time.sleep(1.5)

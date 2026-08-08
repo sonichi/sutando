@@ -138,9 +138,21 @@ class RuntimeServer:
                 ws = str(resolve_workspace())
             except Exception:  # noqa: BLE001
                 pass
-            launcher = {"type": "command",
-                        "executable": str(_HERE.parent.parent / "bin" / "sutando"),
-                        "args": ["serve"]}
+            # The launcher starts the WHOLE instance (Core + daemon). Default
+            # is the repo's startup.sh; SUTANDO_LAUNCHER_EXECUTABLE/_ARGS
+            # override it (tests inject a controlled launcher so they never run
+            # the real startup.sh). Structured executable+args — no shell string.
+            repo = _HERE.parent.parent
+            launcher_exe = (os.environ.get("SUTANDO_LAUNCHER_EXECUTABLE")
+                            or str(repo / "src" / "startup.sh"))
+            try:
+                launcher_args = json.loads(
+                    os.environ.get("SUTANDO_LAUNCHER_ARGS") or "[]")
+            except ValueError:
+                launcher_args = []
+            launcher = {"type": "process", "executable": launcher_exe,
+                        "args": launcher_args,
+                        "working_directory": str(repo)}
             # tmux backend coordinates (v1 attach target): the socket the core
             # launched on (same value the heartbeat records) + its session.
             tmux_socket = (os.environ.get("SUTANDO_TMUX_SOCKET")

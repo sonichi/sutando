@@ -95,43 +95,87 @@ class InstanceRegistryTests(unittest.TestCase):
         m = reg.list_instances()[0]
         self.assertEqual(m["launcher"]["args"], ["serve"])
 
-    def test_start_instance_paths(self):
+    def _touch_launcher(self, name="fake-launch"):
         import stat as _stat
-        run = Path(self.tmp.name) / "run"
-        run.mkdir()
-        sock = run / "rt.sock"
-        # fake launcher: binds the endpoint socket, then sleeps
-        launcher = Path(self.tmp.name) / "fake-serve"
-        launcher.write_text(
-            "#!/usr/bin/env python3\n"
-            "import socket, sys, time\n"
-            f"s = socket.socket(socket.AF_UNIX)\n"
-            f"s.bind({str(sock)!r})\n"
-            "s.listen(8)\n"
-            "while True:\n"
-            "    c, _ = s.accept()\n"
-            "    c.close()\n")
+        launcher = Path(self.tmp.name) / name
+        # a launcher that just creates a marker and exits 0 (readiness is
+        # injected, so the launcher body is irrelevant to attachability)
+        launcher.write_text("#!/bin/sh\ntouch \"$SUTANDO_STARTED_MARKER\"\n")
         launcher.chmod(launcher.stat().st_mode | _stat.S_IXUSR)
-        # not registered
-        self.assertFalse(reg.start_instance("ghost")["ok"])
-        # registered but no launcher
-        reg.write_manifest("a1", endpoint=str(sock))
-        self.assertIn("launcher", reg.start_instance("a1")["error"])
-        # full start: launcher binds the socket -> started + desired running
+        return launcher
+
+    def test_start_not_registered_and_no_launcher(self):
+        self.assertFalse(reg.start_instance("ghost", _ready=lambda m: {"attachable": True})["ok"])
+        reg.write_manifest("a1", endpoint=str(Path(self.tmp.name) / "run" / "rt.sock"))
+        self.assertIn("launcher", reg.start_instance(
+            "a1", _ready=lambda m: {"attachable": False, "stage": "server"})["error"])
+
+    def test_start_waits_for_attachable_then_marks_running(self):
+        sock = Path(self.tmp.name) / "run" / "rt.sock"
+        launcher = self._touch_launcher()
         reg.write_manifest("a1", endpoint=str(sock),
-                           launcher={"type": "command",
-                                     "executable": str(launcher),
-                                     "args": []})
-        out = reg.start_instance("a1", wait_s=8)
+                           launcher={"type": "process", "executable": str(launcher),
+                                     "args": [], "working_directory": self.tmp.name})
+        # readiness flips to attachable only after the launcher marker appears
+        marker = Path(self.tmp.name) / "started.marker"
+        os.environ["SUTANDO_STARTED_MARKER"] = str(marker)
+        ready = lambda m: {"attachable": marker.exists()} if marker.exists() \
+            else {"attachable": False, "stage": "core"}
+        out = reg.start_instance("a1", wait_s=8, _ready=ready)
+        os.environ.pop("SUTANDO_STARTED_MARKER", None)
         self.assertTrue(out["ok"], out)
         self.assertEqual(out["state"], "started")
-        self.assertEqual(reg.read_desired_state("a1")["desired_state"],
-                         "running")
-        # idempotent: socket alive -> already_running, no second spawn
-        out2 = reg.start_instance("a1")
-        self.assertEqual(out2["state"], "already_running")
+        self.assertEqual(reg.read_desired_state("a1")["desired_state"], "running")
+
+    def test_start_idempotent_when_already_attachable(self):
+        sock = Path(self.tmp.name) / "run" / "rt.sock"
+        reg.write_manifest("a1", endpoint=str(sock),
+                           launcher={"type": "process", "executable": "/bin/sh",
+                                     "args": [], "working_directory": self.tmp.name})
+        out = reg.start_instance("a1", _ready=lambda m: {"attachable": True})
+        self.assertEqual(out["state"], "already_running")
+
+    def test_start_timeout_names_the_failing_stage(self):
+        import stat as _stat
+        sock = Path(self.tmp.name) / "run" / "rt.sock"
+        # a launcher that stays alive so we reach the timeout (not exit) branch
+        launcher = Path(self.tmp.name) / "sleeper"
+        launcher.write_text("#!/bin/sh\nsleep 5\n")
+        launcher.chmod(launcher.stat().st_mode | _stat.S_IXUSR)
+        reg.write_manifest("a1", endpoint=str(sock),
+                           launcher={"type": "process", "executable": str(launcher),
+                                     "args": [], "working_directory": self.tmp.name})
+        out = reg.start_instance(
+            "a1", wait_s=1,
+            _ready=lambda m: {"attachable": False, "stage": "core"})
         import subprocess
         subprocess.run(["pkill", "-f", str(launcher)], capture_output=True)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["stage"], "core")
+        self.assertIn("Core did not become attachable", out["error"])
+
+    def test_start_injects_instance_env_from_manifest(self):
+        # the launcher records its own env; assert instance vars came from the
+        # manifest, not this test's shell
+        sock = Path(self.tmp.name) / "run" / "q-1" / "rt.sock"
+        envdump = Path(self.tmp.name) / "env.txt"
+        import stat as _stat
+        launcher = Path(self.tmp.name) / "dump-env"
+        launcher.write_text("#!/bin/sh\nenv > \"%s\"\n" % envdump)
+        launcher.chmod(launcher.stat().st_mode | _stat.S_IXUSR)
+        reg.write_manifest("q-1", endpoint=str(sock), instance="q-1",
+                           tmux_socket="/run/q-1/tmux.sock", session="core-q1",
+                           config_dir="/cfg/q-1",
+                           launcher={"type": "process", "executable": str(launcher),
+                                     "args": [], "working_directory": self.tmp.name})
+        # readiness true once the env dump exists
+        reg.start_instance("q-1", wait_s=5,
+                           _ready=lambda m: {"attachable": envdump.exists()})
+        text = envdump.read_text()
+        self.assertIn("SUTANDO_INSTANCE_ID=q-1", text)
+        self.assertIn("SUTANDO_TMUX_SOCKET=/run/q-1/tmux.sock", text)
+        self.assertIn("SUTANDO_TMUX_SESSION=core-q1", text)
+        self.assertIn("CLAUDE_CONFIG_DIR=/cfg/q-1", text)
 
     def test_agent_id_is_filename_sanitized(self):
         p = reg.write_manifest("../evil/../../id")
