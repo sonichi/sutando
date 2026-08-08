@@ -64,6 +64,23 @@ exc = json.loads(pathlib.Path('$REPO/sutando.config.json').read_text())['vault']
 sys.exit(0 if 'notes/generated/' in exc else 1)
 "
 
+# scripts/sync-workspace.sh:1529 already excludes generated/ AND media/ when it
+# migrates notes; the carrier must not carve out only half that pair.
+check "...and notes/media/, the other half of the migrator's pair" \
+    python3 -c "
+import json, pathlib, sys
+exc = json.loads(pathlib.Path('$REPO/sutando.config.json').read_text())['vault']['sync']['exclude']
+sys.exit(0 if 'notes/media/' in exc else 1)
+"
+
+check "the migrator this mirrors still excludes both (drift guard)" \
+    python3 -c "
+import pathlib, re, sys
+src = pathlib.Path('$REPO/scripts/sync-workspace.sh').read_text()
+ok = re.search(r\"--exclude='generated/'\", src) and re.search(r\"--exclude='media/'\", src)
+sys.exit(0 if ok else 1)
+"
+
 check "...and still INCLUDES notes/ (the carve-out must not swallow the parent)" \
     python3 -c "
 import json, pathlib, sys
@@ -100,9 +117,11 @@ git init -q --bare "$FIXTURE_VAULT"
 # A render bundle beside an ordinary note and an episode spec — the three
 # things whose fates must differ.
 mkdir -p "$FIXTURE_WS/notes/generated/ep999-bundle" \
+         "$FIXTURE_WS/notes/media" \
          "$FIXTURE_WS/notes/sutando-wire/episode-specs" \
          "$FIXTURE_WS/hosts/render-host"
 printf '\x00\x00' > "$FIXTURE_WS/notes/generated/ep999-bundle/ep999-v1.mp4"
+printf '\x00\x00' > "$FIXTURE_WS/notes/media/source-clip.mov"
 printf '{"v":1}\n' > "$FIXTURE_WS/notes/generated/ep999-bundle/provenance.json"
 printf 'a note\n'  > "$FIXTURE_WS/notes/a.md"
 printf 'title: t\n' > "$FIXTURE_WS/notes/sutando-wire/episode-specs/ep999.yaml"
@@ -140,6 +159,8 @@ git -C "$FIXTURE_WS" add -A >/dev/null 2>&1 || true
 
 refute "git does NOT track the rendered mp4 (the 2.15 GiB class)" \
     git -C "$FIXTURE_WS" ls-files --error-unmatch notes/generated/ep999-bundle/ep999-v1.mp4
+refute "git does NOT track source media either (the 0.79 GiB class)" \
+    git -C "$FIXTURE_WS" ls-files --error-unmatch notes/media/source-clip.mov
 refute "git does NOT track the render bundle's sidecar json either" \
     git -C "$FIXTURE_WS" ls-files --error-unmatch notes/generated/ep999-bundle/provenance.json
 check "git DOES track an ordinary note (carrier not broken)" \
