@@ -6608,14 +6608,57 @@ def _pin_scope_flag(scope: str) -> str:
     return "-g" if scope == GLOBAL_PIN_SCOPE else f"-t '={scope}'"
 
 
-def _interpret_core_model_pin(pinned: list, socket: str) -> dict:
-    """Pure half of `check_core_model_pin`: interprets all collected tmux pins.
-    `pinned` is [(scope, value), ...] over every session plus `global`."""
+def _core_argv_pins(socket: str, sessions: list) -> list:
+    """[(session, model)] for live cores whose argv carries --model, plus
+    [(session, None)] when a pane's argv cannot be read — argv is immutable, so a
+    tmux clear cannot undo it."""
+    out = []
+    for sess in sessions:
+        try:
+            pp = subprocess.run(
+                ["tmux", "-S", socket, "list-panes", "-t", f"={sess}", "-F", "#{pane_pid}"],
+                capture_output=True, text=True, timeout=10)
+            pid = (pp.stdout or "").split("\n")[0].strip()
+            if not pid.isdigit():
+                continue
+            ps = subprocess.run(["ps", "-o", "args=", "-p", pid],
+                                capture_output=True, text=True, timeout=10)
+            argv = (ps.stdout or "").strip()
+            if "claude" not in argv:
+                out.append((sess, None))       # cannot confirm either way
+                continue
+            m = re.search(r"--model[= ]+(\S+)", argv)
+            if m:
+                out.append((sess, m.group(1)))
+        except (OSError, subprocess.SubprocessError):
+            out.append((sess, None))
+    return out
+
+
+def _interpret_core_model_pin(pinned: list, socket: str, running=()) -> dict:
+    """Interpret tmux pins AND the live core's argv. A tmux clear cannot change an
+    already-running process, so argv must be reported even when tmux is clean."""
     name = "core-model-pin"
-    if not pinned:
-        return {"name": name, "status": "ok",
-                "detail": "no model pin on any session or the global env "
-                          "(core uses the default window)"}
+    live = [(s, v) for s, v in running if v]
+    unknown = [s for s, v in running if not v]
+    if not pinned and not live:
+        detail = ("no model pin on any session or the global env "
+                  "(core uses the default window)")
+        if unknown:
+            detail += f"; could not read argv for: {', '.join(sorted(unknown))}"
+        return {"name": name, "status": "ok", "detail": detail}
+    if live:
+        where_live = ", ".join(f"{s} argv={v!r}" for s, v in live)
+        extra = ""
+        if pinned:
+            extra = (" The tmux env is ALSO pinned (" +
+                     ", ".join(f"{s}={v!r}" for s, v in pinned) + ").")
+        elif not pinned:
+            extra = (" The tmux env is already clear, so this will NOT show up as an "
+                     "env pin — only a restart moves a running core off it.")
+        return {"name": name, "status": "warn",
+                "detail": (f"a LIVE core is running on a pinned model ({where_live}). "
+                           f"argv is immutable.{extra}")}
     where = ", ".join(f"{scope}={val!r}" for scope, val in pinned)
     # Name the scope in the remedy: an operator copies the emitted line, and a
     # `setenv -u` without -t/-g can clear a different scope than the pinned one.
@@ -6687,7 +6730,11 @@ def check_core_model_pin() -> dict:
                 pinned.append((sess, val))
     except (OSError, subprocess.SubprocessError) as e:
         return {"name": name, "status": "ok", "detail": f"could not query tmux env ({e}) — skipped"}
-    return _interpret_core_model_pin(pinned, socket)
+    try:
+        sessions = _tmux_sessions(socket)
+    except (OSError, subprocess.SubprocessError):
+        sessions = []
+    return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
 
 
 def run_all_checks() -> list[dict]:

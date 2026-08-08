@@ -148,6 +148,75 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
             self.assertNotIn(stale, r["detail"],
                              f"stale claim {stale!r}: the launcher no longer re-supplies")
 
+    def test_a_live_pinned_core_warns_even_when_tmux_is_CLEAN(self):
+        """argv is immutable, so clearing tmux cannot move a running core off a pin."""
+        r = self.hc._interpret_core_model_pin([], "/s", [("sutando-core", "opus")])
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("LIVE core", r["detail"])
+        self.assertIn("argv", r["detail"])
+        self.assertIn("already clear", r["detail"],
+                      "must explain why no env pin shows")
+
+    def test_both_pinned_names_both(self):
+        r = self.hc._interpret_core_model_pin(
+            [("global", "opus")], "/s", [("sutando-core", "opus")])
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("ALSO pinned", r["detail"])
+
+    def test_unreadable_argv_is_named_not_passed_silently(self):
+        r = self.hc._interpret_core_model_pin([], "/s", [("sutando-core", None)])
+        self.assertEqual(r["status"], "ok", "unknown is not a failure by itself")
+        self.assertIn("could not read argv", r["detail"])
+        self.assertIn("sutando-core", r["detail"])
+
+    def test_clean_tmux_and_clean_argv_is_ok(self):
+        r = self.hc._interpret_core_model_pin([], "/s", [])
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn("LIVE core", r["detail"])
+
+    def test_WIRING_check_core_model_pin_actually_inspects_argv(self):
+        """Drives the real entry point: the pure-function tests above pass even if
+        the collector never calls _core_argv_pins, so this pins the wiring."""
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        if not tmux:
+            self.fail("tmux unavailable — cannot exercise the wiring")
+        with tempfile.TemporaryDirectory() as td:
+            sock = os.path.join(td, "s.sock")
+            stub = os.path.join(td, "claude")
+            with open(stub, "w") as fh:
+                fh.write("#!/bin/bash\nsleep 120\n")
+            os.chmod(stub, 0o755)
+
+            def tm(*a):
+                return subprocess.run([tmux, "-S", sock, *a],
+                                      capture_output=True, text=True, timeout=15)
+            try:
+                tm("new-session", "-d", "-s", "sutando-core",
+                   f"{stub} --name sutando-core --model opus")
+                # tmux env deliberately CLEAN: the pin exists only in the live argv.
+                pane = tm("list-panes", "-t", "=sutando-core", "-F", "#{pane_pid}").stdout.strip()
+                argv = subprocess.run(["ps", "-o", "args=", "-p", pane],
+                                      capture_output=True, text=True).stdout
+                if "--model" not in argv:
+                    self.fail(f"fixture did not stage a pinned argv: {argv!r}")
+                old = os.environ.get("SUTANDO_TMUX_SOCKET")
+                os.environ["SUTANDO_TMUX_SOCKET"] = sock
+                try:
+                    r = self.hc.check_core_model_pin()
+                finally:
+                    if old is None:
+                        os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                    else:
+                        os.environ["SUTANDO_TMUX_SOCKET"] = old
+                self.assertEqual(r["status"], "warn", r)
+                self.assertIn("LIVE core", r["detail"])
+            finally:
+                tm("kill-server")
+
     def test_name_is_stable(self):
         for pins in ([], [("core", "opus")]):
             self.assertEqual(
