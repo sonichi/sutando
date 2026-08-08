@@ -128,6 +128,16 @@ case "nudge-not-after-force":
     _ = c.claimForce()
     print("nudge-after=\(c.nudgeApplies(epoch: e1))")
 
+case "stale-launch-blocked-while-current-can":
+    guard case .accepted(let e1) = c.claimRestart() else { fatalError("claim1") }
+    _ = c.claimForce()
+    guard case .accepted(let e3) = c.claimRestart() else { fatalError("claim3") }
+    print("e1=\(e1) e3=\(e3)")
+    // Phase is .starting for e3, so ONLY the epoch clause can refuse e1.
+    print("phase=" + name(c.currentPhase))
+    print("stale=" + show(c.launch(epoch: e1) { print("STALE-RAN") }))
+    print("current=" + show(c.launch(epoch: e3) { print("CURRENT-RAN") }))
+
 case "superseded-finish-does-not-reset":
     guard case .accepted(let e1) = c.claimRestart() else { fatalError("claim1") }
     _ = c.launch(epoch: e1) { }
@@ -231,6 +241,17 @@ class TestRestartCoordinator(unittest.TestCase):
         out = self.run_scenario("nudge-not-after-force")
         self.assertIn("nudge-before=true", out)
         self.assertIn("nudge-after=false", out)
+
+    def test_stale_epoch_cannot_launch_while_the_current_one_can(self):
+        out = self.run_scenario("stale-launch-blocked-while-current-can")
+        self.assertIn("e1=1 e3=3", out)
+        # The phase clause cannot do this work: e3's claim leaves phase .starting,
+        # so only the epoch comparison distinguishes the two closures.
+        self.assertIn("phase=starting", out)
+        self.assertIn("stale=aborted", out)
+        self.assertNotIn("STALE-RAN", out)
+        self.assertIn("current=launched", out)
+        self.assertIn("CURRENT-RAN", out)
 
     def test_superseded_finish_does_not_reset_a_live_claim(self):
         out = self.run_scenario("superseded-finish-does-not-reset")
