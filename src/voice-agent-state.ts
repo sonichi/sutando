@@ -193,7 +193,10 @@ export function voiceCapabilitiesPath(workspace: string): string {
  * probe/verify/takeover connection roles, so a `?probe=1` upgrade is
  * intercepted server-side and can never steal a live client slot. The pin
  * bump and this marker land in the same change on purpose — the marker is
- * the activation switch, so it must never precede the capability.
+ * the activation switch, so it must never precede the capability; the
+ * caller ENFORCES that by gating publication on the same probeState
+ * feature-detect that wires the capability, so a mis-resolved bodhi (failed
+ * or cached install, hand-edited pin) never gets an advertising marker.
  * `pid` + `lockId` bind the marker to the acquisition that published it. The
  * file itself is a one-way latch (older builds neither write nor delete it),
  * so after an engine rollback a stale `true` would otherwise keep arming the

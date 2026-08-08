@@ -959,10 +959,19 @@ async function main() {
 	// Group E activation: this build's bodhi pin ships the probe/verify/
 	// takeover roles, so publish the capability marker the desktop
 	// supervisor's probe battery gates on. Once per process, at wiring init.
-	publishCapabilitiesMarker(WORKSPACE_DIR, {
-		lockId: voiceLockId,
-		onError: (err) => console.error(`${ts()} [AgentState] capabilities marker write failed: ${(err as Error)?.message ?? err}`),
-	});
+	// GATED on the same feature-detect that wires probeState (review): the
+	// marker must never advertise probe isolation the resolved bodhi doesn't
+	// have — npm can resolve a different bodhi than the lockfile's (failed or
+	// cached install, hand-edited package.json), and an ungated marker would
+	// then point the supervisor's probes at the normal attach path.
+	if (bodhiSupportsProbeState) {
+		publishCapabilitiesMarker(WORKSPACE_DIR, {
+			lockId: voiceLockId,
+			onError: (err) => console.error(`${ts()} [AgentState] capabilities marker write failed: ${(err as Error)?.message ?? err}`),
+		});
+	} else {
+		console.error(`${ts()} [AgentState] bodhi lacks probeState — capability marker NOT published (probes stay dormant)`);
+	}
 	const sendAgentStateFrame = (frame: AgentStateV1): void => {
 		try {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
