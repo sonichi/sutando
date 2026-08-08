@@ -11,11 +11,13 @@ Run: python3 tests/health-check-daily-punctuality.test.py
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -122,12 +124,73 @@ class TestArtifactDiscovery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             res = Path(td) / "results"
             res.mkdir()
-            for n in ("insight-notadate.txt", "briefing-2026-08-08.txt", "insight.txt"):
+            # "insight-2099abc" passes the GLOB (insight-20*) and fails the date
+            # regex — the only way to reach that branch, since the glob filters first.
+            for n in ("insight-notadate.txt", "briefing-2026-08-08.txt", "insight.txt",
+                      "insight-2099abc.txt"):
                 (res / n).write_text("x")
             self.assertEqual(hc._daily_artifact_minutes(res, "insight"), [])
 
     def test_missing_results_dir_returns_empty_not_an_exception(self):
         self.assertEqual(hc._daily_artifact_minutes(Path("/nonexistent-xyz"), "insight"), [])
+
+
+class TestCollector(unittest.TestCase):
+    """The collector's FILTERING is where a job silently drops out of scope."""
+
+    def _run(self, entries, artifacts=()):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "hosts" / "H").mkdir(parents=True)
+            if entries is not None:
+                (ws / "hosts" / "H" / "crons.json").write_text(entries)
+            res = ws / "results"
+            res.mkdir()
+            for name, when in artifacts:
+                f = res / name
+                f.write_text("x")
+                os.utime(f, (time.time(), time.mktime(when)))
+            with mock.patch.object(hc, "WORKSPACE_DIR", ws), \
+                 mock.patch.object(hc, "_host_label", lambda: "H"):
+                return hc.check_daily_cron_punctuality()
+
+    def test_no_crons_file_is_skipped_not_ok_silent(self):
+        r = self._run(None)
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("no per-host crons.json", r["detail"])
+
+    def test_unreadable_crons_file_says_so(self):
+        r = self._run("{not json")
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("unreadable", r["detail"])
+
+    def test_launchd_and_codex_entries_are_out_of_scope(self):
+        r = self._run(json.dumps([
+            {"name": "a", "cron": "50 6 * * *", "launchd": True},
+            {"name": "b", "cron": "57 6 * * *", "execution": "codex-task"},
+        ]))
+        self.assertIn("no session-owned daily jobs", r["detail"],
+                      "these have their own runner and must not be scored here")
+
+    def test_sub_daily_and_non_every_day_schedules_are_out_of_scope(self):
+        r = self._run(json.dumps([
+            {"name": "loop", "cron": "*/5 * * * *"},
+            {"name": "weekly", "cron": "0 9 * * 1"},
+            {"name": "monthly", "cron": "0 9 1 * *"},
+            {"name": "dynamic"},
+        ]))
+        self.assertIn("no session-owned daily jobs", r["detail"])
+
+    def test_end_to_end_late_daily_job_warns(self):
+        arts = [(f"insight-2026-08-0{d}.txt", (2026, 8, d, 7, 30, 0, 0, 0, -1))
+                for d in range(1, 8)]
+        r = self._run(json.dumps([{"name": "daily-insight", "cron": "50 6 * * *"}]), arts)
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("late", r["detail"])
+
+    def test_a_dict_shaped_config_is_read_too(self):
+        r = self._run(json.dumps({"crons": [{"name": "x", "cron": "*/5 * * * *"}]}))
+        self.assertIn("no session-owned daily jobs", r["detail"])
 
 
 if __name__ == "__main__":
