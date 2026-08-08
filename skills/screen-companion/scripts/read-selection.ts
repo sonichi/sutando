@@ -10,7 +10,7 @@
 // Timeout budget: 800ms per probe (Mini #1409 review). 3s × 2 = 6s worst-case
 // is too slow for an inline voice tool; 800ms keeps total budget ≤ 1.6s.
 
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 
 export type SelectionSource = 'ax_selection' | 'chrome_js_selection';
 
@@ -35,7 +35,7 @@ end try`;
 
 function probe(script: string, label: string, timeoutMs = 800): string {
 	try {
-		return execSync(`osascript -e '${script}'`, { encoding: 'utf-8', timeout: timeoutMs }).trim();
+		return execFileSync('osascript', ['-e', script], { encoding: 'utf-8', timeout: timeoutMs }).trim();
 	} catch (err) {
 		// execSync timeout surfaces as an Error with .signal === 'SIGTERM' AND .code === 'ETIMEDOUT'.
 		const e = err as { signal?: string; code?: string };
