@@ -217,6 +217,29 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                              mock.Mock(stdout="sleep 120\n", returncode=0)]
             self.assertEqual(self.hc._core_argv_pins("/s", ["notifier"]), [])
 
+    def test_a_SUCCESSFUL_list_panes_that_enumerates_NOTHING_is_unknown(self):
+        """Fifth layer, found by enumerating the collector's exits rather than by
+        review. `list-panes` exiting 0 while yielding no pid used to `continue` with
+        no row, so the session reported clean.
+
+        A live tmux session ALWAYS has at least one pane, so a successful list that
+        produces zero pids enumerated nothing — it is not evidence of an empty
+        session. Two reachable shapes: empty stdout, and output that survives no
+        digit filter (e.g. pane IDs like `%12` rather than pids).
+        """
+        for label, out in (("empty stdout", ""), ("non-numeric", "%12\n%13\n")):
+            def fake_run(cmd, _o=out, **kw):
+                if "list-panes" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, _o, "")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            with self.subTest(shape=label):
+                with mock.patch.object(self.hc.subprocess, "run", side_effect=fake_run):
+                    rows = self.hc._core_argv_pins("/s", ["sutando-core"])
+                self.assertEqual(rows, [("sutando-core", None)], f"{label}: {rows}")
+                self.assertEqual(
+                    self.hc._interpret_core_model_pin([], "/s", rows)["status"], "warn",
+                    f"{label}: a session we could not enumerate must not read clean")
+
     def test_a_MIXED_pane_session_is_unknown_one_readable_claude_does_not_clear_it(self):
         """Fourth layer of the same fail-open. One READABLE unpinned claude pane must
         not suppress an UNREADABLE sibling pane: `seen_claude` says something about
@@ -322,12 +345,24 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(r["status"], "ok")
         self.assertNotIn("LIVE core", r["detail"])
 
-    def test_a_session_with_no_panes_is_skipped_not_reported_unreadable(self):
-        """tmux can answer with no pane_pids (a session going away). That is not the
-        same as a core whose argv could not be read, and must not be reported as one."""
+    def test_a_session_that_ENUMERATES_NOTHING_is_unknown_not_skipped(self):
+        """REVERSED, with a measurement. This asserted that a successful list with no
+        pane_pids should be SKIPPED, justified as "a session going away".
+
+        That justification does not hold — measured against real tmux:
+
+            list-panes -s -t '=alive'  ->  rc 0, "86511"
+            list-panes -s -t '=ghost'  ->  rc 1, "can't find window: ghost"
+
+        A vanishing session exits NONZERO and is already handled by the returncode
+        branch above. So rc 0 with zero pids is not the going-away case; a live
+        session always has >=1 pane, which makes it an enumeration that read nothing.
+        Skipping it was a fail-open with no scenario behind it.
+        """
         with mock.patch.object(self.hc.subprocess, "run",
                                return_value=mock.Mock(stdout="\n", returncode=0)):
-            self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]), [])
+            self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]),
+                             [("sutando-core", None)])
 
     def test_a_tmux_or_ps_failure_reports_unreadable_rather_than_clean(self):
         """Fail-safe direction: an exception must not read as "no pin found"."""

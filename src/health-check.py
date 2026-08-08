@@ -6629,6 +6629,9 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
             pids = [x.strip() for x in (pp.stdout or "").split("\n")
                     if x.strip().isdigit()]
             if not pids:
+                # A live session ALWAYS has >=1 pane, so a successful list that
+                # yields no pid enumerated nothing — unknown, never "no panes".
+                out.append((sess, None))
                 continue
             seen_claude = read_failed = False
             for pid in pids:
