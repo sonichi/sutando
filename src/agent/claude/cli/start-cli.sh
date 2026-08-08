@@ -509,10 +509,14 @@ apply_tmux_defaults() {
   command -v tmux > /dev/null 2>&1 || return 0
   tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
-  # Clear any stale model pin: a shell `unset` never reaches tmux, and -g is
-  # invisible to a per-session query, so both scopes need clearing.
+  # Clear any stale model pin. `setenv -u` with no -t hits tmux's DEFAULT session,
+  # which on a multi-session socket is not necessarily the core's, so target each.
   tmux -S "$TMUX_SOCKET" setenv -gu SUTANDO_CORE_MODEL 2>/dev/null || true
-  tmux -S "$TMUX_SOCKET" setenv -u SUTANDO_CORE_MODEL 2>/dev/null || true
+  _pin_sessions="$(tmux -S "$TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null || true)"
+  while IFS= read -r _pin_sess; do
+    [ -n "$_pin_sess" ] || continue
+    tmux -S "$TMUX_SOCKET" setenv -t "=$_pin_sess" -u SUTANDO_CORE_MODEL 2>/dev/null || true
+  done <<< "$_pin_sessions"
   # Wheel-scroll fix (sutando-plus#46, re-broken 2026-06-11): predicate on
   # mouse_any_flag, NOT alternate_on. Claude Code 2.1.150 stopped using the
   # alternate screen, so the old alt-screen predicate forwarded wheel events

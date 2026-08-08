@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
-"""Tests that src/agent/claude/cli/start-cli.sh IGNORES $SUTANDO_CORE_MODEL.
-
-The launcher reads no model from the environment: an ambient pin cannot be told
-apart from a deliberate choice.
-  - unset → NO --model flag (core inherits the global model; 1M stays default)
-  - set   → STILL no --model flag; the pin is ignored
-  - the tmux defaults hook clears the var in BOTH scopes
-
-Drives the no-tmux fallback branch (the bare `exec claude …`) with a stub
-`claude` that records its argv, and a stub `pgrep` that always reports "not
-running" so the test is independent of any live sutando-core on the host.
-
-Run: python3 tests/start-cli-model-pin.test.py
-Exit: 0 on pass, 1 on fail.
-"""
+"""start-cli.sh must ignore $SUTANDO_CORE_MODEL and clear it from every
+tmux session scope, not just tmux's default target."""
 from __future__ import annotations
 import os
 import subprocess
@@ -96,8 +83,12 @@ def case_tmux_defaults_clear_both_scopes() -> list[str]:
     fails = []
     if "setenv -gu SUTANDO_CORE_MODEL" not in code:
         fails.append("clear) apply_tmux_defaults must clear the GLOBAL scope (setenv -gu)")
-    if "setenv -u SUTANDO_CORE_MODEL" not in code:
-        fails.append("clear) apply_tmux_defaults must clear the SESSION scope (setenv -u)")
+    # TARGETED per session: an untargeted `setenv -u` clears tmux's default
+    # session, which on a multi-session socket is not the core's.
+    if 'setenv -t "=$_pin_sess" -u SUTANDO_CORE_MODEL' not in code:
+        fails.append("clear) the session clear must target each session with -t, not tmux's default")
+    if "list-sessions -F '#{session_name}'" not in code:
+        fails.append("clear) must enumerate sessions to clear each one")
     # The pass-through must be gone, not merely bypassed.
     if "MODEL_ARGS" in code:
         fails.append("clear) MODEL_ARGS is back — an empty array is one edit from a pin")
@@ -121,7 +112,9 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
         bind.mkdir()
         (td / "home").mkdir()
         sock = td / "scratch-tmux.sock"
-        for stub, body in (("claude", "exit 0\n"), ("pgrep", "exit 1\n")):
+        # pgrep exits 0 = "already running": skips ensure_core_monitor's
+        # core-input-watch.py spawn, which outlived the temp dir and held the pipe.
+        for stub, body in (("claude", "exit 0\n"), ("pgrep", "exit 0\n")):
             f = bind / stub
             f.write_text("#!/bin/bash\n" + body)
             f.chmod(0o755)
@@ -131,8 +124,13 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
                                   capture_output=True, text=True, **kw)
 
         try:
+            # Core FIRST, 'other' LAST: tmux's implicit target is the most
+            # recent session, so an untargeted `setenv -u` clears 'other' and
+            # leaves the core pinned. Reversing this order makes the case pass
+            # even with the bug present.
             tm("new-session", "-d", "-s", "sutando-core",
                "-e", "SUTANDO_CORE_MODEL=opus", "sleep 300")
+            tm("new-session", "-d", "-s", "other", "sleep 300")
             tm("setenv", "-g", "SUTANDO_CORE_MODEL", "opus")
             if "SUTANDO_CORE_MODEL=opus" not in tm("show-environment", "-g",
                                                    "SUTANDO_CORE_MODEL").stdout:
@@ -152,8 +150,21 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
             try:
                 out = proc.communicate(timeout=45)[0] or ""
             except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                out = proc.communicate()[0] or ""
+                out = ""
+            finally:
+                # start_new_session makes the child its own group leader, so the
+                # pgid IS proc.pid -- no getpgid, which could race a fast exit.
+                # Unconditional: the script spawns background monitors that
+                # outlive a clean exit and must not leak onto a dev machine.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    out = (out or "") + (proc.communicate(timeout=10)[0] or "")
+                except (subprocess.TimeoutExpired, ValueError):
+                    pass
+                proc.wait(timeout=10)
             if "tmux not found" in out:
                 return ["tmux-launch) script skipped its tmux path — fixture never reached the clear"]
 
@@ -162,6 +173,11 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
                 got = tm("show-environment", *scope_args, "SUTANDO_CORE_MODEL").stdout
                 if "SUTANDO_CORE_MODEL=opus" in got:
                     fails.append(f"tmux-launch) {label} scope still pinned after launch: {got.strip()!r}")
+            leaked = subprocess.run(
+                ["/bin/sh", "-c", f"ps -Ao args= | grep -c '[c]ore-input-watch.py .*{sock}'"],
+                capture_output=True, text=True).stdout.strip()
+            if leaked not in ("0", ""):
+                fails.append(f"tmux-launch) leaked {leaked} core-input-watch monitor(s) on the scratch socket")
         finally:
             tm("kill-server")
     return fails
