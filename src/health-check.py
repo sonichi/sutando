@@ -4754,12 +4754,8 @@ DAILY_MISS_GRACE_MIN = 60
 
 
 def _interpret_daily_punctuality(jobs: list) -> dict:
-    """Pure half of `check_daily_cron_punctuality`.
-
-    `jobs` is [{name, hour, minute, artifacts:[(date, written_minute_of_day)], today_seen,
-    minutes_since_due}]. Artifact PRESENCE cannot distinguish a working schedule from
-    something else producing the same file late, so lateness is what is scored.
-    """
+    """Score LATENESS, not presence: a file produced daily by another path looks
+    identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown = [], [], []
     for j in jobs:
@@ -4808,12 +4804,7 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
 
 
 def check_daily_cron_punctuality() -> dict:
-    """Report a daily job whose output never arrives at its scheduled time.
-
-    A dead daily schedule is invisible when another path produces the same file:
-    the artifact is present every day, just late. Scoring lateness separates the
-    two; presence alone cannot.
-    """
+    """Report a daily job whose output never arrives at its scheduled time."""
     from datetime import datetime, time as dtime
     name = "daily-cron-punctuality"
     ws = WORKSPACE_DIR
@@ -4826,7 +4817,7 @@ def check_daily_cron_punctuality() -> dict:
         return {"name": name, "status": "ok", "detail": f"crons.json unreadable ({e}) — skipped"}
     entries = raw if isinstance(raw, list) else (raw.get("crons") or raw.get("jobs") or [])
     now = datetime.now()
-    jobs = []
+    jobs, malformed = [], []
     for e in entries:
         if not isinstance(e, dict) or e.get("launchd") or e.get("execution") == "codex-task":
             continue
@@ -4836,14 +4827,25 @@ def check_daily_cron_punctuality() -> dict:
         if f[2] != "*" or f[3] != "*" or f[4] != "*":
             continue                       # not a plain every-day schedule
         jname = str(e.get("name") or "?")
+        try:
+            # "61 24 * * *" is all digits and still invalid; dtime() would raise
+            # ValueError out of the always-on run_all_checks() path.
+            due = datetime.combine(now.date(), dtime(int(f[1]), int(f[0])))
+        except ValueError:
+            malformed.append(f"{jname} ({' '.join(f[:2])})")
+            continue
         stem = jname.split("-")[-1] if "-" in jname else jname
         arts = _daily_artifact_minutes(ws / "results", stem)
-        due = datetime.combine(now.date(), dtime(int(f[1]), int(f[0])))
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
         })
+    if malformed:
+        return {"name": name, "status": "warn",
+                "detail": f"unparseable daily cron time(s): {', '.join(malformed)} — "
+                          f"fix the crons.json entry; punctuality unchecked for "
+                          f"{len(malformed)} job(s)"}
     if not jobs:
         return {"name": name, "status": "ok", "detail": "no session-owned daily jobs — skipped"}
     return _interpret_daily_punctuality(jobs)

@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-"""A daily job whose output always arrives late is a DEAD schedule, not a healthy one.
-
-Presence cannot tell "the cron fired" from "another path produced the same file late".
-Measured on this host: daily-insight is scheduled 06:50 and its last 7 dated artifacts
-were written 07:12-08:37 — median +42 min. The deliverable landed every day because the
-loop's cron PROMPT carries the command; the schedule itself never fired.
-
-Run: python3 tests/health-check-daily-punctuality.test.py
-"""
+"""Lateness is the signal: a file produced daily by another path looks identical to
+one produced by a working schedule."""
 from __future__ import annotations
 
 import importlib.util
@@ -104,11 +97,8 @@ class TestUnverifiableIsNotClean(unittest.TestCase):
 
 class TestArtifactDiscovery(unittest.TestCase):
     def test_month_bucketed_archive_is_found(self):
-        """REGRESSION: delivered results are archived into results/archive/YYYY-MM/.
-
-        The first version globbed results/ and results/archive/ only, so it found
-        ZERO artifacts on the real host and reported every job unverifiable.
-        """
+        """Delivered results are archived into results/archive/YYYY-MM/, so the
+        durable copies sit two levels down."""
         with tempfile.TemporaryDirectory() as td:
             res = Path(td) / "results"
             (res / "archive" / "2026-08").mkdir(parents=True)
@@ -187,6 +177,14 @@ class TestCollector(unittest.TestCase):
         r = self._run(json.dumps([{"name": "daily-insight", "cron": "50 6 * * *"}]), arts)
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("late", r["detail"])
+
+    def test_a_malformed_time_degrades_instead_of_crashing(self):
+        """`isdigit()` passes "61"/"24"; dtime() would raise out of run_all_checks()."""
+        r = self._run(json.dumps([{"name": "bad", "cron": "61 24 * * *"},
+                                  {"name": "daily-insight", "cron": "50 6 * * *"}]))
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("unparseable daily cron time", r["detail"])
+        self.assertIn("bad", r["detail"], "name the offending entry")
 
     def test_a_dict_shaped_config_is_read_too(self):
         r = self._run(json.dumps({"crons": [{"name": "x", "cron": "*/5 * * * *"}]}))
