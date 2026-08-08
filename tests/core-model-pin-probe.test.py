@@ -9,6 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# A tmux server inherits its GLOBAL env from whoever starts it, so an ambient pin
+# would make every temp server below born pinned — and only on an affected host.
+os.environ.pop("SUTANDO_CORE_MODEL", None)
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -28,6 +32,20 @@ class CoreModelPinProbe(unittest.TestCase):
         self.sock = os.path.join(self.tmp, "probe.sock")
         self._prev = os.environ.get("SUTANDO_TMUX_SOCKET")
         os.environ["SUTANDO_TMUX_SOCKET"] = self.sock
+
+    def _assert_socket_starts_unpinned(self):
+        """State the precondition instead of assuming it. Call AFTER the server is up:
+        a socket with no server answers nothing, which would pass vacuously."""
+        live = subprocess.run(["tmux", "-S", self.sock, "list-sessions"],
+                              capture_output=True, text=True)
+        self.assertEqual(live.returncode, 0,
+                         "no tmux server on the socket — this check would pass vacuously")
+        # show-environment exits 1 both when unset and when serverless, so server
+        # presence is established separately above rather than read from this rc.
+        got = subprocess.run(["tmux", "-S", self.sock, "show-environment", "-g",
+                              "SUTANDO_CORE_MODEL"], capture_output=True, text=True).stdout
+        self.assertNotIn("SUTANDO_CORE_MODEL=", got,
+                         f"fixture did not start unpinned: {got.strip()!r}")
 
     def tearDown(self):
         subprocess.run(["tmux", "-S", self.sock, "kill-server"],
@@ -77,6 +95,7 @@ class CoreModelPinProbe(unittest.TestCase):
         for n in ("notifier", "sutando-core"):
             subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", n,
                             "sleep 120"], capture_output=True)
+        self._assert_socket_starts_unpinned()
         self.assertEqual(self.hc.check_core_model_pin()["status"], "ok")
 
     def test_global_env_pin_is_not_invisible(self):
@@ -98,6 +117,7 @@ class CoreModelPinProbe(unittest.TestCase):
 
     def test_unpinned_core_ok(self):
         self._session()
+        self._assert_socket_starts_unpinned()
         r = self.hc.check_core_model_pin()
         self.assertEqual(r["status"], "ok", r)
 
