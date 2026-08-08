@@ -92,6 +92,17 @@ class TestUnverifiableIsNotClean(unittest.TestCase):
         self.assertIn("morning-briefing", r["detail"],
                       "name the job whose punctuality cannot be checked")
 
+    def test_an_all_unobservable_set_states_its_coverage_not_a_clean_bill(self):
+        """qingyun-wu's shape: only morning-briefing configured, nothing observable.
+        Status stays ok (warning forever on an unobservable job is a nag), but the
+        detail must not read as a clean bill of health."""
+        r = hc._interpret_daily_punctuality(
+            [job("morning-briefing", 6, 57, [], today_seen=False, since_due=300)])
+        self.assertIn("0 of 1 daily job(s) observable", r["detail"])
+        self.assertIn("UNCHECKED", r["detail"])
+        self.assertNotIn("landing on schedule", r["detail"],
+                         "nothing was observed, so nothing landed on schedule")
+
     def test_unverifiable_is_still_named_alongside_a_real_warn(self):
         mins = [7 * 60 + 30] * 7
         arts = [(f"2026-08-0{i+1}", m) for i, m in enumerate(mins)]

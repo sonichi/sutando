@@ -4771,9 +4771,14 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         if not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN:
             missed.append((j["name"], j["minutes_since_due"]))
     if not late and not missed:
-        detail = f"{len(jobs) - len(unknown)} daily job(s) landing on schedule"
+        seen = len(jobs) - len(unknown)
+        # Lead with coverage: "N landing on schedule" alone read as healthy when the
+        # real answer was that nothing was observable.
+        detail = f"{seen} of {len(jobs)} daily job(s) observable"
+        detail += ", all on schedule" if seen else ""
         if unknown:
-            detail += f"; no dated artifact to check for: {', '.join(sorted(unknown))}"
+            detail += (f"; UNCHECKED (no dated artifact, cannot tell whether it ran): "
+                       f"{', '.join(sorted(unknown))}")
         return {"name": name, "status": "ok", "detail": detail}
     bits = []
     for n, m, c in late:
