@@ -148,6 +148,13 @@ def main(argv=None) -> int:
     ist = ins.add_parser("start")
     ist.add_argument("agent_id")
     ist.add_argument("--wait", type=float, default=10.0)
+    iat = ins.add_parser("attach")
+    iat.add_argument("agent_id")
+    iat.add_argument("--print", action="store_true",
+                     help="print the tmux command instead of exec'ing it")
+    iop = ins.add_parser("open")
+    iop.add_argument("agent_id")
+    iop.add_argument("--window", action="store_true")
 
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsk.add_parser("list")
@@ -166,6 +173,22 @@ def main(argv=None) -> int:
         if args.cmd == "start":
             out = instance_registry.start_instance(args.agent_id,
                                                    wait_s=args.wait)
+            print(json.dumps(out, ensure_ascii=False, indent=1))
+            return 0 if out.get("ok") else 1
+        if args.cmd == "attach":
+            out = instance_registry.attach(args.agent_id)
+            if not out.get("ok"):
+                print(json.dumps(out, ensure_ascii=False), file=sys.stderr)
+                return 1
+            if args.print:
+                print(" ".join(out["argv"]))
+                return 0
+            import os as _os
+            _os.execvp(out["argv"][0], out["argv"])  # hand the tty to tmux
+            return 0
+        if args.cmd == "open":
+            import terminal_open
+            out = terminal_open.open_instance(args.agent_id, window=args.window)
             print(json.dumps(out, ensure_ascii=False, indent=1))
             return 0 if out.get("ok") else 1
         print(json.dumps({"instances": instance_registry.list_instances()},

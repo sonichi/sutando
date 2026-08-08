@@ -48,6 +48,8 @@ def write_manifest(agent_id: str, *, workspace: str | None = None,
                    owner: str | None = None, endpoint: str | None = None,
                    backend: str | None = None, host_label: str | None = None,
                    launcher: dict | None = None, instance: str | None = None,
+                   tmux_socket: str | None = None, session: str | None = None,
+                   config_dir: str | None = None,
                    status: str = "running") -> Path:
     """Atomic write of the instance manifest (0700 dir / 0600 file). Preserves
     installed_at across rewrites so registration age survives restarts."""
@@ -69,7 +71,11 @@ def write_manifest(agent_id: str, *, workspace: str | None = None,
                      **({"host_label": host_label} if host_label else {})},
         **({"workspace": workspace} if workspace else {}),
         **({"endpoint": {"type": "unix", "path": endpoint}} if endpoint else {}),
-        **({"runtime": {"backend": backend}} if backend else {}),
+        **({"runtime": {**({"backend": backend} if backend else {}),
+                        **({"tmux_socket": tmux_socket} if tmux_socket else {}),
+                        **({"session": session} if session else {})}}
+           if (backend or tmux_socket or session) else {}),
+        **({"claude": {"config_dir": config_dir}} if config_dir else {}),
         **({"launcher": launcher} if launcher else {}),
         "status": status,
         "installed_at": installed_at,
@@ -221,3 +227,34 @@ def start_instance(agent_id: str, wait_s: float = 10.0) -> dict:
         time.sleep(0.2)
     return {"ok": False, "error": f"endpoint not ready within {wait_s}s "
                                   "(launcher still running)", "pid": proc.pid}
+
+
+# ── attach (v1: connect to the native tmux Claude Code TUI) ──────────────────
+# The attach IS the session interface (owner v1): no session.* API needed —
+# the Core keeps running its native Claude Code TUI inside tmux, and the client
+# just re-attaches. The argv is resolved FROM THE MANIFEST, never hand-built,
+# so the client stays dumb about where tmux lives.
+
+def attach_command(manifest: dict) -> dict:
+    """Resolve the tmux attach argv for an instance from its manifest.
+    Returns {"ok": True, "argv": [...]} or {"ok": False, "error": ...}."""
+    rt = manifest.get("runtime") or {}
+    if rt.get("backend") not in (None, "tmux"):
+        return {"ok": False, "error": f"backend {rt.get('backend')!r} is not "
+                                      "tmux — attach is a tmux-only v1 verb"}
+    sock = rt.get("tmux_socket")
+    session = rt.get("session")
+    if not sock or not session:
+        return {"ok": False, "error": "manifest has no runtime.tmux_socket + "
+                                      "runtime.session to attach to"}
+    return {"ok": True,
+            "argv": ["tmux", "-S", sock, "attach-session", "-t", session]}
+
+
+def attach(agent_id: str) -> dict:
+    p = _manifest_path(agent_id)
+    try:
+        m = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"ok": False, "error": f"not_registered: no manifest for {agent_id!r}"}
+    return attach_command(m)

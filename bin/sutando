@@ -22,6 +22,12 @@ case "${1:-help}" in
     exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" instance start "$@" ;;
   tui)
     exec python3 "$REPO/src/runtime-cli/tui.py" ;;
+  attach)
+    shift
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" instance attach "$@" ;;
+  open)
+    shift
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" instance open "$@" ;;
   help|-h|--help)
     sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0 ;;

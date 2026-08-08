@@ -139,6 +139,8 @@ ENV = {**os.environ,
        "SUTANDO_AGENT_ID": "@test-agent:example.org",
        "SUTANDO_HOST_LABEL": "e2e-host",  # runtime.* reads its own beat by label
        "SUTANDO_INSTANCE_REGISTRY": str(Path(TMP) / "instances"),
+       "SUTANDO_TMUX_SOCKET": "/tmp/e2e-tmux.sock",
+       "SUTANDO_TMUX_SESSION": "e2e-core",
        "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
        "REMOTE_TASK_TOKEN": "test-bearer"}
 
@@ -626,6 +628,17 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         mtext = Path(inst[0]["_file"]).read_text().lower()
         check(all(n not in mtext for n in ("token", "secret", "password")),
               "manifest carries no secrets")
+        rt18 = inst[0].get("runtime", {})
+        check(rt18.get("tmux_socket") == "/tmp/e2e-tmux.sock"
+              and rt18.get("session") == "e2e-core",
+              "manifest records the tmux attach coords (socket + session)")
+        at18 = subprocess.run(
+            [sys.executable, str(CLI), "instance", "attach",
+             "@test-agent:example.org", "--print"],
+            capture_output=True, text=True, env=ENV)
+        check(at18.stdout.strip() ==
+              "tmux -S /tmp/e2e-tmux.sock attach-session -t e2e-core",
+              "attach resolves the tmux argv from the manifest")
         check(inst[0].get("launcher", {}).get("args") == ["serve"]
               and inst[0]["launcher"]["executable"].endswith("bin/sutando"),
               "manifest carries a structured launcher (no shell strings)")

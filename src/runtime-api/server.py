@@ -141,10 +141,17 @@ class RuntimeServer:
             launcher = {"type": "command",
                         "executable": str(_HERE.parent.parent / "bin" / "sutando"),
                         "args": ["serve"]}
+            # tmux backend coordinates (v1 attach target): the socket the core
+            # launched on (same value the heartbeat records) + its session.
+            tmux_socket = (os.environ.get("SUTANDO_TMUX_SOCKET")
+                           or "/tmp/sutando-tmux.sock")
+            session = os.environ.get("SUTANDO_TMUX_SESSION") or "sutando-core"
             instance_registry.write_manifest(
                 self.actor_id, workspace=ws, endpoint=self.socket_path,
                 backend="tmux", host_label=_host_label(), launcher=launcher,
-                instance=instance_id(), status="running")
+                instance=instance_id(), tmux_socket=tmux_socket, session=session,
+                config_dir=os.environ.get("CLAUDE_CONFIG_DIR"),
+                status="running")
         except Exception as e:  # noqa: BLE001
             _log(f"instance-registry write failed (non-fatal): {e}")
 
