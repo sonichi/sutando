@@ -111,6 +111,7 @@ def main(argv=None) -> int:
     cap.add_argument("--approval", help="approval requestId that authorizes this execution (consumed once)")
 
     req = sub.add_parser("request").add_subparsers(dest="cmd", required=True)
+    req.add_parser("list")
     for name in ("get", "wait", "cancel"):
         p = req.add_parser(name)
         p.add_argument("request_id")
@@ -146,6 +147,7 @@ def main(argv=None) -> int:
     ins.add_parser("list")
 
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
+    tsk.add_parser("list")
     tsub = tsk.add_parser("submit")
     tsub.add_argument("text")
     tsub.add_argument("--priority", default="normal",
@@ -200,13 +202,17 @@ def main(argv=None) -> int:
                     params["note"] = args.note
                 result = _rpc(f"human_action.{args.cmd}", params, timeout=15)
         elif args.group == "task":
-            if args.cmd == "submit":
+            if args.cmd == "list":
+                result = _rpc("task.list", {}, timeout=15)
+            elif args.cmd == "submit":
                 result = _rpc("task.submit", {"task": args.text,
                                               "priority": args.priority},
                               timeout=15)
             else:
                 result = _rpc(f"task.{args.cmd.replace('-', '_')}",
                               {"taskId": args.task_id}, timeout=15)
+        elif args.group == "request" and args.cmd == "list":
+            result = _rpc("request.list", {}, timeout=15)
         else:
             method = f"request.{args.cmd}"
             params = {"requestId": args.request_id}

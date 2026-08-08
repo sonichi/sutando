@@ -146,6 +146,26 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(d["state"], "pending")
         self.assertIsNone(self.view.details("task-ghost"))
 
+    def test_list_tasks_enumerates_live_only(self):
+        a = self.view.submit("first")["taskId"]
+        b = self.view.submit("second")["taskId"]
+        # claimed task still listed (as in_progress); done task drops off
+        (self.tasks / f"{a}.txt").rename(self.tasks / f"{a}.claimed-core-1.txt")
+        c = self.view.submit("third")["taskId"]
+        self.results.mkdir(parents=True, exist_ok=True)
+        (self.results / f"{c}.txt").write_text("done")
+        out = self.view.list_tasks()
+        by_id = {t["taskId"]: t for t in out["tasks"]}
+        self.assertEqual(by_id[a]["state"], "in_progress")
+        self.assertEqual(by_id[b]["state"], "pending")
+        self.assertEqual(by_id[c]["state"], "done")  # file still live until archived
+        self.assertEqual(by_id[b]["source"], "runtime-api")
+        self.assertNotIn("truncated", out)
+
+    def test_list_tasks_empty_dir(self):
+        view = TasksView(self.tasks / "nope", self.results, "@me:x")
+        self.assertEqual(view.list_tasks(), {"tasks": []})
+
     def test_cancel_writes_cancel_instruction_signal(self):
         tid = self.view.submit("long job")["taskId"]
         out = self.view.cancel(tid)

@@ -37,6 +37,8 @@ v0 methods:
   human_action.complete {requestId, note?}
   human_action.decline  {requestId, note?}
   human_action.status   {requestId}
+  task.list             {}
+  request.list          {}
 
 Error codes follow JSON-RPC: -32700 parse, -32600 invalid request,
 -32601 unknown method, -32602 invalid params, -32000 server error.
@@ -73,6 +75,8 @@ METHODS = (
     "human_action.complete",
     "human_action.decline",
     "human_action.status",
+    "task.list",
+    "request.list",
 )
 
 

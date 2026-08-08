@@ -128,6 +128,35 @@ class TasksView:
                 out[k] = v
         return out
 
+    # ── task.list ───────────────────────────────────────────────────────────
+    def list_tasks(self, limit: int = 200) -> dict:
+        """Enumerate LIVE tasks (pending / claimed / waiting) so a fresh
+        client can render "what's waiting" without knowing any taskId — the
+        acceptance-test enumeration gap. Results/archive are deliberately not
+        walked: done work is fetched per-id, not listed."""
+        entries = []
+        if self.tasks_dir.is_dir():
+            files = [f for f in self.tasks_dir.glob("task-*.txt")
+                     if f.is_file()]
+            files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+            truncated = len(files) > limit
+            for f in files[:limit]:
+                task_id = f.name.split(".claimed-")[0].removesuffix(".txt")
+                entry = {"taskId": task_id,
+                         "state": self.status(task_id)["state"]}
+                try:
+                    th = parse_task_headers_lenient(f.read_text())
+                    for k in ("source", "priority", "timestamp", "instance_id"):
+                        v = th.get(k)
+                        if v:
+                            entry[k] = v
+                except OSError:
+                    pass
+                entries.append(entry)
+        else:
+            truncated = False
+        return {"tasks": entries, **({"truncated": True} if truncated else {})}
+
     # ── task.cancel ─────────────────────────────────────────────────────────
     def cancel(self, task_id: str) -> dict:
         """Cancellation is a SIGNAL through the same pipeline (the documented

@@ -597,6 +597,23 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         check(st16b["state"] == "pending",
               "resolving the request returns the task to the normal lifecycle")
 
+        # 15b. enumeration (acceptance-test gap 1): a client with NO known
+        # ids lists live tasks and pending human requests.
+        tl = cli("task", "list")
+        ids15 = [t["taskId"] for t in tl["tasks"]]
+        check(tid16 in ids15 and t12["taskId"] in ids15,
+              "task list enumerates live tasks without prior ids")
+        h15b = cli("human-action", "request", "--action", "List me")
+        rl = cli("request", "list")
+        rl_ids = [r["requestId"] for r in rl["requests"]]
+        check(h15b["requestId"] in rl_ids
+              and any(r.get("action") == "List me" for r in rl["requests"]),
+              "request list enumerates pending human requests with summaries")
+        cli("human-action", "complete", h15b["requestId"])
+        rl2 = cli("request", "list")
+        check(h15b["requestId"] not in [r["requestId"] for r in rl2["requests"]],
+              "resolved requests leave the pending list")
+
         # 16. instance manifest registry (M1): the daemon registered itself at
         # boot; file-based discovery answers through the CLI; the manifest is
         # secret-free.

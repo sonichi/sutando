@@ -200,6 +200,20 @@ class RuntimeDispatcher:
             return self._get(params)
         if method == "capability.execute":
             return await self._capability(params)
+        if method == "request.list":
+            # Pending human-collaboration requests, newest first — what a
+            # fresh client renders as "waiting on a human" after install.
+            out = []
+            for rec in self.store.pending():
+                p = rec.get("params") or {}
+                out.append({"requestId": rec["requestId"],
+                            "requestType": rec["requestType"],
+                            **({"taskId": rec["taskId"]} if rec.get("taskId") else {}),
+                            **({"question": p["question"]} if p.get("question") else {}),
+                            **({"action": p["action"]} if p.get("action") else {}),
+                            **({"createdAt": rec["createdAt"]}
+                               if rec.get("createdAt") else {})})
+            return {"requests": out}
         if method == "request.get":
             return self._get(params)
         if method == "request.wait":
@@ -248,6 +262,8 @@ class RuntimeDispatcher:
                     raise ProtocolError(-32602, "missing required param: task")
                 return self.tasks.submit(params["task"],
                                          priority=params.get("priority") or "normal")
+            if method == "task.list":
+                return self.tasks.list_tasks()
             tid = params.get("taskId")
             if not tid:
                 raise ProtocolError(-32602, "missing required param: taskId")
