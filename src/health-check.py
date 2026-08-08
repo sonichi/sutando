@@ -4749,6 +4749,106 @@ DISK_WARN_GIB = 10.0
 DISK_FAIL_GIB = 2.0
 
 
+DAILY_LATE_TOLERANCE_MIN = 15
+DAILY_MISS_GRACE_MIN = 60
+
+
+def _interpret_daily_punctuality(jobs: list) -> dict:
+    """Pure half of `check_daily_cron_punctuality`.
+
+    `jobs` is [{name, hour, minute, artifacts:[(date, written_minute_of_day)], today_seen,
+    minutes_since_due}]. Artifact PRESENCE cannot distinguish a working schedule from
+    something else producing the same file late, so lateness is what is scored.
+    """
+    name = "daily-cron-punctuality"
+    late, missed, unknown = [], [], []
+    for j in jobs:
+        due = j["hour"] * 60 + j["minute"]
+        if not j["artifacts"]:
+            unknown.append(j["name"])
+            continue
+        deltas = sorted(w - due for _, w in j["artifacts"])
+        median = deltas[len(deltas) // 2]
+        if median > DAILY_LATE_TOLERANCE_MIN:
+            late.append((j["name"], median, len(deltas)))
+        if not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN:
+            missed.append((j["name"], j["minutes_since_due"]))
+    if not late and not missed:
+        detail = f"{len(jobs) - len(unknown)} daily job(s) landing on schedule"
+        if unknown:
+            detail += f"; no dated artifact to check for: {', '.join(sorted(unknown))}"
+        return {"name": name, "status": "ok", "detail": detail}
+    bits = []
+    for n, m, c in late:
+        bits.append(f"{n}: {c} run(s), median +{m} min late — the schedule is not what "
+                    f"produced these; something else is covering for it")
+    for n, m in missed:
+        bits.append(f"{n}: no output today, {m} min past due")
+    if unknown:
+        bits.append(f"unverifiable (no dated artifact): {', '.join(sorted(unknown))}")
+    return {"name": name, "status": "warn", "detail": "; ".join(bits)}
+
+
+def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
+    """(date, minute-of-day-written) for the newest `<stem>-YYYY-MM-DD.*` files."""
+    from datetime import datetime
+    out = []
+    if not results.is_dir():
+        return out
+    # rglob, not glob: delivered results are archived into MONTH buckets
+    # (results/archive/YYYY-MM/), so the durable copies sit two levels down.
+    for f in results.rglob(f"{stem}-20*"):
+        m = re.match(rf"{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})", f.name)
+        if not m:
+            continue
+        lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((m.group(1), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
+def check_daily_cron_punctuality() -> dict:
+    """Report a daily job whose output never arrives at its scheduled time.
+
+    A dead daily schedule is invisible when another path produces the same file:
+    the artifact is present every day, just late. Scoring lateness separates the
+    two; presence alone cannot.
+    """
+    from datetime import datetime, time as dtime
+    name = "daily-cron-punctuality"
+    ws = WORKSPACE_DIR
+    cfg = ws / "hosts" / _host_label() / "crons.json"
+    if not cfg.is_file():
+        return {"name": name, "status": "ok", "detail": "no per-host crons.json — skipped"}
+    try:
+        raw = json.loads(cfg.read_text())
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "ok", "detail": f"crons.json unreadable ({e}) — skipped"}
+    entries = raw if isinstance(raw, list) else (raw.get("crons") or raw.get("jobs") or [])
+    now = datetime.now()
+    jobs = []
+    for e in entries:
+        if not isinstance(e, dict) or e.get("launchd") or e.get("execution") == "codex-task":
+            continue
+        f = str(e.get("cron") or "").split()
+        if len(f) != 5 or not f[0].isdigit() or not f[1].isdigit():
+            continue
+        if f[2] != "*" or f[3] != "*" or f[4] != "*":
+            continue                       # not a plain every-day schedule
+        jname = str(e.get("name") or "?")
+        stem = jname.split("-")[-1] if "-" in jname else jname
+        arts = _daily_artifact_minutes(ws / "results", stem)
+        due = datetime.combine(now.date(), dtime(int(f[1]), int(f[0])))
+        jobs.append({
+            "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
+            "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
+            "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
+        })
+    if not jobs:
+        return {"name": name, "status": "ok", "detail": "no session-owned daily jobs — skipped"}
+    return _interpret_daily_punctuality(jobs)
+
+
 def check_disk_space() -> dict:
     """Free space on the volume(s) the core actually writes to.
 
@@ -7125,6 +7225,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_codex_task_notifier())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
+    checks.append(check_daily_cron_punctuality())
     checks.append(check_disk_space())
 
     return checks

@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""A daily job whose output always arrives late is a DEAD schedule, not a healthy one.
+
+Presence cannot tell "the cron fired" from "another path produced the same file late".
+Measured on this host: daily-insight is scheduled 06:50 and its last 7 dated artifacts
+were written 07:12-08:37 — median +42 min. The deliverable landed every day because the
+loop's cron PROMPT carries the command; the schedule itself never fired.
+
+Run: python3 tests/health-check-daily-punctuality.test.py
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+_spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
+hc = importlib.util.module_from_spec(_spec)
+sys.modules["hc"] = hc
+try:
+    _spec.loader.exec_module(hc)
+except SystemExit:
+    pass
+
+
+def job(name, hour, minute, arts, today_seen=True, since_due=0):
+    return {"name": name, "hour": hour, "minute": minute, "artifacts": arts,
+            "today_seen": today_seen, "minutes_since_due": since_due}
+
+
+DUE = 6 * 60 + 50
+
+
+class TestLatenessIsTheSignal(unittest.TestCase):
+    def test_on_schedule_is_ok(self):
+        arts = [(f"2026-08-0{i}", DUE + 1) for i in range(1, 8)]
+        r = hc._interpret_daily_punctuality([job("daily-insight", 6, 50, arts)])
+        self.assertEqual(r["status"], "ok", r)
+
+    def test_the_real_host_shape_warns(self):
+        """Verbatim from this host: 07:12 08:37 07:53 07:20 07:32 07:38 07:27."""
+        mins = [7 * 60 + 12, 8 * 60 + 37, 7 * 60 + 53, 7 * 60 + 20,
+                7 * 60 + 32, 7 * 60 + 38, 7 * 60 + 27]
+        arts = [(f"2026-08-0{i+1}", m) for i, m in enumerate(mins)]
+        r = hc._interpret_daily_punctuality([job("daily-insight", 6, 50, arts)])
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("+42 min late", r["detail"])
+        self.assertIn("covering for it", r["detail"],
+                      "must say the schedule is not what produced these")
+
+    def test_median_not_mean_so_one_outlier_does_not_flip_it(self):
+        arts = [("2026-08-0%d" % i, DUE + 2) for i in range(1, 7)] + [("2026-08-07", DUE + 300)]
+        r = hc._interpret_daily_punctuality([job("daily-insight", 6, 50, arts)])
+        self.assertEqual(r["status"], "ok", "a single late run is not a dead schedule")
+
+    def test_within_tolerance_is_ok(self):
+        arts = [(f"2026-08-0{i}", DUE + hc.DAILY_LATE_TOLERANCE_MIN - 1) for i in range(1, 8)]
+        self.assertEqual(
+            hc._interpret_daily_punctuality([job("x", 6, 50, arts)])["status"], "ok")
+
+
+class TestMissedToday(unittest.TestCase):
+    def test_no_output_today_past_grace_warns(self):
+        arts = [(f"2026-08-0{i}", DUE + 1) for i in range(1, 8)]
+        r = hc._interpret_daily_punctuality(
+            [job("morning-briefing", 6, 57, arts, today_seen=False,
+                 since_due=hc.DAILY_MISS_GRACE_MIN + 1)])
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("no output today", r["detail"])
+
+    def test_within_grace_is_not_yet_a_miss(self):
+        arts = [(f"2026-08-0{i}", DUE + 1) for i in range(1, 8)]
+        r = hc._interpret_daily_punctuality(
+            [job("morning-briefing", 6, 57, arts, today_seen=False, since_due=5)])
+        self.assertEqual(r["status"], "ok", "do not cry miss inside the grace window")
+
+
+class TestUnverifiableIsNotClean(unittest.TestCase):
+    def test_a_job_with_no_dated_artifact_is_named_not_silently_passed(self):
+        """The fail-open: no artifact means UNKNOWN, and the detail must say so."""
+        r = hc._interpret_daily_punctuality([job("morning-briefing", 6, 57, [])])
+        self.assertEqual(r["status"], "ok", "unknown is not a failure on its own")
+        self.assertIn("no dated artifact", r["detail"])
+        self.assertIn("morning-briefing", r["detail"],
+                      "name the job whose punctuality cannot be checked")
+
+    def test_unverifiable_is_still_named_alongside_a_real_warn(self):
+        mins = [7 * 60 + 30] * 7
+        arts = [(f"2026-08-0{i+1}", m) for i, m in enumerate(mins)]
+        r = hc._interpret_daily_punctuality(
+            [job("daily-insight", 6, 50, arts), job("morning-briefing", 6, 57, [])])
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("daily-insight", r["detail"])
+        self.assertIn("morning-briefing", r["detail"],
+                      "a warn must not swallow the unverifiable job")
+
+
+class TestArtifactDiscovery(unittest.TestCase):
+    def test_month_bucketed_archive_is_found(self):
+        """REGRESSION: delivered results are archived into results/archive/YYYY-MM/.
+
+        The first version globbed results/ and results/archive/ only, so it found
+        ZERO artifacts on the real host and reported every job unverifiable.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            res = Path(td) / "results"
+            (res / "archive" / "2026-08").mkdir(parents=True)
+            deep = res / "archive" / "2026-08" / "insight-2026-08-08.txt"
+            deep.write_text("x")
+            os.utime(deep, (time.time(), time.mktime((2026, 8, 8, 7, 27, 0, 0, 0, -1))))
+            got = hc._daily_artifact_minutes(res, "insight")
+            self.assertEqual([d for d, _ in got], ["2026-08-08"],
+                            "must find the month-bucketed archive copy")
+            self.assertEqual(got[0][1], 7 * 60 + 27)
+
+    def test_unrelated_and_undated_files_are_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = Path(td) / "results"
+            res.mkdir()
+            for n in ("insight-notadate.txt", "briefing-2026-08-08.txt", "insight.txt"):
+                (res / n).write_text("x")
+            self.assertEqual(hc._daily_artifact_minutes(res, "insight"), [])
+
+    def test_missing_results_dir_returns_empty_not_an_exception(self):
+        self.assertEqual(hc._daily_artifact_minutes(Path("/nonexistent-xyz"), "insight"), [])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
