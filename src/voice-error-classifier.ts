@@ -189,27 +189,11 @@ export function clearTerminalClassification(): void {
 	_lastTerminal = null;
 }
 
-// ── User-facing notification text ─────────────────────────────────────────────
-// These live beside the `userMessage` strings they wrap, and are pure so a test
-// exercises THIS code rather than a copy of the format.
-//
-// Why any of this exists: a macOS notification delivered via AppleScript
-// `display notification` cannot be withdrawn. The call returns no handle, there
-// is no remove verb, and the banner belongs to the osascript host (Script
-// Editor) rather than to Sutando. So it sits in Notification Center until the
-// user dismisses it — long after the condition clears.
-//
-// The owner hit this on 2026-08-08: he asked why Script Editor was telling him
-// his Gemini key was invalid. The banner was from 2026-08-06 14:12:33, emitted
-// by a voice process that no longer existed, while the key and the Live API were
-// both verified working. An undated "Voice is offline" is indistinguishable from
-// a live one, so the alert must at least say when it fired.
+// AppleScript `display notification` cannot be withdrawn or updated, so a banner
+// must state when it fired — an undated one is indistinguishable from a live one.
 
-/** Strip characters that would break the AppleScript string literal.
- *
- * Not shell escaping — the caller uses execFileSync, so no shell is involved.
- * This protects the `display notification "..."` literal itself.
- */
+// Strip characters that would break the AppleScript literal. Not shell escaping:
+// the caller uses execFileSync, so no shell is involved.
 function appleScriptSafe(s: string): string {
 	return s.replace(/["\\]/g, '');
 }

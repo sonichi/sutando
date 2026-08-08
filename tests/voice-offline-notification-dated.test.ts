@@ -1,17 +1,6 @@
 // The voice-offline OS banner must be DATED, and recovery must be announced.
-//
-// Why: a macOS notification delivered via AppleScript `display notification`
-// cannot be withdrawn — no handle is returned, there is no remove verb, and the
-// banner belongs to the osascript host (Script Editor) rather than to Sutando.
-// It sits in Notification Center until dismissed, long after the condition
-// clears.
-//
-// The owner hit this on 2026-08-08: he asked why Script Editor was telling him
-// his Gemini key was invalid. The banner was from 2026-08-06 14:12:33, emitted
-// by a voice process that no longer existed, while the key and the Live API were
-// both verified working. He then asked for "stamp the time and withdraw itself".
-// Stamping is implemented; withdrawing is not possible on this platform, so
-// recovery is ANNOUNCED instead. These tests pin both halves.
+// An AppleScript notification cannot be withdrawn or updated, so an undated
+// banner is indistinguishable from a live outage; recovery is announced instead.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -52,9 +41,8 @@ describe('dated offline notification', () => {
 	});
 
 	it('timestamp is local and human, not an ISO string', () => {
-		// An ISO/UTC stamp would reintroduce the confusion in a new form: the
-		// owner reads local time, and the incident was itself a timezone-shaped
-		// misread (voice logs local, task headers UTC).
+		// An ISO/UTC stamp would reintroduce the confusion in a new form — the
+		// reader thinks in local time.
 		const stamp = formatNotificationTimestamp(AT);
 		assert.ok(!stamp.includes('T'), `looks like ISO: ${stamp}`);
 		assert.ok(!/Z$/.test(stamp), `looks like UTC: ${stamp}`);
@@ -88,10 +76,8 @@ describe('voice-agent wiring', () => {
 	});
 
 	it('recovery is hooked to the ACTIVE transition, not the 30s health poll', () => {
-		// Event-driven so the owner hears immediately, and so there is exactly ONE
-		// recovery site (the same seam that already clears the classification).
-		// The first draft of this fix added a second, polled site in the health
-		// monitor; this pins the consolidation.
+		// Event-driven, and exactly one recovery site: the same seam that already
+		// clears the classification, so a polled second copy cannot drift.
 		assert.match(AGENT_SRC, /toState === 'ACTIVE'\)\s*\{[\s\S]{0,600}?notifyVoiceRecovered\(\)/,
 			'notifyVoiceRecovered is not called on the ACTIVE stateChange');
 		const inHealthPoll = /state === 'ACTIVE' && voiceNotifiedCategories\.size/.test(AGENT_SRC);
