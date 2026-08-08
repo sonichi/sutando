@@ -73,6 +73,28 @@ class InstanceRegistryTests(unittest.TestCase):
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["error"], "unreadable manifest")
 
+    def test_desired_state_roundtrip_and_listing(self):
+        reg.write_manifest("a1", endpoint="/s.sock")
+        # no desired file -> no desired_state key
+        self.assertNotIn("desired_state", reg.list_instances()[0])
+        reg.write_desired_state("a1", "paused", reason="owner pause",
+                                restore={"pending_tasks": True})
+        d = reg.read_desired_state("a1")
+        self.assertEqual(d["desired_state"], "paused")
+        self.assertEqual(d["restore"], {"pending_tasks": True})
+        listed = reg.list_instances()
+        self.assertEqual(len(listed), 1)  # .desired.json is not an instance
+        self.assertEqual(listed[0]["desired_state"], "paused")
+        with self.assertRaises(ValueError):
+            reg.write_desired_state("a1", "exploded")
+
+    def test_manifest_carries_structured_launcher(self):
+        reg.write_manifest("a1", launcher={"type": "command",
+                                           "executable": "/x/bin/sutando",
+                                           "args": ["serve"]})
+        m = reg.list_instances()[0]
+        self.assertEqual(m["launcher"]["args"], ["serve"])
+
     def test_agent_id_is_filename_sanitized(self):
         p = reg.write_manifest("../evil/../../id")
         self.assertEqual(p.parent, Path(self.tmp.name))

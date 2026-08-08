@@ -137,9 +137,13 @@ class RuntimeServer:
                 ws = str(resolve_workspace())
             except Exception:  # noqa: BLE001
                 pass
+            launcher = {"type": "command",
+                        "executable": str(_HERE.parent.parent / "bin" / "sutando"),
+                        "args": ["serve"]}
             instance_registry.write_manifest(
                 self.actor_id, workspace=ws, endpoint=self.socket_path,
-                backend="tmux", host_label=_host_label(), status="running")
+                backend="tmux", host_label=_host_label(), launcher=launcher,
+                status="running")
         except Exception as e:  # noqa: BLE001
             _log(f"instance-registry write failed (non-fatal): {e}")
 

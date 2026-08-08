@@ -609,6 +609,9 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         mtext = Path(inst[0]["_file"]).read_text().lower()
         check(all(n not in mtext for n in ("token", "secret", "password")),
               "manifest carries no secrets")
+        check(inst[0].get("launcher", {}).get("args") == ["serve"]
+              and inst[0]["launcher"]["executable"].endswith("bin/sutando"),
+              "manifest carries a structured launcher (no shell strings)")
     finally:
         daemon.terminate()
         try:

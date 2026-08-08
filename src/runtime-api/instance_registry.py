@@ -47,6 +47,7 @@ def _manifest_path(agent_id: str) -> Path:
 def write_manifest(agent_id: str, *, workspace: str | None = None,
                    owner: str | None = None, endpoint: str | None = None,
                    backend: str | None = None, host_label: str | None = None,
+                   launcher: dict | None = None,
                    status: str = "running") -> Path:
     """Atomic write of the instance manifest (0700 dir / 0600 file). Preserves
     installed_at across rewrites so registration age survives restarts."""
@@ -68,6 +69,7 @@ def write_manifest(agent_id: str, *, workspace: str | None = None,
         **({"workspace": workspace} if workspace else {}),
         **({"endpoint": {"type": "unix", "path": endpoint}} if endpoint else {}),
         **({"runtime": {"backend": backend}} if backend else {}),
+        **({"launcher": launcher} if launcher else {}),
         "status": status,
         "installed_at": installed_at,
         "updated_at": now,
@@ -104,10 +106,61 @@ def list_instances() -> list:
         return []
     out = []
     for f in sorted(d.glob("*.json")):
+        if f.name.endswith(".desired.json"):
+            continue
         try:
             m = json.loads(f.read_text())
             m["_file"] = str(f)
-            out.append(m)
         except (OSError, ValueError):
             out.append({"_file": str(f), "error": "unreadable manifest"})
+            continue
+        desired = None
+        try:
+            desired = json.loads(
+                f.with_name(f.name[:-5] + ".desired.json").read_text())
+        except (OSError, ValueError):
+            pass
+        if desired:
+            m["desired_state"] = desired.get("desired_state")
+        out.append(m)
     return out
+
+
+# ── desired state (M2) ──────────────────────────────────────────────────────
+# Separate file so the stable manifest never churns on intent changes. Written
+# ONLY on explicit lifecycle intent (user start/stop/pause) — never by crash
+# or system shutdown, which is exactly what makes crash-vs-stopped decidable.
+
+DESIRED_STATES = ("running", "stopped", "paused")
+
+
+def _desired_path(agent_id: str) -> Path:
+    return registry_dir() / f"{_SAFE_ID.sub('_', agent_id)}.desired.json"
+
+
+def write_desired_state(agent_id: str, state: str, *, reason: str | None = None,
+                        restore: dict | None = None) -> Path:
+    if state not in DESIRED_STATES:
+        raise ValueError(f"desired state must be one of {DESIRED_STATES}")
+    d = registry_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    p = _desired_path(agent_id)
+    payload = {
+        "desired_state": state,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **({"reason": reason} if reason else {}),
+        **({"restore": restore} if restore else {}),
+    }
+    tmp = d / f".{p.name}.tmp"
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+    return p
+
+
+def read_desired_state(agent_id: str) -> dict | None:
+    try:
+        return json.loads(_desired_path(agent_id).read_text())
+    except (OSError, ValueError):
+        return None
