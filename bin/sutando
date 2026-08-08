@@ -11,6 +11,8 @@ case "${1:-help}" in
   serve)
     shift
     exec python3 "$REPO/src/runtime-api/server.py" "$@" ;;
+  chat|watch|submit|results|get-result)
+    exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" task "$@" ;;
   info|status|owner|allowlist)
     exec python3 "$REPO/src/runtime-cli/sutando-runtime.py" sutando "$@" ;;
   health|details)
