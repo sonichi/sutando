@@ -1183,12 +1183,6 @@ def handle_message(event, say):
     _write_task(event, "Slack DM", text, username)
 
 
-# Markers that the bridge handles specially in result bodies. Same set as
-# discord-bridge.py + telegram-bridge.py — see CLAUDE.md "Result-body
-# protocol markers".
-FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
-
-
 def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
     """Upload a file to a Slack channel/DM via files_upload_v2.
 
