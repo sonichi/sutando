@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """send_failure_policy: a blip retries, a rejection parks, an outage parks eventually."""
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -75,6 +76,65 @@ class TestShouldRetry(unittest.TestCase):
 
     def test_a_permanent_failure_never_retries_even_at_zero_attempts(self):
         self.assertFalse(sfp.should_retry(FakeHTTPException(413, 40005), 0))
+
+
+class TestResolveFailedSend(unittest.TestCase):
+    """The decision and the file move are one unit — test the FILESYSTEM outcome."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.claim = self.d / "proactive-x.sending"
+        self.claim.write_text("owner body")
+        self.attempts = {}
+
+    def test_transient_returns_the_body_to_the_polled_name(self):
+        out = sfp.resolve_failed_send(self.claim, FakeHTTPException(503), self.attempts)
+        self.assertEqual(out, "retried")
+        self.assertTrue((self.d / "proactive-x.txt").is_file(),
+                        "a retried body must be re-pollable as .txt")
+        self.assertFalse(self.claim.exists())
+        self.assertEqual((self.d / "proactive-x.txt").read_text(), "owner body")
+        self.assertEqual(self.attempts, {"proactive-x.txt": 1})
+
+    def test_permanent_parks_under_undelivered_with_the_txt_name(self):
+        out = sfp.resolve_failed_send(self.claim, FakeHTTPException(413, 40005), self.attempts)
+        self.assertEqual(out, "parked")
+        parked = self.d / "undelivered" / "proactive-x.txt"
+        self.assertTrue(parked.is_file(), "must park under undelivered/")
+        self.assertEqual(parked.read_text(), "owner body", "the body must survive intact")
+        # A quarantined `*.sending` would read as in-flight to the restart sweep.
+        self.assertFalse((self.d / "undelivered" / "proactive-x.sending").exists())
+
+    def test_the_cap_converts_a_transient_into_a_park(self):
+        self.attempts["proactive-x.txt"] = sfp.MAX_TRANSIENT_ATTEMPTS
+        out = sfp.resolve_failed_send(self.claim, FakeHTTPException(503), self.attempts)
+        self.assertEqual(out, "parked", "an endless outage must stop re-polling")
+        self.assertNotIn("proactive-x.txt", self.attempts, "counter must not leak")
+
+    def test_a_newer_body_is_never_clobbered_by_the_retry(self):
+        # release_claim refuses when a .txt reappeared since the claim; the older
+        # body must then park, not vanish.
+        (self.d / "proactive-x.txt").write_text("newer body")
+        out = sfp.resolve_failed_send(self.claim, FakeHTTPException(503), self.attempts)
+        self.assertEqual(out, "parked")
+        self.assertEqual((self.d / "proactive-x.txt").read_text(), "newer body")
+        self.assertEqual((self.d / "undelivered" / "proactive-x.txt").read_text(), "owner body")
+
+    def test_a_body_is_never_deleted_even_when_the_move_fails(self):
+        # undelivered/ occupied by a FILE, so mkdir raises -> "stuck", body in place.
+        (self.d / "undelivered").write_text("not a directory")
+        out = sfp.resolve_failed_send(self.claim, FakeHTTPException(413), self.attempts)
+        self.assertEqual(out, "stuck")
+        self.assertTrue(self.claim.is_file(), "left in place rather than lost")
+
+    def test_repeated_transients_count_up_per_body(self):
+        for expected in (1, 2, 3):
+            claim = self.d / "proactive-y.sending"
+            claim.write_text("b")
+            self.assertEqual(sfp.resolve_failed_send(claim, FakeHTTPException(503), self.attempts),
+                             "retried")
+            (self.d / "proactive-y.txt").rename(claim)   # simulate the next poll's claim
+            self.assertEqual(self.attempts["proactive-y.txt"], expected)
 
 
 if __name__ == "__main__":

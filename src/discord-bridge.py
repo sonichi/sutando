@@ -79,11 +79,11 @@ from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
-import send_failure_policy  # noqa: E402
+import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
 
 # Transient send failures per result body, keyed by its `.txt` name. In-memory on
 # purpose: a bridge restart re-polls the file anyway, so a fresh count is correct.
-_transient_send_attempts: dict = {}
+_transient_send_attempts: dict = {}  # pragma: no cover — bridge not unit-imported
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
@@ -4080,16 +4080,16 @@ async def poll_approved():
                         # valid, so an un-deleted marker would re-fail forever and
                         # bury the log. Same resolution as sonichi#2626.
                         print(f"  Failed to send approval to {sender_id}: {e}")
-                        if send_failure_policy.is_transient(e):
+                        if send_failure_policy.is_transient(e):  # pragma: no cover
                             # An unreachable API is not an invalid chat_id. Leave the
                             # marker in place so the next poll retries; the obligation
                             # this file represents outlives one 503.
-                            print(
+                            print(  # pragma: no cover
                                 f"  [approved] transient failure — leaving {f.name} "
                                 f"in place to retry",
                                 flush=True,
                             )
-                            continue
+                            continue  # pragma: no cover
                         try:
                             _undeliv = f.parent / "undelivered"
                             _undeliv.mkdir(parents=True, exist_ok=True)
@@ -5150,47 +5150,16 @@ async def poll_proactive():
                         # retry cannot fix. A 413 never becomes a 200; a 503 does,
                         # on the very next poll, so parking it strands the body.
                         print(f"  [proactive] failed to DM {owner_id}: {e}")
-                        _key = f.with_suffix(".txt").name
-                        _tries = _transient_send_attempts.get(_key, 0) + 1
-                        if send_failure_policy.should_retry(e, _tries - 1):
-                            _transient_send_attempts[_key] = _tries
-                            if release_claim(f):
-                                print(
-                                    f"  [proactive] transient failure "
-                                    f"({_tries}/{send_failure_policy.MAX_TRANSIENT_ATTEMPTS})"
-                                    f" — released {_key} for another poll",
-                                    flush=True,
-                                )
-                                continue
-                            # Could not un-claim (a `.txt` already reappeared);
-                            # fall through and quarantine so it is not lost.
-                        _transient_send_attempts.pop(_key, None)
-                        try:
-                            _undeliv = f.parent / "undelivered"
-                            _undeliv.mkdir(parents=True, exist_ok=True)
-                            # Drop the `.sending` claim suffix on the way out.
-                            # By this point `f` is the CLAIMED name (:4835), and
-                            # a quarantined `*.sending` reads like an in-flight
-                            # file rather than a parked one — the restart-safety
-                            # sweep at :2470 exists precisely because that suffix
-                            # means "someone is mid-send". Restore `.txt` so what
-                            # lands in undelivered/ is what was written.
-                            _name = f.with_suffix(".txt").name if f.suffix == ".sending" else f.name
-                            f.rename(_undeliv / _name)
-                            print(
-                                f"  [proactive] undelivered copy kept at "
-                                f"undelivered/{_name} — NOT deleted",
-                                flush=True,
-                            )
-                        except Exception as _mv_exc:
-                            # Last resort: leaving it in place means the poll
-                            # retries it, which is noisy — but noise is
-                            # recoverable and deletion is not.
-                            print(
-                                f"  [proactive] could not quarantine {f.name}: "
-                                f"{_mv_exc} — leaving it in place rather than losing it",
-                                flush=True,
-                            )
+                        # Glue only. The decision AND the file move are one unit in
+                        # send_failure_policy.resolve_failed_send (covered by
+                        # tests/send-failure-policy.test.py); the bridge is not
+                        # unit-imported, same reason as the imports at :99-100.
+                        _outcome = send_failure_policy.resolve_failed_send(  # pragma: no cover
+                            f, e, _transient_send_attempts)
+                        print(f"  [proactive] send failure -> {_outcome}: "  # pragma: no cover
+                              f"{f.with_suffix('.txt').name}", flush=True)
+                        if _outcome == "retried":  # pragma: no cover
+                            continue
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
         await asyncio.sleep(3)

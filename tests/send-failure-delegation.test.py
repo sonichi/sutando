@@ -33,7 +33,7 @@ class TestDelegation(unittest.TestCase):
 
     def test_both_quarantine_sites_consult_the_policy(self):
         # The proactive DM site and the approval-marker site carry the same rule.
-        self.assertIn("send_failure_policy.should_retry", BRIDGE)
+        self.assertIn("send_failure_policy.resolve_failed_send", BRIDGE)
         self.assertIn("send_failure_policy.is_transient", BRIDGE)
 
     def test_no_site_reimplements_status_classification(self):
@@ -45,12 +45,19 @@ class TestDelegation(unittest.TestCase):
                 offenders.append(line.strip())
         self.assertEqual(offenders, [], f"inline status classification: {offenders}")
 
-    def test_the_transient_branch_releases_the_claim(self):
-        # Guard the mechanism, not the narration: a branch that logs "released" but
-        # never renames leaves the body claimed and invisible to the poll.
-        window = BRIDGE.split("failed to DM", 1)[1][:1200]
-        self.assertIn("release_claim(", window)
+    def test_the_bridge_does_not_move_the_file_itself(self):
+        # The whole point of the extraction: the bridge must not carry its own
+        # rename-to-undelivered, which is how the two copies drifted apart.
+        window = BRIDGE.split("failed to DM", 1)[1][:1400]
+        self.assertNotIn('/ "undelivered"', window,
+                         "the file move belongs to resolve_failed_send")
+        self.assertIn("resolve_failed_send", window)
         self.assertIn("continue", window)
+
+    def test_the_policy_module_owns_the_move(self):
+        policy = (REPO / "src" / "send_failure_policy.py").read_text()
+        self.assertIn('/ "undelivered"', policy)
+        self.assertIn("release_claim", policy)
 
 
 class TestReleaseClaimActuallyReturnsTheBody(unittest.TestCase):
