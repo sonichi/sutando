@@ -19,6 +19,7 @@ touches the socket, JSON-RPC, or any remote API directly:
   sutando-runtime task submit "do the thing" [--priority normal]
   sutando-runtime task results   # all results, newest first, with preview
   sutando-runtime task watch     # PUSH mode: stream results live as they land
+  sutando-runtime task chat      # one-screen DM: type tasks, results stream inline
   sutando-runtime task status|details|cancel <taskId> | get-result [taskId]
 
 Issuing commands return immediately with {"requestId", "status": "pending"};
@@ -31,6 +32,7 @@ Env: SUTANDO_RUNTIME_SOCKET (default <run dir>/sutando-runtime.sock).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import socket
@@ -104,6 +106,65 @@ def _watch() -> int:
         pass
     finally:
         s.close()
+    return 0
+
+
+async def _chat_async() -> None:
+    # One-screen DM: ONE connection multiplexes subscribe + submit + the pushed
+    # task.result notifications. stdin lines become tasks; results print inline.
+    reader, writer = await asyncio.open_unix_connection(_socket_path())
+
+    def _send(method, params, rid):
+        writer.write((json.dumps({"jsonrpc": "2.0", "id": rid,
+                                  "method": method, "params": params},
+                                 ensure_ascii=False) + "\n").encode("utf-8"))
+
+    _send("task.subscribe", {}, "chat-sub")
+    await writer.drain()
+    print("sutando chat — type a task, press enter; results stream back inline. "
+          "Ctrl-D to exit.", flush=True)
+    loop = asyncio.get_event_loop()
+
+    async def pump_stdin():
+        while True:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            if not line:  # EOF (Ctrl-D)
+                break
+            text = line.strip()
+            if not text:
+                continue
+            _send("task.submit", {"task": text}, "chat-submit")
+            await writer.drain()
+        writer.close()
+
+    async def pump_socket():
+        buf = b""
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                if not raw.strip():
+                    continue
+                msg = json.loads(raw.decode("utf-8"))
+                if msg.get("method") == "task.result":
+                    p = msg.get("params", {})
+                    print(f"\n← {p.get('taskId')}\n{p.get('result','').rstrip()}\n",
+                          flush=True)
+                elif isinstance(msg.get("result"), dict) and \
+                        msg["result"].get("taskId") and "chat-submit" == msg.get("id"):
+                    print(f"  · submitted {msg['result']['taskId']}", flush=True)
+
+    await asyncio.gather(pump_stdin(), pump_socket())
+
+
+def _chat() -> int:
+    try:
+        asyncio.run(_chat_async())
+    except (KeyboardInterrupt, EOFError):
+        pass
     return 0
 
 
@@ -196,6 +257,7 @@ def main(argv=None) -> int:
     tsk.add_parser("list")
     tsk.add_parser("results")  # list all available results (newest first)
     tsk.add_parser("watch")    # PUSH mode: stream results live as they land
+    tsk.add_parser("chat")     # one-screen DM: submit + live result stream
     tsub = tsk.add_parser("submit")
     tsub.add_argument("text")
     tsub.add_argument("--priority", default="normal",
@@ -275,6 +337,8 @@ def main(argv=None) -> int:
         elif args.group == "task":
             if args.cmd == "watch":
                 return _watch()  # streams until Ctrl-C — not a one-shot RPC
+            if args.cmd == "chat":
+                return _chat()   # interactive: submit + live stream in one pane
             if args.cmd == "list":
                 result = _rpc("task.list", {}, timeout=15)
             elif args.cmd == "results":
