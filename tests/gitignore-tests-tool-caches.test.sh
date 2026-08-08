@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
-# Tool caches under tests/ must stay ignored; relocated tests must not.
-#
-# `tests/*` then an unqualified `!tests/*/` re-included every tool-generated dir
-# and defeated the global `__pycache__/` one level down. Both directions matter:
-# an over-broad fix (`tests/**/`) would re-hide the relocated tests that
-# `!tests/*/` exists to keep visible.
-#
-# Runs against a THROWAWAY repo holding a copy of the real .gitignore, so the
-# checkout's own tests/ tree is never touched.
+# Tool caches under tests/ stay ignored while relocated tests stay visible; an
+# over-broad fix breaks the second half, so both directions are asserted.
 
 set -euo pipefail
 
