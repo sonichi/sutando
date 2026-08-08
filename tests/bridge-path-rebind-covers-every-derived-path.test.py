@@ -15,6 +15,15 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
+# Isolation must be MODULE LEVEL and the temp dir assigned DIRECTLY: the bridge resolves
+# channel config during exec_module, and `setdefault` is a no-op when the var is already set.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-rebind-probe-")
+os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-placeholder"
+os.environ["SLACK_APP_TOKEN"] = "xapp-test-placeholder"
+_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / "access.json").write_text('{"allowFrom": []}')
 sys.path.insert(0, str(REPO / "tests" / "_helpers"))
 import bridge_paths  # noqa: E402
 
@@ -41,9 +50,6 @@ def _load_slack_bridge():
         sm = types.ModuleType("slack_bolt.adapter.socket_mode")
         sm.SocketModeHandler = object
         sys.modules["slack_bolt.adapter.socket_mode"] = sm
-    os.environ.setdefault("CLAUDE_CONFIG_DIR", tempfile.mkdtemp())
-    os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-placeholder")
-    os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-placeholder")
     # deliberately NOT setting SUTANDO_WORKSPACE: the resolver ignores it, which is
     # the whole reason this helper exists. Isolation comes from rebind_workspace().
     sys.path.insert(0, str(REPO / "src"))
@@ -99,6 +105,46 @@ class RebindCoversEveryDerivedPath(unittest.TestCase):
         bridge_paths.restore(self.mod, originals)
         after = {n: str(v) for n, v in bridge_paths.derived_path_attrs(self.mod).items()}
         self.assertEqual(before, after, "restore did not return the module to its original paths")
+
+
+class HelperEdgeCases(unittest.TestCase):
+    """The branches a bridge-import test never reaches; coverage is measured on the diff."""
+
+    class _Fake:
+        pass
+
+    def test_root_falls_back_through_the_name_chain(self):
+        for name in ("REPO", "WORKSPACE", "WORKSPACE_DIR"):
+            m = self._Fake()
+            setattr(m, name, Path("/tmp/root-" + name))
+            self.assertEqual(bridge_paths._original_root(m), Path("/tmp/root-" + name), name)
+
+    def test_a_str_root_is_accepted_and_restored_as_str(self):
+        m = self._Fake()
+        m.WORKSPACE = "/tmp/strroot"
+        m.SUB = Path("/tmp/strroot/state/x.json")
+        originals = bridge_paths.rebind_workspace(m, Path("/tmp/newroot"))
+        self.assertEqual(m.SUB, Path("/tmp/newroot/state/x.json"))
+        self.assertIsInstance(m.WORKSPACE, str, "a str root must stay a str")
+        bridge_paths.restore(m, originals)
+        self.assertEqual(m.WORKSPACE, "/tmp/strroot")
+        self.assertIsInstance(m.WORKSPACE, str)
+
+    def test_paths_outside_the_root_are_skipped(self):
+        m = self._Fake()
+        m.REPO = Path("/tmp/insideroot")
+        m.INSIDE = Path("/tmp/insideroot/a")
+        m.OUTSIDE = Path("/var/elsewhere/b")          # ValueError from relative_to
+        found = bridge_paths.derived_path_attrs(m)
+        self.assertIn("INSIDE", found)
+        self.assertNotIn("OUTSIDE", found)
+
+    def test_no_root_is_an_assertion_not_a_silent_pass(self):
+        with self.assertRaises(AssertionError):
+            bridge_paths.rebind_workspace(self._Fake(), Path("/tmp/whatever"))
+
+    def test_discovery_on_a_rootless_module_is_empty(self):
+        self.assertEqual(bridge_paths.derived_path_attrs(self._Fake()), {})
 
 
 if __name__ == "__main__":
