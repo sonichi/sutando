@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
-from util_paths import _host_label, claude_home_path, shared_personal_path  # noqa: E402
+from util_paths import _host_label, claude_home_path, claude_project_slug, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
@@ -86,7 +86,7 @@ def _default_memory_dir() -> str:
     only when it is unset (preserving the old path for ad-hoc launches).
     """
     repo = Path(__file__).parent.parent.resolve()
-    slug = str(repo).replace("/", "-")
+    slug = claude_project_slug(repo)
     return str(Path(claude_home_path()) / "projects" / slug / "memory")
 
 # SUTANDO_MEMORY_DIR stays authoritative here, same as everywhere else that
