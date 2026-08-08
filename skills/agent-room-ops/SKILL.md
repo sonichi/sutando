@@ -30,7 +30,17 @@ python3 skills/agent-room-ops/room_ops.py join   '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc get '!room:hs' --folder room-todo --name TODO.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc put '!room:hs' --folder room-memo --name note.md --file /tmp/note.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc rm  '!room:hs' --folder room-memo --name note.md --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py grant '!room:hs' --tier '@u:hs=owner' --default-tier guest --agent '@a:hs'
 ```
+
+`grant` makes a room **authoritative** (design-response-policy-v0.2 / #429): it writes
+the room's `space.ag2.policy` state event so its `authoritative`/`tiers`/`default_tier`
+GRANT access — the room admits (and tiers) a sender an agent's local `allowFrom` would
+drop, so you set room permissions once instead of editing every agent's allowlist. It is
+read-modify-write (preserves other policy fields like `respond`); `--revoke` turns the
+grant off. Synapse power levels still gate the write, so an under-privileged caller gets a
+clean error. Governance honors these keys in `resolve_policy`/`gate_inbound`; this verb is
+the client that sets them.
 
 `join` accepts the agent's **own** pending invite (owner-directed self-accept —
 the counterpart to the box-side invite-supervision auto-join, which only fires
