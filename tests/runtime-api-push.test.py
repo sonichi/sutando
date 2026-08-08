@@ -48,22 +48,33 @@ class PushModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_pushes_new_skips_seed_drops_dead_no_repush(self):
         good, dead = _FakeWriter(), _FakeWriter(dead=True)
         self.srv._subscribers = {good, dead}
-        (self.results / "task-old.txt").write_text("old")          # pre-existing
-        seen = {f.name for f in self.tv._result_files()}           # seeded
-        (self.results / "task-new.txt").write_text("hello stream")  # new
+        (self.results / "task-rtapi-old.txt").write_text("old")     # pre-existing
+        seen = {f.name for f in self.tv._result_files()}            # seeded
+        (self.results / "task-rtapi-new.txt").write_text("hello stream")  # new
         await self.srv._emit_new_results(self.tv, seen)
         # good got exactly the new result, as a NO-ID notification
         self.assertEqual(len(good.frames), 1)
         msg = json.loads(good.frames[0])
         self.assertNotIn("id", msg)
         self.assertEqual(msg["method"], "task.result")
-        self.assertEqual(msg["params"]["taskId"], "task-new")
+        self.assertEqual(msg["params"]["taskId"], "task-rtapi-new")
         self.assertEqual(msg["params"]["result"], "hello stream")
         # dead writer dropped, not wedging the pass
         self.assertNotIn(dead, self.srv._subscribers)
         # second pass: nothing new → no re-push of a seen result
         await self.srv._emit_new_results(self.tv, seen)
         self.assertEqual(len(good.frames), 1)
+
+    async def test_room_result_does_not_leak_into_stream(self):
+        # Source isolation: a result from ANOTHER channel (non task-rtapi- id)
+        # must NOT be pushed to runtime-api subscribers — the exact cross-channel
+        # leak this guards against.
+        good = _FakeWriter()
+        self.srv._subscribers = {good}
+        seen = {f.name for f in self.tv._result_files()}
+        (self.results / "task-1234567890.txt").write_text("a room reply")
+        await self.srv._emit_new_results(self.tv, seen)
+        self.assertEqual(good.frames, [])  # not streamed
 
     def test_notification_frame_has_no_id(self):
         msg = json.loads(notification_frame("task.result", {"taskId": "t"}))

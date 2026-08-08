@@ -49,36 +49,41 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(th.get("user_id"), "@me:example.org")
         self.assertEqual(th.body, "review the PR")
 
-    def test_get_result_no_id_returns_newest(self):
+    def test_get_result_no_id_returns_newest_runtime_api_only(self):
         import os
         self.results.mkdir(parents=True, exist_ok=True)
-        (self.results / "task-a.txt").write_text("older")
-        (self.results / "task-b.txt").write_text("newer")
-        os.utime(self.results / "task-a.txt", (1000, 1000))
-        os.utime(self.results / "task-b.txt", (2000, 2000))
+        (self.results / "task-rtapi-a.txt").write_text("older")
+        (self.results / "task-rtapi-b.txt").write_text("newer")
+        (self.results / "task-9999.txt").write_text("A ROOM RESULT")  # other channel
+        os.utime(self.results / "task-rtapi-a.txt", (1000, 1000))
+        os.utime(self.results / "task-rtapi-b.txt", (2000, 2000))
+        os.utime(self.results / "task-9999.txt", (3000, 3000))  # newest overall
         latest = self.view.get_result(None)
-        self.assertEqual(latest["taskId"], "task-b")
+        # source-isolation: latest is the newest RUNTIME-API result, NOT the
+        # even-newer room result — that must not leak into this channel.
+        self.assertEqual(latest["taskId"], "task-rtapi-b")
         self.assertTrue(latest.get("latest"))
-        self.assertEqual(latest["result"], "newer")
-        # explicit id still works and is NOT flagged latest
-        one = self.view.get_result("task-a")
-        self.assertEqual(one["result"], "older")
+        # explicit id still fetches ANY result (incl. the room one) and is
+        # NOT flagged latest
+        one = self.view.get_result("task-9999")
+        self.assertEqual(one["result"], "A ROOM RESULT")
         self.assertNotIn("latest", one)
 
     def test_get_result_no_id_empty_is_none(self):
         self.assertIsNone(self.view.get_result(None))  # no results yet
 
-    def test_list_results_newest_first_with_preview(self):
+    def test_list_results_runtime_api_only_newest_first(self):
         import os
         self.results.mkdir(parents=True, exist_ok=True)
-        (self.results / "task-a.txt").write_text("A" * 300)
-        (self.results / "task-b.txt").write_text("B body")
-        os.utime(self.results / "task-a.txt", (1000, 1000))
-        os.utime(self.results / "task-b.txt", (2000, 2000))
+        (self.results / "task-rtapi-a.txt").write_text("A" * 300)
+        (self.results / "task-rtapi-b.txt").write_text("B body")
+        (self.results / "task-8888.txt").write_text("room")  # other channel
+        os.utime(self.results / "task-rtapi-a.txt", (1000, 1000))
+        os.utime(self.results / "task-rtapi-b.txt", (2000, 2000))
         ids = [r["taskId"] for r in self.view.list_results()["results"]]
-        self.assertEqual(ids, ["task-b", "task-a"])  # newest first
+        self.assertEqual(ids, ["task-rtapi-b", "task-rtapi-a"])  # room excluded
         long_preview = next(r for r in self.view.list_results()["results"]
-                            if r["taskId"] == "task-a")["preview"]
+                            if r["taskId"] == "task-rtapi-a")["preview"]
         self.assertLessEqual(len(long_preview), 160)  # truncated
 
     def test_submit_confines_newline_injection(self):

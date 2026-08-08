@@ -128,9 +128,16 @@ class TasksView:
             return None
 
     def _result_files(self) -> list[Path]:
+        # Source isolation: the runtime-api client (latest / list / watch / chat)
+        # only ever sees results for tasks IT submitted — those carry the
+        # `task-rtapi-` id stamped by submit() (source: runtime-api). Room /
+        # Discord / etc. results (task-<other>) go to their own bridges and must
+        # NOT leak into this channel's stream — the user can be active on both.
+        # An explicit get-result <id> still fetches ANY id via _result_path.
         if not self.results_dir.is_dir():
             return []
-        files = [f for f in self.results_dir.glob("task-*.txt") if f.is_file()]
+        files = [f for f in self.results_dir.glob("task-rtapi-*.txt")
+                 if f.is_file()]
         files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
         return files
 
