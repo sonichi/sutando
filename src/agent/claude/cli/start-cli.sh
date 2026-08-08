@@ -45,6 +45,10 @@ fi
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
 # Backward-compatible: unset → identical to the previous hardcoded value.
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
+
+# A tmux server inherits its GLOBAL environment from whichever process starts it,
+# and `start-server` on a serverless socket is a no-op — so unset before any tmux.
+unset SUTANDO_CORE_MODEL
 SESSION="sutando-core"
 
 # Marker identifying THIS process as the long-lived sutando-core session (as

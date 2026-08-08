@@ -94,6 +94,17 @@ def case_tmux_defaults_clear_both_scopes() -> list[str]:
         fails.append("clear) MODEL_ARGS is back — an empty array is one edit from a pin")
     if "--model" in code:
         fails.append("clear) start-cli.sh reintroduced a --model flag")
+    # The launcher's OWN env must be cleared before any tmux call: a server takes
+    # its global environment from whoever starts it, and `start-server` on a
+    # serverless socket is a no-op, so the setenv clears cannot reach it.
+    lines = code.splitlines()
+    unset_at = next((i for i, l in enumerate(lines) if "unset SUTANDO_CORE_MODEL" in l), None)
+    tmux_at = next((i for i, l in enumerate(lines) if "tmux -S" in l), None)
+    if unset_at is None:
+        fails.append("clear) the launcher must unset SUTANDO_CORE_MODEL from its own env")
+    elif tmux_at is not None and unset_at > tmux_at:
+        fails.append(f"clear) unset is at code line {unset_at} but a tmux call is at "
+                     f"{tmux_at} — a server started first inherits the pin")
     return fails
 
 
