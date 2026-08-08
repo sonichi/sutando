@@ -217,6 +217,45 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                              mock.Mock(stdout="sleep 120\n", returncode=0)]
             self.assertEqual(self.hc._core_argv_pins("/s", ["notifier"]), [])
 
+    def test_an_EMPTY_successful_ps_read_is_unknown_not_a_missing_pin(self):
+        """The collector half of test_empty_string_argv_is_unverified_not_clean.
+
+        That test proves the INTERPRETER treats `(sess, "")` as unverified. This one
+        proves the COLLECTOR ever emits it. `ps` exiting 0 with empty stdout is not
+        "this pane is not claude" — nothing was read, so the pane cannot be ruled
+        out. Without this the session ends with seen_claude=False AND read_failed=
+        False, no row is emitted, and an unverified core reports `ok`.
+        """
+        def fake_run(cmd, **kw):
+            if "list-panes" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "4242\n", "")
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(self.hc.subprocess, "run", side_effect=fake_run):
+            rows = self.hc._core_argv_pins("/s", ["sutando-core"])
+        self.assertEqual(rows, [("sutando-core", None)], rows)
+        self.assertEqual(
+            self.hc._interpret_core_model_pin([], "/s", rows)["status"], "warn",
+            "an unverified core must not reach the owner as a clean probe")
+
+    def test_a_nonempty_non_claude_pane_stays_clean(self):
+        """Discriminator for the test above: a pane that genuinely IS readable and
+        genuinely is not claude must still be `ok`, or the fix above would just warn
+        on every notifier session."""
+        def fake_run(cmd, **kw):
+            if "list-panes" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "4242\n", "")
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(cmd, 0, "-zsh\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(self.hc.subprocess, "run", side_effect=fake_run):
+            rows = self.hc._core_argv_pins("/s", ["notifier"])
+        self.assertEqual(rows, [], rows)
+        self.assertEqual(self.hc._interpret_core_model_pin([], "/s", rows)["status"], "ok")
+
     def test_a_FAILED_ps_read_is_unknown_not_a_missing_pin(self):
         """qingyun-wu, 2026-08-08: after the launcher clears the tmux evidence, a
         transient or permission-denied `ps` made the collector return [] and the probe

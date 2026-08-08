@@ -6640,6 +6640,11 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
                     read_failed = True
                     continue
                 argv = (ps.stdout or "").strip()
+                if not argv:
+                    # rc 0 with EMPTY stdout is not "this pane is not claude" —
+                    # nothing was read, so the pane cannot be ruled out.
+                    read_failed = True
+                    continue
                 if "claude" not in argv:
                     continue
                 seen_claude = True
