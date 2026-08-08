@@ -60,6 +60,9 @@ SEND_ALLOWED_ROOTS: tuple[str, ...] = (
     # allowed during the transition; resolver picks whichever exists.
     str(shared_personal_path("notes", _REPO)),
     str(_REPO / "docs"),
+    # Rendered episode bundles. This tree can be a symlink out to the sync
+    # root; roots are realpath'd below, and `generated` keeps notes/ private.
+    str(Path.home() / ".sutando" / "workspace" / "notes" / "generated"),
     str(Path.home() / "Desktop" / "iclr-backups"),
     str(Path.home() / "Documents" / "sutando-launch-assets"),
 )
