@@ -25,7 +25,27 @@ from presenter_mode import presenter_mode_active  # noqa: E402
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
-LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
+# Under state/, not the workspace root: the root is reserved for top-level
+# directories plus the artifacts WORKSPACE_SURFACE_FILES names, and this stamp is
+# neither. At the root it was real drift that health-check's workspace-root-tidy
+# probe flagged on every run — a permanent WARN teaches operators to ignore the
+# detector. No read-fallback to the old path on purpose: the reader already treats
+# a missing stamp as "set unknown" and notifies ONCE rather than suppressing (see
+# _last_notified), so the transition costs one notification, and a second path
+# would leak the real root file into tests that override this constant.
+LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
+
+
+def write_notify_stamp(questions, now=None):
+    """Record that this question set was just notified.
+
+    A named function rather than two inline lines so the stamp's location and its
+    directory creation are testable without driving `main`, which would fire a real
+    macOS notification.
+    """
+    LAST_NOTIFY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time()) if now is None else now
+    LAST_NOTIFY_FILE.write_text(f"{ts} {questions_key(questions)}")
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
 # How long an UNCHANGED question set stays quiet before it is raised again. This
 # is the floor that stops "notify only when the set changes" from turning an
@@ -455,7 +475,7 @@ def main():
     # exact "claimed an outcome it never achieved" failure this script exists to
     # remove, reproduced in its own control flow.
     summary = deliver(questions, count, titles)
-    LAST_NOTIFY_FILE.write_text(f"{int(time.time())} {questions_key(questions)}")
+    write_notify_stamp(questions)  # pragma: no cover — covered as a unit; reaching here fires a real notification
     print(summary)
 
 
