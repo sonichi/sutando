@@ -18,8 +18,8 @@ touches the socket, JSON-RPC, or any remote API directly:
   sutando-runtime sutando info|status|owner|allowlist
   sutando-runtime task submit "do the thing" [--priority normal]
   sutando-runtime task results   # all results, newest first, with preview
-  sutando-runtime task watch     # PUSH mode: stream results live as they land
-  sutando-runtime task chat      # one-screen DM: type tasks, results stream inline
+  sutando-runtime task chat [--activity] [--raw]   # one-screen DM (+step feed / raw tmux)
+  sutando-runtime task watch [--activity] [--raw]  # stream results (+step feed / raw tmux)
   sutando-runtime task status|details|cancel <taskId> | get-result [taskId]
 
 Issuing commands return immediately with {"requestId", "status": "pending"};
@@ -75,15 +75,32 @@ def _jarg(v):
     return json.loads(v) if v else None
 
 
-def _watch() -> int:
-    # PUSH mode: subscribe and stream `task.result` notifications live.
-    # Persistent connection (not the one-shot _rpc) — blocks until Ctrl-C.
+def _raw_tmux() -> int:
+    # RAW = a live READ-ONLY view of the core's tmux window (everything it
+    # prints). Uses tmux's own read-only attach — the firehose stays on the
+    # tmux socket, never through the daemon push path. Ctrl-b d to detach.
+    import subprocess
+    sock = os.environ.get("SUTANDO_TMUX_SOCKET") or "/tmp/sutando-tmux.sock"
+    session = os.environ.get("SUTANDO_TMUX_SESSION") or "sutando-core"
+    print("⚠ RAW tmux view (read-only) — shows EVERYTHING the core prints, "
+          "including secrets / tokens / private task content. Ctrl-b then d to "
+          "detach.", flush=True)
+    return subprocess.call(["tmux", "-S", sock, "attach-session",
+                            "-t", session, "-r"])
+
+
+def _watch(activity: bool = False, raw: bool = False) -> int:
+    # PUSH mode: subscribe and stream notifications live. Persistent connection
+    # (not the one-shot _rpc) — blocks until Ctrl-C.
+    if raw:
+        return _raw_tmux()
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(_socket_path())
     s.sendall((json.dumps({"jsonrpc": "2.0", "id": "watch",
-                           "method": "task.subscribe", "params": {}}) + "\n")
+                           "method": "task.subscribe",
+                           "params": {"activity": activity}}) + "\n")
               .encode("utf-8"))
-    print(json.dumps({"watching": True}), flush=True)
+    print(json.dumps({"watching": True, "activity": activity}), flush=True)
     buf = b""
     try:
         while True:
@@ -96,10 +113,16 @@ def _watch() -> int:
                 if not line.strip():
                     continue
                 msg = json.loads(line.decode("utf-8"))
-                if msg.get("method") == "task.result":
+                m = msg.get("method")
+                if m == "task.result":
                     p = msg.get("params", {})
-                    print(json.dumps({"taskId": p.get("taskId"),
-                                      "result": p.get("result"),
+                    print(json.dumps({"result": p.get("taskId"),
+                                      "body": p.get("result"),
+                                      "ts": p.get("ts")}, ensure_ascii=False),
+                          flush=True)
+                elif m == "activity":
+                    p = msg.get("params", {})
+                    print(json.dumps({"activity": p.get("step"),
                                       "ts": p.get("ts")}, ensure_ascii=False),
                           flush=True)
     except KeyboardInterrupt:
@@ -109,9 +132,11 @@ def _watch() -> int:
     return 0
 
 
-async def _chat_async() -> None:
+async def _chat_async(activity: bool = False) -> None:
     # One-screen DM: ONE connection multiplexes subscribe + submit + the pushed
-    # task.result notifications. stdin lines become tasks; results print inline.
+    # notifications. stdin lines become tasks; results print inline. Task msgs
+    # (you) and result msgs (agent) render distinctly so they're easy to tell
+    # apart; --activity also shows the step feed.
     reader, writer = await asyncio.open_unix_connection(_socket_path())
 
     def _send(method, params, rid):
@@ -119,10 +144,10 @@ async def _chat_async() -> None:
                                   "method": method, "params": params},
                                  ensure_ascii=False) + "\n").encode("utf-8"))
 
-    _send("task.subscribe", {}, "chat-sub")
+    _send("task.subscribe", {"activity": activity}, "chat-sub")
     await writer.drain()
     print("sutando chat — type a task, press enter; results stream back inline. "
-          "Ctrl-D to exit.", flush=True)
+          "Ctrl-D to exit.\n", flush=True)
     loop = asyncio.get_event_loop()
 
     async def pump_stdin():
@@ -149,20 +174,27 @@ async def _chat_async() -> None:
                 if not raw.strip():
                     continue
                 msg = json.loads(raw.decode("utf-8"))
-                if msg.get("method") == "task.result":
+                m = msg.get("method")
+                if m == "task.result":                       # ← agent reply
                     p = msg.get("params", {})
-                    print(f"\n← {p.get('taskId')}\n{p.get('result','').rstrip()}\n",
+                    print(f"\n\033[36m╭─ agent · {p.get('taskId')}\033[0m\n"
+                          f"{p.get('result', '').rstrip()}\n"
+                          f"\033[36m╰─\033[0m\n", flush=True)
+                elif m == "activity":                        # ⚙ step feed
+                    print(f"  \033[2m⚙ {msg.get('params', {}).get('step')}\033[0m",
                           flush=True)
-                elif isinstance(msg.get("result"), dict) and \
-                        msg["result"].get("taskId") and "chat-submit" == msg.get("id"):
-                    print(f"  · submitted {msg['result']['taskId']}", flush=True)
+                elif (isinstance(msg.get("result"), dict) and
+                      msg["result"].get("taskId") and
+                      msg.get("id") == "chat-submit"):        # › your task, sent
+                    print(f"\033[33m› you · {msg['result']['taskId']} "
+                          f"(sent)\033[0m", flush=True)
 
     await asyncio.gather(pump_stdin(), pump_socket())
 
 
-def _chat() -> int:
+def _chat(activity: bool = False) -> int:
     try:
-        asyncio.run(_chat_async())
+        asyncio.run(_chat_async(activity))
     except (KeyboardInterrupt, EOFError):
         pass
     return 0
@@ -256,8 +288,16 @@ def main(argv=None) -> int:
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsk.add_parser("list")
     tsk.add_parser("results")  # list all available results (newest first)
-    tsk.add_parser("watch")    # PUSH mode: stream results live as they land
-    tsk.add_parser("chat")     # one-screen DM: submit + live result stream
+    tw = tsk.add_parser("watch")   # PUSH mode: stream results live as they land
+    tw.add_argument("--activity", action="store_true",
+                    help="also stream the agent's activity (step feed)")
+    tw.add_argument("--raw", action="store_true",
+                    help="stream the raw tmux window — SHOWS EVERYTHING incl. secrets")
+    tc = tsk.add_parser("chat")    # one-screen DM: submit + live result stream
+    tc.add_argument("--activity", action="store_true",
+                    help="also stream the agent's activity (step feed) inline")
+    tc.add_argument("--raw", action="store_true",
+                    help="stream the raw tmux window — SHOWS EVERYTHING incl. secrets")
     tsub = tsk.add_parser("submit")
     tsub.add_argument("text")
     tsub.add_argument("--priority", default="normal",
@@ -336,9 +376,11 @@ def main(argv=None) -> int:
                 result = _rpc(f"human_action.{args.cmd}", params, timeout=15)
         elif args.group == "task":
             if args.cmd == "watch":
-                return _watch()  # streams until Ctrl-C — not a one-shot RPC
+                return _watch(activity=args.activity, raw=args.raw)
             if args.cmd == "chat":
-                return _chat()   # interactive: submit + live stream in one pane
+                if args.raw:
+                    return _raw_tmux()
+                return _chat(activity=args.activity)
             if args.cmd == "list":
                 result = _rpc("task.list", {}, timeout=15)
             elif args.cmd == "results":

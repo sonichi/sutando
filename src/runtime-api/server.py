@@ -103,6 +103,9 @@ class RuntimeServer:
         # Push mode: writers that called task.subscribe get a live `task.result`
         # notification per new result. Best-effort tail — not a durable outbox.
         self._subscribers: set[asyncio.StreamWriter] = set()
+        # --activity subscribers get `activity` frames (core-status step feed).
+        self._activity_subscribers: set[asyncio.StreamWriter] = set()
+        self._state_dir = state_dir
         # Actor identity is resolved DAEMON-SIDE, here, and handed to the
         # dispatcher explicitly — a client parameter can never override it.
         self.actor_id = (os.environ.get("SUTANDO_AGENT_ID")
@@ -202,9 +205,17 @@ class RuntimeServer:
                 if method == "task.subscribe":
                     # Transport mode-switch: this connection becomes a push
                     # channel. Registered here (the server owns writers); the
-                    # dispatcher stays pure request/response.
-                    self._subscribers.add(writer)
-                    writer.write(result_frame(req_id, {"subscribed": True}))
+                    # dispatcher stays pure request/response. Streams are opt-in:
+                    # results (default on) and/or activity (the step feed).
+                    streams = []
+                    if params.get("results", True):
+                        self._subscribers.add(writer)
+                        streams.append("results")
+                    if params.get("activity"):
+                        self._activity_subscribers.add(writer)
+                        streams.append("activity")
+                    writer.write(result_frame(req_id, {"subscribed": True,
+                                                       "streams": streams}))
                     await writer.drain()
                     continue
                 try:
@@ -218,6 +229,7 @@ class RuntimeServer:
                 await writer.drain()
         finally:
             self._subscribers.discard(writer)
+            self._activity_subscribers.discard(writer)
             writer.close()
 
     async def _results_watcher(self) -> None:
@@ -238,6 +250,37 @@ class RuntimeServer:
         while True:
             await asyncio.sleep(interval)
             await self._emit_new_results(tasks, seen)
+
+    async def _activity_watcher(self) -> None:
+        """Tail core-status.json and push an `activity` frame to activity
+        subscribers whenever the step changes — the 'what I'm doing now' feed,
+        so a client can watch the thought-process at the step level. Curated,
+        not the raw tmux firehose (that stays opt-in + client-side)."""
+        if not self._state_dir:
+            return
+        status_path = Path(self._state_dir) / "core-status.json"
+        last = None
+        while True:
+            await asyncio.sleep(0.3)
+            if not self._activity_subscribers:
+                continue
+            try:
+                data = json.loads(status_path.read_text())
+            except (OSError, ValueError):
+                continue
+            step = data.get("step")
+            if not step or step == last:
+                continue
+            last = step
+            frame = notification_frame("activity", {
+                "step": step, "status": data.get("status"),
+                "ts": data.get("ts")})
+            for w in list(self._activity_subscribers):
+                try:
+                    w.write(frame)
+                    await w.drain()
+                except (ConnectionResetError, BrokenPipeError, RuntimeError):
+                    self._activity_subscribers.discard(w)
 
     async def _emit_new_results(self, tasks, seen: set) -> None:
         """One watcher pass: push a `task.result` notification for each result
@@ -303,7 +346,8 @@ class RuntimeServer:
         async with server:
             await asyncio.gather(server.serve_forever(),
                                  self.dispatcher.resolver_loop(),
-                                 self._results_watcher())
+                                 self._results_watcher(),
+                                 self._activity_watcher())
 
 
 def main() -> None:
