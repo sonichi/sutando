@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression guard: a logging failure must not stop delivery.
 
-## The bug (observed live 2026-08-08)
+## The bug
 
 `discord-bridge.py` line-buffers stdout, so EVERY `print()` flushes at the
 newline. When the far end of stdout goes away (supervisor exits, pipe closed,

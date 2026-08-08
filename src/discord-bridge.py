@@ -39,14 +39,6 @@ class _NeverFatalStream:
     closed, launcher reaped), that flush raises `BrokenPipeError` *inside
     whatever code was logging*, not at some later flush point.
 
-    Observed live 2026-08-08: in `poll_results` the `Replied:` print raised
-    after the DM had already been sent; its own `except` handler's print raised
-    too, so the exception escaped `while True`; `archive_file()` (which sits
-    after the try) never ran. Net effect — the message went out, nothing was
-    logged, the result file stayed on disk looking undelivered, and the
-    coroutine was gone. The process stayed up, so every cheap check said the
-    bridge was healthy while it could no longer reply to anything.
-
     Swallow ONLY OSError (the EPIPE/EBADF class). A logging failure is not a
     reason to stop delivering; anything else still propagates so real bugs are
     not masked.
