@@ -40,7 +40,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
 from protocol import (MAX_LINE_BYTES, ELICITATION_TYPES, ProtocolError,  # noqa: E402
-                      error_frame, parse_line, result_frame)
+                      error_frame, notification_frame, parse_line, result_frame)
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
 from rundir import socket_path, instance_id, lock_path  # noqa: E402
@@ -100,6 +100,9 @@ class RuntimeServer:
         self.socket_path = socket_path
         self.store = RequestStore(db_path)
         self.ha = HumanActionAdapter(ha_dir)
+        # Push mode: writers that called task.subscribe get a live `task.result`
+        # notification per new result. Best-effort tail — not a durable outbox.
+        self._subscribers: set[asyncio.StreamWriter] = set()
         # Actor identity is resolved DAEMON-SIDE, here, and handed to the
         # dispatcher explicitly — a client parameter can never override it.
         self.actor_id = (os.environ.get("SUTANDO_AGENT_ID")
@@ -196,6 +199,14 @@ class RuntimeServer:
                     writer.write(error_frame(e.req_id, e.code, e.message))
                     await writer.drain()
                     continue
+                if method == "task.subscribe":
+                    # Transport mode-switch: this connection becomes a push
+                    # channel. Registered here (the server owns writers); the
+                    # dispatcher stays pure request/response.
+                    self._subscribers.add(writer)
+                    writer.write(result_frame(req_id, {"subscribed": True}))
+                    await writer.drain()
+                    continue
                 try:
                     result = await self.dispatcher.handle(method, params)
                     writer.write(result_frame(req_id, result))
@@ -206,7 +217,51 @@ class RuntimeServer:
                     writer.write(error_frame(req_id, -32000, f"server error: {e}"))
                 await writer.drain()
         finally:
+            self._subscribers.discard(writer)
             writer.close()
+
+    async def _results_watcher(self) -> None:
+        """Tail results/ and push a `task.result` notification to every
+        subscriber as new results land. Seeds `seen` from what already exists
+        so subscribers get NEW results, never a boot-time backlog blast."""
+        tasks = self.dispatcher.tasks
+        if tasks is None:
+            return
+        # Near-instant: a short poll of a small dir is sub-perceptible and
+        # dependency-free (env-tunable). A true fs-event watcher (kqueue/inotify)
+        # would be zero-latency but platform-specific — this is the portable v0.
+        try:
+            interval = float(os.environ.get("SUTANDO_RESULT_POLL_S") or 0.2)
+        except ValueError:
+            interval = 0.2
+        seen = {f.name for f in tasks._result_files()}
+        while True:
+            await asyncio.sleep(interval)
+            await self._emit_new_results(tasks, seen)
+
+    async def _emit_new_results(self, tasks, seen: set) -> None:
+        """One watcher pass: push a `task.result` notification for each result
+        not in `seen`, oldest-first so the stream stays in order. Mutates
+        `seen`. Extracted from the loop so it's unit-testable."""
+        try:
+            files = tasks._result_files()  # newest first
+        except OSError:
+            return
+        for f in reversed([f for f in files if f.name not in seen]):
+            seen.add(f.name)
+            try:
+                body = f.read_text()
+            except OSError:
+                continue
+            frame = notification_frame("task.result", {
+                "taskId": f.name.removesuffix(".txt"),
+                "result": body, "ts": int(f.stat().st_mtime)})
+            for w in list(self._subscribers):
+                try:
+                    w.write(frame)
+                    await w.drain()
+                except (ConnectionResetError, BrokenPipeError, RuntimeError):
+                    self._subscribers.discard(w)
 
     async def serve(self) -> None:
         # Same-instance double start is illegal (different instances may run
@@ -246,7 +301,9 @@ class RuntimeServer:
         self._register_instance()
         _log(f"listening on {sp} (actor={self.actor_id})")
         async with server:
-            await asyncio.gather(server.serve_forever(), self.dispatcher.resolver_loop())
+            await asyncio.gather(server.serve_forever(),
+                                 self.dispatcher.resolver_loop(),
+                                 self._results_watcher())
 
 
 def main() -> None:

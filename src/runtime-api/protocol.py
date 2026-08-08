@@ -78,6 +78,7 @@ METHODS = (
     "human_action.status",
     "task.list",
     "task.list_results",
+    "task.subscribe",
     "request.list",
 )
 
@@ -109,6 +110,13 @@ def result_frame(req_id, result: dict) -> bytes:
 def error_frame(req_id, code: int, message: str) -> bytes:
     return (json.dumps({"jsonrpc": "2.0", "id": req_id,
                         "error": {"code": code, "message": message}},
+                       ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def notification_frame(method: str, params: dict) -> bytes:
+    # A JSON-RPC notification has NO id — that's how a subscriber tells a
+    # server-pushed event apart from a reply to one of its own requests.
+    return (json.dumps({"jsonrpc": "2.0", "method": method, "params": params},
                        ensure_ascii=False) + "\n").encode("utf-8")
 
 

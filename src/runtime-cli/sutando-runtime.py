@@ -18,6 +18,7 @@ touches the socket, JSON-RPC, or any remote API directly:
   sutando-runtime sutando info|status|owner|allowlist
   sutando-runtime task submit "do the thing" [--priority normal]
   sutando-runtime task results   # all results, newest first, with preview
+  sutando-runtime task watch     # PUSH mode: stream results live as they land
   sutando-runtime task status|details|cancel <taskId> | get-result [taskId]
 
 Issuing commands return immediately with {"requestId", "status": "pending"};
@@ -70,6 +71,40 @@ def _rpc(method: str, params: dict, timeout: float) -> dict:
 
 def _jarg(v):
     return json.loads(v) if v else None
+
+
+def _watch() -> int:
+    # PUSH mode: subscribe and stream `task.result` notifications live.
+    # Persistent connection (not the one-shot _rpc) — blocks until Ctrl-C.
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(_socket_path())
+    s.sendall((json.dumps({"jsonrpc": "2.0", "id": "watch",
+                           "method": "task.subscribe", "params": {}}) + "\n")
+              .encode("utf-8"))
+    print(json.dumps({"watching": True}), flush=True)
+    buf = b""
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                msg = json.loads(line.decode("utf-8"))
+                if msg.get("method") == "task.result":
+                    p = msg.get("params", {})
+                    print(json.dumps({"taskId": p.get("taskId"),
+                                      "result": p.get("result"),
+                                      "ts": p.get("ts")}, ensure_ascii=False),
+                          flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        s.close()
+    return 0
 
 
 def main(argv=None) -> int:
@@ -160,6 +195,7 @@ def main(argv=None) -> int:
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsk.add_parser("list")
     tsk.add_parser("results")  # list all available results (newest first)
+    tsk.add_parser("watch")    # PUSH mode: stream results live as they land
     tsub = tsk.add_parser("submit")
     tsub.add_argument("text")
     tsub.add_argument("--priority", default="normal",
@@ -237,6 +273,8 @@ def main(argv=None) -> int:
                     params["note"] = args.note
                 result = _rpc(f"human_action.{args.cmd}", params, timeout=15)
         elif args.group == "task":
+            if args.cmd == "watch":
+                return _watch()  # streams until Ctrl-C — not a one-shot RPC
             if args.cmd == "list":
                 result = _rpc("task.list", {}, timeout=15)
             elif args.cmd == "results":
