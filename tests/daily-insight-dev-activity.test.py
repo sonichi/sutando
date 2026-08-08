@@ -136,7 +136,14 @@ class TestInsightPriority(unittest.TestCase):
         with patch.object(self.mod, "analyze_dev_activity", return_value=None), \
              patch.object(self.mod, "load_calls", return_value=[]), \
              patch.object(self.mod, "analyze_note_activity",
+                          # age_known=True is required for a note-CREATION claim:
+                          # without git-derived dates the count is mtime, which
+                          # the workspace sync resets, so generate_insight()
+                          # stays silent rather than assert it. Absent defaults
+                          # to falsy on purpose — an unknown source must not
+                          # produce an owner-visible claim.
                           return_value={"total": 20, "recent_7d": 7,
+                                        "age_known": True,
                                         "top_tags": [("learned", 3), ("codex", 2)]}), \
              patch.object(self.mod, "analyze_task_patterns", return_value=self.mod.Counter()):
             insight = self.mod.generate_insight()

@@ -405,6 +405,8 @@ fi
 HOST="$(bash "$SCRIPT_DIR/sutando-config.sh" host-label 2>/dev/null || true)"
 if [ -z "$HOST" ]; then
     HOST="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+    # Blank-but-set is non-empty to `[ -z ]`, so it would become the label.
+    HOST="${HOST#"${HOST%%[![:space:]]*}"}"; HOST="${HOST%"${HOST##*[![:space:]]}"}"
     if [ -z "$HOST" ]; then
         if command -v scutil >/dev/null 2>&1; then
             HOST="$(scutil --get LocalHostName 2>/dev/null)"

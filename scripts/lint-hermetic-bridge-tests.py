@@ -111,25 +111,13 @@ tests/discord-bridge-codex-subprocess-argv.test.py
 tests/discord-bridge-collaborator-tier.test.py
 tests/discord-bridge-delivery-failure-visible.test.py
 tests/discord-bridge-delivery-sentinel.test.py
-tests/discord-bridge-discord-state-detection.test.py
 tests/discord-bridge-dm-catchup.test.py
 tests/discord-bridge-dm-fallback-source-guard.test.py
-tests/discord-bridge-file-markers.test.py
-tests/discord-bridge-mod-judge-actions.test.py
-tests/discord-bridge-mod-judge-buffer.test.py
 tests/discord-bridge-mod-judge-codex.test.py
-tests/discord-bridge-mod-judge-dispatcher.test.py
-tests/discord-bridge-mod-judge-integration.test.py
 tests/discord-bridge-mod-judge-trackers.test.py
-tests/discord-bridge-mod-judge.test.py
-tests/discord-bridge-mod-server-config.test.py
 tests/discord-bridge-multibot-seed-gate.test.py
 tests/discord-bridge-reply-directive.test.py
-tests/discord-bridge-state-prefetch.test.py
 tests/discord-bridge-task-write-instrument.test.py
-tests/discord-bridge-thread-seed-owner-notice.test.py
-tests/discord-bridge-welcome-on-first-post.test.py
-tests/discord-chunker.test.py
 tests/discord-task-source-invariance.test.py
 tests/discord-writeside-attachments.test.py
 tests/health-check-fix-down-bridges.test.py
@@ -974,21 +962,87 @@ def scan(paths) -> dict[str, str]:
     return out
 
 
-def tracked_tests() -> list[str]:
-    r = subprocess.run(
-        ["git", "ls-files", "--", "tests/*.py"], capture_output=True, text=True, cwd=REPO
-    )
+#: git's wordings for "this comparison cannot be made in this checkout" -- as
+#: distinct from a genuine git failure. Two different situations, both routine
+#: under `actions/checkout@v4` depth 1 and both requiring the same response:
+#:   * the ref is ABSENT           -> "bad revision" / "unknown revision" / ...
+#:   * the ref exists but shares NO HISTORY with HEAD in the grafted shallow
+#:     graph                       -> "no merge base"
+#: The first cut of this fallback listed only the absent-ref spellings, so the
+#: shallow case it was written for still hard-failed. Verified against real git:
+#: `git diff --name-only A...HEAD` across unrelated histories exits 128 with
+#: `fatal: A...HEAD: no merge base`.
+_UNRESOLVABLE_REF = re.compile(
+    r"bad revision|unknown revision|ambiguous argument|not a valid object name"
+    r"|no merge base",
+    re.I,
+)
+
+#: Floor for full-tree discovery. The tree held 310 tracked test files when this
+#: was added; 50 is far below any plausible legitimate shrink and far above the
+#: zero a broken `git ls-files` returns. A tripwire, not a census.
+MIN_TRACKED_TESTS = 50
+
+
+def _git_lines(cmd: list[str], what: str) -> list[str]:
+    """Run a git query whose EMPTY result would otherwise read as "nothing to do".
+
+    Both discovery paths fed `scan()` straight from `r.stdout` with no returncode
+    check, so a git failure returned `[]` and the lint printed
+    `ok (0 bridge-importing tests scanned)` and exited 0. Reproduced: with git
+    forced to exit 128, `tracked_tests()` went 310 -> 0 and `main()` still exited
+    0. A gate that reports clean because it could not look is worse than no gate
+    -- it occupies the slot where a real check would go and answers with the same
+    word. That is the shape this lint exists to catch, one level up.
+    """
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
+    if r.returncode != 0:
+        err = (r.stderr or "").strip()
+        # An UNRESOLVABLE BASE REF is not a broken discovery -- it means this
+        # comparison is inapplicable here. `actions/checkout@v4` fetches depth 1,
+        # so `origin/main` is frequently absent and `origin/main...HEAD` exits 128
+        # with "bad revision". Hard-failing on that breaks every shallow checkout,
+        # including the repo's own test that exercises --diff -- which is exactly
+        # the "a guard becomes a thing people disable" outcome this PR's own body
+        # warns about, committed one layer up. Signal it and let the caller widen
+        # to the full tree: more coverage than the diff, never less, never silent.
+        if _UNRESOLVABLE_REF.search(err):
+            print(
+                f"lint-hermetic-bridge-tests: cannot resolve the base ref for {what} "
+                f"({err.splitlines()[0][:120] if err else 'no stderr'}).\n"
+                "  Falling back to the full tracked-test scan — wider, not quieter."
+            )
+            return None
+        raise SystemExit(
+            f"lint-hermetic-bridge-tests: FAILED to discover {what} -- "
+            f"`{' '.join(cmd)}` exited {r.returncode}.\n"
+            f"  {err[:300]}\n"
+            "  Refusing to report a verdict on a discovery that did not run."
+        )
     return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def tracked_tests() -> list[str]:
+    files = _git_lines(["git", "ls-files", "--", "tests/*.py"], "tracked tests")
+    if len(files) < MIN_TRACKED_TESTS:
+        raise SystemExit(
+            f"lint-hermetic-bridge-tests: discovered {len(files)} tracked test files, "
+            f"floor is {MIN_TRACKED_TESTS}.\n"
+            "  Discovery collapsed, or the suite genuinely shrank -- if the latter, lower\n"
+            "  MIN_TRACKED_TESTS deliberately in the same PR so the shrink is reviewable."
+        )
+    return files
 
 
 def changed_tests(base: str) -> list[str]:
-    r = subprocess.run(
+    # An empty result is LEGITIMATE here (a PR may touch no test files), so this
+    # path gets the returncode check but NO floor. "zero changed" is a real
+    # answer; "zero tracked" never is. A floor here would fail every PR that
+    # doesn't touch tests, which is how a guard becomes a thing people disable.
+    return _git_lines(
         ["git", "diff", "--name-only", "--diff-filter=AM", f"{base}...HEAD", "--", "tests/*.py"],
-        capture_output=True,
-        text=True,
-        cwd=REPO,
+        f"tests changed vs {base}",
     )
-    return [ln for ln in r.stdout.splitlines() if ln.strip()]
 
 
 def main() -> int:
@@ -998,7 +1052,9 @@ def main() -> int:
     if mode == "--diff":
         base = os.environ.get("BASE_REF", "origin/main")
         targets = changed_tests(base)
-        if not targets:
+        if targets is None:            # base ref unresolvable -> widen, don't skip
+            targets = tracked_tests()
+        elif not targets:
             print("lint-hermetic-bridge-tests: no test files changed — nothing to scan")
             return 0
     else:

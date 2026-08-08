@@ -85,7 +85,8 @@ function scutilLocalHostName(): string {
  * Per-host directory label. Precedence (mirrors `_host_label()` in
  * util_paths.py and `_host()` in sync-workspace.sh — the single source of
  * truth for the per-host segment):
- *   1. `$SUTANDO_HOST_LABEL` (or legacy `$SUTANDO_HOST_OVERRIDE`) — used RAW.
+ *   1. `$SUTANDO_HOST_LABEL` (or legacy `$SUTANDO_HOST_OVERRIDE`), trimmed;
+ *      blank-after-trim counts as unset.
  *   2. macOS `scutil --get LocalHostName` — the STABLE Bonjour name.
  *   3. short `hostname` (mDNS/domain suffix stripped) — last resort.
  *
@@ -106,7 +107,12 @@ export function resolveHostLabel(
 	scutil: () => string = scutilLocalHostName,
 	rawHostname: string = hostname(),
 ): string {
-	const label = env.SUTANDO_HOST_LABEL || env.SUTANDO_HOST_OVERRIDE;
+	// Trim before testing: a blank-but-set override is TRUTHY in JS, so
+	// `if (label)` returned the whitespace itself as the label — `hosts/   /`,
+	// the same self-inflicted per-host split the DHCP note above describes.
+	// Blank means "not set": fall through to scutil/hostname. Lockstep with
+	// _host_label() in util_paths.py and _host() in sync-workspace.sh.
+	const label = (env.SUTANDO_HOST_LABEL || env.SUTANDO_HOST_OVERRIDE || '').trim();
 	if (label) return label;
 	const bonjour = scutil();
 	if (bonjour) return bonjour;
