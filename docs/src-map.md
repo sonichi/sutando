@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-207 modules indexed.
+208 modules indexed.
 
 ## `src/`
 
@@ -254,3 +254,4 @@ and re-run `python3 scripts/gen-src-map.py`.
 ## `src/runtime-cli/`
 
 - **`sutando-runtime.py`** — sutando-runtime — CLI face of the local runtime API (v0).
+- **`tui.py`** — sutando tui — a deliberately DUMB reference client + architecture probe.
