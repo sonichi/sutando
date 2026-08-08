@@ -251,36 +251,70 @@ class RuntimeServer:
             await asyncio.sleep(interval)
             await self._emit_new_results(tasks, seen)
 
+    async def _push_activity(self, params: dict) -> None:
+        frame = notification_frame("activity", params)
+        for w in list(self._activity_subscribers):
+            try:
+                w.write(frame)
+                await w.drain()
+            except (ConnectionResetError, BrokenPipeError, RuntimeError):
+                self._activity_subscribers.discard(w)
+
     async def _activity_watcher(self) -> None:
-        """Tail core-status.json and push an `activity` frame to activity
-        subscribers whenever the step changes — the 'what I'm doing now' feed,
-        so a client can watch the thought-process at the step level. Curated,
-        not the raw tmux firehose (that stays opt-in + client-side)."""
+        """Push `activity` frames to activity subscribers from two sources:
+        core-status.json step changes (kind='step' — the coarse 'what I'm doing
+        now' feed) and activity-feed.jsonl lines (kind='tool' — the per-tool
+        feed written by the PostToolUse hook). Curated; the raw tmux firehose
+        stays opt-in + client-side. The client filters by kind for its
+        quiet/activity/verbose level."""
         if not self._state_dir:
             return
         status_path = Path(self._state_dir) / "core-status.json"
-        last = None
+        feed_path = Path(self._state_dir) / "activity-feed.jsonl"
+        last_step = None
+        try:
+            feed_pos = feed_path.stat().st_size  # seed to EOF: no backlog blast
+        except OSError:
+            feed_pos = 0
         while True:
             await asyncio.sleep(0.3)
             if not self._activity_subscribers:
+                try:                              # keep the tail current while idle
+                    feed_pos = feed_path.stat().st_size
+                except OSError:
+                    pass
                 continue
             try:
                 data = json.loads(status_path.read_text())
+                step = data.get("step")
+                if step and step != last_step:
+                    last_step = step
+                    await self._push_activity({"kind": "step", "step": step,
+                                               "status": data.get("status"),
+                                               "ts": data.get("ts")})
             except (OSError, ValueError):
-                continue
-            step = data.get("step")
-            if not step or step == last:
-                continue
-            last = step
-            frame = notification_frame("activity", {
-                "step": step, "status": data.get("status"),
-                "ts": data.get("ts")})
-            for w in list(self._activity_subscribers):
-                try:
-                    w.write(frame)
-                    await w.drain()
-                except (ConnectionResetError, BrokenPipeError, RuntimeError):
-                    self._activity_subscribers.discard(w)
+                pass
+            try:
+                size = feed_path.stat().st_size
+                if size < feed_pos:               # rotated/truncated
+                    feed_pos = 0
+                if size > feed_pos:
+                    with feed_path.open() as fh:
+                        fh.seek(feed_pos)
+                        chunk = fh.read()
+                        feed_pos = fh.tell()
+                    for line in chunk.splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        await self._push_activity({
+                            "kind": rec.get("kind", "tool"),
+                            "step": rec.get("step"), "ts": rec.get("ts")})
+            except OSError:
+                pass
 
     async def _emit_new_results(self, tasks, seen: set) -> None:
         """One watcher pass: push a `task.result` notification for each result
