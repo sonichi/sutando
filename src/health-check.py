@@ -6721,6 +6721,16 @@ def _tmux_sessions(socket: str) -> list:  # pragma: no cover — thin tmux glue
 
 TMUX_UNSET_MARKER = "unknown variable"
 
+# tmux reached no server at all. A socket FILE can outlive its server, so this is
+# "there is no core to be pinned" — not a query that failed against a live one.
+TMUX_NO_SERVER_MARKERS = ("no server running", "error connecting to")
+
+
+def _tmux_no_server(exc) -> bool:
+    parts = [str(exc), getattr(exc, "stderr", "") or "", getattr(exc, "output", "") or ""]
+    text = " ".join(str(p) for p in parts).lower()
+    return any(m in text for m in TMUX_NO_SERVER_MARKERS)
+
 
 def _query_pin(socket: str, scope_args: list) -> str:
     """Pinned value for one tmux env scope, or "" when tmux says unset.
@@ -6757,11 +6767,25 @@ def check_core_model_pin() -> dict:
             if val:
                 pinned.append((sess, val))
     except (OSError, subprocess.SubprocessError) as e:
-        return {"name": name, "status": "ok", "detail": f"could not query tmux env ({e}) — skipped"}
+        if _tmux_no_server(e):
+            return {"name": name, "status": "ok",
+                    "detail": f"no tmux server on {socket} — no core to be pinned ({e})"}
+        # Not an absent pin: nothing was inspected. emit_task_for_failures() gates
+        # on status, so ok here silences the one case that needs a human.
+        return {"name": name, "status": "warn",
+                "detail": (f"could not query the core tmux env ({e}), so neither the "
+                           f"global scope nor any session was inspected — a live core "
+                           f"may still be pinned and this probe cannot see it")}
     try:
         sessions = _tmux_sessions(socket)
-    except (OSError, subprocess.SubprocessError):
-        sessions = []
+    except (OSError, subprocess.SubprocessError) as e:
+        if _tmux_no_server(e):
+            return _interpret_core_model_pin(pinned, socket, ())
+        # sessions=[] here would report a clean argv pass having read no core at all.
+        return {"name": name, "status": "warn",
+                "detail": (f"could not enumerate core tmux sessions ({e}), so no core "
+                           f"argv was inspected — the tmux env is clear, but a clear "
+                           f"cannot move a running core off a pinned model")}
     return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
 
 

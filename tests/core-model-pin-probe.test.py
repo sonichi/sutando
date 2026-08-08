@@ -1,5 +1,6 @@
 """The wedge-recovery model downgrade must be visible in health output.
 Exercised against a real tmux socket in both directions."""
+import contextlib
 import importlib.util
 import os
 import shutil
@@ -257,25 +258,79 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
             self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]),
                              [("sutando-core", None)])
 
-    def test_check_survives_a_later_session_listing_failure(self):
-        """The argv pass re-lists sessions; that call raising must not propagate out of
-        the always-on health run. First call succeeds, second raises."""
+    def _check_with_socket(self, **patches):
+        """Drive the real entry point against an existing socket, with helpers stubbed."""
         with tempfile.TemporaryDirectory() as td:
             sock = os.path.join(td, "exists.sock")
             Path(sock).write_text("")
             prev = os.environ.get("SUTANDO_TMUX_SOCKET")
             os.environ["SUTANDO_TMUX_SOCKET"] = sock
             try:
-                with mock.patch.object(self.hc, "_tmux_sessions",
-                                       side_effect=[[], OSError("boom")]), \
-                     mock.patch.object(self.hc, "_query_pin", return_value=None):
-                    r = self.hc.check_core_model_pin()
+                with contextlib.ExitStack() as stack:
+                    for attr, kw in patches.items():
+                        stack.enter_context(mock.patch.object(self.hc, attr, **kw))
+                    return self.hc.check_core_model_pin()
             finally:
                 if prev is None:
                     os.environ.pop("SUTANDO_TMUX_SOCKET", None)
                 else:
                     os.environ["SUTANDO_TMUX_SOCKET"] = prev
+
+    def test_FIRST_pass_query_failure_warns_it_inspected_nothing(self):
+        """Control 1 — the pin-query pass raising means no scope was read at all.
+        Reporting ok there is the silent direction: emit_task_for_failures() gates on
+        status, so a live core pinned to a downgraded model would reach nobody."""
+        r = self._check_with_socket(
+            _query_pin={"side_effect": OSError("permission denied")},
+            _tmux_sessions={"return_value": []},
+        )
         self.assertEqual(r["name"], "core-model-pin")
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("could not query", r["detail"])
+
+    def test_check_survives_a_later_session_listing_failure(self):
+        """Control 2 — the argv pass re-lists sessions. That call raising must not
+        propagate out of the always-on health run, AND must not read as clean: with
+        sessions=[] the argv pass inspects no core yet the probe reported ok."""
+        r = self._check_with_socket(
+            _tmux_sessions={"side_effect": [[], OSError("boom")]},
+            _query_pin={"return_value": None},
+        )
+        self.assertEqual(r["name"], "core-model-pin")
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("could not enumerate", r["detail"])
+
+    def test_a_STALE_socket_file_is_ok_not_a_permanent_warn(self):
+        """The regression the warn above could have caused. A socket FILE outlives its
+        server, so every tmux call fails with a no-server marker on an ordinary host
+        with no core — warning there would be a red that never clears. #2717 guarded
+        this and its guard must survive the reversal."""
+        err = subprocess.CalledProcessError(1, ["tmux"], "",
+                                            "error connecting to /tmp/x.sock (No such file or directory)")
+        r = self._check_with_socket(_query_pin={"side_effect": err})
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("no tmux server", r["detail"])
+
+    def test_no_server_on_the_argv_pass_still_reports_a_tmux_pin(self):
+        """No server on the second pass means no core to read argv from — but a pin
+        already collected in the first pass must still be reported, not swallowed."""
+        r = self._check_with_socket(
+            _query_pin={"return_value": "opus"},
+            _tmux_sessions={"side_effect": [["core"],
+                                            subprocess.CalledProcessError(
+                                                1, ["tmux"], "", "no server running on /tmp/x.sock")]},
+        )
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("opus", r["detail"])
+
+    def test_only_a_successfully_inspected_absence_is_ok(self):
+        """The discriminator both controls above turn on: same probe, same socket,
+        nothing pinned — but every read SUCCEEDS. Only this may be ok, and without it
+        the two warns above could be satisfied by a probe that never returns ok."""
+        r = self._check_with_socket(
+            _tmux_sessions={"return_value": []},
+            _query_pin={"return_value": ""},
+        )
         self.assertEqual(r["status"], "ok", r)
 
     def test_WIRING_check_core_model_pin_actually_inspects_argv(self):
@@ -359,9 +414,12 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                     os.environ.pop("SUTANDO_TMUX_SOCKET", None)
                 else:
                     os.environ["SUTANDO_TMUX_SOCKET"] = prev
-        self.assertEqual(r["status"], "ok", r)
+        # Reversed from #2717 deliberately: "tmux exploded" carries no no-server
+        # marker, so the server may be UP and a live core still pinned. ok here is
+        # the silent direction — emit_task_for_failures() gates on status.
+        self.assertEqual(r["status"], "warn", r)
         self.assertIn("tmux exploded", r["detail"])
-        self.assertIn("skipped", r["detail"])
+        self.assertIn("could not query", r["detail"])
 
     def test_failed_scope_query_is_not_reported_as_unset(self):
         """A nonzero `show-environment` that is NOT tmux's unset marker is a failed
@@ -388,7 +446,7 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                     os.environ.pop("SUTANDO_TMUX_SOCKET", None)
                 else:
                     os.environ["SUTANDO_TMUX_SOCKET"] = prev
-        self.assertIn("skipped", r["detail"], "an uninspected scope must not read as clear")
+        self.assertIn("could not query", r["detail"], "an uninspected scope must not read as clear")
         self.assertNotIn("no model pin", r["detail"], r)
 
     def test_unset_marker_on_either_stream_still_means_unset(self):
@@ -403,7 +461,13 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
 
     def test_failed_enumeration_is_not_reported_as_no_pin(self):
         """A nonzero `list-sessions` must not become an empty session list —
-        that would clear the probe without inspecting a single session."""
+        that would clear the probe without inspecting a single session.
+
+        Fixture corrected: this stubbed stderr as "no server running", which is the
+        one failure that legitimately means "no core exists". It therefore exercised
+        the no-server path while claiming to cover failed enumeration — an
+        unrepresentative fixture is indistinguishable from a broken detector. The
+        no-server case now has its own control."""
         import tempfile as _tf
         from unittest import mock
         prev = os.environ.get("SUTANDO_TMUX_SOCKET")
@@ -413,7 +477,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                 with mock.patch.object(
                     self.hc.subprocess, "run",
                     return_value=subprocess.CompletedProcess(
-                        args=["tmux"], returncode=1, stdout="", stderr="no server running"),
+                        args=["tmux"], returncode=1, stdout="",
+                        stderr="tmux: permission denied"),
                 ):
                     r = self.hc.check_core_model_pin()
             finally:
@@ -421,7 +486,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                     os.environ.pop("SUTANDO_TMUX_SOCKET", None)
                 else:
                     os.environ["SUTANDO_TMUX_SOCKET"] = prev
-        self.assertIn("skipped", r["detail"], "must say it could not query, not that it found nothing")
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("could not query", r["detail"], "must say it could not query, not that it found nothing")
         self.assertNotIn("no model pin", r["detail"], r)
 
 
