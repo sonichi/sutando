@@ -145,15 +145,33 @@ async def _chat_async(activity: bool = False) -> None:
                                   "method": method, "params": params},
                                  ensure_ascii=False) + "\n").encode("utf-8"))
 
-    _send("task.subscribe", {"activity": activity}, "chat-sub")
+    # Agent identity for the reply header (its ag2space mxid if connected).
+    agent_id = None
+    try:
+        _send("sutando.info", {}, "chat-info")
+        await writer.drain()
+        for _ in range(20):
+            line = await asyncio.wait_for(reader.readline(), timeout=2)
+            if not line:
+                break
+            m = json.loads(line.decode("utf-8"))
+            if m.get("id") == "chat-info":
+                agent_id = (m.get("result") or {}).get("agentId")
+                break
+    except Exception:
+        pass
+
+    # Always stream activity frames; the client shows/hides them so the mode
+    # can be toggled mid-chat (/activity, /quiet) without a daemon round-trip.
+    _send("task.subscribe", {"activity": True}, "chat-sub")
     await writer.drain()
     if sys.stdin.isatty() and sys.stdout.isatty():
-        await _chat_tui(reader, writer, _send)
+        await _chat_tui(reader, writer, _send, activity, agent_id)
     else:
-        await _chat_line(reader, writer, _send)
+        await _chat_line(reader, writer, _send, activity, agent_id)
 
 
-async def _chat_line(reader, writer, _send) -> None:
+async def _chat_line(reader, writer, _send, show_activity=False, agent_id=None) -> None:
     # Fallback for pipes / non-tty (scripts, tests): no fixed UI.
     print("sutando chat — type a task, enter to send; results stream. Ctrl-D exits.\n",
           flush=True)
@@ -185,14 +203,16 @@ async def _chat_line(reader, writer, _send) -> None:
                 m = json.loads(raw.decode("utf-8"))
                 if m.get("method") == "task.result":
                     p = m.get("params", {})
-                    print(f"\n╭─ agent · {p.get('taskId')}\n"
+                    who = f"agent · {agent_id}" if agent_id else "agent"
+                    print(f"\n╭─ {who}  ({p.get('taskId')})\n"
                           f"{p.get('result', '').rstrip()}\n╰─\n", flush=True)
                 elif m.get("method") == "activity":
-                    print(f"  ⚙ {m.get('params', {}).get('step')}", flush=True)
+                    if show_activity:
+                        print(f"  ⚙ {m.get('params', {}).get('step')}", flush=True)
     await asyncio.gather(pump_stdin(), pump_socket())
 
 
-async def _chat_tui(reader, writer, _send) -> None:
+async def _chat_tui(reader, writer, _send, show_activity=False, agent_id=None) -> None:
     # Fixed-bottom compose box: a pinned "› " input at the bottom; everything
     # you send + all streamed output scrolls in the region ABOVE it, so the
     # input line is never clobbered mid-typing (the flooding fix). No deps —
@@ -207,6 +227,7 @@ async def _chat_tui(reader, writer, _send) -> None:
     pend = bytearray()
     done = loop.create_future()
     orow = [2]  # next output row; transcript fills TOP-down (like Claude Code)
+    show = [bool(show_activity)]  # render ⚙ activity lines? toggled by /activity·/quiet
 
     def dims():
         s = shutil.get_terminal_size((80, 24))
@@ -239,10 +260,30 @@ async def _chat_tui(reader, writer, _send) -> None:
         out.write(ch)
         out.flush()
 
+    def command(text):
+        # Client-side chat commands (not sent to the core as tasks).
+        cmd = text.split()[0].lower()
+        if cmd in ("/activity", "/steps"):
+            show[0] = True
+            emit("\033[2m⚙ activity feed ON — you'll see my steps live\033[0m")
+        elif cmd in ("/quiet", "/nothing", "/off"):
+            show[0] = False
+            emit("\033[2m⚙ activity feed OFF — replies only\033[0m")
+        elif cmd == "/raw":
+            emit("\033[2mraw firehose isn't in-chat yet — exit and relaunch with "
+                 "--raw (read-only tmux view). In-chat raw is the next build.\033[0m")
+        elif cmd == "/help":
+            emit("\033[2mcommands: /activity (steps on) · /quiet (off) · "
+                 "/raw (firehose, launch flag for now) · Ctrl-D exit\033[0m")
+        else:
+            emit(f"\033[2munknown command {cmd} — try /help\033[0m")
+
     def on_enter():
         text = "".join(buf).strip()
         buf.clear()
-        if text:
+        if text.startswith("/"):
+            command(text)
+        elif text:
             # Symmetric with the agent box below (yellow "you" vs cyan "agent"),
             # so the sent message reads as ONE unit — not text with a detached
             # "(sent)" label under it.
@@ -306,12 +347,14 @@ async def _chat_tui(reader, writer, _send) -> None:
                 meth = m.get("method")
                 if meth == "task.result":
                     p = m.get("params", {})
-                    emit(f"\033[36m╭─ agent · {p.get('taskId')}\033[0m")
+                    who = f"agent · {agent_id}" if agent_id else "agent"
+                    emit(f"\033[36m╭─ {who}\033[0m  \033[2m{p.get('taskId')}\033[0m")
                     for ln in p.get("result", "").rstrip().split("\n"):
                         emit(ln)
                     emit("\033[36m╰─\033[0m")
                 elif meth == "activity":
-                    emit(f"  \033[2m⚙ {m.get('params', {}).get('step')}\033[0m")
+                    if show[0]:
+                        emit(f"  \033[2m⚙ {m.get('params', {}).get('step')}\033[0m")
         if not done.done():
             done.set_result(None)
 
@@ -320,8 +363,9 @@ async def _chat_tui(reader, writer, _send) -> None:
     out.write("\033[2J\033[H")                    # clear + home
     # Fixed header (row 1, outside the scroll region so it never scrolls away).
     hdr = " sutando · chat"
-    hint = "Ctrl-D exit · --activity steps · --raw firehose"
-    out.write(f"\033[1;1H\033[K\033[1m{hdr}\033[0m  \033[2m{hint}\033[0m")
+    who = f"  \033[2m{agent_id}\033[0m" if agent_id else ""
+    hint = "/help · /activity · /quiet · Ctrl-D exit"
+    out.write(f"\033[1;1H\033[K\033[1m{hdr}\033[0m{who}  \033[2m{hint}\033[0m")
     out.write(f"\033[2;{rows - 2}r")               # scroll region = rows 2..rows-2
     out.write(f"\033[{rows - 1};1H" + "─" * cols)   # fixed separator above compose
     draw_input()
