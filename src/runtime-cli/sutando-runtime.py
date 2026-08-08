@@ -13,6 +13,8 @@ touches the socket, JSON-RPC, or any remote API directly:
   sutando-runtime request get <requestId>
   sutando-runtime request wait <requestId> --timeout 300
   sutando-runtime request cancel <requestId>
+  sutando-runtime agent list
+  sutando-runtime agent status <agentId>
 
 Issuing commands return immediately with {"requestId", "status": "pending"};
 `request wait` blocks (bounded) for the resolution. Output is JSON on stdout;
@@ -112,6 +114,10 @@ def main(argv=None) -> int:
         if name == "wait":
             p.add_argument("--timeout", type=float, default=300.0)
 
+    agt = sub.add_parser("agent").add_subparsers(dest="cmd", required=True)
+    agt.add_parser("list")
+    agt.add_parser("status").add_argument("agent_id")
+
     args = ap.parse_args(argv)
     try:
         if args.group == "approval":
@@ -131,6 +137,10 @@ def main(argv=None) -> int:
                 "resource": _jarg(args.resource), "input": _jarg(args.input),
                 "idempotencyKey": args.idempotency_key,
                 "approvalRequestId": args.approval}, timeout=60)
+        elif args.group == "agent":
+            result = (_rpc("agent.list", {}, timeout=15) if args.cmd == "list"
+                      else _rpc("agent.status", {"agentId": args.agent_id},
+                                timeout=15))
         else:
             method = f"request.{args.cmd}"
             params = {"requestId": args.request_id}

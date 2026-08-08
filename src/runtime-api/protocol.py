@@ -20,6 +20,8 @@ v0 methods:
   request.get           {requestId}
   request.wait          {requestId, timeoutS?}
   request.cancel        {requestId}
+  agent.list            {}
+  agent.status          {agentId}
 
 Error codes follow JSON-RPC: -32700 parse, -32600 invalid request,
 -32601 unknown method, -32602 invalid params, -32000 server error.
@@ -39,6 +41,8 @@ METHODS = (
     "request.get",
     "request.wait",
     "request.cancel",
+    "agent.list",
+    "agent.status",
 )
 
 

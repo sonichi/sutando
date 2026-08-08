@@ -134,6 +134,7 @@ ENV = {**os.environ,
        "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),
        "SUTANDO_RUNTIME_DB": str(Path(TMP) / "runtime-state.sqlite"),
        "SUTANDO_HA_DIR": str(Path(TMP) / "human-actions"),
+       "SUTANDO_RUNTIME_STATE": str(Path(TMP) / "state"),
        "SUTANDO_RUNTIME_RESOLVE_POLL": "0.3",
        "SUTANDO_AGENT_ID": "@test-agent:example.org",
        "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
@@ -473,6 +474,28 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         g8 = cli("request", "get", r8["requestId"])
         check(g8["status"] == "cancelled",
               "late owner answer cannot overwrite a terminal state (CAS)")
+
+        # 9. agent discovery through the REAL daemon + CLI (Sutando Server
+        # slice 1): cores heartbeats surface as identity+liveness; a stale
+        # beat is present-but-not-alive; unknown ids are loud errors.
+        cores = Path(ENV["SUTANDO_RUNTIME_STATE"]) / "cores"
+        cores.mkdir(parents=True, exist_ok=True)
+        (cores / "e2e-host.alive").write_text(json.dumps(
+            {"host": "e2e-host", "pid": 42, "status": "running"}))
+        stale = cores / "stale-host.alive"
+        stale.write_text(json.dumps({"host": "stale-host"}))
+        _old = time.time() - 300
+        os.utime(stale, (_old, _old))
+        al = cli("agent", "list")
+        by_id = {a["agentId"]: a for a in al["agents"]}
+        check(by_id.get("e2e-host", {}).get("alive") is True
+              and by_id.get("stale-host", {}).get("alive") is False,
+              "agent list: fresh beat alive, stale beat present-but-dead")
+        st9 = cli("agent", "status", "e2e-host")
+        check(st9["alive"] is True and st9["pid"] == 42,
+              "agent status resolves identity + heartbeat metadata via CLI")
+        cli("agent", "status", "no-such-agent", expect_rc=1)
+        check(True, "agent status for unknown id exits 1 (loud, not empty)")
     finally:
         daemon.terminate()
         try:
