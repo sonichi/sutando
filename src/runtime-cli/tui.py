@@ -22,6 +22,7 @@ E2E-tested without a terminal. `main()` is a thin key-driven loop on top.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sys
 import uuid
@@ -134,7 +135,8 @@ def _views() -> list:
 
 
 _KEYS = ("[l] list/refresh  [s] start <id>  [c] connect <id>  "
-         "[t] task <id> <text>  [h] requests <id>  [q] quit")
+         "[a] attach <id>  [o] open <id>  [t] task <id> <text>  "
+         "[h] requests <id>  [q] quit")
 
 
 def main(argv=None) -> int:
@@ -163,7 +165,7 @@ def main(argv=None) -> int:
         if cmd == "l":
             continue
         by_id = {v["agentId"]: v for v in views}
-        if cmd in ("s", "c", "t", "h") and rest:
+        if cmd in ("s", "c", "a", "o", "t", "h") and rest:
             v = by_id.get(rest[0])
             if v is None:
                 print(f"  no such instance: {rest[0]}\n")
@@ -173,6 +175,16 @@ def main(argv=None) -> int:
                     print(" ", instance_registry.start_instance(rest[0]), "\n")
                 elif cmd == "c":
                     print(render_view(instance_view(v["_manifest"])), "\n")
+                elif cmd == "a":
+                    # hand the whole terminal to the native TUI (v1 attach)
+                    ac = instance_registry.attach(rest[0])
+                    if not ac.get("ok"):
+                        print(f"  {ac.get('error')}\n")
+                        continue
+                    os.execvp(ac["argv"][0], ac["argv"])
+                elif cmd == "o":
+                    import terminal_open
+                    print(" ", terminal_open.open_instance(rest[0]), "\n")
                 elif cmd == "t":
                     ep = v.get("endpoint")
                     if not ep or v["server"] != "running":
