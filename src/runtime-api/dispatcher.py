@@ -115,7 +115,8 @@ class RuntimeDispatcher:
     def __init__(self, store: RequestStore, human_actions: HumanActionAdapter,
                  actor_id: str,
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
-                 agents_view=None, identity_view=None, tasks_view=None):
+                 agents_view=None, identity_view=None, tasks_view=None,
+                 runtime_view=None):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
@@ -125,6 +126,7 @@ class RuntimeDispatcher:
         self.agents = agents_view
         self.identity = identity_view
         self.tasks = tasks_view
+        self.runtime = runtime_view
         # request_id → ha action_id, rebuilt at boot for crash recovery.
         self._ha_of: dict = {}
 
@@ -215,6 +217,14 @@ class RuntimeDispatcher:
                   "sutando.status": self.identity.status,
                   "sutando.owner": self.identity.owner,
                   "sutando.allowlist": self.identity.allowlist}.get(method)
+            if fn is not None:
+                return fn()
+        if method.startswith("runtime."):
+            if self.runtime is None:
+                raise ProtocolError(-32601,
+                                    "runtime surface is not configured on this daemon")
+            fn = {"runtime.health": self.runtime.health,
+                  "runtime.details": self.runtime.details}.get(method)
             if fn is not None:
                 return fn()
         if method.startswith("task."):

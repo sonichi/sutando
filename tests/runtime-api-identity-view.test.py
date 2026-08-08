@@ -54,15 +54,9 @@ class IdentityViewTests(unittest.TestCase):
         info = v.info()
         self.assertEqual(info["agentId"], "@me:example.org")
         self.assertEqual(info["hostLabel"], "my-host")
-        self.assertEqual(info["pid"], 7)
-        self.assertEqual(info["socket"], "/tmp/t.sock")  # tmux sock passthrough
-
-    def test_info_includes_injected_runtime_socket(self):
-        v = IdentityView(self.state, "@me:example.org",
-                         runtime_socket="/run/rt.sock")
-        self.assertEqual(v.info()["runtimeSocket"], "/run/rt.sock")
-        # not injected → key absent, never invented
-        self.assertNotIn("runtimeSocket", _mk(self.state).info())
+        # runtime internals relocated to runtime.details (owner taxonomy)
+        self.assertNotIn("pid", info)
+        self.assertNotIn("socket", info)
 
     def test_status_reads_core_status_and_liveness(self):
         (self.state / "core-status.json").write_text(json.dumps(

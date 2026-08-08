@@ -125,6 +125,10 @@ def main(argv=None) -> int:
     for name in ("info", "status", "owner", "allowlist"):
         idn.add_parser(name)
 
+    rt = sub.add_parser("runtime").add_subparsers(dest="cmd", required=True)
+    for name in ("health", "details"):
+        rt.add_parser(name)
+
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsub = tsk.add_parser("submit")
     tsub.add_argument("text")
@@ -158,6 +162,8 @@ def main(argv=None) -> int:
                                 timeout=15))
         elif args.group == "sutando":
             result = _rpc(f"sutando.{args.cmd}", {}, timeout=15)
+        elif args.group == "runtime":
+            result = _rpc(f"runtime.{args.cmd}", {}, timeout=15)
         elif args.group == "task":
             if args.cmd == "submit":
                 result = _rpc("task.submit", {"task": args.text,

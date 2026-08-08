@@ -137,6 +137,7 @@ ENV = {**os.environ,
        "SUTANDO_RUNTIME_STATE": str(Path(TMP) / "state"),
        "SUTANDO_RUNTIME_RESOLVE_POLL": "0.3",
        "SUTANDO_AGENT_ID": "@test-agent:example.org",
+       "SUTANDO_HOST_LABEL": "e2e-host",  # runtime.* reads its own beat by label
        "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
        "REMOTE_TASK_TOKEN": "test-bearer"}
 
@@ -535,6 +536,24 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         c12 = cli("task", "cancel", t12["taskId"])
         check(c12["cancelled"] == "requested" and c12.get("cancelTaskId"),
               "cancel emits a CANCEL_INSTRUCTION signal task")
+
+        # 13. runtime surface (runtime.*): health is the coarse end-user
+        # readout (fresh e2e-host beat from section 9 + live core-status
+        # step), details carries the diagnostics that no longer ride in
+        # sutando.info (owner taxonomy relocation).
+        (cores / "e2e-host.alive").write_text(json.dumps(
+            {"host": "e2e-host", "pid": 42, "socket": "/tmp/e2e-tmux.sock"}))
+        h13 = cli("runtime", "health")
+        check(h13["state"] == "online" and h13.get("currentActivity") == "e2e",
+              "runtime health: online + current activity from core-status")
+        d13 = cli("runtime", "details")
+        check(d13.get("pid") == 42 and d13.get("socket") == "/tmp/e2e-tmux.sock"
+              and d13.get("runtimeSocket", "").endswith("rt.sock"),
+              "runtime details: pid + tmux socket + daemon runtime socket")
+        i13 = cli("sutando", "info")
+        check("pid" not in i13 and "socket" not in i13
+              and "runtimeSocket" not in i13,
+              "sutando info no longer leaks runtime internals")
     finally:
         daemon.terminate()
         try:

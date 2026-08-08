@@ -25,25 +25,22 @@ from agents_view import ALIVE_MAX_AGE_S
 class IdentityView:
     def __init__(self, state_dir: str | Path, actor_id: str,
                  channels_dir: str | Path | None = None,
-                 host_label: str | None = None,
-                 runtime_socket: str | None = None):
+                 host_label: str | None = None):
         self.state_dir = Path(state_dir)
         self.actor_id = actor_id
         self.channels_dir = Path(channels_dir) if channels_dir else None
         self.host_label = host_label
-        self.runtime_socket = runtime_socket
 
     # ── sutando.info ────────────────────────────────────────────────────────
     def info(self) -> dict:
+        # Identity only — pid/sockets/heartbeat internals are runtime
+        # diagnostics and live on runtime.details (owner taxonomy ruling).
         out = {"agentId": self.actor_id}
         if self.host_label:
             out["hostLabel"] = self.host_label
-        if self.runtime_socket:
-            out["runtimeSocket"] = self.runtime_socket
         beat = self._own_beat()
-        for k in ("pid", "started_at", "locality", "socket"):
-            if beat.get(k) is not None:
-                out[k] = beat[k]
+        if beat.get("locality") is not None:
+            out["locality"] = beat["locality"]
         return out
 
     # ── sutando.status ──────────────────────────────────────────────────────

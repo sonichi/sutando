@@ -48,6 +48,7 @@ from dispatcher import RuntimeDispatcher  # noqa: E402
 from agents_view import AgentsView  # noqa: E402
 from identity_view import IdentityView  # noqa: E402
 from tasks_view import TasksView  # noqa: E402
+from runtime_view import RuntimeView  # noqa: E402
 
 def _state_dir() -> Path:
     ws = os.environ.get("SUTANDO_RUNTIME_STATE")
@@ -107,18 +108,21 @@ class RuntimeServer:
         # Request-domain orchestration (dispatch, approvals, governed
         # capabilities, idempotency, durable transitions, recovery) lives in
         # dispatcher.py. This class owns socket transport only.
+        host_label = _host_label() if state_dir else None
         self.dispatcher = RuntimeDispatcher(
             self.store, self.ha, self.actor_id,
             agents_view=AgentsView(state_dir) if state_dir else None,
             identity_view=(IdentityView(state_dir, self.actor_id,
                                         channels_dir=_channels_dir(),
-                                        host_label=_host_label(),
-                                        runtime_socket=socket_path)
+                                        host_label=host_label)
                            if state_dir else None),
             tasks_view=(TasksView(Path(state_dir).parent / "tasks",
                                   Path(state_dir).parent / "results",
                                   self.actor_id)
-                        if state_dir else None))
+                        if state_dir else None),
+            runtime_view=(RuntimeView(state_dir, host_label=host_label,
+                                      runtime_socket=socket_path)
+                          if state_dir else None))
 
     # ── transport ──────────────────────────────────────────────────────────
     async def client(self, reader: asyncio.StreamReader,

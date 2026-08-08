@@ -31,6 +31,8 @@ v0 methods:
   task.get_result       {taskId}
   task.details          {taskId}
   task.cancel           {taskId}
+  runtime.health        {}
+  runtime.details       {}
 
 Error codes follow JSON-RPC: -32700 parse, -32600 invalid request,
 -32601 unknown method, -32602 invalid params, -32000 server error.
@@ -61,6 +63,8 @@ METHODS = (
     "task.get_result",
     "task.details",
     "task.cancel",
+    "runtime.health",
+    "runtime.details",
 )
 
 
