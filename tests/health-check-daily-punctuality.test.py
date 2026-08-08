@@ -53,6 +53,14 @@ class TestLatenessIsTheSignal(unittest.TestCase):
         r = hc._interpret_daily_punctuality([job("daily-insight", 6, 50, arts)])
         self.assertEqual(r["status"], "ok", "a single late run is not a dead schedule")
 
+    def test_even_sample_uses_the_true_median_not_the_upper_middle(self):
+        """[+0, +30] has median +15, inside tolerance; picking deltas[n//2] gave +30
+        and warned on a job that was on time half the days."""
+        arts = [("2026-08-07", DUE), ("2026-08-08", DUE + 30)]
+        r = hc._interpret_daily_punctuality([job("daily-insight", 6, 50, arts)])
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("late", r["detail"])
+
     def test_within_tolerance_is_ok(self):
         arts = [(f"2026-08-0{i}", DUE + hc.DAILY_LATE_TOLERANCE_MIN - 1) for i in range(1, 8)]
         self.assertEqual(
@@ -153,6 +161,13 @@ class TestCollector(unittest.TestCase):
         r = self._run("{not json")
         self.assertEqual(r["status"], "ok")
         self.assertIn("unreadable", r["detail"])
+
+    def test_a_scalar_root_degrades_instead_of_aborting_the_health_run(self):
+        """`1` is valid JSON, so json.loads succeeds and raw.get() raised
+        AttributeError out of the always-on run_all_checks() path."""
+        r = self._run("1")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("root is int", r["detail"])
 
     def test_launchd_and_codex_entries_are_out_of_scope(self):
         r = self._run(json.dumps([

@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import statistics
 import shutil
 import tempfile
 import socket
@@ -4764,7 +4765,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             unknown.append(j["name"])
             continue
         deltas = sorted(w - due for _, w in j["artifacts"])
-        median = deltas[len(deltas) // 2]
+        median = statistics.median(deltas)
         if median > DAILY_LATE_TOLERANCE_MIN:
             late.append((j["name"], median, len(deltas)))
         if not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN:
@@ -4815,7 +4816,15 @@ def check_daily_cron_punctuality() -> dict:
         raw = json.loads(cfg.read_text())
     except (OSError, ValueError) as e:
         return {"name": name, "status": "ok", "detail": f"crons.json unreadable ({e}) — skipped"}
-    entries = raw if isinstance(raw, list) else (raw.get("crons") or raw.get("jobs") or [])
+    if isinstance(raw, list):
+        entries = raw
+    elif isinstance(raw, dict):
+        entries = raw.get("crons") or raw.get("jobs") or []
+    else:
+        # `1` is valid JSON: .get() on it aborted the whole always-on health run.
+        return {"name": name, "status": "ok",
+                "detail": f"crons.json root is {type(raw).__name__}, not a list or "
+                          f"object — skipped"}
     now = datetime.now()
     jobs, malformed = [], []
     for e in entries:
