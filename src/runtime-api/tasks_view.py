@@ -39,12 +39,23 @@ def _one_line(text: str) -> str:
     return _WS_RE.sub(" ", str(text)).strip()
 
 
+# HITL request type → the task state it parks the task in (owner taxonomy:
+# running → waiting_for_* → running; who acts next is the discriminator).
+_WAITING_STATE = {"elicitation": "waiting_for_input",
+                  "approval": "waiting_for_approval",
+                  "human_action": "waiting_for_human_action"}
+
+
 class TasksView:
     def __init__(self, tasks_dir: str | Path, results_dir: str | Path,
-                 actor_id: str):
+                 actor_id: str, hitl_lookup=None):
+        """`hitl_lookup(task_id) -> [requestType, ...]` lists the task's
+        PENDING human-in-the-loop requests; injected by the composer (the
+        daemon binds it to the request store) so this view stays store-free."""
         self.tasks_dir = Path(tasks_dir)
         self.results_dir = Path(results_dir)
         self.actor_id = actor_id
+        self.hitl_lookup = hitl_lookup
 
     # ── task.submit ─────────────────────────────────────────────────────────
     def submit(self, task_text: str, priority: str = "normal") -> dict:
@@ -76,6 +87,10 @@ class TasksView:
             return {"taskId": task_id, "state": "done"}
         live = find_task_file(self.tasks_dir, task_id)
         if live is not None:
+            waiting = self._waiting_state(task_id)
+            if waiting:
+                return {"taskId": task_id, "state": waiting["state"],
+                        "waitingOn": waiting["requests"]}
             claimed = ".claimed-" in live.name
             return {"taskId": task_id,
                     "state": "in_progress" if claimed else "pending"}
@@ -125,6 +140,23 @@ class TasksView:
                 "cancelTaskId": sub["taskId"]}
 
     # ── internals ───────────────────────────────────────────────────────────
+    def _waiting_state(self, task_id: str) -> dict | None:
+        """A live task with pending HITL requests is parked, not running.
+        With several pending requests the state reflects the FIRST by the
+        input < approval < action order; all are listed in waitingOn."""
+        if self.hitl_lookup is None:
+            return None
+        try:
+            types = [t for t in self.hitl_lookup(task_id) if t in _WAITING_STATE]
+        except Exception:  # noqa: BLE001 — a broken lookup ≠ broken task surface
+            return None
+        if not types:
+            return None
+        order = ("elicitation", "approval", "human_action")
+        first = sorted(types, key=order.index)[0]
+        return {"state": _WAITING_STATE[first],
+                "requests": [_WAITING_STATE[t] for t in types]}
+
     def _result_path(self, task_id: str) -> Path | None:
         for p in (self.results_dir / f"{task_id}.txt",
                   self.results_dir / "archive" / f"{task_id}.txt"):

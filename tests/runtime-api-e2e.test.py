@@ -579,6 +579,22 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         s15 = cli("human-action", "status", h15["requestId"])
         check(s15["status"] == "completed" and s15["result"] == {"note": "done irl"},
               "human_action status returns the terminal record")
+
+        # 15. task waiting_for_* weave: a live task with a pending HITL
+        # request is parked in its waiting state; resolving the request
+        # returns it to the ordinary lifecycle.
+        t16 = cli("task", "submit", "e2e: needs a signature")
+        tid16 = t16["taskId"]
+        h16 = cli("human-action", "request", "--action", "Sign it",
+                  "--task-id", tid16)
+        st16 = cli("task", "status", tid16)
+        check(st16["state"] == "waiting_for_human_action"
+              and st16["waitingOn"] == ["waiting_for_human_action"],
+              "pending human_action parks the task in waiting_for_human_action")
+        cli("human-action", "complete", h16["requestId"])
+        st16b = cli("task", "status", tid16)
+        check(st16b["state"] == "pending",
+              "resolving the request returns the task to the normal lifecycle")
     finally:
         daemon.terminate()
         try:

@@ -78,6 +78,42 @@ class TasksViewTests(unittest.TestCase):
         (self.results / f"{tid}.txt").write_text("did it")
         self.assertEqual(self.view.status(tid)["state"], "done")
 
+    def test_status_waiting_for_states_from_hitl_lookup(self):
+        pending = {}
+        view = TasksView(self.tasks, self.results, "@me:x",
+                         hitl_lookup=lambda tid: pending.get(tid, []))
+        tid = view.submit("needs a human")["taskId"]
+        # no pending HITL -> pending as before
+        self.assertEqual(view.status(tid)["state"], "pending")
+        # each HITL type parks the task in its waiting state
+        for rtype, state in (("elicitation", "waiting_for_input"),
+                             ("approval", "waiting_for_approval"),
+                             ("human_action", "waiting_for_human_action")):
+            pending[tid] = [rtype]
+            st = view.status(tid)
+            self.assertEqual(st["state"], state)
+            self.assertEqual(st["waitingOn"], [state])
+        # several pending: input outranks action for the headline state
+        pending[tid] = ["human_action", "elicitation"]
+        st = view.status(tid)
+        self.assertEqual(st["state"], "waiting_for_input")
+        self.assertEqual(sorted(st["waitingOn"]),
+                         ["waiting_for_human_action", "waiting_for_input"])
+        # request resolved -> back to pending; result still wins over waiting
+        pending[tid] = []
+        self.assertEqual(view.status(tid)["state"], "pending")
+        pending[tid] = ["approval"]
+        self.results.mkdir(parents=True, exist_ok=True)
+        (self.results / f"{tid}.txt").write_text("r")
+        self.assertEqual(view.status(tid)["state"], "done")
+
+    def test_status_broken_hitl_lookup_fails_open(self):
+        def boom(tid):
+            raise RuntimeError("store down")
+        view = TasksView(self.tasks, self.results, "@me:x", hitl_lookup=boom)
+        tid = view.submit("still visible")["taskId"]
+        self.assertEqual(view.status(tid)["state"], "pending")
+
     def test_status_unknown_task(self):
         self.assertEqual(self.view.status("task-nope")["state"], "unknown")
 

@@ -118,11 +118,18 @@ class RuntimeServer:
                            if state_dir else None),
             tasks_view=(TasksView(Path(state_dir).parent / "tasks",
                                   Path(state_dir).parent / "results",
-                                  self.actor_id)
+                                  self.actor_id,
+                                  hitl_lookup=self._pending_hitl_types)
                         if state_dir else None),
             runtime_view=(RuntimeView(state_dir, host_label=host_label,
                                       runtime_socket=socket_path)
                           if state_dir else None))
+
+    def _pending_hitl_types(self, task_id: str) -> list:
+        """Pending HITL request types for a task — the tasks view's window
+        into the request store, bound here so the view stays store-free."""
+        return [r["requestType"] for r in self.store.pending()
+                if r.get("taskId") == task_id]
 
     # ── transport ──────────────────────────────────────────────────────────
     async def client(self, reader: asyncio.StreamReader,
