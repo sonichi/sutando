@@ -1,31 +1,29 @@
 #!/usr/bin/env bash
-# Regression: tool caches under tests/ must stay ignored, and real tests must not.
+# Tool caches under tests/ must stay ignored; relocated tests must not.
 #
-# `.gitignore` ignores `tests/*` and then re-includes `!tests/*/` so the tests
-# tree can mirror src/ (tests/kernel/, tests/adapters/, …). That re-include is
-# unqualified, so it also re-included every tool-generated directory — and it
-# silently defeated the global `__pycache__/` rule declared earlier in the same
-# file. Measured before the fix: all six directories below showed as `??`.
+# `tests/*` then an unqualified `!tests/*/` re-included every tool-generated dir
+# and defeated the global `__pycache__/` one level down. Both directions matter:
+# an over-broad fix (`tests/**/`) would re-hide the relocated tests that
+# `!tests/*/` exists to keep visible.
 #
-# It surfaced as a committed `tests/__pycache__/*.cpython-314.pyc` in a PR, which
-# a reviewer had to catch by eye. The cause is not a stray `git add -A` — nothing
-# was ignoring the path, so any contributor running the suite in-tree hits it.
-#
-# The positive half is load-bearing: a fix that over-denied (e.g. `tests/**/`)
-# would re-hide relocated tests, which is exactly what the `!tests/*/` line was
-# added to prevent. So this asserts both directions.
+# Runs against a THROWAWAY repo holding a copy of the real .gitignore, so the
+# checkout's own tests/ tree is never touched.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO"
+FIXTURE="$(mktemp -d -t gitignore-tool-cache-test.XXXXXX)"
+trap 'rm -rf "$FIXTURE"' EXIT
+
+# The fixture is a fresh repo; nothing here can outlive the trap or collide with
+# the checkout, so `rm -rf` is safe in a way it is not on a shared tests/ dir.
+git init -q "$FIXTURE"
+cp "$REPO/.gitignore" "$FIXTURE/.gitignore"
+cd "$FIXTURE"
 
 pass=0
 fail=0
-CREATED=()
-cleanup() { for p in "${CREATED[@]:-}"; do rm -rf "$p"; done; }
-trap cleanup EXIT
 
 check_ignored() {
     local path="$1" desc="$2"
@@ -36,7 +34,7 @@ check_ignored() {
         fail=$((fail + 1))
     fi
 }
-check_tracked_ok() {
+refute_ignored() {
     local path="$1" desc="$2"
     if git check-ignore -q "$path" 2>/dev/null; then
         echo "FAIL: $desc — '$path' IS ignored; the fix over-denied and hides real tests"
@@ -46,26 +44,27 @@ check_tracked_ok() {
     fi
 }
 
-# --- negative: tool caches must be ignored, at top level and nested ----------
+# tool caches, top level under tests/ — the level the re-include exposed
 for d in __pycache__ .pytest_cache .mypy_cache .ruff_cache node_modules htmlcov; do
-    mkdir -p "tests/$d"; CREATED+=("tests/$d")
+    mkdir -p "tests/$d"
     printf 'x' > "tests/$d/_probe"
     check_ignored "tests/$d/_probe" "tests/$d/ is ignored"
 done
 
-# nested one level deeper — the mirror-src layout the re-include exists for
-mkdir -p "tests/kernel/__pycache__"; CREATED+=("tests/kernel")
-printf 'x' > "tests/kernel/__pycache__/_probe.pyc"
+# one level deeper: already covered by the global rule, which is why the hole
+# looked narrower than it was
+mkdir -p tests/kernel/__pycache__
+printf 'x' > tests/kernel/__pycache__/_probe.pyc
 check_ignored "tests/kernel/__pycache__/_probe.pyc" \
     "tests/kernel/__pycache__/ is ignored (nested, not just top level)"
 
-# --- positive: real tests in a nested dir must STAY visible ------------------
-printf 'x' > "tests/kernel/probe.test.py"
-check_tracked_ok "tests/kernel/probe.test.py" \
+# the positive direction the re-include exists for
+printf 'x' > tests/kernel/probe.test.py
+refute_ignored "tests/kernel/probe.test.py" \
     "a relocated test in tests/kernel/ is still trackable"
-mkdir -p "tests/adapters"; CREATED+=("tests/adapters")
-printf 'x' > "tests/adapters/probe.test.sh"
-check_tracked_ok "tests/adapters/probe.test.sh" \
+mkdir -p tests/adapters
+printf 'x' > tests/adapters/probe.test.sh
+refute_ignored "tests/adapters/probe.test.sh" \
     "a relocated test in tests/adapters/ is still trackable"
 
 echo
