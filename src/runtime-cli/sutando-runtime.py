@@ -166,6 +166,7 @@ async def _chat_line(reader, writer, _send) -> None:
                 break
             t = line.strip()
             if t:
+                print(f"\n╭─ you\n{t}\n╰─", flush=True)
                 _send("task.submit", {"task": t}, "chat-submit")
                 await writer.drain()
         writer.close()
@@ -184,8 +185,8 @@ async def _chat_line(reader, writer, _send) -> None:
                 m = json.loads(raw.decode("utf-8"))
                 if m.get("method") == "task.result":
                     p = m.get("params", {})
-                    print(f"\n← {p.get('taskId')}\n{p.get('result', '').rstrip()}\n",
-                          flush=True)
+                    print(f"\n╭─ agent · {p.get('taskId')}\n"
+                          f"{p.get('result', '').rstrip()}\n╰─\n", flush=True)
                 elif m.get("method") == "activity":
                     print(f"  ⚙ {m.get('params', {}).get('step')}", flush=True)
     await asyncio.gather(pump_stdin(), pump_socket())
@@ -232,7 +233,12 @@ async def _chat_tui(reader, writer, _send) -> None:
         text = "".join(buf).strip()
         buf.clear()
         if text:
-            emit(f"\033[33m› you\033[0m {text}")
+            # Symmetric with the agent box below (yellow "you" vs cyan "agent"),
+            # so the sent message reads as ONE unit — not text with a detached
+            # "(sent)" label under it.
+            emit("\033[33m╭─ you\033[0m")
+            emit(text)
+            emit("\033[33m╰─\033[0m")
             _send("task.submit", {"task": text}, "chat-submit")
         draw_input()
 
