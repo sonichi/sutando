@@ -99,7 +99,9 @@ _LEGACY_DOTTED_WORKSPACE = Path.home() / ".sutando" / "workspace"
 
 
 def legacy_dotted_workspace_path(*subpath: str) -> Path:
-    """Path under the retired `~/.sutando/workspace` workspace default.
+    """Path under the retired pre-v0.8 dotted workspace default.
+
+    The location itself is spelled exactly once, in `_LEGACY_DOTTED_WORKSPACE`.
 
     NOT a resolution fallback — `_workspace_root()` owns that, and this must
     never be used to resolve the live workspace. It exists for the narrow case
