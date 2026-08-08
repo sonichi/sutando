@@ -554,6 +554,31 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         check("pid" not in i13 and "socket" not in i13
               and "runtimeSocket" not in i13,
               "sutando info no longer leaks runtime internals")
+
+        # 14. human_action.* (third HITL type) through the real daemon + CLI:
+        # request mirrors a Done/Decline card; the owner's card answer
+        # completes it; the API path (complete) resolves AND closes the card.
+        h14 = cli("human-action", "request", "--action", "Sign the e2e form",
+                  "--instructions", "Review it first")
+        act14 = pending_action_for(h14["requestId"], store)
+        check(act14 is not None
+              and "Sign the e2e form" in json.dumps(act14["questions"])
+              and [o["label"] for o in act14["questions"][0]["options"]] == ["Done", "Decline"],
+              "human_action card carries the act + Done/Decline options")
+        store.resolve(act14["action_id"], {"1": [1]}, "@owner:example.org")
+        w14 = cli("request", "wait", h14["requestId"], "--timeout", "10")
+        check(w14["status"] == "completed" and w14["resolvedBy"] == "@owner:example.org",
+              "owner card answer Done resolves the request to completed")
+        h15 = cli("human-action", "request", "--action", "Plug in the drive")
+        c15 = cli("human-action", "complete", h15["requestId"], "--note", "done irl")
+        check(c15["status"] == "completed",
+              "API complete path resolves the request")
+        act15 = pending_action_for(h15["requestId"], store)
+        check(act15 is not None and act15["status"] == "resolved",
+              "API completion closes the mirrored card (no dangling question)")
+        s15 = cli("human-action", "status", h15["requestId"])
+        check(s15["status"] == "completed" and s15["result"] == {"note": "done irl"},
+              "human_action status returns the terminal record")
     finally:
         daemon.terminate()
         try:

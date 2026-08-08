@@ -144,7 +144,7 @@ class RuntimeDispatcher:
         approval by design."""
         n = relinked = 0
         for rec in self.store.pending():
-            if rec["requestType"] in ("approval", "elicitation"):
+            if rec["requestType"] in ("approval", "elicitation", "human_action"):
                 self._ha_of[rec["requestId"]] = ha_action_id(rec["requestId"])
                 relinked += 1
             elif rec["requestType"] == "capability":
@@ -191,6 +191,13 @@ class RuntimeDispatcher:
                 raise ProtocolError(-32602, f"{etype} requires options")
             return self._issue("elicitation", method, params,
                                required=("question",))
+        if method == "human_action.request":
+            return self._issue("human_action", method, params,
+                               required=("action",))
+        if method in ("human_action.complete", "human_action.decline"):
+            return self._human_action_settle(method, params)
+        if method == "human_action.status":
+            return self._get(params)
         if method == "capability.execute":
             return await self._capability(params)
         if method == "request.get":
@@ -275,8 +282,9 @@ class RuntimeDispatcher:
         rec = self.store.create(rtype, method, self.actor_id, params,
                                 task_id=params.get("taskId"),
                                 expires_in_s=params.get("expiresInS"))
-        opener = (self.ha.open_approval if rtype == "approval"
-                  else self.ha.open_elicitation)
+        opener = {"approval": self.ha.open_approval,
+                  "human_action": self.ha.open_human_action}.get(
+                      rtype, self.ha.open_elicitation)
         try:
             self._ha_of[rec["requestId"]] = opener(rec)
         except Exception as e:  # noqa: BLE001 — mirror failure = failed request
@@ -289,6 +297,34 @@ class RuntimeDispatcher:
             raise ProtocolError(-32603,
                                 f"could not open the human-action card: {e}") from e
         return {"requestId": rec["requestId"], "status": "pending"}
+
+    def _human_action_settle(self, method: str, params: dict) -> dict:
+        """API-side completion: the human confirmed out-of-band (e.g. via CLI)
+        instead of answering the card. Resolves the request AND closes the
+        card so it does not dangle for CardPoster."""
+        rid = params.get("requestId")
+        if not rid:
+            raise ProtocolError(-32602, "missing required param: requestId")
+        rec = self.store.get(rid)
+        if rec is None:
+            raise ProtocolError(-32602, f"unknown requestId: {rid!r}")
+        if rec["requestType"] != "human_action":
+            raise ProtocolError(-32602,
+                                f"{rid!r} is a {rec['requestType']} request — "
+                                "human_action.complete/decline apply only to "
+                                "human_action requests")
+        if rec["status"] != "pending":
+            return {"requestId": rid, "status": rec["status"],
+                    "alreadyTerminal": True}
+        status = ("completed" if method == "human_action.complete"
+                  else "declined")
+        note = params.get("note")
+        self.store.transition(rid, status,
+                              result={"note": note} if note else None,
+                              resolved_by=self.actor_id)
+        aid = self._ha_of.get(rid) or ha_action_id(rid)
+        self.ha.close(aid, self.actor_id, note=note)
+        return {"requestId": rid, "status": status}
 
     async def _capability(self, params: dict) -> dict:
         action = params.get("action")
@@ -462,6 +498,15 @@ class RuntimeDispatcher:
         status, answers, resolved_by = res
         if status == "expired":
             self.store.transition(request_id, "expired", resolved_by=resolved_by)
+            return
+        if rec["requestType"] == "human_action":
+            chosen = self.ha.first_answer(answers or {},
+                                          [{"label": "Done"}, {"label": "Decline"}])
+            labels = chosen if isinstance(chosen, list) else [chosen]
+            done = any(str(c).strip().lower() == "done" for c in labels if c)
+            self.store.transition(request_id,
+                                  "completed" if done else "declined",
+                                  resolved_by=resolved_by)
             return
         if rec["requestType"] == "approval":
             chosen = self.ha.first_answer(answers or {},

@@ -129,6 +129,19 @@ def main(argv=None) -> int:
     for name in ("health", "details"):
         rt.add_parser(name)
 
+    hac = sub.add_parser("human-action").add_subparsers(dest="cmd", required=True)
+    hreq = hac.add_parser("request")
+    hreq.add_argument("--task-id")
+    hreq.add_argument("--action", required=True)
+    hreq.add_argument("--instructions")
+    hreq.add_argument("--deadline")
+    hreq.add_argument("--expires-in", type=float)
+    for name in ("complete", "decline", "status"):
+        p2 = hac.add_parser(name)
+        p2.add_argument("request_id")
+        if name in ("complete", "decline"):
+            p2.add_argument("--note")
+
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsub = tsk.add_parser("submit")
     tsub.add_argument("text")
@@ -164,6 +177,18 @@ def main(argv=None) -> int:
             result = _rpc(f"sutando.{args.cmd}", {}, timeout=15)
         elif args.group == "runtime":
             result = _rpc(f"runtime.{args.cmd}", {}, timeout=15)
+        elif args.group == "human-action":
+            if args.cmd == "request":
+                result = _rpc("human_action.request", {
+                    "taskId": args.task_id, "action": args.action,
+                    "instructions": args.instructions,
+                    "deadline": args.deadline,
+                    "expiresInS": args.expires_in}, timeout=15)
+            else:
+                params = {"requestId": args.request_id}
+                if getattr(args, "note", None):
+                    params["note"] = args.note
+                result = _rpc(f"human_action.{args.cmd}", params, timeout=15)
         elif args.group == "task":
             if args.cmd == "submit":
                 result = _rpc("task.submit", {"task": args.text,
