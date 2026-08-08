@@ -349,6 +349,24 @@ class TestResolveActiveTarget(unittest.TestCase):
                 else:
                     os.environ["CLAUDE_CONFIG_DIR"] = old
 
+    def test_domain_named_lane_with_env_is_deliverable(self):
+        # Dots between alphanumerics are legal (domain-named lanes, in lockstep
+        # with notify.py's rule).
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cfg:
+            os.makedirs(os.path.join(cfg, "channels", "dev.ag2.space"))
+            with open(os.path.join(cfg, "channels", "dev.ag2.space", ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            p = self._write(td, {"channel": "dev.ag2.space", "channel_id": "!r:dev.ag2.space"})
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            try:
+                self.assertEqual(resolve_active_target(p), ("dev.ag2.space", "!r:dev.ag2.space"))
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
     def test_symlinked_out_channel_dir_is_not_deliverable(self):
         # notify.py's sender REFUSES a channel entry that resolves outside
         # channels/ (realpath containment); the probe must agree or we recreate
