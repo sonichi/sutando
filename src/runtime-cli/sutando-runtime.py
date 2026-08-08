@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import socket
 import sys
 import uuid
@@ -144,60 +145,181 @@ async def _chat_async(activity: bool = False) -> None:
                                   "method": method, "params": params},
                                  ensure_ascii=False) + "\n").encode("utf-8"))
 
-    prompt = "\033[33myou ›\033[0m "
-
-    def _show_prompt():
-        sys.stdout.write(prompt)
-        sys.stdout.flush()
-
     _send("task.subscribe", {"activity": activity}, "chat-sub")
     await writer.drain()
-    print("sutando chat — type a task, press enter; results stream back inline. "
-          "Ctrl-D to exit.\n", flush=True)
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        await _chat_tui(reader, writer, _send)
+    else:
+        await _chat_line(reader, writer, _send)
+
+
+async def _chat_line(reader, writer, _send) -> None:
+    # Fallback for pipes / non-tty (scripts, tests): no fixed UI.
+    print("sutando chat — type a task, enter to send; results stream. Ctrl-D exits.\n",
+          flush=True)
     loop = asyncio.get_event_loop()
 
     async def pump_stdin():
         while True:
-            _show_prompt()
             line = await loop.run_in_executor(None, sys.stdin.readline)
-            if not line:  # EOF (Ctrl-D)
+            if not line:
                 break
-            text = line.strip()
-            if not text:
-                continue
-            _send("task.submit", {"task": text}, "chat-submit")
-            await writer.drain()
+            t = line.strip()
+            if t:
+                _send("task.submit", {"task": t}, "chat-submit")
+                await writer.drain()
         writer.close()
 
     async def pump_socket():
-        buf = b""
+        b = b""
         while True:
-            chunk = await reader.read(65536)
-            if not chunk:
+            c = await reader.read(65536)
+            if not c:
                 break
-            buf += chunk
-            while b"\n" in buf:
-                raw, buf = buf.split(b"\n", 1)
+            b += c
+            while b"\n" in b:
+                raw, b = b.split(b"\n", 1)
                 if not raw.strip():
                     continue
-                msg = json.loads(raw.decode("utf-8"))
-                m = msg.get("method")
-                if m == "task.result":                       # ← agent reply
-                    p = msg.get("params", {})
-                    print(f"\n\033[36m╭─ agent · {p.get('taskId')}\033[0m\n"
-                          f"{p.get('result', '').rstrip()}\n"
-                          f"\033[36m╰─\033[0m\n", flush=True)
-                    _show_prompt()  # restore the input prompt under the reply
-                elif m == "activity":                        # ⚙ step feed
-                    print(f"  \033[2m⚙ {msg.get('params', {}).get('step')}\033[0m",
+                m = json.loads(raw.decode("utf-8"))
+                if m.get("method") == "task.result":
+                    p = m.get("params", {})
+                    print(f"\n← {p.get('taskId')}\n{p.get('result', '').rstrip()}\n",
                           flush=True)
-                elif (isinstance(msg.get("result"), dict) and
-                      msg["result"].get("taskId") and
-                      msg.get("id") == "chat-submit"):        # › your task, sent
-                    print(f"\033[33m› you · {msg['result']['taskId']} "
-                          f"(sent)\033[0m", flush=True)
-
+                elif m.get("method") == "activity":
+                    print(f"  ⚙ {m.get('params', {}).get('step')}", flush=True)
     await asyncio.gather(pump_stdin(), pump_socket())
+
+
+async def _chat_tui(reader, writer, _send) -> None:
+    # Fixed-bottom compose box: a pinned "› " input at the bottom; everything
+    # you send + all streamed output scrolls in the region ABOVE it, so the
+    # input line is never clobbered mid-typing (the flooding fix). No deps —
+    # terminal scroll-region + a raw-mode line buffer (UTF-8 aware).
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    out = sys.stdout
+    loop = asyncio.get_event_loop()
+    buf: list[str] = []
+    pend = bytearray()
+    done = loop.create_future()
+
+    def dims():
+        s = shutil.get_terminal_size((80, 24))
+        return s.lines, s.columns
+
+    def draw_input():
+        rows, _ = dims()
+        out.write(f"\033[{rows};1H\033[K\033[33m› \033[0m" + "".join(buf))
+        out.flush()
+
+    def emit(line):
+        rows, _ = dims()
+        out.write("\0337")                       # save cursor (DECSC)
+        out.write(f"\033[{rows - 2};1H\n")        # bottom of scroll region + LF => scroll up
+        out.write(line.replace("\n", " "))        # text on the fresh bottom line
+        out.write("\0338")                       # restore cursor (DECRC)
+        draw_input()
+
+    def add(ch):
+        buf.append(ch)
+        out.write(ch)
+        out.flush()
+
+    def on_enter():
+        text = "".join(buf).strip()
+        buf.clear()
+        if text:
+            emit(f"\033[33m› you\033[0m {text}")
+            _send("task.submit", {"task": text}, "chat-submit")
+        draw_input()
+
+    def on_key():
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            data = b""
+        if not data:
+            if not done.done():
+                done.set_result(None)
+            return
+        for b in data:
+            if pend:
+                pend.append(b)
+                try:
+                    add(pend.decode()); pend.clear()
+                except UnicodeDecodeError:
+                    pass
+                continue
+            if b in (0x0d, 0x0a):                 # Enter
+                on_enter()
+            elif b in (0x7f, 0x08):               # Backspace
+                if buf:
+                    buf.pop(); draw_input()
+            elif b == 0x04:                       # Ctrl-D (empty) → exit
+                if not buf and not done.done():
+                    done.set_result(None)
+            elif b == 0x03:                       # Ctrl-C → exit
+                if not done.done():
+                    done.set_result(None)
+            elif b < 0x20:                        # other control → ignore
+                pass
+            elif b < 0x80:                        # ASCII printable
+                add(chr(b))
+            else:                                 # UTF-8 lead byte
+                pend.append(b)
+                try:
+                    add(pend.decode()); pend.clear()
+                except UnicodeDecodeError:
+                    pass
+
+    async def pump_socket():
+        b = b""
+        while not done.done():
+            c = await reader.read(65536)
+            if not c:
+                break
+            b += c
+            while b"\n" in b:
+                raw, b = b.split(b"\n", 1)
+                if not raw.strip():
+                    continue
+                m = json.loads(raw.decode("utf-8"))
+                meth = m.get("method")
+                if meth == "task.result":
+                    p = m.get("params", {})
+                    emit(f"\033[36m╭─ agent · {p.get('taskId')}\033[0m")
+                    for ln in p.get("result", "").rstrip().split("\n"):
+                        emit(ln)
+                    emit("\033[36m╰─\033[0m")
+                elif meth == "activity":
+                    emit(f"  \033[2m⚙ {m.get('params', {}).get('step')}\033[0m")
+        if not done.done():
+            done.set_result(None)
+
+    tty.setcbreak(fd)                             # raw-ish; keeps Ctrl-C signal off (we read 0x03)
+    rows, cols = dims()
+    out.write("\033[2J\033[H")                    # clear + home
+    out.write(f"\033[1;{rows - 2}r")               # scroll region = rows 1..rows-2
+    out.write(f"\033[{rows - 1};1H" + "─" * cols)   # fixed separator row
+    draw_input()
+    out.flush()
+    loop.add_reader(fd, on_key)
+    ps = asyncio.ensure_future(pump_socket())
+    try:
+        emit("sutando chat — type below; your messages + results appear here. "
+             "Ctrl-D to exit.")
+        await done
+    finally:
+        loop.remove_reader(fd)
+        ps.cancel()
+        out.write("\033[r")                       # reset scroll region
+        out.write(f"\033[{dims()[0]};1H\r\n")
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out.flush()
+        writer.close()
 
 
 def _chat(activity: bool = False) -> int:
