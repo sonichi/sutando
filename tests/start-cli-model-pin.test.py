@@ -107,6 +107,33 @@ def case_tmux_defaults_clear_both_scopes() -> list[str]:
     return fails
 
 
+def _run_launcher(env: dict, log: Path, timeout: int = 45) -> "tuple[str, bool]":
+    """Run start-cli.sh capturing to a FILE, not a pipe. communicate() waits for EOF,
+    so any backgrounded descendant inheriting stdout blocks it until timeout."""
+    import signal
+    with open(log, "w") as fh:
+        proc = subprocess.Popen(
+            ["/bin/bash", str(SCRIPT)], env=env, stdin=subprocess.DEVNULL,
+            stdout=fh, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        finally:
+            # pgid IS proc.pid (start_new_session). Unconditional: spawned
+            # monitors outlive a clean exit.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+    return (log.read_text() if log.exists() else ""), timed_out
+
+
 def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
     """Drives the real script on its tmux path (scratch socket, never the live
     core's): proves the clear RUNS, where the static case only proves it exists."""
@@ -151,26 +178,9 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
             }
             # The script may exec `tmux attach` and block; that is fine. Kill the
             # whole group after the clear has had its chance to run.
-            proc = subprocess.Popen(
-                ["/bin/bash", str(SCRIPT)], env=env, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, start_new_session=True)
-            try:
-                out = proc.communicate(timeout=45)[0] or ""
-            except subprocess.TimeoutExpired:
-                out = ""
-            finally:
-                # pgid IS proc.pid (start_new_session), so no racy getpgid.
-                # Unconditional: spawned monitors outlive a clean exit.
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                try:
-                    out = (out or "") + (proc.communicate(timeout=10)[0] or "")
-                except (subprocess.TimeoutExpired, ValueError):
-                    pass
-                proc.wait(timeout=10)
+            out, timed_out = _run_launcher(env, td / "launcher.log")
+            if timed_out:
+                return ["tmux-launch) launcher did not exit within the timeout"]
             if "tmux not found" in out:
                 return ["tmux-launch) script skipped its tmux path — fixture never reached the clear"]
 
@@ -224,24 +234,9 @@ def case_fresh_socket_server_is_born_unpinned() -> list[str]:
                 "SUTANDO_TMUX_SOCKET": str(sock),
                 "SUTANDO_CORE_MODEL": "opus",   # the pin is in the LAUNCHER's env
             }
-            proc = subprocess.Popen(
-                ["/bin/bash", str(SCRIPT)], env=env, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, start_new_session=True)
-            try:
-                out = proc.communicate(timeout=45)[0] or ""
-            except subprocess.TimeoutExpired:
-                out = ""
-            finally:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                try:
-                    out = (out or "") + (proc.communicate(timeout=10)[0] or "")
-                except (subprocess.TimeoutExpired, ValueError):
-                    pass
-                proc.wait(timeout=10)
+            out, timed_out = _run_launcher(env, td / "launcher.log")
+            if timed_out:
+                return ["fresh-socket) launcher did not exit within the timeout"]
             if "tmux not found" in out:
                 return ["fresh-socket) script skipped its tmux path — never reached the create"]
             if tm("list-sessions").returncode != 0:
@@ -310,20 +305,12 @@ def case_bare_invocation_still_warns_on_a_pinned_live_core() -> list[str]:
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
             }
-            proc = subprocess.Popen(
-                ["/bin/bash", str(SCRIPT)], env=env, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, start_new_session=True)
-            try:
-                out = proc.communicate(timeout=45)[0] or ""
-            except subprocess.TimeoutExpired:
-                out = ""
-            finally:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                proc.wait(timeout=10)
+            out, timed_out = _run_launcher(env, td / "launcher.log")
+            if timed_out:
+                # A hung launcher is not the same finding as a silent one; the old
+                # message printed '' for both and sent the diagnosis the wrong way.
+                return [f"pinned-attach) launcher did not exit within the timeout; "
+                        f"captured so far: {out.strip()[:160]!r}"]
             if "already running" not in out:
                 return [f"pinned-attach) script did not take the attach path: {out.strip()[:200]!r}"]
             for scope, label in ((["-g"], "global"), (["-t", "=sutando-core"], "session")):
