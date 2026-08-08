@@ -60,6 +60,9 @@ SEND_ALLOWED_ROOTS: tuple[str, ...] = (
     # allowed during the transition; resolver picks whichever exists.
     str(shared_personal_path("notes", _REPO)),
     str(_REPO / "docs"),
+    # Derived deliverables (rendered video, exports). Scoped to `generated/`:
+    # `data/` itself holds conversation.sqlite and memory snapshots.
+    str(_REPO / "data" / "generated"),
     str(Path.home() / "Desktop" / "iclr-backups"),
     str(Path.home() / "Documents" / "sutando-launch-assets"),
 )
