@@ -124,10 +124,8 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
                                   capture_output=True, text=True, **kw)
 
         try:
-            # Core FIRST, 'other' LAST: tmux's implicit target is the most
-            # recent session, so an untargeted `setenv -u` clears 'other' and
-            # leaves the core pinned. Reversing this order makes the case pass
-            # even with the bug present.
+            # Core FIRST so tmux's implicit target is 'other': reversing this
+            # makes the case pass even with an untargeted clear.
             tm("new-session", "-d", "-s", "sutando-core",
                "-e", "SUTANDO_CORE_MODEL=opus", "sleep 300")
             tm("new-session", "-d", "-s", "other", "sleep 300")
@@ -152,10 +150,8 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
             except subprocess.TimeoutExpired:
                 out = ""
             finally:
-                # start_new_session makes the child its own group leader, so the
-                # pgid IS proc.pid -- no getpgid, which could race a fast exit.
-                # Unconditional: the script spawns background monitors that
-                # outlive a clean exit and must not leak onto a dev machine.
+                # pgid IS proc.pid (start_new_session), so no racy getpgid.
+                # Unconditional: spawned monitors outlive a clean exit.
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
