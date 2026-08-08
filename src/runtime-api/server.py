@@ -112,7 +112,8 @@ class RuntimeServer:
             agents_view=AgentsView(state_dir) if state_dir else None,
             identity_view=(IdentityView(state_dir, self.actor_id,
                                         channels_dir=_channels_dir(),
-                                        host_label=_host_label())
+                                        host_label=_host_label(),
+                                        runtime_socket=socket_path)
                            if state_dir else None),
             tasks_view=(TasksView(Path(state_dir).parent / "tasks",
                                   Path(state_dir).parent / "results",
