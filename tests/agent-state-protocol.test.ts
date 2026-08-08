@@ -260,16 +260,12 @@ describe('publishCapabilitiesMarker — group E activation switch', () => {
 		} finally { rmSync(ws, { recursive: true, force: true }); }
 	});
 
-	it('publishes UNBOUND (no lockId field) when no acquisition token is available', () => {
-		const ws = mkdtempSync(join(tmpdir(), 'agent-state-caps-unbound-'));
-		try {
-			publishCapabilitiesMarker(ws, { now: () => 777 });
-			const doc = JSON.parse(readFileSync(voiceCapabilitiesPath(ws), 'utf-8'));
-			// No token → no lockId field. The desktop reader requires the token,
-			// so an unbound marker never arms the probe battery (fail closed).
-			assert.deepEqual(doc, { probeIsolation: true, at: 777, pid: process.pid });
-		} finally { rmSync(ws, { recursive: true, force: true }); }
-	});
+	// There is deliberately NO unbound-marker row: `lockId` is a required
+	// parameter, so this repo cannot emit a marker that advertises probe
+	// isolation without binding it to an acquisition. "No token → no
+	// publication" is the caller's gate, proven against a spawned agent in
+	// the integration suite below (fail closed at the writer — the desktop
+	// reader's token requirement is a second fence, not the only one).
 
 	it('is failure-silent: an unwritable target reports via onError, never throws', () => {
 		const errs: unknown[] = [];
@@ -277,7 +273,7 @@ describe('publishCapabilitiesMarker — group E activation switch', () => {
 		const ws = mkdtempSync(join(tmpdir(), 'agent-state-caps-ro-'));
 		try {
 			writeFileSync(join(ws, 'state'), 'occupied');
-			publishCapabilitiesMarker(ws, { onError: (e) => errs.push(e) });
+			publishCapabilitiesMarker(ws, { lockId: 'vl1-test-token', onError: (e) => errs.push(e) });
 			assert.equal(errs.length, 1);
 		} finally { rmSync(ws, { recursive: true, force: true }); }
 	});
@@ -683,6 +679,38 @@ describe('agent.state emission (integration, spawned agent)', () => {
 			const lock = JSON.parse(readFileSync(join(ws, '.voice-agent.pid'), 'utf-8'));
 			assert.equal(marker.pid, lock.pid, 'marker.pid = lock holder pid');
 			assert.equal(marker.lockId, lock.lockId, 'marker.lockId = lock acquisition token');
+		} finally {
+			client.close();
+		}
+	});
+
+	// The FALSE branch of the capability-marker gate — the safety property
+	// itself ("a bodhi without probe isolation never gets an advertising
+	// marker"). Forced via the SUTANDO_TEST_MODE-only detect seam; the agent
+	// otherwise boots normally, so reaching a first frame proves the wiring
+	// init ran PAST the marker site and chose not to publish. Without this
+	// row, deleting the gate would regress silently.
+	it('publishes NO capability marker when bodhi lacks probeState', async () => {
+		const ws = makeWorkspace('no-probe-state');
+		const port = await freePort();
+		const agent = spawnAgent(ws, port, await freePort(), {
+			SUTANDO_TEST_FORCE_NO_PROBE_STATE: '1',
+		});
+
+		const client = await connectClient(port, 90_000);
+		try {
+			const frames = collectFrames(client);
+			await waitFor(() => frames.length >= 1, 20_000, 'immediate agent.state frame');
+			await waitFor(
+				() => agent.stderr().includes('capability marker NOT published'),
+				10_000,
+				'dormant-branch log line',
+			);
+			assert.equal(
+				existsSync(voiceCapabilitiesPath(ws)),
+				false,
+				'no advertising marker for a bodhi without probe isolation',
+			);
 		} finally {
 			client.close();
 		}

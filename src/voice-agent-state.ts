@@ -207,29 +207,31 @@ export function voiceCapabilitiesPath(workspace: string): string {
  * strictly after the lock win (a loser exits 7 first), so marker.{pid,lockId}
  * equal the live lock holder's exactly when the marker describes the running
  * build. The desktop reader requires BOTH equalities plus holder liveness
- * and fails closed otherwise; a marker published without a token (helper
- * output unparseable) is unbound and simply never arms the reader.
+ * and fails closed otherwise. `lockId` is REQUIRED here: with no token there
+ * is nothing binding a marker to its run, so the caller skips publication
+ * entirely (fail closed at the writer, not in another repository) — a marker
+ * on disk is always fully bound.
  * Atomic temp+rename, failure-silent like the lifecycle snapshot: a marker
  * write must never take the voice path down (probes just stay dormant).
  */
 export function publishCapabilitiesMarker(
 	workspace: string,
-	opts?: { now?: () => number; onError?: (err: unknown) => void; lockId?: string },
+	opts: { lockId: string; now?: () => number; onError?: (err: unknown) => void },
 ): void {
 	const target = voiceCapabilitiesPath(workspace);
-	const doc: { probeIsolation: true; at: number; pid: number; lockId?: string } = {
+	const doc = {
 		probeIsolation: true,
-		at: (opts?.now ?? Date.now)(),
+		at: (opts.now ?? Date.now)(),
 		pid: process.pid,
+		lockId: opts.lockId,
 	};
-	if (typeof opts?.lockId === 'string' && opts.lockId) doc.lockId = opts.lockId;
 	const tmp = `${target}-tmp-${process.pid}-${++_tmpCounter}`;
 	try {
 		mkdirSync(dirname(target), { recursive: true });
 		writeFileSync(tmp, JSON.stringify(doc));
 		renameSync(tmp, target);
 	} catch (err) {
-		opts?.onError?.(err);
+		opts.onError?.(err);
 	}
 }
 

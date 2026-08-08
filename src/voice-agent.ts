@@ -855,7 +855,15 @@ async function main() {
 	// silently ignored, so the detect keeps the wiring intent explicit and
 	// lets the pin bump activate it without touching this file. Detection:
 	// the bundled VoiceSession source must mention the option.
+	// Test seam (SUTANDO_TEST_MODE only, same pattern as the injected-close
+	// seam): force the detect false so the suite can prove the FALSE branch
+	// of the capability-marker gate against a spawned agent — the property
+	// "a bodhi without probe isolation never gets an advertising marker"
+	// must fail loudly if the gate regresses.
 	const bodhiSupportsProbeState = (() => {
+		if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_FORCE_NO_PROBE_STATE === '1') {
+			return false;
+		}
 		try { return String(VoiceSession).includes('probeState'); } catch { return false; }
 	})();
 
@@ -964,13 +972,21 @@ async function main() {
 	// have — npm can resolve a different bodhi than the lockfile's (failed or
 	// cached install, hand-edited package.json), and an ungated marker would
 	// then point the supervisor's probes at the normal attach path.
-	if (bodhiSupportsProbeState) {
+	// ALSO gated on the acquisition token (review round 5): with no lockId
+	// there is nothing binding the marker to this run, and an unbound marker
+	// has no consumer — the desktop reader requires the token. Skipping
+	// publication fails closed AT THE WRITER, so the guarantee is local
+	// instead of living across a repo boundary. Net contract: a marker on
+	// disk is always fully bound.
+	if (bodhiSupportsProbeState && typeof voiceLockId === 'string' && voiceLockId) {
 		publishCapabilitiesMarker(WORKSPACE_DIR, {
 			lockId: voiceLockId,
 			onError: (err) => console.error(`${ts()} [AgentState] capabilities marker write failed: ${(err as Error)?.message ?? err}`),
 		});
-	} else {
+	} else if (!bodhiSupportsProbeState) {
 		console.error(`${ts()} [AgentState] bodhi lacks probeState — capability marker NOT published (probes stay dormant)`);
+	} else {
+		console.error(`${ts()} [AgentState] no acquisition token from the lock helper — capability marker NOT published (probes stay dormant)`);
 	}
 	const sendAgentStateFrame = (frame: AgentStateV1): void => {
 		try {
