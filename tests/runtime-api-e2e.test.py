@@ -652,6 +652,24 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
     check(len(_stopped) == 1 and _stopped[0]["status"] == "stopped",
           "SIGTERM shutdown marked the instance manifest stopped")
 
+    # 18. the start verb: with the daemon fully down, `instance start` reads
+    # the manifest, execs the recorded launcher and waits for the endpoint —
+    # the acceptance test's "new client can START the instance" leg. The
+    # spawned daemon inherits this test's env, so it boots on the same tmp
+    # socket/registry; verify identity end-to-end, then shut it down.
+    st18 = cli("instance", "start", "@test-agent:example.org")
+    check(st18.get("ok") is True and st18.get("state") == "started",
+          "start verb boots a stopped instance via its manifest launcher")
+    i18 = cli("sutando", "info")
+    check(i18.get("agentId") == "@test-agent:example.org",
+          "restarted instance answers with the same identity")
+    st18b = cli("instance", "start", "@test-agent:example.org")
+    check(st18b.get("state") == "already_running",
+          "start verb is idempotent on a live instance")
+    import signal as _signal
+    os.kill(st18["pid"], _signal.SIGTERM)
+    time.sleep(1.5)
+
     print(f"\n{'PASS — runtime-api v0 E2E green' if not FAILS else f'FAILED ({len(FAILS)})'}")
     return 1 if FAILS else 0
 

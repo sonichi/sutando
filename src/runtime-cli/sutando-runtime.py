@@ -145,6 +145,9 @@ def main(argv=None) -> int:
 
     ins = sub.add_parser("instance").add_subparsers(dest="cmd", required=True)
     ins.add_parser("list")
+    ist = ins.add_parser("start")
+    ist.add_argument("agent_id")
+    ist.add_argument("--wait", type=float, default=10.0)
 
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsk.add_parser("list")
@@ -157,9 +160,14 @@ def main(argv=None) -> int:
 
     args = ap.parse_args(argv)
     if args.group == "instance":
-        # Registry discovery is FILE-based by design — it must answer even
-        # when no daemon is running, so it never touches the socket.
+        # Registry discovery/start are FILE-based by design — they must work
+        # with no daemon running, so they never require the socket.
         import instance_registry
+        if args.cmd == "start":
+            out = instance_registry.start_instance(args.agent_id,
+                                                   wait_s=args.wait)
+            print(json.dumps(out, ensure_ascii=False, indent=1))
+            return 0 if out.get("ok") else 1
         print(json.dumps({"instances": instance_registry.list_instances()},
                          ensure_ascii=False, indent=1))
         return 0

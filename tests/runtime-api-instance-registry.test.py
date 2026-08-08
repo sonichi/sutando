@@ -95,6 +95,44 @@ class InstanceRegistryTests(unittest.TestCase):
         m = reg.list_instances()[0]
         self.assertEqual(m["launcher"]["args"], ["serve"])
 
+    def test_start_instance_paths(self):
+        import stat as _stat
+        run = Path(self.tmp.name) / "run"
+        run.mkdir()
+        sock = run / "rt.sock"
+        # fake launcher: binds the endpoint socket, then sleeps
+        launcher = Path(self.tmp.name) / "fake-serve"
+        launcher.write_text(
+            "#!/usr/bin/env python3\n"
+            "import socket, sys, time\n"
+            f"s = socket.socket(socket.AF_UNIX)\n"
+            f"s.bind({str(sock)!r})\n"
+            "s.listen(8)\n"
+            "while True:\n"
+            "    c, _ = s.accept()\n"
+            "    c.close()\n")
+        launcher.chmod(launcher.stat().st_mode | _stat.S_IXUSR)
+        # not registered
+        self.assertFalse(reg.start_instance("ghost")["ok"])
+        # registered but no launcher
+        reg.write_manifest("a1", endpoint=str(sock))
+        self.assertIn("launcher", reg.start_instance("a1")["error"])
+        # full start: launcher binds the socket -> started + desired running
+        reg.write_manifest("a1", endpoint=str(sock),
+                           launcher={"type": "command",
+                                     "executable": str(launcher),
+                                     "args": []})
+        out = reg.start_instance("a1", wait_s=8)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["state"], "started")
+        self.assertEqual(reg.read_desired_state("a1")["desired_state"],
+                         "running")
+        # idempotent: socket alive -> already_running, no second spawn
+        out2 = reg.start_instance("a1")
+        self.assertEqual(out2["state"], "already_running")
+        import subprocess
+        subprocess.run(["pkill", "-f", str(launcher)], capture_output=True)
+
     def test_agent_id_is_filename_sanitized(self):
         p = reg.write_manifest("../evil/../../id")
         self.assertEqual(p.parent, Path(self.tmp.name))

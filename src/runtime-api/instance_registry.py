@@ -165,3 +165,59 @@ def read_desired_state(agent_id: str) -> dict | None:
         return json.loads(_desired_path(agent_id).read_text())
     except (OSError, ValueError):
         return None
+
+
+# ── start (lifecycle-lite, M2.5) ────────────────────────────────────────────
+# Client-side by necessity: a STOPPED instance has no daemon to ask, so the
+# discovery flow is registry -> manifest -> probe socket -> launcher. Starting
+# a stopped instance is NOT the self-lifecycle case (nothing running can kill
+# its own caller); stop/restart-of-self remain a separate, gated design.
+
+def _socket_alive(path: str, timeout: float = 1.0) -> bool:
+    import socket as _socket
+    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def start_instance(agent_id: str, wait_s: float = 10.0) -> dict:
+    """Start a registered instance via its manifest launcher. Idempotent on a
+    live instance (already_running). Launches ONLY the structured executable
+    recorded in the 0600 manifest — never a shell string."""
+    import subprocess
+    p = _manifest_path(agent_id)
+    try:
+        m = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"ok": False, "error": f"not_registered: no manifest for {agent_id!r}"}
+    endpoint = (m.get("endpoint") or {}).get("path")
+    if endpoint and _socket_alive(endpoint):
+        return {"ok": True, "state": "already_running", "endpoint": endpoint}
+    launcher = m.get("launcher") or {}
+    exe, args = launcher.get("executable"), launcher.get("args") or []
+    if launcher.get("type") != "command" or not exe:
+        return {"ok": False, "error": "manifest has no usable command launcher"}
+    if not os.access(exe, os.X_OK):
+        return {"ok": False, "error": f"launcher executable missing or not executable: {exe}"}
+    proc = subprocess.Popen([exe, *args], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if endpoint and _socket_alive(endpoint):
+            write_desired_state(agent_id, "running", reason="start verb")
+            return {"ok": True, "state": "started", "pid": proc.pid,
+                    "endpoint": endpoint}
+        if proc.poll() is not None:
+            return {"ok": False,
+                    "error": f"launcher exited rc={proc.returncode} before the "
+                             "endpoint came up"}
+        time.sleep(0.2)
+    return {"ok": False, "error": f"endpoint not ready within {wait_s}s "
+                                  "(launcher still running)", "pid": proc.pid}
