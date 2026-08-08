@@ -264,6 +264,103 @@ def case_fresh_socket_server_is_born_unpinned() -> list[str]:
     return fails
 
 
+def case_bare_invocation_still_warns_on_a_pinned_live_core() -> list[str]:
+    """The upgrade trap end to end: new launcher, OLD pinned process already running.
+    The attach path clears tmux env without replacing the process, so health must keep
+    warning from the immutable argv rather than going green on a clean tmux."""
+    import importlib.util
+    import shutil
+    import signal
+    tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    if not tmux:
+        return ["pinned-attach) tmux not found — cannot exercise the attach path"]
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        bind = td / "bin"
+        bind.mkdir()
+        (td / "home").mkdir()
+        sock = td / "attach-tmux.sock"
+        stub = bind / "claude"
+        stub.write_text("#!/bin/bash\nsleep 300\n")
+        stub.chmod(0o755)
+
+        def tm(*args):
+            return subprocess.run([tmux, "-S", str(sock), *args],
+                                  capture_output=True, text=True)
+        try:
+            tm("new-session", "-d", "-s", "sutando-core",
+               f"{stub} --name sutando-core --model opus")
+            pids = tm("list-panes", "-s", "-t", "=sutando-core",
+                      "-F", "#{pane_pid}").stdout.split()
+            staged = [subprocess.run(["ps", "-o", "args=", "-p", q],
+                                     capture_output=True, text=True).stdout for q in pids]
+            if not any("--model opus" in a and "--name sutando-core" in a for a in staged):
+                return [f"pinned-attach) fixture staged no pinned core: {staged!r}"]
+            # core_claude_pids() reads `pgrep -ax claude`; report the staged pid so the
+            # script takes its already-running attach path instead of launching.
+            pg = bind / "pgrep"
+            pg.write_text("#!/bin/bash\necho '%s claude'\n" % pids[0])
+            pg.chmod(0o755)
+            tm("setenv", "-g", "SUTANDO_CORE_MODEL", "opus")
+            tm("setenv", "-t", "=sutando-core", "SUTANDO_CORE_MODEL", "opus")
+
+            env = {
+                "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin",
+                "HOME": str(td / "home"),
+                "SUTANDO_TMUX_SOCKET": str(sock),
+            }
+            proc = subprocess.Popen(
+                ["/bin/bash", str(SCRIPT)], env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True)
+            try:
+                out = proc.communicate(timeout=45)[0] or ""
+            except subprocess.TimeoutExpired:
+                out = ""
+            finally:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                proc.wait(timeout=10)
+            if "already running" not in out:
+                return [f"pinned-attach) script did not take the attach path: {out.strip()[:200]!r}"]
+            for scope, label in ((["-g"], "global"), (["-t", "=sutando-core"], "session")):
+                if "SUTANDO_CORE_MODEL=opus" in tm("show-environment", *scope,
+                                                   "SUTANDO_CORE_MODEL").stdout:
+                    fails.append(f"pinned-attach) {label} scope not cleared by the attach path")
+            still = [subprocess.run(["ps", "-o", "args=", "-p", q],
+                                    capture_output=True, text=True).stdout for q in pids]
+            if not any("--model opus" in a for a in still):
+                return ["pinned-attach) the pinned process died — nothing left to detect"]
+
+            spec = importlib.util.spec_from_file_location(
+                "hc_attach", REPO / "src" / "health-check.py")
+            hc = importlib.util.module_from_spec(spec)
+            sys.modules["hc_attach"] = hc
+            try:
+                spec.loader.exec_module(hc)
+            except SystemExit:
+                pass
+            prev = os.environ.get("SUTANDO_TMUX_SOCKET")
+            os.environ["SUTANDO_TMUX_SOCKET"] = str(sock)
+            try:
+                r = hc.check_core_model_pin()
+            finally:
+                if prev is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = prev
+            if r.get("status") != "warn":
+                fails.append(f"pinned-attach) health went GREEN on a pinned live core: {r}")
+            elif "opus" not in r.get("detail", ""):
+                fails.append(f"pinned-attach) warn does not name the pinned model: {r}")
+        finally:
+            tm("kill-server")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("default", case_default_no_model_flag),
@@ -271,6 +368,7 @@ def main() -> int:
         ("tmux-clear", case_tmux_defaults_clear_both_scopes),
         ("tmux-launch", case_tmux_launch_clears_a_pinned_socket),
         ("fresh-socket", case_fresh_socket_server_is_born_unpinned),
+        ("pinned-attach", case_bare_invocation_still_warns_on_a_pinned_live_core),
     ]
     all_failures = []
     for label, fn in cases:
