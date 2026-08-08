@@ -148,8 +148,9 @@ def test_rendered_episode_root_is_allowed():
     """
     sys.path.insert(0, str(SRC))
     import send_allowlist as sa
+    from util_paths import legacy_dotted_workspace_path
 
-    wanted = str(Path.home() / ".sutando" / "workspace" / "notes" / "generated")
+    wanted = str(legacy_dotted_workspace_path("notes", "generated"))
     assert wanted in sa.SEND_ALLOWED_ROOTS, (
         f"{wanted} is not in SEND_ALLOWED_ROOTS — rendered episodes are "
         f"unsendable. Got: {sa.SEND_ALLOWED_ROOTS}"

@@ -93,6 +93,22 @@ def _workspace_root() -> Path:
         return Path.home() / "sutando-workspace"
 
 
+# Retired as a RESOLUTION target (see `_workspace_root`) but still holds real
+# content on pre-v0.8 hosts — import this instead of re-hardcoding the literal.
+_LEGACY_DOTTED_WORKSPACE = Path.home() / ".sutando" / "workspace"
+
+
+def legacy_dotted_workspace_path(*subpath: str) -> Path:
+    """Path under the retired `~/.sutando/workspace` workspace default.
+
+    NOT a resolution fallback — `_workspace_root()` owns that, and this must
+    never be used to resolve the live workspace. It exists for the narrow case
+    of reaching content written there before the v0.8 move that has not been
+    migrated, so exactly one file carries the literal.
+    """
+    return _LEGACY_DOTTED_WORKSPACE.joinpath(*subpath)
+
+
 def _host_label() -> str:
     r"""Per-host directory label. Precedence:
       1. `$SUTANDO_HOST_LABEL` (or legacy `$SUTANDO_HOST_OVERRIDE`)
