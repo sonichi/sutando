@@ -120,7 +120,8 @@ class RuntimeServer:
             tasks_view=(TasksView(Path(state_dir).parent / "tasks",
                                   Path(state_dir).parent / "results",
                                   self.actor_id,
-                                  hitl_lookup=self._pending_hitl_types)
+                                  hitl_lookup=self._pending_hitl_types,
+                                  instance=instance_id())
                         if state_dir else None),
             runtime_view=(RuntimeView(state_dir, host_label=host_label,
                                       runtime_socket=socket_path)

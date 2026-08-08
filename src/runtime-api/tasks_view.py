@@ -48,7 +48,7 @@ _WAITING_STATE = {"elicitation": "waiting_for_input",
 
 class TasksView:
     def __init__(self, tasks_dir: str | Path, results_dir: str | Path,
-                 actor_id: str, hitl_lookup=None):
+                 actor_id: str, hitl_lookup=None, instance: str | None = None):
         """`hitl_lookup(task_id) -> [requestType, ...]` lists the task's
         PENDING human-in-the-loop requests; injected by the composer (the
         daemon binds it to the request store) so this view stays store-free."""
@@ -56,6 +56,7 @@ class TasksView:
         self.results_dir = Path(results_dir)
         self.actor_id = actor_id
         self.hitl_lookup = hitl_lookup
+        self.instance = instance
 
     # ── task.submit ─────────────────────────────────────────────────────────
     def submit(self, task_text: str, priority: str = "normal") -> dict:
@@ -73,7 +74,9 @@ class TasksView:
                    f"channel_id: runtime-api\n"
                    f"user_id: {_one_line(self.actor_id)}\n"
                    f"access_tier: owner\n"
-                   f"priority: {priority}\n")
+                   f"priority: {priority}\n"
+                   + (f"instance_id: {_one_line(self.instance)}\n"
+                      if self.instance else ""))
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.tasks_dir / f".{task_id}.tmp"
         tmp.write_text(content)
@@ -118,7 +121,8 @@ class TasksView:
         th = parse_task_headers_lenient(p.read_text())
         out = {"taskId": task_id, "task": th.body,
                "state": self.status(task_id)["state"]}
-        for k in ("source", "timestamp", "priority", "access_tier"):
+        for k in ("source", "timestamp", "priority", "access_tier",
+                  "instance_id"):
             v = th.get(k)
             if v:
                 out[k] = v

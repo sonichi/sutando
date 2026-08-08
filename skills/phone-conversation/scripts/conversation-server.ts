@@ -208,7 +208,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'author_name|author_id|' +
 	'chat_id|thread_ts|reply_to_event|reply_to_me|callSid|caller|from|' +
 	'call_sid|hint|instructions|transcript|content_modalities|media_form|' +
-	'attachments|platform_card)\\s*:',
+	'attachments|platform_card|instance_id)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;

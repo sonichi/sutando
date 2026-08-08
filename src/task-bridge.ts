@@ -94,6 +94,7 @@ const _HEADER_KEYS = [
 	'thread_ts', 'reply_to_event', 'reply_to_me', 'callSid', 'caller',
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
+	'instance_id',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;

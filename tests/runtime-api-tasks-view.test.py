@@ -107,6 +107,18 @@ class TasksViewTests(unittest.TestCase):
         (self.results / f"{tid}.txt").write_text("r")
         self.assertEqual(view.status(tid)["state"], "done")
 
+    def test_submit_stamps_instance_id_when_scoped(self):
+        view = TasksView(self.tasks, self.results, "@me:x",
+                         instance="qingyun-001")
+        tid = view.submit("scoped work")["taskId"]
+        th = parse_task_headers_lenient(self._task_file(tid).read_text())
+        self.assertEqual(th.get("instance_id"), "qingyun-001")
+        self.assertEqual(view.details(tid)["instance_id"], "qingyun-001")
+        # unscoped view writes no instance header (bridge tasks unchanged)
+        tid2 = self.view.submit("plain work")["taskId"]
+        th2 = parse_task_headers_lenient(self._task_file(tid2).read_text())
+        self.assertIsNone(th2.get("instance_id"))
+
     def test_status_broken_hitl_lookup_fails_open(self):
         def boom(tid):
             raise RuntimeError("store down")
