@@ -48,6 +48,9 @@ class TargetNoLeakTests(unittest.TestCase):
         self.assertEqual(hook._target("Bash", {"command": "cd /repo && python3 run.py"}), "python3 run.py")
         # a bare cd (no &&) still shows cd
         self.assertEqual(hook._target("Bash", {"command": "cd /somewhere"}), "cd")
+        # newline-multiline: skip leading cd line, surface the real command
+        self.assertEqual(hook._target("Bash", {"command": "cd /repo\ngit push origin"}), "git push")
+        self.assertEqual(hook._target("Bash", {"command": "cd /a/b\npython3 x.py\ngit add ."}), "python3 x.py")
 
     def test_file_and_pattern_tools_are_terse(self):
         self.assertEqual(hook._target("Edit", {"file_path": "/a/b/server.py"}), "server.py")

@@ -33,10 +33,20 @@ def _target(tool: str, ti: dict) -> str:
             # Verb only (+ safe subcommand for verb-based tools) — never args,
             # which can carry secrets (export FOO=…, curl -H "Authorization …").
             cmd = str(ti.get("command", ""))
-            # Skip a leading `cd <dir> &&` so the REAL command shows, not "cd".
-            if cmd.strip().startswith("cd ") and "&&" in cmd:
-                cmd = cmd.split("&&", 1)[1]
-            parts = cmd.split()
+            # Reduce to the first REAL command so the verb reflects the work, not
+            # a `cd` prefix — handles both `cd <dir> && real` and newline-multiline
+            # `cd <dir>\nreal` (our common shapes).
+            real = ""
+            for line in cmd.splitlines():
+                line = line.strip()
+                if line.startswith("cd ") and "&&" in line:
+                    real = line.split("&&", 1)[1].strip()
+                    break
+                if not line or line == "cd" or line.startswith("cd "):
+                    continue
+                real = line
+                break
+            parts = (real or cmd).split()
             if not parts:
                 return ""
             verb = parts[0]
