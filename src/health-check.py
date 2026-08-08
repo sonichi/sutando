@@ -6627,11 +6627,12 @@ def _interpret_core_model_pin(pinned: list, socket: str) -> dict:
         "name": name,
         "status": "warn",
         "detail": (
-            f"core is PINNED by wedge recovery ({where}) — an emergency downgrade that "
-            f"nothing clears and that survives every bare rerun. If the core did not just "
-            f"wedge, clear it: {fixes}. Clearing tmux alone is not durable: start-cli.sh "
-            f"re-supplies SUTANDO_CORE_MODEL from its own launching env on the next "
-            f"new-session, so the launching process has to be replaced too."
+            f"core model is PINNED ({where}) — nothing in this repo sets this any more, "
+            f"so the pin is LEFT OVER from the retired wedge-recovery downgrade or was "
+            f"set by hand. It survives every bare rerun and no longer expires with the "
+            f"mechanism that created it. Clear it: {fixes}. Clearing tmux alone is not "
+            f"durable: start-cli.sh re-supplies SUTANDO_CORE_MODEL from its own launching "
+            f"env on the next new-session, so the launching process has to be replaced too."
         ),
     }
 
@@ -7701,9 +7702,10 @@ def notify_gateway_for_failures(
 #     file serializes the decision so a manual + launchd run can't double-fire.
 #   - Hard cap of RECOVER_MAX_PER_HOUR; past that it DMs "giving up" and stops,
 #     so a pathological wedge can't become a restart loop.
-#   - Graceful degradation: the FIRST restart of an episode keeps 1M; if the
-#     wedge recurs (the 1M restart didn't hold), the next restart pins
-#     SUTANDO_CORE_MODEL=opus (standard 200K) so the agent keeps WORKING.
+#   - NO model change. A recurring wedge used to pin SUTANDO_CORE_MODEL=opus
+#     (standard 200K) on the second restart. Removed: nothing cleared or expired
+#     it and every later restart inherited it, so one recovery silently became a
+#     permanent downgrade. The cap above is the bound on a re-wedging core.
 #   - DMs the owner before each restart and records whether the DM succeeded
 #     (last_restart_dm_sent) + logs failures, so a restart is never invisible
 #     even if Slack is down — recovery still proceeds (recovery > notification).
@@ -7825,18 +7827,18 @@ def _resolve_launch_env() -> dict:
     return env
 
 
-def _default_core_restart(standard_context: bool) -> bool:
-    """Run the selected core CLI dispatcher with --restart out-of-process. When
-    standard_context is True and Claude is selected, pin
-    SUTANDO_CORE_MODEL=opus so the restarted core uses the standard 200K window.
-    Codex restarts without a provider-specific model override. Returns True if
-    the restart command exited 0."""
+def _default_core_restart() -> bool:
+    """Run the selected core CLI dispatcher with --restart out-of-process.
+    Returns True if the restart command exited 0.
+
+    Deliberately sets no model: the recovery restart must not change which model
+    the core runs on. It used to pin SUTANDO_CORE_MODEL=opus on a repeat wedge,
+    which nothing cleared or expired and which every later restart inherited.
+    """
     script = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not script.exists():
         return False
     env = _resolve_launch_env()  # pragma: no cover — real-subprocess restart path (integration, not unit)
-    if standard_context and resolve_core_runtime(REPO_DIR) == "claude":
-        env["SUTANDO_CORE_MODEL"] = "opus"
     try:
         proc = subprocess.run(
             ["/bin/bash", str(script), "--restart"],
@@ -7983,15 +7985,10 @@ def recover_core_if_wedged(
                     print("[recover-core] WARNING: give-up DM to owner failed", flush=True)
             return {"action": "gave_up", "restarts_last_hour": len(history)}
 
-        # Escalation: the FIRST restart in the trailing hour keeps 1M; if we're
-        # wedged again after a prior restart, that restart didn't hold — degrade
-        # to standard 200K context so the agent keeps working instead of re-wedging.
-        standard_context = len(history) >= 1
-        mode = "standard" if standard_context else "1m"
-        ctx_note = (
-            "in standard 200K context (the 1M restart didn't hold)" if standard_context
-            else "keeping 1M context"
-        )
+        # No model escalation. A repeat wedge used to degrade the core to the
+        # standard 200K window, which bought a working core and paid for it with
+        # a pin nothing cleared. RECOVER_MAX_PER_HOUR + the give-up DM above are
+        # the bound on a re-wedging core; a quieter model is not.
         # DM the owner BEFORE restarting. Capture the result (blocker 2): if the
         # DM fails we still restart (recovery > notification — don't leave the
         # core wedged because Slack is down), but we record dm_sent=False and log
@@ -7999,26 +7996,27 @@ def recover_core_if_wedged(
         dm_ok = send(
             f":hourglass: *Sutando core wedged* — oldest task stuck {oldest_age // 60} min "
             f"while the core process is alive (likely the 1M usage-credit gate or a "
-            f"stalled turn). Auto-restarting {ctx_note}. Queued tasks are preserved."
+            f"stalled turn). Auto-restarting on its configured model. Queued tasks "
+            f"are preserved."
         )
         if not dm_ok:
-            print(f"[recover-core] WARNING: wedge-restart DM failed; restarting anyway (mode={mode})", flush=True)
+            print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 
-        if not restart_fn(standard_context):
+        if not restart_fn():
             # Restart launch failed — don't burn a cooldown/history slot, and
             # keep the observation so we stay confirmed and retry next pass.
-            return {"action": "restart_failed", "mode": mode, "dm_sent": dm_ok}
+            return {"action": "restart_failed", "dm_sent": dm_ok}
 
         history.append(now)
         state["restart_history"] = history
         state["last_restart"] = now
-        state["last_restart_mode"] = mode
+        state.pop("last_restart_mode", None)   # retired with the model escalation
         state["last_restart_dm_sent"] = dm_ok
         _reset_observation()  # re-observe after the restart settles
         state.pop("gave_up_at", None)
         _save()
         return {
-            "action": "restarted", "mode": mode, "oldest_age": oldest_age,
+            "action": "restarted", "oldest_age": oldest_age,
             "restarts_last_hour": len(history), "dm_sent": dm_ok,
         }
     finally:
