@@ -63,6 +63,7 @@ from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -167,26 +168,16 @@ def _is_path_sendable(fpath: str) -> bool:
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
-    """Record owner activity — same schema as src/discord-bridge.py."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "ts": int(time.time()),
-            "channel": channel,
-            "summary": summary[:80],
-        }
-        if channel_id:
-            payload["channel_id"] = str(channel_id)
-        # Per-PID staging name: this file is written by four processes (this
-        # bridge + discord/telegram/sparrow). A shared ".json.tmp" name lets two
-        # concurrent writers truncate and interleave the same temp file, so the
-        # rename can publish torn JSON. A per-PID temp is never shared, and
-        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, OWNER_ACTIVITY_FILE)
-    except Exception as e:
-        print(f"  [owner-activity] write failed: {e}", flush=True)
+    """Record owner activity using the shared provider-neutral schema."""
+    _write_owner_activity_shared(
+        OWNER_ACTIVITY_FILE,
+        channel,
+        summary,
+        channel_id,
+        on_error=lambda exc: print(
+            f"  [owner-activity] write failed: {exc}", flush=True
+        ),
+    )
 
 
 def archive_file(src: Path, kind: str, task_id: str) -> None:
@@ -932,17 +923,11 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if not text and not attachment_note:
         return None
 
-    # Owner-activity state is persisted before tier/vault handling below. Use a
-    # redacted preview so an ordinary pasted token never lands in state JSON.
+    # Redact first: a pasted token must never reach state JSON even in a preview.
     initial_secret_filter = filter_chat_secrets(text)
     detected_secret_types = set(initial_secret_filter.secret_types)
     safe_attachment = filter_chat_secrets(attachment_note)
     detected_secret_types.update(safe_attachment.secret_types)
-    write_owner_activity(
-        "slack",
-        initial_secret_filter.text or safe_attachment.text,
-        channel_id=event.get("channel"),
-    )
 
     channel = event.get("channel", "")
     # Reply in-thread for channel @mentions, top-level for DMs. parens for
@@ -969,6 +954,15 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     seeded_ok = _ensure_tier_map_seeded()
     tier_map = load_tier_map()
     access_tier = resolve_access_tier(user_id, tier_map, seeded_ok)
+
+    # Owner-only, as discord-bridge does: the proactive loop reads this file as
+    # owner PRESENCE, so a team/other sender stamping it fakes "owner is here".
+    if access_tier == "owner":
+        write_owner_activity(
+            "slack",
+            initial_secret_filter.text or safe_attachment.text,
+            channel_id=event.get("channel"),
+        )
 
     # Intercept vault commands before any disk write — must happen AFTER
     # access_tier is resolved so untrusted senders cannot write to Keychain.
@@ -1190,12 +1184,6 @@ def handle_message(event, say):
     username = _resolve_username(user_id)
     text = (event.get("text") or "").strip()
     _write_task(event, "Slack DM", text, username)
-
-
-# Markers that the bridge handles specially in result bodies. Same set as
-# discord-bridge.py + telegram-bridge.py — see CLAUDE.md "Result-body
-# protocol markers".
-FILE_MARKER_RE = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
 
 
 def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
