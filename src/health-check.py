@@ -6632,7 +6632,7 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
                 # yields no pid enumerated nothing — unknown, never "no panes".
                 out.append((sess, None))
                 continue
-            seen_claude = read_failed = False
+            read_failed = False
             for pid in pids:
                 ps = subprocess.run(["ps", "-o", "args=", "-p", pid],
                                     capture_output=True, text=True, timeout=10)
@@ -6649,7 +6649,6 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
                     continue
                 if "claude" not in argv:
                     continue
-                seen_claude = True
                 m = re.search(r"--model[= ]+(\S+)", argv)
                 if m:
                     out.append((sess, m.group(1)))
