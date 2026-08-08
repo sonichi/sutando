@@ -6609,9 +6609,8 @@ def _pin_scope_flag(scope: str) -> str:
 
 
 def _core_argv_pins(socket: str, sessions: list) -> list:
-    """[(session, model)] for live cores whose argv carries --model, plus
-    [(session, None)] when no claude argv could be read — argv is immutable, so a
-    tmux clear cannot undo it."""
+    """[(session, model)] for live cores pinned via argv; (session, None) when no
+    argv could be read. argv is immutable, so a tmux clear cannot undo a pin."""
     out = []
     for sess in sessions:
         try:
@@ -6654,9 +6653,8 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
                 m = re.search(r"--model[= ]+(\S+)", argv)
                 if m:
                     out.append((sess, m.group(1)))
-            # ANY unread pane leaves this session unverified. Finding one readable
-            # claude says nothing about the pane we could not read — it may be the
-            # pinned core. Only an all-reads-succeeded session may stay silent.
+            # ANY unread pane leaves the session unverified: a readable unpinned pane says
+            # nothing about the one that failed, which may be the pinned core.
             if read_failed:
                 out.append((sess, None))
         except (OSError, subprocess.SubprocessError):
@@ -7933,9 +7931,8 @@ def _resolve_launch_env() -> dict:
 
 
 def _default_core_restart() -> bool:
-    """Run the selected core CLI dispatcher with --restart out-of-process.
-    Sets no model: recovery must not change which model the core runs on.
-    Returns True if the restart command exited 0."""
+    """Restart the core out-of-process, setting no model: recovery must not change
+    which model the core runs on. True if the restart command exited 0."""
     script = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not script.exists():
         return False

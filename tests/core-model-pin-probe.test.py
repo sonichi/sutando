@@ -186,9 +186,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertIn("ALSO pinned", r["detail"])
 
     def test_unreadable_argv_WARNS_because_status_is_the_machine_channel(self):
-        """INVERTED from asserting ok. The caveat was in `detail` only, and
-        emit_task_for_failures() gates on status, so the human channel carried it and
-        the machine channel stayed silent about a core that could not be verified."""
+        """INVERTED from asserting ok: emit_task_for_failures() gates on status, so a
+        caveat carried only in `detail` reaches the human channel and nothing else."""
         r = self.hc._interpret_core_model_pin([], "/s", [("sutando-core", None)])
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("could not read argv", r["detail"])
@@ -218,15 +217,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
             self.assertEqual(self.hc._core_argv_pins("/s", ["notifier"]), [])
 
     def test_a_SUCCESSFUL_list_panes_that_enumerates_NOTHING_is_unknown(self):
-        """Fifth layer, found by enumerating the collector's exits rather than by
-        review. `list-panes` exiting 0 while yielding no pid used to `continue` with
-        no row, so the session reported clean.
-
-        A live tmux session ALWAYS has at least one pane, so a successful list that
-        produces zero pids enumerated nothing — it is not evidence of an empty
-        session. Two reachable shapes: empty stdout, and output that survives no
-        digit filter (e.g. pane IDs like `%12` rather than pids).
-        """
+        """A `list-panes` exiting 0 with no pid enumerated nothing. A live session always
+        has >=1 pane, so this is unknown — a vanished session exits nonzero instead."""
         for label, out in (("empty stdout", ""), ("non-numeric", "%12\n%13\n")):
             def fake_run(cmd, _o=out, **kw):
                 if "list-panes" in cmd:
@@ -241,11 +233,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                     f"{label}: a session we could not enumerate must not read clean")
 
     def test_a_MIXED_pane_session_is_unknown_one_readable_claude_does_not_clear_it(self):
-        """Fourth layer of the same fail-open. One READABLE unpinned claude pane must
-        not suppress an UNREADABLE sibling pane: `seen_claude` says something about
-        the pane we could read, and nothing about the one we could not — which may be
-        the still-pinned core after its tmux evidence was cleared.
-        """
+        """One READABLE unpinned pane must not suppress an UNREADABLE sibling: the pane
+        that failed may be the still-pinned core after its tmux evidence was cleared."""
         def fake_run(cmd, **kw):
             if "list-panes" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, "111\n222\n", "")
@@ -263,9 +252,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
             "a session with ANY unread pane cannot be reported clean")
 
     def test_all_panes_readable_and_unpinned_stays_clean(self):
-        """Discriminator: every read SUCCEEDS and no pane carries --model, so the
-        session is genuinely verified and must stay `ok`. Without this, widening the
-        guard to `if read_failed` could warn on every multi-pane session unnoticed."""
+        """Discriminator: every read succeeds and nothing is pinned, so this must stay ok
+        or widening the guard to `if read_failed` would warn on every multi-pane session."""
         def fake_run(cmd, **kw):
             if "list-panes" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, "111\n222\n", "")
@@ -279,14 +267,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(self.hc._interpret_core_model_pin([], "/s", rows)["status"], "ok")
 
     def test_an_EMPTY_successful_ps_read_is_unknown_not_a_missing_pin(self):
-        """The collector half of test_empty_string_argv_is_unverified_not_clean.
-
-        That test proves the INTERPRETER treats `(sess, "")` as unverified. This one
-        proves the COLLECTOR ever emits it. `ps` exiting 0 with empty stdout is not
-        "this pane is not claude" — nothing was read, so the pane cannot be ruled
-        out. Without this the session ends with seen_claude=False AND read_failed=
-        False, no row is emitted, and an unverified core reports `ok`.
-        """
+        """Collector half of the empty-argv case: rc 0 with empty stdout read nothing, so
+        the pane cannot be ruled out as claude and must not count as inspected."""
         def fake_run(cmd, **kw):
             if "list-panes" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, "4242\n", "")
@@ -302,9 +284,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
             "an unverified core must not reach the owner as a clean probe")
 
     def test_a_nonempty_non_claude_pane_stays_clean(self):
-        """Discriminator for the test above: a pane that genuinely IS readable and
-        genuinely is not claude must still be `ok`, or the fix above would just warn
-        on every notifier session."""
+        """Discriminator: a pane that genuinely is readable and is not claude must stay ok,
+        or the fix above would warn on every notifier session."""
         def fake_run(cmd, **kw):
             if "list-panes" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, "4242\n", "")
@@ -318,9 +299,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(self.hc._interpret_core_model_pin([], "/s", rows)["status"], "ok")
 
     def test_a_FAILED_ps_read_is_unknown_not_a_missing_pin(self):
-        """qingyun-wu, 2026-08-08: after the launcher clears the tmux evidence, a
-        transient or permission-denied `ps` made the collector return [] and the probe
-        report ok — a still-pinned live core reading as healthy. rc!=0 is now unknown."""
+        """A transient or permission-denied `ps` made the collector return [], reporting a
+        still-pinned live core as healthy. rc!=0 is unknown, not an absent pin."""
         with mock.patch.object(self.hc.subprocess, "run") as m:
             m.side_effect = [mock.Mock(stdout="4242\n", returncode=0),   # list-panes ok
                              mock.Mock(stdout="", returncode=1)]          # ps FAILED
@@ -346,19 +326,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertNotIn("LIVE core", r["detail"])
 
     def test_a_session_that_ENUMERATES_NOTHING_is_unknown_not_skipped(self):
-        """REVERSED, with a measurement. This asserted that a successful list with no
-        pane_pids should be SKIPPED, justified as "a session going away".
-
-        That justification does not hold — measured against real tmux:
-
-            list-panes -s -t '=alive'  ->  rc 0, "86511"
-            list-panes -s -t '=ghost'  ->  rc 1, "can't find window: ghost"
-
-        A vanishing session exits NONZERO and is already handled by the returncode
-        branch above. So rc 0 with zero pids is not the going-away case; a live
-        session always has >=1 pane, which makes it an enumeration that read nothing.
-        Skipping it was a fail-open with no scenario behind it.
-        """
+        """REVERSED: a vanishing session exits nonzero (`can't find window`) and is handled
+        above, so rc 0 with no pids is an enumeration that read nothing, not a skip."""
         with mock.patch.object(self.hc.subprocess, "run",
                                return_value=mock.Mock(stdout="\n", returncode=0)):
             self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]),
@@ -389,9 +358,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                     os.environ["SUTANDO_TMUX_SOCKET"] = prev
 
     def test_FIRST_pass_query_failure_warns_it_inspected_nothing(self):
-        """Control 1 — the pin-query pass raising means no scope was read at all.
-        Reporting ok there is the silent direction: emit_task_for_failures() gates on
-        status, so a live core pinned to a downgraded model would reach nobody."""
+        """Control 1 — the pin-query pass raising read no scope at all; ok there is the
+        silent direction, since emit_task_for_failures() gates on status."""
         r = self._check_with_socket(
             _query_pin={"side_effect": OSError("permission denied")},
             _tmux_sessions={"return_value": []},
@@ -401,9 +369,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertIn("could not query", r["detail"])
 
     def test_check_survives_a_later_session_listing_failure(self):
-        """Control 2 — the argv pass re-lists sessions. That call raising must not
-        propagate out of the always-on health run, AND must not read as clean: with
-        sessions=[] the argv pass inspects no core yet the probe reported ok."""
+        """Control 2 — the argv pass re-lists sessions; that raising must not escape the
+        always-on run, nor read as clean when it inspected no core."""
         r = self._check_with_socket(
             _tmux_sessions={"side_effect": [[], OSError("boom")]},
             _query_pin={"return_value": None},
@@ -413,10 +380,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertIn("could not enumerate", r["detail"])
 
     def test_a_STALE_socket_file_is_ok_not_a_permanent_warn(self):
-        """The regression the warn above could have caused. A socket FILE outlives its
-        server, so every tmux call fails with a no-server marker on an ordinary host
-        with no core — warning there would be a red that never clears. #2717 guarded
-        this and its guard must survive the reversal."""
+        """A socket FILE outlives its server, so every call fails with a no-server marker
+        on an ordinary host; warning there would be a red that never clears."""
         err = subprocess.CalledProcessError(1, ["tmux"], "",
                                             "error connecting to /tmp/x.sock (No such file or directory)")
         r = self._check_with_socket(_query_pin={"side_effect": err})
@@ -436,9 +401,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertIn("opus", r["detail"])
 
     def test_only_a_successfully_inspected_absence_is_ok(self):
-        """The discriminator both controls above turn on: same probe, same socket,
-        nothing pinned — but every read SUCCEEDS. Only this may be ok, and without it
-        the two warns above could be satisfied by a probe that never returns ok."""
+        """Discriminator for both controls: same probe and socket, nothing pinned, but every
+        read SUCCEEDS — only this may be ok, or a probe that never returns ok would pass."""
         r = self._check_with_socket(
             _tmux_sessions={"return_value": []},
             _query_pin={"return_value": ""},
@@ -526,9 +490,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                     os.environ.pop("SUTANDO_TMUX_SOCKET", None)
                 else:
                     os.environ["SUTANDO_TMUX_SOCKET"] = prev
-        # Reversed from #2717 deliberately: "tmux exploded" carries no no-server
-        # marker, so the server may be UP and a live core still pinned. ok here is
-        # the silent direction — emit_task_for_failures() gates on status.
+        # "tmux exploded" carries no no-server marker, so the server may be UP with a live
+        # core still pinned; ok is the silent direction because the gate reads status.
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("tmux exploded", r["detail"])
         self.assertIn("could not query", r["detail"])
@@ -572,14 +535,8 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                 self.assertEqual(self.hc._query_pin("/s", ["-g"]), "", stream)
 
     def test_failed_enumeration_is_not_reported_as_no_pin(self):
-        """A nonzero `list-sessions` must not become an empty session list —
-        that would clear the probe without inspecting a single session.
-
-        Fixture corrected: this stubbed stderr as "no server running", which is the
-        one failure that legitimately means "no core exists". It therefore exercised
-        the no-server path while claiming to cover failed enumeration — an
-        unrepresentative fixture is indistinguishable from a broken detector. The
-        no-server case now has its own control."""
+        """A nonzero `list-sessions` must not become an empty session list, which would
+        clear the probe without inspecting a single session."""
         import tempfile as _tf
         from unittest import mock
         prev = os.environ.get("SUTANDO_TMUX_SOCKET")
