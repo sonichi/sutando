@@ -397,11 +397,24 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     assumed — we consult their return values. The task-reply path passes a
     marker-stripped body and sends parsed.actions attachments itself, then folds
     those into the same event (so file-only replies still report a delivery and
-    the count/outcome stay accurate)."""
-    # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
-    file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
-    files = file_pattern.findall(text)
-    clean_text = file_pattern.sub('', text).strip()
+    the count/outcome stay accurate).
+
+    Marker grammar comes solely from ``result_markers.parse_markers`` — this
+    function must never re-declare it. It previously compiled a local
+    ``file|send|attach`` regex, which stripped attachment markers but left every
+    OTHER marker in the body. The proactive path (``poll_proactive``) passes raw
+    result text, so ``[dm-only]`` and ``[channel:]`` leaked verbatim into the
+    owner's message — the morning briefing is emitted as a proactive result
+    carrying ``[dm-only]``, so it rendered with the marker visible.
+
+    Parsing here (rather than at each call site) mirrors slack-bridge's
+    ``_send_reply`` and makes the function safe for both callers: parse_markers
+    is idempotent on an already-stripped body, so the task path — which passes
+    ``parsed.body`` and sends its own attachments — yields zero actions here and
+    cannot double-send."""
+    parsed = parse_markers(text)
+    files = [a.value for a in parsed.actions if a.kind == "attach"]
+    clean_text = parsed.body
     text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
     delivered_ok = True
     files_sent = 0
