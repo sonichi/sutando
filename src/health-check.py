@@ -6621,14 +6621,24 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
                 ["tmux", "-S", socket, "list-panes", "-s", "-t", f"={sess}",
                  "-F", "#{pane_pid}"],
                 capture_output=True, text=True, timeout=10)
+            if pp.returncode != 0:
+                # A failed read is not an absent pin. Without this the probe
+                # reports ok, which is the silent direction.
+                out.append((sess, None))
+                continue
             pids = [x.strip() for x in (pp.stdout or "").split("\n")
                     if x.strip().isdigit()]
             if not pids:
                 continue
-            seen_claude = False
+            seen_claude = read_failed = False
             for pid in pids:
                 ps = subprocess.run(["ps", "-o", "args=", "-p", pid],
                                     capture_output=True, text=True, timeout=10)
+                if ps.returncode != 0:
+                    # ps failing (permissions, or the pane exited mid-scan) is
+                    # indistinguishable from a non-claude pane by argv alone.
+                    read_failed = True
+                    continue
                 argv = (ps.stdout or "").strip()
                 if "claude" not in argv:
                     continue
@@ -6636,10 +6646,10 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
                 m = re.search(r"--model[= ]+(\S+)", argv)
                 if m:
                     out.append((sess, m.group(1)))
-            # No claude pane means there is no running core to BE pinned — a
-            # different question, owned by the core-liveness probes, not this one.
-            if not seen_claude:
-                continue
+            # No claude pane and every read SUCCEEDED means there is no core to BE
+            # pinned — the liveness probes' question. A failed read is unknown.
+            if not seen_claude and read_failed:
+                out.append((sess, None))
         except (OSError, subprocess.SubprocessError):
             out.append((sess, None))
     return out

@@ -212,8 +212,32 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         """A session holding no claude process has no core to BE pinned — that is the
         core-liveness probes' question. Reporting it here warned on `notifier`."""
         with mock.patch.object(self.hc.subprocess, "run") as m:
-            m.side_effect = [mock.Mock(stdout="4242\n"), mock.Mock(stdout="sleep 120\n")]
+            m.side_effect = [mock.Mock(stdout="4242\n", returncode=0),
+                             mock.Mock(stdout="sleep 120\n", returncode=0)]
             self.assertEqual(self.hc._core_argv_pins("/s", ["notifier"]), [])
+
+    def test_a_FAILED_ps_read_is_unknown_not_a_missing_pin(self):
+        """qingyun-wu, 2026-08-08: after the launcher clears the tmux evidence, a
+        transient or permission-denied `ps` made the collector return [] and the probe
+        report ok — a still-pinned live core reading as healthy. rc!=0 is now unknown."""
+        with mock.patch.object(self.hc.subprocess, "run") as m:
+            m.side_effect = [mock.Mock(stdout="4242\n", returncode=0),   # list-panes ok
+                             mock.Mock(stdout="", returncode=1)]          # ps FAILED
+            self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]),
+                             [("sutando-core", None)])
+
+    def test_a_FAILED_list_panes_is_unknown_too(self):
+        """The same hole one call earlier: tmux failing left pids empty, which was
+        indistinguishable from a session that genuinely has no panes."""
+        with mock.patch.object(self.hc.subprocess, "run",
+                               return_value=mock.Mock(stdout="", returncode=1)):
+            self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]),
+                             [("sutando-core", None)])
+
+    def test_a_failed_read_reaches_the_probe_as_warn_end_to_end(self):
+        """The wiring: unknown must survive into the status, not just the pins list."""
+        r = self.hc._interpret_core_model_pin([], "/s", [("sutando-core", None)])
+        self.assertEqual(r["status"], "warn", r)
 
     def test_clean_tmux_and_clean_argv_is_ok(self):
         r = self.hc._interpret_core_model_pin([], "/s", [])
@@ -224,7 +248,7 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         """tmux can answer with no pane_pids (a session going away). That is not the
         same as a core whose argv could not be read, and must not be reported as one."""
         with mock.patch.object(self.hc.subprocess, "run",
-                               return_value=mock.Mock(stdout="\n")):
+                               return_value=mock.Mock(stdout="\n", returncode=0)):
             self.assertEqual(self.hc._core_argv_pins("/s", ["sutando-core"]), [])
 
     def test_a_tmux_or_ps_failure_reports_unreadable_rather_than_clean(self):
