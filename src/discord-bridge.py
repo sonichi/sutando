@@ -301,14 +301,37 @@ def _extract_user_id_mentions(mention_strs):
     return out
 
 
-def _chunk_for_discord(text: str, max_len: int = 1900):
-    """Discord-facing alias for the shared fence-aware chunker (Result Router S3).
-
-    Behaviour and the default (max_len=1900) are unchanged; the implementation
-    now lives in src/message_chunking.py:chunk_message so Slack (and any future
-    surface) share the exact same fence-preservation logic.
-    """
+def _chunk_for_discord_unbounded(text: str, max_len: int = 1900):
+    """Yield lossless Discord-sized chunks for local callers."""
     yield from chunk_message(text, max_len)
+
+# Network delivery is bounded; local and golden chunking remains lossless.
+DISCORD_DELIVERY_MAX_CHUNKS = 4
+DISCORD_TRUNCATION_NOTICE = (
+    "⚠️ Result truncated: additional content was suppressed to keep Discord "
+    "responsive."
+)
+
+
+def _chunk_for_discord(
+    text: str,
+    max_len: int = 1900,
+    max_chunks: int = DISCORD_DELIVERY_MAX_CHUNKS,
+):
+    """Bound network sends; reserve the final send for truncation."""
+    if max_chunks < 1:
+        raise ValueError("max_chunks must be at least 1")
+    preview = []
+    # Read one chunk past the limit instead of expanding the full result.
+    for chunk in _chunk_for_discord_unbounded(text, max_len=max_len):
+        preview.append(chunk)
+        if len(preview) > max_chunks:
+            break
+    if len(preview) <= max_chunks:
+        yield from preview
+        return
+    yield from preview[: max_chunks - 1]
+    yield DISCORD_TRUNCATION_NOTICE
 
 # Thin alias — actual logic lives in src/send_allowlist.py so the
 # REST-fallback delivery path (src/dm-result.py) stays in lock-step.
@@ -5516,11 +5539,10 @@ async def poll_dm_fallback():
 def _send_via_rest(channel_id: str, message: str):
     """Send a message via Discord REST API (no gateway connection).
 
-    Chunks via `_chunk_for_discord` so messages over Discord's 2000-char limit
-    (or with code fences spanning chunk boundaries) deliver intact across N
-    sequential POSTs. Without chunking the API returns 400 and the message
-    is silently dropped — this caused codex-output replies (often >2KB) to
-    never reach the channel.
+    Chunks via `_chunk_for_discord` so messages over Discord's 2000-char
+    limit render correctly without allowing one oversized payload to monopolize
+    the bridge. Without chunking the API returns 400; without the delivery budget,
+    a malformed result can produce hundreds of sequential POSTs.
     """
     import urllib.request
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
