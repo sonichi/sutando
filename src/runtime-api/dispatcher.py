@@ -264,16 +264,23 @@ class RuntimeDispatcher:
                                          priority=params.get("priority") or "normal")
             if method == "task.list":
                 return self.tasks.list_tasks()
+            if method == "task.list_results":
+                return self.tasks.list_results()
+            if method == "task.get_result":
+                # taskId is OPTIONAL here — absent means "the newest result".
+                tid = params.get("taskId")
+                out = self.tasks.get_result(tid)
+                if out is None:
+                    raise ProtocolError(
+                        -32602,
+                        f"no result for task: {tid!r}" if tid
+                        else "no results found yet")
+                return out
             tid = params.get("taskId")
             if not tid:
                 raise ProtocolError(-32602, "missing required param: taskId")
             if method == "task.status":
                 return self.tasks.status(tid)
-            if method == "task.get_result":
-                out = self.tasks.get_result(tid)
-                if out is None:
-                    raise ProtocolError(-32602, f"no result for task: {tid!r}")
-                return out
             if method == "task.details":
                 out = self.tasks.details(tid)
                 if out is None:

@@ -49,6 +49,38 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(th.get("user_id"), "@me:example.org")
         self.assertEqual(th.body, "review the PR")
 
+    def test_get_result_no_id_returns_newest(self):
+        import os
+        self.results.mkdir(parents=True, exist_ok=True)
+        (self.results / "task-a.txt").write_text("older")
+        (self.results / "task-b.txt").write_text("newer")
+        os.utime(self.results / "task-a.txt", (1000, 1000))
+        os.utime(self.results / "task-b.txt", (2000, 2000))
+        latest = self.view.get_result(None)
+        self.assertEqual(latest["taskId"], "task-b")
+        self.assertTrue(latest.get("latest"))
+        self.assertEqual(latest["result"], "newer")
+        # explicit id still works and is NOT flagged latest
+        one = self.view.get_result("task-a")
+        self.assertEqual(one["result"], "older")
+        self.assertNotIn("latest", one)
+
+    def test_get_result_no_id_empty_is_none(self):
+        self.assertIsNone(self.view.get_result(None))  # no results yet
+
+    def test_list_results_newest_first_with_preview(self):
+        import os
+        self.results.mkdir(parents=True, exist_ok=True)
+        (self.results / "task-a.txt").write_text("A" * 300)
+        (self.results / "task-b.txt").write_text("B body")
+        os.utime(self.results / "task-a.txt", (1000, 1000))
+        os.utime(self.results / "task-b.txt", (2000, 2000))
+        ids = [r["taskId"] for r in self.view.list_results()["results"]]
+        self.assertEqual(ids, ["task-b", "task-a"])  # newest first
+        long_preview = next(r for r in self.view.list_results()["results"]
+                            if r["taskId"] == "task-a")["preview"]
+        self.assertLessEqual(len(long_preview), 160)  # truncated
+
     def test_submit_confines_newline_injection(self):
         # A hostile body must not be able to smuggle header lines or an
         # in-band instructions fence (the bee-watcher P1 class).

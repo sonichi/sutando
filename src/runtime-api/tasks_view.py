@@ -103,7 +103,11 @@ class TasksView:
         return {"taskId": task_id, "state": "unknown"}
 
     # ── task.get_result ─────────────────────────────────────────────────────
-    def get_result(self, task_id: str) -> dict | None:
+    def get_result(self, task_id: str | None = None) -> dict | None:
+        # No id → the newest result, so a client can fetch "the last one"
+        # without typing a full task id (the friction this removes).
+        if not task_id:
+            return self._latest_result()
         p = self._result_path(task_id)
         if p is None:
             return None
@@ -111,6 +115,42 @@ class TasksView:
             return {"taskId": task_id, "result": p.read_text()}
         except OSError:
             return None
+
+    def _latest_result(self) -> dict | None:
+        files = self._result_files()
+        if not files:
+            return None
+        p = files[0]  # newest first
+        try:
+            return {"taskId": p.name.removesuffix(".txt"),
+                    "result": p.read_text(), "latest": True}
+        except OSError:
+            return None
+
+    def _result_files(self) -> list[Path]:
+        if not self.results_dir.is_dir():
+            return []
+        files = [f for f in self.results_dir.glob("task-*.txt") if f.is_file()]
+        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        return files
+
+    # ── task.list_results ────────────────────────────────────────────────────
+    def list_results(self, limit: int = 50) -> dict:
+        """Every available result (newest first) with a short preview, so a
+        client can see what's there without knowing any id. Poll-state is not
+        tracked yet — this lists ALL, not only un-fetched."""
+        files = self._result_files()
+        out = []
+        for f in files[:limit]:
+            try:
+                body = f.read_text()
+            except OSError:
+                continue
+            out.append({"taskId": f.name.removesuffix(".txt"),
+                        "ts": int(f.stat().st_mtime),
+                        "preview": body.strip()[:160]})
+        return {"results": out,
+                **({"truncated": True} if len(files) > limit else {})}
 
     # ── task.details ────────────────────────────────────────────────────────
     def details(self, task_id: str) -> dict | None:

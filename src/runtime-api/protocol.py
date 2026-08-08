@@ -28,7 +28,8 @@ v0 methods:
   sutando.allowlist     {}
   task.submit           {task, priority?}
   task.status           {taskId}
-  task.get_result       {taskId}
+  task.get_result       {taskId?}   (no taskId → the newest result)
+  task.list_results     {}          (all results, newest first, with preview)
   task.details          {taskId}
   task.cancel           {taskId}
   runtime.health        {}
@@ -76,6 +77,7 @@ METHODS = (
     "human_action.decline",
     "human_action.status",
     "task.list",
+    "task.list_results",
     "request.list",
 )
 

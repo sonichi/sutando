@@ -17,7 +17,8 @@ touches the socket, JSON-RPC, or any remote API directly:
   sutando-runtime agent status <agentId>
   sutando-runtime sutando info|status|owner|allowlist
   sutando-runtime task submit "do the thing" [--priority normal]
-  sutando-runtime task status|get-result|details|cancel <taskId>
+  sutando-runtime task results   # all results, newest first, with preview
+  sutando-runtime task status|details|cancel <taskId> | get-result [taskId]
 
 Issuing commands return immediately with {"requestId", "status": "pending"};
 `request wait` blocks (bounded) for the resolution. Output is JSON on stdout;
@@ -158,12 +159,15 @@ def main(argv=None) -> int:
 
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsk.add_parser("list")
+    tsk.add_parser("results")  # list all available results (newest first)
     tsub = tsk.add_parser("submit")
     tsub.add_argument("text")
     tsub.add_argument("--priority", default="normal",
                       choices=["urgent", "normal", "low"])
-    for name in ("status", "get-result", "details", "cancel"):
+    for name in ("status", "details", "cancel"):
         tsk.add_parser(name).add_argument("task_id")
+    # get-result's id is OPTIONAL — no id means "the newest result".
+    tsk.add_parser("get-result").add_argument("task_id", nargs="?")
 
     args = ap.parse_args(argv)
     if args.group == "instance":
@@ -235,13 +239,18 @@ def main(argv=None) -> int:
         elif args.group == "task":
             if args.cmd == "list":
                 result = _rpc("task.list", {}, timeout=15)
+            elif args.cmd == "results":
+                result = _rpc("task.list_results", {}, timeout=15)
             elif args.cmd == "submit":
                 result = _rpc("task.submit", {"task": args.text,
                                               "priority": args.priority},
                               timeout=15)
             else:
+                params = {}
+                if getattr(args, "task_id", None):
+                    params["taskId"] = args.task_id
                 result = _rpc(f"task.{args.cmd.replace('-', '_')}",
-                              {"taskId": args.task_id}, timeout=15)
+                              params, timeout=15)
         elif args.group == "request" and args.cmd == "list":
             result = _rpc("request.list", {}, timeout=15)
         else:
