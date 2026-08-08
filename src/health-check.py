@@ -6610,26 +6610,34 @@ def _pin_scope_flag(scope: str) -> str:
 
 def _core_argv_pins(socket: str, sessions: list) -> list:
     """[(session, model)] for live cores whose argv carries --model, plus
-    [(session, None)] when a pane's argv cannot be read — argv is immutable, so a
+    [(session, None)] when no claude argv could be read — argv is immutable, so a
     tmux clear cannot undo it."""
     out = []
     for sess in sessions:
         try:
             pp = subprocess.run(
-                ["tmux", "-S", socket, "list-panes", "-t", f"={sess}", "-F", "#{pane_pid}"],
+                # -s spans every window. Without it tmux reports only the ACTIVE
+                # window, so a core in window 0 is invisible whenever another is up.
+                ["tmux", "-S", socket, "list-panes", "-s", "-t", f"={sess}",
+                 "-F", "#{pane_pid}"],
                 capture_output=True, text=True, timeout=10)
-            pid = (pp.stdout or "").split("\n")[0].strip()
-            if not pid.isdigit():
+            pids = [x.strip() for x in (pp.stdout or "").split("\n")
+                    if x.strip().isdigit()]
+            if not pids:
                 continue
-            ps = subprocess.run(["ps", "-o", "args=", "-p", pid],
-                                capture_output=True, text=True, timeout=10)
-            argv = (ps.stdout or "").strip()
-            if "claude" not in argv:
+            seen_claude = False
+            for pid in pids:
+                ps = subprocess.run(["ps", "-o", "args=", "-p", pid],
+                                    capture_output=True, text=True, timeout=10)
+                argv = (ps.stdout or "").strip()
+                if "claude" not in argv:
+                    continue
+                seen_claude = True
+                m = re.search(r"--model[= ]+(\S+)", argv)
+                if m:
+                    out.append((sess, m.group(1)))
+            if not seen_claude:
                 out.append((sess, None))       # cannot confirm either way
-                continue
-            m = re.search(r"--model[= ]+(\S+)", argv)
-            if m:
-                out.append((sess, m.group(1)))
         except (OSError, subprocess.SubprocessError):
             out.append((sess, None))
     return out

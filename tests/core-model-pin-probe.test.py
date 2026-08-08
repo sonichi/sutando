@@ -341,5 +341,72 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertNotIn("no model pin", r["detail"], r)
 
 
+    def _probe_pinned_core(self, layout):
+        """Stage a live `claude --model opus` core with tmux env CLEAN, put it where a
+        naive pane scan misses it, and run the real probe."""
+        tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        if not tmux:
+            self.fail("tmux unavailable — cannot exercise the argv scan")
+        with tempfile.TemporaryDirectory() as td:
+            sock = os.path.join(td, "s.sock")
+            stub = os.path.join(td, "claude")
+            Path(stub).write_text("#!/bin/bash\nsleep 120\n")
+            os.chmod(stub, 0o755)
+
+            def tm(*a):
+                return subprocess.run([tmux, "-S", sock, *a],
+                                      capture_output=True, text=True, timeout=15)
+            try:
+                if layout == "core-in-inactive-window":
+                    tm("new-session", "-d", "-s", "sutando-core", "-n", "core",
+                       f"{stub} --model opus")
+                    tm("new-window", "-t", "=sutando-core", "-n", "other", "sleep 120")
+                    tm("select-window", "-t", "=sutando-core:other")
+                elif layout == "core-in-second-pane":
+                    tm("new-session", "-d", "-s", "sutando-core", "-n", "core",
+                       "sleep 120")
+                    # split-window's -t is a PANE target: "=sutando-core" alone
+                    # resolves to no pane and the split silently does not happen.
+                    tm("split-window", "-t", "sutando-core:core",
+                       f"{stub} --model opus")
+                else:
+                    self.fail(f"unknown layout {layout!r}")
+                self.assertNotIn(
+                    "SUTANDO_CORE_MODEL=",
+                    tm("show-environment", "-g", "SUTANDO_CORE_MODEL").stdout,
+                    "the pin must exist ONLY in the live argv for this to prove anything")
+                staged = [subprocess.run(["ps", "-o", "args=", "-p", q],
+                                         capture_output=True, text=True).stdout
+                          for q in tm("list-panes", "-s", "-t", "=sutando-core",
+                                      "-F", "#{pane_pid}").stdout.split()]
+                if not any("--model" in a for a in staged):
+                    self.fail(f"fixture did not stage a pinned argv: {staged!r}")
+                old = os.environ.get("SUTANDO_TMUX_SOCKET")
+                os.environ["SUTANDO_TMUX_SOCKET"] = sock
+                try:
+                    return self.hc.check_core_model_pin()
+                finally:
+                    if old is None:
+                        os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                    else:
+                        os.environ["SUTANDO_TMUX_SOCKET"] = old
+            finally:
+                tm("kill-server")
+
+    def test_pinned_core_in_an_INACTIVE_window_is_still_found(self):
+        """tmux list-panes reports only the ACTIVE window unless -s is passed, so a
+        core in window 0 vanished whenever any other window was selected."""
+        r = self._probe_pinned_core("core-in-inactive-window")
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("opus", r["detail"])
+        self.assertNotIn("could not read argv", r["detail"],
+                         "the core was readable — it was just in another window")
+
+    def test_pinned_core_in_a_SECOND_pane_is_still_found(self):
+        """Reading only the first pane_pid missed a core sharing its window."""
+        r = self._probe_pinned_core("core-in-second-pane")
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("opus", r["detail"])
+
 if __name__ == "__main__":
     unittest.main()
