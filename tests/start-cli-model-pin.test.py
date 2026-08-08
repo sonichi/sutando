@@ -94,9 +94,8 @@ def case_tmux_defaults_clear_both_scopes() -> list[str]:
         fails.append("clear) MODEL_ARGS is back — an empty array is one edit from a pin")
     if "--model" in code:
         fails.append("clear) start-cli.sh reintroduced a --model flag")
-    # The launcher's OWN env must be cleared before any tmux call: a server takes
-    # its global environment from whoever starts it, and `start-server` on a
-    # serverless socket is a no-op, so the setenv clears cannot reach it.
+    # A server takes its global env from whoever starts it, so the launcher's own
+    # unset must precede any tmux call. Behaviourally covered by fresh-socket.
     lines = code.splitlines()
     unset_at = next((i for i, l in enumerate(lines) if "unset SUTANDO_CORE_MODEL" in l), None)
     tmux_at = next((i for i, l in enumerate(lines) if "tmux -S" in l), None)
@@ -190,12 +189,88 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
     return fails
 
 
+def case_fresh_socket_server_is_born_unpinned() -> list[str]:
+    """The serverless case, entered rather than described: with no server on the
+    socket the setenv clears reach nothing, so only the launcher's own unset works."""
+    import shutil
+    import signal
+    tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    if not tmux:
+        return ["fresh-socket) tmux not found — cannot exercise the tmux path"]
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        bind = td / "bin"
+        bind.mkdir()
+        (td / "home").mkdir()
+        sock = td / "fresh-tmux.sock"
+        # claude must PERSIST: an exiting stub ends the session and the server with
+        # it, leaving nothing to inspect. pgrep 0 = "running", skips the monitor.
+        for stub, body in (("claude", "sleep 300\n"), ("pgrep", "exit 0\n")):
+            f = bind / stub
+            f.write_text("#!/bin/bash\n" + body)
+            f.chmod(0o755)
+
+        def tm(*args):
+            return subprocess.run([tmux, "-S", str(sock), *args],
+                                  capture_output=True, text=True)
+
+        try:
+            if tm("list-sessions").returncode == 0:
+                return ["fresh-socket) a server already exists — this is not the fresh case"]
+            env = {
+                "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin",
+                "HOME": str(td / "home"),
+                "SUTANDO_TMUX_SOCKET": str(sock),
+                "SUTANDO_CORE_MODEL": "opus",   # the pin is in the LAUNCHER's env
+            }
+            proc = subprocess.Popen(
+                ["/bin/bash", str(SCRIPT)], env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True)
+            try:
+                out = proc.communicate(timeout=45)[0] or ""
+            except subprocess.TimeoutExpired:
+                out = ""
+            finally:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    out = (out or "") + (proc.communicate(timeout=10)[0] or "")
+                except (subprocess.TimeoutExpired, ValueError):
+                    pass
+                proc.wait(timeout=10)
+            if "tmux not found" in out:
+                return ["fresh-socket) script skipped its tmux path — never reached the create"]
+            if tm("list-sessions").returncode != 0:
+                return ["fresh-socket) no server after launch — the checks below would "
+                        "pass vacuously"]
+            for scope_args, label in ((["-g"], "global"),
+                                      (["-t", "=sutando-core"], "session")):
+                got = tm("show-environment", *scope_args, "SUTANDO_CORE_MODEL").stdout
+                if "SUTANDO_CORE_MODEL=opus" in got:
+                    fails.append(f"fresh-socket) the new server was born pinned in "
+                                 f"{label} scope: {got.strip()!r}")
+            for pid in tm("list-panes", "-s", "-a", "-F", "#{pane_pid}").stdout.split():
+                argv = subprocess.run(["ps", "-o", "args=", "-p", pid],
+                                      capture_output=True, text=True).stdout
+                if "--model" in argv:
+                    fails.append(f"fresh-socket) a stale pin reached the launched "
+                                 f"argv: {argv.strip()!r}")
+        finally:
+            tm("kill-server")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("default", case_default_no_model_flag),
         ("env-ignored", case_env_set_is_ignored),
         ("tmux-clear", case_tmux_defaults_clear_both_scopes),
         ("tmux-launch", case_tmux_launch_clears_a_pinned_socket),
+        ("fresh-socket", case_fresh_socket_server_is_born_unpinned),
     ]
     all_failures = []
     for label, fn in cases:
