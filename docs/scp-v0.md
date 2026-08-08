@@ -39,15 +39,31 @@ onto a task. See §6.
 
 ## 2. Transport
 
-- **JSON-RPC 2.0**, newline-delimited, one message per line.
-- Local reference transport: a **Unix domain socket** (`runtime.sock`), same-user
-  local RPC — submissions carry the daemon-resolved actor and owner tier.
-- **Requests/responses** carry an `id`. **Notifications** (server-push) omit `id`.
-- Framing limits and per-request timeouts are transport concerns; the reference
-  daemon caps frames and probes liveness on connect.
+SCP is **JSON-RPC 2.0**, newline-delimited (one message per line). Requests and
+responses carry an `id`; **notifications** (server-push) omit `id`. Actor identity
+is resolved **daemon-side** and never overridden by a client parameter. Framing
+limits and per-request timeouts are enforced daemon-side.
 
-Actor identity is resolved **daemon-side** and never overridden by a client
-parameter.
+### v0 — Unix domain socket, local *(implemented)*
+
+A long-lived daemon listens on a **Unix domain socket** (`runtime.sock`); clients
+connect to it. Same-user local RPC — submissions carry the daemon-resolved actor
+and owner tier, and access control is the socket's filesystem permissions.
+
+This is a **persistent, N-clients-to-one-agent** transport: the agent outlives any
+individual client, so many surfaces (chat, watch, dashboards, channel bridges)
+drive one core, and a client disconnecting/reconnecting doesn't disturb the agent.
+Trade-off: a daemon restart drops connected clients. (Contrast ACP's stdio, where
+the client spawns the agent as a 1:1 child subprocess — session-shaped; the Unix
+socket is task-shaped, a durable service many clients submit tasks to.)
+
+### [v0.1+] — Remote agent support *(planned, not built)*
+
+A remote transport (e.g. WebSocket / HTTP) so a client can drive a Sutando agent
+across machines. The task model makes this a clean extension rather than a
+retrofit — submit a task over the wire and stream `task.update` back — because a
+task is durable and channel-agnostic and does not require a co-located session.
+**Until built, this is aspirational: v0 is local-only.**
 
 ## 3. Core methods (implemented in v0)
 
