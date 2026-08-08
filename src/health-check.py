@@ -5896,7 +5896,7 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
     if name == "discord-bridge":
         if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
             return "fail", "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
-    elif name == "telegram-bridge" and status == "ok":
+    elif name == "telegram-bridge" and status in ("ok", "warn"):
         conflict_idxs = [i for i, ln in enumerate(tail) if "409" in ln and "Conflict" in ln]
         if conflict_idxs:
             # Telegram hands each update to exactly ONE getUpdates caller, so a
@@ -5904,7 +5904,9 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
             received_after = any(ln.lstrip().startswith("@") for ln in tail[conflict_idxs[-1] + 1:])
             if not received_after:
                 return "warn", ("another getUpdates poller is competing — Telegram splits "
-                                "updates between hosts; set SKIP_TELEGRAM=1 on the non-owning host")
+                                "updates between hosts; set SKIP_TELEGRAM=1 on the non-owning "
+                                "host. A stale heartbeat here is a CONSEQUENCE of this, not a "
+                                "separate fault")
     elif name == "slack-bridge" and status == "ok":
         warn_idxs = [i for i, ln in enumerate(tail) if "60s elapsed with zero events" in ln]
         if warn_idxs:

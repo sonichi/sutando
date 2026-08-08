@@ -47,6 +47,16 @@ check("409s then a receipt → no override (host winning again)", _r2 is None, s
 _r3 = hc.bridge_log_content_status("telegram-bridge", "ok", [STARTUP, RECEIPT])
 check("clean log → no override", _r3 is None, str(_r3))
 
+# Check 3 overwrites status to "warn" on a stale heartbeat, and the 409 branch was gated
+# on status == "ok" — so the worse the bridge got, the less the probe said.
+_rh = hc.bridge_log_content_status("telegram-bridge", "warn", [STARTUP] + [CONFLICT] * 20)
+check("stale heartbeat does NOT hide the 409",
+      _rh is not None and _rh[0] == "warn" and "competing" in _rh[1], str(_rh))
+check("and it names the causal direction",
+      _rh is not None and "CONSEQUENCE" in _rh[1], str(_rh))
+
+# The tested no-downgrade case stays intact: "stale" means stale CODE, a different
+# axis, and the 409 branch must still keep its hands off it.
 _r4 = hc.bridge_log_content_status("telegram-bridge", "stale", [CONFLICT] * 20)
 check("already stale → not downgraded to warn", _r4 is None, str(_r4))
 
