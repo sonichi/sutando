@@ -1,6 +1,5 @@
-// The voice-offline OS banner must be DATED, and recovery must be announced.
-// An AppleScript notification cannot be withdrawn or updated, so an undated
-// banner is indistinguishable from a live outage; recovery is announced instead.
+// An AppleScript notification cannot be withdrawn, so the banner must be dated
+// and recovery announced — an undated one reads as a live outage.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -60,10 +59,8 @@ describe('recovery notification', () => {
 	});
 });
 
-// ── Wiring guards ─────────────────────────────────────────────────────────────
-// The formatters being correct is worth nothing if voice-agent stops calling
-// them, or calls them from the wrong place. These read the source because the
-// call sites live inside a module with top-level await and heavy side effects.
+// Wiring guards, read from source: correct formatters are worthless if the call
+// site stops using them, and the module cannot be imported in a test.
 const AGENT_SRC = readFileSync(
 	join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'),
 	'utf-8',
@@ -93,9 +90,8 @@ describe('voice-agent wiring', () => {
 	});
 
 	it('the notified set is declared outside the classifier IIFE', () => {
-		// It must be visible to both the close handler and the recovery hook. If it
-		// slips back inside the IIFE, recovery silently stops working while the
-		// offline path keeps functioning — a partial failure that looks fine.
+		// If it slips back inside the IIFE, recovery silently stops while the offline
+		// path keeps working — a partial failure that looks fine.
 		const decl = AGENT_SRC.indexOf('const voiceNotifiedCategories = new Set<string>()');
 		const iife = AGENT_SRC.indexOf('const transport = (session as any).transport;');
 		assert.ok(decl > 0 && iife > 0, 'markers not found — update this test');
