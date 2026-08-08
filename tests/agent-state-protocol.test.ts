@@ -23,10 +23,11 @@
  *  - legacy spawn (no injected generation, no launchd marker): frame omits
  *    `credentialGeneration` and `launchdContract`.
  *
- * NOTE (Step 11 seam): the pinned bodhi has no `?probe=1` interception yet —
- * `probeState` is passed behind a feature-detect in voice-agent.ts and the
- * probe-frame + live-call acceptance tests activate with the bodhi pin bump
- * (impl plan PR group E).
+ * Step 11 (PR group E — this change): the pinned bodhi intercepts `?probe=1`
+ * before client attachment (`probeState` behind the voice-agent.ts
+ * feature-detect), so the probe-frame + live-call acceptance test is ACTIVE
+ * below: a probe upgrade against a spawned agent with a real client attached
+ * gets one frame + clean close and the client keeps its slot.
  */
 
 import { describe, it, after } from 'node:test';
@@ -44,7 +45,9 @@ import {
 	createIsolatedIdleRestore,
 	credentialSourceLabel,
 	mapUpstream,
+	publishCapabilitiesMarker,
 	publishLifecycleSnapshot,
+	voiceCapabilitiesPath,
 	voiceLifecyclePath,
 	type AgentStateV1,
 } from '../src/voice-agent-state.ts';
@@ -241,6 +244,40 @@ function frameFixture(overrides: Partial<AgentStateV1> = {}): AgentStateV1 {
 		...overrides,
 	};
 }
+
+describe('publishCapabilitiesMarker — group E activation switch', () => {
+	it('writes the marker shape the desktop reader gates on, atomically', () => {
+		const ws = mkdtempSync(join(tmpdir(), 'agent-state-caps-'));
+		try {
+			publishCapabilitiesMarker(ws, { now: () => 777, lockId: 'vl1-test-token' });
+			const doc = JSON.parse(readFileSync(voiceCapabilitiesPath(ws), 'utf-8'));
+			// The desktop supervisor requires STRICT `probeIsolation === true` AND
+			// marker.{pid,lockId} === the live lock holder's (stale-marker rollback
+			// defense; lockId defeats pid reuse) — the publisher's own pid/token
+			// are the lock winner's by ordering.
+			assert.deepEqual(doc, { probeIsolation: true, at: 777, pid: process.pid, lockId: 'vl1-test-token' });
+			assert.deepEqual(readdirSync(join(ws, 'state')), ['voice-agent.capabilities.json']);
+		} finally { rmSync(ws, { recursive: true, force: true }); }
+	});
+
+	// There is deliberately NO unbound-marker row: `lockId` is a required
+	// parameter, so this repo cannot emit a marker that advertises probe
+	// isolation without binding it to an acquisition. "No token → no
+	// publication" is the caller's gate, proven against a spawned agent in
+	// the integration suite below (fail closed at the writer — the desktop
+	// reader's token requirement is a second fence, not the only one).
+
+	it('is failure-silent: an unwritable target reports via onError, never throws', () => {
+		const errs: unknown[] = [];
+		// A path whose parent is a FILE cannot gain a state/ subdirectory.
+		const ws = mkdtempSync(join(tmpdir(), 'agent-state-caps-ro-'));
+		try {
+			writeFileSync(join(ws, 'state'), 'occupied');
+			publishCapabilitiesMarker(ws, { lockId: 'vl1-test-token', onError: (e) => errs.push(e) });
+			assert.equal(errs.length, 1);
+		} finally { rmSync(ws, { recursive: true, force: true }); }
+	});
+});
 
 describe('publishLifecycleSnapshot — atomic temp+rename (A9)', () => {
 	it('writes the derived snapshot schema and leaves no temp files behind', () => {
@@ -540,13 +577,23 @@ describe('agent.state emission (integration, spawned agent)', () => {
 			assert.equal(failedFrame.reason, 'quota-exceeded', 'stable protocol reason code (R8)');
 			assert.equal(failedFrame.credentialGeneration, GEN);
 
-			// Lifecycle mirrors the terminal upstream (A9 + S3 fields).
+			// Lifecycle mirrors the terminal upstream (A9 + S3 fields). NOT
+			// pinned to quota: the fake key's own startup auth close arrives
+			// through the SAME wrapped onClose seam and can land after the
+			// injected quota close, legitimately overwriting the category —
+			// R8 makes reason/category changes within 'failed' meaningful
+			// transitions, and the frame assertions above already pinned the
+			// quota mapping end-to-end. The file's invariant is that it
+			// mirrors the LATEST failed classification, so assert exactly
+			// that (captured live: the file read failed/auth at timeout while
+			// the quota frame sat in the frames array).
 			await waitFor(() => {
 				try {
 					const snap = JSON.parse(readFileSync(voiceLifecyclePath(ws), 'utf-8'));
-					return snap.upstream === 'failed' && snap.category === 'quota';
+					const lastFailed = [...frames].reverse().find((f) => f.upstream === 'failed');
+					return !!lastFailed && snap.upstream === 'failed' && snap.category === lastFailed.category;
 				} catch { return false; }
-			}, 10_000, 'lifecycle snapshot upstream=failed');
+			}, 10_000, 'lifecycle snapshot mirrors the latest failed classification');
 			const snap = JSON.parse(readFileSync(voiceLifecyclePath(ws), 'utf-8'));
 			assert.equal(typeof snap.at, 'number');
 			assert.equal(snap.clientAttached, true);
@@ -577,6 +624,93 @@ describe('agent.state emission (integration, spawned agent)', () => {
 			assert.equal(first.credentialSource, 'byok');
 			assert.equal('credentialGeneration' in first, false, 'legacy env key stays generationless (S3)');
 			assert.equal('launchdContract' in first, false, 'no contract marker → no echo (R17)');
+		} finally {
+			client.close();
+		}
+	});
+
+	// Group E acceptance (Step 11): the failure mode this activation exists to
+	// prevent is a `?probe=1` upgrade landing in the normal single-client
+	// attach path and STEALING the live call. Against the pinned bodhi, a
+	// probe socket must be intercepted before client attachment: it gets one
+	// agent.state frame + a clean close(1000), while the attached real client
+	// keeps its slot (socket stays open, lifecycle still counts it). Also
+	// proves the capability marker end-to-end: published because the pinned
+	// bodhi supports probeState, and BOUND to the structured lock (pid +
+	// lockId equality) — the desktop reader's stale-marker defense contract.
+	it('?probe=1 gets one frame + close(1000) and never steals the attached client', async () => {
+		const ws = makeWorkspace('probe');
+		const port = await freePort();
+		spawnAgent(ws, port, await freePort());
+
+		const client = await connectClient(port, 90_000);
+		try {
+			const frames = collectFrames(client);
+			await waitFor(() => frames.length >= 1, 20_000, 'immediate agent.state frame');
+			assert.equal(frames[0].clientAttached, true, 'real client holds the slot');
+			await waitFor(() => existsSync(voiceLifecyclePath(ws)), 10_000, 'voice-lifecycle.json');
+
+			const probe = new WebSocket(`ws://127.0.0.1:${port}/?probe=1`);
+			const probeFrames: AgentStateV1[] = [];
+			let probeCloseCode: number | null = null;
+			probe.addEventListener('message', (ev) => {
+				if (typeof ev.data !== 'string') return;
+				try { probeFrames.push(JSON.parse(ev.data)); } catch { /* non-JSON */ }
+			});
+			probe.addEventListener('close', (ev) => { probeCloseCode = ev.code; });
+			await waitFor(() => probeCloseCode !== null, 15_000, 'probe close');
+
+			assert.equal(probeCloseCode, 1000, 'probe closed cleanly — not an eviction, not an error');
+			assert.ok(probeFrames.length >= 1, 'probe received its status frame');
+			assert.equal(probeFrames[0].type, 'agent.state', 'probe frame is the agent.state snapshot');
+			assert.equal(probeFrames[0].clientAttached, true, 'probe observes the attached client without touching it');
+
+			// The steal would fire onClientDisconnected on probe close: the real
+			// client's socket would drop and the lifecycle would flip detached.
+			await delay(500);
+			assert.equal(client.readyState, WebSocket.OPEN, 'live client socket survived the probe');
+			const snap = JSON.parse(readFileSync(voiceLifecyclePath(ws), 'utf-8'));
+			assert.equal(snap.clientAttached, true, 'agent still counts the real client attached');
+
+			// Marker end-to-end: published (capable pin) and bound to THIS
+			// acquisition — pid and lockId equal the structured lock's.
+			const marker = JSON.parse(readFileSync(voiceCapabilitiesPath(ws), 'utf-8'));
+			assert.equal(marker.probeIsolation, true);
+			const lock = JSON.parse(readFileSync(join(ws, '.voice-agent.pid'), 'utf-8'));
+			assert.equal(marker.pid, lock.pid, 'marker.pid = lock holder pid');
+			assert.equal(marker.lockId, lock.lockId, 'marker.lockId = lock acquisition token');
+		} finally {
+			client.close();
+		}
+	});
+
+	// The FALSE branch of the capability-marker gate — the safety property
+	// itself ("a bodhi without probe isolation never gets an advertising
+	// marker"). Forced via the SUTANDO_TEST_MODE-only detect seam; the agent
+	// otherwise boots normally, so reaching a first frame proves the wiring
+	// init ran PAST the marker site and chose not to publish. Without this
+	// row, deleting the gate would regress silently.
+	it('publishes NO capability marker when bodhi lacks probeState', async () => {
+		const ws = makeWorkspace('no-probe-state');
+		const port = await freePort();
+		const agent = spawnAgent(ws, port, await freePort(), {
+			SUTANDO_TEST_FORCE_NO_PROBE_STATE: '1',
+		});
+
+		const client = await connectClient(port, 90_000);
+		try {
+			const frames = collectFrames(client);
+			await waitFor(() => frames.length >= 1, 20_000, 'immediate agent.state frame');
+			await waitFor(
+				() => agent.stderr().includes('capability marker NOT published'),
+				10_000,
+				'dormant-branch log line',
+			);
+			assert.equal(
+				existsSync(voiceCapabilitiesPath(ws)),
+				false,
+				'no advertising marker for a bodhi without probe isolation',
+			);
 		} finally {
 			client.close();
 		}

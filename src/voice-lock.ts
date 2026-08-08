@@ -75,7 +75,7 @@ export function voiceLockGuardPath(workspaceDir: string): string {
 }
 
 export type AcquireResult =
-	| { status: 'acquired' }
+	| { status: 'acquired'; lockId?: string }
 	| { status: 'held'; holderPid?: number; holderRaw?: string }
 	| { status: 'error'; detail: string };
 
@@ -115,7 +115,18 @@ export function acquireVoiceLock(
 	if (res.error) {
 		return { status: 'error', detail: `helper spawn failed: ${res.error.message}` };
 	}
-	if (res.status === 0) return { status: 'acquired' };
+	if (res.status === 0) {
+		// Surface the lock record's per-acquisition lockId for the capability-marker
+		// binding. Best-effort: unparseable → undefined (no marker), never a lock failure.
+		let lockId: string | undefined;
+		try {
+			const parsed = JSON.parse((res.stdout ?? '').trim());
+			if (typeof parsed?.lock?.lockId === 'string' && parsed.lock.lockId) lockId = parsed.lock.lockId;
+		} catch {
+			/* token is best-effort */
+		}
+		return { status: 'acquired', lockId };
+	}
 	if (res.status === 7) {
 		let holderPid: number | undefined;
 		try {
