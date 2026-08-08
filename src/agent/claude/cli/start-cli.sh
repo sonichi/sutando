@@ -125,7 +125,7 @@ core_claude_running() {
 # Applied uniformly via a tmux `-c` arg array (and a plain `cd` on the no-tmux
 # fallback) so every launch branch agrees. The ${arr[@]+...} expansions below
 # keep the empty (unset) case safe on bash 3.2 under `set -u`, same pattern as
-# MODEL_ARGS / SETTINGS_ARGS.
+# SETTINGS_ARGS.
 #
 # CANONICALIZE ONCE, REUSE EVERYWHERE: Claude Code keys the folder-trust dialog
 # (and the project/auto-memory slug) by the process's ABSOLUTE cwd — getcwd(),
@@ -302,20 +302,16 @@ PY
   rm -f "$_ccd_err"
 fi
 
-# Optional context-window pin (graceful-degradation hook for the 1M
-# usage-credit-gate wedge — see src/health-check.py recover_core_if_wedged).
-# When SUTANDO_CORE_MODEL is set we pass it through as `--model`; otherwise we
-# add NO flag, so the core inherits the user's global model (e.g. `opus[1m]`
-# from ~/.claude/settings.json) and 1M stays the default — we never disable it.
-# health-check's --recover-core escalation only sets SUTANDO_CORE_MODEL=opus
-# AFTER a 1M restart fails to hold, so a re-wedging core falls back to standard
-# 200K context (no gate) and keeps working instead of looping. The
-# ${arr[@]+...} guard keeps an empty array safe on bash 3.2 even under `set -u`
-# (mirrors the empty-array care in PR #1391).
-MODEL_ARGS=()
-if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
-  MODEL_ARGS=(--model "$SUTANDO_CORE_MODEL")
-fi
+# NO --model flag, ever. The core inherits the user's global model (e.g.
+# `opus[1m]` from ~/.claude/settings.json), so 1M stays the default.
+#
+# This used to pass SUTANDO_CORE_MODEL through as `--model`, as the consumer half
+# of health-check's wedge-recovery downgrade. That producer is removed, and the
+# pass-through is why the downgrade was permanent rather than temporary: the var
+# lived in the tmux session env, so every later launch re-read it and re-applied
+# `--model`. A leftover pin therefore outlived the incident that set it -- 17 days
+# on one host, 165 autocompactions in 25h. Honoring an ambient env var for this is
+# the defect: an inherited value cannot be distinguished from a current choice.
 
 # ---- core --settings hooks (AskUserQuestion guard always; obs when enabled) --
 # One `--settings` flag carries every hook the core needs (multiple --settings
@@ -333,7 +329,7 @@ fi
 # interpolation broke when $REPO held a space (split the command) or a `"` (broke
 # the JSON). The helpers POSIX single-quote the path inside the command and
 # JSON-escape the payload. The ${arr[@]+...} guard keeps the empty array safe on
-# bash 3.2 under `set -u` (same pattern as MODEL_ARGS above).
+# bash 3.2 under `set -u`.
 OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
 export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
 
@@ -373,7 +369,6 @@ if [ -x "$WORKSTREAM_SESSION_HANDLER" ]; then
   export SUTANDO_ISOLATED_WORKING_DIR="${SUTANDO_CLAUDE_WORKING_DIR:-$REPO}"
   CORE_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   CORE_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
-  [ -n "${SUTANDO_CORE_MODEL:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")
   if [ -n "${CORE_SETTINGS_JSON:-}" ]; then
     export SUTANDO_ISOLATED_CLAUDE_SETTINGS="$CORE_SETTINGS_JSON"
     CORE_ENV_ARGS+=(-e "SUTANDO_ISOLATED_CLAUDE_SETTINGS=$SUTANDO_ISOLATED_CLAUDE_SETTINGS")
@@ -522,6 +517,13 @@ apply_tmux_defaults() {
   command -v tmux > /dev/null 2>&1 || return 0
   tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
+  # Clear a leftover wedge-recovery model pin. Nothing sets it any more, but an
+  # already-poisoned server keeps it in its session/global env forever, and a
+  # shell `unset` never reaches tmux. Both scopes: -g is invisible to a
+  # per-session query. Runs on every start/attach/restart, so a host that was
+  # pinned before this change heals itself instead of waiting for an operator.
+  tmux -S "$TMUX_SOCKET" setenv -gu SUTANDO_CORE_MODEL 2>/dev/null || true
+  tmux -S "$TMUX_SOCKET" setenv -u SUTANDO_CORE_MODEL 2>/dev/null || true
   # Wheel-scroll fix (sutando-plus#46, re-broken 2026-06-11): predicate on
   # mouse_any_flag, NOT alternate_on. Claude Code 2.1.150 stopped using the
   # alternate screen, so the old alt-screen predicate forwarded wheel events
@@ -630,7 +632,7 @@ if tmux_session_exists; then
   # restart-core (kill core window → rerun this script) truly window-scoped.
   echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
   apply_tmux_defaults
-  CORE_CMD=(claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
+  CORE_CMD=(claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} -- "/startup")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
@@ -673,7 +675,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] && cd "$SUTANDO_CLAUDE_WORKING_DIR"
-  exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
+  exec claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/startup"
 fi
@@ -704,12 +706,12 @@ apply_tmux_defaults
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
+    claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/startup"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
+    claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} \
     -- "/startup"
   # Verify the core actually came up before reporting success. Without this a
