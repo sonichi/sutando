@@ -5,6 +5,7 @@ init; a known live parent means supervised, so the remedy must not say to stop i
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -66,6 +67,29 @@ check("counts both", "2 orphaned" in v3["detail"], v3["detail"])
 print("no watchers at all (unchanged):")
 v4 = _verdict({}, {})
 check("reports not running", "watcher not running" in v4["detail"], v4["detail"])
+
+print("the ps helpers, unpatched (their real bodies, which the fixtures above stub out):")
+
+_snap = hc._ps_snapshot()
+check("_ps_snapshot returns a ps table", isinstance(_snap, str) and "PID" in _snap.upper())
+check("_ps_snapshot lists this process", _snap is not None and str(os.getpid()) in _snap)
+with patch.object(hc.subprocess, "run", side_effect=OSError("boom")):
+    check("_ps_snapshot returns None when ps cannot run", hc._ps_snapshot() is None)
+
+_real_ppid = str(os.getppid())
+check("_pid_parent reads a real ppid via ps", hc._pid_parent(os.getpid()) == _real_ppid,
+      f"got {hc._pid_parent(os.getpid())!r} want {_real_ppid!r}")
+check("_pid_parent returns None for a pid ps does not know", hc._pid_parent(999999) is None)
+with patch.object(hc.subprocess, "run", side_effect=OSError("boom")):
+    check("_pid_parent returns None when ps cannot run", hc._pid_parent(os.getpid()) is None)
+
+_table = "  PID  PPID ARGS\n  100    99 /bin/foo --x\n  200     1 /bin/bar\n"
+check("_pid_parent parses a supplied table", hc._pid_parent("100", _table) == "99")
+check("_pid_parent finds an init parent in a table", hc._pid_parent("200", _table) == "1")
+check("_pid_parent returns None when the pid is absent from the table",
+      hc._pid_parent("777", _table) is None)
+check("_pid_parent tolerates a malformed row",
+      hc._pid_parent("100", "garbage\n  100    99 ok\n") == "99")
 
 if failures:
     print(f"\nFAILED ({len(failures)}): {failures}")
