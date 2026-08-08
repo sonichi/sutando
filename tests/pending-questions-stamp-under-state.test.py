@@ -95,5 +95,82 @@ class TestWriteNotifyStamp(unittest.TestCase):
                          "exactly one writer, inside write_notify_stamp")
 
 
+class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
+    """Moving the writer is not enough: installs that already have the root file keep it.
+
+    Reviewer's repro — a temp workspace containing `.last-pq-notify`, then
+    `write_notify_stamp()`, then `check_workspace_root_tidy()` still warns. The
+    retirement runs AFTER the new stamp is durably written, so a crash between the
+    two loses at most a cooldown, never the record.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.ws = Path(tempfile.mkdtemp())
+        self.legacy = self.ws / ".last-pq-notify"
+        self._saved = cpq.LAST_NOTIFY_FILE
+        cpq.LAST_NOTIFY_FILE = self.ws / "state" / "last-pq-notify"
+
+    def tearDown(self):
+        cpq.LAST_NOTIFY_FILE = self._saved
+
+    def test_the_old_root_stamp_is_retired(self):
+        self.legacy.write_text("1785876643 2f35a3c6")
+        cpq.write_notify_stamp([], now=1700000000)
+        self.assertTrue(cpq.LAST_NOTIFY_FILE.is_file(), "new stamp must exist")
+        self.assertFalse(self.legacy.exists(), "the drift the probe flags must be gone")
+
+    def test_it_is_written_BEFORE_the_old_one_is_removed(self):
+        # Order matters: remove-then-write would lose the cooldown on a crash.
+        src = (REPO / "src" / "check-pending-questions.py").read_text()
+        body = src.split("def write_notify_stamp", 1)[1].split("\ndef ", 1)[0]
+        self.assertLess(body.index("write_text("), body.index('".last-pq-notify"'),
+                        "the new stamp must be durable before the old one is retired")
+
+    def test_a_fresh_install_with_no_root_stamp_is_unaffected(self):
+        self.assertFalse(self.legacy.exists(), "precondition")
+        cpq.write_notify_stamp([], now=1700000000)   # must not raise
+        self.assertTrue(cpq.LAST_NOTIFY_FILE.is_file())
+
+    def test_cleanup_targets_the_OVERRIDDEN_root_not_the_real_workspace(self):
+        # Derived from LAST_NOTIFY_FILE, so a redirected stamp cannot reach the real
+        # workspace root and delete an operator's file during a test run.
+        real = cpq.WORKSPACE / ".last-pq-notify"
+        existed = real.exists()
+        cpq.write_notify_stamp([], now=1700000000)
+        self.assertEqual(real.exists(), existed,
+                         "a test must never touch the real workspace root")
+
+    def test_an_unremovable_root_stamp_does_not_break_the_write(self):
+        # A directory at that path makes unlink raise IsADirectoryError (an OSError).
+        # The cooldown record matters more than the cleanup, so the write must stand.
+        self.legacy.mkdir()
+        cpq.write_notify_stamp([], now=1700000000)
+        self.assertTrue(cpq.LAST_NOTIFY_FILE.is_file(),
+                        "a failed cleanup must not cost the cooldown record")
+        self.assertTrue(self.legacy.is_dir(), "left as found rather than forced")
+
+    def test_root_tidy_is_clean_for_the_upgraded_workspace_afterwards(self):
+        """The reviewer's actual complaint: the standing WARN must clear."""
+        hc_path = REPO / "src" / "health-check.py"
+        if not hc_path.is_file():
+            self.skipTest("health-check.py not present")
+        self.legacy.write_text("1785876643 2f35a3c6")
+        cpq.write_notify_stamp([], now=1700000000)
+        import importlib.util as iu
+        s = iu.spec_from_file_location("hc2", hc_path)
+        hc = iu.module_from_spec(s); sys.modules["hc2"] = hc
+        try:
+            s.loader.exec_module(hc)
+        except SystemExit:
+            pass
+        loose = [f.name for f in self.ws.iterdir()
+                 if f.is_file() and not hc.workspace_root_file_allowed(f.name)] \
+            if hasattr(hc, "workspace_root_file_allowed") else \
+            [f.name for f in self.ws.iterdir()
+             if f.is_file() and f.name not in hc.WORKSPACE_ROOT_ALLOWED]
+        self.assertEqual(loose, [], f"root still not tidy: {loose}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

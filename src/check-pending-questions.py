@@ -39,13 +39,21 @@ LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
 def write_notify_stamp(questions, now=None):
     """Record that this question set was just notified.
 
-    A named function rather than two inline lines so the stamp's location and its
-    directory creation are testable without driving `main`, which would fire a real
-    macOS notification.
+    A named function rather than inline lines so the location, the directory
+    creation and the one-time retirement of the old root stamp are testable without
+    driving `main`, which would fire a real macOS notification.
     """
     LAST_NOTIFY_FILE.parent.mkdir(parents=True, exist_ok=True)
     ts = int(time.time()) if now is None else now
     LAST_NOTIFY_FILE.write_text(f"{ts} {questions_key(questions)}")
+    # Retire the pre-move root stamp AFTER the new one is on disk, so a crash
+    # between the two loses at most a cooldown, never the record. Derived from
+    # LAST_NOTIFY_FILE so a test that redirects the stamp cannot reach the real
+    # workspace root.
+    try:
+        (LAST_NOTIFY_FILE.parent.parent / ".last-pq-notify").unlink(missing_ok=True)
+    except OSError:
+        pass
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
 # How long an UNCHANGED question set stays quiet before it is raised again. This
 # is the floor that stops "notify only when the set changes" from turning an
