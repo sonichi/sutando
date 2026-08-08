@@ -1,44 +1,65 @@
 #!/usr/bin/env python3
 """`data/generated/` is sendable; the rest of `data/` must stay refused.
 
-Skills need somewhere to put derived deliverables (rendered video, exports) that
-is (a) attachable and (b) outside the vault carrier. `data/` satisfies (b)
-already — the carrier whitelist emits `*` and never un-ignores it — so the only
-missing piece was a send root.
+`data/` holds `conversation.sqlite` and `memory-snapshots/*.tar.gz` on a live
+host, so allowlisting it wholesale would make the conversation store and the
+memory corpus attachable. The root is scoped one level down and the negative
+half is asserted, so a widening to `data/` fails rather than shipping quietly.
 
-The obvious version of that change is what this test exists to prevent.
-Allowlisting `data/` WHOLESALE would expose, on a live host:
-
-    data/conversation.sqlite            (+ -wal, -shm)   the conversation store
-    data/memory-snapshots/*.tar.gz                       the whole memory corpus
-    data/usage/usage-*.jsonl                             usage telemetry
-
-All three were verified unsendable before this change, and must stay that way.
-So the root is scoped one level down, and the negative half is asserted here —
-a future widening to `data/` fails this file rather than shipping quietly.
-
-`generated/` is deliberately generic rather than per-skill: the product repo has
-no business naming a skill, and any skill's derived output belongs here.
+Hermetic: builds a fixture repo whose `sutando.config.local.json` points at a
+temp workspace and imports `send_allowlist` from there, so nothing is written
+under the operator's workspace. `$SUTANDO_WORKSPACE` cannot do this — v0.8
+stopped honoring it for resolution.
 """
 import importlib.util
+import json
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SRC = REPO / "src"
+
+COPY_SRC = ("send_allowlist.py", "workspace_default.py", "util_paths.py",
+            "sutando_config.py")
+COPY_SCRIPTS = ("sutando-config.sh", "python-binary.sh")
 
 
-def _load():
-    sys.path.insert(0, str(SRC))
-    spec = importlib.util.spec_from_file_location("sa", SRC / "send_allowlist.py")
+def build_fixture(root: Path) -> tuple[Path, Path]:
+    """Fixture repo + its temp workspace. Returns (repo, workspace)."""
+    # Workspace at <repo>/workspace — the post-v0.8 default — so resolution lands
+    # here whether or not the local config is consulted.
+    repo = root / "repo"
+    ws = repo / "workspace"
+    (repo / "src").mkdir(parents=True)
+    (repo / "scripts").mkdir(parents=True)
+    ws.mkdir()
+    for name in COPY_SRC:
+        shutil.copy(REPO / "src" / name, repo / "src" / name)
+    for name in COPY_SCRIPTS:
+        src = REPO / "scripts" / name
+        if src.is_file():
+            shutil.copy(src, repo / "scripts" / name)
+    shutil.copy(REPO / "sutando.config.json", repo / "sutando.config.json")
+    (repo / "sutando.config.local.json").write_text(
+        json.dumps({"workspace": {"path": str(ws)}}))
+    (repo / "CLAUDE.md").touch()
+    subprocess.run(["git", "init", "-q", str(repo)], check=False)
+    return repo, ws
+
+
+def load_allowlist(repo: Path):
+    sys.path.insert(0, str(repo / "src"))
+    spec = importlib.util.spec_from_file_location(
+        "sa_fixture", repo / "src" / "send_allowlist.py")
     mod = importlib.util.module_from_spec(spec)
+    sys.modules["sa_fixture"] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
 def main():
-    sa = _load()
     failures = []
 
     def check(desc, cond):
@@ -46,57 +67,50 @@ def main():
         if not cond:
             failures.append(desc)
 
-    roots = sa.SEND_ALLOWED_ROOTS
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        repo, ws = build_fixture(root)
+        sa = load_allowlist(repo)
 
-    # --- the root exists, and is SCOPED -------------------------------------
-    check("data/generated is an allowed root",
-          any(r.endswith("/data/generated") for r in roots))
-    check("bare data/ is NOT an allowed root (would expose the conversation store)",
-          not any(r.rstrip("/").endswith("/data") for r in roots))
+        # The fixture only means anything if the workspace actually moved.
+        # Compare RESOLVED paths: on macOS mktemp yields /var/folders, which is a
+        # symlink to /private/var/folders, so a raw string compare fails spuriously.
+        check("fixture redirected the workspace (not the operator's)",
+              Path(ws).resolve() == Path(sa._REPO).resolve())
 
-    # --- behaviour, on real files in a real tree ----------------------------
-    # `is_path_sendable` requires an existing regular file, so the fixture has
-    # to live under the resolved workspace rather than a tmpdir.
-    #
-    # Derive from the module's own _REPO, NOT by searching SEND_ALLOWED_ROOTS:
-    # a `next()` over the roots raises StopIteration when the root is absent,
-    # which killed this half silently on the very states it must report.
-    root = Path(sa._REPO) / "data" / "generated"
-    made = []
-    try:
-        (root / "ep999-bundle").mkdir(parents=True, exist_ok=True)
-        deliverable = root / "ep999-bundle" / "ep999.mp4"
+        # Precondition that silently inverted a reviewer's run: SEND_ALLOWED_PREFIXES
+        # allows /private/tmp/sutando-*, so a fixture placed there is sendable by
+        # prefix and every negative check flips. Fail loudly instead.
+        real = str(Path(ws).resolve())
+        prefixed = [p for p in sa.SEND_ALLOWED_PREFIXES if real.startswith(p)]
+        check(f"fixture path is not covered by SEND_ALLOWED_PREFIXES {prefixed or ''}",
+              not prefixed)
+
+        roots = sa.SEND_ALLOWED_ROOTS
+        check("data/generated is an allowed root",
+              any(r.endswith("/data/generated") for r in roots))
+        check("bare data/ is NOT an allowed root (would expose the conversation store)",
+              not any(r.rstrip("/").endswith("/data") for r in roots))
+
+        # behaviour, on real files inside the FIXTURE workspace
+        gen = ws / "data" / "generated" / "ep999-bundle"
+        gen.mkdir(parents=True)
+        deliverable = gen / "ep999.mp4"
         deliverable.write_bytes(b"\x00")
-        made.append(deliverable)
         check("a derived deliverable under data/generated/ IS sendable",
               sa.is_path_sendable(str(deliverable)))
 
-        # siblings one level up that must never become attachable
-        parent = root.parent
         for name in ("conversation.sqlite", "usage/usage-probe.jsonl",
                      "memory-snapshots/memory-live-probe.tar.gz"):
-            p = parent / name
+            p = ws / "data" / name
             p.parent.mkdir(parents=True, exist_ok=True)
-            if not p.exists():
-                p.write_bytes(b"\x00")
-                made.append(p)
+            p.write_bytes(b"\x00")
             check(f"data/{name} stays REFUSED", not sa.is_path_sendable(str(p)))
 
-        # a symlink out of the scoped root must not launder anything in
-        outside = parent / "conversation.sqlite"
-        if outside.exists():
-            link = root / "sneaky.sqlite"
-            if not link.exists():
-                link.symlink_to(outside)
-                made.append(link)
-            check("a symlink from data/generated/ to data/ is still REFUSED "
-                  "(realpath collapse)", not sa.is_path_sendable(str(link)))
-    finally:
-        for p in reversed(made):
-            try:
-                p.unlink()
-            except OSError:
-                pass
+        link = gen / "sneaky.sqlite"
+        link.symlink_to(ws / "data" / "conversation.sqlite")
+        check("a symlink from data/generated/ to data/ is still REFUSED "
+              "(realpath collapse)", not sa.is_path_sendable(str(link)))
 
     print()
     if failures:
