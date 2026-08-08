@@ -6627,12 +6627,11 @@ def _interpret_core_model_pin(pinned: list, socket: str) -> dict:
         "name": name,
         "status": "warn",
         "detail": (
-            f"core model is PINNED ({where}) — nothing in this repo sets this any more, "
-            f"so the pin is LEFT OVER from the retired wedge-recovery downgrade or was "
-            f"set by hand. It survives every bare rerun and no longer expires with the "
-            f"mechanism that created it. Clear it: {fixes}. Clearing tmux alone is not "
-            f"durable: start-cli.sh re-supplies SUTANDO_CORE_MODEL from its own launching "
-            f"env on the next new-session, so the launching process has to be replaced too."
+            f"core model is PINNED ({where}) — nothing in this repo sets it, so this is "
+            f"left over or was set by hand. The Claude launcher ignores it and clears both "
+            f"tmux scopes on its next start/attach/restart, so a Claude core self-heals; "
+            f"the Codex launcher still honors it (docs/codex-core.md). To clear it now "
+            f"without waiting for a launch: {fixes}."
         ),
     }
 

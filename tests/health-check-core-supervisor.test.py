@@ -100,11 +100,7 @@ class TestCheckCoreSupervisor(unittest.TestCase):
                 self.assertEqual(self._run(td, json.dumps({"state": st}))["status"], "ok", st)
 
     def test_default_restart_never_sets_a_model_env(self):
-        """The wedge-recovery downgrade is REMOVED: no runtime gets a model pin.
-
-        This asserted the opposite until 2026-08-08. The pin it checked for was
-        never cleared or expired and was inherited by every later restart.
-        """
+        """No runtime gets a model pin: recovery must not change the core's model."""
         with tempfile.TemporaryDirectory() as td:
             repo = pathlib.Path(td)
             script = repo / "src" / "agent" / "start-cli.sh"

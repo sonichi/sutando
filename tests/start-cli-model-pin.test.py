@@ -107,11 +107,8 @@ def case_tmux_defaults_clear_both_scopes() -> list[str]:
 
 
 def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
-    """BEHAVIOURAL: driving the real script on its tmux path clears both scopes.
-
-    Uses a scratch socket, never the live core's. The static case above only
-    proves the commands are present; this proves they run and take effect.
-    """
+    """Drives the real script on its tmux path (scratch socket, never the live
+    core's): proves the clear RUNS, where the static case only proves it exists."""
     import shutil
     import signal
     tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")

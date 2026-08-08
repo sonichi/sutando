@@ -139,12 +139,14 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertIn("tmux -S /tmp/s.sock setenv -g -u SUTANDO_CORE_MODEL", r["detail"])
         self.assertNotIn("-t '=global'", r["detail"], r)
 
-    def test_remedy_warns_the_unset_is_not_durable(self):
-        """A restart re-supplies the pin from the launcher's env, so an operator
-        told only to `setenv -u` and restart would see it come straight back."""
+    def test_remedy_describes_the_launcher_self_heal_not_a_re_supply(self):
+        """The Claude launcher clears the pin; it no longer re-supplies it."""
         r = self.hc._interpret_core_model_pin([("sutando-core", "opus")], "/s")
-        self.assertIn("start-cli.sh", r["detail"])
-        self.assertNotIn("then restart.", r["detail"], "restart alone re-supplies it")
+        self.assertIn("self-heals", r["detail"])
+        self.assertIn("Codex", r["detail"], "Codex still honors the var — say so")
+        for stale in ("not durable", "re-supplies", "launching process"):
+            self.assertNotIn(stale, r["detail"],
+                             f"stale claim {stale!r}: the launcher no longer re-supplies")
 
     def test_name_is_stable(self):
         for pins in ([], [("core", "opus")]):
