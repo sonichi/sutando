@@ -217,6 +217,44 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
                              mock.Mock(stdout="sleep 120\n", returncode=0)]
             self.assertEqual(self.hc._core_argv_pins("/s", ["notifier"]), [])
 
+    def test_a_MIXED_pane_session_is_unknown_one_readable_claude_does_not_clear_it(self):
+        """Fourth layer of the same fail-open. One READABLE unpinned claude pane must
+        not suppress an UNREADABLE sibling pane: `seen_claude` says something about
+        the pane we could read, and nothing about the one we could not — which may be
+        the still-pinned core after its tmux evidence was cleared.
+        """
+        def fake_run(cmd, **kw):
+            if "list-panes" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "111\n222\n", "")
+            if cmd[0] == "ps":
+                if cmd[-1] == "111":
+                    return subprocess.CompletedProcess(cmd, 0, "claude --name sutando-core\n", "")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(self.hc.subprocess, "run", side_effect=fake_run):
+            rows = self.hc._core_argv_pins("/s", ["sutando-core"])
+        self.assertEqual(rows, [("sutando-core", None)], rows)
+        self.assertEqual(
+            self.hc._interpret_core_model_pin([], "/s", rows)["status"], "warn",
+            "a session with ANY unread pane cannot be reported clean")
+
+    def test_all_panes_readable_and_unpinned_stays_clean(self):
+        """Discriminator: every read SUCCEEDS and no pane carries --model, so the
+        session is genuinely verified and must stay `ok`. Without this, widening the
+        guard to `if read_failed` could warn on every multi-pane session unnoticed."""
+        def fake_run(cmd, **kw):
+            if "list-panes" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "111\n222\n", "")
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(cmd, 0, "claude --name sutando-core\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(self.hc.subprocess, "run", side_effect=fake_run):
+            rows = self.hc._core_argv_pins("/s", ["sutando-core"])
+        self.assertEqual(rows, [], rows)
+        self.assertEqual(self.hc._interpret_core_model_pin([], "/s", rows)["status"], "ok")
+
     def test_an_EMPTY_successful_ps_read_is_unknown_not_a_missing_pin(self):
         """The collector half of test_empty_string_argv_is_unverified_not_clean.
 

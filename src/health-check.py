@@ -6651,9 +6651,10 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
                 m = re.search(r"--model[= ]+(\S+)", argv)
                 if m:
                     out.append((sess, m.group(1)))
-            # No claude pane and every read SUCCEEDED means there is no core to BE
-            # pinned — the liveness probes' question. A failed read is unknown.
-            if not seen_claude and read_failed:
+            # ANY unread pane leaves this session unverified. Finding one readable
+            # claude says nothing about the pane we could not read — it may be the
+            # pinned core. Only an all-reads-succeeded session may stay silent.
+            if read_failed:
                 out.append((sess, None))
         except (OSError, subprocess.SubprocessError):
             out.append((sess, None))
