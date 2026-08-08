@@ -84,42 +84,49 @@ preflight_selected_core_auth() {
 # fallback chain. Only the slot-lookup rule is restated, and
 # tests/startup-voice-gate.test.sh pins it to the same fixtures as the TS
 # resolver so the two cannot drift apart silently.
-_managed_voice_credential_present() {
-  local _repo _ws _file
+# Path of the canonical managed-credentials file, resolved through
+# sutando-config.sh (the same canonical resolver resolveWorkspace() uses).
+# Prints the path; returns 1 when the workspace cannot be resolved.
+_voice_managed_credentials_file() {
+  local _repo _ws
   _repo="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   _ws="$(bash "$_repo/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 1
   [ -n "$_ws" ] || return 1
-  _file="$_ws/state/auth/managed-credentials.json"
-  [ -f "$_file" ] || return 1
+  printf '%s\n' "$_ws/state/auth/managed-credentials.json"
+}
 
-  # Mirrors CAPABILITY_FALLBACKS['gemini-voice'] = ['gemini-voice','gemini-text'].
-  # Malformed/unreadable files skip the tier rather than throwing, matching
-  # readManaged()'s try/catch contract.
-  # Resolve an interpreter that actually RUNS before reading. A bare `python3`
-  # on a fresh Mac resolves to the Xcode Command Line Tools stub, which exits
-  # non-zero — and this function returns 1 on any failure, so a stub would be
-  # indistinguishable from "no managed credential configured". That is a silent
-  # wrong answer, not a crash: startup would proceed BYO-only while a managed
-  # credential sat on disk.
-  #
-  # PROBE, don't path-match. `command -v` finds the stub because the stub IS on
-  # PATH; only running it tells you whether it works.
-  #
-  # ORDER comes from scripts/sutando-config.sh, asked for rather than restated.
-  # An earlier version of this gate probed `command -v python3` and then Homebrew
-  # and stopped there, skipping the two tiers that actually matter on a bundled
-  # install: $SUTANDO_PY and <engine>/runtime/python. A host with a broken
-  # `python3` first on PATH and a valid $SUTANDO_PY therefore concluded "no usable
-  # python3" and left voice disabled while a managed credential sat on disk —
-  # exactly the silent managed-user outage this function exists to prevent, and
-  # inconsistent with the workspace lookup ABOVE, which resolves fine because
-  # sutando-config.sh honours $SUTANDO_PY internally.
-  #
-  # `python-bin` is consulted FIRST so the precedence has one definition. The
-  # explicit tiers after it are a fallback for the case where that script cannot
-  # run at all; Homebrew stays last, beyond the canonical order, because it was
-  # added for a real host and dropping it would regress that case. brew's
-  # location is asked for, never written down (REVIEW.md hardcoded-paths).
+# Resolve an interpreter that actually RUNS for the credential-gate JSON reads.
+# A bare `python3` on a fresh Mac resolves to the Xcode Command Line Tools
+# stub, which exits non-zero — and the gate returns 1 on any failure, so a
+# stub would be indistinguishable from "no managed credential configured".
+# That is a silent wrong answer, not a crash: startup would proceed BYO-only
+# while a managed credential sat on disk.
+#
+# PROBE, don't path-match. `command -v` finds the stub because the stub IS on
+# PATH; only running it tells you whether it works.
+#
+# ORDER comes from scripts/sutando-config.sh, asked for rather than restated.
+# An earlier version of this gate probed `command -v python3` and then Homebrew
+# and stopped there, skipping the two tiers that actually matter on a bundled
+# install: $SUTANDO_PY and <engine>/runtime/python. A host with a broken
+# `python3` first on PATH and a valid $SUTANDO_PY therefore concluded "no usable
+# python3" and left voice disabled while a managed credential sat on disk —
+# exactly the silent managed-user outage this gate exists to prevent, and
+# inconsistent with the workspace lookup in _voice_managed_credentials_file,
+# which resolves fine because sutando-config.sh honours $SUTANDO_PY internally.
+#
+# `python-bin` is consulted FIRST so the precedence has one definition. The
+# explicit tiers after it are a fallback for the case where that script cannot
+# run at all; Homebrew stays last, beyond the canonical order, because it was
+# added for a real host and dropping it would regress that case. brew's
+# location is asked for, never written down (REVIEW.md hardcoded-paths).
+#
+# Prints the interpreter path; returns 1 (printing nothing) when no candidate
+# is usable. Callers own the loud warning — silence at the CALL SITE is the
+# defect the stub tests pin.
+_voice_gate_python() {
+  local _repo
+  _repo="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   _usable_python() {
     # No `-x` test: `python-bin` may return a bare command name, and a name that
     # is not on PATH simply fails to execute. Running it IS the test.
@@ -138,7 +145,46 @@ _managed_voice_credential_present() {
       break
     fi
   done
-  if [ -z "$_py" ]; then
+  [ -n "$_py" ] || return 1
+  printf '%s\n' "$_py"
+}
+
+# The committed voice credential-source preference (design 2b; amendment S1).
+# Prints exactly one of: managed | byok | unset. Every failure mode — no
+# workspace, no file, no usable python, malformed JSON, out-of-vocabulary
+# value — prints "unset": the legacy resolution every pre-preference install
+# runs under. The quarantine/byok enforcement itself never rides on this
+# helper alone: _managed_voice_credential_present re-checks the marker file
+# directly, so an unreadable preference degrades to legacy behavior, never to
+# a managed key satisfying an explicit BYOK/quarantined state.
+_voice_credential_preference() {
+  local _file _py
+  _file="$(_voice_managed_credentials_file)" || { echo "unset"; return 0; }
+  [ -f "$_file" ] || { echo "unset"; return 0; }
+  _py="$(_voice_gate_python)" || { echo "unset"; return 0; }
+  "$_py" - "$_file" <<'PY' 2>/dev/null || echo "unset"
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        doc = json.load(fh)
+    pref = doc.get("voicePreference") if isinstance(doc, dict) else None
+except Exception:
+    pref = None
+print(pref if pref in ("managed", "byok") else "unset")
+PY
+}
+
+_managed_voice_credential_present() {
+  local _file _py
+  _file="$(_voice_managed_credentials_file)" || return 1
+  [ -f "$_file" ] || return 1
+
+  # Mirrors CAPABILITY_FALLBACKS['gemini-voice'] = ['gemini-voice','gemini-text'].
+  # Malformed/unreadable files skip the tier rather than throwing, matching
+  # readManaged()'s try/catch contract. Interpreter resolution lives in
+  # _voice_gate_python (probe-first, canonical order); the LOUD warning stays
+  # here because "no usable python" must never read as "no managed credential".
+  if ! _py="$(_voice_gate_python)"; then
     echo "  ~ managed-credential gate: no usable python3 —" \
          "cannot read $_file; treating as UNKNOWN, not as absent" >&2
     return 1
@@ -148,10 +194,18 @@ _managed_voice_credential_present() {
 import json, sys
 try:
     with open(sys.argv[1]) as fh:
-        caps = (json.load(fh) or {}).get("capabilities") or {}
+        doc = json.load(fh) or {}
+    caps = doc.get("capabilities") or {}
     if not isinstance(caps, dict):
         raise ValueError("capabilities is not an object")
 except Exception:
+    sys.exit(1)
+# S1 truth table (design 2b): a quarantined file's entries are ABSENT in every
+# mode (signed-out quarantine — the token stays on disk for later renewal but
+# must never satisfy a consumer), and under an explicit BYOK preference the
+# managed tier is skipped entirely. Same guards as the TS/python resolvers and
+# health-check.py; tests/voice-preference-consumers.test.sh pins the agreement.
+if doc.get("quarantined") is True or doc.get("voicePreference") == "byok":
     sys.exit(1)
 for slot in ("gemini-voice", "gemini-text"):
     entry = caps.get(slot)
@@ -169,9 +223,29 @@ configure_startup_runtime() {
     echo "  ~ .env not found — continuing with credential-free services"
   fi
 
-  # Order mirrors resolveCredential(): managed tier first, then BYO env. Only the
-  # *reason* differs between the two enabled branches — both start voice.
-  if [ -n "${GEMINI_VOICE_API_KEY:-${GEMINI_API_KEY:-}}" ]; then
+  # Order mirrors resolveCredential() under the S1 truth table (design 2b):
+  # an explicit `voicePreference: managed` is decided by the managed gate
+  # ALONE, otherwise managed tier and BYO env both enable (only the *reason*
+  # differs). tests/voice-preference-consumers.test.sh pins this against the
+  # resolver, health-check.py, and the desktop supervisor's spawn-env twin.
+  local _voice_pref
+  _voice_pref="$(_voice_credential_preference)"
+  if [ "$_voice_pref" = "managed" ]; then
+    # S1: ONLY a non-quarantined managed entry satisfies a managed
+    # preference — a present env key must NOT silently satisfy it (that is
+    # the logout-quarantine bypass the design closes: quarantined managed
+    # entries with a leftover BYO env key would otherwise boot voice).
+    if _managed_voice_credential_present; then
+      unset SKIP_VOICE
+      echo "  ✓ voice agent enabled (managed credentials)"
+    else
+      export SKIP_VOICE=1
+      echo "  ~ voice agent disabled (voicePreference=managed but no usable" \
+           "managed credential — quarantined or missing in" \
+           "<workspace>/state/auth/managed-credentials.json; sign in to renew" \
+           "the managed key or switch the preference to BYOK)"
+    fi
+  elif [ -n "${GEMINI_VOICE_API_KEY:-${GEMINI_API_KEY:-}}" ]; then
     unset SKIP_VOICE
   elif _managed_voice_credential_present; then
     unset SKIP_VOICE
@@ -180,9 +254,14 @@ configure_startup_runtime() {
     export SKIP_VOICE=1
     # Say WHY, and name the two ways out — a gate that disables a feature without
     # explaining itself is the screen-capture failure mode repeated.
-    echo "  ~ voice agent disabled (no managed credentials in" \
-         "<workspace>/state/auth/managed-credentials.json; set GEMINI_VOICE_API_KEY" \
-         "or GEMINI_API_KEY for a BYO key)"
+    if [ "$_voice_pref" = "byok" ]; then
+      echo "  ~ voice agent disabled (BYOK preference set (managed entries" \
+           "ignored); set GEMINI_VOICE_API_KEY or GEMINI_API_KEY)"
+    else
+      echo "  ~ voice agent disabled (no managed credentials in" \
+           "<workspace>/state/auth/managed-credentials.json; set GEMINI_VOICE_API_KEY" \
+           "or GEMINI_API_KEY for a BYO key)"
+    fi
   fi
 }
 
