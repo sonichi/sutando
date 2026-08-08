@@ -79,6 +79,11 @@ from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+import send_failure_policy  # noqa: E402
+
+# Transient send failures per result body, keyed by its `.txt` name. In-memory on
+# purpose: a bridge restart re-polls the file anyway, so a fresh count is correct.
+_transient_send_attempts: dict = {}
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
@@ -4075,6 +4080,16 @@ async def poll_approved():
                         # valid, so an un-deleted marker would re-fail forever and
                         # bury the log. Same resolution as sonichi#2626.
                         print(f"  Failed to send approval to {sender_id}: {e}")
+                        if send_failure_policy.is_transient(e):
+                            # An unreachable API is not an invalid chat_id. Leave the
+                            # marker in place so the next poll retries; the obligation
+                            # this file represents outlives one 503.
+                            print(
+                                f"  [approved] transient failure — leaving {f.name} "
+                                f"in place to retry",
+                                flush=True,
+                            )
+                            continue
                         try:
                             _undeliv = f.parent / "undelivered"
                             _undeliv.mkdir(parents=True, exist_ok=True)
@@ -5131,12 +5146,25 @@ async def poll_proactive():
                         # right (it unlinks only after a successful send and
                         # falls through otherwise); the DM branch did not.
                         #
-                        # Quarantine rather than retry. A 413 never becomes a
-                        # 200, so leaving the file in place would re-poll it
-                        # every 3s forever and still never deliver, while
-                        # burying the log. Moving it aside stops the spin AND
-                        # keeps the body recoverable.
+                        # Quarantine rather than retry — but ONLY for a failure a
+                        # retry cannot fix. A 413 never becomes a 200; a 503 does,
+                        # on the very next poll, so parking it strands the body.
                         print(f"  [proactive] failed to DM {owner_id}: {e}")
+                        _key = f.with_suffix(".txt").name
+                        _tries = _transient_send_attempts.get(_key, 0) + 1
+                        if send_failure_policy.should_retry(e, _tries - 1):
+                            _transient_send_attempts[_key] = _tries
+                            if release_claim(f):
+                                print(
+                                    f"  [proactive] transient failure "
+                                    f"({_tries}/{send_failure_policy.MAX_TRANSIENT_ATTEMPTS})"
+                                    f" — released {_key} for another poll",
+                                    flush=True,
+                                )
+                                continue
+                            # Could not un-claim (a `.txt` already reappeared);
+                            # fall through and quarantine so it is not lost.
+                        _transient_send_attempts.pop(_key, None)
                         try:
                             _undeliv = f.parent / "undelivered"
                             _undeliv.mkdir(parents=True, exist_ok=True)
