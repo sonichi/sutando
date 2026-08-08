@@ -32,7 +32,11 @@ def _target(tool: str, ti: dict) -> str:
         if tool == "Bash":
             # Verb only (+ safe subcommand for verb-based tools) — never args,
             # which can carry secrets (export FOO=…, curl -H "Authorization …").
-            parts = str(ti.get("command", "")).split()
+            cmd = str(ti.get("command", ""))
+            # Skip a leading `cd <dir> &&` so the REAL command shows, not "cd".
+            if cmd.strip().startswith("cd ") and "&&" in cmd:
+                cmd = cmd.split("&&", 1)[1]
+            parts = cmd.split()
             if not parts:
                 return ""
             verb = parts[0]

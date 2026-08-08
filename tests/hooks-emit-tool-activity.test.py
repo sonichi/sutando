@@ -42,6 +42,13 @@ class TargetNoLeakTests(unittest.TestCase):
         # a subcommand token that looks like an assignment is dropped (no leak)
         self.assertEqual(hook._target("Bash", {"command": "make FOO=secret"}), "make")
 
+    def test_bash_skips_leading_cd_prefix(self):
+        # `cd <dir> && <realcmd>` should surface the REAL command, not "cd".
+        self.assertEqual(hook._target("Bash", {"command": "cd /a/b && git commit -m x"}), "git commit")
+        self.assertEqual(hook._target("Bash", {"command": "cd /repo && python3 run.py"}), "python3 run.py")
+        # a bare cd (no &&) still shows cd
+        self.assertEqual(hook._target("Bash", {"command": "cd /somewhere"}), "cd")
+
     def test_file_and_pattern_tools_are_terse(self):
         self.assertEqual(hook._target("Edit", {"file_path": "/a/b/server.py"}), "server.py")
         self.assertEqual(hook._target("Read", {"file_path": "/x/tasks_view.py"}), "tasks_view.py")
