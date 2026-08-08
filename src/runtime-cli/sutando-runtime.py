@@ -232,6 +232,7 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
     done = loop.create_future()
     orow = [2]  # next output row; transcript fills TOP-down (like Claude Code)
     lvl = [int(level)]  # 0 quiet · 1 steps · 2 per-tool; toggled by /quiet /activity /verbose
+    compose_h = [0]  # current compose-box height (rows); 0 forces the first layout
 
     def dims():
         s = shutil.get_terminal_size((80, 24))
@@ -256,18 +257,38 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
         return rows_out or [""]
 
     def draw_input():
+        # Multi-line compose box pinned to the bottom: the input WRAPS across as
+        # many rows as it needs (up to a cap) and grows upward, so the whole
+        # message is visible while typing — not just the tail. The transcript
+        # scroll region shrinks/grows to match.
         rows, cols = dims()
-        s = "".join(buf)
-        avail = max(1, cols - 3)                  # "› " prefix + margin
-        vis = s[-avail:] if len(s) > avail else s  # show the tail while typing long input
-        out.write(f"\033[{rows};1H\033[K\033[33m› \033[0m" + vis)
+        text = "".join(buf)
+        max_h = max(1, min(6, rows // 3))
+        ilines = wrap(text, max(1, cols - 2)) if text else [""]
+        if len(ilines) > max_h:
+            ilines = ilines[-max_h:]              # keep the tail (where the cursor is)
+        h = len(ilines)
+        sep_row = rows - h                        # separator sits just above the box
+        top = rows - h + 1                        # first compose row
+        if h != compose_h[0]:
+            # Clear the separator+compose band (only ever the bottom band, never
+            # the transcript above the separator), then re-pin the scroll region.
+            band_top = max(2, rows - max(compose_h[0], h))
+            for r in range(band_top, rows + 1):
+                out.write(f"\033[{r};1H\033[K")
+            out.write(f"\033[2;{sep_row - 1}r")           # region = rows 2..(rows-h-1)
+            out.write(f"\033[{sep_row};1H" + "─" * cols)  # separator
+            compose_h[0] = h
+        for i, ln in enumerate(ilines):
+            prefix = "\033[33m› \033[0m" if i == 0 else "  "
+            out.write(f"\033[{top + i};1H\033[K" + prefix + ln)
         out.flush()
 
     def _row(text):
-        # Place one physical row of transcript. Region = rows 2..(rows-2);
-        # fill top-down, scroll only once full.
+        # Place one physical row of transcript. Region = rows 2..(rows-h-1),
+        # where h is the current compose height; fill top-down, scroll when full.
         rows, _ = dims()
-        bot = rows - 2
+        bot = rows - compose_h[0] - 1
         out.write("\0337")                       # save cursor (DECSC)
         if orow[0] <= bot:
             out.write(f"\033[{orow[0]};1H\033[K" + text)
@@ -291,8 +312,7 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
 
     def add(ch):
         buf.append(ch)
-        out.write(ch)
-        out.flush()
+        draw_input()  # full redraw so wrapping / box growth is handled
 
     def command(text):
         # Client-side chat commands (not sent to the core as tasks).
@@ -406,9 +426,7 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
     who = f"  \033[2m{agent_id}\033[0m" if agent_id else ""
     hint = "/help · /activity · /quiet · Ctrl-D exit"
     out.write(f"\033[1;1H\033[K\033[1m{hdr}\033[0m{who}  \033[2m{hint}\033[0m")
-    out.write(f"\033[2;{rows - 2}r")               # scroll region = rows 2..rows-2
-    out.write(f"\033[{rows - 1};1H" + "─" * cols)   # fixed separator above compose
-    draw_input()
+    draw_input()  # owns the scroll region + separator + compose box (grows with input)
     out.flush()
     loop.add_reader(fd, on_key)
     ps = asyncio.ensure_future(pump_socket())
