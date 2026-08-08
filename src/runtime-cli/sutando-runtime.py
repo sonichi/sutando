@@ -219,6 +219,7 @@ async def _chat_tui(reader, writer, _send, show_activity=False, agent_id=None) -
     # terminal scroll-region + a raw-mode line buffer (UTF-8 aware).
     import termios
     import tty
+    import unicodedata
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     out = sys.stdout
@@ -233,19 +234,37 @@ async def _chat_tui(reader, writer, _send, show_activity=False, agent_id=None) -
         s = shutil.get_terminal_size((80, 24))
         return s.lines, s.columns
 
+    def vwidth(s):
+        return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+    def wrap(s, w):
+        # Width-aware wrap (CJK counts as 2) so a long line spans multiple rows
+        # instead of overflowing one.
+        rows_out, cur, cw = [], "", 0
+        for ch in s:
+            chw = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+            if cw + chw > w:
+                rows_out.append(cur)
+                cur, cw = ch, chw
+            else:
+                cur += ch
+                cw += chw
+        rows_out.append(cur)
+        return rows_out or [""]
+
     def draw_input():
-        rows, _ = dims()
-        out.write(f"\033[{rows};1H\033[K\033[33m› \033[0m" + "".join(buf))
+        rows, cols = dims()
+        s = "".join(buf)
+        avail = max(1, cols - 3)                  # "› " prefix + margin
+        vis = s[-avail:] if len(s) > avail else s  # show the tail while typing long input
+        out.write(f"\033[{rows};1H\033[K\033[33m› \033[0m" + vis)
         out.flush()
 
-    def emit(line):
-        # Transcript region = rows 2..(rows-2). Fill from the top; only once the
-        # region is full do we scroll. Explicit per-row positioning renders
-        # multi-line replies reliably (the old scroll-per-line trick dropped
-        # all but the last line).
+    def _row(text):
+        # Place one physical row of transcript. Region = rows 2..(rows-2);
+        # fill top-down, scroll only once full.
         rows, _ = dims()
         bot = rows - 2
-        text = line.replace("\n", " ")
         out.write("\0337")                       # save cursor (DECSC)
         if orow[0] <= bot:
             out.write(f"\033[{orow[0]};1H\033[K" + text)
@@ -254,6 +273,18 @@ async def _chat_tui(reader, writer, _send, show_activity=False, agent_id=None) -
             out.write(f"\033[{bot};1H\n\033[K" + text)  # region full → scroll up 1
         out.write("\0338")                       # restore cursor (DECRC)
         draw_input()
+
+    def emit(line):
+        # Wrap long PLAIN lines to the width so a long message spans rows rather
+        # than getting squeezed onto one (short colored border/label lines pass
+        # through as-is — measuring visible width through ANSI isn't worth it).
+        _, cols = dims()
+        line = line.replace("\n", " ")
+        if "\033" not in line and vwidth(line) > cols:
+            for chunk in wrap(line, cols):
+                _row(chunk)
+        else:
+            _row(line)
 
     def add(ch):
         buf.append(ch)
