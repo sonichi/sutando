@@ -182,6 +182,35 @@ export function voiceLifecyclePath(workspace: string): string {
 	return statusPath('voice-lifecycle.json', workspace);
 }
 
+export function voiceCapabilitiesPath(workspace: string): string {
+	return statusPath('voice-agent.capabilities.json', workspace);
+}
+
+/**
+ * Publishes the group-E capability marker the desktop supervisor gates probes on;
+ * pid+lockId bind it to this acquisition, and lockId is required — an unbound marker has no consumer.
+ */
+export function publishCapabilitiesMarker(
+	workspace: string,
+	opts: { lockId: string; now?: () => number; onError?: (err: unknown) => void },
+): void {
+	const target = voiceCapabilitiesPath(workspace);
+	const doc = {
+		probeIsolation: true,
+		at: (opts.now ?? Date.now)(),
+		pid: process.pid,
+		lockId: opts.lockId,
+	};
+	const tmp = `${target}-tmp-${process.pid}-${++_tmpCounter}`;
+	try {
+		mkdirSync(dirname(target), { recursive: true });
+		writeFileSync(tmp, JSON.stringify(doc));
+		renameSync(tmp, target);
+	} catch (err) {
+		opts.onError?.(err);
+	}
+}
+
 // Unique temp names: pid + monotonic counter — two writers (or one writer's
 // interleaved transitions) can never collide on the temp file, and rename()
 // is atomic on the same filesystem.
