@@ -47,7 +47,7 @@ def _manifest_path(agent_id: str) -> Path:
 def write_manifest(agent_id: str, *, workspace: str | None = None,
                    owner: str | None = None, endpoint: str | None = None,
                    backend: str | None = None, host_label: str | None = None,
-                   launcher: dict | None = None,
+                   launcher: dict | None = None, instance: str | None = None,
                    status: str = "running") -> Path:
     """Atomic write of the instance manifest (0700 dir / 0600 file). Preserves
     installed_at across rewrites so registration age survives restarts."""
@@ -63,6 +63,7 @@ def write_manifest(agent_id: str, *, workspace: str | None = None,
         pass
     manifest = {
         "schema_version": SCHEMA_VERSION,
+        **({"instance_id": instance} if instance else {}),
         "identity": {"agent_id": agent_id,
                      **({"owner": owner} if owner else {}),
                      **({"host_label": host_label} if host_label else {})},

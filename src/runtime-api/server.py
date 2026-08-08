@@ -43,7 +43,7 @@ from protocol import (MAX_LINE_BYTES, ELICITATION_TYPES, ProtocolError,  # noqa:
                       error_frame, parse_line, result_frame)
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
-from rundir import socket_path  # noqa: E402
+from rundir import socket_path, instance_id, lock_path  # noqa: E402
 from dispatcher import RuntimeDispatcher  # noqa: E402
 from agents_view import AgentsView  # noqa: E402
 from identity_view import IdentityView  # noqa: E402
@@ -143,7 +143,7 @@ class RuntimeServer:
             instance_registry.write_manifest(
                 self.actor_id, workspace=ws, endpoint=self.socket_path,
                 backend="tmux", host_label=_host_label(), launcher=launcher,
-                status="running")
+                instance=instance_id(), status="running")
         except Exception as e:  # noqa: BLE001
             _log(f"instance-registry write failed (non-fatal): {e}")
 
@@ -189,6 +189,23 @@ class RuntimeServer:
             writer.close()
 
     async def serve(self) -> None:
+        # Same-instance double start is illegal (different instances may run
+        # in parallel — their locks live in different per-instance run dirs).
+        # flock is held for the daemon's life; per-open-file-description, so
+        # keep the fd referenced on self.
+        import fcntl
+        lp = lock_path()
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(lp.parent, 0o700)
+        self._lock_fd = open(lp, "w")
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit(
+                f"instance {instance_id()!r} already has an authoritative "
+                f"server (lock held: {lp}) — refusing double start")
+        self._lock_fd.write(str(os.getpid()))
+        self._lock_fd.flush()
         sp = Path(self.socket_path)
         sp.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(sp.parent, 0o700)

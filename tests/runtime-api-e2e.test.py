@@ -612,6 +612,15 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         check(inst[0].get("launcher", {}).get("args") == ["serve"]
               and inst[0]["launcher"]["executable"].endswith("bin/sutando"),
               "manifest carries a structured launcher (no shell strings)")
+
+        # 16b. same-instance double start is refused by the instance lock
+        # (different instances may run in parallel; this one may not fork).
+        dup = subprocess.run(
+            [sys.executable, str(REPO / "src" / "runtime-api" / "server.py")],
+            env=ENV, capture_output=True, text=True, timeout=15)
+        check(dup.returncode != 0 and "refusing double start" in
+              (dup.stderr + dup.stdout),
+              "second server for the SAME instance exits loudly (lock held)")
     finally:
         daemon.terminate()
         try:
