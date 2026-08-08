@@ -78,16 +78,18 @@ class MainWritePathTests(unittest.TestCase):
         sys.stdin = io.StringIO(payload_text)
         return hook.main()
 
-    def test_writes_terse_line_no_secret_on_real_path(self):
+    def test_step_is_secret_safe_detail_carries_content(self):
+        # The `step` (the /verbose label) must never leak args; the `detail`
+        # field (only shown at /full) DOES carry the content by design.
         rc = self._run(json.dumps({"tool_name": "Bash",
                                    "tool_input": {"command": "export API_KEY=leakme"}}))
         self.assertEqual(rc, 0)
         feed = Path(self.tmp.name) / "state" / "activity-feed.jsonl"
-        content = feed.read_text()
-        rec = json.loads(content.splitlines()[-1])
+        rec = json.loads(feed.read_text().splitlines()[-1])
         self.assertEqual(rec["kind"], "tool")
         self.assertEqual(rec["step"], "Bash: export")
-        self.assertNotIn("leakme", content)
+        self.assertNotIn("leakme", rec["step"])           # /verbose label: safe
+        self.assertIn("leakme", rec.get("detail", ""))    # /full content: present
 
     def test_fail_open_on_malformed_stdin(self):
         # A broken hook payload must return 0 and write nothing — never block the tool.

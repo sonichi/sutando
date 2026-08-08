@@ -133,7 +133,8 @@ def _watch(activity: bool = False, raw: bool = False) -> int:
     return 0
 
 
-async def _chat_async(activity: bool = False, verbose: bool = False) -> None:
+async def _chat_async(activity: bool = False, verbose: bool = False,
+                      full: bool = False) -> None:
     # One-screen DM: ONE connection multiplexes subscribe + submit + the pushed
     # notifications. stdin lines become tasks; results print inline. Task msgs
     # (you) and result msgs (agent) render distinctly so they're easy to tell
@@ -165,7 +166,7 @@ async def _chat_async(activity: bool = False, verbose: bool = False) -> None:
     # can be toggled mid-chat (/activity, /quiet) without a daemon round-trip.
     _send("task.subscribe", {"activity": True}, "chat-sub")
     await writer.drain()
-    level = 2 if verbose else 1 if activity else 0  # 0 quiet · 1 steps · 2 per-tool
+    level = 3 if full else 2 if verbose else 1 if activity else 0  # quiet·steps·tool·+content
     if sys.stdin.isatty() and sys.stdout.isatty():
         await _chat_tui(reader, writer, _send, level, agent_id)
     else:
@@ -212,6 +213,9 @@ async def _chat_line(reader, writer, _send, level=0, agent_id=None) -> None:
                     need = 2 if p.get("kind") == "tool" else 1
                     if level >= need:
                         print(f"  ⚙ {p.get('step')}", flush=True)
+                        if level >= 3 and p.get("detail"):
+                            for dl in str(p["detail"]).split("\n"):
+                                print(f"    {dl}", flush=True)
     await asyncio.gather(pump_stdin(), pump_socket())
 
 
@@ -325,14 +329,18 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
             emit("\033[2m⚙ activity — step-level feed on\033[0m")
         elif cmd == "/verbose":
             lvl[0] = 2
-            emit("\033[2m⚙ verbose — per-tool activity on (needs a core restart "
-                 "for the tool hook to emit)\033[0m")
+            emit("\033[2m⚙ verbose — per-tool activity (tool + target)\033[0m")
+        elif cmd == "/full":
+            lvl[0] = 3
+            emit("\033[2m⚙ full — per-tool WITH content (diffs / commands). "
+                 "⚠ shows secrets.\033[0m")
         elif cmd == "/raw":
-            emit("\033[2mraw firehose isn't in-chat yet — exit and relaunch with "
-                 "--raw (read-only tmux view). In-chat raw is the next build.\033[0m")
+            emit("\033[2mraw = the whole tmux firehose (incl. my reasoning) — exit "
+                 "and relaunch with --raw (read-only tmux view). /full shows tool "
+                 "content inline; /raw is the full terminal.\033[0m")
         elif cmd == "/help":
             emit("\033[2mcommands: /quiet · /activity (steps) · /verbose (per-tool) · "
-                 "/raw (firehose, launch flag) · Ctrl-D exit\033[0m")
+                 "/full (+content) · /raw (full tmux) · Ctrl-D exit\033[0m")
         else:
             emit(f"\033[2munknown command {cmd} — try /help\033[0m")
 
@@ -415,6 +423,9 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
                     need = 2 if p.get("kind") == "tool" else 1
                     if lvl[0] >= need:
                         emit(f"  \033[2m⚙ {p.get('step')}\033[0m")
+                        if lvl[0] >= 3 and p.get("detail"):   # /full: show content
+                            for dl in str(p["detail"]).split("\n"):
+                                emit(f"    \033[2m{dl}\033[0m")
         if not done.done():
             done.set_result(None)
 
@@ -442,9 +453,9 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
         writer.close()
 
 
-def _chat(activity: bool = False, verbose: bool = False) -> int:
+def _chat(activity: bool = False, verbose: bool = False, full: bool = False) -> int:
     try:
-        asyncio.run(_chat_async(activity, verbose))
+        asyncio.run(_chat_async(activity, verbose, full))
     except (KeyboardInterrupt, EOFError):
         pass
     return 0
@@ -548,6 +559,8 @@ def main(argv=None) -> int:
                     help="also stream the agent's activity (step feed) inline")
     tc.add_argument("--verbose", action="store_true",
                     help="stream per-tool activity too (needs the PostToolUse hook)")
+    tc.add_argument("--full", action="store_true",
+                    help="per-tool activity WITH content (diffs/commands) — shows secrets")
     tc.add_argument("--raw", action="store_true",
                     help="stream the raw tmux window — SHOWS EVERYTHING incl. secrets")
     tsub = tsk.add_parser("submit")
@@ -632,7 +645,8 @@ def main(argv=None) -> int:
             if args.cmd == "chat":
                 if args.raw:
                     return _raw_tmux()
-                return _chat(activity=args.activity, verbose=args.verbose)
+                return _chat(activity=args.activity, verbose=args.verbose,
+                             full=args.full)
             if args.cmd == "list":
                 result = _rpc("task.list", {}, timeout=15)
             elif args.cmd == "results":

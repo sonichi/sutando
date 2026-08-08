@@ -312,7 +312,8 @@ class RuntimeServer:
                             continue
                         await self._push_activity({
                             "kind": rec.get("kind", "tool"),
-                            "step": rec.get("step"), "ts": rec.get("ts")})
+                            "step": rec.get("step"), "ts": rec.get("ts"),
+                            **({"detail": rec["detail"]} if rec.get("detail") else {})})
             except OSError:
                 pass
 

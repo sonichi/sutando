@@ -68,14 +68,44 @@ def _target(tool: str, ti: dict) -> str:
     return ""
 
 
+def _detail(tool: str, ti: dict) -> str:
+    # The actual CONTENT of the tool call — the diff / command / text — for the
+    # /full level only. This carries secrets (that's the point of /full being
+    # opt-in above /verbose); the terse `step` above stays secret-safe.
+    try:
+        if tool == "Bash":
+            return str(ti.get("command", ""))[:400]
+        if tool == "Edit":
+            old = str(ti.get("old_string", ""))[:180]
+            new = str(ti.get("new_string", ""))[:180]
+            return f"- {old}\n+ {new}"
+        if tool in ("Write", "NotebookEdit"):
+            return str(ti.get("content", ti.get("new_source", "")))[:360]
+        if tool == "MultiEdit":
+            n = len(ti.get("edits", []) or [])
+            return f"{n} edit(s)"
+        if tool in ("Grep", "Glob"):
+            return str(ti.get("pattern", ""))[:200]
+        if tool == "WebFetch":
+            return str(ti.get("url", ""))[:200]
+    except Exception:
+        pass
+    return ""
+
+
 def main() -> int:
     try:
         data = json.load(sys.stdin)
     except Exception:
         return 0
     tool = data.get("tool_name") or "tool"
-    target = _target(tool, data.get("tool_input") or {})
+    ti = data.get("tool_input") or {}
+    target = _target(tool, ti)
     label = f"{tool}: {target}" if target else tool
+    rec = {"ts": int(time.time()), "kind": "tool", "step": label}
+    detail = _detail(tool, ti)
+    if detail:
+        rec["detail"] = detail          # /full-only; consumers gate on the level
     try:
         ws = _workspace()
         feed = ws / "state" / "activity-feed.jsonl"
@@ -85,8 +115,7 @@ def main() -> int:
             tail = feed.read_text(errors="replace").splitlines()[-500:]
             feed.write_text("\n".join(tail) + "\n")
         with feed.open("a") as fh:
-            fh.write(json.dumps({"ts": int(time.time()), "kind": "tool",
-                                 "step": label}) + "\n")
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         return 0
     return 0
