@@ -15,6 +15,7 @@ touches the socket, JSON-RPC, or any remote API directly:
   sutando-runtime request cancel <requestId>
   sutando-runtime agent list
   sutando-runtime agent status <agentId>
+  sutando-runtime sutando info|status|owner|allowlist
 
 Issuing commands return immediately with {"requestId", "status": "pending"};
 `request wait` blocks (bounded) for the resolution. Output is JSON on stdout;
@@ -118,6 +119,10 @@ def main(argv=None) -> int:
     agt.add_parser("list")
     agt.add_parser("status").add_argument("agent_id")
 
+    idn = sub.add_parser("sutando").add_subparsers(dest="cmd", required=True)
+    for name in ("info", "status", "owner", "allowlist"):
+        idn.add_parser(name)
+
     args = ap.parse_args(argv)
     try:
         if args.group == "approval":
@@ -141,6 +146,8 @@ def main(argv=None) -> int:
             result = (_rpc("agent.list", {}, timeout=15) if args.cmd == "list"
                       else _rpc("agent.status", {"agentId": args.agent_id},
                                 timeout=15))
+        elif args.group == "sutando":
+            result = _rpc(f"sutando.{args.cmd}", {}, timeout=15)
         else:
             method = f"request.{args.cmd}"
             params = {"requestId": args.request_id}

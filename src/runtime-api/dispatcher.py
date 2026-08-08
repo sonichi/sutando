@@ -115,14 +115,15 @@ class RuntimeDispatcher:
     def __init__(self, store: RequestStore, human_actions: HumanActionAdapter,
                  actor_id: str,
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
-                 agents_view=None):
+                 agents_view=None, identity_view=None):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
         self.executors = executors
-        # Read-only discovery (agents_view.AgentsView) — injected like
-        # executors so tests compose a tmp-dir view; None = methods unavailable.
+        # Read-only discovery/identity views — injected like executors so
+        # tests compose tmp-dir views; None = those methods unavailable.
         self.agents = agents_view
+        self.identity = identity_view
         # request_id → ha action_id, rebuilt at boot for crash recovery.
         self._ha_of: dict = {}
 
@@ -205,6 +206,16 @@ class RuntimeDispatcher:
             if entry is None:
                 raise ProtocolError(-32602, f"unknown agent: {agent_id!r}")
             return entry
+        if method.startswith("sutando."):
+            if self.identity is None:
+                raise ProtocolError(-32601,
+                                    "identity surface is not configured on this daemon")
+            fn = {"sutando.info": self.identity.info,
+                  "sutando.status": self.identity.status,
+                  "sutando.owner": self.identity.owner,
+                  "sutando.allowlist": self.identity.allowlist}.get(method)
+            if fn is not None:
+                return fn()
         raise ProtocolError(-32601, f"unknown method {method}")
 
     def _agents(self):

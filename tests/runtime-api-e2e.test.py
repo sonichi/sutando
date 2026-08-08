@@ -496,6 +496,21 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
               "agent status resolves identity + heartbeat metadata via CLI")
         cli("agent", "status", "no-such-agent", expect_rc=1)
         check(True, "agent status for unknown id exits 1 (loud, not empty)")
+
+        # 10. identity surface (sutando.*) through the real daemon + CLI.
+        # The daemon booted before core-status.json existed — identity reads
+        # live state per call, no restart needed.
+        Path(ENV["SUTANDO_RUNTIME_STATE"], "core-status.json").write_text(
+            json.dumps({"status": "running", "step": "e2e", "ts": 1}))
+        s10 = cli("sutando", "status")
+        check(s10.get("status") == "running" and s10.get("step") == "e2e",
+              "sutando status reflects live core-status.json")
+        i10 = cli("sutando", "info")
+        check(i10.get("agentId") == "@test-agent:example.org",
+              "sutando info reports the daemon-resolved actor id")
+        a10 = cli("sutando", "allowlist")
+        check(isinstance(a10.get("channels"), dict),
+              "sutando allowlist answers with a channels map")
     finally:
         daemon.terminate()
         try:
