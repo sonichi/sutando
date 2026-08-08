@@ -142,6 +142,9 @@ def main(argv=None) -> int:
         if name in ("complete", "decline"):
             p2.add_argument("--note")
 
+    ins = sub.add_parser("instance").add_subparsers(dest="cmd", required=True)
+    ins.add_parser("list")
+
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsub = tsk.add_parser("submit")
     tsub.add_argument("text")
@@ -151,6 +154,13 @@ def main(argv=None) -> int:
         tsk.add_parser(name).add_argument("task_id")
 
     args = ap.parse_args(argv)
+    if args.group == "instance":
+        # Registry discovery is FILE-based by design — it must answer even
+        # when no daemon is running, so it never touches the socket.
+        import instance_registry
+        print(json.dumps({"instances": instance_registry.list_instances()},
+                         ensure_ascii=False, indent=1))
+        return 0
     try:
         if args.group == "approval":
             result = _rpc("approval.request", {

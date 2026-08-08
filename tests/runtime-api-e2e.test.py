@@ -138,6 +138,7 @@ ENV = {**os.environ,
        "SUTANDO_RUNTIME_RESOLVE_POLL": "0.3",
        "SUTANDO_AGENT_ID": "@test-agent:example.org",
        "SUTANDO_HOST_LABEL": "e2e-host",  # runtime.* reads its own beat by label
+       "SUTANDO_INSTANCE_REGISTRY": str(Path(TMP) / "instances"),
        "REMOTE_TASK_URL": "",  # set per-phase: capability tests point at the mock
        "REMOTE_TASK_TOKEN": "test-bearer"}
 
@@ -595,12 +596,32 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         st16b = cli("task", "status", tid16)
         check(st16b["state"] == "pending",
               "resolving the request returns the task to the normal lifecycle")
+
+        # 16. instance manifest registry (M1): the daemon registered itself at
+        # boot; file-based discovery answers through the CLI; the manifest is
+        # secret-free.
+        l17 = cli("instance", "list")
+        inst = [m for m in l17["instances"]
+                if m.get("identity", {}).get("agent_id") == "@test-agent:example.org"]
+        check(len(inst) == 1 and inst[0]["status"] == "running"
+              and inst[0]["endpoint"]["path"].endswith("rt.sock"),
+              "daemon wrote its instance manifest at boot (status running)")
+        mtext = Path(inst[0]["_file"]).read_text().lower()
+        check(all(n not in mtext for n in ("token", "secret", "password")),
+              "manifest carries no secrets")
     finally:
         daemon.terminate()
         try:
             daemon.wait(timeout=5)
         except subprocess.TimeoutExpired:
             daemon.kill()
+    # 17. clean shutdown (SIGTERM) marks the manifest stopped — discovery
+    # still lists the instance with the daemon fully down.
+    _mf = Path(TMP) / "instances"
+    _stopped = [json.loads(f.read_text()) for f in _mf.glob("*.json")
+                if "test-agent" in f.name]
+    check(len(_stopped) == 1 and _stopped[0]["status"] == "stopped",
+          "SIGTERM shutdown marked the instance manifest stopped")
 
     print(f"\n{'PASS — runtime-api v0 E2E green' if not FAILS else f'FAILED ({len(FAILS)})'}")
     return 1 if FAILS else 0

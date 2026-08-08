@@ -49,6 +49,7 @@ from agents_view import AgentsView  # noqa: E402
 from identity_view import IdentityView  # noqa: E402
 from tasks_view import TasksView  # noqa: E402
 from runtime_view import RuntimeView  # noqa: E402
+import instance_registry  # noqa: E402
 
 def _state_dir() -> Path:
     ws = os.environ.get("SUTANDO_RUNTIME_STATE")
@@ -125,6 +126,29 @@ class RuntimeServer:
                                       runtime_socket=socket_path)
                           if state_dir else None))
 
+    def _register_instance(self) -> None:
+        """Boot-time manifest write (registry M1). Best-effort: a registry
+        problem must never stop the daemon from serving."""
+        try:
+            ws = None
+            try:
+                sys.path.insert(0, str(_HERE.parent))
+                from workspace_default import resolve_workspace  # noqa: PLC0415
+                ws = str(resolve_workspace())
+            except Exception:  # noqa: BLE001
+                pass
+            instance_registry.write_manifest(
+                self.actor_id, workspace=ws, endpoint=self.socket_path,
+                backend="tmux", host_label=_host_label(), status="running")
+        except Exception as e:  # noqa: BLE001
+            _log(f"instance-registry write failed (non-fatal): {e}")
+
+    def mark_stopped(self) -> None:
+        try:
+            instance_registry.mark_stopped(self.actor_id)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _pending_hitl_types(self, task_id: str) -> list:
         """Pending HITL request types for a task — the tasks view's window
         into the request store, bound here so the view stays store-free."""
@@ -178,6 +202,7 @@ class RuntimeServer:
             self.client, path=str(sp), limit=MAX_LINE_BYTES + 1024)
         os.chmod(sp, stat.S_IRUSR | stat.S_IWUSR)  # 0600
         self.dispatcher.recover()
+        self._register_instance()
         _log(f"listening on {sp} (actor={self.actor_id})")
         async with server:
             await asyncio.gather(server.serve_forever(), self.dispatcher.resolver_loop())
@@ -195,10 +220,19 @@ def main() -> None:
         or str(state / "human-actions"),
         state_dir=str(state),
     )
+    import signal
+
+    def _term(_sig, _frm):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)
     try:
         asyncio.run(srv.serve())
     except KeyboardInterrupt:
         pass
+    finally:
+        # Clean shutdown only — a crash never reaches this, leaving
+        # status "running" + dead socket = the stale_or_crashed signal.
+        srv.mark_stopped()
 
 
 if __name__ == "__main__":
