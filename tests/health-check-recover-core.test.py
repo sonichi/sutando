@@ -7,8 +7,8 @@ Motivated by the 2026-06-02 incident: the core crossed into 1M extended
 context, hit the interactive `/usage-credits` gate (which cannot be
 pre-authorized for an unattended agent), and looped silently — alive (heartbeat
 ticking) but draining nothing. --notify-slack makes that visible; this makes it
-self-healing by restarting the core via src/agent/start-cli.sh --restart, with
-1M preserved on the first attempt and a graceful 200K fallback if it recurs.
+self-healing by restarting the core via src/agent/start-cli.sh --restart. The
+restart preserves whatever model the core is configured for; it never pins one.
 
 Because auto-restarting a 24/7 agent is consequential, the guards are the whole
 point. These cover:
@@ -171,12 +171,8 @@ def case_f_cooldown_blocks_second_restart() -> list[str]:
 
 
 def case_g_recurrence_does_not_downgrade_the_model() -> list[str]:
-    """The escalation is GONE. A repeat wedge restarts on the configured model.
-
-    It used to pin SUTANDO_CORE_MODEL=opus here. Nothing cleared or expired that,
-    and every later restart inherited it, so one recovery became a permanent
-    downgrade — measured at 165 autocompactions in 25h on a peer core.
-    """
+    """A repeat wedge restarts on the configured model — no downgrade, and the
+    DM must not promise one."""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         h = Harness(Path(td) / "rec.json")

@@ -7702,10 +7702,8 @@ def notify_gateway_for_failures(
 #     file serializes the decision so a manual + launchd run can't double-fire.
 #   - Hard cap of RECOVER_MAX_PER_HOUR; past that it DMs "giving up" and stops,
 #     so a pathological wedge can't become a restart loop.
-#   - NO model change. A recurring wedge used to pin SUTANDO_CORE_MODEL=opus
-#     (standard 200K) on the second restart. Removed: nothing cleared or expired
-#     it and every later restart inherited it, so one recovery silently became a
-#     permanent downgrade. The cap above is the bound on a re-wedging core.
+#   - NO model change on restart: an inherited pin is indistinguishable from a
+#     deliberate choice. The cap above is the bound on a re-wedging core.
 #   - DMs the owner before each restart and records whether the DM succeeded
 #     (last_restart_dm_sent) + logs failures, so a restart is never invisible
 #     even if Slack is down — recovery still proceeds (recovery > notification).
@@ -7829,12 +7827,8 @@ def _resolve_launch_env() -> dict:
 
 def _default_core_restart() -> bool:
     """Run the selected core CLI dispatcher with --restart out-of-process.
-    Returns True if the restart command exited 0.
-
-    Deliberately sets no model: the recovery restart must not change which model
-    the core runs on. It used to pin SUTANDO_CORE_MODEL=opus on a repeat wedge,
-    which nothing cleared or expired and which every later restart inherited.
-    """
+    Sets no model: recovery must not change which model the core runs on.
+    Returns True if the restart command exited 0."""
     script = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not script.exists():
         return False
@@ -7985,10 +7979,8 @@ def recover_core_if_wedged(
                     print("[recover-core] WARNING: give-up DM to owner failed", flush=True)
             return {"action": "gave_up", "restarts_last_hour": len(history)}
 
-        # No model escalation. A repeat wedge used to degrade the core to the
-        # standard 200K window, which bought a working core and paid for it with
-        # a pin nothing cleared. RECOVER_MAX_PER_HOUR + the give-up DM above are
-        # the bound on a re-wedging core; a quieter model is not.
+        # No model escalation: RECOVER_MAX_PER_HOUR plus the give-up DM above
+        # are the bound on a re-wedging core.
         # DM the owner BEFORE restarting. Capture the result (blocker 2): if the
         # DM fails we still restart (recovery > notification — don't leave the
         # core wedged because Slack is down), but we record dm_sent=False and log

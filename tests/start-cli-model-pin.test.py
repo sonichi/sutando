@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """Tests that src/agent/claude/cli/start-cli.sh IGNORES $SUTANDO_CORE_MODEL.
 
-INVERTED 2026-08-08. This suite asserted the opposite (PR #1428): that the script
-threaded the var through as `--model` for health-check's wedge-recovery downgrade.
-That producer is removed, and honoring the var is what made the downgrade permanent
-— the value lived in the tmux session env, so every later launch re-read it and
-re-applied `--model`. One host ran 17 days on a pin set for one incident: 165
-autocompactions in 25h. An ambient env var cannot be told apart from a current
-choice, so the launcher no longer reads one.
+The launcher reads no model from the environment: an ambient pin cannot be told
+apart from a deliberate choice.
   - unset → NO --model flag (core inherits the global model; 1M stays default)
-  - set   → STILL no --model flag; the stale pin is ignored
-  - the tmux defaults hook clears the var in BOTH scopes so a host pinned before
-    this change heals itself
+  - set   → STILL no --model flag; the pin is ignored
+  - the tmux defaults hook clears the var in BOTH scopes
 
 Drives the no-tmux fallback branch (the bare `exec claude …`) with a stub
 `claude` that records its argv, and a stub `pgrep` that always reports "not
@@ -93,13 +87,8 @@ def case_env_set_is_ignored() -> list[str]:
 
 
 def case_tmux_defaults_clear_both_scopes() -> list[str]:
-    """The self-healing clear must target BOTH tmux env scopes.
-
-    Static, so it runs on a CI box with no tmux: a behavioural-only test would
-    skip there and prove nothing — the trap #2717's own follow-up commit hit.
-    -g is invisible to a per-session query, so clearing one scope leaves the pin
-    live in the other.
-    """
+    """Both tmux scopes must be cleared; -g is invisible to a per-session query.
+    Static so it still runs where tmux is absent, rather than skipping."""
     src = SCRIPT.read_text()
     # Comments discuss the removed flag by name, so scan CODE only — otherwise the
     # explanation of the removal trips the guard against the thing it removed.

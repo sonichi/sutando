@@ -302,16 +302,8 @@ PY
   rm -f "$_ccd_err"
 fi
 
-# NO --model flag, ever. The core inherits the user's global model (e.g.
-# `opus[1m]` from ~/.claude/settings.json), so 1M stays the default.
-#
-# This used to pass SUTANDO_CORE_MODEL through as `--model`, as the consumer half
-# of health-check's wedge-recovery downgrade. That producer is removed, and the
-# pass-through is why the downgrade was permanent rather than temporary: the var
-# lived in the tmux session env, so every later launch re-read it and re-applied
-# `--model`. A leftover pin therefore outlived the incident that set it -- 17 days
-# on one host, 165 autocompactions in 25h. Honoring an ambient env var for this is
-# the defect: an inherited value cannot be distinguished from a current choice.
+# NO --model flag: the core inherits the user's global model, so 1M stays the
+# default. An ambient env pin is indistinguishable from a deliberate choice.
 
 # ---- core --settings hooks (AskUserQuestion guard always; obs when enabled) --
 # One `--settings` flag carries every hook the core needs (multiple --settings
@@ -517,11 +509,8 @@ apply_tmux_defaults() {
   command -v tmux > /dev/null 2>&1 || return 0
   tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
-  # Clear a leftover wedge-recovery model pin. Nothing sets it any more, but an
-  # already-poisoned server keeps it in its session/global env forever, and a
-  # shell `unset` never reaches tmux. Both scopes: -g is invisible to a
-  # per-session query. Runs on every start/attach/restart, so a host that was
-  # pinned before this change heals itself instead of waiting for an operator.
+  # Clear any stale model pin: a shell `unset` never reaches tmux, and -g is
+  # invisible to a per-session query, so both scopes need clearing.
   tmux -S "$TMUX_SOCKET" setenv -gu SUTANDO_CORE_MODEL 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" setenv -u SUTANDO_CORE_MODEL 2>/dev/null || true
   # Wheel-scroll fix (sutando-plus#46, re-broken 2026-06-11): predicate on
