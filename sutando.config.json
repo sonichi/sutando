@@ -32,7 +32,8 @@
       ],
       "exclude": [
         "tasks/",
-        "results/"
+        "results/",
+        "notes/generated/"
       ]
     },
     "interval_seconds": 1800
