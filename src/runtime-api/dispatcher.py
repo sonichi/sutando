@@ -114,11 +114,15 @@ class RuntimeDispatcher:
 
     def __init__(self, store: RequestStore, human_actions: HumanActionAdapter,
                  actor_id: str,
-                 executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS):
+                 executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
+                 agents_view=None):
         self.store = store
         self.ha = human_actions
         self.actor_id = actor_id
         self.executors = executors
+        # Read-only discovery (agents_view.AgentsView) — injected like
+        # executors so tests compose a tmp-dir view; None = methods unavailable.
+        self.agents = agents_view
         # request_id → ha action_id, rebuilt at boot for crash recovery.
         self._ha_of: dict = {}
 
@@ -191,7 +195,23 @@ class RuntimeDispatcher:
             return await self._wait(params)
         if method == "request.cancel":
             return self._cancel(params)
+        if method == "agent.list":
+            return self._agents().list_agents()
+        if method == "agent.status":
+            agent_id = params.get("agentId")
+            if not agent_id:
+                raise ProtocolError(-32602, "missing required param: agentId")
+            entry = self._agents().agent_status(agent_id)
+            if entry is None:
+                raise ProtocolError(-32602, f"unknown agent: {agent_id!r}")
+            return entry
         raise ProtocolError(-32601, f"unknown method {method}")
+
+    def _agents(self):
+        if self.agents is None:
+            raise ProtocolError(-32601,
+                                "agent discovery is not configured on this daemon")
+        return self.agents
 
     def _issue(self, rtype: str, method: str, params: dict, required=()) -> dict:
         for k in required:

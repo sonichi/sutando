@@ -45,6 +45,7 @@ from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
 from rundir import socket_path  # noqa: E402
 from dispatcher import RuntimeDispatcher  # noqa: E402
+from agents_view import AgentsView  # noqa: E402
 
 def _state_dir() -> Path:
     ws = os.environ.get("SUTANDO_RUNTIME_STATE")
@@ -62,7 +63,8 @@ def _log(msg: str) -> None:
 
 
 class RuntimeServer:
-    def __init__(self, socket_path: str, db_path: str, ha_dir: str):
+    def __init__(self, socket_path: str, db_path: str, ha_dir: str,
+                 state_dir: str | None = None):
         self.socket_path = socket_path
         self.store = RequestStore(db_path)
         self.ha = HumanActionAdapter(ha_dir)
@@ -75,7 +77,9 @@ class RuntimeServer:
         # Request-domain orchestration (dispatch, approvals, governed
         # capabilities, idempotency, durable transitions, recovery) lives in
         # dispatcher.py. This class owns socket transport only.
-        self.dispatcher = RuntimeDispatcher(self.store, self.ha, self.actor_id)
+        self.dispatcher = RuntimeDispatcher(
+            self.store, self.ha, self.actor_id,
+            agents_view=AgentsView(state_dir) if state_dir else None)
 
     # ── transport ──────────────────────────────────────────────────────────
     async def client(self, reader: asyncio.StreamReader,
@@ -139,6 +143,7 @@ def main() -> None:
         or str(state / "runtime-state.sqlite"),
         ha_dir=os.environ.get("SUTANDO_HA_DIR")
         or str(state / "human-actions"),
+        state_dir=str(state),
     )
     try:
         asyncio.run(srv.serve())
