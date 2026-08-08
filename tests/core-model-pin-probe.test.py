@@ -184,11 +184,36 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(r["status"], "warn")
         self.assertIn("ALSO pinned", r["detail"])
 
-    def test_unreadable_argv_is_named_not_passed_silently(self):
+    def test_unreadable_argv_WARNS_because_status_is_the_machine_channel(self):
+        """INVERTED from asserting ok. The caveat was in `detail` only, and
+        emit_task_for_failures() gates on status, so the human channel carried it and
+        the machine channel stayed silent about a core that could not be verified."""
         r = self.hc._interpret_core_model_pin([], "/s", [("sutando-core", None)])
-        self.assertEqual(r["status"], "ok", "unknown is not a failure by itself")
+        self.assertEqual(r["status"], "warn", r)
         self.assertIn("could not read argv", r["detail"])
         self.assertIn("sutando-core", r["detail"])
+        self.assertIn("cannot be confirmed unpinned", r["detail"])
+
+    def test_empty_string_argv_is_unverified_not_clean(self):
+        """`("sutando-core", "")` is one `is None` away from being read as a clean
+        core; an empty ps read confirms nothing."""
+        r = self.hc._interpret_core_model_pin([], "/s", [("sutando-core", "")])
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("could not read argv", r["detail"])
+
+    def test_no_core_session_stays_ok_that_is_the_discriminator(self):
+        """Nothing to inspect is NOT the same as inspected-and-unreadable. If both
+        warned, the probe would warn on every host with no core running."""
+        r = self.hc._interpret_core_model_pin([], "/s", [])
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("could not read argv", r["detail"])
+
+    def test_a_session_with_no_claude_pane_is_not_an_unverified_core(self):
+        """A session holding no claude process has no core to BE pinned — that is the
+        core-liveness probes' question. Reporting it here warned on `notifier`."""
+        with mock.patch.object(self.hc.subprocess, "run") as m:
+            m.side_effect = [mock.Mock(stdout="4242\n"), mock.Mock(stdout="sleep 120\n")]
+            self.assertEqual(self.hc._core_argv_pins("/s", ["notifier"]), [])
 
     def test_clean_tmux_and_clean_argv_is_ok(self):
         r = self.hc._interpret_core_model_pin([], "/s", [])

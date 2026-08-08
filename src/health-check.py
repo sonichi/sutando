@@ -6636,8 +6636,10 @@ def _core_argv_pins(socket: str, sessions: list) -> list:
                 m = re.search(r"--model[= ]+(\S+)", argv)
                 if m:
                     out.append((sess, m.group(1)))
+            # No claude pane means there is no running core to BE pinned — a
+            # different question, owned by the core-liveness probes, not this one.
             if not seen_claude:
-                out.append((sess, None))       # cannot confirm either way
+                continue
         except (OSError, subprocess.SubprocessError):
             out.append((sess, None))
     return out
@@ -6647,14 +6649,22 @@ def _interpret_core_model_pin(pinned: list, socket: str, running=()) -> dict:
     """Interpret tmux pins AND the live core's argv. A tmux clear cannot change an
     already-running process, so argv must be reported even when tmux is clean."""
     name = "core-model-pin"
-    live = [(s, v) for s, v in running if v]
-    unknown = [s for s, v in running if not v]
+    live = [(s, v) for s, v in running if v and v.strip()]
+    # An empty-string argv read is as unverified as None; both mean "ps told us
+    # nothing", so neither may be reported as a core confirmed unpinned.
+    unknown = [s for s, v in running if not (v and v.strip())]
     if not pinned and not live:
-        detail = ("no model pin on any session or the global env "
-                  "(core uses the default window)")
         if unknown:
-            detail += f"; could not read argv for: {', '.join(sorted(unknown))}"
-        return {"name": name, "status": "ok", "detail": detail}
+            # WARN, not ok: emit_task_for_failures() gates on status, so an
+            # ok-with-caveat reaches the human channel and nothing else.
+            return {"name": name, "status": "warn",
+                    "detail": (f"could not read argv for a LIVE core session "
+                               f"({', '.join(sorted(unknown))}), so it cannot be "
+                               f"confirmed unpinned — the tmux env is clear, but a "
+                               f"clear cannot move a running core off a pinned model")}
+        return {"name": name, "status": "ok",
+                "detail": ("no model pin on any session or the global env "
+                           "(core uses the default window)")}
     if live:
         where_live = ", ".join(f"{s} argv={v!r}" for s, v in live)
         extra = ""
