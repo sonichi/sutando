@@ -209,9 +209,8 @@ function acquirePidLock(): void {
 		console.error(`${ts()} [Startup] Fix the lock helper (scripts/voice-lock.py + its python3), then restart. Exiting.`);
 		process.exit(1);
 	}
-	// This acquisition's unique token (vl1-<uuid4> from the structured lock).
-	// The capability marker binds to it so a stale marker can never match a
-	// later run — even one that reuses this pid (see publishCapabilitiesMarker).
+	// Capability-marker binding token: a stale marker can never match a later
+	// acquisition, even one that reuses this pid.
 	voiceLockId = res.lockId;
 	// Guarded release on clean exit — NON-BLOCKING fire-and-forget (amendment
 	// S4: a blocking release can deadlock against the helper that just TERM'd
@@ -855,11 +854,8 @@ async function main() {
 	// silently ignored, so the detect keeps the wiring intent explicit and
 	// lets the pin bump activate it without touching this file. Detection:
 	// the bundled VoiceSession source must mention the option.
-	// Test seam (SUTANDO_TEST_MODE only, same pattern as the injected-close
-	// seam): force the detect false so the suite can prove the FALSE branch
-	// of the capability-marker gate against a spawned agent — the property
-	// "a bodhi without probe isolation never gets an advertising marker"
-	// must fail loudly if the gate regresses.
+	// Test seam (SUTANDO_TEST_MODE only): forces the detect false so the suite
+	// can prove the marker gate's dormant branch against a spawned agent.
 	const bodhiSupportsProbeState = (() => {
 		if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_FORCE_NO_PROBE_STATE === '1') {
 			return false;
@@ -964,20 +960,8 @@ async function main() {
 	// =========================================================================
 	let lastEmittedUpstream: string | null = null;
 	let lastLifecycleKey = '';
-	// Group E activation: this build's bodhi pin ships the probe/verify/
-	// takeover roles, so publish the capability marker the desktop
-	// supervisor's probe battery gates on. Once per process, at wiring init.
-	// GATED on the same feature-detect that wires probeState (review): the
-	// marker must never advertise probe isolation the resolved bodhi doesn't
-	// have — npm can resolve a different bodhi than the lockfile's (failed or
-	// cached install, hand-edited package.json), and an ungated marker would
-	// then point the supervisor's probes at the normal attach path.
-	// ALSO gated on the acquisition token (review round 5): with no lockId
-	// there is nothing binding the marker to this run, and an unbound marker
-	// has no consumer — the desktop reader requires the token. Skipping
-	// publication fails closed AT THE WRITER, so the guarantee is local
-	// instead of living across a repo boundary. Net contract: a marker on
-	// disk is always fully bound.
+	// The marker must never advertise a capability the resolved bodhi lacks, and
+	// never publish unbound (no token → no marker): a marker on disk is always real and bound.
 	if (bodhiSupportsProbeState && typeof voiceLockId === 'string' && voiceLockId) {
 		publishCapabilitiesMarker(WORKSPACE_DIR, {
 			lockId: voiceLockId,

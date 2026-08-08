@@ -187,32 +187,8 @@ export function voiceCapabilitiesPath(workspace: string): string {
 }
 
 /**
- * Publish the capability marker the desktop supervisor gates its ws-upgrade
- * probes on (`{"probeIsolation": true}` — the reader requires strict `true`).
- * Written ONCE at agent startup: this build's bodhi pin ships the
- * probe/verify/takeover connection roles, so a `?probe=1` upgrade is
- * intercepted server-side and can never steal a live client slot. The pin
- * bump and this marker land in the same change on purpose — the marker is
- * the activation switch, so it must never precede the capability; the
- * caller ENFORCES that by gating publication on the same probeState
- * feature-detect that wires the capability, so a mis-resolved bodhi (failed
- * or cached install, hand-edited pin) never gets an advertising marker.
- * `pid` + `lockId` bind the marker to the acquisition that published it. The
- * file itself is a one-way latch (older builds neither write nor delete it),
- * so after an engine rollback a stale `true` would otherwise keep arming the
- * reader against a build without probe isolation — and pid alone is not
- * enough, because OS pids are reused: a later run can land on the stale
- * marker's pid. `lockId` is the structured lock's per-acquisition unique
- * token (vl1-<uuid4>), surfaced by acquireVoiceLock; publication runs
- * strictly after the lock win (a loser exits 7 first), so marker.{pid,lockId}
- * equal the live lock holder's exactly when the marker describes the running
- * build. The desktop reader requires BOTH equalities plus holder liveness
- * and fails closed otherwise. `lockId` is REQUIRED here: with no token there
- * is nothing binding a marker to its run, so the caller skips publication
- * entirely (fail closed at the writer, not in another repository) — a marker
- * on disk is always fully bound.
- * Atomic temp+rename, failure-silent like the lifecycle snapshot: a marker
- * write must never take the voice path down (probes just stay dormant).
+ * Publishes the group-E capability marker the desktop supervisor gates probes on;
+ * pid+lockId bind it to this acquisition, and lockId is required — an unbound marker has no consumer.
  */
 export function publishCapabilitiesMarker(
 	workspace: string,

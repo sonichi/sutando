@@ -116,11 +116,8 @@ export function acquireVoiceLock(
 		return { status: 'error', detail: `helper spawn failed: ${res.error.message}` };
 	}
 	if (res.status === 0) {
-		// The helper emits {"ok": true, "lock": record} — surface the record's
-		// per-acquisition lockId (vl1-<uuid4>) so the capability marker can bind
-		// to THIS acquisition (PID-reuse defense). Best-effort: an unparseable
-		// token just leaves the marker unbound and the desktop reader fails
-		// closed (probes dormant) — never a lock failure.
+		// Surface the lock record's per-acquisition lockId for the capability-marker
+		// binding. Best-effort: unparseable → undefined (no marker), never a lock failure.
 		let lockId: string | undefined;
 		try {
 			const parsed = JSON.parse((res.stdout ?? '').trim());
