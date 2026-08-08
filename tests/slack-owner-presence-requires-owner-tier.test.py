@@ -25,11 +25,8 @@ def _line_of(p: Path, needle: str, skip_def: bool = True) -> int:
 
 
 def _is_owner_eq_gate(test: "ast.expr") -> bool:
-    """True only for a positive `access_tier == "owner"` equality.
-
-    The first version of this file matched `ast.unparse(test)` for the substrings
-    "access_tier" and "owner", which `access_tier != "owner"` also satisfies.
-    """
+    """True only for a POSITIVE `access_tier == "owner"` equality — a negation,
+    `!=`, or a widening `or` must not satisfy the gate."""
     for n in ast.walk(test):
         if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
             return False
@@ -132,4 +129,3 @@ class OwnerEqPredicate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
