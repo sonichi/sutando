@@ -1,43 +1,19 @@
 #!/usr/bin/env python3
-"""Mediated capability layer — policy-as-data + the decision function.
-
-Authorization core of docs/design-mediated-capability-layer.md (RFC #2632):
-the capability x tier matrix, the inbound-content classifier, and
-``decide(capability, principal, grants, prohibited_overlay) -> Decision``.
-
-This module holds NO transport and executes NOTHING — dispatcher.py and the
-PreToolUse hook consume it so a capability decision is made in exactly one place
-(RFC "Relationship to the runtime-API dispatcher"). First slice per resolved
-open-question 1: credential:* + github:* are wired; the rest are matrix entries
-awaiting their consumers.
-
-Two functions are TOTAL by contract (RFC "Totality is required at two levels"):
-- ``decide()`` returns a decision for every (capability-class, tier) cell.
-- ``classify()`` maps ANY inbound content to a CapabilityRequest or the explicit
-  terminal ``UNCLASSIFIED`` (fail-closed + observable) — never raises, never None.
-
-Never raises: an unknown capability, unknown tier, or malformed input resolves
-to the most restrictive defined outcome, not an exception.
-"""
+"""Mediated capability layer — capability x tier matrix, classify(), decide().
+Opt-in DORMANT scaffolding: no production caller registers, imports, or consumes it; decide()/classify() are total and fail-closed to the most restrictive outcome."""
 from __future__ import annotations
 
 from typing import NamedTuple, Optional
 
 
-# ── Tiers (the access-tier taxonomy is the INPUT; RFC non-goal: don't replace it)
+# Tiers — matrix columns (the access-tier taxonomy is the input, not replaced).
 OWNER, TEAM, OTHER, AMBIENT = "owner", "team", "other", "ambient"
 TIERS = (OWNER, TEAM, OTHER, AMBIENT)
 
 
 def normalize_tier(access_tier: Optional[str]) -> str:
-    """Map a task's ``access_tier`` to a matrix column.
-
-    A MISSING/empty tier is ``owner`` — the existing contract (CLAUDE.md: "only
-    access_tier: owner, or tasks without an access_tier field, get full
-    processing"). A present-but-unrecognized value fails CLOSED to ``other``
-    (the most restrictive real tier), never silently to owner — strict parsing,
-    no auth bypass via a junk tier string.
-    """
+    """Map a task's access_tier to a matrix column. Missing/empty -> owner (the
+    existing contract); a present-but-unrecognized value fails CLOSED to other, never owner."""
     if access_tier is None:
         return OWNER
     t = str(access_tier).strip().lower()
@@ -46,7 +22,7 @@ def normalize_tier(access_tier: Optional[str]) -> str:
     return t if t in TIERS else OTHER
 
 
-# ── Capability classes (matrix rows, RFC "Model")
+# Capability classes (matrix rows).
 INFO_READ = "info-read"
 CREDENTIAL_USE = "credential-use"       # exercise a vaulted secret; value never surfaced
 CREDENTIAL_READ = "credential-read"     # raw stored value handed back
@@ -61,7 +37,7 @@ CLASSES = (
     WRITE_IRREVERSIBLE, PURCHASE, FINANCIAL_MOVE, CREDENTIAL_ENTRY,
 )
 
-# ── Decisions (RFC decision set + PROHIBITED for the human-only overlay rows)
+# Decisions; PROHIBITED marks the human-only overlay rows (no tier, no grant).
 ALLOW = "allow"
 DENY = "deny"
 NEEDS_AUTH = "needs-authorization"
@@ -116,8 +92,8 @@ def capability_class(verb: str) -> Optional[str]:
 
 
 class Principal(NamedTuple):
-    """Derived by the mediator from its trusted context handle — NEVER submitted
-    by a caller (RFC "Trust root"). ``tier`` is already normalized."""
+    """Derived by the mediator from its trusted context handle — never submitted
+    by a caller. ``tier`` is already normalized."""
     tier: str
     source: str = ""
     user_id: str = ""
@@ -181,17 +157,8 @@ def _scope_matches(pattern: str, scope: str) -> bool:
 
 def decide(req: CapabilityRequest, principal: Principal, grants=None,
            prohibited_overlay=DEFAULT_PROHIBITED_OVERLAY) -> Decision:
-    """The decision function. Total over (class, tier).
-
-    Order (RFC "Model"):
-      1. prohibited_overlay is checked FIRST — an overlay class is PROHIBITED for
-         every tier incl. owner and NO grant can satisfy it.
-      2. matrix[class][tier] gives the base decision.
-      3. a NEEDS_AUTH cell resolves to ALLOW iff a covering grant exists, else
-         stays NEEDS_AUTH (escalate). This is CLAUDE.md's "confirm unless standing
-         approval" made enforceable.
-    Unknown verb or unknown tier fails CLOSED to DENY.
-    """
+    """Total over (class, tier): prohibited_overlay first (no grant satisfies it), then
+    matrix; a NEEDS_AUTH cell allows only with a covering grant; unknown fails closed to DENY."""
     tier = principal.tier if principal.tier in TIERS else OTHER
     cls = capability_class(req.verb)
     if cls is None:
@@ -243,14 +210,7 @@ _RECOGNIZERS = (
 
 def classify(inbound_content) -> Classification:
     """Map inbound content to a CapabilityRequest, or the terminal UNCLASSIFIED.
-
-    Total: returns a Classification for ANY input (None, non-str, empty, prose)
-    — never raises, never None. UNCLASSIFIED is fail-closed (callers must not
-    resolve it to a privileged action) and observable (callers emit an audit
-    record + escalate on it), so the class is countable instead of silent (RFC
-    motivating case: a peer bot's ``done:`` status matches no action and must be
-    a defined outcome, not an invisible no-op).
-    """
+    Total (never raises/None); UNCLASSIFIED is fail-closed and observable, not a silent no-op."""
     if inbound_content is None:
         return Classification(None, UNCLASSIFIED, "no content")
     text = str(inbound_content).strip().lower()

@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
-"""Capability-gate — PreToolUse hook that consumes src/capability_policy.decide().
-
-Opt-in DORMANT scaffolding, not a wired enforcement layer: OFF unless
-SUTANDO_CAPABILITY_GATE=1, and nothing production-registers it yet. When enabled
-it is a coarse confirm-first backstop over Bash — prohibited/irreversible/deny ->
-deny; a needs-authorization action is always a confirm-first deny (a human
-performs it: this hook does NOT honor grants). Fail-OPEN: anything it can't map,
-or a missing policy module, passes untouched, so landing it can't disrupt a core.
-Principal is owner by default (SUTANDO_CAPABILITY_TIER overrides for a scoped
-runner). Design rationale lives in docs/design-mediated-capability-layer.md.
-"""
+"""PreToolUse hook over capability_policy.decide() — opt-in DORMANT scaffolding, OFF
+unless SUTANDO_CAPABILITY_GATE=1 and unregistered; fail-OPEN, needs-auth is always a confirm-first deny (no grants honored)."""
 import json
 import os
 import re

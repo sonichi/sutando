@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
-"""Mediated capability layer — the mediator library (in-process; not yet wired to
-any production caller). Decision core is src/capability_policy.py.
-
-``mediate(verb, args, handle, ...)`` derives the principal from a trusted mediator-
-minted handle (a caller never submits one), calls decide(), then for allow executes
-+ verifies + audits; needs-auth consumes a covering in-process grant or escalates
-write-then-assert; deny/prohibited refuses. Dependency-light + injectable (clock,
-audit/pending paths, executor, verifier) for hermetic tests. Design + guarantees:
-docs/design-mediated-capability-layer.md.
-"""
+"""In-process mediator for the capability layer (not wired to any production caller).
+mediate() derives the principal from a trusted minted handle, calls decide(), then executes+verifies+audits, consumes a grant or escalates, or refuses."""
 from __future__ import annotations
 
 import hashlib
@@ -21,10 +13,10 @@ from typing import Callable, NamedTuple, Optional
 import capability_policy as cp
 
 
-# ── Trusted context handles (RFC "Trust root") ───────────────────────────────
+# Trusted context handles — mediator-minted; a caller never submits one.
 class _Context(NamedTuple):
     principal: cp.Principal
-    task_id: str            # immutable originating task/request identity (RFC)
+    task_id: str            # immutable originating task/request identity
     expires_at: float
     closed: bool
 
@@ -71,13 +63,13 @@ class ContextRegistry:
             self._by_handle[handle] = ctx._replace(closed=True)
 
 
-# ── Authorization grants (RFC "Trust root and authorization grants") ─────────
+# Authorization grants — bound to principal identity, not bearer tokens.
 class Grant(NamedTuple):
     grant_id: str
     verb: str
     tier: str
     user_id: str = ""          # the authenticated principal the approval was FOR
-    source: str = ""           # and the source it arrived on (RFC trust-root)
+    source: str = ""           # and the source it arrived on
     task_id: str = ""          # a FRESH grant also binds the originating task/request
     args_digest: str = ""      # fresh single-use grant binds an exact digest
     scope_pattern: str = ""    # standing grant binds a scope pattern instead
@@ -154,7 +146,7 @@ class GrantStore:
         return None
 
 
-# ── Append-only audit log (RFC "Audit" — log-before-mutate, reconcile outcome)
+# Append-only audit log: log-before-mutate, then reconcile the verified outcome.
 class AuditLog:
     """One append-only JSONL record per request: who / capability / decision /
     VERIFIED outcome. Never raises on write (audit must not break the action)."""
@@ -184,17 +176,14 @@ ATTEMPTED, SUCCEEDED, FAILED, UNKNOWN = "attempted", "succeeded", "failed", "unk
 DENIED, ESCALATED, DELEGATED, PROHIBITED_OUT = "denied", "escalated", "delegated", "prohibited"
 
 
-# ── Escalation: write-then-assert to pending-questions (RFC "Escalation delivery")
+# Escalation: write-then-assert to pending-questions; uncounted == failed escalation.
 _RESOLVED_DIVIDER = "# Resolved"
 
 
 def escalate_pending(pq_path: str, question: str,
                      reader: Optional[Callable[[], list]] = None) -> bool:
-    """Insert an escalation ABOVE the ``# Resolved`` divider (so the reader
-    counts it), then READ BACK and confirm it counts. Returns True only when the
-    read-back finds the entry — a written-but-uncounted escalation is a FAILED
-    escalation (RFC: never a silent deny). ``reader`` returns the active
-    questions; when None, a lightweight in-file check is used."""
+    """Insert an escalation ABOVE the ``# Resolved`` divider, then read back and
+    confirm it counts; a written-but-uncounted escalation returns False, never a silent deny."""
     marker = "cap-escalation:" + secrets.token_hex(6)
     # Written as a `## ` section — the only format check-pending-questions counts
     # (a `- [ ]` bullet is silently uncounted); marker early so it survives the scan.
@@ -226,7 +215,7 @@ def escalate_pending(pq_path: str, question: str,
         return False
 
 
-# ── The mediator ─────────────────────────────────────────────────────────────
+# The mediator.
 class MediationResult(NamedTuple):
     decision: str
     outcome: str
