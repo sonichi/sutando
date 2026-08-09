@@ -39,6 +39,8 @@ DIFF="$(gh pr diff "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff $PR\` 
 [[ -n "$DIFF" ]] || { echo "review-pr: empty diff for #$PR (already merged with no changes, or not found)" >&2; exit 2; }
 
 OUT="$(mktemp -t review-pr.XXXXXX)"
+# Consumers split on this rather than guessing where the agent trace ends.
+VERDICT_MARKER="===CODEX-VERDICT==="
 trap 'rm -f "$OUT"' EXIT   # clean up even on interrupt / non-zero exit, not just the happy path
 
 # Mechanical checks first — the deterministic, guide-driven scanners (today:
@@ -59,6 +61,12 @@ $DIFF" < /dev/null
 rc=$?
 
 if [[ $rc -eq 0 && -s "$OUT" ]]; then
+    # Delimit the verdict. codex's own exec trace goes to OUR stdout unredirected
+    # (deliberately -- codex-bounded.sh --stall watches that stream to tell a working
+    # run from a wedged one), and that trace includes source the agent inlined while
+    # working. A consumer reading "the tail" can therefore quote repository code as
+    # the PR's content. Everything after the LAST marker is the verdict.
+    printf '%s\n' "$VERDICT_MARKER"
     cat "$OUT"
 else
     echo "review-pr: no verdict for #$PR (codex exit $rc — 125=stalled, 124=hit --max, other=error)" >&2
