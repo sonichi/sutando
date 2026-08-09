@@ -93,10 +93,15 @@ class WsTransport:
                  activity_subscribers: set | None = None,
                  request_subscribers: set | None = None,
                  voice_bridge=None,
+                 agent_id: str | None = None,
                  host: str = "127.0.0.1", port: int = 8787,
                  route: str = "/scp", log=print):
         self.dispatcher = dispatcher
         self.token = token
+        # The AGENT this server fronts (owner-model: clients key connection
+        # profiles by agent_id, not by machine). Stamped into pair.redeem so a
+        # device knows WHO authorized it from the very first exchange.
+        self.agent_id = agent_id
         self.method_allow = frozenset(method_allow)
         # Per-device credentials + pairing (opaque-bearer v0). When present, a
         # connection is authorized by ITS device credential's grants, not the
@@ -246,6 +251,8 @@ class WsTransport:
                 await ws.send_str(error_frame(
                     req_id, -32000, "pairing token invalid, expired, or used").decode())
                 return
+            if self.agent_id:
+                issued["agent_id"] = self.agent_id
             await ws.send_str(result_frame(req_id, issued).decode())
             return
         if method == "client.hello":

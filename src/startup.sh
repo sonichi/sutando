@@ -1000,10 +1000,27 @@ if [ "${SUTANDO_SCP_WSS_ENABLE:-0}" = "1" ]; then
   fi
   # Bonjour/mDNS advertise (_sutando-scp._tcp) so companions find this Mac by
   # NAME on whatever network both landed on (office, hotspot) — no IP config.
-  if ! pgrep -f "dns-sd -R Sutando _sutando-scp" > /dev/null 2>&1; then
-    dns-sd -R Sutando _sutando-scp._tcp. local "${SUTANDO_SCP_WSS_PORT:-8787}" \
+  # The instance name is the AGENT this server fronts (owner→agents→runtimes
+  # model): with several Sutandos on one LAN, clients must see WHICH agent
+  # answers, never silently join the nearest one.
+  SCP_AGENT_NAME=$(python3 - << 'PYAGENT' 2>/dev/null
+import json, os, sys
+sys.path.insert(0, "src")
+try:
+    from workspace_default import resolve_workspace
+    p = resolve_workspace() / "state" / "auth" / "ag2space.json"
+    aid = json.loads(p.read_text()).get("agent_id") or ""
+    print(aid.split(":")[0].lstrip("@") or "sutando")
+except Exception:
+    print("sutando")
+PYAGENT
+)
+  SCP_AGENT_NAME="${SCP_AGENT_NAME:-sutando}"
+  if ! pgrep -f "dns-sd -R .* _sutando-scp" > /dev/null 2>&1; then
+    dns-sd -R "$SCP_AGENT_NAME" _sutando-scp._tcp. local \
+      "${SUTANDO_SCP_WSS_PORT:-8787}" "agent=$SCP_AGENT_NAME" \
       > /dev/null 2>&1 &
-    echo "  ✓ mDNS advertise (_sutando-scp._tcp :${SUTANDO_SCP_WSS_PORT:-8787})"
+    echo "  ✓ mDNS advertise ($SCP_AGENT_NAME on _sutando-scp._tcp :${SUTANDO_SCP_WSS_PORT:-8787})"
   else
     echo "  ✓ mDNS advertise (already running)"
   fi

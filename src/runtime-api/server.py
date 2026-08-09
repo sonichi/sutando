@@ -280,12 +280,25 @@ class RuntimeServer:
                                    activity_subscribers=self._activity_subscribers,
                                    request_subscribers=self._request_subscribers,
                                    voice_bridge=voice,
+                                   agent_id=wss_agent,
                                    host=host, port=p, log=_log)
 
             started = []
             # Primary listener is PLAIN ws:// — embedded devices (the M5) speak
             # it. TLS is a SIBLING listener on its own port for browsers, whose
             # mic APIs require a secure context — never a switch on the primary.
+            # The agent this WSS fronts (owner→agents→runtimes→endpoints model):
+            # env identity first, then the enrolled ag2space identity — a
+            # deliberate SEPARATE resolution from actor_id, which keeps its
+            # dispatcher-approval semantics untouched.
+            wss_agent = (os.environ.get("SUTANDO_AGENT_ID") or "").strip() or None
+            if not wss_agent and self._state_dir:
+                try:
+                    enrolled = json.loads((Path(self._state_dir) / "auth"
+                                           / "ag2space.json").read_text())
+                    wss_agent = enrolled.get("agent_id") or None
+                except (OSError, ValueError):
+                    wss_agent = None
             wss = make_transport(port)
             await wss.start()
             started.append(wss)

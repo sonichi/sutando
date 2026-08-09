@@ -109,6 +109,8 @@ async def probe():
         red = await rpc(sess, pairing, "pair.redeem",
                         {"label": "m5-watch", "capabilities": ["mic", "speaker", "haptic"]})
         cred = red.get("result", {}).get("credential")
+        check(red.get("result", {}).get("agent_id") == "@wss-pair:example.org",
+              "pair.redeem names the AGENT that authorized the device (owner model)")
         check(cred and "task.submit" in red["result"].get("granted_methods", []),
               "pair.redeem issues a device credential granting task.submit")
 
