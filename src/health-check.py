@@ -20,6 +20,7 @@ Checks:
   - Notes directory
 """
 
+import functools
 import hashlib
 import fnmatch
 import json
@@ -4694,14 +4695,33 @@ def check_disk_space() -> dict:
     return {"name": name, "status": "ok", "detail": where}
 
 
-# Temp roots whose contents do not survive a sweep or reboot. `/var/folders` is
-# the macOS per-user temp base that $TMPDIR points into.
-_EPHEMERAL_ROOTS = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/")
+@functools.lru_cache(maxsize=1)
+def _ephemeral_roots() -> tuple:
+    """Temp roots whose contents do not survive a sweep or reboot, asked of the
+    platform: naming them literally puts a host path in the tree the scan forbids."""
+    roots = set()
+    for cand in (tempfile.gettempdir(), "/tmp"):
+        for p in (cand, os.path.realpath(cand)):
+            p = p.rstrip("/")
+            if not p:
+                continue
+            roots.add(p)
+            # macOS $TMPDIR is <base>/folders/xx/yyy/T. The shared base counts too, so
+            # another session's scratch dir is still recognised as ephemeral.
+            head, sep, _ = p.partition("/folders/")
+            if sep:
+                roots.add(head + "/folders")
+    return tuple(sorted(roots))
 
 
 def _is_ephemeral(target: str) -> bool:
-    """True if `target` lives under a temp root that gets swept."""
-    return any(target.startswith(r) for r in _EPHEMERAL_ROOTS)
+    """True if `target` IS a temp root or lives under one.
+
+    Equality counts: a link pointing AT the root is as ephemeral as one pointing
+    inside it, and a trailing-slash prefix test answers False for exactly that case.
+    """
+    t = os.path.normpath(target).rstrip("/") or "/"
+    return any(t == r or t.startswith(r + "/") for r in _ephemeral_roots())
 
 
 def check_skill_symlinks() -> dict:

@@ -48,27 +48,45 @@ class EphemeralSkillTarget(unittest.TestCase):
         self.hc.claude_home_path = lambda *p: dst.parent.joinpath(*p)
         return self.hc.check_skill_symlinks()
 
+    def _inject_classifier(self, temp_subtree: Path):
+        """Call `temp_subtree` ephemeral and nothing else.
+
+        The integration cases need a path the predicate calls DURABLE. Getting one
+        from the real classifier means writing outside a temp root — under $HOME it
+        raises PermissionError in a restricted environment and mutates a live home
+        when it does not. The predicate itself is unit-tested below.
+        """
+        root = str(temp_subtree.resolve())
+        self.hc._is_ephemeral = lambda t: os.path.realpath(t) == root or \
+            os.path.realpath(t).startswith(root + os.sep)
+
     def test_durable_repo_linking_into_temp_warns(self):
         """The real defect: a durable install whose skill escapes into temp."""
-        with tempfile.TemporaryDirectory(dir=str(Path.home())) as durable:
-            with tempfile.TemporaryDirectory(dir="/tmp") as ephemeral:
-                res = self._run(Path(durable), Path(ephemeral))
-                self.assertEqual(res["status"], "warn", res)
-                self.assertIn("temp", res["detail"].lower())
-                self.assertIn("alpha", res["detail"])
+        with tempfile.TemporaryDirectory() as td:
+            durable, ephemeral = Path(td) / "durable", Path(td) / "ephemeral"
+            durable.mkdir(); ephemeral.mkdir()
+            self._inject_classifier(ephemeral)
+            res = self._run(durable, ephemeral)
+            self.assertEqual(res["status"], "warn", res)
+            self.assertIn("temp", res["detail"].lower())
+            self.assertIn("alpha", res["detail"])
 
     def test_temp_rooted_install_is_self_consistent(self):
         """A fixture builds its whole install under tempfile. Every correct link
         there is temp-rooted; flagging them made two existing suites fail."""
-        with tempfile.TemporaryDirectory(dir="/tmp") as ephemeral:
-            e = Path(ephemeral)
+        with tempfile.TemporaryDirectory() as td:
+            e = Path(td) / "ephemeral"
+            e.mkdir()
+            self._inject_classifier(e)
             res = self._run(e / "a", e / "b")
             self.assertEqual(res["status"], "ok", res)
 
     def test_durable_other_clone_is_ok(self):
         """A second durable checkout is a supported layout, not a defect."""
-        with tempfile.TemporaryDirectory(dir=str(Path.home())) as durable:
-            d = Path(durable)
+        with tempfile.TemporaryDirectory() as td:
+            d, unrelated = Path(td) / "durable", Path(td) / "ephemeral"
+            d.mkdir(); unrelated.mkdir()
+            self._inject_classifier(unrelated)
             res = self._run(d / "a", d / "b")
             self.assertEqual(res["status"], "ok", res)
 
@@ -76,6 +94,28 @@ class EphemeralSkillTarget(unittest.TestCase):
         self.assertTrue(self.hc._is_ephemeral("/private/tmp/x/skills/a"))
         self.assertTrue(self.hc._is_ephemeral("/var/folders/ab/cd/T/x"))
         self.assertFalse(self.hc._is_ephemeral(str(Path.home() / "repo" / "skills" / "a")))
+
+    def test_a_root_itself_is_ephemeral(self):
+        """A link pointing AT the root, not inside it. Every root carried a trailing
+        slash, so the prefix test answered False for the shortest possible case."""
+        for root in ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders",
+                     tempfile.gettempdir()):
+            self.assertTrue(self.hc._is_ephemeral(root), root)
+            self.assertTrue(self.hc._is_ephemeral(root + "/"), root + "/")
+
+    def test_sibling_named_like_a_root_is_not_ephemeral(self):
+        """Boundary the other way: containment is by path component, not by string."""
+        for durable in ("/tmpfoo", "/tmpfoo/skills/a", "/private/tmpfoo",
+                        "/var/foldersX/a"):
+            self.assertFalse(self.hc._is_ephemeral(durable), durable)
+
+    def test_roots_are_derived_not_literal(self):
+        """The scan forbids a host path literal, so the roots must come from the
+        platform — and must still cover what the literal list covered."""
+        roots = self.hc._ephemeral_roots()
+        self.assertIn(os.path.realpath(tempfile.gettempdir()).rstrip("/"), roots)
+        for expected in ("/tmp", os.path.realpath("/tmp").rstrip("/")):
+            self.assertIn(expected, roots)
 
 
 if __name__ == "__main__":
