@@ -85,6 +85,9 @@ function buildWearableAgent(): MainAgent {
 			+ 'If the user asks for real work (research, code, checking a PR, email), call the work tool '
 			+ 'and confirm briefly; do not attempt long tasks in conversation. '
 			+ 'For questions about current status, answer from context conversationally.',
+		// Spoken the moment a session opens: tells the wearer the session is
+		// live, and exercises the downstream path with no mic dependency.
+		greeting: 'Say only: "Hi, I\'m listening."',
 		tools: [buildWorkTool()],
 	} as MainAgent;
 }
@@ -93,6 +96,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 	const n = nextSessionN++;
 	const bodhiPort = nextBodhiPort++;
 	let session: VoiceSession | null = null;
+	let bytesIn = 0, bytesOut = 0;
 
 	const teardown = () => {
 		const s = session as any;
@@ -130,8 +134,18 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			// Downstream: Gemini audio (base64 PCM 24k) → binary frame to the
 			// bridge — the same handleAudioOutput override conversation-server
 			// uses, minus the mu-law hop.
+			// Gemini hands audio in large buffers; the ESP32 websocket client
+			// drops the connection on frames over its RX buffer. 1600B ≈ 33ms
+			// @24kHz — small enough for any client, smooth for the device ring.
+			const CHUNK = 1600;
 			(session as any).handleAudioOutput = (data: string) => {
-				if (ws.readyState === WebSocket.OPEN) ws.send(Buffer.from(data, 'base64'));
+				const buf = Buffer.from(data, 'base64');
+				bytesOut += buf.length;
+				if (ws.readyState === WebSocket.OPEN) {
+					for (let o = 0; o < buf.length; o += CHUNK) {
+						ws.send(buf.subarray(o, Math.min(o + CHUNK, buf.length)));
+					}
+				}
 				if (!spokeThisTurn) { spokeThisTurn = true; sendState('speaking'); }
 			};
 			const bus = (session as any).eventBus;
@@ -144,6 +158,7 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			// reads it before anything else; state comes after.
 			ws.send(JSON.stringify({ ok: true }));
 			sendState('listening');
+			try { (session as any).sendGreeting?.(); } catch { /* greeting is best-effort */ }
 		} catch (e) {
 			console.error(`${ts()} [session ${n}] open failed:`, e);
 			try { ws.send(JSON.stringify({ ok: false, error: String(e) })); } catch { /* */ }
@@ -166,13 +181,18 @@ async function handleSession(ws: WebSocket): Promise<void> {
 				} catch { /* ignore malformed control frames */ }
 				return;
 			}
+			if (bytesIn === 0) console.log(`${ts()} [session ${n}] first mic frame (${data.length}B)`);
+			bytesIn += data.length;
 			try { (session as any).handleAudioFromClient(data); } catch (e) {
 				console.error(`${ts()} [session ${n}] audio-in error:`, e);
 			}
 		});
 	});
 
-	ws.on('close', () => { console.log(`${ts()} [session ${n}] closed`); teardown(); });
+	ws.on('close', () => {
+		console.log(`${ts()} [session ${n}] closed (audio in=${bytesIn}B out=${bytesOut}B)`);
+		teardown();
+	});
 	ws.on('error', () => { ws.close(); teardown(); });
 }
 
