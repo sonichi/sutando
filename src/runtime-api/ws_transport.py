@@ -184,6 +184,13 @@ class WsTransport:
                 await ws.send_str(result_frame(req_id, opened).decode())
             else:
                 sid = params.get("streamId")
+                # Validate before the set lookup: an unhashable streamId (list/
+                # dict from JSON) would raise outside the dispatch try/except
+                # and kill the whole connection.
+                if not isinstance(sid, int):
+                    await ws.send_str(error_frame(
+                        req_id, -32602, "streamId must be an integer").decode())
+                    return
                 ok = sid in streams and self._voice.close(sid)
                 streams.discard(sid)
                 await ws.send_str(result_frame(
@@ -229,18 +236,20 @@ class WsTransport:
                 await ws.send_str(error_frame(
                     req_id, -32601, "task.subscribe not permitted").decode())
                 return
-            streams = []
+            # NB: named ack_streams — `streams` is the per-connection MEDIA
+            # stream set parameter; shadowing it here would be a trap.
+            ack_streams = []
             if params.get("results", True):
                 self._result_subs.add(sink)
-                streams.append("results")
+                ack_streams.append("results")
             if params.get("activity") and self._activity_subs is not None:
                 self._activity_subs.add(sink)
-                streams.append("activity")
+                ack_streams.append("activity")
             if params.get("requests") and self._request_subs is not None:
                 self._request_subs.add(sink)
-                streams.append("requests")
+                ack_streams.append("requests")
             await ws.send_str(result_frame(
-                req_id, {"subscribed": True, "streams": streams}).decode())
+                req_id, {"subscribed": True, "streams": ack_streams}).decode())
             return
         if method not in grants:
             await ws.send_str(error_frame(

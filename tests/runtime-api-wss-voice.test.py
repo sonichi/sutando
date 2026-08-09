@@ -135,6 +135,15 @@ async def probe():
                   and c2.get("result", {}).get("closed") is False,
                   "voice.close tears down the stream (idempotent: second close = not open)")
 
+            # crash-path regression: a malformed streamId (unhashable JSON list)
+            # must be a clean -32602, not a connection-killing TypeError.
+            bad = await rpc(w, "voice.close", {"streamId": []}, rid=13)
+            check(bad.get("error", {}).get("code") == -32602,
+                  "malformed streamId → clean -32602 (connection survives)")
+            st_alive = await rpc(w, "sutando.info", rid=14)
+            check("result" in st_alive,
+                  "connection still serves RPC after the malformed close")
+
             # FULL DUPLEX: a loopback stream echoes upstream audio back
             # downstream — device → server → device round-trip proven with no
             # voice stack (what the M5/web echo-test will exercise).
