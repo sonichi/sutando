@@ -60,7 +60,9 @@
 <div class="card hidden" id="voicecard">
   <div class="lbl">Voice</div>
   <button id="ptt" class="secondary">🎙 Start voice</button>
+  <button id="mute" class="secondary" style="display:none;">🔇 Mute</button>
   <div id="voicestate" style="color:#a78bfa;font-size:13px;margin-top:6px;"></div>
+  <div id="transcript" style="display:none;max-height:40vh;overflow-y:auto;margin-top:8px;font-size:13px;line-height:1.5;"></div>
   <div id="voicemsg" style="color:#9aa0a6;font-size:12px;margin-top:6px;"></div>
 </div>
 
@@ -217,6 +219,8 @@ async function voiceStart() {
     voice.srcNode.connect(voice.proc);
     voice.proc.connect(voice.ctx.destination);   // required to drive the graph
     voice.live = true;
+    $('mute').style.display = '';
+    $('transcript').innerHTML = ''; $('transcript').style.display = 'none';
     $('ptt').textContent = '⏹ End voice';
     $('voicestate').textContent = 'listening';
     $('voicemsg').textContent = 'talk naturally — interrupt by talking over the reply';
@@ -234,12 +238,18 @@ async function voiceStop() {
   if (voice.sid != null) { try { await rpc('voice.close', { streamId: voice.sid }); } catch (e) {} }
   voice.sid = null;
   $('ptt').textContent = '🎙 Start voice';
+  $('mute').style.display = 'none'; $('mute').textContent = '🔇 Mute'; voice.muted = false;
   $('voicestate').textContent = '';
   $('voicemsg').textContent = '';
 }
 
 function initVoiceUi() {
   $('ptt').addEventListener('click', () => { voice.live ? voiceStop() : voiceStart(); });
+  $('mute').addEventListener('click', () => {
+    voice.muted = !voice.muted;
+    if (voice.stream) voice.stream.getAudioTracks().forEach(t => { t.enabled = !voice.muted; });
+    $('mute').textContent = voice.muted ? '🎙 Unmute' : '🔇 Mute';
+  });
 }
 
 function onMessage(ev) {
@@ -258,6 +268,23 @@ function onMessage(ev) {
   if (m.method === 'voice.state') {
     $('voicestate').textContent = p.state || '';
     if (p.state === 'interrupted') flushPlayback();  // cut the dead turn's tail
+    return;
+  }
+  if (m.method === 'voice.transcript') {
+    // Partials replace the current line per role; finals freeze it.
+    const box = $('transcript');
+    box.style.display = 'block';
+    const cls = 't-' + (p.role || 'agent');
+    let line = box.querySelector('.' + cls + '.partial');
+    if (!line) {
+      line = document.createElement('div');
+      line.className = cls + ' partial';
+      line.style.color = p.role === 'user' ? '#7ee0a3' : '#e8eaed';
+      box.appendChild(line);
+    }
+    line.textContent = (p.role === 'user' ? 'You: ' : 'Agent: ') + (p.text || '');
+    if (!p.partial) line.classList.remove('partial');
+    box.scrollTop = box.scrollHeight;
     return;
   }
   if (m.method === 'task.result') feed('result', '✔ ' + (p.taskId || '') + '\n' + (p.result || '').slice(0, 400));

@@ -184,6 +184,21 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			bus?.subscribe?.('turn.start', () => { spokeThisTurn = false; sendState('thinking'); });
 			bus?.subscribe?.('turn.end', () => { spokeThisTurn = false; sendState('listening'); });
 			bus?.subscribe?.('turn.interrupted', () => { spokeThisTurn = false; sendState('interrupted'); });
+			// voice.transcript — both sides of the conversation as text (input
+			// transcription + Gemini's always-on output transcription), tapped at
+			// the TranscriptManager sink. UI metadata like voice.state: partials
+			// replace the current line per role, finals append.
+			const tm = (session as any).transcriptManager;
+			if (tm?.sink?.sendToClient) {
+				const orig = tm.sink.sendToClient.bind(tm.sink);
+				tm.sink.sendToClient = (msg: Record<string, unknown>) => {
+					orig(msg);
+					if (msg?.type === 'transcript' && ws.readyState === WebSocket.OPEN) {
+						ws.send(JSON.stringify({ method: 'voice.transcript', params: {
+							role: msg.role, text: msg.text, partial: !!msg.partial } }));
+					}
+				};
+			}
 			await (session as any).start();
 			console.log(`${ts()} [session ${n}] open (bodhi :${bodhiPort}, `
 				+ `device ${device.label || '?'}${device.deviceId ? '/' + device.deviceId : ''})`);

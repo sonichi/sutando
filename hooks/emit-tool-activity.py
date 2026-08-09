@@ -47,6 +47,15 @@ def _target(tool: str, ti: dict) -> str:
                 real = line
                 break
             parts = (real or cmd).split()
+            # Skip leading VAR=value / VAR=$(…) assignment tokens — the verb is
+            # the first non-assignment word (fixes steps like "WS=$(bash").
+            while parts and "=" in parts[0] and not parts[0].startswith("="):
+                head = parts.pop(0)
+                if "$(" in head:        # VAR=$(cmd …: the verb is inside
+                    inner = head.split("$(", 1)[1]
+                    if inner:
+                        parts.insert(0, inner)
+                    break
             if not parts:
                 return ""
             verb = parts[0]
@@ -93,6 +102,46 @@ def _detail(tool: str, ti: dict) -> str:
     return ""
 
 
+_VERB_PHRASES = {
+    "gh": "working with GitHub", "git": "working with git",
+    "curl": "fetching from the web", "npm": "running npm",
+    "pip": "installing packages", "pip3": "installing packages",
+    "python3": "running a script", "python": "running a script",
+    "node": "running a script", "npx": "running a tool",
+    "bash": "running a script", "sh": "running a script",
+    "pio": "building firmware", "make": "building",
+    "ls": "listing files", "grep": "searching", "find": "searching files",
+}
+
+
+def _humanize(tool: str, target: str) -> str:
+    """Owner-facing phrasing for the feed (voice panels render this line).
+    Falls back to the terse `Tool: target` for anything unmapped — honest,
+    never invented."""
+    try:
+        if tool == "Bash" and target:
+            verb = target.split()[0]
+            phrase = _VERB_PHRASES.get(verb)
+            if phrase:
+                # keep the safe subcommand for context: "working with GitHub (gh pr)"
+                return f"{phrase} ({target})" if " " in target else phrase
+        if tool == "Read" and target:
+            return f"reading {target}"
+        if tool in ("Edit", "Write", "NotebookEdit") and target:
+            return f"editing {target}"
+        if tool in ("Grep", "Glob") and target:
+            return f"searching for {target}"
+        if tool in ("Task", "Agent") and target:
+            return f"delegating: {target}"
+        if tool == "WebFetch" and target:
+            return f"reading {target}"
+        if tool == "WebSearch":
+            return "searching the web"
+    except Exception:
+        pass
+    return f"{tool}: {target}" if target else tool
+
+
 def main() -> int:
     try:
         data = json.load(sys.stdin)
@@ -101,7 +150,7 @@ def main() -> int:
     tool = data.get("tool_name") or "tool"
     ti = data.get("tool_input") or {}
     target = _target(tool, ti)
-    label = f"{tool}: {target}" if target else tool
+    label = _humanize(tool, target)
     rec = {"ts": int(time.time()), "kind": "tool", "step": label}
     detail = _detail(tool, ti)
     if detail:
