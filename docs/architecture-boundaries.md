@@ -152,14 +152,49 @@ sent. Copying the filesystem state machine into each adapter is not permitted.
 HTTP handlers are transport adapters, not the owner of feature policy. Repeated
 authentication gates, status/header emission, and JSON serialization belong in
 small handler helpers so every route uses one wire contract. Route branches retain
-endpoint-specific orchestration and payload construction. Refactors must preserve
-status codes, headers, and payload shapes with direct contract tests.
+only dispatch; named endpoint methods own orchestration and payload construction.
+Refactors must preserve delegation, status codes, headers, and payload shapes with
+direct contract tests.
+
 ### HTTP route boundaries
 
 HTTP route methods should remain dispatch layers: parse and authorize the request,
 call a named operation, then emit its result. Filesystem reconciliation and
 response assembly belong in module-level operations that can be tested without a
 socket. Protect both the operation contract and one route-wiring path.
+
+The same rule governs result-body markers, with an explicit one-way dependency
+direction:
+
+    result_markers.parse_markers()   # protocol interpretation
+              |
+              v
+    send_allowlist.is_path_sendable()  # delivery authorization
+              |
+              v
+    provider-specific upload mechanism
+
+`src/result_markers.py` owns marker syntax, precedence, stripping, and action
+extraction. `src/send_allowlist.py` owns attachment-path authorization. Delivery
+consumers (Discord, Slack, Telegram, gateway, and the `dm-result.py` REST
+fallback) own transport routing and upload calls only — they must not define
+marker regexes or path-policy copies.
+
+**All four Python consumers now conform, and the guard enforces it.**
+`discord-bridge.py`, `dm-result.py`, `telegram-bridge.py`, and `slack-bridge.py`
+obtain marker grammar solely from `parse_markers()`.
+`tests/bridge-marker-no-leak.test.py` fails if any of them declares the grammar
+itself, matching the grammar in any regex literal so a renamed private parser
+cannot slip past. Telegram's `send_reply()` used to compile its own
+`file|send|attach` regex and Slack declared the same regex dead at module scope;
+both are gone. The rule above forbids *new* private parsers — add any new
+consumer to that guard when it starts handling markers.
+
+Parsing never authorizes and authorization never parses: `parse_markers()`
+extracts any marker value and leaves the decision about whether a path may be
+opened to the allowlist. A consumer that filters values during parsing
+re-couples the two and drifts — which is precisely how `dm-result.py` came to
+deliver literal `[file: ...]` text that every other consumer stripped.
 
 ## Current repository classification
 

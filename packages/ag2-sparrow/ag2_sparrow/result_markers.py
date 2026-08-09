@@ -1,13 +1,20 @@
 """
-Unified parsing for the result-body protocol markers used by every bridge
-(discord, slack, telegram, voice/task-bridge). Closes #873.
+Unified parsing for the result-body protocol markers used by every delivery
+consumer (discord, slack, telegram, remote-gateway, voice/task-bridge, and the
+`src/dm-result.py` REST fallback). Closes #873.
 
 Why centralize: each bridge previously hand-rolled its own marker recognition,
 which (a) drifted (telegram never recognized [deduped:], slack never recognized
 [channel:]), and (b) leaked literal marker text to the user when the bridge
 didn't honor it. This module is the single source of truth for marker
-shapes; bridges call `parse_markers(text)` and apply the actions they CAN
+shapes; consumers call `parse_markers(text)` and apply the actions they CAN
 support, silently stripping the rest from the body so nothing ever leaks.
+
+No consumer may define its own marker regex. discord-bridge.py and
+dm-result.py each carried a private `_FILE_MARKER_RE` that matched only
+`/...` or `~/...` values; markers this parser strips were therefore delivered
+as literal text by the fallback. Both copies are gone and
+`tests/bridge-marker-no-leak.test.py` guards their return.
 
 This module deliberately does NOT enforce path allowlists. File-marker
 extraction returns paths; the bridge's own `_is_path_sendable()` check
