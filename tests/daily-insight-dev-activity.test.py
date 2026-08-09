@@ -159,10 +159,35 @@ class TestInsightPriority(unittest.TestCase):
     def test_agent_output_is_not_attributed_to_owner(self):
         insight = self.mod.dev_activity_insight({
             "commits_24h": 2,
+            "landed_24h": 2,
             "top_dirs": [("src", 2)],
             "stand": "Echo Act IV Mini",
         })
         self.assertIn("Sutando's Echo Act IV Mini instance shipped 2 commits", insight)
+
+    def test_shipped_requires_that_the_commits_actually_landed(self):
+        """`--branches` spans UNMERGED work, so the count alone cannot say "shipped".
+        Reported 43 "shipped" on 2026-08-09 when 1 had landed and 42 sat on branches."""
+        base = {"commits_24h": 43, "top_dirs": [("tests", 9)], "stand": ""}
+        none_landed = self.mod.dev_activity_insight({**base, "landed_24h": 0})
+        self.assertNotIn("shipped", none_landed)
+        self.assertIn("in flight", none_landed)
+        partial = self.mod.dev_activity_insight({**base, "landed_24h": 1})
+        self.assertNotIn("shipped", partial)
+        self.assertIn("landed 1 of 43", partial)
+        self.assertIn("42 are still on branches", partial)
+        all_landed = self.mod.dev_activity_insight({**base, "landed_24h": 43})
+        self.assertIn("shipped 43 commits", all_landed)
+
+    def test_unresolvable_landed_count_does_not_claim_shipped(self):
+        """A repo with no remote default branch cannot say what landed, so the word
+        must not appear at all rather than defaulting to the flattering reading."""
+        insight = self.mod.dev_activity_insight({
+            "commits_24h": 7, "landed_24h": None,
+            "top_dirs": [("src", 2)], "stand": "",
+        })
+        self.assertNotIn("shipped", insight)
+        self.assertIn("authored 7 commits", insight)
         self.assertNotIn("You shipped", insight)
 
 

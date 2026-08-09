@@ -430,7 +430,48 @@ def analyze_dev_activity(repo_root=SRC_DIR, now=None):
         return None
     if commits == 0:
         return None
-    return {"commits_24h": commits, "top_dirs": dirs.most_common(3), "stand": stand}
+    # `--branches` above spans UNMERGED work, so `commits` is work-in-progress, not
+    # shipped. Count separately how many reached the default branch; the wording
+    # downstream depends on the split.
+    landed = _landed_commit_count(repo_root, author, stand)
+    return {"commits_24h": commits, "landed_24h": landed,
+            "top_dirs": dirs.most_common(3), "stand": stand}
+
+
+def _landed_commit_count(repo_root, author, stand):
+    """How many of the author's last-24h commits are reachable from the remote
+    default branch. Returns None when that branch cannot be resolved, so the
+    caller can decline to claim anything rather than guess."""
+    ref = None
+    for cand in ("origin/HEAD", "origin/main", "origin/master"):
+        r = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--verify", "-q", cand],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            ref = cand
+            break
+    if ref is None:
+        return None
+    try:
+        out = subprocess.run(
+            # The `C:` sentinel is load-bearing: a commit with NO Stand trailer emits an
+            # EMPTY line, which splitlines() drops, so a bare trailer format undercounts
+            # to zero. Same reason the --branches scan above prefixes its lines.
+            ["git", "-C", str(repo_root), "log", ref, "--since=24 hours ago",
+             f"--author={author}",
+             "--pretty=format:C:%(trailers:key=Stand,valueonly)"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    n = 0
+    for line in out.stdout.splitlines():
+        if not line.startswith("C:"):
+            continue
+        if not stand or line[2:].strip() == stand:
+            n += 1
+    return n
 
 
 def dev_activity_insight(dev):
@@ -442,10 +483,19 @@ def dev_activity_insight(dev):
     plural = "s" if n != 1 else ""
     stand = (dev.get("stand") or "").strip()
     subject = f"Sutando's {stand} instance" if stand else "Sutando"
-    return (
-        f"{subject} shipped {n} commit{plural} in the last 24h, mostly in {where}. "
-        f"That's the real headline — steady build velocity."
-    )
+    landed = dev.get("landed_24h")
+    if landed is None:
+        # Cannot tell what landed, so do not use the word. Report the scope we know.
+        return (f"{subject} authored {n} commit{plural} in the last 24h, mostly in "
+                f"{where} (branch work; landed count unavailable).")
+    if landed == n:
+        return (f"{subject} shipped {n} commit{plural} in the last 24h, mostly in "
+                f"{where}. That's the real headline — steady build velocity.")
+    if landed == 0:
+        return (f"{subject} has {n} commit{plural} in flight from the last 24h "
+                f"({where}) and none landed yet — velocity is in review, not in main.")
+    return (f"{subject} landed {landed} of {n} commit{plural} from the last 24h "
+            f"({where}); the other {n - landed} are still on branches.")
 
 
 def generate_insight():
