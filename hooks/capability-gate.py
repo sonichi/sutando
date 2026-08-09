@@ -20,17 +20,13 @@ SUTANDO_CAPABILITY_TIER for a scoped runner.
 
 Rollout: OFF unless SUTANDO_CAPABILITY_GATE=1. Off, it exits 0 and does nothing —
 so landing it cannot disrupt a running core; enforcement is enabled deliberately.
-On, prohibited -> deny (human-only); owner write-irreversible without a covering
-standing grant -> deny with the escalation instruction (confirm-first).
+On, prohibited -> deny (human-only); owner write-irreversible -> deny with the
+escalation instruction (confirm-first: a human performs the action).
 
 Deploy: register under PreToolUse for "Bash" (and add mappings as more tool
-surfaces are gated). Grants are read from the standing-grant file the mediator
-writes (capability_mediator.load_standing_grants / default_standing_grants_path);
-a covering LIVE standing grant flips needs-authorization to allow. The gate's
-principal identity comes from the trusted launch env — SUTANDO_CAPABILITY_USER
-(and SUTANDO_CAPABILITY_SOURCE) — because a grant binds user_id and decide()
-fails closed on a principal with no user_id; absent identity or a covering grant,
-needs-authorization is a confirm-first deny.
+surfaces are gated). This is a coarse confirm-first backstop — it does NOT itself
+honor authorization grants (an unforgeable owner-approval path is separate future
+work); a needs-authorization action is always a confirm-first deny.
 """
 import json
 import os
@@ -43,10 +39,6 @@ try:
     import capability_policy as cp
 except Exception:  # policy module absent -> fail open (never break tool use)
     cp = None
-try:
-    import capability_mediator as cm   # standing-grant file reader (the owner-approval path)
-except Exception:
-    cm = None
 
 
 # Bash command -> capability verb. Narrow + conservative: only the clearly
@@ -99,19 +91,9 @@ def main():
         sys.exit(0)   # not a gated capability -> pass untouched
 
     tier = cp.normalize_tier(os.environ.get("SUTANDO_CAPABILITY_TIER") or "owner")
-    # A standing grant binds user_id (+source); decide() fails closed without it.
-    # Identity comes from the trusted launch env, never from tool input.
-    user_id = os.environ.get("SUTANDO_CAPABILITY_USER", "")
-    source = os.environ.get("SUTANDO_CAPABILITY_SOURCE", "")
-    grants = []
-    if cm is not None:
-        try:
-            grants = cm.load_standing_grants(cm.default_standing_grants_path())
-        except Exception:
-            grants = []   # any load failure -> no covering grant (fail closed)
     req = cp.CapabilityRequest(verb=verb)
-    decision = cp.decide(req, cp.Principal(tier=tier, user_id=user_id, source=source),
-                         grants=grants, prohibited_overlay=cp.DEFAULT_PROHIBITED_OVERLAY)
+    decision = cp.decide(req, cp.Principal(tier=tier),
+                         prohibited_overlay=cp.DEFAULT_PROHIBITED_OVERLAY)
 
     if decision.decision == cp.PROHIBITED:
         _deny(f"CAPABILITY GATE: {verb} is human-only (prohibited overlay) — "

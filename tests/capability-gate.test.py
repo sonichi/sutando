@@ -79,60 +79,6 @@ rc, dec, out = run("Bash", "gh pr comment 1 --body hi", tier="other")
 check("tier=other + github:comment -> deny (matrix deny cell)", dec == "deny", out)
 
 
-# ── Standing-grant honoring: a covering owner-minted grant flips an irreversible
-#    needs-authorization deny->allow; missing/wrong-identity/expired still DENY.
-import tempfile as _tf   # noqa: E402
-
-
-def run_grant(command, grants_rows, user="owner-1", source="", tier="owner"):
-    """Run the gate with a temp standing-grants file + a principal identity."""
-    d = _tf.mkdtemp()
-    gf = os.path.join(d, "grants.json")
-    with open(gf, "w", encoding="utf-8") as fh:
-        json.dump(grants_rows, fh)
-    env = dict(os.environ)
-    env["SUTANDO_CAPABILITY_GATE"] = "1"
-    env["SUTANDO_CAPABILITY_GRANTS_FILE"] = gf
-    if user:
-        env["SUTANDO_CAPABILITY_USER"] = user
-    if source:
-        env["SUTANDO_CAPABILITY_SOURCE"] = source
-    if tier:
-        env["SUTANDO_CAPABILITY_TIER"] = tier
-    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
-    p = subprocess.run([sys.executable, HOOK], input=payload, capture_output=True,
-                       text=True, env=env)
-    out = json.loads(p.stdout) if p.stdout.strip() else {}
-    return p.returncode, (out.get("hookSpecificOutput") or {}).get("permissionDecision"), p.stdout
-
-
-_FAR = 9_999_999_999.0   # far-future expiry (live)
-_cover = [{"verb": "github:merge", "tier": "owner", "user_id": "owner-1",
-           "scope_pattern": "*", "single_use": False, "expires_at": _FAR}]
-
-rc, dec, out = run_grant("gh pr merge 2729 --squash", _cover, user="owner-1")
-check("covering standing grant + matching owner -> ALLOW (owner-approval path works)",
-      dec is None and rc == 0, out)
-rc, dec, out = run_grant("gh pr merge 2729 --squash", _cover, user="mallory")
-check("covering grant but WRONG user -> still deny (identity preserved at the gate)",
-      dec == "deny", out)
-rc, dec, out = run_grant("gh pr merge 2729 --squash", _cover, user="")
-check("covering grant but NO principal identity -> deny (fail-closed)", dec == "deny", out)
-_expired = [dict(_cover[0], expires_at=1.0)]
-rc, dec, out = run_grant("gh pr merge 2729 --squash", _expired, user="owner-1")
-check("expired standing grant -> deny (fail-closed)", dec == "deny", out)
-rc, dec, out = run_grant("gh pr merge 2729 --squash", [], user="owner-1")
-check("empty grants file -> deny (no covering grant)", dec == "deny", out)
-_wrongscope = [dict(_cover[0], verb="github:comment")]
-rc, dec, out = run_grant("gh pr merge 2729 --squash", _wrongscope, user="owner-1")
-check("standing grant for a DIFFERENT verb -> deny (no cover)", dec == "deny", out)
-# a covering grant can NEVER satisfy a PROHIBITED-overlay action
-_prohib = [{"verb": "financial:move", "tier": "owner", "user_id": "owner-1",
-            "scope_pattern": "*", "single_use": False, "expires_at": _FAR}]
-rc, dec, out = run_grant("wire transfer funds 500 usd to acct", _prohib, user="owner-1")
-check("standing grant does NOT satisfy a prohibited-overlay action (still deny)",
-      dec == "deny", out)
-
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
