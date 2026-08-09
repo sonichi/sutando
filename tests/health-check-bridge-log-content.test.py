@@ -88,6 +88,36 @@ check("discord LoginFailure overrides even non-ok incoming status", result7 is n
 result8 = hc.bridge_log_content_status("discord-bridge", "ok", ["Logged in as SutandoBot#1234"])
 check("discord healthy log → no override", result8 is None)
 
+# ── telegram-bridge: 409 Conflict, incl. the warn it causes ────────────────
+# The 409 branch had no test, which is how a gate on status == "ok" survived:
+# the detector switched OFF once the split stalled the heartbeat.
+
+conflict = ['API error 409: {"ok":false,"error_code":409,"description":"Conflict: '
+            'terminated by other getUpdates request"}']
+
+result9 = hc.bridge_log_content_status("telegram-bridge", "ok", conflict)
+check("telegram 409 on ok → warn override", result9 is not None and result9[0] == "warn")
+
+result10 = hc.bridge_log_content_status("telegram-bridge", "warn", conflict,
+                                       "running but heartbeat stale (3482s old)")
+check("telegram 409 STILL reported when the conflict stalled the heartbeat (the fix)",
+      result10 is not None and "getUpdates" in result10[1], str(result10))
+
+result11 = hc.bridge_log_content_status("telegram-bridge", "warn", conflict,
+                                        "some unrelated warning")
+check("telegram 409 does not hijack an unrelated warn", result11 is None, str(result11))
+
+result12 = hc.bridge_log_content_status("telegram-bridge", "ok",
+                                        conflict + ["@chi: hello"])
+check("telegram message after the last 409 → this host is winning, no override",
+      result12 is None, str(result12))
+
+result13 = hc.bridge_log_content_status("telegram-bridge", "warn",
+                                        conflict + ["@chi: hello"],
+                                        "running but heartbeat stale (10s old)")
+check("telegram heartbeat-stale warn + message after 409 → still no override",
+      result13 is None, str(result13))
+
 # ── run_all_checks() integration: exercise the actual call site ─────────────
 # The unit tests above cover bridge_log_content_status() in isolation, but the
 # call site inside run_all_checks() (fetching `tail`, invoking the function,

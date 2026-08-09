@@ -5876,7 +5876,8 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
     return pgrep_status, pids
 
 
-def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Optional[tuple[str, str]]:
+def bridge_log_content_status(name: str, status: str, tail: list[str],
+                              detail: str = "") -> Optional[tuple[str, str]]:
     """Check a bridge's recent log lines for known failure-mode signatures.
 
     Returns an (status, detail) override, or None if nothing to override.
@@ -5891,12 +5892,16 @@ def bridge_log_content_status(name: str, status: str, tail: list[str]) -> Option
       it last fired (checked via a subsequent "Wrote task-" line) — otherwise
       Event Subscriptions clearly ARE enabled and it's a stale false alarm.
     telegram-bridge: a 409 Conflict is a competing getUpdates poller splitting
-      updates. Only counts if no message arrived after the last conflict.
+      updates. Only counts if no message arrived after the last conflict. It
+      overrides the heartbeat-stale warn too, because the conflict is that
+      warn's CAUSE — gating on "ok" alone silenced it exactly when the split
+      got bad enough to stall the heartbeat.
     """
     if name == "discord-bridge":
         if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
             return "fail", "token invalid (LoginFailure) — regenerate at discord.com/developers/applications"
-    elif name == "telegram-bridge" and status == "ok":
+    elif name == "telegram-bridge" and (
+            status == "ok" or (status == "warn" and "heartbeat stale" in detail)):
         conflict_idxs = [i for i, ln in enumerate(tail) if "409" in ln and "Conflict" in ln]
         if conflict_idxs:
             # Telegram hands each update to exactly ONE getUpdates caller, so a
@@ -7126,12 +7131,12 @@ def run_all_checks() -> list[dict]:
         #   events aren't routing (Slack app Event Subscriptions disabled).
         #   Only overrides "ok" — stale/dead-inode are higher priority.
         # telegram-bridge: a 409 Conflict is a second poller taking a share of
-        #   the updates. Only overrides "ok".
+        #   the updates. Overrides "ok" and the heartbeat-stale warn it causes.
         if (log_file.exists() and name in ("discord-bridge", "slack-bridge", "telegram-bridge")
                 and _bridge_log_belongs_to_process(log_file, proc_start)):
             try:
                 tail = log_file.read_text(errors="replace").splitlines()[-60:]
-                override = bridge_log_content_status(name, status, tail)
+                override = bridge_log_content_status(name, status, tail, detail)
                 if override is not None:
                     status, detail = override
             except OSError:
