@@ -104,13 +104,8 @@ def compose_message(signal: dict) -> str:
                 " `bash src/restart.sh` from the repo, then complete /login."
                 " A chat reply can't resolve this.")
     else:
-        # `blocked-human` is a CLI prompt waiting on stdin. Neither route the old
-        # text offered can answer it: no consumer turns a chat reply into a prompt
-        # answer, and the app's only core levers are a restart intent and a fixed
-        # `watcher` keystroke — restarting discards the in-flight work.
-        # Deliberately does NOT name tmux: the core may be embedded (e.g. AG2
-        # Space), and the socket is env-overridable, so this module cannot know
-        # which console hosts it.
+        # Names no console on purpose: the core may be embedded and the socket is
+        # env-overridable, so no fixed target is correct from here.
         host = platform.node().split(".")[0] or "the host"
         msg += (f" — answer it where the core is running on {host}."
                 " A chat reply can't answer it.")

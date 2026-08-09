@@ -119,10 +119,8 @@ class TestComposeMessage(unittest.TestCase):
         self.assertNotIn("GUI /login", m)
 
     def test_truncates_long_prompt(self):
-        """The prompt ECHO is bounded; the remedy is not. A 500-char prompt must
-        not reach the message, and the bound holds for BOTH remedy branches —
-        the login branch was previously only tested with a short prompt, so its
-        long-prompt case exceeded this bound unnoticed."""
+        """The prompt echo is bounded, the remedy is not, and the bound must hold
+        for BOTH remedy branches."""
         for state, kind in (("blocked-human", "unknown"), ("logged-out", "login")):
             big = {"state": state, "detail": "awaiting user: unknown",
                    "prompt": "x" * 500, "kind": kind}
