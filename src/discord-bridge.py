@@ -5339,13 +5339,7 @@ async def poll_dm_fallback():
                 if age < GRACE_SECONDS:
                     continue
                 # Digest artifacts (question-/insight-) are web-UI/voice
-                # surfaces, never DM material (owner 2026-08-06). The
-                # voiceConnected gate in dm-result.py once jammed for 24h
-                # and then flushed ~20 near-identical pending-questions
-                # walls into the owner DM in one burst, retrying through
-                # 429s. Past the voice first-dibs grace window, archive
-                # them instead of DM-ing. briefing-/friction-/task- keep
-                # their existing delivery behavior.
+                # surfaces, never DM material — archive past the grace window.
                 if f.name.startswith(("question-", "insight-")):
                     print(f"  [dm-fallback] digest artifact archived (no DM): {f.name}", flush=True)
                     archive_file(f, "results", f.stem)

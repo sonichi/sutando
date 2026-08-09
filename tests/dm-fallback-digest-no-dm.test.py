@@ -1,23 +1,6 @@
 #!/usr/bin/env python3
-"""Regression guard for the 2026-08-06 DM digest flood.
-
-## The incident
-
-check-pending-questions writes a `question-{ts}.txt` digest every 30 min.
-dm-result.py defers all DM delivery while sse-status reports voiceConnected —
-that gate stayed true for ~24h, so ~20 near-identical digests accumulated in
-results/. The moment the owner left VC the gate flipped and poll_dm_fallback
-flushed every copy into her DM in one burst, retrying through HTTP 429s.
-
-## The fix (two halves, owner-approved 2026-08-06 「提交 pr」)
-
-1. poll_dm_fallback: digest artifacts (question-/insight-) are web-UI/voice
-   surfaces, never DM material. Past the 90s voice first-dibs grace window
-   they are archived, not DM'd. briefing-/friction-/task- are unchanged.
-2. check-pending-questions.notify_voice: a new digest supersedes older
-   undelivered ones (「新清单作废旧清单」), so no consumer can ever drain a
-   backlog of near-identical copies.
-"""
+"""poll_dm_fallback must archive (never DM) question-/insight- digests past
+the grace window; notify_voice must supersede older undelivered digests."""
 
 import ast
 import re

@@ -255,12 +255,8 @@ def questions_key(questions):
 
 
 def notify_voice(questions):
-    """Write to results/ so voice agent can speak it.
-
-    A new digest supersedes any older undelivered ones (owner 2026-08-06:
-    「新清单作废旧清单」). Without this, a jammed consumer accumulates N
-    near-identical question-*.txt files and whoever drains the queue later
-    delivers every copy."""
+    """Write to results/ so voice agent can speak it. A new digest unlinks
+    any older undelivered ones first, so no consumer can drain a backlog."""
     for old in RESULTS_DIR.glob("question-*.txt"):
         old.unlink(missing_ok=True)
     ts = int(time.time() * 1000)
