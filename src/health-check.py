@@ -4660,11 +4660,8 @@ def _gateway_configured() -> bool:
 
 
 def _gateway_lock_pids() -> "dict[str, str]":
-    """Role -> PID for each gateway-bridge instance lock under state/locks/.
-
-    Role identity (`gateway-bridge`, `gateway-bridge.<inst>`) exists only in the
-    lock; the process table cannot distinguish instances.
-    """
+    """Role -> PID from state/locks/. Instance identity exists only in the lock;
+    every instance shares the same argv, so the process table cannot separate them."""
     out: "dict[str, str]" = {}
     try:
         locks = sorted((Path(WORKSPACE_DIR) / "state" / "locks").glob("gateway-bridge*.lock"))
@@ -4701,14 +4698,8 @@ def check_gateway_bridge() -> "dict | None":
         return None
     try:
         gw = subprocess.run(
-            # BOTH filenames. src/remote-relay-bridge.py is the DEPRECATED name kept
-            # as a compat stub that runs the gateway client in-process via runpy —
-            # the repo ships it precisely so existing launchers keep working, so a
-            # long-lived instance under the old name is the EXPECTED case, not an
-            # exotic one. Matching only the new name made this check's own
-            # duplicate-pileup branch unable to see the duplicate: measured on a live
-            # host with two instances, the anchored pattern matched 1 and reported ok
-            # while a 41-day-old stub-named process was serving most of the traffic.
+            # remote-relay-bridge.py is a shipped compat stub running the same
+            # client, so an instance under the old name is a real duplicate.
             ["/usr/bin/pgrep", "-f", r"remote-(gateway|relay)-bridge\.py$"],
             capture_output=True, text=True,
         )

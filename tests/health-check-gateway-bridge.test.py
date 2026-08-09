@@ -116,10 +116,8 @@ def main() -> int:
     check("configured + duplicates → warn", r is not None and r["status"] == "warn", f"got {r!r}")
     check("duplicate detail says multiple", r and "multiple processes" in r["detail"], f"got {r!r}")
 
-    # 4a-i) A supported multi-instance host is NOT a pileup. startup.sh launches the
-    # primary and every named secondary with identical argv, so a PID count alone
-    # cannot tell them apart; the role locks can. This case FAILS on a count-only
-    # rule, which is the regression it exists to catch.
+    # A supported multi-instance host is not a pileup; only the role locks can
+    # separate instances, so this case fails on any count-only rule.
     r = _run(env={"REMOTE_TASK_TOKEN": "tok"}, gw_env_path=missing, pgrep_rc=0,
              pgrep_out="111\n222\n", serving=None,
              locks={"gateway-bridge": "111", "gateway-bridge.dev": "222"})
@@ -168,18 +166,8 @@ def main() -> int:
         got = hc._gateway_lock_pids()
     check("unreadable locks/ → {} rather than an exception", got == {}, f"got {got!r}")
 
-    # 4b) THE PATTERN ITSELF must see a process running under the DEPRECATED filename.
-    #
-    # src/remote-relay-bridge.py is a compat stub the repo deliberately ships so
-    # existing launchers keep working; it runs the gateway client in-process via
-    # runpy, so an instance under that name IS a real second instance. The pattern
-    # was anchored to the new filename only, which made the pileup branch above
-    # structurally unable to fire for the most likely duplicate. Measured live: two
-    # instances running, the old pattern matched 1 and reported ok while a 41-day-old
-    # stub-named process carried most of the traffic.
-    #
-    # Asserted by MATCHING the pattern against real argv strings rather than
-    # string-comparing it, so a future rewrite that stays correct still passes.
+    # The pattern must match the deprecated filename too, since that stub is a real
+    # instance. Asserted by matching real argv, so a correct rewrite still passes.
     captured: list = []
 
     def _capture(cmd, **kw):
@@ -199,13 +187,8 @@ def main() -> int:
         check(f"pattern matches the {label}",
               re.search(pattern, argv) is not None,
               f"pattern {pattern!r} did not match {argv!r}")
-    # ...and must NOT match an unrelated process that merely mentions the word.
-    #
-    # The filename here is deliberately FICTIONAL. scripts/lint-hermetic-bridge-tests.py
-    # greps test sources for `(discord|slack|telegram)-bridge\.py` to find tests that
-    # import a real bridge without isolating CLAUDE_CONFIG_DIR; naming a real bridge here
-    # — even inside a string that is only ever fed to re.search — trips that lint. Keep it
-    # fictional rather than "fixing" the lint.
+    # The filename below must stay fictional: the hermetic-bridge lint greps test
+    # sources for real bridge names, even inside a string only fed to re.search.
     check("pattern does not match an unrelated bridge",
           re.search(pattern, "/usr/bin/python3 src/some-other-bridge.py") is None,
           f"pattern {pattern!r} over-matched")
