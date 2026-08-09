@@ -95,4 +95,45 @@ set -e
 ok "wrapped command exit code propagates via exec"
 
 echo
-echo "OK — 9/9 cron-gate tests passed"
+
+# --- a task that EXPLICITLY declares a non-owner tier does NOT defer ----------
+# Regression for the 2026-08-03 starvation: peer #bot2bot notices carry
+# access_tier: team and were deferring owner-facing crons. 6 team-tier tasks
+# arrived in one hour that night, so a busy peer can starve the cron entirely.
+rm -f "$TMPDIR/tasks/"task-*.txt
+printf 'id: t\naccess_tier: team\ntask: peer notice\n' > "$TMPDIR/tasks/task-team-1.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-team echo 'ran-despite-team' 2>&1)"
+[ "$out" = "ran-despite-team" ] || fail "team-tier task must NOT defer, got '$out'"
+ok "access_tier: team does not trigger deferral"
+
+for tier in other ambient; do
+  rm -f "$TMPDIR/tasks/"task-*.txt
+  printf 'id: t\naccess_tier: %s\n' "$tier" > "$TMPDIR/tasks/task-$tier-1.txt"
+  out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-$tier echo "ran-$tier" 2>&1)"
+  [ "$out" = "ran-$tier" ] || fail "access_tier: $tier must NOT defer, got '$out'"
+done
+ok "access_tier: other / ambient do not trigger deferral"
+
+# --- but an OWNER task still defers, even beside non-owner ones ---------------
+printf 'id: t\naccess_tier: owner\ntask: real owner work\n' > "$TMPDIR/tasks/task-owner-1.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-mixed echo 'should-not-run' 2>&1)"
+case "$out" in
+  *"deferring test-mixed"*) : ;;
+  *) fail "owner task beside non-owner ones must still defer, got '$out'" ;;
+esac
+ok "an owner task still defers even alongside team/other/ambient tasks"
+
+# --- a task with NO access_tier line still defers (fails CLOSED) --------------
+# CLAUDE.md: tasks without an access_tier field get full owner processing, so an
+# unstated tier must yield rather than be silently treated as peer traffic.
+rm -f "$TMPDIR/tasks/"task-*.txt
+printf 'id: t\ntask: no tier declared\n' > "$TMPDIR/tasks/task-notier-1.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-notier echo 'should-not-run' 2>&1)"
+case "$out" in
+  *"deferring test-notier"*) : ;;
+  *) fail "task with no access_tier must still defer (fail closed), got '$out'" ;;
+esac
+ok "a task with no access_tier still defers — unknown tier fails closed"
+rm -f "$TMPDIR/tasks/"task-*.txt
+
+echo "OK — 13/13 cron-gate tests passed"

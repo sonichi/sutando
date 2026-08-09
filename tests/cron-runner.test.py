@@ -17,10 +17,36 @@ from __future__ import annotations
 
 import calendar
 import importlib.util
+import os
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+# This suite drives the real `run()` tick, which emits cron telemetry via
+# `_emit_cron_telemetry` -> `task_processed(..., flush=True)`. The flush path is
+# a BLOCKING `urlopen` to the PostHog host, so without this every tick here
+# makes a real network request and the suite's timing becomes a function of an
+# external service. `test_run_acquires_shared_state_lock` gives the worker
+# `join(2)`; a tick measured at 0.72-0.82s against that 2s ceiling is a ~2x
+# margin, which holds on an idle laptop and intermittently does not on a shared
+# clean-install runner:
+#
+#   0.716s run()
+#    └─ 0.713s _emit_cron_telemetry
+#        └─ 0.678s urllib.request.urlopen        <- real network
+#
+# Opting out drops the tick to 0.001-0.002s (~1100x margin) and makes the suite
+# hermetic. `opted_out()` is re-read on every capture and never cached, so
+# setting it here covers every test in the file. Same lever, and the same
+# clean-install motivation, as agent-api-task-field-injection.test.py and
+# github-webhook-access-tier.test.py.
+#
+# The two tests that assert telemetry DOES fire are unaffected: one replaces
+# `telemetry.task_processed` wholesale, the other runs a subprocess against a
+# fake `telemetry.py` that never consults the opt-out.
+os.environ["SUTANDO_TELEMETRY"] = "0"
 
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("cron_runner", REPO / "src" / "cron-runner.py")
@@ -188,6 +214,63 @@ def test_emit_task_prompt():
         check("user_id: cron-runner" in body, "user_id is cron-runner")
         check("access_tier: owner" in body, "access_tier owner")
         check("priority: low" in body, "priority low")
+
+
+def test_emit_task_emits_cron_telemetry():
+    # PR #2274 CR (liususan091219): the telemetry allowlist added `cron`, but
+    # emit_task never emitted task_processed, so DAU/WAU under-counted
+    # cron-driven activity and the bucket could never fire. Assert the emit now
+    # fires with source "cron" exactly once at the write site.
+    import telemetry
+    calls: list[str] = []
+    orig = telemetry.task_processed
+    telemetry.task_processed = lambda source, **kw: calls.append(source)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            cr.TASKS_DIR = Path(d)
+            cr.emit_task("digest", {"prompt": "do the thing"})
+        check(calls == ["cron"], f"emit_task fires task_processed('cron') once (got {calls})")
+    finally:
+        telemetry.task_processed = orig
+
+
+def test_cron_telemetry_survives_runner_exit():
+    # Regression for the one-shot launchd lifecycle: the default telemetry
+    # sender uses a daemon thread, which dies with cron-runner. A subprocess
+    # stub records a receipt only for the bounded synchronous path, then the
+    # parent verifies the receipt after that process has exited.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        receipt = root / "receipt.txt"
+        (root / "telemetry.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "def task_processed(source, *, flush=False):\n"
+            "    if flush:\n"
+            "        Path(os.environ['CRON_TELEMETRY_RECEIPT']).write_text(source)\n"
+        )
+        code = (
+            "import importlib.util,sys\n"
+            f"sys.path.insert(0, {str(root)!r})\n"
+            "import telemetry\n"
+            f"spec=importlib.util.spec_from_file_location('cron_runner', {str(REPO / 'src' / 'cron-runner.py')!r})\n"
+            "mod=importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "mod._emit_cron_telemetry()\n"
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(root)
+        env["CRON_TELEMETRY_RECEIPT"] = str(receipt)
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=REPO,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        check(proc.returncode == 0, f"cron telemetry subprocess exits cleanly ({proc.stderr})")
+        check(receipt.read_text() == "cron",
+              "synchronous cron telemetry receipt exists after runner exits")
 
 
 def test_emit_task_prompt_skill():

@@ -193,7 +193,9 @@ class CardPoster:
         # Cloudflare rejects urllib's default UA with 403 (same edge rule the
         # bridge's gateway path documents) — without an explicit client UA the
         # card post would retry forever on the real gateway (review blocker).
-        self._headers = {**headers}
+        # BY REFERENCE (no copy): the owning bridge mutates this dict on token
+        # rotation; the post path below builds a per-request copy anyway.
+        self._headers = headers
         self._headers.setdefault("User-Agent", "sutando-gateway-client/1.0")
         self._room = room_id
         self._log = log

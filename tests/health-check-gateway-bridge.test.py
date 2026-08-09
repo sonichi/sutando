@@ -73,6 +73,23 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
             return hc.check_gateway_bridge()
 
 
+def _configured(*, env=None, gw_env_path=None):
+    """Call _gateway_configured() directly, with env + the channel-.env path pinned.
+
+    It is the single source of truth BOTH probes now consult (check_gateway_bridge
+    here, check_core_supervisor for the gateway-down mapping). The core-supervisor
+    suite mocks it out, so without these cases the logic that decides the whole
+    question would ship untested.
+    """
+    env = env or {}
+    base = {k: v for k, v in hc.os.environ.items()
+            if k not in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+    base.update(env)
+    with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
+         unittest.mock.patch.object(hc, "claude_home_path", return_value=gw_env_path):
+        return hc._gateway_configured()
+
+
 def main() -> int:
     # 1) NOT configured (no env token, channel .env absent) → None
     missing = Path(tempfile.gettempdir()) / "sutando-gw-nonexistent-xyz" / ".env"
@@ -155,10 +172,81 @@ def main() -> int:
     check("_gateway_serving: absent file → None",
           hc._gateway_serving(Path(_tf.mkdtemp()) / "nope.json", now) is None)
 
+    # --- _gateway_configured(): the shared predicate itself -----------------
+    with _tf.TemporaryDirectory() as _td:
+        _gw = Path(_td) / "ag2space" / ".env"
+        _gw.parent.mkdir(parents=True, exist_ok=True)
+        _absent = Path(_td) / "nope" / ".env"
+
+        check("_gateway_configured: REMOTE_TASK_TOKEN in env → True",
+              _configured(env={"REMOTE_TASK_TOKEN": "t"}, gw_env_path=_absent) is True)
+        check("_gateway_configured: AG2_REMOTE_TOKEN in env → True",
+              _configured(env={"AG2_REMOTE_TOKEN": "t"}, gw_env_path=_absent) is True)
+        check("_gateway_configured: no token, no file → False",
+              _configured(gw_env_path=_absent) is False)
+
+        _gw.write_text("REMOTE_TASK_TOKEN=abc\n")
+        check("_gateway_configured: token in the .env file → True",
+              _configured(gw_env_path=_gw) is True)
+
+        _gw.write_text("OTHER=1\n")
+        check("_gateway_configured: file with unrelated keys → False",
+              _configured(gw_env_path=_gw) is False)
+
+        _gw.write_text("")
+        check("_gateway_configured: empty file → False",
+              _configured(gw_env_path=_gw) is False)
+
+        # startswith, not substring: a commented-out token is not configuration.
+        _gw.write_text("#REMOTE_TASK_TOKEN=abc\n")
+        check("_gateway_configured: token only in a COMMENT → False",
+              _configured(gw_env_path=_gw) is False)
+
+        # A non-UTF-8 byte must NOT turn a configured host into an unconfigured
+        # one: that would silence BOTH the bridge probe and the gateway-down warn.
+        _gw.write_bytes(b"REMOTE_TASK_TOKEN=abc\n\xff\xfe not utf-8\n")
+        check("_gateway_configured: token + invalid UTF-8 byte → still True",
+              _configured(gw_env_path=_gw) is True)
+
+    # --- failure CLASSIFICATION (john-the-dev, review of 2328fbe9) ---------
+    # The catch was `except Exception`, so ANY error became False = "no gateway
+    # configured here". check_core_supervisor then reports a real `gateway-down`
+    # as OK and check_gateway_bridge returns None — a CONFIGURED gateway's outage
+    # goes silent. Fail-open in the one direction this probe must not fail.
+    #
+    # These pin the classification itself, so narrowing cannot be undone quietly.
+    base = {k: v for k, v in hc.os.environ.items()
+            if k not in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+
+    # 1) UNEXPECTED exception must NOT be classified as unconfigured. The
+    #    reviewer's exact repro: a resolver contract bug.
+    raised = None
+    with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
+         unittest.mock.patch.object(hc, "claude_home_path",
+                                    side_effect=ValueError("resolver contract bug")):
+        try:
+            got = hc._gateway_configured()
+        except ValueError:
+            raised = True
+        else:
+            raised = False
+    check("_gateway_configured: unexpected exception propagates, is NOT False",
+          raised is True,
+          "a resolver bug was swallowed into 'unconfigured' — that silences a real gateway-down")
+
+    # 2) EXPECTED I/O failure still means unconfigured (the narrowing must not
+    #    break the case the catch legitimately exists for).
+    with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
+         unittest.mock.patch.object(hc, "claude_home_path",
+                                    side_effect=OSError("unreadable")):
+        check("_gateway_configured: OSError → False (expected I/O failure)",
+              hc._gateway_configured() is False)
+
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1
     print("\nall check_gateway_bridge cases passed")
+
     return 0
 
 

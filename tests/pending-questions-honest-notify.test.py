@@ -206,7 +206,15 @@ class TestReviewFindings(unittest.TestCase):
         self.m.should_notify = lambda *a, **k: True
         self.m.main()
         self.assertTrue(stamp.exists(), "a successful delivery MUST set the cooldown")
-        self.assertGreater(int(stamp.read_text()), 0)
+        # The marker carries "<epoch> <content-key>" as of 2026-08-01: the cooldown
+        # gates on the SET rather than only the clock, so the key must persist next
+        # to the timestamp. Assert BOTH — if a later change drops the key the file
+        # still parses as an int, and hourly re-notification of an unchanged queue
+        # would come back silently.
+        ts, _, key = stamp.read_text().partition(" ")
+        self.assertGreater(int(ts), 0)
+        self.assertTrue(key.strip(),
+                        "the content key must be stamped alongside the timestamp")
 
     # --- finding 2: only THIS notifier's files are evidence ---
     def test_b_unrelated_stale_proactive_file_is_ignored(self):
