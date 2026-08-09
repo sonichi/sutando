@@ -235,5 +235,36 @@ class TestReviewFindings(unittest.TestCase):
         self.assertIn('RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}', src)
 
 
+class TestDmBanGate(unittest.TestCase):
+    """dm-ban.sentinel must suppress both DM-bound writers, not just deliver()."""
+
+    def setUp(self):
+        import tempfile
+        root = Path(tempfile.mkdtemp(prefix="cpq-dmban-"))
+        self.results = root / "results"
+        self.results.mkdir()
+        self.m = _load(self.results)
+        (root / "state").mkdir()
+        self.sentinel = root / "state" / "dm-ban.sentinel"
+
+    def test_notify_voice_writes_nothing_while_banned(self):
+        self.sentinel.write_text("")
+        self.m.notify_voice([{"title": "q"}])
+        self.assertEqual(list(self.results.glob("question-*.txt")), [])
+
+    def test_notify_voice_writes_normally_when_not_banned(self):
+        self.m.notify_voice([{"title": "q"}])
+        self.assertEqual(len(list(self.results.glob("question-*.txt"))), 1)
+
+    def test_notify_discord_dm_writes_nothing_while_banned(self):
+        self.sentinel.write_text("")
+        self.m.notify_discord_dm([{"title": "q"}])
+        self.assertEqual(list(self.results.glob(f"{self.m.PROACTIVE_PREFIX}*.txt")), [])
+
+    def test_notify_discord_dm_writes_normally_when_not_banned(self):
+        self.m.notify_discord_dm([{"title": "q"}])
+        self.assertEqual(len(list(self.results.glob(f"{self.m.PROACTIVE_PREFIX}*.txt"))), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

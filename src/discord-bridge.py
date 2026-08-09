@@ -4945,6 +4945,10 @@ async def poll_proactive():
                 continue
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt":
+                    # While dm-ban.sentinel exists, no proactive file is claimed
+                    # or sent — it stays queued for delivery once lifted.
+                    if (STATE_DIR / "dm-ban.sentinel").exists():
+                        continue
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram

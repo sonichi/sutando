@@ -260,8 +260,6 @@ def notify_voice(questions):
     ts = int(time.time() * 1000)
     path = RESULTS_DIR / f"question-{ts}.txt"
     titles = [q["title"] for q in questions]
-    # Same dm-ban gate as the proactive write below: THIS file is what produced
-    # 31 "pending questions waiting" DMs in one day (2026-08-01 census).
     if (RESULTS_DIR.parent / "state" / "dm-ban.sentinel").exists():
         print("dm-ban.sentinel present — question-file DM suppressed")
         return
@@ -291,11 +289,8 @@ def notify_discord_dm(questions):
     lines.append(
         f"Reply here or edit pending-questions.md on {socket.gethostname().split('.')[0]} to resolve."
     )
-    # TOTAL DM BAN (owner 2026-08-01, repeated 7x: 「我明令禁止你发 dm 了」):
-    # while <workspace>/state/dm-ban.sentinel exists, the DM delivery is
-    # suppressed entirely — the macOS notification above still fires, and the
-    # questions stay in pending-questions.md for her to pull. Remove the
-    # sentinel to restore DM delivery.
+    # While dm-ban.sentinel exists, DM delivery is suppressed; the macOS
+    # notification still fires and questions stay readable in the file.
     if (RESULTS_DIR.parent / "state" / "dm-ban.sentinel").exists():
         print("dm-ban.sentinel present — DM delivery suppressed (macOS-only)")
         return

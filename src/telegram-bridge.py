@@ -996,6 +996,10 @@ def main():  # pragma: no cover
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) and f.suffix == ".txt":
+                        # While dm-ban.sentinel exists, no proactive file is claimed
+                        # or sent — it stays queued for delivery once lifted.
+                        if (STATE_DIR / "dm-ban.sentinel").exists():
+                            continue
                         # Peek before claiming: skip Discord-targeted proactive files.
                         # [channel: <17-20 digit snowflake>] is a Discord-only marker;
                         # claiming it here sends the literal text to Telegram DM instead

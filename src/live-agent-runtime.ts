@@ -130,9 +130,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				// (some users keep the web UI open).
 				console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
 				try {
-					// dm-ban sentinel (owner 2026-08-01): this fallback DM'd her 19 times in
-					// one day during voice churn. While the sentinel exists, skip the DM —
-					// the result file itself still lands in results/ for the normal path.
+					// While dm-ban.sentinel exists, skip the DM — the result file
+					// itself still lands in results/ for the normal path.
 					if (existsSync(join(WORKSPACE_DIR, 'state', 'dm-ban.sentinel'))) {
 						console.log(`${ts()} [TaskBridge] dm-ban.sentinel present — stuck-voice DM suppressed`);
 						throw new Error('__dm_ban_skip__');

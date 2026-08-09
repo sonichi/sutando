@@ -95,6 +95,8 @@ BRIDGE_IMPORT = re.compile(r"(discord|slack|telegram)-bridge\.py")
 # from 26 to 27 when detection moved off regex: two files the regex called clean were real
 # bypasses (assignment-shaped comment / assignment after exec_module), which is exactly the
 # P1 qingyun raised on #2429.
+# dm-ban-proactive-delivery-boundary: false positive, same shape as the
+# dm-fallback digest test — reads bridge source, execs an unrelated AST node.
 KNOWN_UNISOLATED = frozenset(
     """
 tests/audio-transcribe-skill.test.py
@@ -120,6 +122,7 @@ tests/discord-bridge-reply-directive.test.py
 tests/discord-bridge-task-write-instrument.test.py
 tests/discord-task-source-invariance.test.py
 tests/discord-writeside-attachments.test.py
+tests/dm-ban-proactive-delivery-boundary.test.py
 tests/health-check-fix-down-bridges.test.py
 tests/owner-activity-channel-id.test.py
 tests/slack-bridge-access-durable-backup.test.py

@@ -1457,6 +1457,10 @@ def result_watcher():
                 for f in list(RESULTS_DIR.iterdir()):
                     if not (f.name.startswith("proactive-") and f.suffix == ".txt"):
                         continue
+                    # While dm-ban.sentinel exists, no proactive file is claimed
+                    # or sent — it stays queued for delivery once lifted.
+                    if (STATE_DIR / "dm-ban.sentinel").exists():
+                        continue
                     delivery_id = f.name
                     # A producer may recreate the same deterministic result
                     # filename after the watcher successfully sends and removes
