@@ -108,6 +108,31 @@ class ClaimForDeliveryTest(unittest.TestCase):
                          "clobbered a .txt the exists() guard could not see")
         self.assertFalse(released)
 
+    def test_a_target_appearing_inside_the_syscall_window_is_not_clobbered(self):
+        """The competing write lands BETWEEN the decision and the syscall.
+
+        A pre-existing target is refused by check-then-act too; only a write
+        arriving inside the window separates no-clobber from a guarded rename.
+        """
+        claim = self.box / "proactive-race.sending"
+        claim.write_text("older claim body")
+        target = self.box / "proactive-race.txt"
+        self.assertFalse(target.exists(), "target must be ABSENT when the call begins")
+        real_link = os.link
+
+        def link_losing_the_window(src, dst):
+            if Path(dst) == target and not target.exists():
+                target.write_text("newer body")
+            return real_link(src, dst)
+
+        with mock.patch.object(os, "link", link_losing_the_window):
+            released = release_claim(claim)
+
+        self.assertEqual(target.read_text(), "newer body",
+                         "a body that appeared inside the window was overwritten")
+        self.assertFalse(released, "lost the race but reported released")
+        self.assertTrue(claim.exists(), "claim discarded after losing the race")
+
     def test_falsy_but_present_recipient_still_claims(self):
         """Only None means 'no recipient' — 0 or '' are recipients a provider may use."""
         claim = claim_for_delivery(self.msg, 0)
