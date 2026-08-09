@@ -300,6 +300,21 @@ function submitTask() {
 
 const saved = localStorage.getItem('scp_credential');
 if (saved) { $('token').value = saved; start(saved); }
+
+// Embed mode (?embed=1): the page becomes a compact in-chat CALL PANEL —
+// agent + voice toggle + state + live feed. The host app supplies chat and
+// text input beside it, so the ask/submit card is hidden. Pairing UI stays
+// until a credential exists (first run needs it even embedded).
+if (new URLSearchParams(location.search).get('embed')) {
+  document.body.classList.add('embed');
+  const style = document.createElement('style');
+  style.textContent = `
+    body.embed { padding: 8px; }
+    body.embed h1 { font-size: 14px; margin: 4px 0; }
+    body.embed #askcard { display: none !important; }
+  `;
+  document.head.appendChild(style);
+}
 </script>
 </body>
 </html>
