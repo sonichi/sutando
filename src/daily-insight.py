@@ -401,20 +401,23 @@ def analyze_dev_activity(repo_root=SRC_DIR, now=None):
         return None
     stand = _own_stand_value(repo_root=repo_root)
     commits = 0
+    counted_shas = []
     dirs = Counter()
     counting = False
     seen_stands = set()
     for line in out.stdout.splitlines():
         if line.startswith("C:"):
             # "C:<sha>\x1f<Stand trailer value>" — the trailer is the ONLY thing
-            # that separates this instance from its peer, because both commit
-            # under the owner's GH-mapped email (see _own_stand_value).
-            trailer = line.split("\x1f", 1)[1].strip() if "\x1f" in line else ""
+            # that separates this instance from its peer (see _own_stand_value).
+            body = line[2:]
+            sha, _, trailer = body.partition("\x1f")
+            trailer = trailer.strip()
             if trailer:
                 seen_stands.add(trailer)
             counting = (not stand) or (trailer == stand)
             if counting:
                 commits += 1
+                counted_shas.append(sha.strip())
         elif counting and line.strip() and "/" in line:
             dirs[line.split("/", 1)[0]] += 1
     if not stand and len(seen_stands) > 1:
@@ -430,22 +433,24 @@ def analyze_dev_activity(repo_root=SRC_DIR, now=None):
         return None
     if commits == 0:
         return None
-    # `--branches` above spans UNMERGED work, so `commits` is work-in-progress, not
-    # shipped. Count separately how many reached the default branch; the wording
-    # downstream depends on the split.
-    landed = _landed_commit_count(repo_root, author, stand)
+    # `--branches` spans UNMERGED work, so `commits` is work-in-progress. Landed is a
+    # SUBSET of the very SHAs counted above — never a second query (see the function).
+    landed = _landed_subset_count(repo_root, counted_shas)
     return {"commits_24h": commits, "landed_24h": landed,
             "top_dirs": dirs.most_common(3), "stand": stand}
 
 
-def _landed_commit_count(repo_root, author, stand):
-    """How many of the author's last-24h commits are reachable from the remote
-    default branch. Returns None when that branch cannot be resolved, so the
-    caller can decline to claim anything rather than guess."""
+def _landed_subset_count(repo_root, shas):
+    """How many of `shas` are reachable from the remote default branch.
+
+    A SUBSET of the caller's own scan, so landed can never exceed the total. A
+    second author/time query can, and rendered "landed 2 of 1 ... the other -1".
+    """
+    if not shas:
+        return 0
     ref = None
-    # Guarded like the log call below: if git is missing entirely this must return
-    # None (unknown), not raise. An exception here would propagate out of
-    # analyze_dev_activity and take the whole insight down.
+    # If git is missing this must return None (unknown), not raise: an exception here
+    # propagates out of analyze_dev_activity and takes the whole insight down.
     try:
         for cand in ("origin/HEAD", "origin/main", "origin/master"):
             r = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--verify", "-q", cand],
@@ -458,28 +463,18 @@ def _landed_commit_count(repo_root, author, stand):
     if ref is None:
         return None
     try:
+        # --no-walk considers ONLY the listed commits, so this asks "which of these
+        # exact SHAs is not reachable from ref" in one call rather than N.
         out = subprocess.run(
-            # The `C:` sentinel is load-bearing: a commit with NO Stand trailer emits an
-            # EMPTY line, which splitlines() drops, so a bare trailer format undercounts
-            # to zero. Same reason the --branches scan above prefixes its lines.
-            ["git", "-C", str(repo_root), "log", ref, "--since=24 hours ago",
-             f"--author={author}",
-             "--pretty=format:C:%(trailers:key=Stand,valueonly)"],
+            ["git", "-C", str(repo_root), "rev-list", "--no-walk", *shas, "--not", ref],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
         return None
-    n = 0
-    for line in out.stdout.splitlines():
-        if not line.startswith("C:"):
-            continue
-        if not stand or line[2:].strip() == stand:
-            n += 1
-    return n
-
-
+    unlanded = {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
+    return sum(1 for s in shas if s not in unlanded)
 def dev_activity_insight(dev):
     """Render the dev-activity dict into one headline sentence, or None."""
     if not dev or dev.get("commits_24h", 0) <= 0:

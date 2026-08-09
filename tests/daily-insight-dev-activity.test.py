@@ -7,10 +7,12 @@ work he did (shipping commits, PRs, meetings). Fix: surface git commit activity
 in the last 24h as the highest-priority insight, so a productive day doesn't
 read as "just notes."
 
-All git calls are mocked — no real repo history is inspected here.
+Most git calls are mocked; TestLandedIsASubsetNotASecondQuery builds a real
+temp repo, because the subset invariant depends on real reachability.
 """
 import importlib.util
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -180,7 +182,7 @@ class TestInsightPriority(unittest.TestCase):
         self.assertIn("shipped 43 commits", all_landed)
 
     def test_a_git_failure_yields_None_not_a_false_shipped(self):
-        """The two failure branches of _landed_commit_count exist so a git error
+        """The two failure branches of _landed_subset_count exist so a git error
         cannot become a "shipped" claim: None means unknown, and the caller then
         says "authored". A 0 here would read as "nothing landed", which is a
         different and unearned assertion."""
@@ -191,7 +193,7 @@ class TestInsightPriority(unittest.TestCase):
             raise OSError("git missing")
         mod.subprocess.run = raiser
         try:
-            self.assertIsNone(mod._landed_commit_count(REPO, "a@b", ""))
+            self.assertIsNone(mod._landed_subset_count(REPO, ["deadbeef"]))
         finally:
             mod.subprocess.run = real
 
@@ -208,7 +210,7 @@ class TestInsightPriority(unittest.TestCase):
             return Bad()
         mod.subprocess.run = flaky
         try:
-            self.assertIsNone(mod._landed_commit_count(REPO, "a@b", ""))
+            self.assertIsNone(mod._landed_subset_count(REPO, ["deadbeef"]))
             self.assertGreater(calls["n"], 1, "should have reached the log call")
         finally:
             mod.subprocess.run = real
@@ -223,7 +225,7 @@ class TestInsightPriority(unittest.TestCase):
             stdout = ""
         mod.subprocess.run = lambda *a, **k: NoRef()
         try:
-            self.assertIsNone(mod._landed_commit_count(REPO, "a@b", ""))
+            self.assertIsNone(mod._landed_subset_count(REPO, ["deadbeef"]))
         finally:
             mod.subprocess.run = real
 
@@ -237,7 +239,7 @@ class TestInsightPriority(unittest.TestCase):
             raise OSError("git vanished mid-run")
         mod.subprocess.run = flaky
         try:
-            self.assertIsNone(mod._landed_commit_count(REPO, "a@b", ""))
+            self.assertIsNone(mod._landed_subset_count(REPO, ["deadbeef"]))
         finally:
             mod.subprocess.run = real
 
@@ -251,6 +253,54 @@ class TestInsightPriority(unittest.TestCase):
         self.assertNotIn("shipped", insight)
         self.assertIn("authored 7 commits", insight)
         self.assertNotIn("You shipped", insight)
+
+
+class TestLandedIsASubsetNotASecondQuery(unittest.TestCase):
+    """landed_24h counted from a different universe than commits_24h renders "-1"."""
+
+    def _diverged_repo(self, td):
+        """Local branches hold 1 WIP commit; origin/main holds 2 others, same author."""
+        r = Path(td) / "repo"
+        r.mkdir()
+
+        def g(*a):
+            return subprocess.run(["git", "-C", str(r), *a], capture_output=True, text=True)
+
+        g("init", "-q", "-b", "main")
+        g("config", "user.email", "a@b")
+        g("config", "user.name", "A")
+        for name in ("a", "b"):
+            (r / name).write_text(name)
+            g("add", "-A")
+            g("commit", "-q", "-m", name)
+        g("update-ref", "refs/remotes/origin/main", "HEAD")
+        # Orphan branch so the two commits above are reachable ONLY from origin/main.
+        g("checkout", "-q", "--orphan", "wip")
+        g("rm", "-rq", "--cached", ".")
+        (r / "w").write_text("w")
+        g("add", "-A")
+        g("commit", "-q", "-m", "wip")
+        g("branch", "-q", "-D", "main")
+        return r
+
+    def test_landed_never_exceeds_the_commits_it_is_a_subset_of(self):
+        mod = _load()
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._diverged_repo(td)
+            dev = mod.analyze_dev_activity(repo_root=repo)
+        self.assertIsNotNone(dev, "the --branches scan should still see the WIP commit")
+        self.assertEqual(dev["commits_24h"], 1, dev)
+        self.assertLessEqual(dev["landed_24h"], dev["commits_24h"], dev)
+        self.assertEqual(dev["landed_24h"], 0, "the WIP commit is not on origin/main")
+
+    def test_the_rendered_sentence_cannot_go_negative(self):
+        mod = _load()
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._diverged_repo(td)
+            dev = mod.analyze_dev_activity(repo_root=repo)
+        line = mod.dev_activity_insight(dev)
+        self.assertNotIn("-1", line, line)
+        self.assertNotIn("of 1 commit", line.replace("0 of 1 commit", ""), line)
 
 
 if __name__ == "__main__":
