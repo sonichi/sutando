@@ -287,16 +287,11 @@ def get_reminders() -> "list[str] | None":
         return None
 
 
-# `reminders.py --due-today` returns today's AND overdue items by contract, with no
-# upper bound on how overdue. Live on this host: "7-minute timer (due … 1219)" and a
-# 2020 item, rendered every morning as "Reminders due" — implying action on a corrupt
-# date and a six-year-old one, and holding 2 of the 5 slots permanently.
-# TWO calendar years, not one: the due clause gives year granularity, so `year_now - 1`
-# would demote a December item in January — one month overdue, not a year. Demoting a
-# live reminder is the worse error, so the bound is the one this precision can justify.
+# TWO years, not one: the due clause gives only year granularity, so `year_now - 1`
+# would demote a December item in January — one month overdue, not a year.
 _STALE_YEARS = 2
-# Any 4-digit run AFTER the literal "due" is the year — the alternation this
-# replaced missed 1219, i.e. the single most obviously-corrupt date on the host.
+# Any 4-digit run after the literal "due" — an alternation of plausible years cannot
+# match a corrupt one.
 _DUE_YEAR_RE = re.compile(r"\bdue\b[^)]*?\b(\d{4})\b")
 
 
@@ -309,11 +304,8 @@ def _reminder_due_year(line):
 def _demote_stale_reminders(items, now=None):
     """Move reminders overdue by two calendar years or more to the END of the list.
 
-    Deliberately does NOT drop them: they are the owner's data, and a briefing that
-    silently hides a reminder is the failure mode this module already guards against
-    for the calendar. Demoting is enough — a real due-today item can no longer be
-    crowded out by a year-1219 artifact. Unparseable dates keep their position, so a
-    format change cannot bury a live reminder.
+    Demotes, never drops. Unparseable dates keep their position, so a format change
+    cannot bury a live reminder.
     """
     year_now = (datetime.fromtimestamp(now) if now else datetime.now()).year
     cutoff = year_now - _STALE_YEARS

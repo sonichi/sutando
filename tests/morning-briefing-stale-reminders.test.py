@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
-"""A years-overdue reminder must not outrank a real one in the briefing.
-
-`reminders.py --due-today` returns today's AND overdue items by contract, with no
-upper bound on how overdue. Live on this host the whole list was:
-
-    [Reminders] How launch (due Monday, January 13, 2020 at 11:52:42 AM)
-    [Reminders] 7-minute timer (due Sunday, November 3, 1219 at 12:00:00 AM)
-
-Both rendered every morning as "Reminders due" — implying action on a six-year-old
-item and a corrupt date, and holding 2 of the 5 slots permanently.
-
-Demote, never drop: they are the owner's data, and this module already refuses to
-hide a calendar it could not read.
+"""`--due-today` includes overdue items with no upper bound, so a years-stale one can
+outrank a real one. Demotion must never drop them — they are the owner's data.
 """
 from __future__ import annotations
 
@@ -55,8 +44,8 @@ class StaleReminders(unittest.TestCase):
         self.assertEqual(sorted(out), sorted(items))
 
     def test_year_1219_parses(self):
-        """The first regex used a 16xx-21xx alternation and missed 1219 — the single
-        most obviously-corrupt date on the host went undetected."""
+        """An alternation of plausible years cannot match a corrupt one; any 4-digit
+        run after "due" can."""
         self.assertEqual(self.mb._reminder_due_year(JUNK_1219), 1219)
         self.assertEqual(self.mb._reminder_due_year(JUNK_2020), 2020)
         self.assertEqual(self.mb._reminder_due_year(REAL), 2026)
