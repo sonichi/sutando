@@ -64,6 +64,14 @@ class StubVoiceBridge:
             except RuntimeError:
                 pass  # no loop (unit-test direct call) — loopback is loop-only
 
+    def interrupt(self, stream_id: int) -> bool:
+        with self._lock:
+            s = self._streams.get(stream_id)
+            if s is None:
+                return False
+            s["interrupts"] = s.get("interrupts", 0) + 1
+            return True
+
     def close(self, stream_id: int) -> bool:
         with self._lock:
             return self._streams.pop(stream_id, None) is not None

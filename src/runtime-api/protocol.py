@@ -85,6 +85,7 @@ METHODS = (
     "client.hello",      # WSS-only: a device advertises its live device_type + capabilities
     "voice.open",        # WSS-only: open a media (audio) stream on this connection
     "voice.close",       # WSS-only: tear down a media stream
+    "voice.interrupt",   # WSS-only: cut the in-flight reply on an own stream
 )
 
 

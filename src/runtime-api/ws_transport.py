@@ -157,14 +157,28 @@ class WsTransport:
             await ws.send_str(error_frame(e.req_id, e.code, e.message).decode())
             return
         grants = auth["grants"]
-        if method in ("voice.open", "voice.close"):
+        if method in ("voice.open", "voice.close", "voice.interrupt"):
             # Media-plane control. The transport owns the stream's CONNECTION
             # lifecycle (which streams this connection may route binary to, and
             # teardown on disconnect); the voice bridge owns the session. The
             # transport never touches audio semantics here.
-            if self._voice is None or method not in grants:
+            # voice.interrupt is gated by the voice.open grant: cutting short a
+            # reply on a stream this connection opened adds no capability.
+            gate = "voice.open" if method == "voice.interrupt" else method
+            if self._voice is None or gate not in grants:
                 await ws.send_str(error_frame(
                     req_id, -32601, f"{method} not permitted").decode())
+                return
+            if method == "voice.interrupt":
+                sid = params.get("streamId")
+                if not isinstance(sid, int):
+                    await ws.send_str(error_frame(
+                        req_id, -32602, "streamId must be an integer").decode())
+                    return
+                ok = sid in streams and bool(
+                    getattr(self._voice, "interrupt", lambda _sid: False)(sid))
+                await ws.send_str(result_frame(
+                    req_id, {"interrupted": ok, "streamId": sid}).decode())
                 return
             if method == "voice.open":
                 # Downstream path: the bridge gets a per-stream async callback

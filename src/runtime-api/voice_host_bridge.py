@@ -54,6 +54,16 @@ class NodeVoiceBridge:
         if st is not None:
             st["queue"].put_nowait(payload)
 
+    def interrupt(self, stream_id: int) -> bool:
+        # Rides the upstream queue so ordering vs. queued audio is preserved;
+        # the pump sends dict entries as text control frames.
+        with self._lock:
+            st = self._streams.get(stream_id)
+        if st is None:
+            return False
+        st["queue"].put_nowait({"interrupt": True})
+        return True
+
     def close(self, stream_id: int) -> bool:
         with self._lock:
             st = self._streams.pop(stream_id, None)
@@ -81,7 +91,10 @@ class NodeVoiceBridge:
                             if payload is None:
                                 await ws.close()
                                 return
-                            await ws.send_bytes(payload)
+                            if isinstance(payload, dict):  # control (interrupt)
+                                await ws.send_str(json.dumps(payload))
+                            else:
+                                await ws.send_bytes(payload)
 
                     async def downstream():
                         async for msg in ws:

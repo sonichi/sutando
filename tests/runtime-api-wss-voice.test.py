@@ -128,6 +128,18 @@ async def probe():
             check(st2.get("result", {}).get("agentId") == "@wss-voice:example.org",
                   "connection survives audio frames (opened + orphan) and still serves RPC")
 
+            # voice.interrupt: own open stream → interrupted; unopened → not;
+            # malformed sid → clean -32602 (same crash-path contract as close)
+            vi = await rpc(w, "voice.interrupt", {"streamId": sid}, rid=20)
+            check(vi.get("result", {}).get("interrupted") is True,
+                  "voice.interrupt on an own open stream reports interrupted")
+            vi2 = await rpc(w, "voice.interrupt", {"streamId": 0xABCD}, rid=21)
+            check(vi2.get("result", {}).get("interrupted") is False,
+                  "voice.interrupt on an unopened stream reports not-interrupted")
+            vi3 = await rpc(w, "voice.interrupt", {"streamId": "x"}, rid=22)
+            check(vi3.get("error", {}).get("code") == -32602,
+                  "voice.interrupt malformed streamId → clean -32602")
+
             # voice.close tears the stream down; a second close reports not-open
             c1 = await rpc(w, "voice.close", {"streamId": sid}, rid=3)
             c2 = await rpc(w, "voice.close", {"streamId": sid}, rid=4)
@@ -172,6 +184,9 @@ async def probe():
             r = await rpc(w, "voice.open", {})
             check(r.get("error", {}).get("code") == -32601,
                   "a device without the voice.open grant is refused")
+            ri = await rpc(w, "voice.interrupt", {"streamId": 1}, rid=2)
+            check(ri.get("error", {}).get("code") == -32601,
+                  "voice.interrupt rides the voice.open grant (no grant → refused)")
 
 
 def main() -> int:

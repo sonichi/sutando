@@ -134,8 +134,20 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			return;
 		}
 		// Upstream: binary = device mic PCM 16k → straight into the session.
+		// Text after open = control: {"interrupt": true} marks the turn
+		// interrupted (device already cut its speaker; keeps queued
+		// notifications from flushing into a dead turn).
 		ws.on('message', (data: Buffer, isBin: boolean) => {
-			if (!isBin || !session) return;
+			if (!session) return;
+			if (!isBin) {
+				try {
+					if (JSON.parse(data.toString()).interrupt) {
+						(session as any).handleInterrupted?.();
+						console.log(`${ts()} [session ${n}] interrupted by device`);
+					}
+				} catch { /* ignore malformed control frames */ }
+				return;
+			}
 			try { (session as any).handleAudioFromClient(data); } catch (e) {
 				console.error(`${ts()} [session ${n}] audio-in error:`, e);
 			}
