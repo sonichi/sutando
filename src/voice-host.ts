@@ -230,15 +230,114 @@ async function handleSession(ws: WebSocket): Promise<void> {
 	ws.on('error', () => { ws.close(); teardown(); });
 }
 
+/** Text-plane sessions (/text): for endpoints whose platform owns STT/TTS
+ * (Mentra glasses — transcriptions in, their TTS out; no raw PCM access).
+ * SAME agent definition as the audio plane — instructions + work tool come
+ * from buildWearableAgent, so there is no per-device brain. Wire: text frames
+ * {"user": "..."} in → {"reply": "..."} out; {"open": {...}} handshake first.
+ * Results for delegated tasks stream back as {"result": "..."} frames via the
+ * same results-poll the audio plane speaks through. */
+function handleTextSession(ws: WebSocket): void {
+	const n = nextSessionN++;
+	let device: { deviceId?: string; label?: string } = {};
+	const history: { role: 'user' | 'assistant'; content: string }[] = [];
+	let poll: ReturnType<typeof setInterval> | null = null;
+
+	ws.on('message', (data: Buffer, isBin: boolean) => {
+		if (isBin) return; // text plane only
+		void (async () => {
+			try {
+				const msg = JSON.parse(data.toString());
+				if (msg.open) {
+					device = msg.open.device ?? {};
+					ws.send(JSON.stringify({ ok: true }));
+					console.log(`${ts()} [text ${n}] open (device ${device.label || '?'})`);
+					// spoken-results parity: relay finished wearable tasks as text
+					const dir = join(resolveWorkspace(), 'results');
+					const seen = new Set<string>();
+					const since = Date.now();
+					poll = setInterval(() => {
+						let names: string[] = [];
+						try { names = readdirSync(dir); } catch { return; }
+						for (const f of names) {
+							if (!/^task-wearable-.*\.txt$/.test(f) || seen.has(f)) continue;
+							try {
+								if (statSync(join(dir, f)).mtimeMs < since) { seen.add(f); continue; }
+								const body = readFileSync(join(dir, f), 'utf8').trim();
+								seen.add(f);
+								if (body && ws.readyState === WebSocket.OPEN) {
+									ws.send(JSON.stringify({ result: body }));
+								}
+							} catch { /* skip unreadable */ }
+						}
+					}, 2000);
+					return;
+				}
+				if (typeof msg.user === 'string' && msg.user.trim()) {
+					const agent = buildWearableAgent(device) as any;
+					const workTool = (agent.tools as ToolDefinition[])[0] as any;
+					history.push({ role: 'user', content: msg.user });
+					// Direct Gemini REST (generateContent + function calling): the
+					// repo's ai/@ai-sdk versions disagree on model spec, and this
+					// plane needs only a plain tool loop.
+					const url = 'https://generativelanguage.googleapis.com/v1beta/models/'
+						+ `${TEXT_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+					const contents: any[] = history.slice(-20).map((m) => (
+						{ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
+					const body: any = {
+						systemInstruction: { parts: [{ text: agent.instructions }] },
+						contents,
+						tools: [{ functionDeclarations: [{
+							name: workTool.name, description: workTool.description,
+							parameters: { type: 'object',
+								properties: { task: { type: 'string' } }, required: ['task'] },
+						}] }],
+					};
+					let reply = '';
+					for (let step = 0; step < 3 && !reply; step++) {
+						const res = await fetch(url, { method: 'POST',
+							headers: { 'content-type': 'application/json' },
+							body: JSON.stringify(body) });
+						if (!res.ok) throw new Error(`gemini ${res.status}: ${(await res.text()).slice(0, 200)}`);
+						const parts = (await res.json())?.candidates?.[0]?.content?.parts ?? [];
+						const call = parts.find((p: any) => p.functionCall);
+						if (call) {
+							const result = await workTool.execute(call.functionCall.args ?? {});
+							body.contents.push({ role: 'model', parts: [call] });
+							body.contents.push({ role: 'user', parts: [{ functionResponse: {
+								name: call.functionCall.name, response: result } }] });
+							continue;
+						}
+						reply = parts.map((p: any) => p.text ?? '').join('').trim();
+					}
+					if (!reply) reply = 'On it.';
+					history.push({ role: 'assistant', content: reply });
+					if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ reply }));
+				}
+			} catch (e) {
+				console.error(`${ts()} [text ${n}] error:`, e);
+				try { ws.send(JSON.stringify({ error: String(e) })); } catch { /* */ }
+			}
+		})();
+	});
+	ws.on('close', () => {
+		if (poll) clearInterval(poll);
+		console.log(`${ts()} [text ${n}] closed`);
+	});
+}
+
 function main(): void {
 	if (!GEMINI_API_KEY) {
 		console.error('GEMINI_API_KEY is required');
 		process.exit(1);
 	}
-	const wss = new WebSocketServer({ port: PORT, path: '/session', host: '127.0.0.1' });
-	wss.on('connection', (ws) => { void handleSession(ws); });
-	console.log(`${ts()} voice-host listening on ws://127.0.0.1:${PORT}/session `
-		+ `(audio model: ${NATIVE_AUDIO_MODEL})`);
+	const wss = new WebSocketServer({ port: PORT, host: '127.0.0.1' });
+	wss.on('connection', (ws, req) => {
+		if (req.url?.startsWith('/text')) void handleTextSession(ws);
+		else void handleSession(ws);
+	});
+	console.log(`${ts()} voice-host listening on ws://127.0.0.1:${PORT}/session + /text `
+		+ `(audio model: ${NATIVE_AUDIO_MODEL}, text model: ${TEXT_MODEL})`);
 }
 
 main();
