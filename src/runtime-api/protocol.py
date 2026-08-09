@@ -76,6 +76,7 @@ METHODS = (
     "human_action.complete",
     "human_action.decline",
     "human_action.status",
+    "approval.respond",  # resolve an approval from an authorized client (wearable)
     "task.list",
     "task.list_results",
     "task.subscribe",

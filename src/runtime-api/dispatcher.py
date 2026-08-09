@@ -196,6 +196,8 @@ class RuntimeDispatcher:
                                required=("action",))
         if method in ("human_action.complete", "human_action.decline"):
             return self._human_action_settle(method, params)
+        if method == "approval.respond":
+            return self._approval_respond(params)
         if method == "human_action.status":
             return self._get(params)
         if method == "capability.execute":
@@ -347,6 +349,36 @@ class RuntimeDispatcher:
                               resolved_by=self.actor_id)
         aid = self._ha_of.get(rid) or ha_action_id(rid)
         self.ha.close(aid, self.actor_id, note=note)
+        return {"requestId": rid, "status": status}
+
+    def _approval_respond(self, params: dict) -> dict:
+        """Resolve an approval from an authorized client (e.g. a paired wearable
+        granted approval.respond). Mirrors the owner's card answer: approve →
+        approved, reject → denied. Same CAS terminal-immutability as every other
+        resolution path, so a late/duplicate respond — or a concurrent card
+        answer — cannot overwrite a resolved request; the mirrored card is closed
+        so it does not dangle. Authorization to call this at all is enforced at
+        the transport edge (a device's granted_methods), off by default."""
+        rid = params.get("requestId")
+        if not rid:
+            raise ProtocolError(-32602, "missing required param: requestId")
+        decision = params.get("decision")
+        if decision not in ("approve", "reject"):
+            raise ProtocolError(-32602, "decision must be 'approve' or 'reject'")
+        rec = self.store.get(rid)
+        if rec is None:
+            raise ProtocolError(-32602, f"unknown requestId: {rid!r}")
+        if rec["requestType"] != "approval":
+            raise ProtocolError(
+                -32602, f"{rid!r} is a {rec['requestType']} request — "
+                "approval.respond applies only to approval requests")
+        if rec["status"] != "pending":
+            return {"requestId": rid, "status": rec["status"],
+                    "alreadyTerminal": True}
+        status = "approved" if decision == "approve" else "denied"
+        self.store.transition(rid, status, resolved_by=self.actor_id)
+        aid = self._ha_of.get(rid) or ha_action_id(rid)
+        self.ha.close(aid, self.actor_id)
         return {"requestId": rid, "status": status}
 
     async def _capability(self, params: dict) -> dict:

@@ -32,7 +32,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SERVER = REPO / "src" / "runtime-api" / "server.py"
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
-from device_store import DeviceStore  # noqa: E402
+from device_store import DEFAULT_DEVICE_GRANTS, DeviceStore  # noqa: E402
 
 FAILS: list = []
 
@@ -141,6 +141,28 @@ async def probe():
         check(rec.get("device_type") == "watch"
               and "vibration" in rec.get("capabilities", []),
               "client.hello records the device's advertised type + capabilities")
+
+        # 5d. approval.respond (slice 4b) — approve-from-device, default-off.
+        # Owner raises an approval over the Unix socket (as an agent turn would).
+        ap = subprocess.run(
+            [sys.executable, str(REPO / "src" / "runtime-cli" / "sutando-runtime.py"),
+             "approval", "request", "--action", "deploy-to-prod"],
+            capture_output=True, text=True, env=ENV, timeout=15)
+        approval_id = json.loads(ap.stdout)["requestId"]
+        # the default paired device has NO approval.respond grant → refused
+        ref = await rpc(sess, cred, "approval.respond",
+                        {"requestId": approval_id, "decision": "approve"})
+        check(ref.get("error", {}).get("code") == -32601,
+              "a device WITHOUT the approval.respond grant cannot approve")
+        # a device paired WITH the grant resolves the approval
+        pt2 = store.mint_pairing(
+            "approver", grants=list(DEFAULT_DEVICE_GRANTS) + ["approval.respond"])
+        red2 = await rpc(sess, pt2, "pair.redeem", {"label": "approver"})
+        cred2 = red2["result"]["credential"]
+        resp = await rpc(sess, cred2, "approval.respond",
+                         {"requestId": approval_id, "decision": "approve"})
+        check(resp.get("result", {}).get("status") == "approved",
+              "a device GRANTED approval.respond resolves the approval to approved")
 
         # 6. pairing token is single-use — once redeemed it no longer authorizes
         #    ANY connection, so reuse is rejected at connect (stronger than a
