@@ -335,6 +335,7 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
     compose_h = [0]  # current compose-box height (rows); 0 forces the first layout
     esc = bytearray()   # in-progress ANSI escape sequence (arrow keys, paste markers)
     pasting = [False]   # inside a bracketed paste (\033[200~ … \033[201~)
+    paste_run = [-1.0]  # monotonic ts of the last unmarked multi-line paste burst
 
     def dims():
         s = shutil.get_terminal_size((80, 24))
@@ -466,6 +467,18 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
             if not done.done():
                 done.set_result(None)
             return
+        # Paste WITHOUT bracketed markers: some paste paths never send
+        # \x1b[200~, so each newline hit Enter and a multi-line paste became N
+        # separate tasks (live 2026-08-09: one message → 17 tasks). Detect by
+        # burst shape — a typed Enter arrives as a lone trailing newline, while
+        # a paste arrives as one read burst with INTERIOR newlines. Treat every
+        # newline in such a burst (and in continuation bursts of a big split
+        # paste, within 150ms) as a literal separator, never a submit.
+        import time as _t
+        core = data[:-1]
+        if b"\r" in core or b"\n" in core:
+            paste_run[0] = _t.monotonic()
+        burst_paste = _t.monotonic() - paste_run[0] < 0.15
         for b in data:
             if esc:                               # collecting an escape sequence
                 esc.append(b)
@@ -502,8 +515,11 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
                     except UnicodeDecodeError:
                         pass
                 continue
-            if b in (0x0d, 0x0a):                 # Enter
-                on_enter()
+            if b in (0x0d, 0x0a):                 # Enter — or a paste newline
+                if burst_paste:
+                    add(" ")                      # unmarked paste: never submit
+                else:
+                    on_enter()
             elif b in (0x7f, 0x08):               # Backspace
                 if buf:
                     buf.pop(); draw_input()
