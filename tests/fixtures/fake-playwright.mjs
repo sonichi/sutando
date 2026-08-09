@@ -28,6 +28,7 @@ const page = {
   },
   async close() {
     record('page.close');
+    if (mode === 'slow-close') await new Promise((resolve) => setTimeout(resolve, 2000));
     clearInterval(hangTimer);
     rejectPending?.(new Error('fixture page closed'));
   },

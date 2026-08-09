@@ -50,15 +50,23 @@ const setupMode = command === 'setup';
 const url = setupMode ? (process.argv[3] || 'about:blank') : command;
 const rawActions = process.argv.slice(setupMode ? 4 : 3);
 const headed = setupMode || rawActions.includes('--headed') || process.env.SUTANDO_BROWSER_HEADLESS === '0';
+const MAX_COMMAND_TIMEOUT_MS = 300000;
 const timeoutOptions = rawActions.filter((action) => action.startsWith('--timeout='));
 if (timeoutOptions.length > 1 || (timeoutOptions[0] && !/^--timeout=[1-9]\d*$/.test(timeoutOptions[0]))) {
   console.error('Error: --timeout must be one positive integer in milliseconds');
   process.exit(1);
 }
-const operationTimeoutMs = Math.min(
-  timeoutOptions[0] ? Number(timeoutOptions[0].slice('--timeout='.length)) : 45000,
-  300000,
-);
+const commandTimeoutMs = timeoutOptions[0] ? Number(timeoutOptions[0].slice('--timeout='.length)) : 45000;
+if (commandTimeoutMs > MAX_COMMAND_TIMEOUT_MS) {
+  console.error(`Error: --timeout cannot exceed ${MAX_COMMAND_TIMEOUT_MS} milliseconds`);
+  process.exit(1);
+}
+// Keep part of the advertised command-level budget for closing a page/context
+// that becomes available just as the operation itself times out.
+const requestedCleanupBudgetMs = Math.min(5000, Math.max(10, Math.floor(commandTimeoutMs / 5)));
+const cleanupBudgetMs = setupMode ? 0 : Math.min(Math.max(0, commandTimeoutMs - 1), requestedCleanupBudgetMs);
+const commandDeadline = setupMode ? Infinity : Date.now() + commandTimeoutMs;
+const operationDeadline = commandDeadline - cleanupBudgetMs;
 const actions = rawActions.filter((action) => action !== '--headed' && !action.startsWith('--timeout='));
 // Per-user temp dir: a shared /tmp/sutando-screenshots is owned by whichever
 // macOS account created it first and EACCES-blocks every other account.
@@ -73,9 +81,9 @@ class BrowserInterruption extends Error {
   }
 }
 
-class BrowserOperationTimeout extends Error {
+class BrowserCommandTimeout extends Error {
   constructor(timeoutMs) {
-    super(`browser operation timed out after ${timeoutMs}ms`);
+    super(`browser command timed out after ${timeoutMs}ms`);
   }
 }
 
@@ -98,12 +106,26 @@ let stopping = false;
 
 async function cleanup() {
   if (cleanupPromise) return cleanupPromise;
-  cleanupPromise = (async () => {
-    await closeQuietly(page);
-    await closeQuietly(context);
-    await closeQuietly(browser);
-  })();
+  // Start every close even if another resource is already closed or stalls.
+  cleanupPromise = Promise.allSettled([
+    closeQuietly(page),
+    closeQuietly(context),
+    closeQuietly(browser),
+  ]);
   return cleanupPromise;
+}
+
+async function settleBefore(promise, deadline) {
+  if (!Number.isFinite(deadline)) return promise;
+  const remaining = Math.max(0, deadline - Date.now());
+  if (!remaining) return false;
+  let timer;
+  const settled = await Promise.race([
+    promise.then(() => true, () => true),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
+  ]);
+  clearTimeout(timer);
+  return settled;
 }
 
 let rejectInterruption;
@@ -115,6 +137,9 @@ const signalHandlers = new Map(['SIGINT', 'SIGTERM'].map((signal) => {
   const handler = () => {
     if (receivedSignal) return;
     receivedSignal = signal;
+    // Restore Node's default behavior immediately. A second signal remains an
+    // operator escape hatch instead of becoming a no-op during cleanup.
+    for (const [name, activeHandler] of signalHandlers) process.off(name, activeHandler);
     rejectInterruption(new BrowserInterruption(signal));
   };
   process.on(signal, handler);
@@ -122,17 +147,22 @@ const signalHandlers = new Map(['SIGINT', 'SIGTERM'].map((signal) => {
 }));
 
 const operation = (async () => {
+  const launchTimeoutMs = Math.max(1, Math.min(30000, operationDeadline - Date.now()));
   launchPromise = chromium.launchPersistentContext(PROFILE_DIR, {
     channel: 'chrome',
     headless: !headed,
     viewport: headed ? null : { width: 1440, height: 1000 },
-    timeout: Math.min(operationTimeoutMs, 30000),
+    timeout: launchTimeoutMs,
   });
   const launchedContext = await launchPromise;
-  if (stopping) return;
   context = launchedContext;
   browser = context.browser?.();
   page = context.pages()[0] || await context.newPage();
+  if (stopping) {
+    cleanupPromise = null;
+    await cleanup();
+    return;
+  }
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
   if (setupMode) {
@@ -190,7 +220,8 @@ let timeoutId;
 const timeout = setupMode
   ? new Promise(() => {})
   : new Promise((resolve, reject) => {
-    timeoutId = setTimeout(() => reject(new BrowserOperationTimeout(operationTimeoutMs)), operationTimeoutMs);
+    const delay = Math.max(0, operationDeadline - Date.now());
+    timeoutId = setTimeout(() => reject(new BrowserCommandTimeout(commandTimeoutMs)), delay);
   });
 
 try {
@@ -201,16 +232,9 @@ try {
 } finally {
   stopping = true;
   clearTimeout(timeoutId);
-  await cleanup();
-  if (!context && launchPromise) {
-    const launchedContext = await launchPromise.catch(() => null);
-    if (launchedContext) {
-      context = launchedContext;
-      browser = context.browser?.();
-      page = context.pages()[0];
-      cleanupPromise = null;
-      await cleanup();
-    }
-  }
+  // `operation` adopts and closes a context that launches after cancellation.
+  // Its wait shares the original command deadline rather than adding a fresh
+  // Playwright launch timeout after the advertised bound has elapsed.
+  await settleBefore(Promise.allSettled([cleanup(), operation]), commandDeadline);
   for (const [signal, handler] of signalHandlers) process.off(signal, handler);
 }

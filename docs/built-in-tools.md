@@ -130,9 +130,11 @@ node src/browser.mjs "https://example.com" --headed           # watch automation
 node src/browser.mjs "https://example.com" screenshot --timeout=60000  # override the 45s command limit
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
-Non-interactive commands are bounded to 45 seconds by default. Normal completion,
-errors, timeouts, `SIGINT`, and `SIGTERM` all close the page, context, and browser
-before the command exits.
+Non-interactive commands are bounded to 45 seconds by default; `--timeout` may
+raise that command-level limit to at most 300,000 ms. Normal completion, errors,
+timeouts, `SIGINT`, and `SIGTERM` all close the page, context, and browser before
+the command exits. A second signal during cleanup restores Node's normal immediate
+termination behavior instead of being swallowed.
 
 **File search (Spotlight)** — find any file on the Mac:
 ```bash
