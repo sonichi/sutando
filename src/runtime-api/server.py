@@ -235,17 +235,23 @@ class RuntimeServer:
             if self._state_dir:
                 from device_store import DeviceStore  # noqa: PLC0415
                 device_store = DeviceStore(Path(self._state_dir) / "auth")
-            # Media plane: a STUB voice bridge for now — it proves stream
-            # lifecycle + binary routing without pulling the voice stack into
-            # the daemon. The real VoiceSession-backed bridge slots in behind
-            # the same interface in a later slice.
-            from voice_bridge import StubVoiceBridge  # noqa: PLC0415
+            # Media plane: with SUTANDO_VOICE_HOST_URL set, streams bind to the
+            # external voice-host (the Node process that owns VoiceSession);
+            # otherwise the stub serves (lifecycle + loopback, no voice stack).
+            # Same interface either way — the transport does not change.
+            host_url = os.environ.get("SUTANDO_VOICE_HOST_URL")
+            if host_url:
+                from voice_host_bridge import NodeVoiceBridge  # noqa: PLC0415
+                voice = NodeVoiceBridge(host_url, log=_log)
+            else:
+                from voice_bridge import StubVoiceBridge  # noqa: PLC0415
+                voice = StubVoiceBridge()
             wss = WsTransport(self.dispatcher, token=self._wss_token(),
                               device_store=device_store,
                               result_subscribers=self._subscribers,
                               activity_subscribers=self._activity_subscribers,
                               request_subscribers=self._request_subscribers,
-                              voice_bridge=StubVoiceBridge(),
+                              voice_bridge=voice,
                               host=host, port=port, log=_log)
             await wss.start()
             if host not in ("127.0.0.1", "localhost", "::1"):
