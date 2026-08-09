@@ -59,7 +59,8 @@
 
 <div class="card hidden" id="voicecard">
   <div class="lbl">Voice</div>
-  <button id="ptt" class="secondary">🎙 Hold to talk</button>
+  <button id="ptt" class="secondary">🎙 Start voice</button>
+  <div id="voicestate" style="color:#a78bfa;font-size:13px;margin-top:6px;"></div>
   <div id="voicemsg" style="color:#9aa0a6;font-size:12px;margin-top:6px;"></div>
 </div>
 
@@ -117,6 +118,8 @@ async function onOpen(token) {
   localStorage.setItem('scp_credential', token);
   $('authcard').classList.add('hidden');
   for (const id of ['statuscard', 'askcard', 'voicecard', 'feedcard']) $(id).classList.remove('hidden');
+  const agent = localStorage.getItem('scp_agent');
+  if (agent) $('voicemsg').textContent = 'agent: ' + agent;
   initVoiceUi();
   try { const i = await rpc('sutando.info'); $('agent').textContent = i.agentId || ''; } catch (e) {}
   try { await rpc('client.hello', { device_type: 'web', capabilities: ['display', 'touch'] }); } catch (e) {}
@@ -143,7 +146,7 @@ const mfDecode = (buf) => {
 };
 
 let voice = { sid: null, ctx: null, srcNode: null, proc: null, stream: null,
-              playCursor: 0 };
+              playCursor: 0, live: false, sources: [] };
 
 function pcmDownTo16k(f32, fromRate) {
   const ratio = fromRate / 16000, n = Math.floor(f32.length / ratio);
@@ -166,50 +169,67 @@ function playPcm24k(buf) {
   const t = Math.max(voice.ctx.currentTime, voice.playCursor);
   src.start(t);
   voice.playCursor = t + ab.duration;
+  voice.sources.push(src);
+  src.onended = () => { voice.sources = voice.sources.filter(s => s !== src); };
 }
 
-async function pttStart() {
+// Interrupt: cut all scheduled reply audio NOW (server marks the turn; the
+// browser's echo cancellation is what makes talk-over interruption safe).
+function flushPlayback() {
+  for (const s of voice.sources.splice(0)) { try { s.stop(); } catch (e) {} }
+  voice.playCursor = 0;
+}
+
+// Toggle-live full-duplex voice: tap once → persistent session, talk
+// naturally, interrupt by talking over the reply (browser AEC prevents the
+// mic from hearing the speaker); tap again → end. Same session shape as the
+// watch and glasses — the client stays a dumb mic/speaker.
+async function voiceStart() {
   if (!window.isSecureContext) {
-    $('voicemsg').textContent = 'mic needs https or localhost — open the page on the Mac (localhost) for voice, or we add TLS later';
+    $('voicemsg').textContent = 'mic needs https or localhost — use the :8443 page';
     return;
   }
   try {
-    if (voice.sid == null) {
-      const r = await rpc('voice.open', {});
-      voice.sid = r.streamId;
-    }
-    voice.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const r = await rpc('voice.open', {});
+    voice.sid = r.streamId;
+    voice.stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     voice.ctx = voice.ctx || new (window.AudioContext || window.webkitAudioContext)();
     await voice.ctx.resume();
+    voice.playCursor = 0;
     voice.srcNode = voice.ctx.createMediaStreamSource(voice.stream);
     voice.proc = voice.ctx.createScriptProcessor(4096, 1, 1);
     voice.proc.onaudioprocess = (e) => {
-      if (voice.sid == null || !ws || ws.readyState !== 1) return;
+      if (!voice.live || voice.sid == null || !ws || ws.readyState !== 1) return;
       const i16 = pcmDownTo16k(e.inputBuffer.getChannelData(0), voice.ctx.sampleRate);
       ws.send(mfEncode(voice.sid, i16.buffer));
     };
     voice.srcNode.connect(voice.proc);
     voice.proc.connect(voice.ctx.destination);   // required to drive the graph
-    $('ptt').textContent = '🎙 Listening… (release to send)';
-    $('voicemsg').textContent = '';
-  } catch (e) { $('voicemsg').textContent = 'mic failed: ' + e.message; }
+    voice.live = true;
+    $('ptt').textContent = '⏹ End voice';
+    $('voicestate').textContent = 'listening';
+    $('voicemsg').textContent = 'talk naturally — interrupt by talking over the reply';
+  } catch (e) { $('voicemsg').textContent = 'voice failed: ' + e.message; }
 }
 
-function pttStop() {
+async function voiceStop() {
+  voice.live = false;
+  flushPlayback();
   try {
     if (voice.proc) { voice.proc.disconnect(); voice.proc = null; }
     if (voice.srcNode) { voice.srcNode.disconnect(); voice.srcNode = null; }
     if (voice.stream) { voice.stream.getTracks().forEach(t => t.stop()); voice.stream = null; }
   } catch (e) {}
-  $('ptt').textContent = '🎙 Hold to talk';
+  if (voice.sid != null) { try { await rpc('voice.close', { streamId: voice.sid }); } catch (e) {} }
+  voice.sid = null;
+  $('ptt').textContent = '🎙 Start voice';
+  $('voicestate').textContent = '';
+  $('voicemsg').textContent = '';
 }
 
 function initVoiceUi() {
-  const b = $('ptt');
-  b.addEventListener('mousedown', pttStart);
-  b.addEventListener('touchstart', (e) => { e.preventDefault(); pttStart(); });
-  for (const ev of ['mouseup', 'mouseleave']) b.addEventListener(ev, pttStop);
-  b.addEventListener('touchend', (e) => { e.preventDefault(); pttStop(); });
+  $('ptt').addEventListener('click', () => { voice.live ? voiceStop() : voiceStart(); });
 }
 
 function onMessage(ev) {
@@ -225,6 +245,11 @@ function onMessage(ev) {
     return;
   }
   const p = m.params || {};
+  if (m.method === 'voice.state') {
+    $('voicestate').textContent = p.state || '';
+    if (p.state === 'interrupted') flushPlayback();  // cut the dead turn's tail
+    return;
+  }
   if (m.method === 'task.result') feed('result', '✔ ' + (p.taskId || '') + '\n' + (p.result || '').slice(0, 400));
   else if (m.method === 'activity') { $('step').textContent = p.step || ''; feed('act', '⚙ ' + (p.step || '')); }
   else if (m.method === 'request.pending') approvalCard(p);
@@ -236,7 +261,9 @@ async function onOpenSmart(token) {
   let redeemed = null;
   try { redeemed = await rpc('pair.redeem', { label: 'web-companion' }); } catch (e) { /* not a pairing token */ }
   if (redeemed && redeemed.credential) {
+    // Agent-first storage: the credential belongs to an AGENT, not a machine.
     localStorage.setItem('scp_credential', redeemed.credential);
+    if (redeemed.agent_id) localStorage.setItem('scp_agent', redeemed.agent_id);
     ws.close();
     setTimeout(() => start(redeemed.credential), 300);
     return;
