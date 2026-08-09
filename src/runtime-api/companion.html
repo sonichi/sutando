@@ -57,6 +57,12 @@
   <button onclick="submitTask()">Send</button>
 </div>
 
+<div class="card hidden" id="voicecard">
+  <div class="lbl">Voice</div>
+  <button id="ptt" class="secondary">🎙 Hold to talk</button>
+  <div id="voicemsg" style="color:#9aa0a6;font-size:12px;margin-top:6px;"></div>
+</div>
+
 <div class="card hidden" id="feedcard">
   <div class="lbl">Live</div>
   <div id="feed"></div>
@@ -110,7 +116,8 @@ function setState(s, cls) { $('state').textContent = s; $('dot').className = 'do
 async function onOpen(token) {
   localStorage.setItem('scp_credential', token);
   $('authcard').classList.add('hidden');
-  for (const id of ['statuscard', 'askcard', 'feedcard']) $(id).classList.remove('hidden');
+  for (const id of ['statuscard', 'askcard', 'voicecard', 'feedcard']) $(id).classList.remove('hidden');
+  initVoiceUi();
   try { const i = await rpc('sutando.info'); $('agent').textContent = i.agentId || ''; } catch (e) {}
   try { await rpc('client.hello', { device_type: 'web', capabilities: ['display', 'touch'] }); } catch (e) {}
   try {
@@ -121,7 +128,96 @@ async function onOpen(token) {
   try { await rpc('task.subscribe', { results: true, activity: true, requests: true }); } catch (e) {}
 }
 
+// ── voice: media envelope + capture/playback ─────────────────────────────────
+// Envelope (media_frame.py): [version=1][stream_type=1][stream_id u16 BE][payload]
+const mfEncode = (sid, payload) => {
+  const out = new Uint8Array(4 + payload.byteLength);
+  out[0] = 1; out[1] = 1; out[2] = (sid >> 8) & 0xff; out[3] = sid & 0xff;
+  out.set(new Uint8Array(payload), 4);
+  return out.buffer;
+};
+const mfDecode = (buf) => {
+  const b = new Uint8Array(buf);
+  if (b.length < 4 || b[0] !== 1) return null;
+  return { sid: (b[2] << 8) | b[3], payload: buf.slice(4) };
+};
+
+let voice = { sid: null, ctx: null, srcNode: null, proc: null, stream: null,
+              playCursor: 0 };
+
+function pcmDownTo16k(f32, fromRate) {
+  const ratio = fromRate / 16000, n = Math.floor(f32.length / ratio);
+  const out = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, f32[Math.floor(i * ratio)]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+function playPcm24k(buf) {
+  if (!voice.ctx) return;
+  const i16 = new Int16Array(buf), f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 0x8000;
+  const ab = voice.ctx.createBuffer(1, f32.length, 24000);
+  ab.getChannelData(0).set(f32);
+  const src = voice.ctx.createBufferSource();
+  src.buffer = ab; src.connect(voice.ctx.destination);
+  const t = Math.max(voice.ctx.currentTime, voice.playCursor);
+  src.start(t);
+  voice.playCursor = t + ab.duration;
+}
+
+async function pttStart() {
+  if (!window.isSecureContext) {
+    $('voicemsg').textContent = 'mic needs https or localhost — open the page on the Mac (localhost) for voice, or we add TLS later';
+    return;
+  }
+  try {
+    if (voice.sid == null) {
+      const r = await rpc('voice.open', {});
+      voice.sid = r.streamId;
+    }
+    voice.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    voice.ctx = voice.ctx || new (window.AudioContext || window.webkitAudioContext)();
+    await voice.ctx.resume();
+    voice.srcNode = voice.ctx.createMediaStreamSource(voice.stream);
+    voice.proc = voice.ctx.createScriptProcessor(4096, 1, 1);
+    voice.proc.onaudioprocess = (e) => {
+      if (voice.sid == null || !ws || ws.readyState !== 1) return;
+      const i16 = pcmDownTo16k(e.inputBuffer.getChannelData(0), voice.ctx.sampleRate);
+      ws.send(mfEncode(voice.sid, i16.buffer));
+    };
+    voice.srcNode.connect(voice.proc);
+    voice.proc.connect(voice.ctx.destination);   // required to drive the graph
+    $('ptt').textContent = '🎙 Listening… (release to send)';
+    $('voicemsg').textContent = '';
+  } catch (e) { $('voicemsg').textContent = 'mic failed: ' + e.message; }
+}
+
+function pttStop() {
+  try {
+    if (voice.proc) { voice.proc.disconnect(); voice.proc = null; }
+    if (voice.srcNode) { voice.srcNode.disconnect(); voice.srcNode = null; }
+    if (voice.stream) { voice.stream.getTracks().forEach(t => t.stop()); voice.stream = null; }
+  } catch (e) {}
+  $('ptt').textContent = '🎙 Hold to talk';
+}
+
+function initVoiceUi() {
+  const b = $('ptt');
+  b.addEventListener('mousedown', pttStart);
+  b.addEventListener('touchstart', (e) => { e.preventDefault(); pttStart(); });
+  for (const ev of ['mouseup', 'mouseleave']) b.addEventListener(ev, pttStop);
+  b.addEventListener('touchend', (e) => { e.preventDefault(); pttStop(); });
+}
+
 function onMessage(ev) {
+  if (ev.data instanceof ArrayBuffer) {          // media plane: downstream audio
+    const f = mfDecode(ev.data);
+    if (f && f.sid === voice.sid) playPcm24k(f.payload);
+    return;
+  }
   let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
   if (m.id && pend[m.id]) {
     const p = pend[m.id]; delete pend[m.id];
@@ -151,6 +247,7 @@ async function onOpenSmart(token) {
 function start(token) {
   try { if (ws) ws.close(); } catch (e) {}
   ws = new WebSocket(wsUrl(token));
+  ws.binaryType = 'arraybuffer';                 // media-plane frames
   ws.onopen = () => onOpenSmart(token);
   ws.onmessage = onMessage;
   ws.onclose = () => setState('OFFLINE', 'off');
