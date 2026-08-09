@@ -204,12 +204,6 @@ def check_overdue_reminders():
     return issues
 
 
-def check_stale_results():
-    """Find undelivered results (no corresponding task completion)."""
-    # Not critical — skip for now
-    return []
-
-
 def check_notes_without_follow_up():
     """Find notes tagged 'action' or 'todo' that are >7 days old."""
     issues = []

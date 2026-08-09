@@ -28,6 +28,9 @@ MAX_TABLE_BYTES = 64 * 1024 * 1024
 MAX_TABLE_ROWS = 100_000
 MAX_TABLE_CELLS = 1_000_000
 MAX_TABLE_TEXT_CHARS = 16 * 1024 * 1024
+# --csv compute-exact view: source/output ceilings (fail-closed, never truncate).
+CSV_MAX_SOURCE_BYTES = 32 * 1024 * 1024
+CSV_MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_XLSX_COLUMNS = 16_384
 TEXT_READ_CHUNK_CHARS = 64 * 1024
 MAX_DOCUMENT_TEXT_CHARS = 16 * 1024 * 1024
@@ -677,6 +680,119 @@ def extract_textutil(path: Path, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     return stdout
 
 
+TABULAR_SUFFIXES = {".xlsx", ".xlsm", ".csv", ".tsv"}
+
+
+def _stream_rows_to_csv(rows_iter, budget: Optional[dict[str, int]]) -> str:
+    """Render rows to CSV incrementally under a shared fail-closed budget.
+
+    `budget` is {"cells": N, "bytes": N}, mutated cumulatively so multi-sheet
+    workbooks share ONE budget; None means the caller passed the explicit
+    --csv-no-budget override. Exactness contract: on budget exhaustion this
+    raises loudly — it never truncates, because a partial table computes a
+    wrong aggregate.
+    """
+    parts: list[str] = []
+    row_buf = io.StringIO()
+    writer = csv.writer(row_buf)
+    for raw in rows_iter:
+        row = ["" if c is None else c for c in raw]
+        row_buf.seek(0)
+        row_buf.truncate()
+        writer.writerow(row)
+        chunk = row_buf.getvalue()
+        if budget is not None:
+            budget["cells"] -= len(row)
+            # Budget the ENCODED size of what will be emitted, not
+            # StringIO.tell() character deltas — multibyte and replacement
+            # characters render more UTF-8 bytes than characters, and the
+            # byte budget's contract is bytes-on-stdout (qingyun CR
+            # 2026-07-31: a 31-char row encoding to 91 bytes must count 91).
+            budget["bytes"] -= len(chunk.encode("utf-8"))
+            if budget["cells"] < 0:
+                raise RuntimeError(
+                    f"--csv table exceeds the {MAX_TABLE_CELLS:,}-cell compute "
+                    "budget (fail-closed: attachments are untrusted and "
+                    "compute-exact mode never truncates); rerun with "
+                    "--csv-no-budget to override")
+            if budget["bytes"] < 0:
+                raise RuntimeError(
+                    f"--csv output exceeds the "
+                    f"{CSV_MAX_OUTPUT_BYTES // (1024 * 1024)} MiB compute "
+                    "budget (fail-closed: attachments are untrusted and "
+                    "compute-exact mode never truncates); rerun with "
+                    "--csv-no-budget to override")
+        parts.append(chunk)
+    return "".join(parts).rstrip("\n")
+
+
+def extract_table_csv(path: Path, unbounded: bool = False) -> str:
+    """Exact, uncapped per-sheet CSV for COMPUTING over — the machine twin of the
+    row-capped markdown view (which is for reading/summaries).
+
+    Quantitative answers must come from computation over the exact table, not
+    from eyeballing extracted text — validated on the GAIA file-attached subset
+    (3/3 multi-cell numeric misses flipped, 84.2%→92.1%, 2026-07-30). Two
+    exactness rules follow from that purpose:
+      * no row caps and no char caps by default — a silently truncated table
+        computes a silently wrong aggregate;
+      * xlsx without openpyxl is REFUSED (clear error) rather than served by
+        the approximate zip-XML fallback — approximate cells are fine to read,
+        not to compute with;
+      * no caps does NOT mean no bounds: attachments are untrusted, so inputs
+        over CSV_MAX_SOURCE_BYTES and renders over CSV_MAX_OUTPUT_BYTES /
+        MAX_TABLE_CELLS fail LOUDLY (never truncate) unless the caller passes
+        the explicit --csv-no-budget override.
+    """
+    suffix = path.suffix.lower()
+    if suffix not in TABULAR_SUFFIXES:
+        raise ValueError(f"--csv applies to tabular files ({', '.join(sorted(TABULAR_SUFFIXES))}); got {suffix or 'no suffix'}")
+    if not unbounded:
+        size = path.stat().st_size
+        if size > CSV_MAX_SOURCE_BYTES:
+            raise RuntimeError(
+                f"--csv input is {size:,} bytes, over the "
+                f"{CSV_MAX_SOURCE_BYTES // (1024 * 1024)} MiB compute budget "
+                "(fail-closed: attachments are untrusted and compute-exact "
+                "mode never truncates); rerun with --csv-no-budget to override")
+    budget = None if unbounded else {"cells": MAX_TABLE_CELLS,
+                                     "bytes": CSV_MAX_OUTPUT_BYTES}
+    if suffix in {".csv", ".tsv"}:
+        delimiter = "\t" if suffix == ".tsv" else ","
+        with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+            return _stream_rows_to_csv(csv.reader(fh, delimiter=delimiter), budget)
+    # XLSX/XLSM path. The compressed-size gate above cannot catch an OOXML zip
+    # bomb (a small archive whose sharedStrings/worksheet XML inflates far past
+    # the budget) — openpyxl.load_workbook would allocate past the compute budget
+    # before any cell/byte budget could fire. Preflight the UNCOMPRESSED archive
+    # size here, BEFORE importing/handing the file to openpyxl, so the bomb is
+    # rejected even where openpyxl is absent. Mirrors extract_xlsx's
+    # _validate_ooxml_archive_bounded (qingyun CR #2434). --csv-no-budget opts out.
+    if not unbounded:
+        try:
+            with zipfile.ZipFile(path) as zf:
+                uncompressed = sum(info.file_size for info in zf.infolist())
+        except zipfile.BadZipFile:
+            uncompressed = None  # not a zip — let openpyxl raise its own clear error
+        if uncompressed is not None and uncompressed > CSV_MAX_SOURCE_BYTES:
+            raise RuntimeError(
+                f"--csv xlsx inflates to {uncompressed:,} uncompressed bytes, over "
+                f"the {CSV_MAX_SOURCE_BYTES // (1024 * 1024)} MiB compute budget "
+                "(fail-closed: attachments are untrusted and compute-exact mode "
+                "never truncates); rerun with --csv-no-budget to override")
+    try:
+        import openpyxl  # noqa: PLC0415
+    except ImportError as exc:
+        raise RuntimeError("--csv for xlsx needs openpyxl (the zip-XML fallback is "
+                           "approximate — fine for reading, not for computing)") from exc
+    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    parts = []
+    for ws in wb.worksheets:
+        parts.append(f"=== sheet: {ws.title} ===\n"
+                     + _stream_rows_to_csv(ws.iter_rows(values_only=True), budget))
+    return "\n\n".join(parts)
+
+
 def extract(path: Path, max_rows: int, max_chars: int = DEFAULT_MAX_CHARS,
             _archive_budget: dict[str, int] | None = None,
             _archive_depth: int = 0) -> tuple[str, str]:
@@ -716,7 +832,14 @@ def main(argv: list[str]) -> int:
     as_json = "--json" in args
     if as_json:
         args.remove("--json")
+    csv_mode = "--csv" in args
+    if csv_mode:
+        args.remove("--csv")
+    csv_unbounded = "--csv-no-budget" in args
+    if csv_unbounded:
+        args.remove("--csv-no-budget")
     max_chars, max_rows = DEFAULT_MAX_CHARS, DEFAULT_MAX_ROWS
+    explicit_chars = False
     for flag, setter in (("--max-chars", "chars"), ("--max-rows", "rows")):
         if flag in args:
             i = args.index(flag)
@@ -727,11 +850,17 @@ def main(argv: list[str]) -> int:
                 return 2
             if setter == "chars":
                 max_chars = value
+                explicit_chars = True
             else:
                 max_rows = value
             del args[i:i + 2]
+    # --csv is the compute-exact view: the default char cap must not silently
+    # truncate a table mid-row (a truncated table computes a wrong aggregate).
+    # An EXPLICIT --max-chars still wins — the caller asked for it.
+    if csv_mode and not explicit_chars:
+        max_chars = 0
     if not args:
-        print("usage: ingest.py <file> [<file> ...] [--json] [--max-chars N] [--max-rows N]", file=sys.stderr)
+        print("usage: ingest.py <file> [<file> ...] [--json] [--csv] [--csv-no-budget] [--max-chars N] [--max-rows N]", file=sys.stderr)
         return 2
 
     had_failure = had_pointer = False
@@ -742,7 +871,10 @@ def main(argv: list[str]) -> int:
             result = {"file": name, "kind": "missing", "ok": False, "error": "not a file"}
         else:
             try:
-                kind, text = extract(path, max_rows, max_chars)
+                if csv_mode:
+                    kind, text = "csv", extract_table_csv(path, unbounded=csv_unbounded)
+                else:
+                    kind, text = extract(path, max_rows, max_chars)
                 if kind in {"image", "audio"}:
                     had_pointer = True
                     result = {"file": name, "kind": kind, "ok": False, "error": text}

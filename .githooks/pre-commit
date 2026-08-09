@@ -52,4 +52,65 @@ if [[ -n "$offenders" ]]; then
   exit 1
 fi
 
+# Pre-filter, never an authority: fails open when ruff is absent or cannot run.
+# Lints the STAGED blob via --stdin-filename so ruff.toml still resolves.
+
+staged_py="$(printf '%s\n' "$staged" | grep -E '\.py$' || true)"
+
+if [[ -n "$staged_py" ]]; then
+  ruff_cmd=""
+  if command -v ruff >/dev/null 2>&1; then
+    ruff_cmd="ruff"
+  elif command -v uvx >/dev/null 2>&1; then
+    ruff_cmd="uvx ruff"
+  elif command -v uv >/dev/null 2>&1; then
+    ruff_cmd="uv tool run ruff"
+  fi
+
+  if [[ -z "$ruff_cmd" ]]; then
+    printf '\033[33m~ pre-commit: no ruff found locally; skipping lint pre-filter (CI still checks).\033[0m\n' >&2
+  else
+    # rc 1 WITH stdout is a finding. rc>=2, or rc 1 with no stdout, is the runner
+    # failing to RUN and must fail open exactly like "no ruff installed".
+    ruff_out=""
+    runner_err=""
+    # Newline-safe, NOT `for f in $staged_py`: word-splitting a spaced path makes
+    # `git show` fail, which this loop would score as a runner error and skip.
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      out_f="$(mktemp)"; err_f="$(mktemp)"
+      # `|| rc=$?` is required under `set -e` and captures the code a bare
+      # `|| true` would discard.
+      rc=0
+      git show ":$f" 2>/dev/null | $ruff_cmd check --stdin-filename "$f" - >"$out_f" 2>"$err_f" || rc=$?
+      out="$(cat "$out_f")"; err="$(cat "$err_f")"
+      rm -f "$out_f" "$err_f"
+      if [[ "$rc" -eq 0 ]]; then
+        continue                                  # clean
+      elif [[ "$rc" -eq 1 && -n "${out// }" ]]; then
+        ruff_out+="$out"$'\n'                     # genuine findings
+      else
+        runner_err="${err:-$out}"                 # the runner could not run
+        break
+      fi
+    done <<< "$staged_py"
+
+    if [[ -n "${runner_err// }" ]]; then
+      printf '\033[33m~ pre-commit: ruff could not run (%s); skipping lint pre-filter — CI still checks.\033[0m\n' \
+        "$(printf '%s' "$runner_err" | head -1 | cut -c1-100)" >&2
+      ruff_out=""
+    fi
+
+    if [[ -n "${ruff_out// }" ]]; then
+      printf '\n\033[31m✖ pre-commit refusing: ruff findings in staged Python.\033[0m\n\n'
+      printf '%s\n' "$ruff_out"
+      printf 'Fix them, or re-run the check yourself with:\n'
+      printf '  %s check .\n\n' "$ruff_cmd"
+      printf 'If this is a false positive or a local/CI version disagreement,\n'
+      printf 'pass --no-verify to git commit and let CI adjudicate.\n\n'
+      exit 1
+    fi
+  fi
+fi
+
 exit 0

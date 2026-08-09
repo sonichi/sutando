@@ -85,6 +85,8 @@ PO_REPO="$PO_ROOT/repo"; PO_WS="$PO_ROOT/ws"; PO_VAULT="$PO_ROOT/v.git"
 mkdir -p "$PO_REPO/scripts" "$PO_REPO/src" "$PO_WS/state" "$PO_REPO/skills"
 cp "$REPO/scripts/sync-workspace.sh" "$PO_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$PO_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh"  "$PO_REPO/scripts/"
 cp "$REPO/src/sutando_config.py"     "$PO_REPO/src/"
 cp "$REPO/sutando.config.json"       "$PO_REPO/"
 touch "$PO_REPO/CLAUDE.md"

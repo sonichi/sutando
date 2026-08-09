@@ -928,6 +928,72 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIn("hosts/*/", r["detail"])
         self.assertIn("--force-gitignore", r["detail"], "the real remedy must survive")
 
+    # ---- symlinks: git cannot carry content beyond a link ------------------
+    #
+    # Found live 2026-08-05: a compat ALIAS symlink under
+    # `.claude-sutando/projects/` (a space-slug project dir pointing at its
+    # dash-slug twin) made the whole memory entry read UNMEASURED every pass.
+    # `git check-ignore` refuses any pathspec that traverses a symlink
+    # ("beyond a symbolic link", exit 128), and 128 -> unmeasured -> fail.
+    # The content was backed up the entire time at its REAL path, which the
+    # same probe measures via the twin's own materialization. Git stores at
+    # most the link entry for such paths — never the content — so alias
+    # materializations are outside what the vault could ever carry and must
+    # not condemn the entry that DOES carry the content.
+
+    def test_a_symlinked_project_ALIAS_does_not_make_the_entry_unmeasured(self):
+        # The live incident shape: glob entry matches both the real dir and a
+        # sibling alias symlink; every file "under" the alias is beyond a link.
+        ws = _mkworkspace(
+            self.tmp,
+            ["proj/", "proj/*/", "proj/*/memory/", "proj/*/memory/**"],
+            ["proj/real/memory/a.md"])
+        os.symlink("real", ws / "proj" / "alias")
+        self._patch_resolved(["proj/*/memory/"])
+        self._patch_shipped(["proj/*/memory/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", r.get("detail"))
+
+    def test_a_symlinked_SUBDIR_inside_a_carried_tree_does_not_condemn_it(self):
+        # One level down: the walk must not descend through a symlinked
+        # directory inside a carried tree. Passes today because pathlib's
+        # `**` does not follow directory symlinks — this PINS that behavior
+        # so a future walk change cannot silently re-open the class.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"], ["notes/real/a.md"])
+        os.symlink("real", ws / "notes" / "link")
+        self._patch_resolved(["notes/"])
+        self._patch_shipped(["notes/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", r.get("detail"))
+
+    def test_an_entry_matching_a_symlinked_DIRECTORY_itself_stays_measured(self):
+        # A glob can also match a symlinked directory directly (`hosts/*/`
+        # catching an alias host dir). Its children are equally beyond the
+        # link; the entry must stay measured via its real sibling.
+        ws = _mkworkspace(self.tmp, ["hosts/", "hosts/*/", "hosts/**"],
+                          ["hosts/h/pending-questions.md"])
+        os.symlink("h", ws / "hosts" / "alias")
+        self._patch_resolved(["hosts/*/"])
+        self._patch_shipped(["hosts/*/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", r.get("detail"))
+
+    def test_a_symlink_does_not_MASK_a_genuinely_dropped_sibling(self):
+        # Discriminator control: skipping alias paths must not soften the
+        # probe. A genuinely un-carried entry alongside a symlink still fails.
+        ws = _mkworkspace(self.tmp, ["notes/", "notes/**"],
+                          ["notes/real/a.md", "hosts/h/pending-questions.md"])
+        os.symlink("real", ws / "notes" / "link")
+        self._patch_resolved(["notes/", "hosts/*/"])
+        self._patch_shipped(["notes/", "hosts/*/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "fail")
+        self.assertIn("hosts/*/", r["detail"])
+
     def test_the_probe_is_registered_in_the_run_list(self):
         # A probe nobody calls cannot report anything. This is the assertion
         # that fails if the function is added but never wired in.
