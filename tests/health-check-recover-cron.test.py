@@ -386,11 +386,33 @@ def case_l_socket_resolution_fallbacks() -> list[str]:
             corrupt.write_text("not json{")
             if hc._live_core_socket(ws) != "/tmp/env-default.sock":
                 fails.append("l) corrupt heartbeat must not crash or supply the socket")
+            # NON-OBJECT heartbeat (fresh mtime, VALID json that isn't a mapping).
+            # Distinct from the garbage case above: `null` / `[]` / `"x"` / `3` all
+            # decode fine and then raise AttributeError on `.get`, which the
+            # (OSError, ValueError) handler does NOT catch — one junk file took the
+            # whole call down, and its caller `_rearm_core_crons()` is a RECOVERY path.
+            nonobj = cores / "nonobject.alive"
+            for raw in ("null", "[]", '"sock"', "3"):
+                nonobj.write_text(raw)
+                try:
+                    got = hc._live_core_socket(ws)
+                except Exception as exc:  # noqa: BLE001 — a crash IS the failure
+                    fails.append(f"l) non-object heartbeat {raw!r} crashed: {type(exc).__name__}")
+                    continue
+                if got != "/tmp/env-default.sock":
+                    fails.append(f"l) non-object heartbeat {raw!r} should fall back, got {got}")
+            nonobj.unlink()
             # Fresh heartbeat with a socket beats the fallbacks.
             good = cores / "good.alive"
             good.write_text(json.dumps({"socket": "/tmp/live.sock"}))
             if hc._live_core_socket(ws) != "/tmp/live.sock":
                 fails.append("l) fresh heartbeat socket should win over the default")
+            # A junk PEER file must not hide a good one. This glob reads *.alive for
+            # EVERY host, so one machine writing an unexpected shape must not blind
+            # this host to its own live core.
+            (cores / "peerjunk.alive").write_text("null")
+            if hc._live_core_socket(ws) != "/tmp/live.sock":
+                fails.append("l) a junk peer heartbeat must not mask a good one")
     finally:
         hc.WORKSPACE_DIR = saved_ws
         if saved_env is None:

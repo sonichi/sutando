@@ -31,6 +31,10 @@ _spec = importlib.util.spec_from_file_location(
     "rt_server", REPO / "src" / "runtime-api" / "server.py")
 rt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rt)
+# EXECUTORS moved to dispatcher.py with the request-domain layer. It is the same
+# dict object the dispatcher holds (constructor default), so mutating it here
+# still injects test executors into a live RuntimeServer.
+import dispatcher as rt_dispatcher  # noqa: E402
 
 import protocol as proto  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
@@ -85,7 +89,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
           "protocol: result/error frames encode")
 
     # ── issue + elicitation validation ──────────────────────────────────────
-    ra = run(srv.handle("approval.request",
+    ra = run(srv.dispatcher.handle("approval.request",
                         {"action": "message.send",
                          "resource": {"roomId": "!r:hs"}, "reason": "why"}))
     check(ra["status"] == "pending", "approval.request issues pending")
@@ -100,18 +104,18 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
             ({"question": "q", "type": "single_select"}, "requires options"),
             ({"type": "confirmation"}, "missing required param")):
         try:
-            run(srv.handle("elicitation.request", bad_params))
+            run(srv.dispatcher.handle("elicitation.request", bad_params))
             check(False, f"elicitation rejects: {frag}")
         except rt.ProtocolError as e:
             check(frag in e.message, f"elicitation rejects: {frag}")
-    re1 = run(srv.handle("elicitation.request",
+    re1 = run(srv.dispatcher.handle("elicitation.request",
                          {"question": "Which?", "type": "multi_select",
                           "options": ["a", "b", "c"]}))
     rec1 = json.loads((tmp / "ha" / (ha_action_id(re1["requestId"]) + ".json")).read_text())
     check(rec1["questions"][0].get("multiSelect") is True,
           "multi_select sets the multiSelect card flag")
     try:
-        run(srv.handle("no.such", {}))
+        run(srv.dispatcher.handle("no.such", {}))
         check(False, "unknown method rejected")
     except rt.ProtocolError as e:
         check(e.code == -32601, "unknown method rejected")
@@ -123,8 +127,8 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
         sent.append(p)
         return {"executed": True, "eventId": f"$e{len(sent)}"}
 
-    rt.EXECUTORS["test.echo"] = ok_exec
-    rt.GOVERNED_ACTIONS = frozenset({"test.echo"})
+    rt_dispatcher.EXECUTORS["test.echo"] = ok_exec
+    rt_dispatcher.GOVERNED_ACTIONS = frozenset({"test.echo"})
     try:
         for p, frag in (({}, "missing required param"),
                         ({"action": "test.echo"}, "is governed"),
@@ -133,19 +137,19 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
                         ({"action": "test.echo",
                           "approvalRequestId": ra["requestId"]}, "not approved")):
             try:
-                run(srv.handle("capability.execute", p))
+                run(srv.dispatcher.handle("capability.execute", p))
                 check(False, f"capability rejects: {frag}")
             except rt.ProtocolError as e:
                 check(frag in e.message, f"capability rejects: {frag}")
 
         # approve via the ha lifecycle → settle → approved (action matches
         # the governed test executor so binding passes on the happy path)
-        rb = run(srv.handle("approval.request",
+        rb = run(srv.dispatcher.handle("approval.request",
                             {"action": "test.echo",
                              "resource": {"roomId": "!r:hs"},
                              "input": {"body": "hi"}}))
         _resolve_ha(srv, rb["requestId"], {"1": [1]})
-        w = run(srv.handle("request.wait", {"requestId": rb["requestId"],
+        w = run(srv.dispatcher.handle("request.wait", {"requestId": rb["requestId"],
                                             "timeoutS": 5}))
         check(w["status"] == "approved" and w["resolvedBy"] == "@owner:hs",
               "wait settles ha Approve → approved(by owner)")
@@ -156,30 +160,30 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
                         ({"action": "test.echo", "resource": {"roomId": "!other"},
                           "approvalRequestId": rb["requestId"]}, "different resource")):
             try:
-                run(srv.handle("capability.execute", p))
+                run(srv.dispatcher.handle("capability.execute", p))
                 check(False, f"binding rejects: {frag}")
             except rt.ProtocolError as e:
                 check(frag in e.message, f"binding rejects: {frag}")
 
         good = {"action": "test.echo", "resource": {"roomId": "!r:hs"},
                 "input": {"body": "hi"}, "idempotencyKey": "k1"}
-        r1 = run(srv.handle("capability.execute",
+        r1 = run(srv.dispatcher.handle("capability.execute",
                             {**good, "approvalRequestId": rb["requestId"]}))
         check(r1["status"] == "completed" and r1["result"]["eventId"] == "$e1",
               "governed execute completes via executor")
-        r2 = run(srv.handle("capability.execute",
+        r2 = run(srv.dispatcher.handle("capability.execute",
                             {**good, "approvalRequestId": rb["requestId"]}))
         check(r2.get("idempotentReplay") is True and len(sent) == 1,
               "idempotency key replays without re-executing")
         try:
-            run(srv.handle("capability.execute",
+            run(srv.dispatcher.handle("capability.execute",
                            {**good, "input": {"body": "DIFFERENT"}}))
             check(False, "fingerprint mismatch rejected")
         except rt.ProtocolError as e:
             check("different action/resource/input" in e.message,
                   "fingerprint mismatch rejected")
         try:
-            run(srv.handle("capability.execute",
+            run(srv.dispatcher.handle("capability.execute",
                            {**good, "idempotencyKey": "k2",
                             "approvalRequestId": rb["requestId"]}))
             check(False, "consumed approval rejected")
@@ -187,12 +191,12 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
             check("already consumed" in e.message, "consumed approval rejected")
 
         # duplicate-key RACE branch: replay check misses, unique index wins
-        ra2 = run(srv.handle("approval.request",
+        ra2 = run(srv.dispatcher.handle("approval.request",
                              {"action": "test.echo",
                               "resource": {"roomId": "!r:hs"},
                               "input": {"body": "hi"}}))
         _resolve_ha(srv, ra2["requestId"], {"1": [1]})
-        run(srv.handle("request.wait", {"requestId": ra2["requestId"], "timeoutS": 5}))
+        run(srv.dispatcher.handle("request.wait", {"requestId": ra2["requestId"], "timeoutS": 5}))
         real_lookup = srv.store.by_idempotency_key
         calls = {"n": 0}
 
@@ -201,7 +205,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
             return None if calls["n"] == 1 else real_lookup(key)
 
         srv.store.by_idempotency_key = racey
-        rr = run(srv.handle("capability.execute",
+        rr = run(srv.dispatcher.handle("capability.execute",
                             {**good, "approvalRequestId": ra2["requestId"]}))
         srv.store.by_idempotency_key = real_lookup
         a2 = srv.store.get(ra2["requestId"])
@@ -209,59 +213,59 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
               "same-key race replays winner; loser's approval NOT consumed")
 
         # ungoverned + executor failure + unknown action
-        rt.GOVERNED_ACTIONS = frozenset()
+        rt_dispatcher.GOVERNED_ACTIONS = frozenset()
 
         def boom(_p):
             raise RuntimeError("exec boom")
 
-        rt.EXECUTORS["test.boom"] = boom
-        rf = run(srv.handle("capability.execute", {"action": "test.boom"}))
+        rt_dispatcher.EXECUTORS["test.boom"] = boom
+        rf = run(srv.dispatcher.handle("capability.execute", {"action": "test.boom"}))
         check(rf["status"] == "failed" and "exec boom" in rf["result"]["error"],
               "executor exception → failed request")
-        ru = run(srv.handle("capability.execute", {"action": "no.executor"}))
+        ru = run(srv.dispatcher.handle("capability.execute", {"action": "no.executor"}))
         check(ru["status"] == "failed" and "no executor" in ru["result"]["error"],
               "unknown action → clean failed request")
     finally:
-        rt.EXECUTORS.pop("test.echo", None)
-        rt.EXECUTORS.pop("test.boom", None)
-        rt.GOVERNED_ACTIONS = frozenset({"message.send"})
+        rt_dispatcher.EXECUTORS.pop("test.echo", None)
+        rt_dispatcher.EXECUTORS.pop("test.boom", None)
+        rt_dispatcher.GOVERNED_ACTIONS = frozenset({"message.send"})
 
     # ── settle mapping: deny + elicitation answer + expiry + cancel ─────────
-    rd = run(srv.handle("approval.request", {"action": "x.y"}))
+    rd = run(srv.dispatcher.handle("approval.request", {"action": "x.y"}))
     _resolve_ha(srv, rd["requestId"], {"1": [2]})  # option 2 = Deny
-    wd = run(srv.handle("request.wait", {"requestId": rd["requestId"], "timeoutS": 5}))
+    wd = run(srv.dispatcher.handle("request.wait", {"requestId": rd["requestId"], "timeoutS": 5}))
     check(wd["status"] == "denied", "ha Deny → denied")
-    re2 = run(srv.handle("elicitation.request",
+    re2 = run(srv.dispatcher.handle("elicitation.request",
                          {"question": "Pick", "options": ["red", "blue"]}))
     _resolve_ha(srv, re2["requestId"], {"Pick": "blue"})
-    we = run(srv.handle("request.wait", {"requestId": re2["requestId"], "timeoutS": 5}))
+    we = run(srv.dispatcher.handle("request.wait", {"requestId": re2["requestId"], "timeoutS": 5}))
     check(we["status"] == "resolved" and we["result"]["answer"] == "blue",
           "elicitation answer maps to resolved(answer)")
-    rw = run(srv.handle("approval.request", {"action": "x.y"}))
-    wt = run(srv.handle("request.wait", {"requestId": rw["requestId"], "timeoutS": 0.6}))
+    rw = run(srv.dispatcher.handle("approval.request", {"action": "x.y"}))
+    wt = run(srv.dispatcher.handle("request.wait", {"requestId": rw["requestId"], "timeoutS": 0.6}))
     check(wt.get("timedOut") is True and wt["status"] == "pending",
           "wait timeout reports timedOut, stays pending")
-    rc = run(srv.handle("request.cancel", {"requestId": rw["requestId"]}))
+    rc = run(srv.dispatcher.handle("request.cancel", {"requestId": rw["requestId"]}))
     check(rc["status"] == "cancelled", "cancel transitions")
     try:
-        run(srv.handle("request.get", {"requestId": "nope"}))
+        run(srv.dispatcher.handle("request.get", {"requestId": "nope"}))
         check(False, "unknown requestId rejected")
     except rt.ProtocolError:
         check(True, "unknown requestId rejected")
     # expiry through the ha mirror
-    rx = run(srv.handle("approval.request", {"action": "x.y"}))
+    rx = run(srv.dispatcher.handle("approval.request", {"action": "x.y"}))
     xf = tmp / "ha" / (ha_action_id(rx["requestId"]) + ".json")
     xr = json.loads(xf.read_text())
     xr["expires_at"] = time.time() - 5
     xf.write_text(json.dumps(xr))
-    srv._settle(rx["requestId"])
+    srv.dispatcher._settle(rx["requestId"])
     check(srv.store.get(rx["requestId"])["status"] == "expired",
           "expired ha action settles the request expired")
 
     # recover() re-links pending approvals/elicitations after a restart
     srv2 = _srv(tmp)
-    srv2.recover()
-    check(any(k for k in srv2._ha_of), "recover() re-links pending requests")
+    srv2.dispatcher.recover()
+    check(any(k for k in srv2.dispatcher._ha_of), "recover() re-links pending requests")
 
     # ── serve(): live unix socket, frame errors, stale-socket takeover ──────
     async def drive_socket():
@@ -357,23 +361,23 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     os.environ["REMOTE_TASK_TOKEN"] = "test-bearer-not-real"
     try:
         good_send = {"resource": {"roomId": "!r:hs"}, "input": {"body": "hi"}}
-        out = rt._exec_message_send(good_send)
+        out = rt_dispatcher._exec_message_send(good_send)
         check(out == {"executed": True, "eventId": "$sent-1", "roomId": "!r:hs"}
               and hits[0]["op"] == "message",
               "_exec_message_send delivers and returns the event id")
         try:
-            rt._exec_message_send(good_send)  # stub now answers 200 w/o event_id
+            rt_dispatcher._exec_message_send(good_send)  # stub now answers 200 w/o event_id
             check(False, "swallowed 200 fails closed")
         except RuntimeError as e:
             check("not confirmed" in str(e), "swallowed 200 fails closed")
         try:
-            rt._exec_message_send({"resource": {}, "input": {}})
+            rt_dispatcher._exec_message_send({"resource": {}, "input": {}})
             check(False, "missing room/body rejected")
         except RuntimeError as e:
             check("needs resource.roomId" in str(e), "missing room/body rejected")
         os.environ.pop("REMOTE_TASK_TOKEN")
         try:
-            rt._exec_message_send(good_send)
+            rt_dispatcher._exec_message_send(good_send)
             check(False, "unconfigured gateway rejected")
         except RuntimeError as e:
             check("not configured" in str(e), "unconfigured gateway rejected")
@@ -389,7 +393,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     os.environ.pop("SUTANDO_RUNTIME_STATE")
 
     # request.get success path
-    g = run(srv.handle("request.get", {"requestId": rd["requestId"]}))
+    g = run(srv.dispatcher.handle("request.get", {"requestId": rd["requestId"]}))
     check(g["status"] == "denied", "request.get returns the public record")
 
     # duplicate-key race where NO winner row exists → original error re-raised
@@ -398,7 +402,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     real2 = srv.store.by_idempotency_key
     srv.store.by_idempotency_key = lambda _k: None
     try:
-        run(srv.handle("capability.execute", dup))
+        run(srv.dispatcher.handle("capability.execute", dup))
         check(False, "raceless duplicate key re-raises")
     except _sq.IntegrityError:
         check(True, "raceless duplicate key re-raises")
@@ -406,28 +410,28 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
         srv.store.by_idempotency_key = real2
 
     # _settle early-outs: terminal request; pending with no ha mapping
-    srv._settle(rd["requestId"])  # already denied — returns at the top
+    srv.dispatcher._settle(rd["requestId"])  # already denied — returns at the top
     check(srv.store.get(rd["requestId"])["status"] == "denied",
           "_settle no-ops on a terminal request")
     srv3 = _srv(tmp)  # same DB, NO recover() → pending rows without ha mapping
     pend = [r for r in srv3.store.pending()][:1]
     if pend:
-        srv3._settle(pend[0]["requestId"])
+        srv3.dispatcher._settle(pend[0]["requestId"])
         check(srv3.store.get(pend[0]["requestId"])["status"] == "pending",
               "_settle without an ha mapping leaves the request pending")
 
     # single_select index-shaped answer flattens to one label
-    rs = run(srv.handle("elicitation.request",
+    rs = run(srv.dispatcher.handle("elicitation.request",
                         {"question": "One?", "type": "single_select",
                          "options": ["left", "right"]}))
     _resolve_ha(srv, rs["requestId"], {"1": [2]})
-    ws2 = run(srv.handle("request.wait", {"requestId": rs["requestId"], "timeoutS": 5}))
+    ws2 = run(srv.dispatcher.handle("request.wait", {"requestId": rs["requestId"], "timeoutS": 5}))
     check(ws2["status"] == "resolved" and ws2["result"]["answer"] == "right",
           "single_select index answer flattens to its label")
 
     # resolver_loop: settles pending requests; isolates a store error
     async def drive_resolver():
-        rr = await srv.handle("approval.request", {"action": "loop.test"})
+        rr = await srv.dispatcher.handle("approval.request", {"action": "loop.test"})
         real_pending = srv.store.pending
         state = {"raised": False}
 
@@ -438,7 +442,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
             return real_pending()
 
         srv.store.pending = flaky
-        task = asyncio.ensure_future(srv.resolver_loop())
+        task = asyncio.ensure_future(srv.dispatcher.resolver_loop())
         await asyncio.sleep(0.05)
         _resolve_ha(srv, rr["requestId"], {"1": [1]})
         for _ in range(80):
@@ -453,10 +457,10 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
         srv.store.pending = real_pending
         return srv.store.get(rr["requestId"])["status"], state["raised"]
 
-    old_poll = rt.RESOLVER_POLL_S
-    rt.RESOLVER_POLL_S = 0.05
+    old_poll = rt_dispatcher.RESOLVER_POLL_S
+    rt_dispatcher.RESOLVER_POLL_S = 0.05
     status, raised = run(drive_resolver())
-    rt.RESOLVER_POLL_S = old_poll
+    rt_dispatcher.RESOLVER_POLL_S = old_poll
     check(status == "approved" and raised,
           "resolver_loop survives a store error and settles the approval")
 
@@ -530,10 +534,10 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
             os.environ.pop(k, None)
 
     # ── INPUT binding (review P1): approval binds the exact effect ──────────
-    rt.EXECUTORS["test.echo"] = lambda p2: {"executed": True, "eventId": "$x"}
-    rt.GOVERNED_ACTIONS = frozenset({"test.echo"})
+    rt_dispatcher.EXECUTORS["test.echo"] = lambda p2: {"executed": True, "eventId": "$x"}
+    rt_dispatcher.GOVERNED_ACTIONS = frozenset({"test.echo"})
     try:
-        rbi = run(srv.handle("approval.request",
+        rbi = run(srv.dispatcher.handle("approval.request",
                              {"action": "test.echo",
                               "resource": {"roomId": "!r:hs"},
                               "input": {"body": "benign"}}))
@@ -542,30 +546,30 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
         check("benign" in card["questions"][0]["question"],
               "approval card shows the governed input")
         _resolve_ha(srv, rbi["requestId"], {"1": [1]})
-        run(srv.handle("request.wait", {"requestId": rbi["requestId"], "timeoutS": 5}))
+        run(srv.dispatcher.handle("request.wait", {"requestId": rbi["requestId"], "timeoutS": 5}))
         try:
-            run(srv.handle("capability.execute",
+            run(srv.dispatcher.handle("capability.execute",
                            {"action": "test.echo", "resource": {"roomId": "!r:hs"},
                             "input": {"body": "SUBSTITUTED"},
                             "approvalRequestId": rbi["requestId"]}))
             check(False, "substituted input rejected")
         except rt.ProtocolError as e:
             check("different resource/input" in e.message, "substituted input rejected")
-        rok = run(srv.handle("capability.execute",
+        rok = run(srv.dispatcher.handle("capability.execute",
                              {"action": "test.echo", "resource": {"roomId": "!r:hs"},
                               "input": {"body": "benign"},
                               "approvalRequestId": rbi["requestId"]}))
         check(rok["status"] == "completed",
               "refusal did not consume — the exact approved effect executes")
     finally:
-        rt.EXECUTORS.pop("test.echo", None)
-        rt.GOVERNED_ACTIONS = frozenset({"message.send"})
+        rt_dispatcher.EXECUTORS.pop("test.echo", None)
+        rt_dispatcher.GOVERNED_ACTIONS = frozenset({"message.send"})
 
     # ── restart-strand (review P1): consumed-approval capability row must not
     # stay pending forever after a daemon restart ───────────────────────────
-    apx = run(srv.handle("approval.request", {"action": "x.y"}))
+    apx = run(srv.dispatcher.handle("approval.request", {"action": "x.y"}))
     _resolve_ha(srv, apx["requestId"], {"1": [1]})
-    run(srv.handle("request.wait", {"requestId": apx["requestId"], "timeoutS": 5}))
+    run(srv.dispatcher.handle("request.wait", {"requestId": apx["requestId"], "timeoutS": 5}))
     strand = srv.store.create_consuming(apx["requestId"], "capability",
                                         "capability.execute", "@a:hs",
                                         {"action": "x.y"})
@@ -573,7 +577,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
           and srv.store.get(apx["requestId"])["consumedAt"] is not None,
           "simulated crash window: row pending, approval consumed")
     srv_r = _srv(tmp)
-    srv_r.recover()
+    srv_r.dispatcher.recover()
     got_r = srv_r.store.get(strand["requestId"])
     check(got_r["status"] == "failed"
           and "interrupted by daemon restart" in (got_r["result"] or {}).get("error", "")
@@ -585,7 +589,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
           "may be post-send; false would invite a duplicate retry)")
     check(srv_r.store.get(apx["requestId"])["consumedAt"] is not None,
           "the spent approval stays spent — retry requires a fresh approval")
-    wr = run(srv_r.handle("request.wait", {"requestId": strand["requestId"],
+    wr = run(srv_r.dispatcher.handle("request.wait", {"requestId": strand["requestId"],
                                            "timeoutS": 2}))
     check(wr["status"] == "failed" and wr.get("timedOut") is None,
           "wait on the recovered row returns failed, not a pending timeout")

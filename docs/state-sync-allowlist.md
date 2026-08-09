@@ -4,11 +4,19 @@
 
 ## Why
 
-The 3-space model (`docs/workspace-design.md`) deliberately keeps State per-machine:
+The 2-space model (`docs/workspace-design.md`) puts all per-user runtime state in **Workspace** and
+makes sync a property of individual sub-paths rather than of the container. Most of `state/` is
+deliberately per-machine:
 
-- State is rebuildable.
-- `rm -rf $SUTANDO_WORKSPACE` is meant to be survivable.
+- The per-machine parts of `state/` are rebuildable — `state/cores/`, logs, PIDs, runtime scratch.
+- Deleting one of those *rebuildable `state/` sub-paths* is survivable; whatever owns it rewrites it.
 - Logs and PIDs from one Mac have no value on another.
+
+**That is a claim about rebuildable `state/` sub-paths, not about the workspace.** `<workspace>` also
+holds persistent notes, agent memory, `build_log.md`, `pending-questions.md`, and durable per-host
+identity under `state/auth/`. Deleting the canonical workspace destroys owner data outright on a
+single-host or unsynced install, and on a synced fleet still loses whatever has not been committed.
+`docs/workspace-design.md` is the current source of truth for that lifecycle.
 
 Real use case that bends the rule: a user with multiple Macs wants a **cross-machine task queue** — start a Telegram task on the MacBook, finish it on the Mac Studio because that's the machine with the GPU / the right tool / the recording it needs. The relevant State subdirectories are:
 
@@ -21,7 +29,7 @@ The straightforward fix — sync the whole workspace — breaks the "rebuildable
 
 Add `<workspace>/state/.sync-allowlist` — a newline-delimited list of subpaths under `state/` that get synced across the fleet. Default (file missing) → nothing in State syncs. Existing single-machine installs are unaffected.
 
-> `<workspace>` resolves via `bash scripts/sutando-config.sh workspace` (M0 helper, PR #1395). Defaults to `<repo>/workspace/`; honors `$SUTANDO_WORKSPACE` as a legacy escape hatch internally. Bare references to `$SUTANDO_WORKSPACE` below (as a shell variable to `rm -rf` or similar) keep the env-var form intentionally — those are commands the user would type, not path literals.
+> `<workspace>` resolves via `bash scripts/sutando-config.sh workspace` (M0 helper, PR #1395). Defaults to `<repo>/workspace/`. **`$SUTANDO_WORKSPACE` is not honored** — removed in v0.8; setting it only warns. This document never spells out a resolved workspace path next to a deletion command: doing so would make a destructive line copy-pasteable. It also does not describe deleting `<workspace>` as survivable — that claim is scoped to rebuildable `state/` sub-paths and to `state/fleet/`, never to the canonical workspace. The old `$SUTANDO_WORKSPACE` form was inert when pasted (the var is unset); anything that resolves for real is not. `tests/state-sync-allowlist-doc.test.py` enforces both.
 
 Example file:
 
@@ -92,10 +100,12 @@ A Mac that wakes up post-sync and sees `state/fleet/done/task-<id>.<otherhost>.f
 
 ## Lifecycle invariants
 
-The 3-space model's invariant is `rm -rf $SUTANDO_WORKSPACE` is survivable. With fleet sync added, the invariant becomes:
+The invariant this proposal owns is scoped to the allowlisted subtree it introduces —
+`state/fleet/` — and **not** to the workspace as a whole:
 
-- `rm -rf $SUTANDO_WORKSPACE` on **one** Mac is survivable — the next sync pulls fleet state back.
-- `rm -rf $SUTANDO_WORKSPACE` on **all** Macs simultaneously loses uncommitted claims + uncommitted results. This is a user-action consequence, not a bug; document it but don't engineer for it.
+- Losing `state/fleet/` on **one** Mac is survivable — the next sync pulls fleet state back.
+- Losing `state/fleet/` on **all** Macs simultaneously forfeits uncommitted claims + uncommitted results. This is a user-action consequence, not a bug; document it but don't engineer for it.
+- Nothing here makes the canonical workspace disposable. The fleet allowlist neither backs up nor makes recoverable the notes, memory, `build_log.md`, `pending-questions.md`, or `state/auth/` that live beside it.
 - A Mac that loses network mid-claim retries the claim on next sync. If the same task is already done by another Mac (flag present post-sync), it noops.
 
 Tasks **not** on the allowlist behave exactly as today — no change to single-machine semantics.
@@ -150,7 +160,7 @@ This is the rough shape for when code actually lands; not part of this PR.
 
 ## Acceptance for the implementation PR (when it happens)
 
-- Owner can opt specific State subdirs into sync without compromising the default "rm -rf workspace is recoverable" invariant.
+- Owner can opt specific `state/` sub-paths into sync without changing the default (nothing in `state/` syncs) and without implying the canonical workspace is disposable.
 - Cross-Mac task queue works without **lost-task** incidents.
 - **Duplicate-process** incidents bounded to at most one duplicate per task in a sync gap; documented as the v1 trade.
 - All claim files use atomic rename, not write-then-copy.
@@ -162,11 +172,11 @@ This is the rough shape for when code actually lands; not part of this PR.
 - CRDT-style claim merging.
 - External coordinator (etcd, DynamoDB).
 - Per-task SLA / priority across the fleet (priority calculator already exists at `src/task_priority.py`; integrate but don't redesign).
-- Multi-user / team-shared fleet. The 3-space model is per-user-per-fleet; this stays inside that scope.
+- Multi-user / team-shared fleet. The workspace contract is per-user-per-fleet; this stays inside that scope.
 
 ## Relationship to other docs
 
-- [`docs/workspace-design.md`](workspace-design.md) — 3-space model. This proposal sits inside the State space and tunes its sync rule from "none" to "opt-in allowlist."
+- [`docs/workspace-design.md`](workspace-design.md) — the 2-space model (Code vs Workspace; sync is per-sub-path). This proposal sits inside `state/` and tunes its sync rule from "none" to "opt-in allowlist."
 - [`docs/workspace-contract.md`](workspace-contract.md) — implementation reference. Will need a line referencing this doc once the fleet/ path is real.
 - [`docs/workspace-sync.md`](workspace-sync.md) — Workspace sync mechanics (canonical as of v0.3.0). The fleet sync rides on the same transport in v1.
 

@@ -21,6 +21,30 @@ Exit: 0 on pass, 1 on fail.
 
 from __future__ import annotations
 
+import os
+
+# This suite drives real task-accept handlers but does not test telemetry. Keep it
+# hermetic: since #2274 the task-accepting paths emit `task_processed`, and
+# `src/github-webhook.py:_emit_github_telemetry()` lazily imports it. With
+# flush=False the production emitter starts a DAEMON urllib thread, which can still
+# be inside OpenSSL while this short-lived interpreter finalizes — observed in
+# clean-install CI as `double free or corruption (out)` + SIGSEGV AFTER the suite
+# reports `31/31 passed`. A CI runner has no telemetry opt-out marker, so
+# `enabled()` is True there.
+#
+# Same fix and same reason as #2388, which did this for
+# tests/agent-api-task-field-injection.test.py. That PR closed exactly one suite;
+# this is a second suite with the identical mechanism.
+#
+# Set BEFORE the regular imports so nothing can import `telemetry` first, and after
+# `from __future__` because that must lead the file.
+#
+# Verified locally that this is the right lever — macOS cannot reproduce the glibc
+# double-free, so the CRASH is not reproducible here, only its cause:
+#   SUTANDO_TELEMETRY unset -> enabled()=True,  task_processed spawns 1 thread
+#   SUTANDO_TELEMETRY=0     -> enabled()=False, task_processed spawns 0 threads
+os.environ["SUTANDO_TELEMETRY"] = "0"
+
 import hashlib
 import hmac
 import importlib.util

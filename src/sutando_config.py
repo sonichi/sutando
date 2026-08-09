@@ -57,6 +57,8 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "core_config_dirs",
     "vault",
     "migrate",
+    "bridges",
+    "stand",          # this instance's `Stand:` commit-trailer value
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
@@ -190,6 +192,7 @@ _CACHE_REPO_ROOT: Optional[Path] = None
 _LEGACY_ENV_WARN_PRINTED = False
 _DOTENV_DRIFT_WARN_PRINTED = False
 _UNKNOWN_KEYS_WARN_PRINTED = False
+_PROGRESS_STREAM_TYPE_WARN_PRINTED = False
 
 
 def _color_warn(msg: str) -> str:
@@ -232,18 +235,37 @@ def _warn_unknown_top_level_keys(cfg: Dict[str, Any], path: Path) -> None:
     )
 
 
+def _warn_progress_stream_type(val: Any) -> None:
+    """One-time stderr diagnostic for a non-boolean `bridges.progress_stream`.
+
+    Silence is what made the old coercion dangerous: a user who wrote
+    `"false"` got the opposite of what they asked for and no signal at all.
+    """
+    global _PROGRESS_STREAM_TYPE_WARN_PRINTED
+    if _PROGRESS_STREAM_TYPE_WARN_PRINTED:
+        return
+    _PROGRESS_STREAM_TYPE_WARN_PRINTED = True
+    print(
+        f"sutando config: bridges.progress_stream must be a JSON boolean "
+        f"(true/false), got {type(val).__name__} {val!r}. Ignoring it and "
+        f"leaving the progress streamer OFF.",
+        file=sys.stderr,
+    )
+
+
 def _reset_cache_for_tests() -> None:
     """Test-only: clear the per-process cache so unit tests can swap configs.
 
     Production code never calls this. Importing in tests is intentional —
     keeps the public surface honest.
     """
-    global _CACHE, _CACHE_REPO_ROOT, _LEGACY_ENV_WARN_PRINTED, _DOTENV_DRIFT_WARN_PRINTED, _UNKNOWN_KEYS_WARN_PRINTED
+    global _CACHE, _CACHE_REPO_ROOT, _LEGACY_ENV_WARN_PRINTED, _DOTENV_DRIFT_WARN_PRINTED, _UNKNOWN_KEYS_WARN_PRINTED, _PROGRESS_STREAM_TYPE_WARN_PRINTED
     _CACHE = None
     _CACHE_REPO_ROOT = None
     _LEGACY_ENV_WARN_PRINTED = False
     _DOTENV_DRIFT_WARN_PRINTED = False
     _UNKNOWN_KEYS_WARN_PRINTED = False
+    _PROGRESS_STREAM_TYPE_WARN_PRINTED = False
 
 
 def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
@@ -413,6 +435,37 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     vault["sync"] = sync
     vault.setdefault("interval_seconds", 1800)
     return vault
+
+
+def resolve_progress_stream(repo_root: Optional[Path] = None) -> Optional[bool]:
+    """Return ``bridges.progress_stream`` from config, or ``None`` if unset.
+
+    This is the config home for the owner progress-streamer toggle consulted by
+    both the Discord and Telegram bridges (``progress_stream.stream_enabled``).
+    Returns ``None`` (not ``False``) when the key is absent so the caller can
+    distinguish "not configured" (fall through to its own default) from an
+    explicit ``false``. The ``SUTANDO_PROGRESS_STREAM`` env var overrides this.
+
+    Only a real JSON boolean is honored. Anything else is treated as UNSET (so
+    the caller's own default — off — applies) and draws a one-time diagnostic.
+    The previous ``bool(val)`` coercion inverted the user's intent on the two
+    shapes people actually type when disabling a feature: ``"false"`` and
+    ``{"enabled": false}`` both coerced to ``True`` and switched owner-channel
+    progress messages ON. The runtime loader is deliberately schema-lenient
+    (see ``_warn_unknown_top_level_keys``), so ``docs/sutando-config.schema.json``
+    declaring this boolean does not protect a hand-edited
+    ``sutando.config.local.json``; the guard has to live here.
+    """
+    cfg = load_config(repo_root)
+    bridges = cfg.get("bridges") or {}
+    val = bridges.get("progress_stream")
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        # NB: bool is a subclass of int, so this correctly rejects 0/1.
+        return val
+    _warn_progress_stream_type(val)
+    return None
 
 
 def resolve_dotenv(repo_root: Optional[Path] = None,

@@ -26,6 +26,11 @@ ag2-sparrow
 The token is your AG2 Space **identity** — not a model API key. Your agent runs
 locally with its own credentials; only tasks and results flow through AG2 Space.
 
+Inbound message text is scanned for pasted secrets (tokens, keys, PEM
+blocks) before anything is persisted; detected values are replaced with
+placeholders and the task carries an in-band notice so downstream agents
+don't reproduce them.
+
 ## Optional: room-event subscription (0.3.0)
 
 Off by default. With `SPARROW_EVENTS=1` the client also maintains a persistent

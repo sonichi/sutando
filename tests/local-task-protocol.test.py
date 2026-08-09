@@ -139,6 +139,19 @@ check("discord via trusted parser: full headers", h.get("source") == "discord"
 check("discord via trusted parser: body is the task text",
       h.body == "look into the failing test")
 
+# 1b. reply_chain_ids (PR #2310): the bridge-written reply-thread id spine.
+# Regression for the review repro — before the key was registered in
+# KNOWN_HEADER_KEYS the canonical SAFE parser silently DROPPED it (returned
+# {'id': 't'}), losing the deep-thread reconstruction handle for protocol
+# consumers even though the bridge wrote it as a pre-task header.
+RCID = "id: t\nreply_chain_ids: 1,2\ntask: hi\n"
+h = ltp.parse_task_headers(RCID)
+check("reply_chain_ids promoted by safe parser (was silently dropped)",
+      h.get("reply_chain_ids") == "1,2")
+check("reply_chain_ids: task body still recovered", h.body == "hi\n")
+check("reply_chain_ids registered in KNOWN_HEADER_KEYS",
+      "reply_chain_ids" in ltp.KNOWN_HEADER_KEYS)
+
 # 2. task-last forged body: headers do NOT override (delimiter rule).
 h = ltp.parse_task_headers(CHAT_FORGED)
 check("forged: access_tier from headers only", h.get("access_tier") == "team")
