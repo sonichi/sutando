@@ -516,9 +516,17 @@ _exclude_rules_only() {
 # A previously-generated exclude whose ONLY difference is carve-outs the shipped
 # config now adds is safe to refresh: no operator-authored rule is lost.
 _is_safe_carveout_addition() {
-    local existing="$1" desired="$2" shipped line
+    local existing="$1" desired="$2" shipped shipped_rules line path
     shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
     [ -n "$shipped" ] || return 1
+    # Compare against what the composer EMITS, not the raw config value: a
+    # directory yields both `p/` and `p/**`, and a real older file lacks all of them.
+    shipped_rules=""
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        shipped_rules+="$(_emit_exclude_lines "$path")"$'\n'
+    done <<<"$shipped"
+    shipped="$shipped_rules"
     # Refuse if the refresh would DROP any rule the existing file carries.
     [ -z "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ] || return 1
     # Every added rule must be a shipped carve-out, never an operator's line.

@@ -34,9 +34,7 @@ refute() {
     fi
 }
 
-# ---------------------------------------------------------------------------
 # 1. The shipped default list itself.
-# ---------------------------------------------------------------------------
 check "shipped sutando.config.json carves out notes/generated/" \
     python3 -c "
 import json, pathlib, sys
@@ -76,9 +74,7 @@ bad = [p for p in exc if p.rstrip('/*') == 'notes']
 sys.exit(0 if bad else 1)
 "
 
-# ---------------------------------------------------------------------------
 # 2. Drive the SHIPPED config through the SHIPPED composer.
-# ---------------------------------------------------------------------------
 FIXTURE_ROOT="$TEST_ROOT/render-exclude"
 FIXTURE_REPO="$FIXTURE_ROOT/repo"
 FIXTURE_WS="$FIXTURE_ROOT/workspace"
@@ -131,10 +127,8 @@ check "generated rules still un-ignore notes/ (carrier intact)" \
 check "generated rules carve out notes/generated/" \
     grep -qE '^notes/generated/' "$RULES"
 
-# ---------------------------------------------------------------------------
 # 3. The behaviour the rules are for: what git would actually track.
 #    This half survives a refactor of the rule syntax.
-# ---------------------------------------------------------------------------
 git -C "$FIXTURE_WS" add -A >/dev/null 2>&1 || true
 
 refute "git does NOT track the rendered mp4 (the 2.15 GiB class)" \
@@ -286,7 +280,13 @@ compose_rules() {
 seed_older_install() {
     local dir="$1"; shift
     local -a strip=()
-    local l; for l in "$@"; do strip+=(-e "$l"); done
+    local l
+    # A dir path emits BOTH `p/` and `p/**`; stripping only the config value leaves
+    # the `**` rule behind, and the recognizer then has less to add than reality.
+    for l in "$@"; do
+        strip+=(-e "$l")
+        [[ "$l" == */ ]] && strip+=(-e "${l}**")
+    done
     rm -rf "$dir"; mkdir -p "$dir/.git/info"
     if [ "${#strip[@]}" -gt 0 ]; then
         compose_rules | grep -vxF "${strip[@]}" > "$dir/.git/info/exclude"
@@ -298,7 +298,7 @@ upgrade_rc() {
     bash "$DRIVER" "$SYNC_SH" "$REPO" "$1" >/dev/null 2>&1
     echo $?
 }
-carveouts_in() { grep -cE '^notes/(generated|media)/$' "$1/.git/info/exclude" || true; }
+carveouts_in() { grep -cE '^notes/(generated|media)/(\*\*)?$' "$1/.git/info/exclude" || true; }
 
 check "the composer emits both shipped carve-outs (fixture is representative)" \
     test "$(compose_rules | grep -cE '^notes/(generated|media)/$')" -eq 2
@@ -307,10 +307,16 @@ UPG="$TEST_ROOT/upgrade-generated"
 seed_older_install "$UPG" 'notes/generated/' 'notes/media/'
 check "an older GENERATED install starts without the carve-outs" \
     test "$(carveouts_in "$UPG")" -eq 0
+# The fixture must lack EVERY emitted carve-out rule (4 = 2 dirs x {p/, p/**}).
+# With any left behind, the refresh has less to add than a real install does.
+check "...and lacks all FOUR emitted carve-out rules, not just the 2 config values" \
+    test "$(grep -cE '^notes/(generated|media)/(\*\*)?$' "$UPG/.git/info/exclude")" -eq 0
+check "...while the CURRENT generated content carries all four" \
+    test "$(compose_rules | grep -cE '^notes/(generated|media)/(\*\*)?$')" -eq 4
 check "...the real generate_exclude accepts the refresh (rc=0)" \
     test "$(upgrade_rc "$UPG")" -eq 0
 check "...and both carve-outs are now present (migration actually reaches it)" \
-    test "$(carveouts_in "$UPG")" -eq 2
+    test "$(carveouts_in "$UPG")" -eq 4
 
 UPG_OP="$TEST_ROOT/upgrade-operator-edited"
 seed_older_install "$UPG_OP" 'notes/generated/' 'notes/media/'
@@ -337,7 +343,7 @@ printf '# an older header line that no longer ships\n' >> "$UPG_CMT/.git/info/ex
 check "comment-only drift does not block the refresh (rc=0)" \
     test "$(upgrade_rc "$UPG_CMT")" -eq 0
 check "...and the carve-outs landed despite the stale comment" \
-    test "$(carveouts_in "$UPG_CMT")" -eq 2
+    test "$(carveouts_in "$UPG_CMT")" -eq 4
 
 check "the refusal chain consults the carve-out recognizer" \
     grep -qF '_is_safe_carveout_addition "$exclude_path" "$tmp_path"' <<< "$SYNC_CODE"
