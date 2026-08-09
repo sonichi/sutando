@@ -196,9 +196,9 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
 # "dev-ag2space") becomes routable by creating its config dir, no code change.
 _DELIVERABLE_SURFACES = {"discord", "slack", "telegram", "ag2space"}
 
-# Same slug shape notify.py enforces — keeps a malformed/hostile activity file
-# from steering the existence probe at an arbitrary path.
-_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# Must stay identical to notify.py's slug rule (sender/probe alignment): dots
+# only BETWEEN alphanumerics, so traversal shapes never reach the path probe.
+_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9]))*$")
 
 
 def _is_deliverable(source):
