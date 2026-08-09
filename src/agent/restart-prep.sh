@@ -19,9 +19,8 @@ fail() {
   exit 3
 }
 
-# macOS has no `timeout` binary, so emulate a bounded run. Signals go to the child's
-# process GROUP: a sync that spawns a helper outlives a pid-only kill, so the caller
-# would report "timed out" while the descendant still writes to the workspace.
+# macOS has no `timeout`; signals must reach the child's process GROUP, because a sync
+# that spawns a helper outlives a pid-only kill and keeps writing to the workspace.
 bounded() {
   local secs="$1"; shift
   local grace="${GR_KILL_GRACE_S:-3}"
