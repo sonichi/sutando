@@ -11,9 +11,10 @@ bricking the running core session** — the "success path" distilled from a real
 A naive "pull + restart" self-upgrade gets **stuck**, because:
 
 1. `src/restart.sh` ends with `exec bash src/startup.sh`.
-2. `src/startup.sh` runs **foreground** work — it rebuilds the Swift helpers
-   (`ax-read`, `Sutando.app`) and it **foreground-parents the credential-proxy**
-   (a `tsx` process that never exits).
+2. `src/startup.sh` runs **foreground** work and **foreground-parents the
+   credential-proxy** (a `tsx` process that never exits). The open-source core
+   is headless: the optional Swift helpers (`ax-read`, `Sutando.app`) are built
+   separately by the app packaging/setup workflow, not by core startup.
 3. So running `restart.sh` **inline** from the core session never returns —
    the Bash call hangs forever, the task never gets a result, and from the
    owner's side you've "gone stuck."
@@ -41,9 +42,10 @@ Exit `0` = upgraded (or already latest); exit `2` = aborted (dirty tree /
 not a fast-forward) — surface the reason and stop.
 
 If the diff touched `package*.json` / `tsconfig` / `*.swift` / `requirements`
-(the script prints this), a rebuild may be needed — startup.sh handles the
-Swift rebuild itself; for npm deps run `npm ci` before relying on the TS
-services.
+(the script prints this), a rebuild may be needed. For `*.swift`, rebuild the
+optional menu-bar app and `ax-read` through the app setup workflow; core
+`startup.sh` intentionally does not build them. For npm deps run `npm ci`
+before relying on the TS services.
 
 ### Step 2 — Verify + report
 
