@@ -139,9 +139,11 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			bus?.subscribe?.('turn.end', () => { spokeThisTurn = false; sendState('listening'); });
 			bus?.subscribe?.('turn.interrupted', () => { spokeThisTurn = false; sendState('interrupted'); });
 			await (session as any).start();
-			sendState('listening');
 			console.log(`${ts()} [session ${n}] open (bodhi :${bodhiPort})`);
+			// The {"ok"} ack MUST be the first text frame — the bridge handshake
+			// reads it before anything else; state comes after.
 			ws.send(JSON.stringify({ ok: true }));
+			sendState('listening');
 		} catch (e) {
 			console.error(`${ts()} [session ${n}] open failed:`, e);
 			try { ws.send(JSON.stringify({ ok: false, error: String(e) })); } catch { /* */ }

@@ -82,10 +82,22 @@ class NodeVoiceBridge:
                 async with sess.ws_connect(self.host_url + "/session") as ws:
                     st["ws"] = ws
                     await ws.send_str(json.dumps({"open": st["params"]}))
-                    ack = await asyncio.wait_for(ws.receive(), timeout=10)
-                    if ack.type != aiohttp.WSMsgType.TEXT or \
-                            not json.loads(ack.data).get("ok"):
-                        raise RuntimeError(f"voice-host refused session: {ack.data!r}")
+                    # Wait for the {"ok"} ack, tolerating event notifications
+                    # that may arrive first — only an explicit ok:false (or
+                    # timeout/close) is a refusal.
+                    deadline = asyncio.get_running_loop().time() + 10
+                    while True:
+                        left = deadline - asyncio.get_running_loop().time()
+                        ack = await asyncio.wait_for(ws.receive(), timeout=max(left, 0.1))
+                        if ack.type != aiohttp.WSMsgType.TEXT:
+                            raise RuntimeError(f"voice-host refused session: {ack.data!r}")
+                        obj = json.loads(ack.data)
+                        if "ok" in obj:
+                            if not obj["ok"]:
+                                raise RuntimeError(f"voice-host refused session: {ack.data!r}")
+                            break
+                        if obj.get("method") and st.get("send_event"):
+                            await st["send_event"](obj)
 
                     async def upstream():
                         while True:

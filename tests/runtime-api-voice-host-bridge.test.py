@@ -97,6 +97,10 @@ async def session(request):
     first = await ws.receive()
     obj = json.loads(first.data)
     OPENED.append(obj.get("open"))
+    # Regression (live 2026-08-08): a notification BEFORE the ack must not be
+    # read as a refusal — the bridge skips events until the {{"ok"}} frame.
+    await ws.send_str(json.dumps({{"method": "voice.state",
+                                   "params": {{"state": "listening"}}}}))
     await ws.send_str(json.dumps({{"ok": True}}))
     async for msg in ws:
         if msg.type == WSMsgType.BINARY:
