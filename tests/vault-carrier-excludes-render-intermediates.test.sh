@@ -265,7 +265,8 @@ eval "$(awk '/^[A-Za-z_][A-Za-z0-9_]*\(\) \{/,/^\}$/' "$SYNC")"
 log() { :; }
 color_warn() { :; }
 _host() { echo "TestHost"; }
-_is_literal_host_label() { return 1; }
+# The REAL _is_literal_host_label is used: stubbing it to 1 made the widening a
+# pass-through, so the combined-migration case could never pass in this harness.
 generate_exclude
 DRIVE
 
@@ -347,6 +348,49 @@ check "...and the carve-outs landed despite the stale comment" \
 
 check "the refusal chain consults the carve-out recognizer" \
     grep -qF '_is_safe_carveout_addition "$exclude_path" "$tmp_path"' <<< "$SYNC_CODE"
+
+# A generated install can need BOTH safe migrations. They were independent whole-file
+# comparisons, so each recognizer refused a file that needed the other as well.
+host_downgrade() {
+    sed 's#^!hosts/\*/$#!hosts/TestHost/#; s#^!hosts/\*/\*\*$#!hosts/TestHost/**#'
+}
+seed_combined() {
+    local dir="$1"
+    rm -rf "$dir"; mkdir -p "$dir/.git/info"
+    compose_rules | host_downgrade \
+        | grep -vxF -e 'notes/generated/' -e 'notes/generated/**' \
+                    -e 'notes/media/' -e 'notes/media/**' > "$dir/.git/info/exclude"
+}
+host_rules_in() { grep -c '^!hosts/\*/' "$1/.git/info/exclude" || true; }
+
+CMB="$TEST_ROOT/upgrade-combined"
+seed_combined "$CMB"
+check "the combined fixture starts on the legacy per-host scope" \
+    test "$(grep -c '^!hosts/TestHost/' "$CMB/.git/info/exclude")" -eq 2
+check "...and with none of the four carve-out rules" \
+    test "$(carveouts_in "$CMB")" -eq 0
+check "...the real generate_exclude accepts BOTH migrations at once (rc=0)" \
+    test "$(upgrade_rc "$CMB")" -eq 0
+check "...the host scope is widened to hosts/*/" \
+    test "$(host_rules_in "$CMB")" -eq 2
+check "...and all four carve-out rules landed" \
+    test "$(carveouts_in "$CMB")" -eq 4
+
+CMB_OP="$TEST_ROOT/upgrade-combined-operator"
+seed_combined "$CMB_OP"
+echo '!my/operator/rule' >> "$CMB_OP/.git/info/exclude"
+check "an operator rule ON TOP of the combined shape is still REFUSED (rc=1)" \
+    test "$(upgrade_rc "$CMB_OP")" -eq 1
+check "...and that operator rule survives" \
+    grep -qxF '!my/operator/rule' "$CMB_OP/.git/info/exclude"
+
+# One widening implementation, consumed by both recognizers.
+check "the widening is a shared helper, not duplicated awk" \
+    test "$(grep -c '_widen_legacy_host_scope' <<< "$SYNC_CODE")" -ge 3
+check "the carve-out recognizer runs on the WIDENED content" \
+    grep -qF '_widen_legacy_host_scope "$existing" > "$widened"' <<< "$SYNC_CODE"
+check "the widened temp file is removed on every return path" \
+    test "$(grep -c 'rm -f "$widened"' <<< "$SYNC_CODE")" -ge 2
 
 echo
 echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"

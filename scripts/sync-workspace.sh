@@ -483,6 +483,28 @@ _compose_exclude_content() {
     echo "*.jks"
 }
 
+# Print `existing` with a legacy per-host carrier scope rewritten to the shared
+# `hosts/*/` form. Unchanged when the host label is not a literal path segment.
+_widen_legacy_host_scope() {
+    local existing="$1" own_host
+    own_host="$(_host)"
+    if ! _is_literal_host_label "$own_host"; then
+        cat "$existing"
+        return 0
+    fi
+    awk -v host="$own_host" '
+        $0 == "!hosts/" host "/" {
+            print "!hosts/*/"
+            next
+        }
+        $0 == "!hosts/" host "/**" {
+            print "!hosts/*/**"
+            next
+        }
+        { print }
+    ' "$existing"
+}
+
 # Return success only when an existing generated rule set differs from the
 # desired one solely because one or more legacy `!hosts/<label>/` entries need
 # widening to `!hosts/*/`. This narrow comparison preserves the existing
@@ -492,19 +514,7 @@ _is_safe_legacy_host_scope_widening() {
     local existing="$1" desired="$2" own_host
     own_host="$(_host)"
     _is_literal_host_label "$own_host" || return 1
-    cmp -s <(
-        awk -v host="$own_host" '
-            $0 == "!hosts/" host "/" {
-                print "!hosts/*/"
-                next
-            }
-            $0 == "!hosts/" host "/**" {
-                print "!hosts/*/**"
-                next
-            }
-            { print }
-        ' "$existing"
-    ) "$desired"
+    cmp -s <(_widen_legacy_host_scope "$existing") "$desired"
 }
 
 # Comments and blanks are inert in gitignore, so header drift between generated
@@ -516,9 +526,14 @@ _exclude_rules_only() {
 # A previously-generated exclude whose ONLY difference is carve-outs the shipped
 # config now adds is safe to refresh: no operator-authored rule is lost.
 _is_safe_carveout_addition() {
-    local existing="$1" desired="$2" shipped shipped_rules line path
+    local existing="$1" desired="$2" shipped shipped_rules line path widened rc
+    # Compare against the HOST-WIDENED existing content: the two safe migrations are
+    # independent, so a file needing both was refused by each recognizer alone.
+    widened="$(mktemp -t sync-workspace-widened.XXXXXX)" || return 1
+    _widen_legacy_host_scope "$existing" > "$widened"
+    existing="$widened"
     shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
-    [ -n "$shipped" ] || return 1
+    [ -n "$shipped" ] || { rm -f "$widened"; return 1; }
     # Compare against what the composer EMITS, not the raw config value: a
     # directory yields both `p/` and `p/**`, and a real older file lacks all of them.
     shipped_rules=""
@@ -527,14 +542,19 @@ _is_safe_carveout_addition() {
         shipped_rules+="$(_emit_exclude_lines "$path")"$'\n'
     done <<<"$shipped"
     shipped="$shipped_rules"
+    rc=0
     # Refuse if the refresh would DROP any rule the existing file carries.
-    [ -z "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ] || return 1
-    # Every added rule must be a shipped carve-out, never an operator's line.
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        grep -qxF -- "$line" <<< "$shipped" || return 1
-    done < <(comm -13 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))
-    return 0
+    if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ]; then
+        rc=1
+    else
+        # Every added rule must be a shipped carve-out, never an operator's line.
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            grep -qxF -- "$line" <<< "$shipped" || { rc=1; break; }
+        done < <(comm -13 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))
+    fi
+    rm -f "$widened"
+    return "$rc"
 }
 
 # Write `<workspace>/.git/info/exclude` from the composed content. Also
