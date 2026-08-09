@@ -299,5 +299,43 @@ class TestD7HeaderTolerance(unittest.TestCase):
         self.assertIn("**[core: 2]**", r.body)
 
 
+class UnknownAttachKeywords(unittest.TestCase):
+    """Only file/send/attach are attachment aliases.
+
+    Migrated from tests/discord-bridge-file-markers.test.py, which tested the
+    Discord bridge's private `_split_file_markers()` helper. That helper is
+    gone (the grammar now lives solely here), so the case moved to the
+    canonical suite rather than being dropped.
+
+    NOTE: that file's `test_relative_path_does_not_match` was deliberately NOT
+    migrated. It asserted the *legacy* private regex's `(?:/|~/)`-only shape.
+    The canonical parser extracts any marker value and defers path
+    authorization to src/send_allowlist.py, so a relative value is recognised,
+    stripped from the body, and then rejected at the allowlist — see
+    tests/dm-result-adoption-gap.test.py.
+    """
+
+    def test_unknown_keyword_is_not_an_attachment(self):
+        for bad in ("reply", "foo", "channel-x", "files"):
+            with self.subTest(keyword=bad):
+                r = parse_markers(f"body [{bad}: /tmp/sutando-x.png]")
+                self.assertEqual([a for a in r.actions if a.kind == "attach"], [])
+
+    def test_unknown_keyword_is_left_in_the_body(self):
+        """Not an attachment marker => not our protocol => don't mangle prose."""
+        text = "body [reply: 12345678901234567890]"
+        self.assertEqual(parse_markers(text).body, text)
+
+    def test_aliases_extract_and_strip(self):
+        for kw in ("file", "send", "attach"):
+            with self.subTest(alias=kw):
+                r = parse_markers(f"body [{kw}: /tmp/sutando-x.png]")
+                self.assertEqual(
+                    [a.value for a in r.actions if a.kind == "attach"],
+                    ["/tmp/sutando-x.png"],
+                )
+                self.assertNotIn(f"[{kw}:", r.body)
+
+
 if __name__ == "__main__":
     unittest.main()

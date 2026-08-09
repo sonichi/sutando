@@ -58,6 +58,7 @@ def is_addressed_in_shared_channel(
     is_reply: bool,
     reply_author_id,
     self_id,
+    other_agent_mentioned: bool = False,
 ) -> bool:
     """Return True iff this message should be processed as addressed to us.
 
@@ -71,13 +72,18 @@ def is_addressed_in_shared_channel(
 
     Otherwise the message is addressed elsewhere (→ False) when it is:
       * another agent's own post — `author_is_bot` and not addressed to us; or
-      * a reply to a DIFFERENT author — `is_reply` whose target is not us.
+      * a reply to a DIFFERENT author — `is_reply` whose target is not us; or
+      * a human message that @-mentions a DIFFERENT agent and not us
+        (`other_agent_mentioned`) — it addressed that agent, not everyone.
 
-    A fresh (non-reply) message from a human that doesn't address anyone is still
+    A fresh (non-reply) message from a human that addresses NOBODY is still
     processed (→ True): the owner posting directly is for whoever is listening —
     that is the pre-existing `requireMention:false` behavior and is out of scope
     for this fix (the multi-agent "who owns an unaddressed message" question
     belongs to the channel-IFC design, not the addressee gate).
+
+    `other_agent_mentioned` is resolved by the adapter (which mentioned users are
+    bots other than us); the policy decision stays here.
     """
     replying_to_me = bool(
         is_reply and reply_author_id is not None and reply_author_id == self_id
@@ -87,6 +93,10 @@ def is_addressed_in_shared_channel(
 
     replying_to_other = bool(is_reply) and not replying_to_me
     if author_is_bot or replying_to_other:
+        return False
+
+    # A human who @-mentioned another agent addressed THAT agent, not everyone.
+    if other_agent_mentioned:
         return False
 
     return True

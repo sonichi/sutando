@@ -7,7 +7,12 @@ In a shared channel configured `requireMention:false` (non-bot2bot), the bridge
 was processing messages NOT addressed to this bot:
   * the owner replying to another agent (Discord auto-adds the reply-target to
     mentions; the old gate *excluded* it from the addressee check — backwards);
-  * another agent's own posts (e.g. a sibling bot's "⏳ working…" status).
+  * another agent's own posts (e.g. a sibling bot's "⏳ working…" status);
+  * a human @-mentioning a DIFFERENT agent — observed 2026-08-06, when the owner
+    posted "<@PRO> keep improving the arcade" twice in five minutes in a channel
+    named "arcade — Pro iterating, Chi reviews". Every listening bot ingested it:
+    this one queued tasks it could only discard, and its progress-streamer posted
+    "⏳ working…" into the lane the owner had pointed at one agent.
 
 The fix moves the decision into the pure `src/discord_addressee.py`
 (`is_addressed_in_shared_channel`) so the truth table is tested directly, and
@@ -114,6 +119,46 @@ def main() -> int:
     assert "reference_is_reply(" in bridge, \
         "discord-bridge.py does not use reference_is_reply (forward vs reply fix)"
     print("  ok  bridge uses reference_is_reply for forward/reply disambiguation")
+
+    # --- a human addressing a DIFFERENT agent ---
+    assert not addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+                         is_reply=False, reply_author_id=None,
+                         other_agent_mentioned=True), "owner @-mentions ANOTHER agent"
+    print("  ok  owner @-mentions another agent -> not ours")
+
+    # Reachability must survive: naming us AND a peer is still ours.
+    assert addressed(author_is_bot=False, bot_mentioned=True, role_mentioned=False,
+                     is_reply=False, reply_author_id=None,
+                     other_agent_mentioned=True), "owner @-mentions BOTH us and a peer"
+    print("  ok  owner @-mentions us AND a peer -> still ours")
+
+    assert addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=True,
+                     is_reply=False, reply_author_id=None,
+                     other_agent_mentioned=True), "role-mention of us alongside a peer"
+    print("  ok  role-mention of us alongside a peer -> still ours")
+
+    assert addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+                     is_reply=True, reply_author_id=ME,
+                     other_agent_mentioned=True), "reply to US that also names a peer"
+    print("  ok  reply to us that also names a peer -> still ours")
+
+    # Unaddressed owner messages are unchanged (out of scope).
+    assert addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+                     is_reply=False, reply_author_id=None,
+                     other_agent_mentioned=False), "owner addresses nobody"
+    print("  ok  owner addresses nobody -> still ours (unchanged)")
+
+    # Omitting the kwarg entirely must behave as before this change.
+    assert addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
+                     is_reply=False, reply_author_id=None), "default keeps old behavior"
+    print("  ok  parameter defaults to False (back-compatible)")
+
+    assert "other_agent_mentioned=_other_agent_mentioned" in bridge, \
+        "discord-bridge.py does not pass other_agent_mentioned to the gate"
+    print("  ok  bridge resolves and passes other_agent_mentioned")
+    assert 'getattr(u, "bot", False)' in bridge and "message, \"mentions\"" in bridge, \
+        "discord-bridge.py does not derive peer mentions from message.mentions"
+    print("  ok  bridge derives peer mentions from message.mentions")
 
     print("\nAll addressee-gate cases pass.")
     return 0
