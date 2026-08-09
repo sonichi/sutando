@@ -49,7 +49,46 @@ sys.path.insert(0, str(_RUNTIME_API_DIR))
 from rundir import socket_path as _socket_path  # noqa: E402
 
 
+def _wss_url() -> str | None:
+    """Remote SCP target, if set — the SAME client, over the LAN-WSS transport
+    instead of the local Unix socket (one SCP, N transports). Env-driven so
+    every read command works over WSS with no per-command flag:
+      SUTANDO_SCP_WSS_URL    ws://<host>:<port>/scp
+      SUTANDO_SCP_WSS_TOKEN  bearer credential (from the Server's
+                             state/auth/scp-wss.token)
+    Only the read method set is served over WSS today (the transport's
+    allowlist) — mutating verbs are refused until per-device authz lands."""
+    return os.environ.get("SUTANDO_SCP_WSS_URL") or None
+
+
+def _rpc_wss(method: str, params: dict, timeout: float) -> dict:
+    import asyncio  # noqa: PLC0415
+    import aiohttp  # noqa: PLC0415
+    url = os.environ["SUTANDO_SCP_WSS_URL"]
+    token = os.environ.get("SUTANDO_SCP_WSS_TOKEN", "")
+    rid = f"cli-{uuid.uuid4().hex[:8]}"
+    frame = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
+                        "params": params}, ensure_ascii=False)
+
+    async def _go() -> dict:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        async with aiohttp.ClientSession() as sess:
+            async with sess.ws_connect(url, headers=headers,
+                                       timeout=timeout) as ws:
+                await ws.send_str(frame)
+                msg = await asyncio.wait_for(ws.receive(), timeout)
+                return json.loads(msg.data)
+
+    resp = asyncio.run(_go())
+    if "error" in resp:
+        raise RuntimeError(
+            f"{resp['error'].get('code')}: {resp['error'].get('message')}")
+    return resp["result"]
+
+
 def _rpc(method: str, params: dict, timeout: float) -> dict:
+    if _wss_url():
+        return _rpc_wss(method, params, timeout)
     frame = json.dumps({"jsonrpc": "2.0", "id": f"cli-{uuid.uuid4().hex[:8]}",
                         "method": method, "params": params},
                        ensure_ascii=False) + "\n"
