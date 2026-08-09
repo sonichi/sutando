@@ -109,8 +109,11 @@ class TestComposeMessage(unittest.TestCase):
         sig = {"state": "blocked-human", "detail": "awaiting user: selection",
                "prompt": "pick one", "kind": "selection"}
         m = compose_message(sig)
-        self.assertIn("CLI terminal", m)
-        self.assertIn("sutando-core", m)
+        self.assertIn("where the core is running", m)
+        # No transport name: the core may be embedded (AG2 Space) and the tmux
+        # socket is env-overridable, so naming one would be wrong somewhere.
+        self.assertNotIn("tmux", m)
+        self.assertNotIn("sutando-core", m)
         self.assertNotIn("reply here", m)
         self.assertNotIn("open the app to resolve", m)
         self.assertNotIn("GUI /login", m)

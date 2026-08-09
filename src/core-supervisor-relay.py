@@ -108,9 +108,12 @@ def compose_message(signal: dict) -> str:
         # text offered can answer it: no consumer turns a chat reply into a prompt
         # answer, and the app's only core levers are a restart intent and a fixed
         # `watcher` keystroke — restarting discards the in-flight work.
+        # Deliberately does NOT name tmux: the core may be embedded (e.g. AG2
+        # Space), and the socket is env-overridable, so this module cannot know
+        # which console hosts it.
         host = platform.node().split(".")[0] or "the host"
-        msg += (f" — answer it at the core's CLI terminal on {host}"
-                " (tmux `sutando-core`). A chat reply can't answer it.")
+        msg += (f" — answer it where the core is running on {host}."
+                " A chat reply can't answer it.")
     return msg
 
 
