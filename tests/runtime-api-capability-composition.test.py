@@ -55,6 +55,9 @@ def provider(capability_id, item_id):
 print("── generic composition ──")
 empty = compose_capability_registry()
 check("zero factories produce an empty registry", empty.list({}) == {"capabilities": []})
+none = compose_capability_registry(None)
+check("None factories preserve an empty optional registry",
+      none.list({}) == {"capabilities": []})
 
 one = provider("example.one", "one")
 two = provider("example.two", "two")
@@ -79,7 +82,10 @@ except ValueError as exc:
 
 for label, factories in (
     ("non-callable factory is rejected", ["bad"]),
+    ("non-iterable factories are rejected", 7),
     ("malformed factory result is rejected", [lambda: {}]),
+    ("provider descriptors must be a mapping", [lambda: ([], {})]),
+    ("provider readers must be a mapping", [lambda: ({}, [])]),
     ("cross-factory reader attachment is rejected", [
         lambda: ({"example.split": descriptor("example.split")}, {}),
         lambda: ({}, {"example.split": lambda _params: {}}),

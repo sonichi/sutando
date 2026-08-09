@@ -10,6 +10,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import math
 import sqlite3
 import sys
 import tempfile
@@ -86,6 +87,37 @@ for label, descriptors, readers in (
     ("descriptor rejects unknown fields", {CAPABILITY_ID: {**DESCRIPTOR, "token": "x"}}, {}),
     ("reader requires descriptor", {CAPABILITY_ID: DESCRIPTOR}, {"other.id": lambda _p: {}}),
     ("reader must be callable", {CAPABILITY_ID: DESCRIPTOR}, {CAPABILITY_ID: "no"}),
+    ("descriptors must be a mapping", [], {}),
+    ("readers must be a mapping", {}, []),
+    ("descriptor must be an object", {CAPABILITY_ID: []}, {}),
+    ("descriptor fields must be strings", {CAPABILITY_ID: {**DESCRIPTOR, 1: "bad"}}, {}),
+    ("descriptor version must be positive", {
+        CAPABILITY_ID: {**DESCRIPTOR, "version": 0},
+    }, {}),
+    ("descriptor availability is enumerated", {
+        CAPABILITY_ID: {**DESCRIPTOR, "availability": "maybe"},
+    }, {}),
+    ("descriptor operations must be non-empty", {
+        CAPABILITY_ID: {**DESCRIPTOR, "operations": []},
+    }, {}),
+    ("descriptor operations must be unique", {
+        CAPABILITY_ID: {**DESCRIPTOR, "operations": ["records.list", "records.list"]},
+    }, {}),
+    ("descriptor description is bounded", {
+        CAPABILITY_ID: {**DESCRIPTOR, "description": "x" * 501},
+    }, {}),
+    ("descriptor metadata fields must be objects", {
+        CAPABILITY_ID: {**DESCRIPTOR, "metadata": []},
+    }, {}),
+    ("descriptor nested objects require string keys", {
+        CAPABILITY_ID: {**DESCRIPTOR, "metadata": {1: "bad"}},
+    }, {}),
+    ("descriptor rejects non-finite numbers", {
+        CAPABILITY_ID: {**DESCRIPTOR, "metadata": {"score": math.inf}},
+    }, {}),
+    ("descriptor rejects non-JSON values", {
+        CAPABILITY_ID: {**DESCRIPTOR, "metadata": {"values": {"set"}}},
+    }, {}),
 ):
     try:
         EphemeralCapabilityRegistry(descriptors, readers)
@@ -99,6 +131,24 @@ try:
     check("reader timeout has a hard upper bound", False, "registration succeeded")
 except ValueError:
     check("reader timeout has a hard upper bound", True)
+
+for label, max_result_bytes in (
+    ("reader result limit rejects bool", True),
+    ("reader result limit has a lower bound", 1023),
+    ("reader result limit has an upper bound", 192 * 1024 + 1),
+):
+    try:
+        EphemeralCapabilityRegistry(
+            {CAPABILITY_ID: DESCRIPTOR}, {}, max_result_bytes=max_result_bytes)
+        check(label, False, "registration succeeded")
+    except ValueError:
+        check(label, True)
+
+float_descriptor = EphemeralCapabilityRegistry({
+    CAPABILITY_ID: {**DESCRIPTOR, "metadata": {"confidence": 0.5}},
+}, {})
+check("finite JSON numbers remain valid",
+      float_descriptor.list({})["capabilities"][0]["metadata"]["confidence"] == 0.5)
 
 
 print("── dispatcher/server wiring and non-durability ──")
@@ -183,6 +233,14 @@ for label, params, fragment in (
     ("read limit is capped", {
         "capabilityId": CAPABILITY_ID, "operation": "identity.get", "limit": 101,
     }, "limit"),
+    ("read resource rejects non-finite nested values", {
+        "capabilityId": CAPABILITY_ID, "operation": "identity.get",
+        "resource": {"score": math.nan},
+    }, "finite JSON"),
+    ("read cursor enforces its byte bound", {
+        "capabilityId": CAPABILITY_ID, "operation": "identity.get",
+        "cursor": {"after": "x" * (16 * 1024)},
+    }, "byte limit"),
 ):
     raises_protocol(label, lambda params=params: srv.dispatcher.handle(
         "capability.read", params), contains=fragment)
@@ -231,6 +289,11 @@ wrong_shape_registry = EphemeralCapabilityRegistry(
 raises_protocol("reader result must be an object", lambda: wrong_shape_registry.read({
     "capabilityId": CAPABILITY_ID, "operation": "identity.get",
 }), code=-32000, contains="non-object")
+
+no_reader_registry = EphemeralCapabilityRegistry({CAPABILITY_ID: DESCRIPTOR}, {})
+raises_protocol("descriptor without a reader fails closed", lambda: no_reader_registry.read({
+    "capabilityId": CAPABILITY_ID, "operation": "identity.get",
+}), contains="not readable")
 
 
 print("── CLI wiring ──")

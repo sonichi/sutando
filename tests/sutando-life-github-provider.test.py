@@ -216,6 +216,110 @@ class GitHubProviderTests(unittest.TestCase):
         self.assertNotIn("super-secret", json.dumps(result))
         self.assertEqual(len(fake.calls), 2)
 
+    def test_limit_and_process_failure_contracts_are_bounded_and_redacted(self):
+        self.assertEqual(PROVIDER._bounded_limit(True), PROVIDER.MAX_ITEMS)
+        self.assertEqual(PROVIDER._bounded_limit("bad"), PROVIDER.MAX_ITEMS)
+        self.assertEqual(PROVIDER._bounded_limit(0), 1)
+        expected = (
+            ((1, "", "rate limit token=secret"), "rate_limited", True),
+            ((1, "", "HTTP 404 token=secret"), "permission_limited", False),
+            ((1, "", "network timeout token=secret"), "provider_unavailable", True),
+            ((1, "", "unexpected token=secret"), "provider_error", True),
+        )
+        for response, code, retryable in expected:
+            failure = PROVIDER._failure_from_process(
+                subprocess.CompletedProcess(["gh"], response[0], response[1], response[2])
+            )
+            self.assertEqual((failure.code, failure.retryable), (code, retryable))
+            self.assertNotIn("secret", failure.message)
+
+    def test_runner_and_json_failures_are_structured(self):
+        for response, code in (
+            (OSError("secret"), "provider_unavailable"),
+            ((0, "not-json", ""), "invalid_provider_response"),
+        ):
+            fake, _, read = ready_reader(response)
+            result = read({"operation": "repositories.list"})
+            self.assertEqual(result["error"]["code"], code)
+            self.assertNotIn("secret", json.dumps(result))
+            self.assertEqual(len(fake.calls), 2)
+
+    def test_repository_cursor_and_provider_shape_validation(self):
+        for cursor in ({"page": "bad"}, {"page": 0}, {"page": 1001}):
+            fake, _, read = ready_reader()
+            result = read({"operation": "repositories.list", "cursor": cursor})
+            self.assertEqual(result["error"]["code"], "invalid_cursor")
+            self.assertEqual(len(fake.calls), 1)
+
+        _, _, read = ready_reader({"not": "a-list"})
+        result = read({"operation": "repositories.list"})
+        self.assertEqual(result["error"]["code"], "invalid_provider_response")
+
+        for repository in ("./repo", "owner/.."):
+            fake, _, read = ready_reader()
+            result = read({
+                "operation": "repository.events.delta",
+                "resource": {"repository": repository},
+            })
+            self.assertEqual(result["error"]["code"], "invalid_resource")
+            self.assertEqual(len(fake.calls), 1)
+
+        _, _, read = ready_reader({"not": "a-list"})
+        result = read({
+            "operation": "repository.events.delta",
+            "resource": {"repository": "owner/repo"},
+        })
+        self.assertEqual(result["error"]["code"], "invalid_provider_response")
+
+    def test_cursor_time_and_newest_cursor_fail_closed(self):
+        for cursor in (
+            {"version": 1, "ts": None, "id": "1"},
+            {"version": 1, "ts": "2026-08-08T10:00:00", "id": "1"},
+            {"version": 1, "ts": "2026-08-08T10:00:00Z", "id": 1},
+        ):
+            fake, _, read = ready_reader()
+            result = read({
+                "operation": "repository.events.delta",
+                "resource": {"repository": "owner/repo"},
+                "cursor": cursor,
+            })
+            self.assertEqual(result["error"]["code"], "invalid_cursor")
+            self.assertEqual(len(fake.calls), 1)
+
+        previous = PROVIDER._decode_cursor({
+            "version": 1, "ts": "2026-08-08T10:00:00Z", "id": "old",
+        })
+        preserved = PROVIDER._newest_cursor(
+            [{"id": "bad-time", "created_at": None}], previous)
+        self.assertEqual(preserved["id"], "old")
+        self.assertIsNone(PROVIDER._newest_cursor([], None))
+        self.assertFalse(PROVIDER._event_at_or_after(
+            {"created_at": None}, previous[0]))
+
+    def test_unsupported_operation_and_invalid_identity_are_structured(self):
+        fake, _, read = ready_reader()
+        unsupported = read({"operation": "repository.delete"})
+        self.assertEqual(unsupported["error"]["code"], "unsupported_operation")
+        self.assertEqual(len(fake.calls), 1)
+
+        with self.assertRaises(PROVIDER.ProviderFailure) as raised:
+            PROVIDER._read_identity(FakeGh([]), "gh", "identity.get", {"id": 1})
+        self.assertEqual(raised.exception.code, "invalid_provider_response")
+
+    def test_startup_invalid_identity_and_transport_failure_are_snapshotted(self):
+        for response, expected_code in (
+            ({"id": 42}, "invalid_provider_response"),
+            (OSError("private-token-value"), "provider_unavailable"),
+        ):
+            descriptors, readers = PROVIDER.registry_inputs(
+                run_gh=FakeGh([response]), gh_path="gh"
+            )
+            descriptor = descriptors[PROVIDER.CAPABILITY_ID]
+            self.assertEqual(descriptor["availability"], "unavailable")
+            result = readers[PROVIDER.CAPABILITY_ID]({"operation": "identity.get"})
+            self.assertEqual(result["error"]["code"], expected_code)
+            self.assertNotIn("private-token-value", json.dumps(result))
+
 
 if __name__ == "__main__":
     unittest.main()

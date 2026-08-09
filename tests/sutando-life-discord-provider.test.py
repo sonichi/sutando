@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -256,6 +257,176 @@ class DiscordProviderTests(unittest.TestCase):
         self.assertFalse(result["error"]["retryable"])
         self.assertNotIn(TOKEN, json.dumps(result))
         self.assertEqual(len(fake.calls), 2)
+
+    def test_limit_and_http_failure_contracts_are_bounded_and_redacted(self):
+        self.assertEqual(PROVIDER._bounded_limit(True), PROVIDER.MAX_ITEMS)
+        self.assertEqual(PROVIDER._bounded_limit("not-a-number"), PROVIDER.MAX_ITEMS)
+        self.assertEqual(PROVIDER._bounded_limit(0), 1)
+        self.assertEqual(PROVIDER._bounded_limit(1000), PROVIDER.MAX_ITEMS)
+
+        expected = {
+            401: ("authorization_required", False),
+            403: ("permission_limited", False),
+            404: ("permission_limited", False),
+            429: ("rate_limited", True),
+            500: ("provider_unavailable", True),
+            418: ("provider_error", True),
+        }
+        for status, contract in expected.items():
+            failure = PROVIDER._failure_from_http(http_error(status, TOKEN.encode()))
+            self.assertEqual((failure.code, failure.retryable), contract)
+            self.assertNotIn(TOKEN, failure.message)
+
+    def test_transport_failures_are_structured_without_exception_details(self):
+        for exception, code in (
+            (OSError(TOKEN), "provider_unavailable"),
+            (ValueError(TOKEN), "invalid_provider_response"),
+            (RuntimeError(TOKEN), "provider_error"),
+        ):
+            fake, _, read = self.ready(exception)
+            result = read({
+                "operation": "context.get", "resource": {"channelId": CHANNEL_ID},
+            })
+            self.assertEqual(result["error"]["code"], code)
+            self.assertNotIn(TOKEN, json.dumps(result))
+            self.assertEqual(len(fake.calls), 2)
+
+    def test_access_file_and_channel_shape_fail_closed(self):
+        self.access_path.unlink()
+        fake, _, read = self.ready()
+        missing = read({
+            "operation": "context.get", "resource": {"channelId": CHANNEL_ID},
+        })
+        self.assertEqual(missing["error"]["code"], "local_authorization_unavailable")
+        self.assertEqual(len(fake.calls), 1)
+
+        self.access_path.write_text("not-json")
+        _, _, read = self.ready()
+        malformed = read({
+            "operation": "context.get", "resource": {"channelId": CHANNEL_ID},
+        })
+        self.assertEqual(malformed["error"]["code"], "local_authorization_unavailable")
+
+        self.write_access({"allowFrom": "not-a-list", "groups": {CHANNEL_ID: True}})
+        _, _, read = self.ready()
+        wrong_schema = read({
+            "operation": "context.get", "resource": {"channelId": CHANNEL_ID},
+        })
+        self.assertEqual(wrong_schema["error"]["code"], "local_authorization_unavailable")
+
+        self.write_access({"allowFrom": [], "groups": {CHANNEL_ID: True}})
+        fake, _, read = self.ready({"id": "900000000000000099", "type": 0})
+        wrong_channel = read({
+            "operation": "context.get", "resource": {"channelId": CHANNEL_ID},
+        })
+        self.assertEqual(wrong_channel["error"]["code"], "invalid_provider_response")
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_resource_cursor_and_operation_validation_cover_edge_shapes(self):
+        fake, _, read = self.ready()
+        before = len(fake.calls)
+        results = [
+            read({"operation": "unknown"}),
+            read({
+                "operation": "context.get",
+                "resource": {"channelId": CHANNEL_ID, "extra": True},
+            }),
+            read({
+                "operation": "channel.messages.delta",
+                "resource": {"channelId": CHANNEL_ID},
+                "cursor": {"version": 2, "ts": "2026-08-08T10:00:00Z", "id": CHANNEL_ID},
+            }),
+            read({
+                "operation": "channel.messages.delta",
+                "resource": {"channelId": CHANNEL_ID},
+                "cursor": {"version": 1, "ts": "2026-08-08T10:00:00Z", "id": "bad"},
+            }),
+            read({
+                "operation": "channel.messages.delta",
+                "resource": {"channelId": CHANNEL_ID},
+                "cursor": {"version": 1, "ts": None, "id": CHANNEL_ID},
+            }),
+            read({
+                "operation": "channel.messages.delta",
+                "resource": {"channelId": CHANNEL_ID},
+                "cursor": {"version": 1, "ts": "2026-08-08T10:00:00", "id": CHANNEL_ID},
+            }),
+        ]
+        self.assertEqual(results[0]["error"]["code"], "unsupported_operation")
+        self.assertEqual(results[1]["error"]["code"], "invalid_resource")
+        self.assertTrue(all(row["error"]["code"] == "invalid_cursor" for row in results[2:]))
+        self.assertEqual(len(fake.calls), before)
+
+    def test_dm_policy_requires_every_non_bot_recipient(self):
+        recipient = "900000000000000004"
+        other = "900000000000000005"
+        access = {"allowFrom": [recipient], "groups": {}}
+        dm = {
+            "id": CHANNEL_ID,
+            "type": 3,
+            "recipients": [{"id": BOT["id"]}, {"id": recipient}, {"id": other}],
+        }
+        self.assertIsNone(PROVIDER._authorization_kind(access, dm, BOT["id"]))
+
+    def test_message_projection_handles_forwarded_reply_and_cursor_fallbacks(self):
+        message_id = "1600000000000000000"
+        channel = {"id": CHANNEL_ID, "type": 1}
+        row = {
+            "id": message_id,
+            "content": "local",
+            "message_snapshots": [{"message": {"content": "forwarded body"}}],
+            "author": {"id": "900000000000000004", "username": "owner"},
+            "message_reference": {"message_id": "1600000000000000001"},
+        }
+        item = PROVIDER._message(row, channel)
+        self.assertEqual(item["content"], "local [forwarded] forwarded body")
+        self.assertTrue(item["createdAt"].endswith("Z"))
+        self.assertEqual(item["replyToId"], "discord-message:1600000000000000001")
+
+        fallback = PROVIDER._next_cursor([row], None)
+        self.assertEqual(fallback["id"], message_id)
+        previous = (datetime(2026, 8, 8, tzinfo=timezone.utc), CHANNEL_ID)
+        self.assertEqual(PROVIDER._next_cursor([], previous)["id"], CHANNEL_ID)
+        self.assertIsNone(PROVIDER._next_cursor([], None))
+
+    def test_message_read_rejects_unsupported_or_invalid_provider_rows(self):
+        fake, _, read = self.ready({"id": CHANNEL_ID, "type": 15})
+        unsupported = read({
+            "operation": "channel.messages.delta",
+            "resource": {"channelId": CHANNEL_ID},
+        })
+        self.assertEqual(unsupported["error"]["code"], "unsupported_resource")
+        self.assertEqual(len(fake.calls), 2)
+
+        _, _, read = self.ready({"id": CHANNEL_ID, "type": 0}, {"not": "a-list"})
+        invalid_list = read({
+            "operation": "channel.messages.delta",
+            "resource": {"channelId": CHANNEL_ID},
+        })
+        self.assertEqual(invalid_list["error"]["code"], "invalid_provider_response")
+
+        _, _, read = self.ready(
+            {"id": CHANNEL_ID, "type": 0},
+            [{"id": "bad"}, {"id": "1600000000000000000", "timestamp": "2026-08-08T10:00:00Z"}],
+        )
+        partial = read({
+            "operation": "channel.messages.delta",
+            "resource": {"channelId": CHANNEL_ID},
+            "limit": 10,
+        })
+        self.assertTrue(partial["partial"])
+        self.assertEqual(partial["coverage"]["omitted"], 1)
+        self.assertEqual(partial["limitations"][0]["code"], "invalid_items_omitted")
+
+    def test_invalid_startup_identity_and_unavailable_snapshot_fail_closed(self):
+        descriptors, readers = PROVIDER.registry_inputs(
+            requester=FakeDiscord([{"id": BOT["id"]}]),
+            token=TOKEN,
+            access_path=self.access_path,
+        )
+        self.assertEqual(descriptors[PROVIDER.CAPABILITY_ID]["availability"], "unavailable")
+        result = readers[PROVIDER.CAPABILITY_ID]({"operation": "identity.get"})
+        self.assertEqual(result["error"]["code"], "provider_unavailable")
 
 
 if __name__ == "__main__":
