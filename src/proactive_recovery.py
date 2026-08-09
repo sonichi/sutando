@@ -1,23 +1,19 @@
 """Restart recovery for proactively delivered result files.
 
-Messaging bridges claim ``proactive-*.txt`` by renaming it to ``.sending``.
-This module restores claims stranded by a crash so every adapter applies the
-same collision, race, and failure policy at startup.
+Bridges claim ``proactive-*.txt`` as ``.sending``; this restores claims a crash
+stranded so every adapter applies one collision and failure policy at startup.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 
-def claim_for_delivery(path: Path, recipient: object | None) -> Path | None:
-    """Claim ``path`` for delivery, but only when there IS somewhere to deliver.
-
-    Returns the ``.sending`` claim, or None when this adapter has no recipient —
-    a claim renames the file out of the ``*.txt`` glob every other bridge polls,
-    so claiming what you cannot deliver strands mail addressed to a peer.
-    """
+def claim_for_delivery(path: Path, recipient: Optional[object]) -> Optional[Path]:
+    """Claim only when a recipient exists: a claim moves the file out of the
+    ``*.txt`` glob every other bridge polls, stranding mail meant for a peer."""
     if recipient is None:
         return None
     claim = path.with_suffix(".sending")
@@ -35,11 +31,8 @@ def claim_for_delivery(path: Path, recipient: object | None) -> Path | None:
 
 
 def release_claim(claim: Path) -> bool:
-    """Return a ``.sending`` claim to the polling stream. True if released.
-
-    For a claim whose file is not ready yet. Deleting it instead discards a
-    message that is still being written.
-    """
+    """Return a ``.sending`` claim to the polling stream; True if released.
+    Deleting it instead discards a message that is still being written."""
     target = claim.with_suffix(".txt")
     try:
         # Same clobber hazard as the claim: exists()-then-rename is check-then-act.
@@ -66,9 +59,8 @@ def recover_orphan_sending_files(results_dir: Path) -> int:
         target = orphan.with_suffix(".txt")
         try:
             if target.exists():
-                # A crash between the claim's link and unlink leaves BOTH names
-                # on ONE inode; the .txt is already the correct state, so drop
-                # the half-made claim. Different inodes ARE a real collision.
+                # Both names on ONE inode = a claim whose unlink never ran; the
+                # .txt is already correct. Different inodes ARE a real collision.
                 if orphan.stat().st_ino == target.stat().st_ino:
                     orphan.unlink()
                     print(
