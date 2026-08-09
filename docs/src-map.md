@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-217 modules indexed.
+218 modules indexed.
 
 ## `src/`
 
@@ -254,6 +254,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 
 ## `src/runtime-api/`
 
+- **`capability_registry.py`** — Provider-neutral, ephemeral read-capability registry.
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
