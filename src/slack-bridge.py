@@ -1500,11 +1500,17 @@ def result_watcher():
                             _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
                             mark_proactive_delivered(STATE_DIR, delivery_id)
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
+                            claim.unlink(missing_ok=True)
                         except Exception as e:
-                            print(f"  [proactive] failed: {e}", flush=True)
+                            # Release, never delete: pollers scan `.txt`, so a kept or
+                            # deleted claim is a message no bridge can ever retry.
+                            print(f"  [proactive] failed, releasing {claim.name}: {e}", flush=True)
+                            release_claim(claim)
                     else:
-                        print(f"  [proactive] no owner in allowFrom, skipping {claim.name}", flush=True)
-                    claim.unlink(missing_ok=True)
+                        # A proactive file is not addressed to one bridge; a bridge that
+                        # cannot deliver must hand it back rather than consume it.
+                        print(f"  [proactive] no owner in allowFrom, releasing {claim.name}", flush=True)
+                        release_claim(claim)
 
             # Heartbeat (used by health-check.py)
             now = time.time()

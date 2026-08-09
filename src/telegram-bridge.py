@@ -1039,8 +1039,10 @@ def main():  # pragma: no cover
                             access_data = {}
                         owner_id = _resolve_proactive_owner_id(env_override, access_data)
                         if owner_id is None:
-                            print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
-                            f.unlink(missing_ok=True)
+                            # A proactive file is not addressed to one bridge; a bridge
+                            # that cannot deliver must hand it back rather than consume it.
+                            print(f"  [proactive] no owner in allowFrom, releasing {f.name}")
+                            release_claim(f)
                             continue
                         try:
                             _s = send_reply(int(owner_id), text)
@@ -1054,9 +1056,12 @@ def main():  # pragma: no cover
                                     data={"text_chunks": _s["text_chunks"], "file_count": _s["files_sent"]},
                                 )
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                            f.unlink(missing_ok=True)
                         except Exception as e:
-                            print(f"  [proactive] failed: {e}")
-                        f.unlink(missing_ok=True)
+                            # Release, never delete: pollers scan `.txt`, so a deleted
+                            # claim is a message no bridge can ever retry.
+                            print(f"  [proactive] failed, releasing {f.name}: {e}")
+                            release_claim(f)
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
 
