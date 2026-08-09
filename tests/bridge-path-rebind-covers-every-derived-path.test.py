@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """rebind_workspace() must leave no bridge path attribute under the real workspace.
-
-Discovery is by relationship to the resolved root rather than a name list, so a
-constant added later is covered without anyone remembering to extend a list.
-"""
+Discovery is by relationship to the root, so a later constant needs no list edit."""
 from __future__ import annotations
 
 import importlib.util
