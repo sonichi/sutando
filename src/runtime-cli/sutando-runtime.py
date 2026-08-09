@@ -129,11 +129,56 @@ def _raw_tmux() -> int:
                             "-t", session, "-r"])
 
 
+def _watch_wss(activity: bool = False) -> int:
+    # PUSH mode over the LAN-WSS transport — subscribe + stream results/activity
+    # live from a remote Server. Read-only stream (submit stays edge-refused).
+    import asyncio  # noqa: PLC0415
+    import aiohttp  # noqa: PLC0415
+    url = os.environ["SUTANDO_SCP_WSS_URL"]
+    token = os.environ.get("SUTANDO_SCP_WSS_TOKEN", "")
+
+    async def _go() -> None:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        async with aiohttp.ClientSession() as sess:
+            async with sess.ws_connect(url, headers=headers) as ws:
+                await ws.send_str(json.dumps({
+                    "jsonrpc": "2.0", "id": "watch", "method": "task.subscribe",
+                    "params": {"activity": activity}}))
+                print(json.dumps({"watching": True, "activity": activity,
+                                  "transport": "wss"}), flush=True)
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    obj = json.loads(msg.data)
+                    m = obj.get("method")
+                    if m == "task.result":
+                        p = obj.get("params", {})
+                        print(json.dumps({"result": p.get("taskId"),
+                                          "body": p.get("result"),
+                                          "ts": p.get("ts")}, ensure_ascii=False),
+                              flush=True)
+                    elif m == "activity":
+                        p = obj.get("params", {})
+                        print(json.dumps({"activity": p.get("step"),
+                                          "ts": p.get("ts")}, ensure_ascii=False),
+                              flush=True)
+
+    try:
+        asyncio.run(_go())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def _watch(activity: bool = False, raw: bool = False) -> int:
     # PUSH mode: subscribe and stream notifications live. Persistent connection
     # (not the one-shot _rpc) — blocks until Ctrl-C.
     if raw:
+        # RAW is the local tmux firehose; the WSS equivalent is terminal.attach
+        # (a later slice), so raw stays Unix-socket-only.
         return _raw_tmux()
+    if _wss_url():
+        return _watch_wss(activity)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(_socket_path())
     s.sendall((json.dumps({"jsonrpc": "2.0", "id": "watch",

@@ -114,6 +114,46 @@ def main() -> int:
         check("not permitted" in p.stderr,
               "task submit over WSS is refused at the edge (read-only allowlist)")
 
+        # streaming: `sutando watch --activity` over WSS receives a live push
+        import queue
+        import threading
+        watch = subprocess.Popen(
+            [sys.executable, str(CLI), "task", "watch", "--activity"],
+            env=CLI_ENV, stdout=subprocess.PIPE, text=True, bufsize=1)
+        lines: queue.Queue = queue.Queue()
+
+        def _pump():
+            for ln in watch.stdout:
+                lines.put(ln)
+        threading.Thread(target=_pump, daemon=True).start()
+
+        def _await_line(pred, timeout):
+            dl = time.time() + timeout
+            while time.time() < dl:
+                try:
+                    ln = lines.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if pred(ln):
+                    return ln
+            return None
+        try:
+            started = _await_line(lambda l: '"watching": true' in l.lower(), 5)
+            check(started is not None and '"transport": "wss"' in started,
+                  "sutando watch over WSS opens a streaming subscription")
+            time.sleep(0.4)  # let the watcher seed past the initial step
+            Path(TMP, "state", "core-status.json").write_text(json.dumps(
+                {"status": "running", "step": "WATCH-OVER-WSS", "ts": 9}))
+            got = _await_line(lambda l: "WATCH-OVER-WSS" in l, 6)
+            check(got is not None,
+                  "watch over WSS streams a live activity frame from the daemon")
+        finally:
+            watch.terminate()
+            try:
+                watch.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                watch.kill()
+
         # control: the SAME CLI without the WSS env still uses the Unix socket
         info_uds, _ = cli("sutando", "info", env=ENV)
         check(info_uds.get("agentId") == "@wss-client:example.org",
