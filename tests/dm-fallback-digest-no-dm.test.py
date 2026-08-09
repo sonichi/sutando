@@ -36,10 +36,8 @@ failures = []
 
 
 def _compile_function(path: Path, src: str, func_name: str):
-    """Compile a single top-level function AGAINST THE REAL FILE PATH, original
-    line numbers preserved, so coverage.py attributes the run to the real
-    file's lines instead of a detached string (same technique as
-    tests/bridge-timeout-guards.test.py's _compile_segment)."""
+    """Compile against the real file path with original line numbers kept,
+    so coverage.py attributes the run to the file, not a detached string."""
     tree = ast.parse(src)
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == func_name:
@@ -49,9 +47,7 @@ def _compile_function(path: Path, src: str, func_name: str):
 
 
 def _find_digest_if(tree):
-    """The `if f.name.startswith(("question-", "insight-")): ...` node inside
-    poll_dm_fallback, matched structurally (not by text) so a reformat can't
-    silently stop finding it."""
+    """Matched structurally, not by text, so a reformat can't stop finding it."""
     for fn in ast.walk(tree):
         if isinstance(fn, ast.AsyncFunctionDef) and fn.name == "poll_dm_fallback":
             for node in ast.walk(fn):
@@ -111,12 +107,8 @@ check("briefing-/friction- delivery NOT swept into the digest branch",
 
 
 # --- Half 1b: exercise the digest branch for real (not just structurally) -----
-# Regex above proves the branch exists in the right place; this actually RUNS
-# it — real coverage on src/discord-bridge.py's changed lines, not just a
-# string match. The `if` sits inside poll_dm_fallback's own `for`/`continue`,
-# so it is wrapped in a throwaway one-iteration `for` here to keep `continue`
-# valid; the branch's own statements keep their ORIGINAL line numbers from the
-# real file, so coverage.py attributes the run to src/discord-bridge.py.
+# Wrapped in a throwaway one-iteration `for` so `continue` stays valid;
+# original line numbers are kept so coverage.py attributes the run correctly.
 digest_if = _find_digest_if(ast.parse(BRIDGE_SRC))
 check("digest branch If node found structurally (for real execution)", digest_if is not None)
 
@@ -161,9 +153,6 @@ check("notify_voice unlinks older question-*.txt before writing",
       re.search(r'glob\("question-\*\.txt"\).*?unlink', nv_src, re.DOTALL) is not None)
 
 # Exercise it for real: two stale digests + one write -> exactly one file left.
-# Compiled against the REAL file path (original line numbers preserved) so
-# coverage.py attributes this run to src/check-pending-questions.py, not a
-# detached regex-extracted string.
 nv_code = _compile_function(CPQ_PATH, CPQ_SRC, "notify_voice")
 with tempfile.TemporaryDirectory() as td:
     tmp = Path(td)

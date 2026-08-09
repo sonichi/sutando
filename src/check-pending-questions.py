@@ -35,8 +35,7 @@ UNCHANGED_REMINDER_SEC = 86400  # 24h
 
 def voice_client_connected():
     """True if the most recent [Health] line in voice-agent.log shows client=true.
-    When the voice client is offline, dm-fallback already delivers question-*.txt
-    files via Discord DM — writing one would double-DM with notify_discord_dm."""
+    When offline, no one reads question-*.txt — dm-fallback archives it unread."""
     if not VOICE_LOG.exists():
         return False
     try:
@@ -355,7 +354,7 @@ def deliver(questions, count, titles):
 
     Separated from main() so the delivery decisions are testable; main() is left
     as argument parsing plus printing. Voice is skipped when disconnected because
-    the DM fallback would otherwise deliver question-*.txt as a duplicate.
+    nothing reads question-*.txt then — dm-fallback archives it, never DMs it.
     """
     stale = undrained_proactive_files()
     macos_ok = notify_macos(count, titles)
