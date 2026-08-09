@@ -6,7 +6,7 @@
       "audience": ["contributors", "maintainers"],
       "status": "draft",
       "canonical_for": "the capability-not-key credential-resolver contract: tier order, managed-file schema, source observability, and the reader-sweep migration plan",
-      "last_verified": "2026-08-02"
+      "last_verified": "2026-08-05"
     },
     "docs/runtime-dependencies.md": {
       "title": "External runtime dependencies",

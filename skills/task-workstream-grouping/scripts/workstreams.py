@@ -14,13 +14,22 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
 
 from sutando_config import resolve_workspace  # noqa: E402
-from task_workstreams import apply_inference, build_classifier_snapshot  # noqa: E402
+from task_workstreams import (  # noqa: E402
+    apply_inference,
+    build_classifier_snapshot,
+    build_workstream_context,
+)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("snapshot", help="print the current inert classifier snapshot")
+    context_parser = sub.add_parser(
+        "context", help="print bounded prior context for an assigned task"
+    )
+    context_parser.add_argument("task", help="task id or task filename")
+    context_parser.add_argument("--limit", type=int, default=5)
     apply_parser = sub.add_parser("apply", help="validate and atomically apply inferred groups")
     apply_parser.add_argument("file", help="proposal JSON path, or - for stdin")
     args = parser.parse_args(argv)
@@ -28,6 +37,12 @@ def main(argv=None) -> int:
     workspace = resolve_workspace(REPO)
     if args.command == "snapshot":
         print(json.dumps(build_classifier_snapshot(workspace), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "context":
+        task_id = Path(args.task).stem
+        context = build_workstream_context(workspace, task_id, limit=args.limit)
+        if context is not None:
+            sys.stdout.write(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
         return 0
 
     try:
