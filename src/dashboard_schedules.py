@@ -156,8 +156,8 @@ def write_crons(path: Path, jobs: list) -> None:
 
 def validate_job(job: dict) -> str | None:
     """Return an error string if the job is invalid, else None. A job needs a
-    non-empty name, a valid 5-field cron expr, and exactly one of prompt /
-    prompt_skill (what schedule-crons requires to actually fire something)."""
+    non-empty name, a valid 5-field cron expr, and exactly one execution body:
+    shell_command, prompt, or prompt_skill."""
     if not isinstance(job, dict):
         return "job must be an object"
     name = (job.get("name") or "").strip()
@@ -175,8 +175,12 @@ def validate_job(job: dict) -> str | None:
         return f"invalid cron expression: {expr!r}"
     has_prompt = bool((job.get("prompt") or "").strip())
     has_skill = bool((job.get("prompt_skill") or "").strip())
-    if has_prompt == has_skill:
-        return "provide exactly one of prompt or prompt_skill"
+    has_shell = bool((job.get("shell_command") or "").strip())
+    if sum((has_shell, has_prompt, has_skill)) != 1:
+        if "shell_command" not in job:
+            # Keep the established API error for the legacy two-form schema.
+            return "provide exactly one of prompt or prompt_skill"
+        return "provide exactly one of shell_command, prompt or prompt_skill"
     return None
 
 
@@ -192,7 +196,7 @@ def upsert_schedule(path: Path, body: dict) -> tuple[int, dict]:
     # AttributeError on `.strip()` and close the request with no JSON 400
     # (CR #2164, qingyun-wu). `null` is allowed here — it's handled downstream as
     # "field absent".
-    for _k in ("name", "cron", "prompt", "prompt_skill", "description"):
+    for _k in ("name", "cron", "prompt", "prompt_skill", "shell_command", "description"):
         _v = body.get(_k)
         if _v is not None and not isinstance(_v, str):
             return 400, {"error": f"{_k} must be a string"}
@@ -211,13 +215,18 @@ def upsert_schedule(path: Path, body: dict) -> tuple[int, dict]:
         existing = next((j for j in jobs if j.get("name") == name), None)
         merged = dict(existing) if existing else {}
         merged["name"] = name
-        for k in ("cron", "prompt", "prompt_skill", "description"):
+        for k in ("cron", "prompt", "prompt_skill", "shell_command", "description"):
             if k in body and str(body.get(k)).strip():
                 merged[k] = str(body[k]).strip()
-        if (body.get("prompt_skill") or "").strip():
+        if (body.get("shell_command") or "").strip():
             merged.pop("prompt", None)
+            merged.pop("prompt_skill", None)
+        elif (body.get("prompt_skill") or "").strip():
+            merged.pop("prompt", None)
+            merged.pop("shell_command", None)
         elif (body.get("prompt") or "").strip():
             merged.pop("prompt_skill", None)
+            merged.pop("shell_command", None)
         err = validate_job(merged)
         if err:
             return 400, {"error": err}

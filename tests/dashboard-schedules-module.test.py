@@ -128,6 +128,13 @@ check("failed write leaves the original intact",
 print("── validate_job ──")
 _ok = {"name": "n", "cron": "*/5 * * * *", "prompt_skill": "s"}
 check("a well-formed job validates", ds.validate_job(_ok) is None)
+check("a shell-command job validates",
+      ds.validate_job({"name": "shell", "cron": "*/5 * * * *",
+                       "shell_command": "bash scripts/poll.sh"}) is None)
+check("shell-command conflicts with prompt",
+      ds.validate_job({"name": "shell", "cron": "*/5 * * * *",
+                       "shell_command": "bash scripts/poll.sh", "prompt": "x"})
+      == "provide exactly one of shell_command, prompt or prompt_skill")
 check("non-dict rejected", ds.validate_job("nope") == "job must be an object")
 check("missing name rejected",
       ds.validate_job({**_ok, "name": ""}) == "name is required")

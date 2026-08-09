@@ -506,6 +506,50 @@ def test_run_drops_stale_catchup_slot():
         check(not cr.TASKS_DIR.exists(), "stale slot leaves no task file")
 
 
+def test_run_executes_shell_command_without_core_or_task_file():
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.REPO_ROOT = root
+        fire = _epoch(2026, 7, 2, 6, 2)
+        cr.CRONS_FILE.write_text(json.dumps([
+            {
+                "name": "mechanical",
+                "cron": "2 6 * * *",
+                "shell_command": (
+                    "python3 -c \"from pathlib import Path; import sys; "
+                    "Path('shell-marker').write_text('ok'); print('stdout-ok'); "
+                    "print('stderr-ok', file=sys.stderr); sys.exit(3)\""
+                ),
+                "prompt": "must not become an agent turn",
+                "launchd": True,
+            },
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({"mechanical": fire - 60}))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            emitted = cr.run(now_epoch=fire)
+
+        check(emitted == ["mechanical"], "shell command is recorded as executed")
+        check((root / "shell-marker").read_text() == "ok", "shell command runs from repo root")
+        check(not cr.TASKS_DIR.exists(), "shell command does not emit an agent task")
+        check("stdout-ok" in stdout.getvalue(), "shell stdout is observable")
+        check("stderr-ok" in stderr.getvalue() and "exit code 3" in stderr.getvalue(),
+              "shell stderr and non-zero exit are loud")
+        log = (root / "logs" / "cron-runner.log").read_text()
+        check("exit_code=3" in log and "stdout-ok" in log and "stderr-ok" in log,
+              "shell stdout and stderr are persisted in the runner log")
+        cr.REPO_ROOT = original_repo_root
+
+
 def test_run_acquires_shared_state_lock():
     """run() must take the shared state lock around its read-modify-write, so a
     concurrent Codex reconciler can neither clobber the tick's state write-back

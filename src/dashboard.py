@@ -503,7 +503,12 @@ def get_schedules() -> list[dict]:
     out = []
     for job in jobs:
         expr = job.get("cron", "")
-        kind = f'skill:{job["prompt_skill"]}' if job.get("prompt_skill") else "prompt"
+        if job.get("shell_command"):
+            kind = "shell"
+        elif job.get("prompt_skill"):
+            kind = f'skill:{job["prompt_skill"]}'
+        else:
+            kind = "prompt"
         nxt = _cron_next_run(expr, now) if expr else None
         if nxt:
             mins = int((nxt - now).total_seconds() // 60)
@@ -518,6 +523,8 @@ def get_schedules() -> list[dict]:
             next_str = ">7d" if expr else "invalid"
         if job.get("description"):
             desc = job["description"]
+        elif job.get("shell_command"):
+            desc = f'Runs shell command: {job["shell_command"]}'
         elif job.get("prompt_skill"):
             desc = f'Runs the /{job["prompt_skill"]} skill'
         else:

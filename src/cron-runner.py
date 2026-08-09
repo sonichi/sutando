@@ -14,8 +14,10 @@ This runner is the reliable path. It is invoked by launchd
 (``com.sutando.cron-runner``) every 60s, independent of any Claude session.
 Each tick it reads the per-host ``crons.json``, decides which entries are DUE
 since their last recorded fire, and emits a task file into ``tasks/`` for each.
-The streaming watcher hands that task to the running session, which executes
-the prompt and delivers the result. Same OS-level → emit-task → process
+Entries with a ``shell_command`` are the mechanical lane: the command runs from
+the repository root with output logged, without waking the core or creating a
+task file. Prompt-backed entries follow the streaming watcher pipeline, which
+hands the task to the running session. Same OS-level → emit-task → process
 pipeline the launchd health-check fallback already uses.
 
 Ownership / no double-fire
@@ -36,6 +38,7 @@ import fcntl
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -86,6 +89,7 @@ CRONS_FILE = WORKSPACE / "hosts" / host_slug() / "crons.json"
 TASKS_DIR = WORKSPACE / "tasks"
 STATE_FILE = WORKSPACE / "state" / "cron-runner-state.json"
 CORE_ALIVE_FILE = WORKSPACE / "state" / "cores" / f"{host_slug()}.alive"
+REPO_ROOT = SRC_DIR.parent
 
 # Look back at most this far when catching up a missed fire. Bounds work after
 # long downtime and guarantees at most one catch-up emission per entry.
@@ -247,6 +251,63 @@ def _sanitize_name(name: str) -> str:
     return slug or "unnamed"
 
 
+def _shell_log_path() -> Path:
+    """Return the durable log path for direct shell-command jobs."""
+    # Derive this from the state path so tests and callers that inject a
+    # workspace by replacing STATE_FILE keep all runner state together.
+    return STATE_FILE.parent.parent / "logs" / "cron-runner.log"
+
+
+def _run_shell_command(name: str, command: str) -> int:
+    """Run one mechanical cron command and persist all output.
+
+    Shell jobs deliberately bypass the core heartbeat: their purpose is to
+    perform work without waking a model session. The command is configuration
+    owned by the user and runs from the repository root, matching the cwd a
+    task-backed cron receives when the core executes it.
+    """
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        completed = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        returncode = completed.returncode
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+    except OSError as exc:
+        returncode = 127
+        stdout = ""
+        stderr = f"{exc.__class__.__name__}: {exc}"
+
+    log = (
+        f"[{started}] shell_command job={name!r} exit_code={returncode}\n"
+        f"command: {command}\n"
+        f"stdout:\n{stdout}"
+        f"stderr:\n{stderr}"
+        "\n"
+    )
+    log_path = _shell_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as handle:
+        handle.write(log)
+
+    if stdout:
+        print(f"cron-runner: shell_command {name} stdout:\n{stdout}", end="")
+    if stderr:
+        print(f"cron-runner: shell_command {name} stderr:\n{stderr}", end="", file=sys.stderr)
+    if returncode:
+        print(
+            f"cron-runner: shell_command {name} failed with exit code {returncode}",
+            file=sys.stderr,
+        )
+    return returncode
+
+
 def emit_task(name: str, entry: dict) -> Path:
     now_ms = int(time.time() * 1000)
     ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -336,6 +397,17 @@ def run(now_epoch: Optional[int] = None) -> list:
             expr = entry.get("cron")
             if not name or not expr:
                 continue
+            has_shell_command = "shell_command" in entry
+            shell_command = entry.get("shell_command")
+            if has_shell_command and (
+                not isinstance(shell_command, str) or not shell_command.strip()
+            ):
+                print(
+                    f"cron-runner: skipping {name}: shell_command must be a non-empty string",
+                    file=sys.stderr,
+                )
+                state[name] = now_epoch
+                continue
             # When state is absent (first run or after reinstall), look back the
             # full catch-up window so a daily cron missed during a restart or
             # sleep cycle is still emitted on the next tick.
@@ -346,20 +418,27 @@ def run(now_epoch: Optional[int] = None) -> list:
                 print(f"cron-runner: skipping {name}: {e}", file=sys.stderr)
                 continue
             if due_epoch is not None:
-                if not core_alive:
+                # Direct shell jobs are the mechanical lane: they must remain
+                # runnable while the model core is stopped, and never emit a
+                # task that would wake a full agent turn.
+                if shell_command is not None:
+                    _run_shell_command(name, shell_command)
+                    emitted.append(name)
+                elif not core_alive:
                     # Preserve the previous boundary so a short outage can
                     # recover this slot after the heartbeat returns.
                     continue
-                lateness = now_epoch - due_epoch
-                if lateness <= MAX_EMIT_LATENESS_SECONDS:
-                    emit_task(name, entry)
-                    emitted.append(name)
                 else:
-                    print(
-                        f"cron-runner: dropping stale slot for {name} "
-                        f"({lateness}s late)",
-                        file=sys.stderr,
-                    )
+                    lateness = now_epoch - due_epoch
+                    if lateness <= MAX_EMIT_LATENESS_SECONDS:
+                        emit_task(name, entry)
+                        emitted.append(name)
+                    else:
+                        print(
+                            f"cron-runner: dropping stale slot for {name} "
+                            f"({lateness}s late)",
+                            file=sys.stderr,
+                        )
             state[name] = now_epoch
 
         if crons:  # only persist once we've actually read a config
