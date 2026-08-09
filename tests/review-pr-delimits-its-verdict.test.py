@@ -26,9 +26,9 @@ VERDICT = "no blocking issues\nbut check the deferral path\n"
 
 
 class ReviewPrDelimitsItsVerdict(unittest.TestCase):
-    def _run(self):
+    def _run(self, diff="diff --git a/x b/x\n+real change\n"):
         bin_dir = Path(tempfile.mkdtemp())
-        (bin_dir / "gh").write_text("#!/bin/bash\necho 'diff --git a/x b/x'\necho '+real change'\n")
+        (bin_dir / "gh").write_text(f"#!/bin/bash\nprintf '%b' {diff!r}\n")
         # codex writes the clean verdict to -o and streams a trace to stdout
         (bin_dir / "codex").write_text(
             "#!/bin/bash\n"
@@ -48,8 +48,12 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
         r = self._run()
         self.assertIn(MARKER, r.stdout, f"no verdict marker in stdout (rc={r.returncode})")
         after = r.stdout.rsplit(MARKER, 1)[1].strip()
-        self.assertEqual(after, VERDICT.strip(),
-                         "splitting on the last marker must yield exactly the verdict")
+        # The extracted region is the mechanical findings THEN the codex verdict:
+        # both are review output, and only the trace belongs on the other side.
+        self.assertTrue(after.endswith(VERDICT.strip()), after)
+        self.assertIn("Mechanical checks", after)
+        self.assertLess(after.index("Mechanical checks"), after.index("no blocking issues"))
+        self.assertNotIn("thinking about the diff", after, "no trace may cross the marker")
 
     def test_the_trace_is_still_on_stdout_so_the_stall_watchdog_keeps_working(self):
         """Silencing codex would fix the parsing and break the watchdog. It must stay."""
@@ -63,6 +67,19 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
         after = r.stdout.rsplit(MARKER, 1)[1]
         self.assertNotIn("not_in_this_pr", after)
         self.assertNotIn("diff --git", after)
+
+    def test_a_mechanical_failure_survives_marker_extraction(self):
+        """A deterministic FAIL printed before the marker is dropped by the consumer."""
+        bad = ('diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n'
+               '+TOKEN = "/Users/qingyun-air/.secret"\n')
+        r = self._run(diff=bad)
+        self.assertIn("review-checks", r.stdout, "the mechanical runner did not fire")
+        after = r.stdout.rsplit(MARKER, 1)[1]
+        # codex says "no blocking issues" here, so the extracted text is the ONLY
+        # place a reader would see the hardcoded path.
+        self.assertIn("hardcoded path", after,
+                      "a mechanical FAIL must survive extraction, not just appear on stdout")
+        self.assertIn("no blocking issues", after, "the codex verdict must still be there")
 
     def test_the_bridge_instruction_tells_the_agent_to_extract_after_the_marker(self):
         """The only production consumer: a bare 'verdict on stdout' reproduces the defect."""

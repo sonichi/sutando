@@ -43,27 +43,26 @@ OUT="$(mktemp -t review-pr.XXXXXX)"
 VERDICT_MARKER="===CODEX-VERDICT==="
 trap 'rm -f "$OUT"' EXIT   # clean up even on interrupt / non-zero exit, not just the happy path
 
-# Mechanical checks first — the deterministic, guide-driven scanners (today:
-# hardcoded paths) via the shared runner (supersedes the baked-in scanner from
-# #2229; the patterns live in REVIEW.md, not here). Surfaced ahead
-# of the codex verdict so the mechanical findings are never buried. Best-effort:
-# the runner's own exit code doesn't fail the review.
+# Mechanical checks — the deterministic, guide-driven scanners (today: hardcoded
+# paths) via the shared runner (supersedes the baked-in scanner from #2229; the
+# patterns live in REVIEW.md, not here). Captured now, emitted after the marker:
+# a consumer keeps only the post-marker text, so printing here would drop a FAIL.
 CHECKS_SH="$(cd "$HERE/../../.." && pwd)/scripts/review-checks.sh"
 MECH=""
 if [[ -x "$CHECKS_SH" ]]; then
     MECH="$(printf '%s' "$DIFF" | bash "$CHECKS_SH" 2>&1 || true)"
 fi
-[[ -n "$MECH" ]] && printf 'Mechanical checks (review-checks.sh):\n%s\n\n' "$MECH"
 bash "$HERE/codex-bounded.sh" --stall "$STALL" --max "$MAX" -- \
     codex exec --sandbox read-only -o "$OUT" -- "Concisely review this PR diff. List only real bugs, correctness issues, or security problems as bullets; if there are none, say 'no blocking issues'. Be specific (file + what's wrong).
 
 $DIFF" < /dev/null
 rc=$?
 
+# codex's trace shares this stdout and --stall watches it, so it cannot be
+# silenced; the marker is what separates that trace from the review output.
+printf '%s\n' "$VERDICT_MARKER"
+[[ -n "$MECH" ]] && printf 'Mechanical checks (review-checks.sh):\n%s\n\n' "$MECH"
 if [[ $rc -eq 0 && -s "$OUT" ]]; then
-    # codex's trace shares this stdout and --stall watches it, so it cannot be
-    # silenced; the marker is what separates that trace from the verdict.
-    printf '%s\n' "$VERDICT_MARKER"
     cat "$OUT"
 else
     echo "review-pr: no verdict for #$PR (codex exit $rc — 125=stalled, 124=hit --max, other=error)" >&2
