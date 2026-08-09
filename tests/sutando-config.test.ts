@@ -326,9 +326,8 @@ describe('sutando_config loader', () => {
 		}
 	});
 
-	// exclude_extra must resolve IDENTICALLY here and in resolve_vault(). This file
-	// is the twin of sutando_config.py, so a key implemented on one side only makes
-	// the same config mean different things to a TS caller and a Python caller.
+	// Twin of sutando_config.py: a key implemented on one side only makes the same
+	// config mean different things to a TS caller and a Python caller.
 	it('resolveVault appends exclude_extra without dropping the shipped excludes', () => {
 		writeConfig(repo, 'sutando.config.json', {
 			vault: { enabled: true, sync: { include: ['notes/'], exclude: ['tasks/', 'results/'] } },
