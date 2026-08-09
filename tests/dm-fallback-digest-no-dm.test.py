@@ -19,6 +19,7 @@ flushed every copy into her DM in one burst, retrying through HTTP 429s.
    backlog of near-identical copies.
 """
 
+import ast
 import re
 import sys
 import tempfile
@@ -26,10 +27,47 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-BRIDGE_SRC = (REPO / "src" / "discord-bridge.py").read_text()
-CPQ_SRC = (REPO / "src" / "check-pending-questions.py").read_text()
+BRIDGE_PATH = REPO / "src" / "discord-bridge.py"
+CPQ_PATH = REPO / "src" / "check-pending-questions.py"
+BRIDGE_SRC = BRIDGE_PATH.read_text()
+CPQ_SRC = CPQ_PATH.read_text()
 
 failures = []
+
+
+def _compile_function(path: Path, src: str, func_name: str):
+    """Compile a single top-level function AGAINST THE REAL FILE PATH, original
+    line numbers preserved, so coverage.py attributes the run to the real
+    file's lines instead of a detached string (same technique as
+    tests/bridge-timeout-guards.test.py's _compile_segment)."""
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            mod = ast.Module(body=[node], type_ignores=[])
+            return compile(mod, str(path), "exec")
+    raise AssertionError(f"{func_name} not found in {path}")
+
+
+def _find_digest_if(tree):
+    """The `if f.name.startswith(("question-", "insight-")): ...` node inside
+    poll_dm_fallback, matched structurally (not by text) so a reformat can't
+    silently stop finding it."""
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.AsyncFunctionDef) and fn.name == "poll_dm_fallback":
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.If):
+                    continue
+                test = node.test
+                if not (isinstance(test, ast.Call)
+                        and isinstance(test.func, ast.Attribute)
+                        and test.func.attr == "startswith"
+                        and test.args
+                        and isinstance(test.args[0], ast.Tuple)):
+                    continue
+                consts = {c.value for c in test.args[0].elts if isinstance(c, ast.Constant)}
+                if consts == {"question-", "insight-"}:
+                    return node
+    return None
 
 
 def check(name, cond, detail=""):
@@ -72,6 +110,47 @@ check("briefing-/friction- delivery NOT swept into the digest branch",
       and 'startswith(("question-", "insight-", "briefing-"' not in body)
 
 
+# --- Half 1b: exercise the digest branch for real (not just structurally) -----
+# Regex above proves the branch exists in the right place; this actually RUNS
+# it — real coverage on src/discord-bridge.py's changed lines, not just a
+# string match. The `if` sits inside poll_dm_fallback's own `for`/`continue`,
+# so it is wrapped in a throwaway one-iteration `for` here to keep `continue`
+# valid; the branch's own statements keep their ORIGINAL line numbers from the
+# real file, so coverage.py attributes the run to src/discord-bridge.py.
+digest_if = _find_digest_if(ast.parse(BRIDGE_SRC))
+check("digest branch If node found structurally (for real execution)", digest_if is not None)
+
+if digest_if is not None:
+    _loc = dict(lineno=digest_if.lineno, col_offset=0,
+                end_lineno=digest_if.end_lineno, end_col_offset=0)
+    _wrapper = ast.For(
+        target=ast.Name(id="_dm_digest_iter", ctx=ast.Store(), **_loc),
+        iter=ast.List(elts=[ast.Constant(value=0, **_loc)], ctx=ast.Load(), **_loc),
+        body=[digest_if], orelse=[],
+        **_loc,
+    )
+    _mod = ast.Module(body=[_wrapper], type_ignores=[])
+    ast.fix_missing_locations(_mod)
+    digest_code = compile(_mod, str(BRIDGE_PATH), "exec")
+
+    class _FakeResultFile:
+        def __init__(self, name):
+            self.name = name
+            self.stem = name.rsplit(".", 1)[0]
+
+    archived = []
+    fobj = _FakeResultFile("question-999.txt")
+    digest_ns = {
+        "f": fobj,
+        "archive_file": lambda f, kind, stem: archived.append((f.name, kind, stem)),
+        "print": lambda *a, **kw: None,
+    }
+    exec(digest_code, digest_ns)
+    check("executing the digest branch archives (not DM) with the right args",
+          archived == [("question-999.txt", "results", "question-999")],
+          f"(got {archived})")
+
+
 # --- Half 2: notify_voice supersedes older digests ----------------------------
 m = re.search(r"def notify_voice\(questions\):.*?(?=^def |\Z)",
               CPQ_SRC, re.MULTILINE | re.DOTALL)
@@ -82,13 +161,17 @@ check("notify_voice unlinks older question-*.txt before writing",
       re.search(r'glob\("question-\*\.txt"\).*?unlink', nv_src, re.DOTALL) is not None)
 
 # Exercise it for real: two stale digests + one write -> exactly one file left.
+# Compiled against the REAL file path (original line numbers preserved) so
+# coverage.py attributes this run to src/check-pending-questions.py, not a
+# detached regex-extracted string.
+nv_code = _compile_function(CPQ_PATH, CPQ_SRC, "notify_voice")
 with tempfile.TemporaryDirectory() as td:
     tmp = Path(td)
     (tmp / "question-111.txt").write_text("old wall 1")
     (tmp / "question-222.txt").write_text("old wall 2")
     (tmp / "task-333.txt").write_text("unrelated result")
     ns = {"RESULTS_DIR": tmp, "time": __import__("time"), "Path": Path}
-    exec(compile(nv_src, "notify_voice", "exec"), ns)
+    exec(nv_code, ns)
     ns["notify_voice"]([{"title": "q1"}, {"title": "q2"}])
     remaining = sorted(p.name for p in tmp.glob("question-*.txt"))
     check("exactly one digest remains after a new write",
