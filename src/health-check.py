@@ -6608,14 +6608,91 @@ def _pin_scope_flag(scope: str) -> str:
     return "-g" if scope == GLOBAL_PIN_SCOPE else f"-t '={scope}'"
 
 
-def _interpret_core_model_pin(pinned: list, socket: str) -> dict:
-    """Pure half of `check_core_model_pin`: interprets all collected tmux pins.
-    `pinned` is [(scope, value), ...] over every session plus `global`."""
+def _core_argv_pins(socket: str, sessions: list) -> list:
+    """[(session, model)] for live cores pinned via argv; (session, None) when no
+    argv could be read. argv is immutable, so a tmux clear cannot undo a pin."""
+    out = []
+    for sess in sessions:
+        try:
+            pp = subprocess.run(
+                # -s spans every window. Without it tmux reports only the ACTIVE
+                # window, so a core in window 0 is invisible whenever another is up.
+                ["tmux", "-S", socket, "list-panes", "-s", "-t", f"={sess}",
+                 "-F", "#{pane_pid}"],
+                capture_output=True, text=True, timeout=10)
+            if pp.returncode != 0:
+                # A failed read is not an absent pin. Without this the probe
+                # reports ok, which is the silent direction.
+                out.append((sess, None))
+                continue
+            pids = [x.strip() for x in (pp.stdout or "").split("\n")
+                    if x.strip().isdigit()]
+            if not pids:
+                # A live session ALWAYS has >=1 pane, so a successful list that
+                # yields no pid enumerated nothing — unknown, never "no panes".
+                out.append((sess, None))
+                continue
+            read_failed = False
+            for pid in pids:
+                ps = subprocess.run(["ps", "-o", "args=", "-p", pid],
+                                    capture_output=True, text=True, timeout=10)
+                if ps.returncode != 0:
+                    # ps failing (permissions, or the pane exited mid-scan) is
+                    # indistinguishable from a non-claude pane by argv alone.
+                    read_failed = True
+                    continue
+                argv = (ps.stdout or "").strip()
+                if not argv:
+                    # rc 0 with EMPTY stdout is not "this pane is not claude" —
+                    # nothing was read, so the pane cannot be ruled out.
+                    read_failed = True
+                    continue
+                if "claude" not in argv:
+                    continue
+                m = re.search(r"--model[= ]+(\S+)", argv)
+                if m:
+                    out.append((sess, m.group(1)))
+            # ANY unread pane leaves the session unverified: a readable unpinned pane says
+            # nothing about the one that failed, which may be the pinned core.
+            if read_failed:
+                out.append((sess, None))
+        except (OSError, subprocess.SubprocessError):
+            out.append((sess, None))
+    return out
+
+
+def _interpret_core_model_pin(pinned: list, socket: str, running=()) -> dict:
+    """Interpret tmux pins AND the live core's argv. A tmux clear cannot change an
+    already-running process, so argv must be reported even when tmux is clean."""
     name = "core-model-pin"
-    if not pinned:
+    live = [(s, v) for s, v in running if v and v.strip()]
+    # An empty-string argv read is as unverified as None; both mean "ps told us
+    # nothing", so neither may be reported as a core confirmed unpinned.
+    unknown = [s for s, v in running if not (v and v.strip())]
+    if not pinned and not live:
+        if unknown:
+            # WARN, not ok: emit_task_for_failures() gates on status, so an
+            # ok-with-caveat reaches the human channel and nothing else.
+            return {"name": name, "status": "warn",
+                    "detail": (f"could not read argv for a LIVE core session "
+                               f"({', '.join(sorted(unknown))}), so it cannot be "
+                               f"confirmed unpinned — the tmux env is clear, but a "
+                               f"clear cannot move a running core off a pinned model")}
         return {"name": name, "status": "ok",
-                "detail": "no model pin on any session or the global env "
-                          "(core uses the default window)"}
+                "detail": ("no model pin on any session or the global env "
+                           "(core uses the default window)")}
+    if live:
+        where_live = ", ".join(f"{s} argv={v!r}" for s, v in live)
+        extra = ""
+        if pinned:
+            extra = (" The tmux env is ALSO pinned (" +
+                     ", ".join(f"{s}={v!r}" for s, v in pinned) + ").")
+        elif not pinned:
+            extra = (" The tmux env is already clear, so this will NOT show up as an "
+                     "env pin — only a restart moves a running core off it.")
+        return {"name": name, "status": "warn",
+                "detail": (f"a LIVE core is running on a pinned model ({where_live}). "
+                           f"argv is immutable.{extra}")}
     where = ", ".join(f"{scope}={val!r}" for scope, val in pinned)
     # Name the scope in the remedy: an operator copies the emitted line, and a
     # `setenv -u` without -t/-g can clear a different scope than the pinned one.
@@ -6627,11 +6704,11 @@ def _interpret_core_model_pin(pinned: list, socket: str) -> dict:
         "name": name,
         "status": "warn",
         "detail": (
-            f"core is PINNED by wedge recovery ({where}) — an emergency downgrade that "
-            f"nothing clears and that survives every bare rerun. If the core did not just "
-            f"wedge, clear it: {fixes}. Clearing tmux alone is not durable: start-cli.sh "
-            f"re-supplies SUTANDO_CORE_MODEL from its own launching env on the next "
-            f"new-session, so the launching process has to be replaced too."
+            f"core model is PINNED ({where}) — nothing in this repo sets it, so this is "
+            f"left over or was set by hand. The Claude launcher ignores it and clears both "
+            f"tmux scopes on its next start/attach/restart, so a Claude core self-heals; "
+            f"the Codex launcher still honors it (docs/codex-core.md). To clear it now "
+            f"without waiting for a launch: {fixes}."
         ),
     }
 
@@ -6649,6 +6726,16 @@ def _tmux_sessions(socket: str) -> list:  # pragma: no cover — thin tmux glue
 
 
 TMUX_UNSET_MARKER = "unknown variable"
+
+# tmux reached no server at all. A socket FILE can outlive its server, so this is
+# "there is no core to be pinned" — not a query that failed against a live one.
+TMUX_NO_SERVER_MARKERS = ("no server running", "error connecting to")
+
+
+def _tmux_no_server(exc) -> bool:
+    parts = [str(exc), getattr(exc, "stderr", "") or "", getattr(exc, "output", "") or ""]
+    text = " ".join(str(p) for p in parts).lower()
+    return any(m in text for m in TMUX_NO_SERVER_MARKERS)
 
 
 def _query_pin(socket: str, scope_args: list) -> str:
@@ -6686,8 +6773,26 @@ def check_core_model_pin() -> dict:
             if val:
                 pinned.append((sess, val))
     except (OSError, subprocess.SubprocessError) as e:
-        return {"name": name, "status": "ok", "detail": f"could not query tmux env ({e}) — skipped"}
-    return _interpret_core_model_pin(pinned, socket)
+        if _tmux_no_server(e):
+            return {"name": name, "status": "ok",
+                    "detail": f"no tmux server on {socket} — no core to be pinned ({e})"}
+        # Not an absent pin: nothing was inspected. emit_task_for_failures() gates
+        # on status, so ok here silences the one case that needs a human.
+        return {"name": name, "status": "warn",
+                "detail": (f"could not query the core tmux env ({e}), so neither the "
+                           f"global scope nor any session was inspected — a live core "
+                           f"may still be pinned and this probe cannot see it")}
+    try:
+        sessions = _tmux_sessions(socket)
+    except (OSError, subprocess.SubprocessError) as e:
+        if _tmux_no_server(e):
+            return _interpret_core_model_pin(pinned, socket, ())
+        # sessions=[] here would report a clean argv pass having read no core at all.
+        return {"name": name, "status": "warn",
+                "detail": (f"could not enumerate core tmux sessions ({e}), so no core "
+                           f"argv was inspected — the tmux env is clear, but a clear "
+                           f"cannot move a running core off a pinned model")}
+    return _interpret_core_model_pin(pinned, socket, _core_argv_pins(socket, sessions))
 
 
 def run_all_checks() -> list[dict]:
@@ -7701,9 +7806,8 @@ def notify_gateway_for_failures(
 #     file serializes the decision so a manual + launchd run can't double-fire.
 #   - Hard cap of RECOVER_MAX_PER_HOUR; past that it DMs "giving up" and stops,
 #     so a pathological wedge can't become a restart loop.
-#   - Graceful degradation: the FIRST restart of an episode keeps 1M; if the
-#     wedge recurs (the 1M restart didn't hold), the next restart pins
-#     SUTANDO_CORE_MODEL=opus (standard 200K) so the agent keeps WORKING.
+#   - NO model change on restart: an inherited pin is indistinguishable from a
+#     deliberate choice. The cap above is the bound on a re-wedging core.
 #   - DMs the owner before each restart and records whether the DM succeeded
 #     (last_restart_dm_sent) + logs failures, so a restart is never invisible
 #     even if Slack is down — recovery still proceeds (recovery > notification).
@@ -7825,18 +7929,13 @@ def _resolve_launch_env() -> dict:
     return env
 
 
-def _default_core_restart(standard_context: bool) -> bool:
-    """Run the selected core CLI dispatcher with --restart out-of-process. When
-    standard_context is True and Claude is selected, pin
-    SUTANDO_CORE_MODEL=opus so the restarted core uses the standard 200K window.
-    Codex restarts without a provider-specific model override. Returns True if
-    the restart command exited 0."""
+def _default_core_restart() -> bool:
+    """Restart the core out-of-process, setting no model: recovery must not change
+    which model the core runs on. True if the restart command exited 0."""
     script = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not script.exists():
         return False
     env = _resolve_launch_env()  # pragma: no cover — real-subprocess restart path (integration, not unit)
-    if standard_context and resolve_core_runtime(REPO_DIR) == "claude":
-        env["SUTANDO_CORE_MODEL"] = "opus"
     try:
         proc = subprocess.run(
             ["/bin/bash", str(script), "--restart"],
@@ -7983,15 +8082,8 @@ def recover_core_if_wedged(
                     print("[recover-core] WARNING: give-up DM to owner failed", flush=True)
             return {"action": "gave_up", "restarts_last_hour": len(history)}
 
-        # Escalation: the FIRST restart in the trailing hour keeps 1M; if we're
-        # wedged again after a prior restart, that restart didn't hold — degrade
-        # to standard 200K context so the agent keeps working instead of re-wedging.
-        standard_context = len(history) >= 1
-        mode = "standard" if standard_context else "1m"
-        ctx_note = (
-            "in standard 200K context (the 1M restart didn't hold)" if standard_context
-            else "keeping 1M context"
-        )
+        # No model escalation: RECOVER_MAX_PER_HOUR plus the give-up DM above
+        # are the bound on a re-wedging core.
         # DM the owner BEFORE restarting. Capture the result (blocker 2): if the
         # DM fails we still restart (recovery > notification — don't leave the
         # core wedged because Slack is down), but we record dm_sent=False and log
@@ -7999,26 +8091,27 @@ def recover_core_if_wedged(
         dm_ok = send(
             f":hourglass: *Sutando core wedged* — oldest task stuck {oldest_age // 60} min "
             f"while the core process is alive (likely the 1M usage-credit gate or a "
-            f"stalled turn). Auto-restarting {ctx_note}. Queued tasks are preserved."
+            f"stalled turn). Auto-restarting on its configured model. Queued tasks "
+            f"are preserved."
         )
         if not dm_ok:
-            print(f"[recover-core] WARNING: wedge-restart DM failed; restarting anyway (mode={mode})", flush=True)
+            print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 
-        if not restart_fn(standard_context):
+        if not restart_fn():
             # Restart launch failed — don't burn a cooldown/history slot, and
             # keep the observation so we stay confirmed and retry next pass.
-            return {"action": "restart_failed", "mode": mode, "dm_sent": dm_ok}
+            return {"action": "restart_failed", "dm_sent": dm_ok}
 
         history.append(now)
         state["restart_history"] = history
         state["last_restart"] = now
-        state["last_restart_mode"] = mode
+        state.pop("last_restart_mode", None)   # retired with the model escalation
         state["last_restart_dm_sent"] = dm_ok
         _reset_observation()  # re-observe after the restart settles
         state.pop("gave_up_at", None)
         _save()
         return {
-            "action": "restarted", "mode": mode, "oldest_age": oldest_age,
+            "action": "restarted", "oldest_age": oldest_age,
             "restarts_last_hour": len(history), "dm_sent": dm_ok,
         }
     finally:
