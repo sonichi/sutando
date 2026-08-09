@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 """Slack must not claim a proactive file it has nobody to deliver to.
 
-THE BUG. `result_watcher` renamed every `results/proactive-*.txt` to `.sending`
-at `:1466` and only asked `resolve_proactive_owner_id` thirteen lines later at
-`:1479`. On a host where Slack is unconfigured — no `access.json`, TOFU never
-ran — that resolve always returns None, so the bridge claimed the file, logged
-"no owner in allowFrom, skipping", and deleted it anyway.
-
-Those files are routed to **Discord**. `should_claim_proactive` is never called
-here (`grep -c proactive_routing src/slack-bridge.py` -> 0), so Slack was
-deleting another bridge's mail, and Discord logged nothing because it never saw
-the file. Measured on Chis-MacBook-Pro 2026-08-04: 52 distinct files, including
-four morning briefings, each verified absent from the owner's DM history.
+The claim renames the file out of the `*.txt` glob every other bridge polls, so
+claiming without a recipient strands mail routed to one of them.
 
 WHY "DON'T CLAIM" RATHER THAN "CLAIM AND RELEASE". On `main` there is no release
 path, so a claimed `.sending` is outside every poller's `*.txt` glob until the
@@ -55,12 +46,8 @@ os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
 os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-not-real")
 _slack_cfg = Path(_CFG) / "channels" / "slack"
 _slack_cfg.mkdir(parents=True, exist_ok=True)
-# Seed the canonical access.json BEFORE the import. Creating the directory is not
-# enough: `channel_access_path()` falls back to the real home when the canonical
-# file is absent, so an env override alone still reads the developer's live
-# allowlist. `lint-hermetic-bridge-tests` requires both, and it caught exactly
-# this omission on the first CI run of this PR — the anti-pollution lint catching
-# an anti-pollution test, which is the system working.
+# Seed access.json BEFORE the import: an absent canonical file makes
+# `channel_access_path()` fall back to the developer's real home allowlist.
 (_slack_cfg / "access.json").write_text(json.dumps({"allowFrom": []}))
 
 for name in ("slack_bolt", "slack_bolt.adapter", "slack_bolt.adapter.socket_mode",
@@ -115,22 +102,14 @@ def _one_pass(results: Path, access: dict | None, owner: str | None = None,
     if hasattr(sb, "TASKS_DIR"):
         sb.TASKS_DIR = results
 
-    # Positive-control wiring. @john-the-dev mutated `if owner_id is None:` to
-    # `if True:` — disabling EVERY Slack proactive claim — and the suite still
-    # exited 0, because every case asserted only the no-owner side. A gate that
-    # cannot tell "correctly skipped" from "never runs at all" is not a gate.
+    # Owner-present wiring: without it the suite asserts only the no-owner side,
+    # so a gate mutated to skip every claim still exits 0.
     if owner is not None:
         sb.resolve_proactive_owner_id = lambda _d: owner
         sb.app.client.conversations_open = lambda **kw: {"channel": {"id": "D_TEST_DM"}}
         def _stub_send(ch, _ts, text, **_kw):
-            # MUST return truthy. #2627 changes `_send_reply` from `-> None` to
-            # `-> bool` (delivered?) and gates cleanup on it. `list.append()`
-            # returns None, so the original stub read as "Slack refused" on the
-            # COMBINED tree: the claim was released instead of consumed and this
-            # suite failed while passing on either PR alone.
-            # @Sutando-Mini found it by running both suites on the merged tree;
-            # a clean `git merge` cannot see it, because the contract and the
-            # fixture live in different files.
+            # MUST return truthy: cleanup is gated on `_send_reply`'s bool, and
+            # `list.append()` returns None, which reads as a refusal.
             if sent is not None:
                 sent.append((ch, text))
             return True
@@ -171,10 +150,8 @@ def main() -> int:
           f"found {[p.name for p in box.glob('*.sending')]} — out of the poller's *.txt glob")
 
     # --- POSITIVE CONTROL: a CONFIGURED Slack must still claim and deliver ----
-    # Without this, an over-broad future gate (or a mutation to `if True:`)
-    # silently disables Slack proactive delivery and every assertion above still
-    # passes. This is the case that makes the gate discriminating rather than
-    # merely permissive.
+    # An over-broad gate would disable delivery entirely and still satisfy every
+    # assertion above.
     box2 = Path(tempfile.mkdtemp(prefix="slack-owner-"))
     msg2 = box2 / "proactive-pending-q-deliverme.txt"
     msg2.write_text("a notification Slack CAN deliver")
@@ -183,12 +160,8 @@ def main() -> int:
 
     check("configured owner -> the send actually happened", bool(sent),
           "no send recorded — the gate is skipping when it should deliver")
-    # Unconditional. Nesting this under `if sent:` meant that when the send did
-    # NOT happen the assertion silently vanished instead of failing — 6 of 7
-    # checks ran under the over-broad mutation, and the missing one was never
-    # reported as missing. @Sutando-Mini's sharpening of the mutation rule: a
-    # suite must survive long enough to name EVERY property it lost, and a
-    # conditional assertion is a quieter version of aborting.
+    # Unconditional: nested under `if sent:` this assertion vanishes instead of
+    # failing, so the suite cannot name the property it lost.
     check("  ...to the opened DM channel with the body",
           bool(sent) and sent[0][0] == "D_TEST_DM" and "CAN deliver" in sent[0][1],
           repr(sent[0]) if sent else "no send recorded at all")

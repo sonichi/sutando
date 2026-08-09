@@ -1463,41 +1463,14 @@ def result_watcher():
                     if peek.startswith("[channel:") and \
                             re.match(r'\[channel:\s*\d{17,20}\]', peek):
                         continue
-                    # Resolve the owner BEFORE claiming. This used to happen 13
-                    # lines later, after the rename — so on a host where Slack is
-                    # unconfigured (no access.json, TOFU never ran) this bridge
-                    # claimed EVERY proactive file, discovered it had nobody to
-                    # send to, and dropped it. Those files are routed to Discord;
-                    # `should_claim_proactive` is not consulted here at all. The
-                    # owner's notifications were being deleted by the one bridge
-                    # that could not deliver them, and Discord logged nothing
-                    # because it never saw the file.
-                    #
-                    # Measured on Chis-MacBook-Pro 2026-08-04 (this host only —
-                    # the peer host has no running slack-bridge and no log, so
-                    # the volume is one machine's figure, not the fleet's):
-                    # 52 distinct files, including FOUR morning briefings
-                    # (07-31, 08-01, 08-02, 08-03), each verified absent from the
-                    # owner's DM history rather than inferred from the filename.
-                    #
-                    # Why not claim-and-release. On `main` today there is no
-                    # release path at all, so a claimed `.sending` is invisible to
-                    # every poller's `*.txt` glob until the startup-only recovery
-                    # sweep. #2627 adds `release_claim()`, which renames it back
-                    # and IS re-polled — so once that lands the reason changes
-                    # rather than disappears: claiming a file you cannot deliver
-                    # buys a claim/release hot race and ~a second of hiding it
-                    # from the bridge that can. Not claiming avoids both.
-                    # (@john-the-dev corrected my first rationale here, which
-                    # described only main's behaviour while this PR's own merge
-                    # order puts #2627 first.)
+                    # Resolve the owner BEFORE claiming: a claim this bridge
+                    # cannot deliver hides the file from the poller that can.
                     try:
                         access_data = json.loads(ACCESS_FILE.read_text())
                     except Exception:
                         access_data = {}
                     owner_id = resolve_proactive_owner_id(access_data)
                     if owner_id is None:
-                        # Untouched: no rename, no delete. Discord's poll still sees it.
                         continue
                     claim = f.with_suffix(".sending")
                     try:
