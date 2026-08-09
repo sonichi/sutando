@@ -110,11 +110,11 @@ async def probe():
                 url, headers={"Authorization": f"Bearer {TOKEN}"}) as ws:
             await ws.send_str(json.dumps({
                 "jsonrpc": "2.0", "id": "sub", "method": "task.subscribe",
-                "params": {"results": True, "activity": True}}))
+                "params": {"results": True, "activity": True, "requests": True}}))
             sub = json.loads((await ws.receive()).data)
             check(sub.get("result", {}).get("subscribed") is True
-                  and set(sub["result"]["streams"]) == {"results", "activity"},
-                  "task.subscribe over WSS acknowledges results+activity streams")
+                  and set(sub["result"]["streams"]) == {"results", "activity", "requests"},
+                  "task.subscribe over WSS acknowledges results+activity+requests streams")
 
             # activity push: change the core-status step
             await asyncio.sleep(0.4)  # let the watcher seed past 'initial'
@@ -134,6 +134,22 @@ async def probe():
                   and res.get("params", {}).get("taskId") == "task-rtapi-wsspush"
                   and res["params"].get("result") == "streamed result body",
                   "a new result file pushes a `task.result` frame over WSS")
+
+            # requests push: a new pending HITL request → `request.pending`
+            # (the wearable's buzz-and-card trigger). Trigger via the CLI over
+            # the Unix socket, exactly as an agent turn would.
+            cli = REPO / "src" / "runtime-cli" / "sutando-runtime.py"
+            subprocess.run([sys.executable, str(cli), "approval", "request",
+                            "--action", "deploy-to-prod",
+                            "--reason", "ship the release"],
+                           env=ENV, capture_output=True, text=True, timeout=15)
+            req = await collect_until(
+                ws, "request.pending",
+                match=lambda p: p.get("action") == "deploy-to-prod")
+            check(req is not None
+                  and req["params"].get("requestType") == "approval"
+                  and req["params"].get("reason") == "ship the release",
+                  "a new pending HITL request pushes a `request.pending` frame over WSS")
 
 
 def main() -> int:

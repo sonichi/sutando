@@ -105,6 +105,10 @@ class RuntimeServer:
         self._subscribers: set[asyncio.StreamWriter] = set()
         # --activity subscribers get `activity` frames (core-status step feed).
         self._activity_subscribers: set[asyncio.StreamWriter] = set()
+        # `requests` subscribers get `request.pending` frames when a HITL
+        # request (approval / elicitation / human_action) needs a human — the
+        # wearable's buzz-and-card trigger.
+        self._request_subscribers: set[asyncio.StreamWriter] = set()
         self._state_dir = state_dir
         # Actor identity is resolved DAEMON-SIDE, here, and handed to the
         # dispatcher explicitly — a client parameter can never override it.
@@ -235,6 +239,7 @@ class RuntimeServer:
                               device_store=device_store,
                               result_subscribers=self._subscribers,
                               activity_subscribers=self._activity_subscribers,
+                              request_subscribers=self._request_subscribers,
                               host=host, port=port, log=_log)
             await wss.start()
             if host not in ("127.0.0.1", "localhost", "::1"):
@@ -274,6 +279,9 @@ class RuntimeServer:
                     if params.get("activity"):
                         self._activity_subscribers.add(writer)
                         streams.append("activity")
+                    if params.get("requests"):
+                        self._request_subscribers.add(writer)
+                        streams.append("requests")
                     writer.write(result_frame(req_id, {"subscribed": True,
                                                        "streams": streams}))
                     await writer.drain()
@@ -290,6 +298,7 @@ class RuntimeServer:
         finally:
             self._subscribers.discard(writer)
             self._activity_subscribers.discard(writer)
+            self._request_subscribers.discard(writer)
             writer.close()
 
     async def _results_watcher(self) -> None:
@@ -319,6 +328,60 @@ class RuntimeServer:
                 await w.drain()
             except (ConnectionResetError, BrokenPipeError, RuntimeError):
                 self._activity_subscribers.discard(w)
+
+    @staticmethod
+    def _request_summary(rec: dict) -> dict:
+        """The client-facing shape of a pending HITL request — enough for a
+        wearable to render a card (what + why + deadline), no store internals."""
+        p = rec.get("params") or {}
+        return {"requestId": rec.get("requestId"),
+                "requestType": rec.get("requestType"),
+                "taskId": rec.get("taskId"),
+                "action": p.get("action"), "question": p.get("question"),
+                "reason": p.get("reason"), "instructions": p.get("instructions"),
+                "createdAt": rec.get("createdAt"),
+                "expiresAt": rec.get("expiresAt")}
+
+    async def _push_request(self, params: dict) -> None:
+        frame = notification_frame("request.pending", params)
+        for w in list(self._request_subscribers):
+            try:
+                w.write(frame)
+                await w.drain()
+            except (ConnectionResetError, BrokenPipeError, RuntimeError):
+                self._request_subscribers.discard(w)
+
+    async def _requests_watcher(self) -> None:
+        """Push a `request.pending` notification when a NEW HITL request needs a
+        human — the wearable's interrupt/buzz channel. Seeds `seen` from the
+        current pending set so a subscriber gets NEW requests, not a boot
+        backlog. Resolved requests simply stop being pending; no resolve push in
+        v0 (the responder path is a later slice)."""
+        try:
+            interval = float(os.environ.get("SUTANDO_REQUEST_POLL_S") or 0.3)
+        except ValueError:
+            interval = 0.3
+        try:
+            seen = {r["requestId"] for r in self.store.pending()}
+        except Exception:  # noqa: BLE001
+            seen = set()
+        while True:
+            await asyncio.sleep(interval)
+            if not self._request_subscribers:
+                try:                              # keep `seen` current while idle
+                    seen = {r["requestId"] for r in self.store.pending()}
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            try:
+                pend = self.store.pending()
+            except Exception:  # noqa: BLE001
+                continue
+            live = {r["requestId"] for r in pend}
+            for rec in pend:
+                if rec["requestId"] not in seen:
+                    await self._push_request(self._request_summary(rec))
+            seen = live
 
     async def _activity_watcher(self) -> None:
         """Push `activity` frames to activity subscribers from two sources:
@@ -444,7 +507,8 @@ class RuntimeServer:
                 await asyncio.gather(server.serve_forever(),
                                      self.dispatcher.resolver_loop(),
                                      self._results_watcher(),
-                                     self._activity_watcher())
+                                     self._activity_watcher(),
+                                     self._requests_watcher())
         finally:
             if wss is not None:
                 await wss.cleanup()

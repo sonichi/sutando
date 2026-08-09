@@ -88,6 +88,7 @@ class WsTransport:
                  device_store=None,
                  result_subscribers: set | None = None,
                  activity_subscribers: set | None = None,
+                 request_subscribers: set | None = None,
                  host: str = "127.0.0.1", port: int = 8787,
                  route: str = "/scp", log=print):
         self.dispatcher = dispatcher
@@ -103,6 +104,7 @@ class WsTransport:
         # transport serves request/response only (no streaming).
         self._result_subs = result_subscribers
         self._activity_subs = activity_subscribers
+        self._request_subs = request_subscribers
         self.host = host
         self.port = port
         self.route = route
@@ -178,6 +180,9 @@ class WsTransport:
             if params.get("activity") and self._activity_subs is not None:
                 self._activity_subs.add(sink)
                 streams.append("activity")
+            if params.get("requests") and self._request_subs is not None:
+                self._request_subs.add(sink)
+                streams.append("requests")
             await ws.send_str(result_frame(
                 req_id, {"subscribed": True, "streams": streams}).decode())
             return
@@ -216,6 +221,8 @@ class WsTransport:
                 self._result_subs.discard(sink)
             if self._activity_subs is not None:
                 self._activity_subs.discard(sink)
+            if self._request_subs is not None:
+                self._request_subs.discard(sink)
         return ws
 
     def build_app(self) -> web.Application:
