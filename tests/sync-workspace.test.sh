@@ -143,6 +143,8 @@ touch "$FIXTURE_REPO/CLAUDE.md"
 git init -q "$FIXTURE_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$FIXTURE_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$FIXTURE_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$FIXTURE_REPO/src/"
 cat > "$FIXTURE_REPO/sutando.config.json" <<'JSON'
 {
@@ -1063,6 +1065,8 @@ touch "$WSA_REPO/CLAUDE.md"
 git init -q "$WSA_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$WSA_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$WSA_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$WSA_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$WSA_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$WSA_REPO/"
 WSA_SLUG=$(printf '%s' "$WSA_REPO" | sed 's|/|-|g')
@@ -1086,6 +1090,8 @@ touch "$WSB_REPO/CLAUDE.md"
 git init -q "$WSB_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$WSB_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$WSB_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$WSB_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$WSB_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$WSB_REPO/"
 WSB_SLUG=$(printf '%s' "$WSB_REPO" | sed 's|/|-|g')
@@ -1161,6 +1167,8 @@ touch "$HOSTA_REPO/CLAUDE.md"
 git init -q "$HOSTA_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$HOSTA_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$HOSTA_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$HOSTA_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$HOSTA_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$HOSTA_REPO/"
 HOSTA_SLUG=$(printf '%s' "$HOSTA_REPO" | sed 's|/|-|g')
@@ -1189,6 +1197,8 @@ touch "$HOSTB_REPO/CLAUDE.md"
 git init -q "$HOSTB_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$HOSTB_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$HOSTB_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$HOSTB_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$HOSTB_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$HOSTB_REPO/"
 HOSTB_SLUG=$(printf '%s' "$HOSTB_REPO" | sed 's|/|-|g')
@@ -1331,6 +1341,8 @@ touch "$T27_REPO/CLAUDE.md"
 git init -q "$T27_REPO"
 cp "$REPO/scripts/sync-workspace.sh" "$T27_REPO/scripts/"
 cp "$REPO/scripts/sutando-config.sh" "$T27_REPO/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$T27_REPO/scripts/"
 cp "$REPO/src/sutando_config.py" "$T27_REPO/src/"
 cp "$FIXTURE_REPO/sutando.config.json" "$T27_REPO/"
 

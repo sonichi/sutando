@@ -75,8 +75,13 @@ def main() -> int:
         return fail("`tofu_onboard` function not found")
     if not re.search(r"if\s+ACCESS_FILE\.exists\(\)", tofu_block):
         return fail("tofu_onboard must race-guard with ACCESS_FILE.exists()", tofu_block)
-    if not re.search(r"os\.chmod\s*\(\s*ACCESS_FILE\s*,\s*0o600\s*\)", tofu_block):
-        return fail("tofu_onboard must chmod ACCESS_FILE to 0o600 — file holds "
+    # STRENGTHENED: the old assertion accepted `write_text(...)` + `os.chmod(0o600)`,
+    # which leaves the file world-readable between the two calls. Require
+    # write_private_text(), which creates the fd already 0600 (util_paths), so the
+    # window cannot exist. This is strictly stronger — the previous pattern passes
+    # for the buggy implementation.
+    if not re.search(r"write_private_text\s*\(\s*ACCESS_FILE\s*,", tofu_block):
+        return fail("tofu_onboard must use write_private_text(ACCESS_FILE, ...) — file holds "
                     "owner's Slack user ID, must not inherit umask 644",
                     tofu_block)
 

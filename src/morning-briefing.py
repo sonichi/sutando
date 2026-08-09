@@ -25,7 +25,6 @@ from util_paths import personal_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
-LOGS_DIR = WORKSPACE / "logs"
 STATE_DIR = WORKSPACE / "state"
 
 # Agent-written cache of the owner's real (Google Workspace) calendar. This
@@ -254,18 +253,25 @@ return output
     return events
 
 
-def get_reminders() -> list[str]:
-    """Get today's and overdue reminders via the existing script."""
+def get_reminders() -> "list[str] | None":
+    """Today's and overdue reminders, or None when the query could not run.
+
+    None and [] are different facts and the caller relies on the difference:
+    [] is a verified-empty list, None is "I do not know". Returning [] for a
+    timeout let `synthesize()` fold an unanswered query into "Everything looks
+    clean" — the same shape as the 2026-07-21 falsely-clear calendar bug
+    (#2256), which is why `get_calendar_events()` already draws this line.
+    """
     script_path = Path(__file__).parent.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
     if not script_path.exists():
-        return []
+        return None
     try:
         r = subprocess.run(
             [sys.executable, str(script_path), "list", "--due-today"],
             capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0:
-            return []
+            return None
         items = []
         # reminders.py prints the human-readable sentinel "No reminders."
         # (exit 0) when the due-today list is empty — skip it so the empty
@@ -278,29 +284,88 @@ def get_reminders() -> list[str]:
                 items.append(line)
         return items[:5]
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        return None
 
 
-def get_overnight_discord() -> list[str]:
-    """Read last 8 hours of Discord DMs from the bridge log."""
-    log = LOGS_DIR / "discord-bridge.log"
-    if not log.exists():
-        return []
-    try:
-        cutoff = time.time() - 8 * 3600
-        messages = []
-        for line in log.read_text(errors="replace").splitlines()[-200:]:
-            # Look for DM lines: [msg] #DM @user: text
-            if "[msg] #DM" in line and "is_dm: True" in line:
-                # Extract sender and preview
-                m = re.search(r'\[msg\] #DM @(\S+): (.+?) \(mentions:', line)
-                if m:
-                    sender, text = m.group(1), m.group(2)[:80]
-                    if sender != "Sutando" and "Sutando-Pro" not in sender:
-                        messages.append(f"{sender}: {text}")
-        return messages[-5:] if messages else []
-    except OSError:
-        return []
+def get_overnight_discord(now: float | None = None) -> list[str]:
+    """Owner Discord DMs from the last 8 hours, newest last (max 5).
+
+    Reads the TASK FILES the bridge writes, not `logs/discord-bridge.log`.
+
+    The log cannot answer this question. Its docstring promised an 8-hour window
+    and the code computed `cutoff = time.time() - 8 * 3600` and then never used
+    it: the effective window was `splitlines()[-200:]`, a line count. That is not
+    an oversight that a one-line patch fixes — the `[msg] #DM` lines carry no
+    timestamp at all (measured 2026-08-02: 10 of 6,754 lines in the live log had
+    an ISO stamp, and none of them were message lines), so there is nothing for a
+    time cutoff to compare against. Meanwhile the line window silently shrinks as
+    the bridge gets chattier: on the same log, all 9 matching DM lines sat at
+    indices 596-6177 while the window began at 6,554, so the briefing reported
+    ZERO overnight messages on a day that had them. The failure direction is
+    false-clean, which is the worst one for a daily briefing.
+
+    The bridge already writes a properly timestamped record of every DM it
+    processes: `tasks/task-<id>.txt`, archived to `tasks/archive/` after
+    handling, each carrying an ISO `timestamp:`, `source:`, `channel_name:` and
+    `access_tier:`. Reading those makes the promised 8-hour filter actually
+    implementable, with no new instrumentation.
+
+    Owner DMs are `source: discord` + `channel_name: DM` + `access_tier: owner`.
+    The tier check is what replaces the old sender-name exclusion: peer bots post
+    to shared channels as `team`, so they cannot reach this list.
+    """
+    now = time.time() if now is None else now
+    cutoff = now - 8 * 3600
+    tasks_dir = WORKSPACE / "tasks"
+    archive = tasks_dir / "archive"
+    found: list[tuple[float, str]] = []
+    # The archive is MONTH-PARTITIONED (`tasks/archive/YYYY-MM/<id>.txt`, PR
+    # #591); the flat form is legacy and only holds tasks archived before it.
+    # Scanning the flat form alone reproduces the very false-clean this function
+    # exists to fix: measured on the live workspace, 280 flat vs 178 month-
+    # partitioned, and in an 8-hour window 1 owner DM flat vs 2 missed. One
+    # level deep, matching discord-bridge.py's own `archive.glob(f"*/{id}.txt")`
+    # — not rglob, which would walk unbounded depth.
+    globs = ((tasks_dir, "task-*.txt"),
+             (archive, "task-*.txt"),
+             (archive, "*/task-*.txt"))
+    for directory, pattern in globs:
+        if not directory.is_dir():
+            continue
+        for path in directory.glob(pattern):
+            try:
+                head = path.read_text(errors="replace")
+            except OSError:
+                continue
+            fields = dict(re.findall(r"^([a-z_]+):[ \t]*(.*)$", head, re.M))
+            if fields.get("source") != "discord":
+                continue
+            if fields.get("channel_name") != "DM":
+                continue
+            if fields.get("access_tier", "owner") != "owner":
+                continue
+            stamp = fields.get("timestamp", "")
+            try:
+                when = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            # BOTH edges. Only the lower one was enforced, so a single
+            # future-dated timestamp counted as "overnight" in every briefing
+            # until the wall clock caught up — unbounded, and the mirror image
+            # of the false-clean this function exists to fix. The risk is not
+            # theoretical now that briefing truth rests on mutable on-disk
+            # stamps: clock skew, a hand-edited file, or imported state all
+            # produce one. Both bounds inclusive: `cutoff` is 8h ago exactly,
+            # and a task written this instant must still count.
+            if not cutoff <= when <= now:
+                continue
+            body = ""
+            m = re.search(r"^task:[ \t]*(.*)$", head, re.M)
+            if m:
+                body = m.group(1).strip()[:80]
+            found.append((when, body))
+    found.sort()
+    return [body for _when, body in found[-5:]]
 
 
 def _load_notifier():
@@ -325,6 +390,72 @@ def _load_notifier():
 
 
 _CPQ = _load_notifier()
+
+
+#: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
+#: DM'd, so a title clipped mid-word is read aloud as a mid-word fragment. A hard
+#: `title[:60]` produced, from a real 2026-08-02 run:
+#:     "WIRE - awaiting your verdict / steer (no urgency; nothing bl"
+#: - cut inside "blocked", and leaving an unmatched "(" so the parenthetical never
+#: closes. Clip on a word boundary instead, and drop a parenthetical that the clip
+#: left open rather than speaking half of it.
+def _cut_at_imbalance(s: str) -> str:
+    """Truncate `s` at the first bracket that cannot be matched, either way.
+
+    Both directions matter and only one was handled before. Stripping a leading
+    "(" shifts the slice window one character right, which can pull the matching
+    ")" into the output ALONE -- the mirror image of the orphan being removed:
+
+        clip_for_speech("(abcdefghi) long trailing title", 11) -> "abcdefghi)..."
+
+    A single left-to-right pass covers both: an unmatched ")" truncates before
+    itself; anything still open at the end truncates before the FIRST unmatched
+    "(" (not the last -- cutting at the first is what guarantees balance when
+    several are open).
+    """
+    stack: list[int] = []
+    for i, ch in enumerate(s):
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")":
+            if not stack:
+                return s[:i]
+            stack.pop()
+    return s[:stack[0]] if stack else s
+
+
+#: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
+#: DM'd, so a title clipped mid-word is read aloud as a mid-word fragment. A hard
+#: `title[:60]` produced, from a real 2026-08-02 run:
+#:     "WIRE - awaiting your verdict / steer (no urgency; nothing bl"
+#: - cut inside "blocked", and leaving an unmatched "(" so the parenthetical never
+#: closes. Clip on a word boundary instead, and never emit an unbalanced bracket.
+def clip_for_speech(text: str, limit: int) -> str:
+    """Clip to <= limit chars without cutting a word or orphaning a bracket.
+
+    Returns text unchanged when it already fits, so the common case is untouched
+    -- including text that is ALREADY unbalanced at the source. The contract is
+    "clipping must not create an orphan", not "rewrite titles we did not clip".
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+
+    def _shorten(s: str) -> str:
+        # limit - 1 reserves the ellipsis, so the result is never over the limit.
+        head = s[:limit - 1]
+        cut = head.rfind(" ")
+        if cut > 0:
+            head = head[:cut]
+        return _cut_at_imbalance(head).rstrip(" ,;:-\u2014/(")
+
+    head = _shorten(text)
+    if not head:
+        # The whole window sat inside a parenthetical opening at character 0.
+        # Drop the bracket and re-shorten -- through the SAME balance guard, which
+        # is what the first version of this fix missed.
+        head = _shorten(text.lstrip("(").lstrip())
+    return head + "\u2026"
 
 
 def get_pending_questions() -> list[str]:
@@ -369,16 +500,21 @@ def get_pending_questions() -> list[str]:
         title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
         if not title:
             continue
-        out.append(title[:60])
+        out.append(clip_for_speech(title, 60))
     return out
 
 
 
-def get_health_issues() -> list[str]:
-    """Run health check and return only the failed/warn items, concisely."""
+def get_health_issues() -> "list[str] | None":
+    """Failed health items, or None when the check could not run.
+
+    Same contract as `get_reminders`: [] means the check ran and found nothing,
+    None means it did not run. A timed-out health check returning [] made the
+    briefing assert a clean system it had never inspected.
+    """
     hc = Path(__file__).parent / "health-check.py"
     if not hc.exists():
-        return []
+        return None
     try:
         r = subprocess.run(
             [sys.executable, str(hc)],
@@ -398,9 +534,18 @@ def get_health_issues() -> list[str]:
                     issues.append(f"{name}: {detail}")
                 elif parts:
                     issues.append(parts[0])
+        # A non-zero exit is AMBIGUOUS here and must not be read as failure
+        # alone: health-check.py ends in `sys.exit(1 if issues else 0)`, so
+        # non-zero is its normal way of saying "I found problems" — and those
+        # problems are exactly what this function is for. The crash case is
+        # non-zero WITH nothing parseable (import error, traceback on stderr,
+        # empty stdout): the run produced no verdict at all, so the answer is
+        # "unknown", not "clean".
+        if r.returncode != 0 and not issues:
+            return None
         return issues[:3]
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        return None
 
 
 def get_daily_insight() -> str | None:
@@ -483,8 +628,14 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         if not has_raw_data and len(first_sentence) > 20:
             parts.append(f"Insight: {first_sentence}.")
 
-    # Closing — an unreadable calendar (None) is not a verified-clean day.
-    if events == [] and not reminders and not pending_qs and not health_issues:
+    # Closing — every input must be VERIFIED empty, not merely falsy. `None`
+    # from any gather means that query did not run, and an unanswered query is
+    # not evidence of a clean day. Previously only the calendar was checked this
+    # way, so a timed-out reminders fetch and a timed-out health check (both
+    # returning [] at the time) produced a confident "Everything looks clean"
+    # over two questions nobody had answered.
+    if (events == [] and reminders == [] and health_issues == []
+            and not pending_qs):
         parts.append("Everything looks clean. Good day for deep work.")
 
     return " ".join(parts)
@@ -525,7 +676,7 @@ def main():
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
 
     reminders = get_reminders()
-    print(f"  reminders: {len(reminders)} due")
+    print(f"  reminders: {'unavailable' if reminders is None else f'{len(reminders)} due'}")
 
     discord_msgs = get_overnight_discord()
     print(f"  discord overnight: {len(discord_msgs)} messages")
@@ -537,7 +688,7 @@ def main():
     print(f"  pending questions: {len(pending_qs)}")
 
     health_issues = get_health_issues()
-    print(f"  health issues: {len(health_issues)}")
+    print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")
 
     # Synthesize
     narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight)
