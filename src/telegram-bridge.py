@@ -1055,8 +1055,14 @@ def main():  # pragma: no cover
                                     outcome="ok" if _s["ok"] else "error",
                                     data={"text_chunks": _s["text_chunks"], "file_count": _s["files_sent"]},
                                 )
-                            print(f"  [proactive] sent to {owner_id}: {text[:80]}")
-                            f.unlink(missing_ok=True)
+                            if _s.get("ok"):
+                                print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                                f.unlink(missing_ok=True)
+                            else:
+                                # send_reply reports refusal by returning ok=False
+                                # without raising; the except below never sees it.
+                                print(f"  [proactive] send refused, releasing {f.name}")
+                                release_claim(f)
                         except Exception as e:
                             # Release, never delete: pollers scan `.txt`, so a deleted
                             # claim is a message no bridge can ever retry.

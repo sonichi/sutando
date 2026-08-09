@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""An UNDELIVERABLE proactive claim is released, not deleted.
+"""An undeliverable proactive claim is released, not deleted.
 
-Sibling of proactive-claim-release.test.py, which covers the *unready* claim.
-This covers the two branches where the file is ready but this bridge cannot
-send it: no owner is configured, and the send raised. Both used to fall through
-to `unlink`, which destroys a message that another bridge could have delivered.
-
-The delegation checks walk the AST rather than matching source text: the defect
-they pin is an `unlink` reachable from a non-delivery branch, which is a
-structural property. A regex over the source cannot see that the deleting call
-sat at the *outer* indent of the poll block -- the shape of the real bug.
+Walks the AST: the defect is an `unlink` reachable from a non-delivery branch,
+which is a structural property a source regex cannot see.
 """
 from __future__ import annotations
 
@@ -149,9 +142,8 @@ class UndeliverableClaimDelegationTest(unittest.TestCase):
                                 and stmt.test.left.id == "owner_id"):
                             continue
                         checked += 1
-                        # A guard clause (`if owner_id is None: ... continue`) makes
-                        # the following statements the owner-PRESENT path, where a
-                        # delete is correct. Only a fallthrough branch shares them.
+                        # A guard clause that `continue`s makes the followers the
+                        # owner-PRESENT path, where a delete is correct.
                         if isinstance(stmt.body[-1], (ast.Continue, ast.Return, ast.Raise)):
                             continue
                         for follower in body[i + 1:]:

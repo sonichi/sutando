@@ -1209,7 +1209,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> None:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> bool:
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -1222,9 +1222,22 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
 
     Long text chunked at 4000 chars per Slack message (40k hard cap, but
     readability suffers above ~4k).
+
+    Returns True when the caller may CONSUME the source (delivered, or there
+    was nothing to send) and False when a send was attempted and Slack refused.
+    `chat_postMessage` failures are caught in here and recorded as an error
+    event rather than raised, so a caller gating cleanup on "did not raise"
+    never sees the common failure — it has to consult this value. Purely
+    additive: the annotation was `-> None` and no existing caller reads it.
     """
     if not text:
-        return
+        # Unreachable from every current caller: both the task-reply and
+        # proactive drains guard empty text before calling (slack
+        # `if not text: claim.unlink()`, telegram :928). Kept as a contract
+        # statement rather than removed, because a future caller without that
+        # guard must get "consume it" — returning False would release an empty
+        # file, re-claim it, and loop forever.
+        return True  # pragma: no cover — see above; no caller reaches this
 
     parsed = parse_markers(text)
     clean_text = parsed.body
@@ -1298,8 +1311,12 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                     text=f"(file access denied: {fpath})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # The deny notice can be the ONLY user-visible output: a body of
+                # just `[file: /blocked]` posts no text chunk, so if this refusal
+                # is swallowed the caller consumes the source and nobody is told.
+                print(f"[Slack] deny-notice chat_postMessage failed: {e}", flush=True)
+                delivered_ok = False
             print(f"  BLOCKED file: {fpath}", flush=True)
         else:
             try:
@@ -1308,8 +1325,10 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                     text=f"(file not found: {fpath})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # Same reasoning as the deny branch above.
+                print(f"[Slack] not-found notice chat_postMessage failed: {e}", flush=True)
+                delivered_ok = False
 
     # Observability: one delivered-reply event. outcome reflects whether the
     # text chunks + file uploads actually succeeded (the helpers swallow API
@@ -1341,6 +1360,8 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             )
         except Exception:  # pragma: no cover  (defensive: result_audit import is safe + record() never raises)
             pass
+
+    return delivered_ok
 
 
 def _record_skip_audit(task_id: str, skip_value: str) -> None:
@@ -1497,10 +1518,15 @@ def result_watcher():
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
-                            _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
-                            mark_proactive_delivered(STATE_DIR, delivery_id)
-                            print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
-                            claim.unlink(missing_ok=True)
+                            if _send_reply(dm_channel, None, text, access_tier="owner"):
+                                mark_proactive_delivered(STATE_DIR, delivery_id)
+                                print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
+                                claim.unlink(missing_ok=True)
+                            else:
+                                # Slack refused WITHOUT raising, which is the ordinary
+                                # failure; the except below never sees it.
+                                print(f"  [proactive] send refused, releasing {claim.name}", flush=True)
+                                release_claim(claim)
                         except Exception as e:
                             # Release, never delete: pollers scan `.txt`, so a kept or
                             # deleted claim is a message no bridge can ever retry.

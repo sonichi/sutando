@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """A proactive Slack send that RAISES must release its claim, not destroy it.
 
-Behavioural sibling of proactive-undeliverable-claim-released.test.py, which
-asserts the same policy over the AST. This one drives the real `result_watcher`
-loop so the failure path actually executes: an AST test cannot show that a
-rejected DM survives, and diff coverage cannot see a line no test runs.
-
-The gap was real, not bureaucratic. Before this file, nothing anywhere drove a
-Slack proactive send that throws -- the exact path that used to fall through to
-`claim.unlink()` and destroy the message.
+Drives the real `result_watcher` loop, so the failure path actually executes.
 """
 from __future__ import annotations
 
