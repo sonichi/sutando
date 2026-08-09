@@ -1100,6 +1100,9 @@ def main():  # pragma: no cover
                     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                     archive_file(task_file, "tasks", task_id)
                     continue
+                # Bound before the try: a raise below must not leave the archive
+                # gate reading an unassigned name.
+                delivered_ok = False
                 try:
                     # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
                     # File attachments are in parsed.actions; send_reply() won't re-find them,
@@ -1137,9 +1140,15 @@ def main():  # pragma: no cover
                             outcome="ok" if delivered_ok else "error",
                             data={"task_id": task_id, "text_chunks": _s["text_chunks"], "file_count": sent_files},
                         )
-                    print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
+                    if delivered_ok:
+                        print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 except Exception as e:
                     print(f"[Telegram] Reply error: {e}", flush=True)
+                if not delivered_ok:
+                    # Restore the route popped above, or a retry has no chat_id.
+                    pending_replies[task_id] = chat_id
+                    print(f"[Telegram] reply refused, keeping {task_id} for retry", flush=True)
+                    continue
                 _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 # Archive (not delete) so we can mine patterns later.
                 archive_file(result_file, "results", task_id)

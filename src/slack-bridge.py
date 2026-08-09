@@ -1461,13 +1461,18 @@ def result_watcher():
                     _record_skip_audit(task_id, _skip_action.value)
                 else:
                     try:
-                        _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
-                        print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
+                        delivered = _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
                     except Exception as e:
                         print(f"[Slack] reply error: {e}", flush=True)
                         # Keep both the durable route and result file so the
                         # next poll (or restarted bridge) can retry delivery.
                         continue  # pragma: no cover - watcher loop retry; helper state is unit-tested
+                    if not delivered:
+                        # Slack refuses without raising, so the except never sees it;
+                        # archiving here would destroy an undelivered reply.
+                        print(f"[Slack] reply refused, keeping {task_id} for retry", flush=True)
+                        continue
+                    print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
 
                 _pop_pending_reply(task_id)
                 archive_file(result_file, "results", task_id)
