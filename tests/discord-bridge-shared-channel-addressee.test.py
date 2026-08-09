@@ -73,9 +73,8 @@ def main() -> int:
         "owner replies to their OWN message"
     print("  ok  owner replies to their OWN message (self-reply fix)")
 
-    # --- COMPOSITION: this branch's self-reply exemption meets main's
-    # other_agent_mentioned gate. Neither side's tests cover the interaction,
-    # and the merge that brought them together is where it could break.
+    # COMPOSITION: the self-reply exemption meets the other_agent_mentioned gate;
+    # neither side's own tests exercise the interaction.
     assert not addressed(author_is_bot=False, bot_mentioned=False, role_mentioned=False,
                          is_reply=True, reply_author_id=OWNER, author_id=OWNER,
                          other_agent_mentioned=True), \

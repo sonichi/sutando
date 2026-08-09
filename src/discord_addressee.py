@@ -64,14 +64,10 @@ def is_addressed_in_shared_channel(
     A fresh (non-reply) message from a human that addresses NOBODY is still
     processed (→ True): the owner posting directly is for whoever is listening —
     that is the pre-existing `requireMention:false` behavior and is out of scope
-    for this fix (the multi-agent "who owns an unaddressed message" question
-    belongs to the channel-IFC design, not the addressee gate).
+    for this fix.
 
     `other_agent_mentioned` is resolved by the adapter (which mentioned users are
     bots other than us); the policy decision stays here.
-
-    An owner self-reply (reply to own message, no @-mention) was dropped as
-    `replying_to_other`; the `author_id` exemption makes it count as addressed.
     """
     replying_to_me = bool(
         is_reply and reply_author_id is not None and reply_author_id == self_id
