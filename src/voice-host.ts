@@ -45,7 +45,30 @@ let nextBodhiPort = Number(process.env.SUTANDO_VOICE_HOST_BODHI_BASE || 8850);
 /** The `work` tool — durable-task handoff, the conversation-server pattern:
  * the MODEL decides an utterance is work and calls this; the implementation
  * writes a canonical task file the core's watcher picks up. */
-function buildWorkTool(device: { deviceId?: string; label?: string }): ToolDefinition {
+/** Where a session's delegated work goes — the multi-tenant seam.
+ * 'dir' = this machine's core (today's local mode). 'gateway' = the TENANT'S
+ * own core over the relay (cloud mode: the session runs cloudside but work
+ * and results stay with the user's core). The transport layer injects this
+ * per session after credential verification — NEVER client-supplied. */
+interface TenantRoute {
+	kind: 'dir' | 'gateway';
+	agentId?: string;
+	url?: string;      // gateway: relay task-submit endpoint for the tenant
+	token?: string;    // gateway: the tenant's relay bearer
+}
+
+async function submitViaGateway(route: TenantRoute, id: string, body: string): Promise<void> {
+	const res = await fetch(route.url!, {
+		method: 'POST',
+		headers: { 'content-type': 'application/json',
+			authorization: `Bearer ${route.token}` },
+		body: JSON.stringify({ id, task: body }),
+	});
+	if (!res.ok) throw new Error(`gateway submit ${res.status}`);
+}
+
+function buildWorkTool(device: { deviceId?: string; label?: string },
+		route: TenantRoute = { kind: 'dir' }): ToolDefinition {
 	return {
 		name: 'work',
 		description:
@@ -65,19 +88,26 @@ function buildWorkTool(device: { deviceId?: string; label?: string }): ToolDefin
 				`user_id: ${device.label || 'wearable'}`,
 				...(device.deviceId ? [`device_id: ${device.deviceId}`] : []),
 				...(device.label ? [`device_label: ${device.label}`] : []),
+				...(route.agentId ? [`agent_id: ${route.agentId}`] : []),
 				'access_tier: owner',
 				'priority: urgent',
 				'',
 			].join('\n');
-			writeFileSync(join(resolveWorkspace(), 'tasks', `${id}.txt`), body);
-			console.log(`${ts()} [work] delegated ${id}: ${task.slice(0, 80)}`);
+			if (route.kind === 'gateway') {
+				await submitViaGateway(route, id, body);
+			} else {
+				writeFileSync(join(resolveWorkspace(), 'tasks', `${id}.txt`), body);
+			}
+			console.log(`${ts()} [work] delegated ${id} via ${route.kind}`
+				+ `${route.agentId ? ' for ' + route.agentId : ''}: ${task.slice(0, 80)}`);
 			return { status: 'delegated', taskId: id,
 				note: 'Task handed to Sutando. Tell the user it is underway; results arrive as a notification.' };
 		},
 	};
 }
 
-function buildWearableAgent(device: { deviceId?: string; label?: string }): MainAgent {
+function buildWearableAgent(device: { deviceId?: string; label?: string },
+		route: TenantRoute = { kind: 'dir' }): MainAgent {
 	return {
 		name: 'wearable',
 		instructions:
@@ -90,7 +120,7 @@ function buildWearableAgent(device: { deviceId?: string; label?: string }): Main
 		// Spoken the moment a session opens: tells the wearer the session is
 		// live, and exercises the downstream path with no mic dependency.
 		greeting: 'Say only: "Hi, I\'m listening."',
-		tools: [buildWorkTool(device)],
+		tools: [buildWorkTool(device, route)],
 	} as MainAgent;
 }
 
@@ -140,11 +170,16 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			if (isBinary) throw new Error('first frame must be the {"open"} handshake');
 			const params = JSON.parse(first.toString()).open ?? {};
 			const device = params.device ?? {};   // transport-stamped, not client-supplied
+			// Tenant route: also transport-injected. Absent → local 'dir' mode.
+			// The ISOLATION INVARIANT lives here: everything tenant-specific in
+			// this session (task destination, attribution, later context reads)
+			// derives from THIS object and nothing else.
+			const route: TenantRoute = params.tenant ?? { kind: 'dir' };
 			session = new VoiceSession({
 				sessionId: `wearable_${Date.now()}_${n}`,
 				userId: 'wearable_user',
 				apiKey: GEMINI_API_KEY,
-				agents: [buildWearableAgent(device)],
+				agents: [buildWearableAgent(device, route)],
 				initialAgent: 'wearable',
 				port: bodhiPort,
 				host: '127.0.0.1',
@@ -207,7 +242,11 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			ws.send(JSON.stringify({ ok: true }));
 			sendState('listening');
 			try { (session as any).sendGreeting?.(); } catch { /* greeting is best-effort */ }
-			startResultsPoll(Date.now());
+			// ISOLATION: the local results dir belongs to THIS machine's core.
+			// Cloud (gateway-routed) sessions never touch it — their results
+			// arrive via the relay (follow-up); polling here would read another
+			// tenant's files.
+			if (route.kind === 'dir') startResultsPoll(Date.now());
 		} catch (e) {
 			console.error(`${ts()} [session ${n}] open failed:`, e);
 			try { ws.send(JSON.stringify({ ok: false, error: String(e) })); } catch { /* */ }
