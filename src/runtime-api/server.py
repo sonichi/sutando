@@ -227,7 +227,12 @@ class RuntimeServer:
                 port = int(os.environ.get("SUTANDO_SCP_WSS_PORT") or "8787")
             except ValueError:
                 port = 8787
+            device_store = None
+            if self._state_dir:
+                from device_store import DeviceStore  # noqa: PLC0415
+                device_store = DeviceStore(Path(self._state_dir) / "auth")
             wss = WsTransport(self.dispatcher, token=self._wss_token(),
+                              device_store=device_store,
                               result_subscribers=self._subscribers,
                               activity_subscribers=self._activity_subscribers,
                               host=host, port=port, log=_log)

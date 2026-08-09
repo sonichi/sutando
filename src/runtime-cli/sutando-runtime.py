@@ -61,6 +61,18 @@ def _wss_url() -> str | None:
     return os.environ.get("SUTANDO_SCP_WSS_URL") or None
 
 
+def _auth_dir() -> str:
+    """The Server's auth dir (device credentials + pairing) — resolved the same
+    way the daemon resolves state, so owner-local pair commands touch the same
+    files the running Server reads."""
+    st = os.environ.get("SUTANDO_RUNTIME_STATE")
+    if st:
+        return str(Path(st) / "auth")
+    sys.path.insert(0, str(_RUNTIME_API_DIR.parent))
+    from workspace_default import resolve_workspace  # noqa: PLC0415
+    return str(Path(resolve_workspace()) / "state" / "auth")
+
+
 def _rpc_wss(method: str, params: dict, timeout: float) -> dict:
     import asyncio  # noqa: PLC0415
     import aiohttp  # noqa: PLC0415
@@ -686,6 +698,21 @@ def main(argv=None) -> int:
     # get-result's id is OPTIONAL — no id means "the newest result".
     tsk.add_parser("get-result").add_argument("task_id", nargs="?")
 
+    # pair: device pairing + per-device credentials. new/list/revoke are
+    # owner-local (touch the Server's auth dir directly, no daemon needed);
+    # redeem runs on the NEW device over WSS (pairing token → credential).
+    prg = sub.add_parser("pair").add_subparsers(dest="cmd", required=True)
+    pnew = prg.add_parser("new")
+    pnew.add_argument("--label", required=True)
+    pnew.add_argument("--grant", action="append", default=None,
+                      help="method to grant (repeatable); default = read + task.submit/cancel")
+    pnew.add_argument("--ttl", type=int, default=600)
+    prg.add_parser("list")
+    prg.add_parser("revoke").add_argument("device_id")
+    pred = prg.add_parser("redeem")
+    pred.add_argument("token")
+    pred.add_argument("--label", default=None)
+
     args = ap.parse_args(argv)
     if args.group == "instance":
         # Registry discovery/start are FILE-based by design — they must work
@@ -715,6 +742,38 @@ def main(argv=None) -> int:
         print(json.dumps({"instances": instance_registry.list_instances()},
                          ensure_ascii=False, indent=1))
         return 0
+    if args.group == "pair":
+        from device_store import DeviceStore  # noqa: PLC0415
+        if args.cmd == "redeem":
+            # New device: present the pairing token as the bearer, exchange it
+            # for a long-term credential over WSS. Needs SUTANDO_SCP_WSS_URL.
+            if not _wss_url():
+                print(json.dumps({"error": "set SUTANDO_SCP_WSS_URL to the Server "
+                                  "endpoint (ws://host:port/scp)"}), file=sys.stderr)
+                return 1
+            os.environ["SUTANDO_SCP_WSS_TOKEN"] = args.token
+            res = _rpc_wss("pair.redeem",
+                           {"label": args.label} if args.label else {}, timeout=15)
+            print(json.dumps(res, ensure_ascii=False, indent=1))
+            return 0
+        store = DeviceStore(_auth_dir())  # owner-local
+        if args.cmd == "new":
+            tok = store.mint_pairing(args.label, grants=args.grant, ttl_s=args.ttl)
+            endpoint = _wss_url() or "ws://<server-lan-ip>:8787/scp"
+            print(json.dumps({
+                "pairing_token": tok, "label": args.label,
+                "endpoint": endpoint, "ttl_s": args.ttl,
+                "redeem_with": f"SUTANDO_SCP_WSS_URL={endpoint} "
+                               f"sutando pair redeem {tok}"},
+                ensure_ascii=False, indent=1))
+            return 0
+        if args.cmd == "list":
+            print(json.dumps({"devices": store.list_devices()},
+                             ensure_ascii=False, indent=1))
+            return 0
+        if args.cmd == "revoke":
+            print(json.dumps({"revoked": store.revoke(args.device_id)}))
+            return 0
     try:
         if args.group == "approval":
             result = _rpc("approval.request", {

@@ -85,6 +85,7 @@ class WsTransport:
 
     def __init__(self, dispatcher, *, token: str,
                  method_allow=READ_ONLY_METHODS,
+                 device_store=None,
                  result_subscribers: set | None = None,
                  activity_subscribers: set | None = None,
                  host: str = "127.0.0.1", port: int = 8787,
@@ -92,6 +93,10 @@ class WsTransport:
         self.dispatcher = dispatcher
         self.token = token
         self.method_allow = frozenset(method_allow)
+        # Per-device credentials + pairing (opaque-bearer v0). When present, a
+        # connection is authorized by ITS device credential's grants, not the
+        # shared read-only allowlist. None → single shared bearer only.
+        self.device_store = device_store
         # The server's OWN subscriber sets (shared with the UDS transport); a
         # WSS subscriber is a WsWriterSink added to these, so the server's push
         # watchers reach it with no transport-specific code. None → the
@@ -105,32 +110,66 @@ class WsTransport:
         self._runner: web.AppRunner | None = None
 
     # ── auth (network edge) ──────────────────────────────────────────────────
-    def _authorized(self, request: web.Request) -> bool:
-        """Constant-time bearer check. Accepts `Authorization: Bearer <t>` or a
-        `?token=<t>` query param (browsers/WebSocket clients can't always set
-        headers on the upgrade). An empty configured token authorizes no one."""
+    def _presented(self, request: web.Request) -> str:
         auth = request.headers.get("Authorization", "")
-        presented = (auth[len("Bearer "):] if auth.startswith("Bearer ")
-                     else request.query.get("token", ""))
-        return bool(self.token) and hmac.compare_digest(presented, self.token)
+        return (auth[len("Bearer "):] if auth.startswith("Bearer ")
+                else request.query.get("token", ""))
+
+    def _resolve_auth(self, request: web.Request) -> dict | None:
+        """Resolve the presented bearer to a connection auth context, or None
+        (→ 401). Precedence: a paired DEVICE credential (its own grants) → the
+        shared read-only token → a valid PAIRING token (may only pair.redeem).
+        `grants` is the effective per-connection method set."""
+        tok = self._presented(request)
+        if not tok:
+            return None
+        if self.device_store is not None:
+            dev = self.device_store.authenticate(tok)
+            if dev is not None:
+                return {"kind": "device", "token": tok,
+                        "device_id": dev.get("device_id"),
+                        "grants": frozenset(dev.get("granted_methods", ()))}
+        if self.token and hmac.compare_digest(tok, self.token):
+            # shared read-only bearer — includes the streaming subscribe
+            return {"kind": "shared", "token": tok,
+                    "grants": self.method_allow | {"task.subscribe"}}
+        if self.device_store is not None and self.device_store.pending_pairing(tok):
+            return {"kind": "pairing", "token": tok, "grants": frozenset({"pair.redeem"})}
+        return None
 
     # ── dispatch ─────────────────────────────────────────────────────────────
     async def _dispatch_one(self, ws: web.WebSocketResponse,
-                            sink: "WsWriterSink", data: str) -> None:
+                            sink: "WsWriterSink", auth: dict, data: str) -> None:
         raw = data.encode("utf-8") if isinstance(data, str) else data
         try:
             req_id, method, params = parse_line(raw)
         except ProtocolError as e:
             await ws.send_str(error_frame(e.req_id, e.code, e.message).decode())
             return
-        if method == "task.subscribe":
-            # Transport mode-switch (read-only stream) — handled before the
-            # allowlist, exactly as the UDS transport does. The sink joins the
-            # server's own subscriber sets; the push watchers do the rest.
-            if self._result_subs is None:
+        grants = auth["grants"]
+        if method == "pair.redeem":
+            # A connection authenticated by a pairing token exchanges it for a
+            # long-term per-device credential (returned once). No dispatcher
+            # round-trip — pairing state is the device store's, not the agent's.
+            if auth["kind"] != "pairing" or self.device_store is None:
                 await ws.send_str(error_frame(
-                    req_id, -32601,
-                    "task.subscribe not available on this transport").decode())
+                    req_id, -32601, "pair.redeem requires a pairing token").decode())
+                return
+            issued = self.device_store.redeem_pairing(
+                auth["token"], label=params.get("label"),
+                capabilities=params.get("capabilities"))
+            if issued is None:
+                await ws.send_str(error_frame(
+                    req_id, -32000, "pairing token invalid, expired, or used").decode())
+                return
+            await ws.send_str(result_frame(req_id, issued).decode())
+            return
+        if method == "task.subscribe":
+            # Transport mode-switch (read-only stream), before the grant check —
+            # the sink joins the server's subscriber sets; watchers do the rest.
+            if "task.subscribe" not in grants or self._result_subs is None:
+                await ws.send_str(error_frame(
+                    req_id, -32601, "task.subscribe not permitted").decode())
                 return
             streams = []
             if params.get("results", True):
@@ -142,10 +181,10 @@ class WsTransport:
             await ws.send_str(result_frame(
                 req_id, {"subscribed": True, "streams": streams}).decode())
             return
-        if method not in self.method_allow:
+        if method not in grants:
             await ws.send_str(error_frame(
                 req_id, -32601,
-                f"method not permitted on this transport: {method}").decode())
+                f"method not permitted for this credential: {method}").decode())
             return
         try:
             result = await self.dispatcher.handle(method, params)
@@ -158,7 +197,8 @@ class WsTransport:
                 error_frame(req_id, -32000, f"server error: {e}").decode())
 
     async def _handle(self, request: web.Request):
-        if not self._authorized(request):
+        auth = self._resolve_auth(request)
+        if auth is None:
             return web.Response(status=401, text="unauthorized")
         ws = web.WebSocketResponse(max_msg_size=MAX_LINE_BYTES + 1024)
         await ws.prepare(request)
@@ -166,7 +206,7 @@ class WsTransport:
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
-                    await self._dispatch_one(ws, sink, msg.data)
+                    await self._dispatch_one(ws, sink, auth, msg.data)
                 elif msg.type == WSMsgType.ERROR:
                     break
                 # non-text frames are ignored — SCP is a text JSON protocol

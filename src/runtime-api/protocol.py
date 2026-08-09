@@ -80,6 +80,7 @@ METHODS = (
     "task.list_results",
     "task.subscribe",
     "request.list",
+    "pair.redeem",       # WSS-only: exchange a pairing token for a device credential
 )
 
 
