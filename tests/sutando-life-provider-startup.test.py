@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 
 
-SKILL = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parent.parent
+SKILL = REPO / "skills" / "sutando-life-provider"
 SERVE_PATH = SKILL / "scripts" / "serve.py"
 SPEC = importlib.util.spec_from_file_location("sutando_life_provider_serve", SERVE_PATH)
 assert SPEC and SPEC.loader
@@ -27,7 +28,9 @@ class ProviderStartupTests(unittest.TestCase):
             SERVE.runtime_main = original
 
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0], [SERVE.registry_inputs])
+        self.assertEqual(
+            calls[0], [SERVE.github_registry_inputs, SERVE.discord_registry_inputs]
+        )
 
     def test_manifest_declares_owner_startup_entrypoint(self):
         manifest = json.loads((SKILL / "manifest.json").read_text())

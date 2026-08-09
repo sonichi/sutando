@@ -11,8 +11,8 @@ import unittest
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "github_provider.py"
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parent.parent
+MODULE_PATH = REPO / "skills" / "sutando-life-provider" / "scripts" / "github_provider.py"
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 from capability_registry import EphemeralCapabilityRegistry  # noqa: E402
 

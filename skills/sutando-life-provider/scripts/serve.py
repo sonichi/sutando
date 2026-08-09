@@ -12,12 +12,13 @@ _REPO = _HERE.parents[2]
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_REPO / "src" / "runtime-api"))
 
-from github_provider import registry_inputs  # noqa: E402
+from discord_provider import registry_inputs as discord_registry_inputs  # noqa: E402
+from github_provider import registry_inputs as github_registry_inputs  # noqa: E402
 from server import main as runtime_main  # noqa: E402
 
 
 def main() -> None:
-    runtime_main([registry_inputs])
+    runtime_main([github_registry_inputs, discord_registry_inputs])
 
 
 if __name__ == "__main__":
