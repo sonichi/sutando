@@ -96,5 +96,32 @@ class SkipMarkers(unittest.TestCase):
         self.assertTrue(called["send"], "file-marker handling regressed")
 
 
+class DmBanGate(SkipMarkers):
+    """dm-ban.sentinel must gate this consumer too — it is the LAST one in the
+    poll_dm_fallback chain and is not a proactive-*.txt reader, so the
+    delivery-loop guards added elsewhere for that path do not cover it."""
+
+    def setUp(self):
+        import tempfile
+        self.d = Path(tempfile.mkdtemp(prefix="dm-result-ban-"))
+        (self.d / "state").mkdir()
+        self.orig_repo = dm.REPO
+        dm.REPO = self.d
+
+    def tearDown(self):
+        dm.REPO = self.orig_repo
+
+    def test_banned_body_is_not_delivered(self):
+        (self.d / "state" / "dm-ban.sentinel").write_text("")
+        called, out = self._run("Here is the answer you asked for.")
+        self.assertFalse(called["send"], "delivered a DM while dm-ban.sentinel exists")
+        self.assertFalse(called["voice"], "returned before the voice probe, as intended")
+        self.assertIn("dm-ban.sentinel", out)
+
+    def test_unbanned_body_is_still_delivered(self):
+        called, _ = self._run("Here is the answer you asked for.")
+        self.assertTrue(called["send"], "an ordinary result stopped being delivered")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

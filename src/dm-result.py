@@ -421,6 +421,10 @@ def main():
         print(f"dm-result: [{skip.value}] marker — not delivering")
         return
 
+    if (REPO / "state" / "dm-ban.sentinel").exists():
+        print("dm-result: dm-ban.sentinel present — not delivering")
+        return
+
     if voice_connected():
         print("dm-result: voice client connected, skipping DM (voice will deliver)")
         return
