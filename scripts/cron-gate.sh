@@ -46,6 +46,14 @@ shift
 # file every fire, silently and permanently. This is the gate-side (root) half
 # of the fix; the eligibility-side half (don't migrate gated entries) landed in
 # reconcile_launchd.py.
+#
+# Exclude task-workstream-grouping-*.txt (and its legacy task-project-grouping-*
+# name) for the same reason: task_workstreams.py queues them only while the core
+# is idle, so every cron fire that follows an idle core sees one and defers. They
+# declare access_tier: owner (source: task-workstream-grouping, priority: low),
+# which the tier filter below cannot distinguish from a human DM. Observed
+# 2026-08-09: pending-questions, sync-workspace and pr-flag deferred three fires
+# in a row with only a classifier task queued.
 # Tier filter: a task that EXPLICITLY declares a non-owner access_tier (team /
 # other / ambient) is peer or public traffic, not the human-owner DMs/voice this
 # gate exists to yield to. Deferring on it starves the cron for as long as peers
@@ -65,7 +73,7 @@ owner_task_queued() {
       *) return 0 ;;                    # owner, or unstated -> yield
     esac
   done <<EOF
-$(find "$WORKSPACE/tasks" -maxdepth 1 -name 'task-*.txt' ! -name 'task-cron-*.txt' 2>/dev/null)
+$(find "$WORKSPACE/tasks" -maxdepth 1 -name 'task-*.txt' ! -name 'task-cron-*.txt' ! -name 'task-workstream-grouping-*.txt' ! -name 'task-project-grouping-*.txt' 2>/dev/null)
 EOF
   return 1
 }
