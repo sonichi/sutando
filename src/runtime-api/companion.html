@@ -121,7 +121,17 @@ async function onOpen(token) {
   const agent = localStorage.getItem('scp_agent');
   if (agent) $('voicemsg').textContent = 'agent: ' + agent;
   initVoiceUi();
-  try { const i = await rpc('sutando.info'); $('agent').textContent = i.agentId || ''; } catch (e) {}
+  // Agent-first display: the paired agent (from pair.redeem) is the truth;
+  // sutando.info's actorId can be a "local-agent" fallback — never show that.
+  const pairedAgent = localStorage.getItem('scp_agent');
+  if (pairedAgent) { $('agent').textContent = pairedAgent; }
+  else {
+    try {
+      const i = await rpc('sutando.info');
+      const aid = i.agentId || '';
+      $('agent').textContent = aid === 'local-agent' ? '' : aid;
+    } catch (e) {}
+  }
   try { await rpc('client.hello', { device_type: 'web', capabilities: ['display', 'touch'] }); } catch (e) {}
   try {
     const st = await rpc('sutando.status');
