@@ -60,6 +60,10 @@ check("vault set (credential entry) -> deny (prohibited overlay)", dec == "deny"
 # owner write-irreversible, no grant -> needs-authorization deny (confirm-first)
 rc, dec, out = run("Bash", "gh pr merge 2729 --squash")
 check("gh pr merge -> deny (owner write-irreversible needs authorization)", dec == "deny", out)
+# the deny reason must match option A's contract: a human performs it — never the
+# removed "mint a standing grant" path (which would loop forever).
+check("needs-auth deny reason says a human performs it, not 'mint a standing grant'",
+      "human must perform" in out and "standing grant" not in out, out)
 # review writes with the PR number BEFORE the flag must not bypass the gate
 rc, dec, out = run("Bash", "gh pr review 2729 --approve")
 check("gh pr review <n> --approve -> deny (no number-first bypass)", dec == "deny", out)

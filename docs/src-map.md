@@ -22,7 +22,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
-- **`capability_mediator.py`** — Mediated capability layer — the mediator (execution + grants + escalation + audit).
+- **`capability_mediator.py`** — Mediated capability layer — the mediator library (in-process; not yet wired to any production caller).
 - **`capability_policy.py`** — Mediated capability layer — policy-as-data + the decision function.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.

@@ -1,32 +1,14 @@
 #!/usr/bin/env python3
-"""Capability-gate — PreToolUse hook, the enforcement locus for the mediated
-capability layer (docs/design-mediated-capability-layer.md, RFC #2632 step 3).
+"""Capability-gate — PreToolUse hook that consumes src/capability_policy.decide().
 
-Why a hook and not a library: an advisory library the agent can simply not call
-is discipline, not mechanism (RFC revised open-question 2). The layer's headline
-property — "authorization asserted in observed content can't satisfy
-needs-authorization by construction" — only holds if the gate is *unavoidable*.
-This hook is that unavoidable point for agent-tool surfaces; it consumes the SAME
-src/capability_policy decision function as the runtime-API dispatcher, so a
-capability decision is made in exactly one place.
-
-Scope (deliberately narrow, fail-OPEN): it acts ONLY on tool calls it can map to
-a prohibited-overlay or write-irreversible capability — a financial move, a new
-credential entry, or an irreversible git/gh mutation. Everything else passes
-untouched, so it cannot block ordinary work. Within the core session the
-principal is owner (non-owner tasks are delegated to a sandboxed executor and
-never reach this session's tools); tier can be overridden via
-SUTANDO_CAPABILITY_TIER for a scoped runner.
-
-Rollout: OFF unless SUTANDO_CAPABILITY_GATE=1. Off, it exits 0 and does nothing —
-so landing it cannot disrupt a running core; enforcement is enabled deliberately.
-On, prohibited -> deny (human-only); owner write-irreversible -> deny with the
-escalation instruction (confirm-first: a human performs the action).
-
-Deploy: register under PreToolUse for "Bash" (and add mappings as more tool
-surfaces are gated). This is a coarse confirm-first backstop — it does NOT itself
-honor authorization grants (an unforgeable owner-approval path is separate future
-work); a needs-authorization action is always a confirm-first deny.
+Opt-in DORMANT scaffolding, not a wired enforcement layer: OFF unless
+SUTANDO_CAPABILITY_GATE=1, and nothing production-registers it yet. When enabled
+it is a coarse confirm-first backstop over Bash — prohibited/irreversible/deny ->
+deny; a needs-authorization action is always a confirm-first deny (a human
+performs it: this hook does NOT honor grants). Fail-OPEN: anything it can't map,
+or a missing policy module, passes untouched, so landing it can't disrupt a core.
+Principal is owner by default (SUTANDO_CAPABILITY_TIER overrides for a scoped
+runner). Design rationale lives in docs/design-mediated-capability-layer.md.
 """
 import json
 import os
@@ -102,8 +84,7 @@ def main():
         _deny(f"CAPABILITY GATE: {verb} denied for tier {tier}. [{decision.rule}]")
     if decision.decision == cp.NEEDS_AUTH:
         _deny(f"CAPABILITY GATE: {verb} is irreversible and needs owner "
-              f"authorization first (no covering standing grant). Confirm with the "
-              f"owner or mint a standing grant before retrying. [{decision.rule}]")
+              f"authorization — a human must perform this action. [{decision.rule}]")
     sys.exit(0)   # allow / delegate -> pass (delegate is handled by the task path)
 
 

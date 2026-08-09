@@ -1,36 +1,13 @@
 #!/usr/bin/env python3
-"""Mediated capability layer — the mediator (execution + grants + escalation + audit).
+"""Mediated capability layer — the mediator library (in-process; not yet wired to
+any production caller). Decision core is src/capability_policy.py.
 
-Second half of docs/design-mediated-capability-layer.md (RFC #2632); the decision
-core is src/capability_policy.py. A consumer never holds a raw key, tool handle,
-or merge button — it calls ``mediate(verb, args, handle, ...)`` and the mediator
-resolves, authorizes, executes, and audits against the single policy:
-
-    request -> derive principal (from a trusted, mediator-owned handle)
-            -> decide(...) [capability_policy]
-            -> allow:       execute -> verify outcome -> audit
-               delegate:    return a sandboxed-delegate directive       -> audit
-               needs-auth:  covering grant? consume+execute+verify+audit
-                            else escalate (write-then-assert) + audit(pending)
-               deny/prohibited: refuse (rule cited)                     -> audit
-
-Guarantees the RFC requires and this module enforces mechanically:
-- **Trust root:** a caller never submits a principal. The principal is derived
-  from an opaque handle the mediator minted against a task envelope; unknown /
-  expired / closed handles are rejected.
-- **Grants are the ONLY satisfier of needs-authorization.** A fresh single-use
-  grant (nonce consumed before execution) or a standing scope grant — never a
-  claim embedded in observed content (a string is not a grant).
-- **Verified outcome:** a mutation is ``succeeded`` only when an independent
-  postcondition verifier confirms it; a callee's truthy return is never enough
-  (``unknown``/``failed`` otherwise).
-- **Escalation delivery (write-then-assert):** an escalation is not "recorded"
-  until it is read back and confirmed to COUNT (above the pending-questions
-  ``# Resolved`` divider); a write whose read-back fails is a failed escalation,
-  surfaced, not assumed delivered.
-
-Dependency-light + injectable (clock, audit path, pending-questions path,
-executor, verifier) so it is hermetically testable AND live-demonstrable.
+``mediate(verb, args, handle, ...)`` derives the principal from a trusted mediator-
+minted handle (a caller never submits one), calls decide(), then for allow executes
++ verifies + audits; needs-auth consumes a covering in-process grant or escalates
+write-then-assert; deny/prohibited refuses. Dependency-light + injectable (clock,
+audit/pending paths, executor, verifier) for hermetic tests. Design + guarantees:
+docs/design-mediated-capability-layer.md.
 """
 from __future__ import annotations
 
@@ -53,19 +30,16 @@ class _Context(NamedTuple):
 
 
 class ContextRegistry:
-    """Mints opaque handles bound to a derived principal AND the originating
-    task/request identity. A handle is process-local (cross-process handles are
-    rejected by construction — they never exist in this registry) and
-    single-registry; unknown/expired/closed -> None."""
+    """Mints opaque, process-local handles bound to a derived principal + the
+    originating task id. Unknown/expired/closed -> None (fail-closed)."""
 
     def __init__(self, now: Callable[[], float] = time.time):
         self._now = now
         self._by_handle: dict = {}
 
     def mint(self, envelope: dict, ttl_seconds: float = 900.0) -> str:
-        """Mint a handle from an authenticated task ENVELOPE. The principal AND
-        the originating task id are derived here; a caller can never inject a
-        tier, and the task id is retained so a fresh grant can bind to it."""
+        """Mint a handle from an authenticated task ENVELOPE — principal + task
+        id are derived here; a caller can never inject a tier."""
         env = envelope or {}
         principal = cp.Principal(
             tier=cp.normalize_tier(env.get("access_tier")),
@@ -118,10 +92,8 @@ def digest_args(args) -> str:
 
 
 class GrantStore:
-    """Owner-minted, enumerable, revocable. A grant is BOUND to the principal the
-    approval was for (identity + source), so it is not a bearer token another
-    same-tier principal can replay. A fresh grant is consumed before execution;
-    a standing grant is not. Expiry is enforced on read."""
+    """In-process grants bound to the principal (identity+source), not bearer
+    tokens. Fresh = single-use (consumed before execution); standing = scoped."""
 
     def __init__(self, now: Callable[[], float] = time.time):
         self._now = now
@@ -156,15 +128,9 @@ class GrantStore:
 
     def consume_covering(self, req: cp.CapabilityRequest, principal: cp.Principal,
                          task_id: str = "") -> Optional[Grant]:
-        """Find a LIVE covering grant BOUND to this principal and, for a FRESH
-        grant, to the originating task — and if single-use, atomically consume it
-        BEFORE the caller executes. A grant covers only when its verb, tier, AND
-        user_id (and source, if pinned) match the principal; a FRESH grant must
-        ALSO match the current task_id (fail-closed if the grant carries a task_id
-        the request doesn't match) — so a grant approved for task-A cannot be
-        replayed by task-B. An approval record is neither a bearer token nor
-        reusable across requests. Standing grants stay scope-based (no task bind)
-        and are returned without consumption (RFC)."""
+        """Return + atomically consume (if single-use) a LIVE grant bound to this
+        principal; a fresh grant must also match the current task_id (so task-A's
+        grant can't be replayed by task-B). Fail-closed on any missing bind."""
         if not principal.user_id:
             return None
         for g in self._live():

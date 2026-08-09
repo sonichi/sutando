@@ -69,11 +69,8 @@ DELEGATE = "delegate-sandboxed"
 PROHIBITED = "prohibited"   # human-only, all tiers incl. owner — never automated
 DECISIONS = (ALLOW, DENY, NEEDS_AUTH, DELEGATE, PROHIBITED)
 
-# ── The capability x tier matrix as DATA (RFC "Model" table). Every cell decided;
-#    tested total by tests/capability-policy.test.py. The two prohibited-overlay
-#    classes are ``PROHIBITED`` for ALL tiers incl. owner (the layer directs the
-#    human to do it); they are ALSO checked ahead of the matrix in decide() so an
-#    overlay membership can never be satisfied by a grant.
+# Capability x tier matrix as DATA; every cell decided (totality tested). The
+# prohibited-overlay classes are checked ahead of the matrix so no grant satisfies them.
 _MATRIX = {
     INFO_READ:          {OWNER: ALLOW, TEAM: ALLOW,     OTHER: DENY, AMBIENT: DELEGATE},
     CREDENTIAL_USE:     {OWNER: ALLOW, TEAM: ALLOW,     OTHER: DENY, AMBIENT: DENY},
@@ -85,14 +82,12 @@ _MATRIX = {
     CREDENTIAL_ENTRY:   {OWNER: PROHIBITED, TEAM: PROHIBITED, OTHER: PROHIBITED, AMBIENT: PROHIBITED},
 }
 
-# Classes that are prohibited-overlay members by default in the reference
-# deployment (RFC paragraph-symbol). decide() checks the overlay FIRST; no grant
-# (standing or fresh) can satisfy an overlay capability.
+# Prohibited-overlay classes: decide() checks the overlay FIRST, so no grant
+# (standing or fresh) can ever satisfy one.
 DEFAULT_PROHIBITED_OVERLAY = frozenset({FINANCIAL_MOVE, CREDENTIAL_ENTRY})
 
-# ── Concrete capability verb -> class. Verbs are "verb:scope"; the class lookup
-#    keys on the bare verb (scope is carried on the request for grant matching).
-#    First slice: credential:* + github:* are real; others map for the matrix.
+# Concrete verb -> class; the class lookup keys on the bare verb (scope rides on
+# the request for grant matching).
 _VERB_CLASS = {
     "info:read": INFO_READ,
     "github:read": INFO_READ,
@@ -141,22 +136,9 @@ class Decision(NamedTuple):
 
 
 def _covered_by_grant(req: CapabilityRequest, principal: Principal, grants) -> bool:
-    """True iff a covering grant exists, BOUND to the authenticated principal
-    (RFC "authorization grants": a grant binds the owner identity and source on
-    which approval arrived). A grant covers only when it matches the verb, the
-    principal's **tier AND user_id** (and source, if the grant pins one), and
-    either the exact args_digest (fresh single-use grant) or a scope pattern
-    (standing grant).
-
-    Fail-closed identity binding — an approval record is NOT a bearer token: a
-    grant that omits ``tier`` or ``user_id``, or names a different principal,
-    never covers, and a principal with no ``user_id`` can never be covered. This
-    is what stops one principal replaying another same-tier principal's grant.
-
-    This module only CONSULTS grants; minting, nonce consumption, and expiry live
-    in the mediator. Grant objects are mappings/attr-bags; unknown shapes never
-    match. Observed-content 'authorization' is not a grant and can never appear.
-    """
+    """True iff a live grant covers the request: matches verb, tier AND user_id
+    (+source if pinned), and args_digest (fresh) or scope (standing). Fail-closed
+    — a grant missing tier/user_id or a principal with no user_id never covers."""
     if not grants or not principal.user_id:
         return False
     for g in grants:
@@ -228,11 +210,8 @@ def decide(req: CapabilityRequest, principal: Principal, grants=None,
     return Decision(base, cls, f"{cls}/{tier} -> {base} (matrix)")
 
 
-# ── Inbound-content classification (RFC "Totality is required at two levels").
-#    classify() is TOTAL: every input yields a Classification, and anything not
-#    matched is the explicit terminal UNCLASSIFIED (fail-closed + observable), not
-#    a silent no-op. Recognizers are intentionally conservative; a miss is
-#    UNCLASSIFIED, never a guessed privileged action.
+# Inbound-content classification: classify() is TOTAL — every input yields a
+# Classification; an unmatched input is the explicit UNCLASSIFIED terminal (fail-closed).
 UNCLASSIFIED = "unclassified"
 
 
