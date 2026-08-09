@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -202,7 +203,7 @@ class DiscordProviderTests(unittest.TestCase):
             }
             for index in range(101)
         ]
-        fake, descriptor, read = self.ready(channel, rows)
+        fake, descriptor, read = self.ready(channel, rows, [])
         registry = EphemeralCapabilityRegistry(
             {PROVIDER.CAPABILITY_ID: descriptor},
             {PROVIDER.CAPABILITY_ID: read},
@@ -232,6 +233,56 @@ class DiscordProviderTests(unittest.TestCase):
         self.assertIn("after=", fake.calls[-1]["url"])
         self.assertIn("limit=100", fake.calls[-1]["url"])
         self.assertLess(len(json.dumps(result).encode("utf-8")), 192 * 1024)
+
+    def test_message_delta_pages_past_dense_overlap_without_cursor_regression(self):
+        channel = {"id": CHANNEL_ID, "guild_id": GUILD_ID, "type": 0}
+        previous_id = 1600000000000001000
+        overlap_rows = [
+            {
+                "id": str(previous_id - 200 + index),
+                "timestamp": PROVIDER._snowflake_time(str(previous_id - 200 + index)),
+                "content": f"overlap {index}",
+                "author": {"id": "900000000000000005", "username": "member"},
+            }
+            for index in range(100)
+        ]
+        new_rows = [
+            {
+                "id": str(previous_id + index),
+                "timestamp": PROVIDER._snowflake_time(str(previous_id + index)),
+                "content": f"new {index}",
+                "author": {"id": "900000000000000005", "username": "member"},
+            }
+            for index in (1, 2)
+        ]
+        fake, _, read = self.ready(channel, overlap_rows, new_rows)
+
+        result = read({
+            "operation": "channel.messages.delta",
+            "resource": {"channelId": CHANNEL_ID},
+            "cursor": {
+                "version": 1,
+                "ts": PROVIDER._snowflake_time(str(previous_id)),
+                "id": str(previous_id),
+            },
+            "limit": 100,
+        })
+
+        message_calls = [call for call in fake.calls if "/messages?" in call["url"]]
+        self.assertEqual(len(message_calls), 2)
+        second_query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(message_calls[1]["url"]).query
+        )
+        self.assertEqual(second_query["after"], [str(previous_id)])
+        self.assertEqual(result["nextCursor"]["id"], str(previous_id + 2))
+        self.assertGreaterEqual(int(result["nextCursor"]["id"]), previous_id)
+        self.assertEqual(
+            [item["providerId"] for item in result["items"][-2:]],
+            [str(previous_id + 1), str(previous_id + 2)],
+        )
+        self.assertEqual(len(result["items"]), 100)
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["coverage"]["gapPossible"])
 
     def test_invalid_resource_and_cursor_do_not_invoke_discord(self):
         fake, _, read = self.ready()
@@ -386,6 +437,11 @@ class DiscordProviderTests(unittest.TestCase):
         fallback = PROVIDER._next_cursor([row], None)
         self.assertEqual(fallback["id"], message_id)
         previous = (datetime(2026, 8, 8, tzinfo=timezone.utc), CHANNEL_ID)
+        older = {
+            "id": str(int(CHANNEL_ID) - 1),
+            "timestamp": "2026-08-07T23:59:59Z",
+        }
+        self.assertEqual(PROVIDER._next_cursor([older], previous)["id"], CHANNEL_ID)
         self.assertEqual(PROVIDER._next_cursor([], previous)["id"], CHANNEL_ID)
         self.assertIsNone(PROVIDER._next_cursor([], None))
 

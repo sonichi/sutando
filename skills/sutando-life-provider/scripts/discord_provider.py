@@ -404,6 +404,12 @@ def _next_cursor(rows: list[Mapping[str, Any]],
     if rows:
         newest = max(rows, key=lambda row: int(str(row.get("id"))))
         provider_id = str(newest.get("id"))
+        if previous and int(provider_id) <= int(previous[1]):
+            return {
+                "version": 1,
+                "ts": previous[0].isoformat().replace("+00:00", "Z"),
+                "id": previous[1],
+            }
         try:
             timestamp = _parse_time(newest.get("timestamp")).isoformat().replace(
                 "+00:00", "Z"
@@ -485,15 +491,36 @@ def _read_messages(requester: _Requester, token: str, access_path: Path,
         floor = previous[0] - timedelta(seconds=OVERLAP_SECONDS)
         floor_id = _snowflake_at(floor)
         query["after"] = floor_id
-    rows = _api_get(
+    first_rows = _api_get(
         requester, token, f"/channels/{channel.get('id')}/messages", query,
     )
-    if not isinstance(rows, list):
+    if not isinstance(first_rows, list):
         raise ProviderFailure(
             "invalid_provider_response", "Discord returned an invalid message list.",
             retryable=True,
         )
-    bounded = rows[:limit]
+    pages = [first_rows]
+    full = len(first_rows) >= limit
+    if previous and full:
+        page_ids = [
+            int(row["id"])
+            for row in first_rows[:limit]
+            if isinstance(row, Mapping) and isinstance(row.get("id"), str)
+            and _is_snowflake(row["id"])
+        ]
+        forward_after = str(max([int(previous[1]), *page_ids]))
+        forward_rows = _api_get(
+            requester, token, f"/channels/{channel.get('id')}/messages",
+            {"limit": str(limit), "after": forward_after},
+        )
+        if not isinstance(forward_rows, list):
+            raise ProviderFailure(
+                "invalid_provider_response", "Discord returned an invalid message list.",
+                retryable=True,
+            )
+        pages.append(forward_rows)
+    rows = [row for page in pages for row in page]
+    bounded = [row for page in pages for row in page[:limit]]
     valid = [
         row for row in bounded
         if isinstance(row, Mapping) and isinstance(row.get("id"), str)
@@ -502,8 +529,8 @@ def _read_messages(requester: _Requester, token: str, access_path: Path,
     if floor_id is not None:
         valid = [row for row in valid if int(row["id"]) >= int(floor_id)]
     valid.sort(key=lambda row: int(row["id"]))
-    full = len(rows) >= limit
     omitted = len(bounded) - len(valid)
+    valid = valid[-limit:]
     limitations = []
     if full:
         limitations.append({
