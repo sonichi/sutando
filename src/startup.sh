@@ -711,6 +711,24 @@ else
   echo "  ✓ services-status emitter (already running)"
 fi
 
+# Menu-bar app — only for the loose-binary layout. restart.sh stops
+# src/Sutando/Sutando but nothing restarted it, so every restart silently
+# dropped the menu bar. Skipped when com.sutando.menubar owns the app, or when
+# the .app bundle exists, since that layout relaunches via launchd KeepAlive.
+if launchctl print "gui/$(id -u)/com.sutando.menubar" > /dev/null 2>&1; then
+  echo "  ✓ menu bar app (launchd-supervised)"
+elif [ -d "$REPO/src/Sutando/Sutando.app" ]; then
+  echo "  ⊘ menu bar app skipped — .app bundle present, install the launchd job to supervise it"
+elif [ ! -x "$REPO/src/Sutando/Sutando" ]; then
+  echo "  ⊘ menu bar app skipped — no binary at src/Sutando/Sutando"
+elif ! pgrep -f "$REPO/src/Sutando/Sutando" > /dev/null 2>&1; then
+  echo "  Starting menu bar app..."
+  "$REPO/src/Sutando/Sutando" >> "$WORKSPACE/logs/sutando-app.relaunch.log" 2>&1 &
+  echo "  ✓ menu bar app"
+else
+  echo "  ✓ menu bar app (already running)"
+fi
+
 # 0. Credential proxy for quota tracking (port 7846).
 # Prefer the launchd-supervised job (KeepAlive + ThrottleInterval=10s) so the
 # proxy restarts on crash instead of leaving a proxy-routed core stranded on a
