@@ -91,23 +91,37 @@ class EphemeralSkillTarget(unittest.TestCase):
             self.assertEqual(res["status"], "ok", res)
 
     def test_ephemeral_roots(self):
-        self.assertTrue(self.hc._is_ephemeral("/private/tmp/x/skills/a"))
-        self.assertTrue(self.hc._is_ephemeral("/var/folders/ab/cd/T/x"))
+        """Fixtures are DERIVED from the platform's own roots. Naming `/private/tmp`
+        passes on macOS and fails on Linux, where realpath('/tmp') is '/tmp'."""
+        for root in self.hc._ephemeral_roots():
+            self.assertTrue(self.hc._is_ephemeral(f"{root}/x/skills/a"), root)
         self.assertFalse(self.hc._is_ephemeral(str(Path.home() / "repo" / "skills" / "a")))
 
     def test_a_root_itself_is_ephemeral(self):
         """A link pointing AT the root, not inside it. Every root carried a trailing
         slash, so the prefix test answered False for the shortest possible case."""
-        for root in ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders",
-                     tempfile.gettempdir()):
+        roots = self.hc._ephemeral_roots()
+        self.assertTrue(roots, "no ephemeral roots derived — fixture would be vacuous")
+        for root in roots:
             self.assertTrue(self.hc._is_ephemeral(root), root)
             self.assertTrue(self.hc._is_ephemeral(root + "/"), root + "/")
 
     def test_sibling_named_like_a_root_is_not_ephemeral(self):
-        """Boundary the other way: containment is by path component, not by string."""
-        for durable in ("/tmpfoo", "/tmpfoo/skills/a", "/private/tmpfoo",
-                        "/var/foldersX/a"):
-            self.assertFalse(self.hc._is_ephemeral(durable), durable)
+        """Boundary the other way: containment is by path component, not by string.
+
+        Derived per root, so the case is real on every platform — a hardcoded
+        `/private/tmpfoo` is trivially false on Linux and proves nothing there.
+
+        Only SHALLOWEST roots qualify: macOS roots nest (`/private/var/folders` and
+        `/private/var/folders/<id>/T`), and `<deep-root>foo` sits inside the shallow
+        one, so it is ephemeral for a correct reason and is not a sibling case."""
+        roots = self.hc._ephemeral_roots()
+        shallow = [r for r in roots
+                   if not any(r != o and r.startswith(o + "/") for o in roots)]
+        self.assertTrue(shallow, "no shallowest root — fixture would be vacuous")
+        for root in shallow:
+            self.assertFalse(self.hc._is_ephemeral(root + "foo"), root + "foo")
+            self.assertFalse(self.hc._is_ephemeral(root + "foo/skills/a"), root + "foo")
 
     def test_roots_are_derived_not_literal(self):
         """The scan forbids a host path literal, so the roots must come from the
