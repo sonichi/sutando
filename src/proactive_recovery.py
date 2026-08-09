@@ -10,6 +10,23 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def claim_for_delivery(path: Path, recipient: object | None) -> Path | None:
+    """Claim ``path`` for delivery, but only when there IS somewhere to deliver.
+
+    Returns the ``.sending`` claim, or None when this adapter has no recipient —
+    a claim renames the file out of the ``*.txt`` glob every other bridge polls,
+    so claiming what you cannot deliver strands mail addressed to a peer.
+    """
+    if recipient is None:
+        return None
+    claim = path.with_suffix(".sending")
+    try:
+        path.rename(claim)
+    except FileNotFoundError:
+        return None
+    return claim
+
+
 def release_claim(claim: Path) -> bool:
     """Return a ``.sending`` claim to the polling stream. True if released.
 

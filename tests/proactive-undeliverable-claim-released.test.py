@@ -62,10 +62,18 @@ def _owner_none_branches(tree: ast.AST) -> list[ast.AST]:
 
 
 class UndeliverableClaimDelegationTest(unittest.TestCase):
-    def test_no_owner_branch_releases_and_never_deletes(self):
+    def test_no_owner_branch_never_claims_and_never_deletes(self):
+        """No recipient => the `.txt` stays exactly where a peer bridge polls.
+
+        This asserted "release what you claimed". Resolving the recipient BEFORE
+        claiming reaches the same property with no claim to release, so assert the
+        property: the owner-absent branch neither deletes nor claims, and the claim
+        itself is delegated so one module owns the decision.
+        """
         for name, path in CONSUMERS.items():
             with self.subTest(consumer=name):
-                branches = _owner_none_branches(ast.parse(path.read_text()))
+                tree = ast.parse(path.read_text())
+                branches = _owner_none_branches(tree)
                 self.assertTrue(
                     branches, f"{name}: no owner-absent branch found -- test is stale"
                 )
@@ -76,11 +84,37 @@ class UndeliverableClaimDelegationTest(unittest.TestCase):
                         f"{name}: deletes the claim when no owner is configured -- "
                         f"that destroys a message another bridge could deliver",
                     )
-                    self.assertIn(
-                        "release_claim", calls,
-                        f"{name}: does not hand the claim back via "
-                        f"proactive_recovery.release_claim",
+                    self.assertNotIn(
+                        "rename", calls,
+                        f"{name}: claims the file on the owner-absent path -- a claim "
+                        f"renames it out of the *.txt glob a peer bridge polls",
                     )
+                self.assertIn(
+                    "claim_for_delivery", _calls(tree),
+                    f"{name}: claims inline instead of delegating to "
+                    f"proactive_recovery.claim_for_delivery",
+                )
+
+    def test_the_recipient_is_resolved_before_the_claim(self):
+        """Ordering IS the fix. A delegated claim placed first is still a claim."""
+        for name, path in CONSUMERS.items():
+            with self.subTest(consumer=name):
+                tree = ast.parse(path.read_text())
+                resolves = [n.lineno for n in ast.walk(tree)
+                            if isinstance(n, ast.Call)
+                            and isinstance(n.func, ast.Name)
+                            and n.func.id.endswith("resolve_proactive_owner_id")]
+                claims = [n.lineno for n in ast.walk(tree)
+                          if isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Name)
+                          and n.func.id == "claim_for_delivery"]
+                self.assertTrue(resolves, f"{name}: no owner resolution found -- test is stale")
+                self.assertTrue(claims, f"{name}: no claim_for_delivery call found")
+                self.assertLess(
+                    min(resolves), min(claims),
+                    f"{name}: claims at line {min(claims)} before resolving the owner at "
+                    f"line {min(resolves)} -- the claim hides the file from peers first",
+                )
 
     def test_a_raised_send_releases_and_never_deletes(self):
         """The handler for a failed proactive send must not consume the claim."""

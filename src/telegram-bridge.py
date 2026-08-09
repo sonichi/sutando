@@ -44,7 +44,8 @@ except Exception:  # pragma: no cover — bridge must keep running
         return False
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
+                                release_claim)
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
@@ -1007,31 +1008,10 @@ def main():  # pragma: no cover
                         if peek.startswith("[channel:") and \
                                 re.match(r'\[channel:\s*\d{17,20}\]', peek):
                             continue
-                        # Claim-by-rename: atomic move to a `.sending`
-                        # suffix before reading, so a concurrent poll
-                        # (same bridge, or a race with discord-bridge)
-                        # can't pick it up and resend. See
-                        # discord-bridge.py for the same fix + the
-                        # 2026-04-20 bug-scenario that motivated it.
-                        claim = f.with_suffix(".sending")
-                        try:
-                            f.rename(claim)
-                        except FileNotFoundError:
-                            continue
-                        f = claim
-                        text = read_ready_result(f)
-                        if text is None:
-                            release_claim(f)
-                            continue
-                        # Pre-fix used `next(iter(load_allowed()))`,
-                        # which iterates a `set` — hash-slot order, not
-                        # list order. With multiple users in allowFrom
-                        # (e.g. admin adds a second sender via
-                        # `/telegram:access allow`), proactive
-                        # owner-notifications could route to the wrong
-                        # user. Mirrors the same fix shape used by
-                        # discord-bridge's poll_proactive; full priority
-                        # chain documented on _resolve_proactive_owner_id.
+                        # Resolve the recipient BEFORE claiming: the claim renames the
+                        # file out of the `*.txt` glob every peer bridge polls.
+                        # `_resolve_proactive_owner_id` orders allowFrom explicitly; a
+                        # bare `next(iter(set))` picked a hash-slot, not the first user.
                         env_override = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip()
                         try:
                             access_data = json.loads(ACCESS_FILE.read_text())
@@ -1039,9 +1019,15 @@ def main():  # pragma: no cover
                             access_data = {}
                         owner_id = _resolve_proactive_owner_id(env_override, access_data)
                         if owner_id is None:
-                            # A proactive file is not addressed to one bridge; a bridge
-                            # that cannot deliver must hand it back rather than consume it.
-                            print(f"  [proactive] no owner in allowFrom, releasing {f.name}")
+                            continue
+                        # The shared helper owns "no recipient -> do not claim"; this
+                        # adapter contributes only the owner it resolved.
+                        claim = claim_for_delivery(f, owner_id)
+                        if claim is None:
+                            continue
+                        f = claim
+                        text = read_ready_result(f)
+                        if text is None:
                             release_claim(f)
                             continue
                         try:

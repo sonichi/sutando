@@ -80,7 +80,16 @@ for adapter in ("discord-bridge.py", "slack-bridge.py", "telegram-bridge.py"):
         and isinstance(return_node.value.func, ast.Name)
         and return_node.value.func.id == "recover_orphan_sending_files"
     )
-    check(f"{adapter} imports shared recovery", "from proactive_recovery import recover_orphan_sending_files" in source)
+    # Match the NAME, not the import line's text: a multi-name or parenthesised
+    # import is the same delegation and a substring test calls it a regression.
+    imported = {
+        alias.name
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom) and node.module == "proactive_recovery"
+        for alias in node.names
+    }
+    check(f"{adapter} imports shared recovery",
+          "recover_orphan_sending_files" in imported)
     check(f"{adapter} wrapper delegates to shared recovery", delegates)
 
 

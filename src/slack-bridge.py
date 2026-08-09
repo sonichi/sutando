@@ -62,7 +62,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
+                                release_claim)
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
@@ -1511,12 +1512,10 @@ def result_watcher():
                     except Exception:
                         access_data = {}
                     owner_id = resolve_proactive_owner_id(access_data)
-                    if owner_id is None:
-                        continue
-                    claim = f.with_suffix(".sending")
-                    try:
-                        f.rename(claim)
-                    except FileNotFoundError:
+                    # The shared helper owns "no recipient -> do not claim"; this
+                    # adapter contributes only the owner it resolved.
+                    claim = claim_for_delivery(f, owner_id)
+                    if claim is None:
                         continue
                     text = read_ready_result(claim)
                     if text is None:
