@@ -15,7 +15,39 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from proactive_recovery import release_claim  # noqa: E402
+from proactive_recovery import claim_for_delivery, release_claim  # noqa: E402
+
+
+class ClaimForDeliveryTest(unittest.TestCase):
+    """Direct contract for the shared gate — the adapters' AST checks never RUN it."""
+
+    def setUp(self):
+        self.box = Path(tempfile.mkdtemp(prefix="claim-gate-"))
+        self.msg = self.box / "proactive-x.txt"
+        self.msg.write_text("body")
+
+    def test_no_recipient_leaves_the_txt_untouched(self):
+        self.assertIsNone(claim_for_delivery(self.msg, None))
+        self.assertTrue(self.msg.exists(), "claimed despite having no recipient")
+        self.assertEqual(self.msg.read_text(), "body")
+        self.assertFalse(list(self.box.glob("*.sending")))
+
+    def test_a_recipient_claims_it(self):
+        claim = claim_for_delivery(self.msg, "UOWNER")
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.suffix, ".sending")
+        self.assertTrue(claim.exists())
+        self.assertFalse(self.msg.exists(), "left the .txt behind — a peer could double-send")
+
+    def test_a_lost_race_returns_none_rather_than_raising(self):
+        """Another poller renamed it first; the caller must see None, not a traceback."""
+        gone = self.box / "proactive-vanished.txt"
+        self.assertIsNone(claim_for_delivery(gone, "UOWNER"))
+
+    def test_falsy_but_present_recipient_still_claims(self):
+        """Only None means 'no recipient' — 0 or '' are recipients a provider may use."""
+        claim = claim_for_delivery(self.msg, 0)
+        self.assertIsNotNone(claim, "treated a falsy-but-present recipient as absent")
 
 CONSUMERS = {
     "slack-bridge": REPO / "src" / "slack-bridge.py",
