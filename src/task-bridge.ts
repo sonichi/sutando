@@ -15,7 +15,11 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { claudeHomePath } from './util_paths.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
-import { selectBackend, type TaskDelegationService } from './task-delegation.js';
+import {
+	emitTaskProcessed,
+	selectBackend,
+	type TaskDelegationService,
+} from './task-delegation.js';
 
 const REPO_DIR = resolveWorkspace();
 const TASK_DIR = join(REPO_DIR, 'tasks');
@@ -86,7 +90,7 @@ const _HEADER_KEYS = [
 	'id', 'timestamp', 'task', 'source', 'access_tier', 'user_id',
 	'channel_id', 'priority', 'interaction_type', 'source_message_id',
 	'channel_name', 'guild_name', 'attempts', 'sender_name', 'room_name',
-	'parent_message_id', 'reminder', 'author_name', 'author_id', 'chat_id',
+	'parent_message_id', 'reply_chain_ids', 'reminder', 'author_name', 'author_id', 'chat_id',
 	'thread_ts', 'reply_to_event', 'reply_to_me', 'callSid', 'caller',
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
@@ -567,8 +571,7 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					// `task:` last so the (multi-line) context-drop body can't
 					// forge header fields. Same shape as the voice/chat task
 					// writers and agent-api.py's /task endpoint per PR #982.
-					writeFileSync(
-						join(TASK_DIR, `${taskId}.txt`),
+					const taskContent =
 						`id: ${taskId}\n` +
 						`timestamp: ${new Date().toISOString()}\n` +
 						`source: context-drop\n` +
@@ -577,8 +580,12 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 						`user_id: ${ownerId}\n` +
 						`access_tier: owner\n` +
 						`priority: normal\n` +
-						`task: User dropped context via hotkey. Process this:\n${confineUserContent(content)}\n`,
+						`task: User dropped context via hotkey. Process this:\n${confineUserContent(content)}\n`;
+					writeFileSync(
+						join(TASK_DIR, `${taskId}.txt`),
+						taskContent,
 					);
+					emitTaskProcessed(taskContent);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available
 					onContextDrop(content);
@@ -822,8 +829,17 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// destination already is the owner's DM). It has no meaning for the
 				// voice/task path, so strip it on read: this keeps voice from ever
 				// speaking "dm only" and keeps it out of logs. Parity with Python
-				// parse_markers(), which strips it before delivery.
-				const result = readFileSync(path, 'utf-8').replace(/\[dm-only\]\s*/gi, '').trim();
+				// parse_markers(), which strips ONLY a STANDALONE marker — one alone
+				// on its line. An inline mention is prose (a result DISCUSSING the
+				// marker) and rewriting it silently corrupts owner-facing text:
+				//   in  "- #2170 [dm-only]: closes the leak vector"
+				//   out "- #2170 : closes the leak vector"
+				// The old expression here was /\[dm-only\]\s*/gi, which stripped
+				// every occurrence and made this consumer disagree with every
+				// text bridge after the Python side was narrowed.
+				const result = readFileSync(path, 'utf-8')
+					.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '')
+					.trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
 

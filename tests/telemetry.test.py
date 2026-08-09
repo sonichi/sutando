@@ -216,6 +216,32 @@ def run():
         passed += 1
         print("ok   task_processed/feature_used send correct bucketed events")
 
+    # 6b) task_processed sanitizes its source against a fixed allowlist. The
+    # value can come from a caller-supplied task `source:` header (local web/API
+    # path), so an unknown / hostile value must collapse to "unknown" — no
+    # unbounded cardinality, no accidental identifier/secret reaching PostHog
+    # (CR #2274, qingyun-wu). Known surfaces pass through unchanged.
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_live")
+        # Direct unit on the collapse helper.
+        assert mod._coarse_source("discord") == "discord"
+        assert mod._coarse_source("  Phone ") == "phone"  # normalized (case/space)
+        assert mod._coarse_source("sk-secret-abc123") == "unknown"
+        assert mod._coarse_source("api; DROP TABLE") == "unknown"
+        assert mod._coarse_source("") == "unknown"
+        # End-to-end: a hostile source never leaves the allowlist on the wire.
+        calls = []
+        mod._post = lambda payload: calls.append(payload)  # type: ignore
+        before = set(threading.enumerate())
+        mod.task_processed("s3cr3t-token-leak")
+        for t in set(threading.enumerate()) - before:
+            t.join(timeout=2)
+        tp = next(c for c in calls if c["event"] == "task_processed")
+        assert tp["properties"]["source"] == "unknown", \
+            f"hostile source must collapse to 'unknown', got {tp['properties']['source']!r}"
+        passed += 1
+        print("ok   task_processed collapses unknown/hostile source to 'unknown'")
+
     # 7) Short-lived callers can select the bounded synchronous path.
     with tempfile.TemporaryDirectory() as td:
         mod = _load(Path(td), key="phc_live")
@@ -299,6 +325,83 @@ def run():
         assert received[0]["properties"]["feature"] == "subprocess_probe"
         passed += 1
         print("ok   short-lived subprocess flushes feature_used before exit")
+
+    # 9b) The `python3 src/telemetry.py task_processed <source>` CLI entrypoint
+    # delivers a source-tagged task_processed event before exit. This is the
+    # exact path the non-Python task creators use (task-delegation.ts for
+    # voice/chat/context-drop, conversation-server.ts for phone) so their
+    # surfaces finally count. Runs the real module file as a script.
+    with tempfile.TemporaryDirectory() as td:
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append(json.loads(self.rfile.read(length)))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        try:
+            env = {
+                **os.environ,
+                "POSTHOG_API_KEY": "phc_cli_test",
+                "POSTHOG_HOST": f"http://127.0.0.1:{server.server_port}",
+                "SUTANDO_STATE_DIR": td,
+                "SUTANDO_SURFACE": "oss",
+            }
+            env.pop("DO_NOT_TRACK", None)
+            env.pop("SUTANDO_TELEMETRY", None)
+            proc = subprocess.run(
+                [sys.executable, str(SRC / "telemetry.py"), "task_processed", "voice"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+        assert proc.returncode == 0, proc.stderr
+        assert len(received) == 1, \
+            f"CLI must deliver task_processed before exit, got {len(received)}"
+        assert received[0]["event"] == "task_processed"
+        assert received[0]["properties"]["source"] == "voice"
+        # A bad verb must fail loudly (exit 2).
+        bad = subprocess.run(
+            [sys.executable, str(SRC / "telemetry.py"), "bogus_verb"],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        assert bad.returncode == 2, f"usage error must exit 2, got {bad.returncode}"
+        passed += 1
+        print("ok   CLI entrypoint delivers source-tagged task_processed (voice)")
+
+    # 9c) _cli_main dispatch — every branch in-process (the subprocess shim above
+    # escapes the coverage gate; this covers the real logic).
+    import unittest.mock as _um
+    with tempfile.TemporaryDirectory() as td:
+        mod = _load(Path(td), key="phc_cli_unit")
+        with _um.patch.object(mod, "task_processed") as tp, \
+                _um.patch.object(mod, "feature_used") as fu:
+            assert mod._cli_main(["task_processed", "chat"]) == 0
+            tp.assert_called_once_with("chat", flush=True)
+            assert mod._cli_main(["feature_used", "morning_briefing"]) == 0
+            fu.assert_called_once_with("morning_briefing", flush=True)
+            # Unknown verb / wrong arity → exit 2, no emit.
+            assert mod._cli_main(["bogus"]) == 2
+            assert mod._cli_main(["task_processed"]) == 2
+            assert mod._cli_main(["task_processed", "a", "b"]) == 2
+            assert tp.call_count == 1 and fu.call_count == 1
+        passed += 1
+        print("ok   _cli_main dispatches task_processed/feature_used + rejects bad args")
 
     # 10) Per-install id PERSISTS across workspace churn — the id-persistence fix.
     #    Change the state dir between boots (as a desktop update/relaunch does)

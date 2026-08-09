@@ -8,11 +8,36 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# Shadow the vault boundary before any gateway() call can reach it. gateway() now
+# resolves the token from the Keychain when the env has none — and this file's
+# EnvCase fixture clears every token var in setUp, so "no token in env" is the
+# DEFAULT state for every test here. Without this shadow, any gateway() call under
+# that fixture would read the operator's REAL macOS Keychain — the fixture-default
+# analogue of #2646's import-time Keychain read (@john-the-dev / @qingyun-air). The
+# real channel_token.token_from_vault policy stays under test; only the host
+# boundary is replaced. Installed before `import _gateway` so no path can slip past.
+_VAULT_STORE: dict = {}
+_VAULT_CALLS: list = []
+
+
+def _fake_get_vault_key(var):
+    _VAULT_CALLS.append(var)
+    if var in _VAULT_STORE:
+        return _VAULT_STORE[var]
+    raise KeyError(var)
+
+
+_FAKE_VI = types.ModuleType("vault_intercept")
+_FAKE_VI.get_vault_key = _fake_get_vault_key
+sys.modules["vault_intercept"] = _FAKE_VI
+
 import _gateway  # noqa: E402
 import read as rd  # noqa: E402
 import media as md  # noqa: E402
@@ -72,6 +97,13 @@ class GateTests(unittest.TestCase):
         self.assertIn("HTTP 500", _gateway.degrade_reason(500))
 
 
+# The gateway() vault tier (sonichi#2638) is tested in
+# tests/room_ops_gateway_vault.test.py — the coverage gate discovers only
+# tests/*.test.py, so the _gateway.py changed lines are measured there. The
+# shadow installed at the top of this file keeps every OTHER gateway()-calling
+# test below off the real host Keychain.
+
+
 # ----- read ----- #
 class ReadTests(EnvCase):
     def test_no_room(self):
@@ -98,6 +130,66 @@ class ReadTests(EnvCase):
                                side_effect=lambda m, u, h: (cap.update(url=u), (200, b'{"messages":[]}', {}))[1]):
             rd.read_room(ROOM, HS, limit=9999, gate=None)
         self.assertIn(f"limit={rd.MAX_LIMIT}", cap["url"])
+
+    def _raw_window_gateway(self, total_messages=14, noise_per_message=2):
+        """A gateway whose `limit` bounds RAW EVENTS, of which only some are messages.
+
+        This is what the live ag2.space gateway does. Reproduced here because the failure
+        it causes is silent: fewer messages than asked for, ok:true, and no error.
+        """
+        import urllib.parse as _up
+
+        def _http(_m, url, _h):
+            raw = int(dict(_up.parse_qsl(_up.urlparse(url).query))["limit"])
+            # Newest-first timeline: every message preceded by `noise` non-message events,
+            # so the first `noise` slots of any window contain no messages at all.
+            msgs, consumed = [], 0
+            for i in range(total_messages):
+                consumed += noise_per_message
+                if consumed >= raw:
+                    break
+                consumed += 1
+                msgs.append({"sender": "@a:hs", "ts": 1000 - i, "body": f"m{i}"})
+                if consumed >= raw:
+                    break
+            return (200, json.dumps({"messages": msgs}).encode(), {})
+        return _http
+
+    def test_small_limit_does_not_report_an_empty_room(self):
+        """limit=3 must not return zero messages from a room that has fourteen.
+
+        REGRESSION (measured live 2026-08-05): the gateway's limit counts raw timeline
+        events, so `--limit 3` returned `ok:true` with an EMPTY message list on a busy
+        room. A cheap "did anyone reply?" probe is exactly what passes a small limit, and
+        the false empty is indistinguishable from silence. Before the fix this asserts 0.
+        """
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(rd, "http_request", side_effect=self._raw_window_gateway()):
+            res = rd.read_room(ROOM, HS, limit=3, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["messages"]), 3, "a small limit must still yield messages")
+
+    def test_limit_counts_messages_not_raw_events(self):
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(rd, "http_request", side_effect=self._raw_window_gateway()):
+            res = rd.read_room(ROOM, HS, limit=10, gate=None)
+        self.assertEqual(len(res["messages"]), 10)
+        self.assertTrue(res["complete"])
+
+    def test_short_room_under_claims_completeness(self):
+        """Short of `limit` never claims complete — the client cannot tell why it is short.
+
+        Updated per the #2678 review: a repeated message count across a wider window is
+        NOT proof of exhausted history (the extra raw events may all be non-messages), and
+        this endpoint returns only message-type items, so a short page is indistinguishable
+        from a noisy one. Under-claiming is the safe direction here.
+        """
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(rd, "http_request",
+                               side_effect=self._raw_window_gateway(total_messages=2)):
+            res = rd.read_room(ROOM, HS, limit=20, gate=None)
+        self.assertEqual(len(res["messages"]), 2)
+        self.assertFalse(res["complete"], "short of limit -> never claim complete")
 
     def test_success_parses(self):
         os.environ["RELAY_URL"] = "https://r"

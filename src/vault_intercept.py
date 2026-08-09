@@ -335,8 +335,12 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # entirely) to store it for real.
                 failed.append(key)
                 return (
-                    f"vault set {key} [vault: unrecognized value — NOT stored. "
-                    f"Resend quoted (e.g. vault set {key} \"value\") to store it.]"
+                    f"vault set {key} [vault: value not recognized as a secret, so it was "
+                    f"NOT STORED **and the text you sent has been discarded** — nothing was "
+                    f"kept anywhere, so you will need the value again. Resend it QUOTED: "
+                    f"vault set {key} \"value\" — quoting skips this classifier and "
+                    f"ATTEMPTS storage; you are stored only if the reply says "
+                    f"[STORED-IN-KEYCHAIN].]"
                 )
         try:
             _store_in_keychain(key, value)
