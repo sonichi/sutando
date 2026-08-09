@@ -29,6 +29,7 @@ import hmac
 
 from aiohttp import WSMsgType, web
 
+import media_frame  # noqa: E402
 from protocol import (MAX_LINE_BYTES, ProtocolError, error_frame,  # noqa: E402
                       parse_line, result_frame)
 
@@ -89,6 +90,7 @@ class WsTransport:
                  result_subscribers: set | None = None,
                  activity_subscribers: set | None = None,
                  request_subscribers: set | None = None,
+                 voice_bridge=None,
                  host: str = "127.0.0.1", port: int = 8787,
                  route: str = "/scp", log=print):
         self.dispatcher = dispatcher
@@ -105,6 +107,10 @@ class WsTransport:
         self._result_subs = result_subscribers
         self._activity_subs = activity_subscribers
         self._request_subs = request_subscribers
+        # Media-plane handler. The transport frames + routes binary streams to
+        # it by stream_id; it must NOT be imported/understood here beyond the
+        # open/on_audio/close interface (voice semantics live behind it).
+        self._voice = voice_bridge
         self.host = host
         self.port = port
         self.route = route
@@ -141,7 +147,8 @@ class WsTransport:
 
     # ── dispatch ─────────────────────────────────────────────────────────────
     async def _dispatch_one(self, ws: web.WebSocketResponse,
-                            sink: "WsWriterSink", auth: dict, data: str) -> None:
+                            sink: "WsWriterSink", auth: dict, streams: set,
+                            data: str) -> None:
         raw = data.encode("utf-8") if isinstance(data, str) else data
         try:
             req_id, method, params = parse_line(raw)
@@ -149,6 +156,26 @@ class WsTransport:
             await ws.send_str(error_frame(e.req_id, e.code, e.message).decode())
             return
         grants = auth["grants"]
+        if method in ("voice.open", "voice.close"):
+            # Media-plane control. The transport owns the stream's CONNECTION
+            # lifecycle (which streams this connection may route binary to, and
+            # teardown on disconnect); the voice bridge owns the session. The
+            # transport never touches audio semantics here.
+            if self._voice is None or method not in grants:
+                await ws.send_str(error_frame(
+                    req_id, -32601, f"{method} not permitted").decode())
+                return
+            if method == "voice.open":
+                opened = self._voice.open(params)
+                streams.add(opened["streamId"])
+                await ws.send_str(result_frame(req_id, opened).decode())
+            else:
+                sid = params.get("streamId")
+                ok = sid in streams and self._voice.close(sid)
+                streams.discard(sid)
+                await ws.send_str(result_frame(
+                    req_id, {"closed": bool(ok), "streamId": sid}).decode())
+            return
         if method == "pair.redeem":
             # A connection authenticated by a pairing token exchanges it for a
             # long-term per-device credential (returned once). No dispatcher
@@ -224,22 +251,43 @@ class WsTransport:
         ws = web.WebSocketResponse(max_msg_size=MAX_LINE_BYTES + 1024)
         await ws.prepare(request)
         sink = WsWriterSink(ws)
+        streams: set = set()  # media stream_ids opened on THIS connection
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
-                    await self._dispatch_one(ws, sink, auth, msg.data)
+                    await self._dispatch_one(ws, sink, auth, streams, msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    self._route_binary(streams, msg.data)
                 elif msg.type == WSMsgType.ERROR:
                     break
-                # non-text frames are ignored — SCP is a text JSON protocol
         finally:
-            # a subscribed connection leaving must not linger in the push sets
+            # a leaving connection must not linger in the push sets, and its
+            # media streams must be torn down (connection lifecycle = transport).
             if self._result_subs is not None:
                 self._result_subs.discard(sink)
             if self._activity_subs is not None:
                 self._activity_subs.discard(sink)
             if self._request_subs is not None:
                 self._request_subs.discard(sink)
+            if self._voice is not None:
+                for sid in streams:
+                    self._voice.close(sid)
         return ws
+
+    def _route_binary(self, streams: set, data: bytes) -> None:
+        """Decode the media envelope and route the payload to the voice bridge
+        by stream_id — but ONLY for a stream this connection opened (no
+        cross-connection routing). The transport does not interpret the payload.
+        A malformed or unknown-stream frame is dropped, never fatal."""
+        if self._voice is None:
+            return
+        try:
+            _stream_type, stream_id, payload = media_frame.decode(data)
+        except media_frame.MediaFrameError:
+            return
+        if stream_id not in streams:
+            return
+        self._voice.on_audio(stream_id, payload)
 
     def build_app(self) -> web.Application:
         app = web.Application()

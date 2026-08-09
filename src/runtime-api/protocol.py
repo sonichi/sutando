@@ -83,6 +83,8 @@ METHODS = (
     "request.list",
     "pair.redeem",       # WSS-only: exchange a pairing token for a device credential
     "client.hello",      # WSS-only: a device advertises its live device_type + capabilities
+    "voice.open",        # WSS-only: open a media (audio) stream on this connection
+    "voice.close",       # WSS-only: tear down a media stream
 )
 
 

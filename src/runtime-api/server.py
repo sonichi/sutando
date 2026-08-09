@@ -235,11 +235,17 @@ class RuntimeServer:
             if self._state_dir:
                 from device_store import DeviceStore  # noqa: PLC0415
                 device_store = DeviceStore(Path(self._state_dir) / "auth")
+            # Media plane: a STUB voice bridge for now — it proves stream
+            # lifecycle + binary routing without pulling the voice stack into
+            # the daemon. The real VoiceSession-backed bridge slots in behind
+            # the same interface in a later slice.
+            from voice_bridge import StubVoiceBridge  # noqa: PLC0415
             wss = WsTransport(self.dispatcher, token=self._wss_token(),
                               device_store=device_store,
                               result_subscribers=self._subscribers,
                               activity_subscribers=self._activity_subscribers,
                               request_subscribers=self._request_subscribers,
+                              voice_bridge=StubVoiceBridge(),
                               host=host, port=port, log=_log)
             await wss.start()
             if host not in ("127.0.0.1", "localhost", "::1"):
