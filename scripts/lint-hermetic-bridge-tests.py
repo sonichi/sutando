@@ -91,6 +91,16 @@ BRIDGE_IMPORT = re.compile(r"(discord|slack|telegram)-bridge\.py")
 #     than fixed here: repairing another PR's test is a second concern, and
 #     CONTRIBUTING forbids bundling it. Follow-up tracked separately. Mini's shared-helper
 # migration removes these; the stale-entry check below forces the list to shrink.
+#   + ADDED tests/dm-fallback-digest-no-dm.test.py — a FALSE POSITIVE, not a real hole:
+#     `BRIDGE_SRC = (REPO / "src" / "discord-bridge.py").read_text()` only feeds regex
+#     checks over the bridge's SOURCE TEXT (Half 1); the file's one `exec(...)` call runs
+#     a snippet extracted from check-pending-questions.py's `notify_voice` (Half 2), which
+#     touches only `RESULTS_DIR` and never CLAUDE_CONFIG_DIR or channel access files. The
+#     coarse text-level pre-filter (a bridge filename as a code string + any `exec(` in the
+#     file) can't tell "reads the bridge's text" from "execs the bridge", so this classifies
+#     as in-scope though nothing ever imports discord-bridge.py. Grandfathered rather than
+#     widening the pre-filter here: sharpening that distinction is a second concern (it
+#     would touch every test this lint scans), and CONTRIBUTING forbids bundling it.
 # Measured on origin/main (2026-07-30, post-#2428-merge) with the AST classifier. The count rose
 # from 26 to 27 when detection moved off regex: two files the regex called clean were real
 # bypasses (assignment-shaped comment / assignment after exec_module), which is exactly the
@@ -120,6 +130,7 @@ tests/discord-bridge-reply-directive.test.py
 tests/discord-bridge-task-write-instrument.test.py
 tests/discord-task-source-invariance.test.py
 tests/discord-writeside-attachments.test.py
+tests/dm-fallback-digest-no-dm.test.py
 tests/health-check-fix-down-bridges.test.py
 tests/owner-activity-channel-id.test.py
 tests/slack-bridge-access-durable-backup.test.py
