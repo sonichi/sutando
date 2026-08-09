@@ -74,6 +74,35 @@ check("same resolved dir → no warn (not two trees)", r is None, str(r))
 # that deletes it does not change any output, and a test claiming otherwise would
 # be asserting its own wishful thinking.
 
+# Pro measured this on a second host and read "2 of 11,442" as nothing to worry
+# about. Counting is what made that wrong: those 2 are the files a "delete the
+# legacy tree" cleanup destroys. So the legacy-only paths must be NAMED.
+print("\nthe at-risk paths are named, not just counted:")
+r = _probe(["keep.md"], ["keep.md", "sutando-wire/peg-signals/2026-08-05.md"])
+check("names the legacy-only path",
+      r is not None and "sutando-wire/peg-signals/2026-08-05.md" in r["detail"], str(r))
+check("labels it as having no canonical copy",
+      r is not None and "LEGACY-ONLY" in r["detail"], str(r))
+
+r = _probe(["keep.md"], ["keep.md"] + [f"only{i}.md" for i in range(7)])
+check("caps the sample and says how many more",
+      r is not None and "and 4 more" in r["detail"], str(r))
+check("...without dropping the true total",
+      r is not None and "7 only in the legacy tree" in r["detail"], str(r))
+
+# A plain alphabetical sample leads with .DS_Store and buries what matters —
+# measured on the live tree, where it crowded out sutando-wire/peg-signals/*.md.
+r = _probe(["keep.md"], ["keep.md", ".DS_Store", ".aaa", ".bbb",
+                         "sutando-wire/peg-signals/x.md"])
+check("dotfiles do not crowd the 3-wide sample",
+      r is not None and "sutando-wire/peg-signals/x.md" in r["detail"], str(r))
+check("...and the count still includes the dotfiles",
+      r is not None and "4 only in the legacy tree" in r["detail"], str(r))
+
+r = _probe(["canonical-only.md", "keep.md"], ["keep.md"])
+check("no legacy-only paths → no LEGACY-ONLY clause at all",
+      r is not None and "LEGACY-ONLY" not in r["detail"], str(r))
+
 print("\nsupersets are still a divergence — neither side may be trusted blindly:")
 r = _probe(["a.md"], ["a.md", "extra.yaml"])
 check("legacy is a strict superset → still warns", r is not None, str(r))

@@ -5732,6 +5732,15 @@ def check_legacy_notes_divergence() -> "dict | None":
     Recursive and extension-agnostic on purpose: the #1266 probe globs top-level
     `*.md`, and this divergence lives in `sutando-wire/episode-specs/*.yaml`,
     so an .md-only top-level scan reports clean twice over.
+
+    Reports counts, and NAMES the legacy-only paths — never a "which side is live"
+    verdict. A whole-tree newest-mtime is dominated by whichever file was touched
+    last for any reason: on one host it read "canonical newer by 0.0d" while the
+    subtree that mattered was 7 days older. And a bare ratio invites dismissal —
+    on a second host "2 of 11,442" was first read as nothing to worry about, when
+    those 2 were the files a "delete the legacy tree" cleanup would destroy with
+    no copy anywhere. Legacy-only, not both directions: canonical is the tree the
+    resolver reaches, so a canonical-only file is merely unsynced.
     """
     ws_notes = Path(shared_personal_path("notes", WORKSPACE_DIR))
     legacy_notes = legacy_dotted_workspace() / "notes"
@@ -5758,23 +5767,26 @@ def check_legacy_notes_divergence() -> "dict | None":
     if not only_ws and not only_legacy:
         return None
 
-    # Deliberately NO "which side is live" verdict. A whole-tree newest-mtime is
-    # dominated by whichever file was touched last for any reason, so it can read
-    # "canonical is newer" while the producer for the subtree that matters writes
-    # to the legacy side — measured exactly that way on one host (canonical newer
-    # by 0.0d over the whole tree, 7 days OLDER on episode-specs alone). The
-    # counts are checkable; that inference is not, at this granularity.
+    # Non-dotfiles first: an alphabetical sample leads with .DS_Store and buries
+    # the paths worth acting on. Counts stay over the FULL set.
+    ranked = sorted(only_legacy, key=lambda p: (Path(p).name.startswith("."), p))
+    named = ", ".join(ranked[:3])
+    more = f" … and {len(only_legacy) - 3} more" if len(only_legacy) > 3 else ""
+    at_risk = (
+        f" LEGACY-ONLY (no copy in the canonical tree): {named}{more}."
+        if only_legacy else ""
+    )
     return {
         "name": "legacy-notes-divergence",
         "status": "warn",
         "detail": (
             f"notes/ has diverged from the pre-v0.8 {legacy_notes}: "
             f"{len(only_ws)} file(s) only in the canonical workspace, "
-            f"{len(only_legacy)} only in the legacy tree, {len(a & b)} shared. "
-            f"Neither side is a superset, so pointing a consumer at either one "
-            f"loses files. Decide which tree is authoritative before 'fixing' "
-            f"any path that reads notes/, and compare the SUBTREE you care about "
-            f"— a whole-tree mtime does not tell you which side is still live."
+            f"{len(only_legacy)} only in the legacy tree, {len(a & b)} shared."
+            f"{at_risk} Neither side is a superset, so pointing a consumer at "
+            f"either one loses files. Decide which tree is authoritative before "
+            f"'fixing' any path that reads notes/, and compare the SUBTREE you "
+            f"care about — a whole-tree mtime does not say which side is live."
         ),
     }
 
