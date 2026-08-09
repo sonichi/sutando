@@ -149,7 +149,7 @@ def main() -> int:
     # --- WIRING: a policy with no caller is the defect it fixes ------------
     # CLAUDE.md: "Pin both the shared contract and every adapter's delegation
     # in tests." Landing the bound with nothing calling it would be the same
-    # latent no-op this PR exists to remove, so assert BOTH bridges delegate.
+    # latent no-op this PR exists to remove, so assert the bridge delegates.
     for bridge in ("discord-bridge.py",):
         src = (REPO / "src" / bridge).read_text()
         # These four assertions fired when I moved the counting into
@@ -168,8 +168,11 @@ def main() -> int:
               "_empty_result_polls.pop(task_id, None)" in src,
               "a counter that never clears announces a healthy task after a "
               "few transient empty reads")
+        # #2695 moved emptiness into the shared read_ready_result owner, so the
+        # spelling moved with it; re-pointed at the real contract, not loosened.
         check(f"  ...{bridge} still SKIPS rather than delivering the empty body",
-              "if not reply_text:" in src and src.count("continue") > 0,
+              "read_ready_result(result_file)" in src
+              and "if reply_text is None:" in src and src.count("continue") > 0,
               "the partial-write guard was removed")
 
     print()
