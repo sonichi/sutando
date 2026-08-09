@@ -40,6 +40,25 @@ class ClaimForDeliveryTest(unittest.TestCase):
         self.assertTrue(claim.exists())
         self.assertFalse(self.msg.exists(), "left the .txt behind — a peer could double-send")
 
+    def test_the_txt_vanishing_inside_the_claim_window_still_yields_a_claim(self):
+        """A peer can remove the source between the link and the unlink.
+
+        The claim is already made at that point, so losing the source is not a
+        failure; returning None here would strand a body this bridge holds.
+        """
+        real = Path.unlink
+
+        def vanish(self_path, *a, **kw):
+            if self_path == self.msg:
+                raise FileNotFoundError(2, "vanished", str(self_path))
+            return real(self_path, *a, **kw)
+
+        with mock.patch.object(Path, "unlink", vanish):
+            claim = claim_for_delivery(self.msg, "UOWNER")
+        self.assertIsNotNone(claim, "dropped a claim it had already linked")
+        self.assertTrue(claim.exists())
+        self.assertEqual(claim.read_text(), "body")
+
     def test_a_lost_race_returns_none_rather_than_raising(self):
         """Another poller renamed it first; the caller must see None, not a traceback."""
         gone = self.box / "proactive-vanished.txt"
@@ -112,17 +131,21 @@ def _calls(node: ast.AST) -> set[str]:
 
 
 def _owner_none_branches(tree: ast.AST) -> list[ast.AST]:
-    """Every branch body that runs when the resolved proactive owner is absent.
+    """Every branch body that runs when this bridge has no one to deliver to.
 
-    Matches both spellings the bridges use: `if owner_id is None:` (body) and
-    `if owner_id is not None: ... else:` (orelse).
+    THREE spellings, because resolving the recipient before claiming removes the
+    need for an owner-absent branch after it: `if owner_id is None:` (body),
+    `if owner_id is not None: ... else:` (orelse), and the guard-clause form
+    `if claim is None:` that the delegating shape uses. Matching only the first
+    two made this assertion report "stale" the moment a consumer adopted the
+    third, which is the shape the fix is FOR.
     """
     found = []
     for n in ast.walk(tree):
         if not isinstance(n, ast.If) or not isinstance(n.test, ast.Compare):
             continue
         left = n.test.left
-        if not (isinstance(left, ast.Name) and left.id == "owner_id"):
+        if not (isinstance(left, ast.Name) and left.id in ("owner_id", "claim")):
             continue
         if len(n.test.ops) != 1 or not isinstance(n.test.comparators[0], ast.Constant):
             continue

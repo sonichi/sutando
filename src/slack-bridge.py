@@ -1540,11 +1540,6 @@ def result_watcher():
                             # deleted claim is a message no bridge can ever retry.
                             print(f"  [proactive] failed, releasing {claim.name}: {e}", flush=True)
                             release_claim(claim)
-                    else:
-                        # A proactive file is not addressed to one bridge; a bridge that
-                        # cannot deliver must hand it back rather than consume it.
-                        print(f"  [proactive] no owner in allowFrom, releasing {claim.name}", flush=True)
-                        release_claim(claim)
 
             # Heartbeat (used by health-check.py)
             now = time.time()
