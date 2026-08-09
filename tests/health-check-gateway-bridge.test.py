@@ -155,6 +155,19 @@ def main() -> int:
     check("_gateway_lock_pids reads role→PID, skips malformed, ignores other roles",
           got == {"gateway-bridge": "4242", "gateway-bridge.dev": "4243"}, f"got {got!r}")
 
+    # 4a-v) An unreadable locks/ must degrade to "no lock data", not raise. The probe
+    # runs on hosts where state/locks/ may not exist or may be permission-denied.
+    class _BoomPath:
+        def __truediv__(self, other):
+            return self
+
+        def glob(self, pattern):
+            raise OSError("locks dir unreadable")
+
+    with unittest.mock.patch.object(hc, "Path", lambda *a, **k: _BoomPath()):
+        got = hc._gateway_lock_pids()
+    check("unreadable locks/ → {} rather than an exception", got == {}, f"got {got!r}")
+
     # 4b) THE PATTERN ITSELF must see a process running under the DEPRECATED filename.
     #
     # src/remote-relay-bridge.py is a compat stub the repo deliberately ships so
