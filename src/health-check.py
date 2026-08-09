@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
-from util_paths import _host_label, claude_home_path, claude_project_slug, shared_personal_path  # noqa: E402
+from util_paths import _host_label, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
@@ -5717,6 +5717,68 @@ def check_notes_split_brain() -> "dict | None":
     }
 
 
+
+
+def check_legacy_notes_divergence() -> "dict | None":
+    """Detect a canonical-vs-legacy notes/ divergence the #1266 probe cannot see.
+
+    `check_notes_split_brain` compares <repo>/notes against <workspace>/notes.
+    A host whose repo has no notes/ dir clears that guard and goes quiet, while the
+    pre-v0.8 <legacy workspace>/notes (often a symlink into the memory-sync clone)
+    keeps taking writes. Measured on one host:
+    91 specs canonical, 105 legacy, 83 shared — bidirectional, and the newest
+    canonical spec was 7 days older than the newest legacy one.
+
+    Recursive and extension-agnostic on purpose: the #1266 probe globs top-level
+    `*.md`, and this divergence lives in `sutando-wire/episode-specs/*.yaml`,
+    so an .md-only top-level scan reports clean twice over.
+    """
+    ws_notes = Path(shared_personal_path("notes", WORKSPACE_DIR))
+    legacy_notes = legacy_dotted_workspace() / "notes"
+    if not ws_notes.exists() or not legacy_notes.exists():
+        return None
+    try:
+        if ws_notes.resolve() == legacy_notes.resolve():
+            return None
+    except OSError:
+        return None
+
+    def _rel(root: Path) -> "set[str]":
+        out = set()
+        try:
+            for p in root.rglob("*"):
+                if p.is_file():
+                    out.add(str(p.relative_to(root)))
+        except OSError:
+            pass
+        return out
+
+    a, b = _rel(ws_notes), _rel(legacy_notes)
+    only_ws, only_legacy = a - b, b - a
+    if not only_ws and not only_legacy:
+        return None
+
+    # Deliberately NO "which side is live" verdict. A whole-tree newest-mtime is
+    # dominated by whichever file was touched last for any reason, so it can read
+    # "canonical is newer" while the producer for the subtree that matters writes
+    # to the legacy side — measured exactly that way on one host (canonical newer
+    # by 0.0d over the whole tree, 7 days OLDER on episode-specs alone). The
+    # counts are checkable; that inference is not, at this granularity.
+    return {
+        "name": "legacy-notes-divergence",
+        "status": "warn",
+        "detail": (
+            f"notes/ has diverged from the pre-v0.8 {legacy_notes}: "
+            f"{len(only_ws)} file(s) only in the canonical workspace, "
+            f"{len(only_legacy)} only in the legacy tree, {len(a & b)} shared. "
+            f"Neither side is a superset, so pointing a consumer at either one "
+            f"loses files. Decide which tree is authoritative before 'fixing' "
+            f"any path that reads notes/, and compare the SUBTREE you care about "
+            f"— a whole-tree mtime does not tell you which side is still live."
+        ),
+    }
+
+
 def _drop_launcher_parents(pids: list) -> list:
     """Collapse a launcher+child pair to the child that is the real process.
 
@@ -6910,6 +6972,11 @@ def run_all_checks() -> list[dict]:
     _notes_sb = check_notes_split_brain()
     if _notes_sb:
         checks.append(_notes_sb)
+
+    # Sibling of the above, for the pair it cannot reach (see its docstring).
+    _legacy_nd = check_legacy_notes_divergence()
+    if _legacy_nd:
+        checks.append(_legacy_nd)
 
     # Memory sync
     checks.append(check_memory_sync())

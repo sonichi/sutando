@@ -89,8 +89,17 @@ def _workspace_root() -> Path:
             pass
         # Last-ditch default: the canonical post-v0.8 home-dir location
         # (~/sutando-workspace, matching sutando_config.py resolve_workspace) —
-        # NOT the pre-v0.8 dotted ~/.sutando/workspace, which no longer exists.
+        # NOT the pre-v0.8 dotted ~/.sutando/workspace, which is no longer
+        # RESOLVED to. It may still exist on disk and still be taking writes;
+        # health-check's legacy-notes-divergence probe reports that case.
         return Path.home() / "sutando-workspace"
+
+
+def legacy_dotted_workspace() -> Path:
+    """The pre-v0.8 dotted workspace dir. NOT resolved to any more — but it can
+    still exist on disk and still take writes, which is why one file owns the
+    literal instead of each caller writing it fresh."""
+    return Path.home() / ".sutando" / "workspace"
 
 
 def _host_label() -> str:
