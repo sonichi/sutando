@@ -1353,10 +1353,25 @@ _push_only_impl() {
     fi
 
     # Mass-deletion tripwire (carried over from sync-memory.sh)
-    local deleted max_delete
+    local deleted staged_d untracked_by_policy max_delete
     # `-M` for rename detection: legitimate moves (refactor) don't count as
     # deletions. Mirrors pull-side tripwire fix. Mini #1445 v4 Low.
-    deleted=$(git diff -M --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
+    staged_d=$(git diff -M --cached --name-only --diff-filter=D | wc -l | tr -d ' ')
+    # A carrier-policy untrack (_enforce_carrier_set_pre's `git rm --cached`)
+    # stages a D too, so counting raw D's makes the guard block the migration it
+    # is supposed to allow: the file stays on disk, only the index entry goes.
+    # Discriminate by asking the CURRENT rules — a staged deletion whose path is
+    # now excluded is policy; anything else is real content loss and still counts.
+    # check-ignore exits 1 when nothing matches, hence `|| true` (see the same
+    # trap documented at _enforce_carrier_set_pre).
+    untracked_by_policy=$(git diff -M --cached --name-only --diff-filter=D -z \
+        | git check-ignore -z --stdin --no-index 2>/dev/null | tr -dc '\0' | wc -c | tr -d ' ' || true)
+    [ -n "$untracked_by_policy" ] || untracked_by_policy=0
+    deleted=$(( staged_d - untracked_by_policy ))
+    [ "$deleted" -ge 0 ] || deleted=0
+    if [ "$untracked_by_policy" -gt 0 ]; then
+        log "_push_only_impl: tripwire counts $deleted real deletion(s); $untracked_by_policy staged D(s) are carrier-policy untracks"
+    fi
     max_delete="${SUTANDO_SYNC_MAX_DELETE:-50}"
     if [ "$deleted" -gt "$max_delete" ] && [ "${SUTANDO_FORCE_SYNC:-0}" != "1" ]; then
         log "_push_only_impl: ABORT — would delete $deleted files (>$max_delete tripwire)"
