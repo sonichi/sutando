@@ -47,13 +47,8 @@ shift
 # of the fix; the eligibility-side half (don't migrate gated entries) landed in
 # reconcile_launchd.py.
 #
-# Exclude task-workstream-grouping-*.txt (and its legacy task-project-grouping-*
-# name) for the same reason: task_workstreams.py queues them only while the core
-# is idle, so every cron fire that follows an idle core sees one and defers. They
-# declare access_tier: owner (source: task-workstream-grouping, priority: low),
-# which the tier filter below cannot distinguish from a human DM. Observed
-# 2026-08-09: pending-questions, sync-workspace and pr-flag deferred three fires
-# in a row with only a classifier task queued.
+# task-workstream-grouping-* / task-project-grouping-* are emitted only while
+# the core is idle and declare access_tier: owner, so the tier filter misses them.
 # Tier filter: a task that EXPLICITLY declares a non-owner access_tier (team /
 # other / ambient) is peer or public traffic, not the human-owner DMs/voice this
 # gate exists to yield to. Deferring on it starves the cron for as long as peers

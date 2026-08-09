@@ -16,8 +16,7 @@ mkdir -p "$TMPDIR/tasks"
 export SUTANDO_TEST_MODE=1
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
-# Count in ok() rather than hardcoding the total in the footer: the footer read
-# "13/13" while 16 checks ran, so adding a case silently left the summary behind.
+# Counted, not hardcoded: a literal total silently under-reports added cases.
 PASSED=0
 ok()   { PASSED=$((PASSED + 1)); echo "  ok  $1"; }
 
@@ -82,13 +81,8 @@ ok "genuine owner task still defers even when a task-cron-* file is present"
 rm -f "$TMPDIR/tasks/task-cron-sync-workspace-1785114482357.txt" "$TMPDIR/tasks/task-9876543210987.txt"
 
 # --- task-workstream-grouping-*.txt (classifier emission) does NOT count ------
-# Same shape as task-cron-* above, different emitter. task_workstreams.py queues
-# a classifier task only while the core is IDLE, and it declares
-# access_tier: owner, so the tier filter cannot tell it from a human DM. Every
-# cron fire that follows an idle core therefore deferred on a file the core
-# itself produced. Observed 2026-08-09: three consecutive fires of
-# pending-questions / sync-workspace / pr-flag deferred with only this queued.
-# The body is the real emitted shape, so the access_tier line is exercised.
+# Queued only while the core is idle and declares access_tier: owner, so the
+# tier filter cannot tell it from a human DM. Body is the real emitted shape.
 cat > "$TMPDIR/tasks/task-workstream-grouping-1786301397837.txt" <<'CLASSIFIER'
 id: task-workstream-grouping-1786301397837
 source: task-workstream-grouping
@@ -100,7 +94,7 @@ out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-classif
 [ "$out" = "ran-despite-classifier" ] || fail "task-workstream-grouping-*: expected 'ran-despite-classifier', got '$out'"
 ok "task-workstream-grouping-*.txt (classifier emission) does not trigger deferral"
 
-# legacy name must be excluded too — task_workstreams.py still recognises it
+# legacy name is still recognised by the emitter, so exclude it too
 touch "$TMPDIR/tasks/task-project-grouping-1786301397838.txt"
 out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-legacy-emit echo 'ran-despite-legacy' 2>&1)"
 [ "$out" = "ran-despite-legacy" ] || fail "task-project-grouping-*: expected 'ran-despite-legacy', got '$out'"
