@@ -324,11 +324,8 @@ enum SutandoConfig {
         return proc.terminationStatus == 0
     }
 
-    /// Resolve a runnable python3, or nil: `$SUTANDO_PY`, the bundled
-    /// runtime, then `/usr/bin/python3` only when the developer tools exist.
-    ///
-    /// nil is a real outcome — the caller must skip rather than prompt.
-    /// Dependencies are injected so tests can drive every tier.
+    /// Resolves python3 in order: `$SUTANDO_PY`, the bundled runtime, then
+    /// `/usr/bin/python3` only if developer tools exist. nil means skip, not prompt.
     static func resolvePython(
         repoRoot: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,
