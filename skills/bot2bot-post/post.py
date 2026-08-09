@@ -185,7 +185,45 @@ def _recipient_in_channel(access: dict, channel_id: str, recipient_id: str) -> b
     return str(recipient_id) in {str(x) for x in cfg.get("allowFrom", [])}
 
 
-def post(channel_id: str, text: str, token: str):
+#: Discord rejects a message whose `content` exceeds this many characters.
+DISCORD_MAX_CONTENT = 2000
+
+
+def check_length(text: str, overhead: int = 0) -> "str | None":
+    """The refusal message if `text` is over the limit, else None.
+
+    Measures the FINAL content — the routing prefix and `kind:` tag are part of
+    what Discord counts, and they are the part callers forget. A body sized to
+    exactly 2000 is already over once `<@id> done: ` is prepended.
+
+    Returned rather than raised so the caller decides how to fail, and so a test
+    can assert the wording without trapping SystemExit.
+    """
+    n = len(text)
+    if n <= DISCORD_MAX_CONTENT:
+        return None
+    over = n - DISCORD_MAX_CONTENT
+    room = DISCORD_MAX_CONTENT - overhead
+    detail = (
+        f" The count INCLUDES the {overhead}-char routing prefix, so the body "
+        f"itself must be <= {room} chars."
+        if overhead else ""
+    )
+    return (
+        f"ERROR: content is {n} chars — {over} over Discord's "
+        f"{DISCORD_MAX_CONTENT} limit. NOTHING WAS SENT.{detail} "
+        f"Cut ~{over} chars and retry."
+    )
+
+
+def post(channel_id: str, text: str, token: str, overhead: int = 0):
+    # Refuse locally rather than spending a round trip to be told the same thing
+    # by a 400 that reports no numbers. The API's error names the limit but not
+    # the actual length or the overage, so the caller cannot tell how much to
+    # cut without measuring again.
+    problem = check_length(text, overhead)
+    if problem:
+        sys.exit(problem)
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     body = json.dumps({"content": text}).encode()
     req = urllib.request.Request(
@@ -289,7 +327,7 @@ def main():
     prefix = f"<@{other_id}> " if other_id else ""
     message = f"{prefix}{kind}: {text}"
 
-    result = post(channel_id, message, token)
+    result = post(channel_id, message, token, overhead=len(message) - len(text))
     print(f"Posted to #{channel_id} (msg_id {result.get('id')}): {message[:80]}")
 
 

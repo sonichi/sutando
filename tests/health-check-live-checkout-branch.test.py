@@ -267,8 +267,11 @@ def main() -> int:
     #
     # Observed on this node: exactly ONE commit behind, this probe reporting ok,
     # while the live `context-reconstruct` still instructed writing the shared
-    # flat `state/current-track.md` whose two-writer collision had destroyed a
-    # peer's anchor hours earlier (#2567/#2568).
+    # flat `state/current-track.md`, which delivers one host's anchor onto
+    # another host at the same local path (#2567/#2568). This used to say that
+    # collision "had destroyed a peer's anchor"; nothing was destroyed, and the
+    # observation does not depend on it — what the probe missed is that the
+    # running skill and the merged skill disagreed with nothing to compare.
     def _mk_clone_behind_paths(td: Path, paths: "list[str]") -> Path:
         """A clone on `main`, one commit behind per entry in `paths`."""
         up = _mk_repo(td, "main")

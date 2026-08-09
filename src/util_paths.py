@@ -19,6 +19,7 @@ Usage:
 """
 from __future__ import annotations
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -270,7 +271,7 @@ def shared_personal_path(filename: str, workspace: Path | None = None) -> Path:
 # `~/.claude/`. Does NOT create the dir.
 # ---------------------------------------------------------------------------
 
-def claude_home_path(*subpath: str) -> Path:
+def claude_home_path(*subpath: str, vanilla: bool = False) -> Path:
     """Resolve a path under Claude Code's per-user home (`~/.claude/` by default).
 
     Pass subpath components positionally, e.g.:
@@ -285,6 +286,17 @@ def claude_home_path(*subpath: str) -> Path:
       2. $CLAUDE_HOME (legacy alt-host override, kept for tests).
       3. ~/.claude/ (default — vanilla `claude` users).
 
+    `vanilla=True` asks a DIFFERENT question: where does *stock* Claude Code
+    keep this, regardless of where Sutando relocated its own config? It skips
+    $CLAUDE_CONFIG_DIR entirely and reads $SOURCE_CLAUDE_CONFIG_DIR (the name
+    the note below already gives that location) before the default. Use it ONLY
+    to read state written by a tool that hardcodes the stock home and does not
+    honour $CLAUDE_CONFIG_DIR — that surface stays as countable as this one.
+    A caller who wants the relocated dir wants the default form; collapsing the
+    two is the bug sonichi#2629 is about, where the official discord plugin
+    wrote approval markers to the stock home and the bridge read the relocated
+    one, so confirmations were silently never sent.
+
     The CLAUDE_CONFIG_DIR check goes first because for a claude-sutando
     install, that's where settings, sessions, channels, skills, and memory
     actually live post-migrate. The CLAUDE_HOME hatch still works for tests
@@ -297,18 +309,35 @@ def claude_home_path(*subpath: str) -> Path:
     RUNTIME path resolution. Migration code uses SOURCE_CLAUDE_CONFIG_DIR
     directly to keep the read-side / write-side distinction visible.
     """
-    ccd_env = os.environ.get("CLAUDE_CONFIG_DIR")
-    home_env = os.environ.get("CLAUDE_HOME")
+    ccd_env = None if vanilla else os.environ.get("CLAUDE_CONFIG_DIR")
+    home_env = (os.environ.get("SOURCE_CLAUDE_CONFIG_DIR") if vanilla
+                else os.environ.get("CLAUDE_HOME"))
     if ccd_env:
         base = Path(os.path.expanduser(ccd_env))
     elif home_env:
         base = Path(os.path.expanduser(home_env))
     else:
-        _emit_claude_home_fallback_banner_once()
+        # `vanilla=True` landing here is the CORRECT answer, not a fallback, so
+        # it must not fire the "nothing is configured" banner.
+        if not vanilla:
+            _emit_claude_home_fallback_banner_once()
         base = Path.home() / ".claude"
     if not subpath:
         return base
     return base.joinpath(*subpath)
+
+
+def claude_project_slug(path: str | Path) -> str:
+    """Derive the project slug Claude Code uses under `projects/<slug>/`.
+
+    Claude Code dashes every non-alphanumeric character of the path, not
+    just "/" — matching only "/" resolves to a nonexistent dir on any path
+    containing a space or dot (e.g. a desktop-bundled checkout under
+    "Application Support/space.ag2.app/"). Every caller must derive the slug
+    through this one function rather than re-implementing the regex, so the
+    derivation can't drift out of sync again.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
 def channel_access_path(source: str) -> Path:

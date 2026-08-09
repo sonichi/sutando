@@ -1084,7 +1084,16 @@ _resolve_conflicts_keep_ours() {
 # add ITS OWN `hosts/<label>/current-track.md`, which is not the puller's anchor.
 # The guarantee therefore has to be local and to run BEFORE the fetch/merge —
 # each host rescues its own copy. Same placement and contract as
-# `_migrate_flat_branch` above. Idempotent: a no-op once the per-host file
+# `_migrate_flat_branch` above.
+#
+# Called from BOTH entry points, and the reason is worth stating because the
+# pull-side rationale above does not imply it. The hazard is not the merge; it
+# is `_enforce_carrier_set_pre`, which untracks newly-excluded files and lets
+# the caller commit that deletion. `--push-only` runs that enforcement without
+# ever passing through `_pull_only_impl`, so a pull-only call site leaves the
+# explicit push mode able to delete the sole carried copy of an anchor it never
+# replaced. Idempotent, so calling it twice in the default bidirectional path
+# costs one `[ -e ]`. Idempotent: a no-op once the per-host file
 # exists, so it costs one `[ -e ]` per tick thereafter.
 _migrate_flat_anchor() {
     local _flat _dest
@@ -1280,6 +1289,14 @@ _push_only_impl() {
     # access.json) into hosts/<host>/ before staging, so it's carried + survives
     # a rebuild. Non-fatal: never blocks the push.
     _snapshot_per_host_config || color_warn "sync-workspace: per-host config snapshot failed (non-fatal); push continues"
+    # Rescue this host's anchor BEFORE carrier enforcement can untrack it
+    # (#2567/#2607). `--push-only` never reaches `_pull_only_impl`, so without
+    # this call the enforcement below regenerates the exclude, untracks the
+    # now-uncarried flat `state/current-track.md`, and COMMITS that deletion —
+    # on a host whose anchor exists only at the flat path that removes the sole
+    # carried copy and writes no replacement. Pull-side placement alone is not
+    # enough: the hazard is carrier enforcement, and both entry points run it.
+    _migrate_flat_anchor
     _enforce_carrier_set_pre
     git add -A
     _refuse_staged_secrets
@@ -1463,10 +1480,10 @@ _migrate_from_legacy_impl() {
         echo "sync-workspace migrate: copying from $legacy_dir into $WORKSPACE_DIR" >&2
     fi
 
-    # Local slug derivation: matches Claude Code's auto-derived slug
-    # (REPO_DIR with / replaced by -).
+    # Claude Code dashes EVERY non-alphanumeric char, not just `/`; a path with a
+    # space or dot would otherwise resolve to a slug it never creates.
     local local_slug
-    local_slug="$(printf '%s' "$REPO_DIR" | sed 's|/|-|g')"
+    local_slug="$(printf '%s' "$REPO_DIR" | tr -c 'A-Za-z0-9' '-')"
 
     # Per-host segment for hostname-qualified destinations (build_log,
     # pending-questions). Computed once; matches `_host()` + the reader probe.

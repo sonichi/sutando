@@ -87,8 +87,7 @@ class TestTranscriptsDir(unittest.TestCase):
         with patch.object(self.m.subprocess, "run", return_value=fake):
             got = self.m.transcripts_dir()
         self.assertTrue(str(got).startswith("/tmp/ws/.claude-sutando/projects/"))
-        import re as _re
-        self.assertIn(_re.sub(r"[^A-Za-z0-9]", "-", str(self.m.REPO)), str(got))
+        self.assertIn(self.m.claude_project_slug(str(self.m.REPO)), str(got))
 
     def test_slug_dashes_all_non_alphanumerics(self):
         # Claude Code's project slug dashes spaces and dots too, not just "/".

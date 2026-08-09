@@ -30,6 +30,10 @@ resolves `core.runtime` and delegates to the matching implementation.
 
 The Codex implementation:
 
+- is selected before startup touches Claude credentials, so `startup.sh` does
+  not copy Claude login state or run the Claude-only preflight for a Codex core;
+- exports the configured `CODEX_HOME` and requires `codex login status` to pass
+  before any background service launches;
 - owns the same `sutando-core` tmux session used by the menu bar, health checks,
   and terminal attachment;
 - validates `codex` availability and authentication before changing the live
@@ -45,6 +49,10 @@ The Codex implementation:
 - runs the shared core supervisor so dashboard/runtime health signals continue
   to update when Codex is selected;
 - restarts the core and notifier together, preventing duplicate task consumers.
+
+`SUTANDO_SKIP_AUTH_PREFLIGHT=1` bypasses either runtime's early authentication
+check for one startup. The runtime launcher still performs its own defensive
+authentication check before replacing the core session.
 
 For a one-command trial without changing config, use the invocation-scoped
 override:
