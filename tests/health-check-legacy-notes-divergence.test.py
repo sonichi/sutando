@@ -158,6 +158,53 @@ check("the probe is CALLED, not merely defined",
 check("the #1266 probe is still called too",
       "_notes_sb = check_notes_split_brain()" in src)
 
+# The two `except OSError` arms decide what happens when the filesystem will not
+# answer, and an untested fail-safe is indistinguishable from one that never runs.
+print("\nfail-safe branches, driven rather than asserted:")
+with tempfile.TemporaryDirectory() as _td:
+    _root = Path(_td)
+    _ws, _legacy = _root / "canonical", _root / "legacy"
+    for _base in (_ws / "notes", _legacy / "notes"):
+        _base.mkdir(parents=True)
+        (_base / "a.md").write_text("x")
+
+    _real_resolve = Path.resolve
+
+    def _boom_resolve(self, *a, **k):
+        if str(self).startswith(str(_legacy)):
+            raise OSError("simulated resolve failure")
+        return _real_resolve(self, *a, **k)
+
+    with patch.object(hc, "WORKSPACE_DIR", _ws), \
+         patch.object(hc, "legacy_dotted_workspace", lambda: _legacy), \
+         patch.object(Path, "resolve", _boom_resolve):
+        r = hc.check_legacy_notes_divergence()
+    check("resolve() raising OSError -> None, not a traceback", r is None, str(r))
+
+    _real_rglob = Path.rglob
+
+    def _boom_rglob(self, pattern):
+        if str(self).startswith(str(_legacy)):
+            raise OSError("simulated listing failure")
+        return _real_rglob(self, pattern)
+
+    with patch.object(hc, "WORKSPACE_DIR", _ws), \
+         patch.object(hc, "legacy_dotted_workspace", lambda: _legacy), \
+         patch.object(Path, "rglob", _boom_rglob):
+        r = hc.check_legacy_notes_divergence()
+    check("an unreadable legacy tree still reports, from the side that IS readable",
+          r is not None and r.get("status") == "warn", str(r))
+    check("...and attributes every file to the readable side, not to a false divergence",
+          r is not None and "1 file(s) only in the canonical" in r["detail"], str(r))
+
+# The source-substring check above survives deleting the append; only calling the
+# aggregate proves the result actually reaches an operator.
+_synthetic = {"name": "legacy-notes-divergence", "status": "warn", "detail": "synthetic"}
+with patch.object(hc, "check_legacy_notes_divergence", lambda: _synthetic):
+    _names = [c.get("name") for c in hc.run_all_checks()]
+check("run_all_checks() APPENDS the result — executed, not grepped",
+      "legacy-notes-divergence" in _names)
+
 if failures:
     print(f"\nFAILED ({len(failures)}): {failures}")
     sys.exit(1)
