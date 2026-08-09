@@ -19,19 +19,28 @@ fail() {
   exit 3
 }
 
-# macOS has no `timeout` binary, so emulate a bounded run. Both paths escalate to
-# KILL: TERM alone leaves `wait` blocking for a TERM-ignoring child's full runtime.
+# macOS has no `timeout` binary, so emulate a bounded run. Signals go to the child's
+# process GROUP: a sync that spawns a helper outlives a pid-only kill, so the caller
+# would report "timed out" while the descendant still writes to the workspace.
 bounded() {
   local secs="$1"; shift
   local grace="${GR_KILL_GRACE_S:-3}"
   if command -v timeout >/dev/null 2>&1; then
     timeout --kill-after="$grace" "$secs" "$@"; return $?
   fi
-  "$@" & local pid=$!
-  ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null
-    sleep "$grace"; kill -KILL "$pid" 2>/dev/null ) & local killer=$!
+  # `set -m` makes the job a process-group leader, so pgid == pid and `-$pid` is the
+  # group. Without it the job shares OUR group and `-$pid` would signal this shell.
+  set -m; "$@" & local pid=$!; set +m
+  ( sleep "$secs"; kill -TERM "-$pid" 2>/dev/null
+    sleep "$grace"; kill -KILL "-$pid" 2>/dev/null ) & local killer=$!
   wait "$pid"; local rc=$?
   kill -TERM "$killer" 2>/dev/null; wait "$killer" 2>/dev/null || true
+  # The group can outlive its leader; drain it before the caller reports a verdict.
+  if kill -0 "-$pid" 2>/dev/null; then
+    kill -KILL "-$pid" 2>/dev/null
+    local waited=0
+    while kill -0 "-$pid" 2>/dev/null && [ "$waited" -lt 20 ]; do sleep 0.1; waited=$((waited+1)); done
+  fi
   return $rc
 }
 

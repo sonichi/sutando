@@ -205,6 +205,25 @@ grep -q 'timed out after' "$WS7B/state/restart-prep-failed.json" 2>/dev/null \
   && say ok "failed sentinel names the timeout" \
   || say FAIL "failed sentinel missing or does not name the timeout"
 
+echo "7c. a timed-out sync's DESCENDANTS are reaped, not just the direct child"
+# A pid-only kill leaves the grandchild running, so prep reports "timed out" and the
+# restart proceeds while that process is still writing to the workspace.
+WS7C="$TMP/ws7c"; mkdir -p "$WS7C/state" "$WS7C/tasks"
+GR_WS="$WS7C" GR_STEP_TIMEOUT=1 GR_KILL_GRACE_S=2 \
+  GR_SYNC_CMD='trap "" TERM; sleep 41 & echo $! >"'"$WS7C"'/gchild.pid"; wait' \
+  bash "$REPO/src/agent/restart-prep.sh" pgroup-rid >/dev/null 2>&1
+gpid="$(cat "$WS7C/gchild.pid" 2>/dev/null)"
+# Fixture control: with no grandchild the survival check below passes vacuously.
+[ -n "$gpid" ] && say ok "fixture spawned a grandchild (pid $gpid)" \
+  || say FAIL "no grandchild pid recorded — fixture is unrepresentative, not passing"
+sleep 1
+if [ -n "$gpid" ] && kill -0 "$gpid" 2>/dev/null; then
+  kill -KILL "$gpid" 2>/dev/null
+  say FAIL "grandchild $gpid SURVIVED — signals went to the pid, not the process group"
+else
+  say ok "grandchild reaped with its process group"
+fi
+
 echo
 
 # --- GNU-style `stat -f` must not break alive_age() ------------------------------------
