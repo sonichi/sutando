@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
-"""review-pr.sh must delimit its verdict, so a consumer never quotes the trace.
-
-codex's own exec trace goes to review-pr.sh's stdout UNREDIRECTED, and that is
-deliberate: codex-bounded.sh --stall watches that stream to tell a working run
-from a wedged one, so silencing it would break the watchdog. But the trace
-contains source the agent inlined while working, so a consumer that reads "the
-tail" can quote repository code as the PR's own content.
-
-That is not hypothetical. Reviewing sonichi/sutando#2763 I read test names out of
-the tail of a 64KB dump and reported them as the PR's coverage; `grep` over the
-actual diff showed all four were absent. Everything after the LAST marker is the
-verdict, and nothing else is.
-
-Stubs `gh` and `codex` on PATH — no network, no agent, no cost.
+"""The verdict is everything after the LAST marker; the rest of stdout is codex's
+trace, which --stall needs, so a consumer must extract instead of taking the stream.
 """
 from __future__ import annotations
 
@@ -75,6 +63,27 @@ class ReviewPrDelimitsItsVerdict(unittest.TestCase):
         after = r.stdout.rsplit(MARKER, 1)[1]
         self.assertNotIn("not_in_this_pr", after)
         self.assertNotIn("diff --git", after)
+
+    def test_the_bridge_instruction_tells_the_agent_to_extract_after_the_marker(self):
+        """The only production consumer: a bare 'verdict on stdout' reproduces the defect."""
+        text = (REPO / "src" / "discord-bridge.py").read_text()
+        success = [ln for ln in text.splitlines()
+                   if "On SUCCESS" in ln and "results/task-{id}.txt" in ln]
+        self.assertTrue(success, "PR-REVIEW success instruction not found in the bridge")
+        for ln in success:
+            self.assertIn(MARKER, ln,
+                          "the bridge must name the marker, not just 'verdict on stdout'")
+            self.assertIn("LAST", ln, "must specify the LAST marker, not any marker")
+
+    def test_the_skill_stdout_contract_names_the_marker(self):
+        """SKILL.md documents the same path the in-band block runs; both or neither."""
+        text = (REPO / "skills" / "claude-codex" / "SKILL.md").read_text()
+        idx = text.find("Prints Codex's verdict to stdout")
+        self.assertNotEqual(idx, -1, "the stdout contract paragraph is gone")
+        para = text[idx:idx + 700]
+        self.assertIn(MARKER, para,
+                      "SKILL.md must name the marker where it describes stdout")
+        self.assertIn("LAST", para, "must specify the LAST marker, not any marker")
 
 
 if __name__ == "__main__":
