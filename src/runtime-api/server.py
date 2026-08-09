@@ -217,6 +217,33 @@ class RuntimeServer:
         _log(f"generated SCP WSS token at {tok_path}")
         return tok
 
+    def _wss_ssl_context(self):
+        """TLS for the WSS listener (SUTANDO_SCP_WSS_TLS truthy). Browsers gate
+        the microphone behind a secure context, so phone-voice on the LAN needs
+        https/wss — a self-signed cert is generated once (openssl, universally
+        present on macOS) under state/auth/scp-tls/ and reused. The phone
+        accepts the self-signed warning once. Returns an SSLContext or None."""
+        if (os.environ.get("SUTANDO_SCP_WSS_TLS") or "").lower() not in (
+                "1", "true", "yes", "on"):
+            return None
+        import ssl
+        import subprocess
+        tls_dir = Path(self._state_dir) / "auth" / "scp-tls"
+        tls_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(tls_dir, 0o700)
+        cert, key = tls_dir / "cert.pem", tls_dir / "key.pem"
+        if not (cert.exists() and key.exists()):
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                 "-keyout", str(key), "-out", str(cert), "-days", "825",
+                 "-subj", "/CN=sutando-server"],
+                check=True, capture_output=True)
+            os.chmod(key, stat.S_IRUSR | stat.S_IWUSR)
+            _log(f"generated self-signed TLS cert at {tls_dir}")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert), str(key))
+        return ctx
+
     async def _maybe_start_wss(self):
         """Start the LAN WSS transport iff SUTANDO_SCP_WSS_ENABLE is truthy.
         Best-effort: any failure here must NOT stop the UDS daemon from
@@ -253,7 +280,7 @@ class RuntimeServer:
                               request_subscribers=self._request_subscribers,
                               voice_bridge=voice,
                               host=host, port=port, log=_log)
-            await wss.start()
+            await wss.start(ssl_context=self._wss_ssl_context())
             if host not in ("127.0.0.1", "localhost", "::1"):
                 _log(f"SCP WSS is LAN-exposed on {host}:{port} "
                      f"(bearer-gated, read-only method set)")

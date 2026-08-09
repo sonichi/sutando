@@ -319,13 +319,15 @@ class WsTransport:
         return app
 
     # ── lifecycle (runs on the daemon's asyncio loop, non-blocking) ──────────
-    async def start(self) -> None:
+    async def start(self, ssl_context=None) -> None:
         self._runner = web.AppRunner(self.build_app())
         await self._runner.setup()
-        site = web.TCPSite(self._runner, self.host, self.port)
+        site = web.TCPSite(self._runner, self.host, self.port,
+                           ssl_context=ssl_context)
         await site.start()
+        scheme = "wss" if ssl_context else "ws"
         self._log(
-            f"SCP WSS listening on ws://{self.host}:{self.port}{self.route}")
+            f"SCP WSS listening on {scheme}://{self.host}:{self.port}{self.route}")
 
     async def cleanup(self) -> None:
         if self._runner is not None:
