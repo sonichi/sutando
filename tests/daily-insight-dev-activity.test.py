@@ -179,6 +179,68 @@ class TestInsightPriority(unittest.TestCase):
         all_landed = self.mod.dev_activity_insight({**base, "landed_24h": 43})
         self.assertIn("shipped 43 commits", all_landed)
 
+    def test_a_git_failure_yields_None_not_a_false_shipped(self):
+        """The two failure branches of _landed_commit_count exist so a git error
+        cannot become a "shipped" claim: None means unknown, and the caller then
+        says "authored". A 0 here would read as "nothing landed", which is a
+        different and unearned assertion."""
+        import subprocess as _sp
+        mod, real = self.mod, self.mod.subprocess.run
+
+        def raiser(*a, **k):
+            raise OSError("git missing")
+        mod.subprocess.run = raiser
+        try:
+            self.assertIsNone(mod._landed_commit_count(REPO, "a@b", ""))
+        finally:
+            mod.subprocess.run = real
+
+        class Bad:
+            returncode = 128
+            stdout = ""
+        # rev-parse must still succeed so we reach the log call, then fail there.
+        calls = {"n": 0}
+
+        def flaky(argv, *a, **k):
+            calls["n"] += 1
+            if "rev-parse" in argv:
+                return real(argv, *a, **k)
+            return Bad()
+        mod.subprocess.run = flaky
+        try:
+            self.assertIsNone(mod._landed_commit_count(REPO, "a@b", ""))
+            self.assertGreater(calls["n"], 1, "should have reached the log call")
+        finally:
+            mod.subprocess.run = real
+
+    def test_no_resolvable_default_branch_yields_None(self):
+        """A repo with no origin/HEAD, origin/main or origin/master cannot say what
+        landed. None, so the caller drops the word rather than reporting zero."""
+        mod, real = self.mod, self.mod.subprocess.run
+
+        class NoRef:
+            returncode = 1
+            stdout = ""
+        mod.subprocess.run = lambda *a, **k: NoRef()
+        try:
+            self.assertIsNone(mod._landed_commit_count(REPO, "a@b", ""))
+        finally:
+            mod.subprocess.run = real
+
+    def test_a_raising_log_call_yields_None(self):
+        """rev-parse succeeds, then the log call itself raises — still None."""
+        mod, real = self.mod, self.mod.subprocess.run
+
+        def flaky(argv, *a, **k):
+            if "rev-parse" in argv:
+                return real(argv, *a, **k)
+            raise OSError("git vanished mid-run")
+        mod.subprocess.run = flaky
+        try:
+            self.assertIsNone(mod._landed_commit_count(REPO, "a@b", ""))
+        finally:
+            mod.subprocess.run = real
+
     def test_unresolvable_landed_count_does_not_claim_shipped(self):
         """A repo with no remote default branch cannot say what landed, so the word
         must not appear at all rather than defaulting to the flattering reading."""

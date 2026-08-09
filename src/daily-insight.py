@@ -443,12 +443,18 @@ def _landed_commit_count(repo_root, author, stand):
     default branch. Returns None when that branch cannot be resolved, so the
     caller can decline to claim anything rather than guess."""
     ref = None
-    for cand in ("origin/HEAD", "origin/main", "origin/master"):
-        r = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--verify", "-q", cand],
-                           capture_output=True, text=True)
-        if r.returncode == 0:
-            ref = cand
-            break
+    # Guarded like the log call below: if git is missing entirely this must return
+    # None (unknown), not raise. An exception here would propagate out of
+    # analyze_dev_activity and take the whole insight down.
+    try:
+        for cand in ("origin/HEAD", "origin/main", "origin/master"):
+            r = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--verify", "-q", cand],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                ref = cand
+                break
+    except (OSError, subprocess.SubprocessError):
+        return None
     if ref is None:
         return None
     try:
