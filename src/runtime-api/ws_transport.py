@@ -26,6 +26,7 @@ SUTANDO_SCP_WSS_ENABLE) so UDS-only deployments are unchanged.
 from __future__ import annotations
 
 import hmac
+import json
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -192,7 +193,17 @@ class WsTransport:
                         await ws.send_bytes(media_frame.encode(
                             media_frame.STREAM_AUDIO, sid_box[0], payload))
 
-                opened = self._voice.open(params, _send_media)
+                async def _send_event(ev: dict) -> None:
+                    # UI-metadata notifications (voice.state) — stamped with the
+                    # stream id, JSON-RPC notification shape (no id).
+                    if sid_box:
+                        params_out = dict(ev.get("params") or {})
+                        params_out["streamId"] = sid_box[0]
+                        await ws.send_str(json.dumps({
+                            "jsonrpc": "2.0", "method": ev["method"],
+                            "params": params_out}))
+
+                opened = self._voice.open(params, _send_media, _send_event)
                 sid_box.append(opened["streamId"])
                 streams.add(opened["streamId"])
                 await ws.send_str(result_frame(req_id, opened).decode())

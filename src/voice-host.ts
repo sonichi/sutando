@@ -117,13 +117,29 @@ async function handleSession(ws: WebSocket): Promise<void> {
 				inputAudioTranscription: true,
 				speechConfig: { voiceName: params.voice || 'Aoede' },
 			} as any);
+			// voice.state — UI metadata, never transport sync: the device plays
+			// audio the moment frames arrive; these only drive its tiny screen.
+			// Mapping: turn.start → thinking, first audio of the turn → speaking,
+			// turn.interrupted → interrupted, turn.end → listening.
+			let spokeThisTurn = false;
+			const sendState = (state: string) => {
+				if (ws.readyState === WebSocket.OPEN) {
+					ws.send(JSON.stringify({ method: 'voice.state', params: { state } }));
+				}
+			};
 			// Downstream: Gemini audio (base64 PCM 24k) → binary frame to the
 			// bridge — the same handleAudioOutput override conversation-server
 			// uses, minus the mu-law hop.
 			(session as any).handleAudioOutput = (data: string) => {
 				if (ws.readyState === WebSocket.OPEN) ws.send(Buffer.from(data, 'base64'));
+				if (!spokeThisTurn) { spokeThisTurn = true; sendState('speaking'); }
 			};
+			const bus = (session as any).eventBus;
+			bus?.subscribe?.('turn.start', () => { spokeThisTurn = false; sendState('thinking'); });
+			bus?.subscribe?.('turn.end', () => { spokeThisTurn = false; sendState('listening'); });
+			bus?.subscribe?.('turn.interrupted', () => { spokeThisTurn = false; sendState('interrupted'); });
 			await (session as any).start();
+			sendState('listening');
 			console.log(`${ts()} [session ${n}] open (bodhi :${bodhiPort})`);
 			ws.send(JSON.stringify({ ok: true }));
 		} catch (e) {

@@ -36,12 +36,14 @@ class NodeVoiceBridge:
         self._next_id = 1
 
     # ── bridge interface ─────────────────────────────────────────────────────
-    def open(self, params: dict | None = None, send_media=None) -> dict:
+    def open(self, params: dict | None = None, send_media=None,
+             send_event=None) -> dict:
         with self._lock:
             sid = self._next_id
             self._next_id = (self._next_id % 0xFFFF) + 1
             st = {"ws": None, "queue": asyncio.Queue(), "task": None,
-                  "send": send_media, "params": params or {}}
+                  "send": send_media, "send_event": send_event,
+                  "params": params or {}}
             self._streams[sid] = st
         # The session runs as a task on the running loop: connect → open →
         # pump upstream (from queue) and downstream (to send_media) until closed.
@@ -100,6 +102,16 @@ class NodeVoiceBridge:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.BINARY and st["send"]:
                                 await st["send"](msg.data)
+                            elif msg.type == aiohttp.WSMsgType.TEXT and \
+                                    st.get("send_event"):
+                                # Host UI-state events (voice.state) — metadata
+                                # only; audio never waits on these.
+                                try:
+                                    ev = json.loads(msg.data)
+                                except ValueError:
+                                    continue
+                                if isinstance(ev, dict) and ev.get("method"):
+                                    await st["send_event"](ev)
                             elif msg.type in (aiohttp.WSMsgType.CLOSED,
                                               aiohttp.WSMsgType.ERROR):
                                 return

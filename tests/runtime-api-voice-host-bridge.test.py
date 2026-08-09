@@ -101,6 +101,8 @@ async def session(request):
     async for msg in ws:
         if msg.type == WSMsgType.BINARY:
             await ws.send_bytes(bytes(reversed(msg.data)))  # transform ≠ loopback
+            await ws.send_str(json.dumps({{"method": "voice.state",
+                                           "params": {{"state": "speaking"}}}}))
     return ws
 
 app = web.Application()
@@ -150,6 +152,20 @@ async def probe():
             st_e, sid_e, pl_e = mf.decode(echo) if echo else (None, None, b"")
             check(sid_e == sid and pl_e == bytes(reversed(probe_payload)),
                   "audio went THROUGH the host (transformed, not looped) and came back enveloped")
+
+            # host text events forward as JSON-RPC notifications, stream-stamped
+            ev = None
+            dl = time.monotonic() + 6
+            while time.monotonic() < dl:
+                msg = await asyncio.wait_for(w.receive(), timeout=6)
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    o = json.loads(msg.data)
+                    if o.get("method") == "voice.state":
+                        ev = o; break
+            check(ev is not None
+                  and ev.get("params", {}).get("state") == "speaking"
+                  and ev.get("params", {}).get("streamId") == sid,
+                  "host voice.state event reaches the device as a stamped notification")
 
             c = await rpc("voice.close", {"streamId": sid}, rid=3)
             check(c.get("result", {}).get("closed") is True,

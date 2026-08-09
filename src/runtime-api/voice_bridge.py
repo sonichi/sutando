@@ -38,7 +38,8 @@ class StubVoiceBridge:
         self._streams: dict[int, dict] = {}
         self._next_id = 1
 
-    def open(self, params: dict | None = None, send_media=None) -> dict:
+    def open(self, params: dict | None = None, send_media=None,
+             send_event=None) -> dict:  # send_event unused: stub emits no state
         p = params or {}
         with self._lock:
             sid = self._next_id
