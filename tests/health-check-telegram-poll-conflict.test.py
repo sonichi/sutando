@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
@@ -73,10 +74,8 @@ check("receipt BEFORE the last 409 does not clear it", _r5 is not None and _r5[0
 _r6 = hc.bridge_log_content_status("discord-bridge", "ok", [CONFLICT] * 20)
 check("branch is telegram-only (discord unaffected)", _r6 is None, str(_r6))
 
-# qingyun-wu's P1 on 81d47ac5: the first cut accepted EVERY warn, so a merely-OLD log
-# ending in historical 409s reported an ACTIVE competing poller and told the operator
-# to set SKIP_TELEGRAM=1 — which could disable the only working bridge. The stale-LOG
-# and dead-inode warns must therefore survive untouched.
+# Accepting every `warn` would let a merely-OLD log ending in historical 409s advise
+# SKIP_TELEGRAM=1, which can disable the only working bridge. These two must survive.
 _r7 = hc.bridge_log_content_status("telegram-bridge", "warn", [CONFLICT] * 20, LOG_STALE)
 check("a stale-LOG warn is NOT replaced by the conflict diagnosis", _r7 is None, str(_r7))
 
@@ -111,14 +110,14 @@ def _fake_pgrep(cmd, *args, **kwargs):
     return _orig_run(cmd, *args, **kwargs)
 
 
-def _telegram_check(log_contents: str, heartbeat_age_s: int | None = None):
+def _telegram_check(log_contents: str, heartbeat_age_s: Optional[int] = None):
     with tempfile.TemporaryDirectory() as tmpws, tempfile.TemporaryDirectory() as tmphome:
         tmpws = Path(tmpws)
         (tmpws / "logs").mkdir(parents=True)
         (tmpws / "logs" / "telegram-bridge.log").write_text(log_contents)
         if heartbeat_age_s is not None:
-            # A REAL stale heartbeat, per qingyun-wu's "add a run_all_checks()
-            # regression that actually creates the stale heartbeat case".
+            # A real stale heartbeat on disk, not a stubbed status — the call-site
+            # gate only fires on the genuine one.
             (tmpws / "state").mkdir(parents=True, exist_ok=True)
             hb = tmpws / "state" / "telegram-bridge.heartbeat"
             stamp = int(time.time()) - heartbeat_age_s
@@ -151,9 +150,8 @@ check("run_all_checks: 409 storm → telegram-bridge warns", _w1 is not None and
 _w2 = _telegram_check("\n".join([CONFLICT] * 20 + [RECEIPT]) + "\n")
 check("run_all_checks: 409s then receipt → stays ok", _w2 is not None and _w2["status"] == "ok", str(_w2))
 
-# THE CALL-SITE GATE. Dropping `detail` from the bridge_log_content_status(...) call
-# leaves every direct case above green, because they pass detail themselves — measured:
-# that mutation kept the whole file passing until this case existed.
+# The call-site gate: dropping `detail` from the bridge_log_content_status(...) call
+# leaves every direct case above green, because those pass detail themselves.
 _w3 = _telegram_check("\n".join([STARTUP] + [CONFLICT] * 20) + "\n", heartbeat_age_s=1906)
 check("run_all_checks: 409 storm + REAL stale heartbeat → conflict diagnosis",
       _w3 is not None and _w3["status"] == "warn" and "SKIP_TELEGRAM=1" in _w3["detail"], str(_w3))
