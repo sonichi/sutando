@@ -131,6 +131,35 @@ class EphemeralSkillTarget(unittest.TestCase):
         for expected in ("/tmp", os.path.realpath("/tmp").rstrip("/")):
             self.assertIn(expected, roots)
 
+    def _roots_with_tmpdir(self, value):
+        """Derive the roots as if the platform reported `value` as its temp dir."""
+        orig = tempfile.gettempdir
+        tempfile.gettempdir = lambda: value
+        try:
+            self.hc._ephemeral_roots.cache_clear()
+            return self.hc._ephemeral_roots()
+        finally:
+            tempfile.gettempdir = orig
+            self.hc._ephemeral_roots.cache_clear()
+
+    def test_macos_tmpdir_also_yields_the_shared_folders_base(self):
+        """macOS $TMPDIR is <base>/folders/xx/yy/T; the shared `/folders` base must
+        also be a root so ANOTHER session's scratch dir is still ephemeral. Driven
+        through gettempdir so a Linux runner exercises this branch too."""
+        roots = self._roots_with_tmpdir("/var/folders/ab/cd/T")
+        self.assertIn("/var/folders", roots)
+        self.assertIn("/var/folders/ab/cd/T", roots)
+        self.assertTrue(self.hc._is_ephemeral("/var/folders/zz/other/T/x"),
+                        "a peer session's scratch dir must be ephemeral")
+
+    def test_an_empty_tmpdir_is_skipped_not_added_as_a_root(self):
+        """An empty temp dir must not become the root '' — which, as a prefix, would
+        make EVERY path ephemeral."""
+        roots = self._roots_with_tmpdir("")
+        self.assertNotIn("", roots)
+        self.assertIn("/tmp", roots)
+        self.assertFalse(self.hc._is_ephemeral(str(Path.home() / "durable")))
+
 
 if __name__ == "__main__":
     unittest.main()
