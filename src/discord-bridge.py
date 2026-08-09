@@ -5109,11 +5109,8 @@ async def poll_proactive():
                                         f"failed: {_exc} — keeping literal marker in DM",
                                         flush=True,
                                     )
-                            # Fall through to DM with marker INTACT — the
-                            # visible `[channel: <id>]` is the loud-failure
-                            # signal. Don't strip it here.
-                        # Zero-progress guard: this except wraps the chunk loop AND the
-                        # attachment loop, so a retry after any successful send repeats it.
+                            # Fall through to DM with the marker INTACT: the visible `[channel: <id>]` is
+                            # the loud-failure signal. This except wraps the chunk AND attachment loops.
                         _sent_any = False  # pragma: no cover — live send path
                         if clean_text:
                             for chunk in _chunk_for_discord(clean_text):
@@ -5147,23 +5144,11 @@ async def poll_proactive():
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
                         f.unlink(missing_ok=True)
                     except Exception as e:  # pragma: no cover — live send path
-                        # The unlink used to sit OUTSIDE this try, so it ran on
-                        # failure too: a DM Discord rejected was DESTROYED and
-                        # left only a log line. Observed live on this host —
-                        # `413 Payload Too Large (error code: 40005)` on an
-                        # over-long body — and that message is unrecoverable.
-                        # The channel-redirect branch above already gets this
-                        # right (it unlinks only after a successful send and
-                        # falls through otherwise); the DM branch did not.
-                        #
-                        # Quarantine rather than retry — but ONLY for a failure a
-                        # retry cannot fix. A 413 never becomes a 200; a 503 does,
-                        # on the very next poll, so parking it strands the body.
+                        # Quarantine rather than retry, and ONLY for a failure a retry cannot fix: a
+                        # 413 never becomes a 200, a 503 does on the very next poll.
                         print(f"  [proactive] failed to DM {owner_id}: {e}")  # pragma: no cover — live send path
-                        # Glue only. The decision AND the file move are one unit in
-                        # send_failure_policy.resolve_failed_send (covered by
-                        # tests/send-failure-policy.test.py); the bridge is not
-                        # unit-imported, same reason as the imports at :99-100.
+                        # Glue only: the decision AND the file move are one unit in
+                        # send_failure_policy.resolve_failed_send.
                         _outcome = send_failure_policy.resolve_failed_send(  # pragma: no cover
                             f, e, _transient_send_attempts, progressed=_sent_any)
                         print(f"  [proactive] send failure -> {_outcome}: "  # pragma: no cover

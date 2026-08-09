@@ -32,9 +32,8 @@ class TestDelegation(unittest.TestCase):
         self.assertIn("import send_failure_policy", BRIDGE)
 
     def test_both_quarantine_sites_consult_the_policy(self):
-        # The proactive site delegates the whole transition; the approval site keeps
-        # its own file (the marker IS the obligation) but must still take the CAP
-        # from the policy — a bare is_transient there was an unbounded 3s hot loop.
+        # The approval site keeps its own file (the marker IS the obligation) but must
+        # still take the CAP from the policy, or it is an unbounded 3s hot loop.
         self.assertIn("send_failure_policy.resolve_failed_send", BRIDGE)
         self.assertIn("send_failure_policy.should_retry", BRIDGE)
 

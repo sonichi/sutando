@@ -1,18 +1,14 @@
 """Classify an outbound-send failure as transient (retry) or permanent (park).
 
-A bridge that quarantines every failed send is right for a rejection the API will
-never accept and wrong for a blip: a 503 becomes a 200 on the next poll, so
-parking it strands an owner-facing message that would have delivered on its own.
-Unknown failures stay parked — a quarantined file is preserved and surfaced by
-health-check, so parking is the safe default and only a KNOWN transient retries.
+Parking is the safe default: only a KNOWN transient retries.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-# 429 and 5xx clear on their own; 408/425 are request-timing. Every other 4xx
-# rejects this payload or recipient and will fail identically forever.
+# 4xx timing cases only. 5xx is handled as a RANGE below, because enumerating it
+# silently parked the Cloudflare statuses (520-527) Discord sits behind.
 TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 # Bound the retry: a multi-hour outage must park rather than re-poll every 3s.
@@ -44,13 +40,18 @@ def failure_status(exc: BaseException) -> int | None:
 
 
 def is_transient(exc: BaseException) -> bool:
-    """True when retrying the same send could plausibly succeed."""
+    """True when retrying the same send could plausibly succeed.
+
+    The NAME is checked before the status: a status short-circuit made
+    `_TRANSIENT_EXC_NAMES` unreachable for any of those types that carries one.
+    """
+    if type(exc).__name__ in _TRANSIENT_EXC_NAMES:
+        return True
     status = failure_status(exc)
     if status is not None:
-        return status in TRANSIENT_STATUSES
-    if isinstance(exc, (TimeoutError, ConnectionError)):
-        return True
-    return type(exc).__name__ in _TRANSIENT_EXC_NAMES
+        # Whole 5xx range: the server failed, not the payload.
+        return status in TRANSIENT_STATUSES or 500 <= status <= 599
+    return isinstance(exc, (TimeoutError, ConnectionError))
 
 
 def should_retry(exc: BaseException, attempts: int,
@@ -64,15 +65,9 @@ def should_retry(exc: BaseException, attempts: int,
 
 def resolve_failed_send(claim: Path, exc: BaseException,
                         attempts: "dict[str, int]", progressed: bool = False) -> str:
-    """Decide and CARRY OUT what happens to a body whose send failed.
+    """Decide and CARRY OUT the transition. Returns "retried" (claim released),
+    "parked" (moved to undelivered/), or "stuck" (unmovable, left for the next poll).
 
-    Returns "retried" (claim released, poll will pick it up again), "parked"
-    (moved to undelivered/), or "stuck" (could not move it; left in place so the
-    poll retries rather than losing it).
-
-    Owns the file transition as well as the decision, because the two cannot
-    disagree without stranding a message: a branch that logs "released" without
-    renaming leaves the body claimed and invisible to every future poll.
     `attempts` is mutated in place, keyed by the body's polled `.txt` name.
     """
     key = claim.with_suffix(".txt").name

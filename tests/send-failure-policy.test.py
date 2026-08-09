@@ -20,9 +20,8 @@ class FakeHTTPException(Exception):
 
 class TestIsTransient(unittest.TestCase):
     def test_503_is_transient(self):
-        # The live case: `503 Service Unavailable (error code: 0): upstream connect
-        # error or disconnect/reset before headers` parked a pending-questions digest
-        # for 10.5h. It would have delivered on the next 3s poll.
+        # The live case: a 503 parked an owner-facing digest that the next 3s poll
+        # would have delivered.
         self.assertTrue(sfp.is_transient(FakeHTTPException(503)))
 
     def test_server_errors_and_rate_limit_are_transient(self):
@@ -36,9 +35,8 @@ class TestIsTransient(unittest.TestCase):
             self.assertFalse(sfp.is_transient(FakeHTTPException(status, code)), status)
 
     def test_discord_error_code_is_not_read_as_an_http_status(self):
-        # `.code` 50035 is not a status. If the classifier fell back to `.code` when
-        # `.status` were absent, a permanent rejection could land in a transient
-        # bucket by coincidence of numbering.
+        # `.code` shares no numbering with an HTTP status, so reading it as one could
+        # land a permanent rejection in the transient bucket.
         exc = FakeHTTPException(400, 50035)
         self.assertEqual(sfp.failure_status(exc), 400)
 
@@ -52,9 +50,8 @@ class TestIsTransient(unittest.TestCase):
         self.assertTrue(sfp.is_transient(ServerDisconnectedError()))
 
     def test_unknown_failure_parks(self):
-        # The safe default: quarantine preserves the body AND health-check reports it,
-        # so parking an unknown error loses nothing, while retrying it forever
-        # would bury the log.
+        # Parking an unknown error loses nothing — quarantine preserves the body and
+        # health-check reports it — while retrying forever would bury the log.
         self.assertFalse(sfp.is_transient(ValueError("something else entirely")))
         self.assertFalse(sfp.is_transient(FakeHTTPException(418)))
 
@@ -64,6 +61,43 @@ class TestIsTransient(unittest.TestCase):
 
         self.assertIsNone(sfp.failure_status(Odd()))
         self.assertFalse(sfp.is_transient(Odd()))
+
+
+class TestServerErrorRange(unittest.TestCase):
+    """A named server error carrying an unenumerated status must not park.
+
+    `DiscordServerError` is in _TRANSIENT_EXC_NAMES, but the status branch returned
+    first, so any status outside the enumerated four made the name unreachable.
+    """
+
+    class DiscordServerError(Exception):
+        def __init__(self, status=None):
+            super().__init__(str(status))
+            if status is not None:
+                self.status = status
+
+    def test_a_524_is_retried_not_parked(self):
+        e = self.DiscordServerError(524)
+        self.assertTrue(sfp.is_transient(e))
+        self.assertTrue(sfp.should_retry(e, 0))
+
+    def test_the_cloudflare_range_discord_sits_behind_is_transient(self):
+        for status in range(520, 528):
+            self.assertTrue(sfp.is_transient(self.DiscordServerError(status)), status)
+
+    def test_the_whole_5xx_range_is_transient(self):
+        for status in (500, 505, 507, 511, 550, 599):
+            self.assertTrue(sfp.is_transient(FakeHTTPException(status)), status)
+
+    def test_the_name_is_not_shadowed_by_an_unenumerated_status(self):
+        # The mechanism, stated separately from the 5xx range: a named-transient type
+        # stays transient even at a status the range would not cover.
+        self.assertTrue(sfp.is_transient(self.DiscordServerError(418)))
+
+    def test_permanent_4xx_still_parks(self):
+        # The range must not have widened into the rejection statuses.
+        for status in (400, 401, 403, 404, 413, 422, 451):
+            self.assertFalse(sfp.is_transient(FakeHTTPException(status)), status)
 
 
 class TestShouldRetry(unittest.TestCase):
