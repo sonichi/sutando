@@ -273,18 +273,38 @@ class RuntimeServer:
             else:
                 from voice_bridge import StubVoiceBridge  # noqa: PLC0415
                 voice = StubVoiceBridge()
-            wss = WsTransport(self.dispatcher, token=self._wss_token(),
-                              device_store=device_store,
-                              result_subscribers=self._subscribers,
-                              activity_subscribers=self._activity_subscribers,
-                              request_subscribers=self._request_subscribers,
-                              voice_bridge=voice,
-                              host=host, port=port, log=_log)
-            await wss.start(ssl_context=self._wss_ssl_context())
+            def make_transport(p):
+                return WsTransport(self.dispatcher, token=self._wss_token(),
+                                   device_store=device_store,
+                                   result_subscribers=self._subscribers,
+                                   activity_subscribers=self._activity_subscribers,
+                                   request_subscribers=self._request_subscribers,
+                                   voice_bridge=voice,
+                                   host=host, port=p, log=_log)
+
+            started = []
+            # Primary listener is PLAIN ws:// — embedded devices (the M5) speak
+            # it. TLS is a SIBLING listener on its own port for browsers, whose
+            # mic APIs require a secure context — never a switch on the primary.
+            wss = make_transport(port)
+            await wss.start()
+            started.append(wss)
+            ssl_ctx = self._wss_ssl_context()
+            if ssl_ctx is not None:
+                try:
+                    tls_port = int(os.environ.get("SUTANDO_SCP_WSS_TLS_PORT")
+                                   or "8443")
+                except ValueError:
+                    tls_port = 8443
+                tls = make_transport(tls_port)
+                await tls.start(ssl_context=ssl_ctx)
+                started.append(tls)
+                _log(f"SCP WSS TLS sibling on wss://{host}:{tls_port}/scp "
+                     f"(browser/companion clients)")
             if host not in ("127.0.0.1", "localhost", "::1"):
                 _log(f"SCP WSS is LAN-exposed on {host}:{port} "
                      f"(bearer-gated, read-only method set)")
-            return wss
+            return started
         except Exception as e:  # noqa: BLE001
             _log(f"SCP WSS start failed (non-fatal, UDS unaffected): {e}")
             return None
@@ -549,8 +569,8 @@ class RuntimeServer:
                                      self._activity_watcher(),
                                      self._requests_watcher())
         finally:
-            if wss is not None:
-                await wss.cleanup()
+            for t in (wss or []):
+                await t.cleanup()
 
 
 def main() -> None:
