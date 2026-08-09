@@ -10,7 +10,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "tsx --test --test-force-exit 'tests/**/*.test.ts' && npm run test:py",
-    "test:py": "find tests -name '*.test.py' | sort | while read f; do echo \"--- $f ---\" && python3 \"$f\" || exit 1; done",
+    "test:py": "find tests -name '*.test.py' -not -path '*/node_modules/*' | sort | { fail=0; failed=''; while IFS= read -r f; do echo \"--- $f ---\"; python3 \"$f\" || { fail=1; failed=\"$failed $f\"; }; done; [ \"$fail\" -eq 0 ] || echo \"python test file(s) failed:$failed\"; exit \"$fail\"; }",
     "build:bundle": "node scripts/build-bundle.mjs"
   },
   "dependencies": {
