@@ -151,11 +151,15 @@ def _parse_start(ev: dict):
     raw = str(ev.get("start") or "").strip()
     if not raw:
         return None
+    # A bare YYYY-MM-DD is an ALL-DAY event: the DAY is known, the time of day is
+    # not, and midnight would read as already-past for the rest of the day.
+    if "T" not in raw and ":" not in raw:
+        return None
     try:
         dt = datetime.fromisoformat(raw)
     except ValueError:
         return None
-    if dt.tzinfo is None:                 # all-day events arrive as bare YYYY-MM-DD
+    if dt.tzinfo is None:                 # naive but time-bearing: assume local
         dt = dt.astimezone()
     return dt
 

@@ -254,5 +254,51 @@ class TestSpokenSentence(unittest.TestCase):
         self.assertIn("couldn't read your calendar", self._say(None))
 
 
+class TestAllDayDateOnlyStarts(unittest.TestCase):
+    """A bare YYYY-MM-DD start is an ALL-DAY event: the day is known, the clock
+    time is not, so midnight reads as already-past for the rest of the day.
+    """
+
+    def setUp(self):
+        self.mod = _load(SCRIPT, "morning_briefing")
+        self.today = datetime.now().astimezone().date().isoformat()
+
+    def _say(self, events):
+        return self.mod.synthesize("W", events, [], [], [], [])
+
+    def test_a_date_only_start_is_unknown_not_midnight(self):
+        self.assertIsNone(self.mod._parse_start({"start": self.today}))
+
+    def test_all_day_events_do_not_count_as_known_starts(self):
+        evs = [{"raw": "all-day offsite", "start": self.today},
+               {"raw": "all-day training", "start": self.today}]
+        self.assertFalse(self.mod._all_starts_known(evs))
+
+    def test_two_all_day_events_never_claim_all_earlier(self):
+        # The exact-head repro: both starts equal today's local date produced
+        # "2 meetings today, all earlier — last was all-day offsite."
+        out = self._say([{"raw": "all-day offsite", "calendar": "work",
+                          "start": self.today},
+                         {"raw": "all-day training", "calendar": "work",
+                          "start": self.today}])
+        self.assertNotIn("all earlier", out)
+        self.assertNotIn("Next up", out)
+
+    def test_an_all_day_event_beside_a_timed_one_stays_conservative(self):
+        now = datetime.now().astimezone()
+        out = self._say([{"raw": "all-day offsite", "calendar": "work",
+                          "start": self.today},
+                         {"raw": "8am Zoom", "calendar": "work",
+                          "start": _iso(now - timedelta(minutes=300))}])
+        self.assertNotIn("all earlier", out)
+
+    def test_time_bearing_starts_are_not_over_rejected(self):
+        # The guard keys on the absence of a clock time, so every timed form
+        # must still parse — including the space separator and a UTC offset.
+        for raw in (f"{self.today}T10:00", f"{self.today}T10:00:00+00:00",
+                    f"{self.today} 14:30"):
+            self.assertIsNotNone(self.mod._parse_start({"start": raw}), raw)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
