@@ -228,6 +228,8 @@ class RuntimeServer:
             except ValueError:
                 port = 8787
             wss = WsTransport(self.dispatcher, token=self._wss_token(),
+                              result_subscribers=self._subscribers,
+                              activity_subscribers=self._activity_subscribers,
                               host=host, port=port, log=_log)
             await wss.start()
             if host not in ("127.0.0.1", "localhost", "::1"):

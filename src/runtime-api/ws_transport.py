@@ -47,6 +47,35 @@ READ_ONLY_METHODS = frozenset({
 })
 
 
+class WsWriterSink:
+    """Adapts a WebSocketResponse to the StreamWriter push interface
+    (`write(bytes)` + `async drain()`) so a WSS subscriber drops into the SAME
+    subscriber sets as the Unix-socket writers — the server's push watchers
+    (_emit_new_results / _push_activity) stay transport-agnostic and untouched.
+
+    A failed send raises ConnectionResetError so the watchers' existing
+    dead-writer cleanup discards it, exactly as it does for a dropped socket."""
+
+    def __init__(self, ws):
+        self._ws = ws
+        self._pending: list = []
+
+    def write(self, frame) -> None:
+        self._pending.append(frame)
+
+    async def drain(self) -> None:
+        while self._pending:
+            frame = self._pending.pop(0)
+            text = frame.decode("utf-8") if isinstance(frame, (bytes, bytearray)) else frame
+            try:
+                await self._ws.send_str(text)
+            except Exception as e:  # noqa: BLE001 — normalize to the socket signal
+                raise ConnectionResetError(str(e)) from e
+
+    def close(self) -> None:  # StreamWriter parity; the ws owns its own close
+        pass
+
+
 class WsTransport:
     """A WSS front-end that dispatches SCP frames through a shared dispatcher.
 
@@ -56,11 +85,19 @@ class WsTransport:
 
     def __init__(self, dispatcher, *, token: str,
                  method_allow=READ_ONLY_METHODS,
+                 result_subscribers: set | None = None,
+                 activity_subscribers: set | None = None,
                  host: str = "127.0.0.1", port: int = 8787,
                  route: str = "/scp", log=print):
         self.dispatcher = dispatcher
         self.token = token
         self.method_allow = frozenset(method_allow)
+        # The server's OWN subscriber sets (shared with the UDS transport); a
+        # WSS subscriber is a WsWriterSink added to these, so the server's push
+        # watchers reach it with no transport-specific code. None → the
+        # transport serves request/response only (no streaming).
+        self._result_subs = result_subscribers
+        self._activity_subs = activity_subscribers
         self.host = host
         self.port = port
         self.route = route
@@ -78,12 +115,32 @@ class WsTransport:
         return bool(self.token) and hmac.compare_digest(presented, self.token)
 
     # ── dispatch ─────────────────────────────────────────────────────────────
-    async def _dispatch_one(self, ws: web.WebSocketResponse, data: str) -> None:
+    async def _dispatch_one(self, ws: web.WebSocketResponse,
+                            sink: "WsWriterSink", data: str) -> None:
         raw = data.encode("utf-8") if isinstance(data, str) else data
         try:
             req_id, method, params = parse_line(raw)
         except ProtocolError as e:
             await ws.send_str(error_frame(e.req_id, e.code, e.message).decode())
+            return
+        if method == "task.subscribe":
+            # Transport mode-switch (read-only stream) — handled before the
+            # allowlist, exactly as the UDS transport does. The sink joins the
+            # server's own subscriber sets; the push watchers do the rest.
+            if self._result_subs is None:
+                await ws.send_str(error_frame(
+                    req_id, -32601,
+                    "task.subscribe not available on this transport").decode())
+                return
+            streams = []
+            if params.get("results", True):
+                self._result_subs.add(sink)
+                streams.append("results")
+            if params.get("activity") and self._activity_subs is not None:
+                self._activity_subs.add(sink)
+                streams.append("activity")
+            await ws.send_str(result_frame(
+                req_id, {"subscribed": True, "streams": streams}).decode())
             return
         if method not in self.method_allow:
             await ws.send_str(error_frame(
@@ -105,12 +162,20 @@ class WsTransport:
             return web.Response(status=401, text="unauthorized")
         ws = web.WebSocketResponse(max_msg_size=MAX_LINE_BYTES + 1024)
         await ws.prepare(request)
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                await self._dispatch_one(ws, msg.data)
-            elif msg.type == WSMsgType.ERROR:
-                break
-            # non-text frames are ignored — SCP is a text JSON protocol
+        sink = WsWriterSink(ws)
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    await self._dispatch_one(ws, sink, msg.data)
+                elif msg.type == WSMsgType.ERROR:
+                    break
+                # non-text frames are ignored — SCP is a text JSON protocol
+        finally:
+            # a subscribed connection leaving must not linger in the push sets
+            if self._result_subs is not None:
+                self._result_subs.discard(sink)
+            if self._activity_subs is not None:
+                self._activity_subs.discard(sink)
         return ws
 
     def build_app(self) -> web.Application:
