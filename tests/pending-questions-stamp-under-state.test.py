@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """The notify-cooldown stamp belongs under state/, not at the workspace root.
 
-At the root it was real drift: the contract reserves the root for top-level
-directories plus the artifacts WORKSPACE_SURFACE_FILES names, and this stamp is
-neither — so health-check's workspace-root-tidy probe flagged it on every run.
-A permanent WARN is how a correct detector gets ignored.
-
-No read-fallback to the old path on purpose. `_last_notified` already treats a
-missing stamp as "set unknown" and notifies ONCE rather than suppressing, so the
-transition costs one notification; a second path would also leak the real root
-file into the tests that override this constant with a tmpdir.
+Pins the move, the legacy-stamp retirement, and the deliberate lack of a read-fallback.
 """
 import importlib.util
 import sys
@@ -37,8 +29,7 @@ class TestStampLocation(unittest.TestCase):
     def test_health_check_would_not_call_the_new_location_drift(self):
         """The probe only inspects files directly AT the root, so state/ is exempt.
 
-        Asserted through health-check's own predicate rather than by reasoning, so
-        this fails if that contract ever changes.
+        Asserted through health-check's own predicate, so it fails if that changes.
         """
         hc_path = REPO / "src" / "health-check.py"
         if not hc_path.is_file():
@@ -96,12 +87,9 @@ class TestWriteNotifyStamp(unittest.TestCase):
 
 
 class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
-    """Moving the writer is not enough: installs that already have the root file keep it.
+    """An install that already has the root file must end up clean too.
 
-    Reviewer's repro — a temp workspace containing `.last-pq-notify`, then
-    `write_notify_stamp()`, then `check_workspace_root_tidy()` still warns. The
-    retirement runs AFTER the new stamp is durably written, so a crash between the
-    two loses at most a cooldown, never the record.
+    Retirement runs AFTER the new stamp is written, so a crash costs a cooldown.
     """
 
     def setUp(self):
@@ -151,7 +139,7 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
         self.assertTrue(self.legacy.is_dir(), "left as found rather than forced")
 
     def test_root_tidy_is_clean_for_the_upgraded_workspace_afterwards(self):
-        """The reviewer's actual complaint: the standing WARN must clear."""
+        """The standing WARN must actually clear, not just stop being re-created."""
         hc_path = REPO / "src" / "health-check.py"
         if not hc_path.is_file():
             self.skipTest("health-check.py not present")

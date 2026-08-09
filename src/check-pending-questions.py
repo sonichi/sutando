@@ -25,31 +25,21 @@ from presenter_mode import presenter_mode_active  # noqa: E402
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
-# Under state/, not the workspace root: the root is reserved for top-level
-# directories plus the artifacts WORKSPACE_SURFACE_FILES names, and this stamp is
-# neither. At the root it was real drift that health-check's workspace-root-tidy
-# probe flagged on every run — a permanent WARN teaches operators to ignore the
-# detector. No read-fallback to the old path on purpose: the reader already treats
-# a missing stamp as "set unknown" and notifies ONCE rather than suppressing (see
-# _last_notified), so the transition costs one notification, and a second path
-# would leak the real root file into tests that override this constant.
+# No read-fallback to the old root path on purpose: a missing stamp makes the
+# reader notify ONCE rather than suppress, so the move costs one notification.
 LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
 
 
 def write_notify_stamp(questions, now=None):
     """Record that this question set was just notified.
 
-    A named function rather than inline lines so the location, the directory
-    creation and the one-time retirement of the old root stamp are testable without
-    driving `main`, which would fire a real macOS notification.
+    Named so it is testable without driving `main`, which fires a real notification.
     """
     LAST_NOTIFY_FILE.parent.mkdir(parents=True, exist_ok=True)
     ts = int(time.time()) if now is None else now
     LAST_NOTIFY_FILE.write_text(f"{ts} {questions_key(questions)}")
-    # Retire the pre-move root stamp AFTER the new one is on disk, so a crash
-    # between the two loses at most a cooldown, never the record. Derived from
-    # LAST_NOTIFY_FILE so a test that redirects the stamp cannot reach the real
-    # workspace root.
+    # Retire AFTER the new stamp exists: a crash between the two costs at most a
+    # cooldown. Path derived from LAST_NOTIFY_FILE so a redirected test stays in tmp.
     try:
         (LAST_NOTIFY_FILE.parent.parent / ".last-pq-notify").unlink(missing_ok=True)
     except OSError:
