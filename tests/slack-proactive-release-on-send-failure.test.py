@@ -150,6 +150,29 @@ def main() -> int:
           _settle(lambda: txt.exists()),
           "left stranded as .sending — invisible until the next restart sweep")
 
+    # PHASE 1b — REFUSED WITHOUT RAISING. This is the ordinary Slack failure and
+    # the `except` above never sees it; only the delivery result does.
+    refused = {"n": 0}
+
+    def _returns_false(*_a, **_k):
+        refused["n"] += 1
+        return False
+
+    bridge._send_reply = _returns_false
+    name2 = "proactive-slack-refused-not-raised.txt"
+    body2 = "a proactive message slack refuses without raising"
+    (results / name2).write_text(body2)
+    txt2 = results / name2
+    sending2 = results / name2.replace(".txt", ".sending")
+
+    check("the non-raising refusal was attempted",
+          _settle(lambda: refused["n"] > 0), "drain never called the refusing send")
+    check("a NON-RAISING refusal does not consume the claim",
+          _settle(lambda: txt2.exists() or sending2.exists()),
+          "consumed on the ordinary refusal — the except never fires for it")
+    check("it too returns to the .txt stream",
+          _settle(lambda: txt2.exists()), "left stranded as .sending")
+
     # PHASE 2 — positive control. Without this, an unconditional "always
     # release" would pass every assertion above.
     delivered = {"n": 0}
