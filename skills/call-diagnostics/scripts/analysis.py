@@ -16,11 +16,10 @@ Public API:
     categorize_issue(issue)          -> str
     analyze_patterns_and_repair(calls) -> list[dict]
 
-KNOWN PRE-EXISTING DEFECT (not introduced here, not fixed here — separate PR):
-`analyze_patterns_and_repair` raises IndexError when a call has `events: []`,
-because `call.get("events", [{}])[0]` defaults only on a MISSING key, not an
-empty list. Characterized in the test suite so the behavior is recorded rather
-than silently changed by this extraction.
+A call with `events: []` is handled: `(call.get("events") or [{}])[0]` covers
+both a MISSING key and a present-but-empty list. The bare-default form
+`call.get("events", [{}])` only applies its default when the key is absent, so
+an empty list indexed out of range (fixed in the PR stacked on the extraction).
 """
 import re
 from datetime import datetime
@@ -428,7 +427,7 @@ def analyze_patterns_and_repair(calls):
     """Analyze persistent patterns across all calls and recommend systematic repairs."""
     issue_history = {}
     for idx, call in enumerate(calls):
-        first_ts = call.get("events", [{}])[0].get("timestamp", "")[:10]
+        first_ts = (call.get("events") or [{}])[0].get("timestamp", "")[:10]
         for iss in diagnose(call):
             cat = categorize_issue(iss)
             issue_history.setdefault(cat, []).append({"idx": idx, "date": first_ts, "issue": iss})
@@ -455,5 +454,3 @@ def analyze_patterns_and_repair(calls):
     priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     repairs.sort(key=lambda r: priority_order.get(r["priority"], 4))
     return repairs
-
-

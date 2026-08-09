@@ -1515,10 +1515,10 @@ _migrate_from_legacy_impl() {
         echo "sync-workspace migrate: copying from $legacy_dir into $WORKSPACE_DIR" >&2
     fi
 
-    # Local slug derivation: matches Claude Code's auto-derived slug
-    # (REPO_DIR with / replaced by -).
+    # Claude Code dashes EVERY non-alphanumeric char, not just `/`; a path with a
+    # space or dot would otherwise resolve to a slug it never creates.
     local local_slug
-    local_slug="$(printf '%s' "$REPO_DIR" | sed 's|/|-|g')"
+    local_slug="$(printf '%s' "$REPO_DIR" | tr -c 'A-Za-z0-9' '-')"
 
     # Per-host segment for hostname-qualified destinations (build_log,
     # pending-questions). Computed once; matches `_host()` + the reader probe.

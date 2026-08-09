@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 import re
 import secrets
 import shutil
@@ -45,7 +44,8 @@ except Exception:  # pragma: no cover — bridge must keep running
         return False
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files  # noqa: E402
+from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 
 # Observability: emit channel.telegram.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -56,6 +56,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
+from result_ready import read_ready_result  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
@@ -175,26 +176,14 @@ def extract_forward_note(msg: dict) -> str:
 
 
 def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
-    """Record owner activity — see src/discord-bridge.py for schema."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "ts": int(time.time()),
-            "channel": channel,
-            "summary": summary[:80],
-        }
-        if channel_id:
-            payload["channel_id"] = str(channel_id)
-        # Per-PID staging name: this file is written by four processes (this
-        # bridge + slack/discord/sparrow). A shared ".json.tmp" name lets two
-        # concurrent writers truncate and interleave the same temp file, so the
-        # rename can publish torn JSON. A per-PID temp is never shared, and
-        # os.replace is an atomic overwrite — last writer wins, cleanly. (#2222)
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, OWNER_ACTIVITY_FILE)
-    except Exception as e:
-        print(f"  [owner-activity] write failed: {e}")
+    """Record owner activity using the shared provider-neutral schema."""
+    _write_owner_activity_shared(
+        OWNER_ACTIVITY_FILE,
+        channel,
+        summary,
+        channel_id,
+        on_error=lambda exc: print(f"  [owner-activity] write failed: {exc}"),
+    )
 
 
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
@@ -408,11 +397,24 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
     assumed — we consult their return values. The task-reply path passes a
     marker-stripped body and sends parsed.actions attachments itself, then folds
     those into the same event (so file-only replies still report a delivery and
-    the count/outcome stay accurate)."""
-    # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
-    file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
-    files = file_pattern.findall(text)
-    clean_text = file_pattern.sub('', text).strip()
+    the count/outcome stay accurate).
+
+    Marker grammar comes solely from ``result_markers.parse_markers`` — this
+    function must never re-declare it. It previously compiled a local
+    ``file|send|attach`` regex, which stripped attachment markers but left every
+    OTHER marker in the body. The proactive path (``poll_proactive``) passes raw
+    result text, so ``[dm-only]`` and ``[channel:]`` leaked verbatim into the
+    owner's message — the morning briefing is emitted as a proactive result
+    carrying ``[dm-only]``, so it rendered with the marker visible.
+
+    Parsing here (rather than at each call site) mirrors slack-bridge's
+    ``_send_reply`` and makes the function safe for both callers: parse_markers
+    is idempotent on an already-stripped body, so the task path — which passes
+    ``parsed.body`` and sends its own attachments — yields zero actions here and
+    cannot double-send."""
+    parsed = parse_markers(text)
+    files = [a.value for a in parsed.actions if a.kind == "attach"]
+    clean_text = parsed.body
     text_chunks = (len(clean_text) + 3999) // 4000 if clean_text else 0  # ceil; matches the 4000-char send loop
     delivered_ok = True
     files_sent = 0
@@ -483,6 +485,100 @@ def _clear_progress(task_id: str) -> None:
             api("deleteMessage", chat_id=info["chat_id"], message_id=info["message_id"])
         except Exception:
             pass
+
+
+def _find_task_file_anywhere(tasks_dir: Path, task_id: str) -> Path | None:
+    """Locate task_id's file across live tasks/ (bare or claimed-core-N) AND
+    the archive (flat tasks/archive/, tasks/processed/, and month-partitioned
+    tasks/archive/YYYY-MM/).
+
+    find_task_file() alone only checks live tasks/ — measured on a real host
+    (2026-07-20, per @qingyun-wu's review on this PR): of the result files
+    still sitting undelivered in results/, 0 had their task file still in
+    tasks/ and effectively all had it already in tasks/archive/. Something
+    other than this bridge's own delivery path (which archives task+result
+    together, but only AFTER a successful send) moves task files into the
+    archive independently — most likely task-orphan-check running on a
+    session restart, classifying the still-undelivered task as "done"
+    because its result already exists. Recovery must therefore check the
+    archive too, or it silently no-ops in the actual common case.
+    """
+    found = find_task_file(tasks_dir, task_id)
+    if found:
+        return found
+    return local_task_protocol.find_archived_task(tasks_dir, task_id)
+
+
+def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_task_ids: set) -> dict:
+    """Rebuild {task_id: chat_id} for Telegram tasks whose result file exists
+    but whose in-memory routing was lost — e.g. this process restarted
+    mid-task (a result written by the OLD process's `pending_replies` entry
+    has no counterpart in the NEW process's empty dict, so it sits in
+    results/ forever, un-delivered and silently orphaned). chat_id is
+    durable — it's in the task file's own headers from creation time — even
+    though pending_replies is memory-only (mirrors the same bug class
+    proposed for src/slack-bridge.py in #2218, open as of this PR).
+
+    Only claims tasks THIS bridge actually wrote (source: telegram), so a
+    crashed slack/discord bridge's own stranded results are left alone for
+    them to recover, not silently swallowed here.
+    """
+    recovered = {}
+    for result_file in results_dir.glob("task-*.txt"):
+        task_id = result_file.stem
+        if task_id in known_task_ids:
+            continue
+        task_file = _find_task_file_anywhere(tasks_dir, task_id)
+        if not task_file:
+            continue
+        try:
+            text = task_file.read_text()
+        except OSError:
+            continue
+        headers = local_task_protocol.parse_task_headers(text).headers
+        if headers.get("source") != "telegram":
+            continue
+        chat_id = headers.get("chat_id")
+        if not chat_id:
+            print(f"  [recovery] {task_id}: task file found but no chat_id header — skipping", flush=True)
+            continue
+        try:
+            recovered[task_id] = int(chat_id)
+        except ValueError:
+            print(f"  [recovery] {task_id}: chat_id header {chat_id!r} isn't numeric — skipping", flush=True)
+            continue
+    return recovered
+
+
+def _gather_pending_task_ids(pending_replies: dict, results_dir: Path, tasks_dir: Path) -> list:
+    """Fold any orphaned-by-restart routing recovered from disk into
+    `pending_replies` (mutated in place via setdefault — if the id
+    reappeared through normal means in the meantime, that entry wins), and
+    return the full task_id list for this poll.
+
+    Must run every tick, not once at startup (per @qingyun-wu's review,
+    correcting my earlier "run once" design): a task can be created by the
+    OLD process, survive a restart, and have its result land AFTER the new
+    process's startup scan — the core is still processing it at restart
+    time. A one-time startup scan sees no result yet, the task_id is never
+    registered (it wasn't created by *this* process), and nothing ever
+    looks for it again once the scan has passed — the reply is dropped for
+    the life of the process. Confirmed as the exact mechanism behind the
+    26-file live-host measurement in the sibling review.
+
+    This isn't the "full glob every tick" cost it looks like: the outer
+    `results_dir.glob()` is a cheap directory listing, and
+    `_recover_orphaned_task_routing()` only pays the expensive per-file cost
+    (reading task-file headers, checking the archive) for task_ids NOT
+    already in `pending_replies` — on a steady-state tick with no pending
+    restart-orphans, that set is empty and the extra work is zero.
+    """
+    known_ids = set(pending_replies)
+    recovered = _recover_orphaned_task_routing(results_dir, tasks_dir, known_ids)
+    for tid, chat_id in recovered.items():
+        pending_replies.setdefault(tid, chat_id)
+        print(f"  [recovered] {tid} routing from task file (was orphaned after a restart)", flush=True)
+    return list(pending_replies)
 
 
 def poll_progress(pending_replies: dict) -> None:
@@ -923,9 +1019,9 @@ def main():  # pragma: no cover
                         except FileNotFoundError:
                             continue
                         f = claim
-                        text = f.read_text().strip()
-                        if not text:
-                            f.unlink(missing_ok=True)
+                        text = read_ready_result(f)
+                        if text is None:
+                            release_claim(f)
                             continue
                         # Pre-fix used `next(iter(load_allowed()))`,
                         # which iterates a `set` — hash-slot order, not
@@ -970,12 +1066,14 @@ def main():  # pragma: no cover
         except Exception as e:
             print(f"[Telegram] poll_progress error: {e}", flush=True)
 
-        # Check for results to send back
-        for task_id in list(pending_replies.keys()):
+        # Check for results to send back (includes any orphaned-by-restart
+        # routing recovered from the task files themselves — see
+        # _gather_pending_task_ids for why this must run every tick).
+        for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
-                reply_text = result_file.read_text().strip()
-                if not reply_text:
+                reply_text = read_ready_result(result_file)
+                if reply_text is None:
                     continue
                 chat_id = pending_replies.pop(task_id)
                 # Parse markers via the unified module (#873). Telegram
