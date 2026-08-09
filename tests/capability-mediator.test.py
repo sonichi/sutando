@@ -81,9 +81,8 @@ check("context handle derives the owner principal",
 check("an unknown handle derives no principal (fail-closed)",
       contexts.derive_principal("cap-ctx-bogus") is None)
 
-# ── 2. team + github:merge (write-irreversible) with no grant -> DENY? No:
-#      team write-irreversible is needs-auth -> escalates. A team credential:read
-#      is the hard DENY (boundary preserved).
+# ── 2. team write-irreversible (github:merge) is needs-auth -> escalates;
+#      a team credential:read is the hard DENY (boundary preserved).
 r = med.mediate("credential:read", {"key": "OPENAI"}, h_team)
 check("team credential:read -> deny (boundary preserved)", r.decision == cp.DENY)
 LIVE.append(("team credential:read DENIED", r.audit))
@@ -175,6 +174,7 @@ check("a prohibited action is audited with no execution",
       any(x["decision"] == cp.PROHIBITED and x["outcome"] == cm.PROHIBITED_OUT for x in rows))
 
 # ── LIVE EVIDENCE dump (captured real artifacts for the PR body) ─────────────
+
 # ── 10. branch completeness (close handle, standing grant, revoke, no-divider
 #        escalation, no-executor allow, executor/verifier raising).
 h_close = contexts.mint(envelope("owner"))
@@ -237,9 +237,8 @@ check("consume: different source -> None (source-pinned, fail-closed)",
 check("consume: matching identity + task -> grant returned + consumed",
       _gs.consume_covering(_req1, _alice, TA) is not None and
       _gs.consume_covering(_req1, _alice, TA) is None)
-# omitted-ID fail-closed (qingyun-wu CR round 3): an UNBOUND fresh grant (no
-# task_id at mint) NEVER covers, and a matching request with NO task_id never
-# consumes a bound grant. The unsafe default is fail-closed, not a wildcard.
+# An unbound fresh grant (no task_id at mint) never covers, and a request with
+# no task_id never consumes a bound one — the unsafe default fails closed.
 _gs2 = cm.GrantStore(now=now)
 _gs2.mint_fresh("github:merge", _alice, {"pr": 1})   # NOTE: no task_id (unbound)
 check("consume: UNBOUND fresh grant (minted without task_id) never covers",
@@ -249,8 +248,8 @@ _gs3.mint_fresh("github:merge", _alice, {"pr": 1}, task_id="task-alice")
 check("consume: bound grant + request with NO task_id -> None (fail-closed)",
       _gs3.consume_covering(_req1, _alice, "") is None)
 
-# ── 11. IDENTITY BINDING (qingyun-wu + bassilkhilo-ag2 P1): a grant bound to one
-#        principal must NOT execute under a different principal, even same tier.
+# ── 11. IDENTITY BINDING: a grant bound to one principal must NOT execute under
+#        a different principal, even at the same tier.
 executed["n_before_mallory"] = executed["n"]
 grants.mint_fresh("github:merge", p_owner, {"repo": "sonichi/sutando", "pr": 99}, task_id=t_main)  # for @rui
 h_mallory = contexts.mint({"access_tier": "owner", "source": "discord", "user_id": "mallory"})
@@ -260,8 +259,8 @@ check("mallory CANNOT execute @rui's grant (same tier, diff user_id) -> escalate
       rm.outcome == cm.ESCALATED and executed["n"] == executed["n_before_mallory"])
 LIVE.append(("mallory replay of @rui's grant BLOCKED", rm.audit))
 
-# ── 12. TASK BINDING (qingyun-wu CR round 2): a fresh grant approved for task-A
-#        must NOT be consumable by task-B (same principal, same verb+args).
+# ── 12. TASK BINDING: a fresh grant approved for task-A must NOT be consumable
+#        by task-B (same principal, same verb+args).
 h_taskA = contexts.mint(envelope("owner", tid="task-A"))
 h_taskB = contexts.mint(envelope("owner", tid="task-B"))
 grants.mint_fresh("github:merge", p_owner, {"repo": "sonichi/sutando", "pr": 500},
@@ -278,9 +277,8 @@ check("task-A (originating) CAN use its own fresh grant -> allow/succeeded",
       rA.decision == cp.ALLOW and rA.outcome == cm.SUCCEEDED)
 LIVE.append(("task-B replay of task-A's grant BLOCKED", rB.audit))
 
-# ── 13. OMITTED-ID fail-closed end-to-end (qingyun-wu CR round 3): a fresh grant
-#        minted WITHOUT a task_id (the unsafe default) is unbound and must NEVER
-#        be consumed — even by the same principal's own task. It escalates.
+# ── 13. OMITTED-ID fail-closed end-to-end: a fresh grant minted WITHOUT a task_id
+#        is unbound and never consumed — even by the same principal's task; escalates.
 h_taskC = contexts.mint(envelope("owner", tid="task-C"))
 grants.mint_fresh("github:merge", p_owner, {"repo": "sonichi/sutando", "pr": 700})  # NO task_id
 n_before2 = executed["n"]
@@ -289,6 +287,71 @@ rC = med.mediate("github:merge", {"repo": "sonichi/sutando", "pr": 700}, h_taskC
 check("UNBOUND fresh grant (no task_id at mint) is never consumed -> escalated, executor NOT run",
       rC.outcome == cm.ESCALATED and executed["n"] == n_before2)
 LIVE.append(("unbound fresh grant NOT honored (fail-closed)", rC.audit))
+
+# ── Standing-grant persistence: the out-of-process gate honors an owner approval
+#    only via a file, and every uncertainty on that path must fail CLOSED.
+_tp = tempfile.mkdtemp()
+_gf = os.path.join(_tp, "state", "standing.json")
+_clock = [1_000_000.0]
+_pn = lambda: _clock[0]  # noqa: E731
+_ps = cm.GrantStore(now=_pn, path=_gf)
+_alice = cp.Principal(tier="owner", user_id="u-alice", source="ag2space")
+_ps.mint_standing("github:merge", _alice, scope_pattern="*", ttl_seconds=1000.0)
+_loaded = cm.load_standing_grants(_gf, now=_pn)
+check("standing grant persisted + reloaded (the gate's owner-approval path)",
+      len(_loaded) == 1 and _loaded[0]["verb"] == "github:merge"
+      and _loaded[0]["user_id"] == "u-alice" and _loaded[0]["scope_pattern"] == "*")
+_req = cp.CapabilityRequest(verb="github:merge")
+check("reloaded standing grant flips decide() needs-auth -> ALLOW for its owner",
+      cp.decide(_req, _alice, grants=_loaded).decision == cp.ALLOW)
+check("reloaded standing grant does NOT cover a different user (identity preserved)",
+      cp.decide(_req, cp.Principal(tier="owner", user_id="mallory", source="ag2space"),
+                grants=_loaded).decision == cp.NEEDS_AUTH)
+_ps.mint_fresh("github:merge", _alice, {"pr": 1}, task_id="t1")
+check("fresh (single-use) grants are NEVER persisted (only standing reach the gate)",
+      all(not r.get("single_use") for r in cm.load_standing_grants(_gf, now=_pn)))
+_clock[0] += 5000.0
+check("expired standing grant is dropped on load (fail-closed)",
+      cm.load_standing_grants(_gf, now=_pn) == [])
+check("missing grants file -> [] (fail-closed)",
+      cm.load_standing_grants(os.path.join(_tp, "nope.json")) == [])
+_bad = os.path.join(_tp, "bad.json")
+open(_bad, "w").write("{not json")
+check("malformed grants file -> [] (fail-closed)", cm.load_standing_grants(_bad) == [])
+open(_bad, "w").write(json.dumps({"not": "a list"}))
+check("non-list grants payload -> [] (fail-closed)", cm.load_standing_grants(_bad) == [])
+open(_bad, "w").write(json.dumps([{"verb": "github:merge", "expires_at": 9e18}]))
+check("unbound row (no tier/user_id) -> dropped (fail-closed)",
+      cm.load_standing_grants(_bad, now=_pn) == [])
+_r2 = [{"verb": "github:merge", "tier": "owner", "user_id": "u-alice",
+        "scope_pattern": "*", "single_use": True, "expires_at": 9e18}]
+open(_bad, "w").write(json.dumps(_r2))
+check("a single_use row in the file is ignored (gate honors standing only)",
+      cm.load_standing_grants(_bad, now=_pn) == [])
+_ps2 = cm.GrantStore(now=lambda: 2_000_000.0, path=_gf)
+_g2 = _ps2.mint_standing("github:merge", _alice, scope_pattern="*", ttl_seconds=1e9)
+check("revoke re-persists -> grant present before, gone after",
+      len(cm.load_standing_grants(_gf, now=lambda: 2_000_000.0)) == 1)
+_ps2.revoke(_g2.grant_id)
+check("after revoke, standing file is empty (fail-closed)",
+      cm.load_standing_grants(_gf, now=lambda: 2_000_000.0) == [])
+# a persist failure must not crash the mint (dirname is a FILE -> makedirs raises)
+_blocker = os.path.join(_tp, "afile")
+open(_blocker, "w").write("x")
+_ps3 = cm.GrantStore(now=_pn, path=os.path.join(_blocker, "grants.json"))
+_ps3.mint_standing("github:merge", _alice, scope_pattern="*", ttl_seconds=1e9)
+check("persist failure is swallowed (mint doesn't crash, file not created)",
+      not os.path.exists(os.path.join(_blocker, "grants.json")))
+# default path resolver: env override wins; without it, workspace-derived suffix
+_old = os.environ.pop("SUTANDO_CAPABILITY_GRANTS_FILE", None)
+os.environ["SUTANDO_CAPABILITY_GRANTS_FILE"] = "/tmp/override-grants.json"
+check("default_standing_grants_path honors the env override",
+      cm.default_standing_grants_path() == "/tmp/override-grants.json")
+del os.environ["SUTANDO_CAPABILITY_GRANTS_FILE"]
+check("default_standing_grants_path derives the workspace state path otherwise",
+      cm.default_standing_grants_path().endswith("state/capability-standing-grants.json"))
+if _old is not None:
+    os.environ["SUTANDO_CAPABILITY_GRANTS_FILE"] = _old
 
 print("\n================ LIVE TEST DATA (captured real artifacts) ================")
 for label, art in LIVE:

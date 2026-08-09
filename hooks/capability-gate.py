@@ -25,7 +25,12 @@ standing grant -> deny with the escalation instruction (confirm-first).
 
 Deploy: register under PreToolUse for "Bash" (and add mappings as more tool
 surfaces are gated). Grants are read from the standing-grant file the mediator
-writes; absent one, needs-authorization is a confirm-first deny.
+writes (capability_mediator.load_standing_grants / default_standing_grants_path);
+a covering LIVE standing grant flips needs-authorization to allow. The gate's
+principal identity comes from the trusted launch env — SUTANDO_CAPABILITY_USER
+(and SUTANDO_CAPABILITY_SOURCE) — because a grant binds user_id and decide()
+fails closed on a principal with no user_id; absent identity or a covering grant,
+needs-authorization is a confirm-first deny.
 """
 import json
 import os
@@ -38,6 +43,10 @@ try:
     import capability_policy as cp
 except Exception:  # policy module absent -> fail open (never break tool use)
     cp = None
+try:
+    import capability_mediator as cm   # standing-grant file reader (the owner-approval path)
+except Exception:
+    cm = None
 
 
 # Bash command -> capability verb. Narrow + conservative: only the clearly
@@ -45,7 +54,10 @@ except Exception:  # policy module absent -> fail open (never break tool use)
 _BASH_PATTERNS = (
     (re.compile(r"\bgh\s+pr\s+merge\b"), "github:merge"),
     (re.compile(r"\bgit\s+push\b.*--force|\bgit\s+push\s+-f\b"), "github:merge"),
-    (re.compile(r"\bgh\s+pr\s+(comment|review\s+--approve|create)\b"), "github:comment"),
+    # Any `gh pr review` write is an authority action (approve/request-changes/
+    # comment, PR number in any position) — gate it like an irreversible write.
+    (re.compile(r"\bgh\s+pr\s+review\b"), "github:merge"),
+    (re.compile(r"\bgh\s+pr\s+(comment|create)\b"), "github:comment"),
     (re.compile(r"\brm\s+-rf?\b|\brm\s+-fr?\b"), "fs:delete"),
     # financial moves / credential entry — prohibited overlay, human-only
     (re.compile(r"\b(transfer|withdraw|deposit|wire)\b.*\b(funds|money|usd|btc|eth)\b",
@@ -87,9 +99,19 @@ def main():
         sys.exit(0)   # not a gated capability -> pass untouched
 
     tier = cp.normalize_tier(os.environ.get("SUTANDO_CAPABILITY_TIER") or "owner")
+    # A standing grant binds user_id (+source); decide() fails closed without it.
+    # Identity comes from the trusted launch env, never from tool input.
+    user_id = os.environ.get("SUTANDO_CAPABILITY_USER", "")
+    source = os.environ.get("SUTANDO_CAPABILITY_SOURCE", "")
+    grants = []
+    if cm is not None:
+        try:
+            grants = cm.load_standing_grants(cm.default_standing_grants_path())
+        except Exception:
+            grants = []   # any load failure -> no covering grant (fail closed)
     req = cp.CapabilityRequest(verb=verb)
-    decision = cp.decide(req, cp.Principal(tier=tier),
-                         prohibited_overlay=cp.DEFAULT_PROHIBITED_OVERLAY)
+    decision = cp.decide(req, cp.Principal(tier=tier, user_id=user_id, source=source),
+                         grants=grants, prohibited_overlay=cp.DEFAULT_PROHIBITED_OVERLAY)
 
     if decision.decision == cp.PROHIBITED:
         _deny(f"CAPABILITY GATE: {verb} is human-only (prohibited overlay) — "

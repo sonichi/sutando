@@ -117,21 +117,81 @@ def digest_args(args) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+# Standing-grant persistence: the out-of-process gate honors an owner-minted grant
+# only via this shared file; identity + scope binding are preserved for decide().
+
+def _standing_row(g: "Grant") -> dict:
+    """Serialize a standing grant to the exact keys decide() consumes."""
+    return {"grant_id": g.grant_id, "verb": g.verb, "tier": g.tier,
+            "user_id": g.user_id, "source": g.source,
+            "scope_pattern": g.scope_pattern, "expires_at": g.expires_at,
+            "single_use": False}
+
+
+def load_standing_grants(path: str, now: Callable[[], float] = time.time) -> list:
+    """Return the LIVE (non-expired) standing grants from ``path`` as dicts ready
+    to pass to ``capability_policy.decide(grants=...)``.
+
+    FAIL-CLOSED on every uncertainty: a missing file, unreadable/malformed JSON, a
+    non-list payload, or a row missing its binding fields (verb/tier/user_id) all
+    yield an EMPTY list — never a permissive guess. A grant with no ``expires_at``
+    is treated as already expired (dropped), so a truncated row can't linger.
+    Single-use rows are ignored here (fresh grants are never honored by the gate)."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []   # malformed / unreadable -> fail closed
+    if not isinstance(rows, list):
+        return []
+    t = now()
+    live = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if r.get("single_use"):
+            continue                      # only standing grants are gate-honored
+        if not (r.get("verb") and r.get("tier") and r.get("user_id")):
+            continue                      # unbound row -> never covers
+        try:
+            if float(r.get("expires_at") or 0.0) <= t:
+                continue                  # expired (or missing expiry) -> drop
+        except (TypeError, ValueError):
+            continue
+        live.append(r)
+    return live
+
+
+def default_standing_grants_path() -> str:
+    """Canonical location the gate and the live mediator agree on. Env override
+    (SUTANDO_CAPABILITY_GRANTS_FILE) wins so a scoped runner/test can redirect it.
+    The workspace import is lazy to keep this module dependency-light."""
+    override = os.environ.get("SUTANDO_CAPABILITY_GRANTS_FILE")
+    if override:
+        return override
+    from workspace_default import resolve_workspace
+    return os.path.join(resolve_workspace(), "state", "capability-standing-grants.json")
+
+
 class GrantStore:
     """Owner-minted, enumerable, revocable. A grant is BOUND to the principal the
     approval was for (identity + source), so it is not a bearer token another
     same-tier principal can replay. A fresh grant is consumed before execution;
     a standing grant is not. Expiry is enforced on read."""
 
-    def __init__(self, now: Callable[[], float] = time.time):
+    def __init__(self, now: Callable[[], float] = time.time, path: "str | None" = None):
         self._now = now
         self._grants: dict = {}
+        # When set, STANDING grants persist here for the out-of-process gate.
+        # Fresh grants are never persisted (single-use, in-request).
+        self._path = path
 
     def mint_fresh(self, verb: str, principal: cp.Principal, args, task_id: str = "",
                    ttl_seconds: float = 300.0) -> Grant:
-        # A fresh grant SHOULD carry the originating task_id. If left empty it is
-        # unbound and consume_covering() will NEVER honor it (fail-closed) — it can
-        # never become a cross-task wildcard.
+        # A fresh grant without a task_id is unbound: consume_covering() never
+        # honors it (fail-closed), so it can't become a cross-task wildcard.
         g = Grant(grant_id="grant-" + secrets.token_hex(12), verb=verb,
                   tier=principal.tier, user_id=principal.user_id, source=principal.source,
                   task_id=str(task_id or ""), args_digest=digest_args(args),
@@ -146,10 +206,28 @@ class GrantStore:
                   scope_pattern=scope_pattern, expires_at=self._now() + ttl_seconds,
                   single_use=False)
         self._grants[g.grant_id] = g
+        self._persist_standing()
         return g
 
     def revoke(self, grant_id: str) -> None:
         self._grants.pop(grant_id, None)
+        self._persist_standing()
+
+    def _persist_standing(self) -> None:
+        """Atomically write the LIVE standing grants to the shared file the gate
+        reads. Best-effort: a write failure means the grant simply doesn't reach
+        the gate, so the gated action stays denied — fail-closed, never a crash."""
+        if not self._path:
+            return
+        rows = [_standing_row(g) for g in self._live() if not g.single_use]
+        try:
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            tmp = f"{self._path}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(rows, fh)
+            os.replace(tmp, self._path)
+        except Exception:
+            pass
 
     def _live(self):
         now = self._now()
@@ -178,10 +256,8 @@ class GrantStore:
             if g.source and g.source != principal.source:
                 continue
             if g.single_use and g.args_digest and g.args_digest == req.args_digest:
-                # A FRESH grant MUST carry a non-empty originating task id and match
-                # the current one. An unbound grant (task_id="") NEVER covers — so
-                # omitting the bind at mint time fails closed instead of becoming a
-                # cross-task wildcard.
+                # A fresh grant must carry a non-empty task id matching the current
+                # one; an unbound grant (task_id="") never covers (fail-closed).
                 if not g.task_id or not task_id or g.task_id != task_id:
                     continue
                 self._grants.pop(g.grant_id, None)   # atomic single-use consume
@@ -233,10 +309,8 @@ def escalate_pending(pq_path: str, question: str,
     escalation (RFC: never a silent deny). ``reader`` returns the active
     questions; when None, a lightweight in-file check is used."""
     marker = "cap-escalation:" + secrets.token_hex(6)
-    # Written as a `## ` section — the format check-pending-questions actually
-    # COUNTS. A `- [ ]` bullet is silently uncounted (the exact silent-deny the
-    # write-then-assert guards against); the marker sits early in the title so it
-    # survives the reader's first-~100-char match.
+    # Written as a `## ` section — the only format check-pending-questions counts
+    # (a `- [ ]` bullet is silently uncounted); marker early so it survives the scan.
     entry = f"## [{marker}] {question}\n\n**Status:** unanswered\n"
     try:
         existing = ""
@@ -303,9 +377,8 @@ class Mediator:
             return MediationResult(cp.DENY, DENIED, None, row, "no valid context handle")
         task_id = self.contexts.derive_task_id(handle) or ""  # bind a fresh grant to THIS task
 
-        # Base decision, grants NOT applied here — the GrantStore is the single
-        # place a live grant is consulted AND atomically consumed (below), so the
-        # consume can't drift from the decision.
+        # Grants not applied here — GrantStore is the single place a live grant is
+        # consulted AND atomically consumed (below), so consume can't drift.
         decision = cp.decide(req, principal, grants=None, prohibited_overlay=self.overlay)
 
         if decision.decision == cp.PROHIBITED:

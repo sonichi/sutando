@@ -253,9 +253,8 @@ _RECOGNIZERS = (
     (_has("approve the pr", "comment on the pr", "post a comment", "approve pr"), "github:comment"),
     (_has("send an email", "send email", "email to"), "email:send"),
     (_has("read the secret", "read credential", "get the api key", "read .env"), "credential:read"),
-    # narrow to EXPLICIT secret/token/key usage — a bare "use the ..." is ordinary
-    # prose ("use the blue theme") and must fall through to UNCLASSIFIED, not the
-    # credential lane (qingyun-wu CR on #2729).
+    # Narrow to EXPLICIT secret/token/key usage — a bare "use the ..." is ordinary
+    # prose and must fall through to UNCLASSIFIED, not the credential lane.
     (_has("use the api key", "use the token", "use the credential", "use the secret",
           "use the vault", "sign the request", "authenticate with the"), "credential:use"),
     (_has("purchase", "buy ", "check out", "place the order"), "purchase"),
