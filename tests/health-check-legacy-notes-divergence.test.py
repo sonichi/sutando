@@ -33,16 +33,21 @@ def check(label, cond, extra=""):
 
 
 def _probe(ws_files, legacy_files, *, same_dir=False):
-    """Build two notes trees and run the probe against them."""
+    """Build two notes trees and run the probe against them.
+
+    A list entry may be "path" (contents "x") or a ("path", "contents") pair, so a
+    fixture can put the SAME path on both sides with DIFFERENT bytes.
+    """
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         ws = root / "canonical"
         legacy_ws = root / "legacy"
         for base, files in ((ws / "notes", ws_files), (legacy_ws / "notes", legacy_files)):
-            for rel in files:
+            for entry in files:
+                rel, body = entry if isinstance(entry, tuple) else (entry, "x")
                 p = base / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text("x")
+                p.write_text(body)
         target = ws / "notes" if same_dir else legacy_ws / "notes"
         with patch.object(hc, "WORKSPACE_DIR", ws), \
              patch.object(hc, "legacy_dotted_workspace", lambda: target.parent):
@@ -59,6 +64,28 @@ check("names the shared count too", r is not None and "1 shared" in r["detail"],
 check("claims no live-side verdict from a whole-tree mtime",
       r is not None and "newer by" not in r["detail"], str(r))
 
+# A name-set comparison reports healthy when both trees hold one path with
+# different bytes, so deleting either side loses bytes it called fine.
+print("\nsame path, DIFFERENT bytes (the P1):")
+r = _probe([("sutando-wire/episode-specs/a.yaml", "a: 1\n")],
+           [("sutando-wire/episode-specs/a.yaml", "a: 2\n")])
+check("identical NAMES but differing content still warns", r is not None, str(r))
+check("...and says how many differ",
+      r is not None and "1 shared path(s) differ in CONTENT" in r["detail"], str(r))
+check("...and names one of them",
+      r is not None and "episode-specs/a.yaml" in r["detail"], str(r))
+check("...and reports 0 in each only-side (the sets really are equal)",
+      r is not None and "0 file(s) only in the canonical" in r["detail"]
+      and "0 only in the legacy" in r["detail"], str(r))
+check("...and does NOT claim a superset, since names match on both sides",
+      r is not None and "strict superset" not in r["detail"]
+      and "Neither side is a superset" not in r["detail"], str(r))
+
+# An unreadable file must never compare EQUAL to another — that would convert a
+# read failure into a silent "identical".
+check("the digest sentinel cannot collide with a real digest",
+      hc._file_digest(Path("/nonexistent/x")) != hc._file_digest(Path("/nonexistent/y")))
+
 print("\nsilence where it should be silent:")
 r = _probe(["a.md", "b.md"], ["a.md", "b.md"])
 check("identical trees → no warn", r is None, str(r))
@@ -68,15 +95,11 @@ check("legacy notes/ dir absent → no warn (nothing to diverge from)", r is Non
 
 r = _probe(["a.md", "b.md"], ["a.md", "b.md"], same_dir=True)
 check("same resolved dir → no warn (not two trees)", r is None, str(r))
-# NOTE: that case passes even with the resolve() guard removed, because two views
-# of one directory also produce an empty diff. The guard is a cheap short-circuit,
-# not a behavioural gate, so it is deliberately NOT asserted as one — a mutation
-# that deletes it does not change any output, and a test claiming otherwise would
-# be asserting its own wishful thinking.
+# Deleting the resolve() guard changes no output here: two views of one dir also
+# give an empty diff. It is a short-circuit, so it is NOT asserted as a gate.
 
-# Pro measured this on a second host and read "2 of 11,442" as nothing to worry
-# about. Counting is what made that wrong: those 2 are the files a "delete the
-# legacy tree" cleanup destroys. So the legacy-only paths must be NAMED.
+# A bare ratio invites dismissal, so the legacy-only paths must be NAMED — they
+# are the ones a "delete the legacy tree" cleanup destroys.
 print("\nthe at-risk paths are named, not just counted:")
 r = _probe(["keep.md"], ["keep.md", "sutando-wire/peg-signals/2026-08-05.md"])
 check("names the legacy-only path",
@@ -108,14 +131,27 @@ r = _probe(["a.md"], ["a.md", "extra.yaml"])
 check("legacy is a strict superset → still warns", r is not None, str(r))
 check("...and says 0 only in the canonical",
       r is not None and "0 file(s) only in the canonical" in r["detail"], str(r))
+# The shape sentence must be DERIVED: hardcoding "neither side is a superset"
+# states the opposite of the sets whenever one side actually is.
+check("...and does NOT claim 'neither side is a superset'",
+      r is not None and "Neither side is a superset" not in r["detail"], str(r))
+check("...it names WHICH side is the superset",
+      r is not None and "legacy tree is a strict superset" in r["detail"], str(r))
+
+r = _probe(["a.md", "onlyhere.md"], ["a.md"])
+check("canonical is the superset → the sentence flips",
+      r is not None and "canonical workspace is a strict superset" in r["detail"], str(r))
+
+r = _probe(["a.md", "x.md"], ["a.md", "y.md"])
+check("both sides exclusive → 'neither side is a superset' is CORRECT here",
+      r is not None and "Neither side is a superset" in r["detail"], str(r))
 
 print("\nthe #1266 probe is untouched:")
 check("check_notes_split_brain still exists and is separate",
       callable(getattr(hc, "check_notes_split_brain", None)))
 src = (REPO / "src" / "health-check.py").read_text()
-# Match the CALL SITE, not the name: "check_legacy_notes_divergence()" also occurs
-# in the `def` line, so the obvious assertion survives deleting the call entirely —
-# measured, that mutation kept this file green.
+# Match the CALL SITE: the bare name also occurs in the `def` line, so asserting
+# the name alone survives deleting the call.
 check("the probe is CALLED, not merely defined",
       "_legacy_nd = check_legacy_notes_divergence()" in src
       and "checks.append(_legacy_nd)" in src)

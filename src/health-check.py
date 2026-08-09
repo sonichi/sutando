@@ -5719,6 +5719,23 @@ def check_notes_split_brain() -> "dict | None":
 
 
 
+def _file_digest(path: Path) -> str:
+    """sha256 of a file, or a sentinel that can never equal another file's digest.
+
+    Read errors must NOT make two files compare equal — that would silently turn an
+    unreadable pair into "identical" and hide the divergence this probe reports.
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return f"<unreadable:{path}>"
+
+
 def check_legacy_notes_divergence() -> "dict | None":
     """Detect a canonical-vs-legacy notes/ divergence the #1266 probe cannot see.
 
@@ -5752,23 +5769,24 @@ def check_legacy_notes_divergence() -> "dict | None":
     except OSError:
         return None
 
-    def _rel(root: Path) -> "set[str]":
-        out = set()
+    def _rel(root: Path) -> "dict[str, Path]":
+        out = {}
         try:
             for p in root.rglob("*"):
                 if p.is_file():
-                    out.add(str(p.relative_to(root)))
+                    out[str(p.relative_to(root))] = p
         except OSError:
             pass
         return out
 
     a, b = _rel(ws_notes), _rel(legacy_notes)
-    only_ws, only_legacy = a - b, b - a
-    if not only_ws and not only_legacy:
+    only_ws, only_legacy = set(a) - set(b), set(b) - set(a)
+    # A shared PATH is not a shared FILE. Comparing name sets alone reports healthy
+    # when both trees hold the same path with different bytes — measured 57 of 1056.
+    differing = sorted(r for r in (set(a) & set(b)) if _file_digest(a[r]) != _file_digest(b[r]))
+    if not only_ws and not only_legacy and not differing:
         return None
 
-    # Non-dotfiles first: an alphabetical sample leads with .DS_Store and buries
-    # the paths worth acting on. Counts stay over the FULL set.
     ranked = sorted(only_legacy, key=lambda p: (Path(p).name.startswith("."), p))
     named = ", ".join(ranked[:3])
     more = f" … and {len(only_legacy) - 3} more" if len(only_legacy) > 3 else ""
@@ -5776,15 +5794,32 @@ def check_legacy_notes_divergence() -> "dict | None":
         f" LEGACY-ONLY (no copy in the canonical tree): {named}{more}."
         if only_legacy else ""
     )
+    # Derived from the computed sets, never asserted: a hardcoded "neither side is a
+    # superset" is FALSE when one is, and would tell cleanup the opposite of the truth.
+    if only_ws and only_legacy:
+        shape = "Neither side is a superset, so pointing a consumer at either one loses files."
+    elif only_legacy:
+        shape = (f"The legacy tree is a strict superset by name — the canonical one is missing "
+                 f"{len(only_legacy)} file(s).")
+    elif only_ws:
+        shape = (f"The canonical workspace is a strict superset by name — the legacy one is "
+                 f"missing {len(only_ws)} file(s).")
+    else:
+        shape = "Names match on both sides; the divergence is entirely in file CONTENT."
+    content = (
+        f" {len(differing)} shared path(s) differ in CONTENT, so deleting either tree "
+        f"loses bytes even where the names match (e.g. {', '.join(differing[:2])})."
+        if differing else ""
+    )
     return {
         "name": "legacy-notes-divergence",
         "status": "warn",
         "detail": (
             f"notes/ has diverged from the pre-v0.8 {legacy_notes}: "
             f"{len(only_ws)} file(s) only in the canonical workspace, "
-            f"{len(only_legacy)} only in the legacy tree, {len(a & b)} shared."
-            f"{at_risk} Neither side is a superset, so pointing a consumer at "
-            f"either one loses files. Decide which tree is authoritative before "
+            f"{len(only_legacy)} only in the legacy tree, "
+            f"{len(set(a) & set(b))} shared ({len(differing)} of them differing)."
+            f"{at_risk}{content} {shape} Decide which tree is authoritative before "
             f"'fixing' any path that reads notes/, and compare the SUBTREE you "
             f"care about — a whole-tree mtime does not say which side is live."
         ),

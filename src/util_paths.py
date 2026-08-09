@@ -89,9 +89,8 @@ def _workspace_root() -> Path:
             pass
         # Last-ditch default: the canonical post-v0.8 home-dir location
         # (~/sutando-workspace, matching sutando_config.py resolve_workspace) —
-        # NOT the pre-v0.8 dotted ~/.sutando/workspace, which is no longer
-        # RESOLVED to. It may still exist on disk and still be taking writes;
-        # health-check's legacy-notes-divergence probe reports that case.
+        # The pre-v0.8 dotted path is no longer RESOLVED to, but may still exist
+        # and still take writes — health-check reports that divergence.
         return Path.home() / "sutando-workspace"
 
 
