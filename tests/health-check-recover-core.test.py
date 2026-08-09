@@ -262,8 +262,8 @@ def case_j_dead_core_relaunches() -> list[str]:
         r1 = h.run(now=1_000_200, alive=False, age=5000)     # +200s > CONFIRM → relaunch
         if not r1 or r1.get("action") != "restarted":
             fails.append(f"j) confirmed-dead core should relaunch, got {r1}")
-        if h.restart_calls != [False]:
-            fails.append(f"j) dead relaunch should call restart once (1M), got {h.restart_calls}")
+        if h.restart_calls != [True]:
+            fails.append(f"j) dead relaunch should call restart once, got {h.restart_calls}")
     with tempfile.TemporaryDirectory() as td:
         h = Harness(Path(td) / "rec.json")
         r = h.run(now=1_000_000, alive=False, age=5000, booted=True)  # dead but just booted
@@ -296,7 +296,7 @@ def case_j2_dead_core_before_after_output() -> list[str]:
         ra = ha.run(now=1_000_200, alive=False, age=5000)    # +200s > CONFIRM → relaunch
         print("  AFTER  (dead core):    action=%r restart_calls=%r DM=%r"
               % ((ra or {}).get("action"), ha.restart_calls, ha.sent))
-        if (ra or {}).get("action") != "restarted" or ha.restart_calls != [False]:
+        if (ra or {}).get("action") != "restarted" or ha.restart_calls != [True]:
             fails.append(f"j2) dead core should relaunch once, got {ra}/{ha.restart_calls}")
         dm = " ".join(ha.sent).lower()
         if not ("down" in dm and "relaunch" in dm):
@@ -448,8 +448,8 @@ def case_p_wedged_to_dead_transition_reobserves() -> list[str]:
         r_dead = h.run(now=1_000_400, alive=False, age=1000, key="t1")  # +200s from the dead observe
         if not r_dead or r_dead.get("action") != "restarted":
             fails.append(f"p) confirmed-dead (own window) should relaunch, got {r_dead}")
-        if h.restart_calls != [False]:
-            fails.append(f"p) dead relaunch should call restart once (1M), got {h.restart_calls}")
+        if h.restart_calls != [True]:
+            fails.append(f"p) dead relaunch should call restart once, got {h.restart_calls}")
     return fails
 
 
@@ -565,7 +565,7 @@ def case_s_actuator_DEFAULT_alive_fn_is_local_not_fleet():
             oldest_task_fn=lambda: ("t1", 5000),
             status_ts_fn=lambda: None,
             just_booted_fn=lambda: False,
-            restart_fn=lambda standard_context: True,
+            restart_fn=lambda: True,
             sender=lambda text: True,
         )
     finally:
@@ -681,7 +681,7 @@ def case_x_uncertainty_between_two_deaths_invalidates_the_window():
         oldest_task_fn=lambda: ("t1", 5000),
         status_ts_fn=lambda: None,
         just_booted_fn=lambda: False,
-        restart_fn=lambda standard_context: restarts.append(standard_context) or True,
+        restart_fn=lambda: restarts.append(True) or True,
         sender=lambda text: True,
     )
     seq = iter([False, None, False])          # dead, UNKNOWN, dead
@@ -833,7 +833,7 @@ def case_v_an_unknown_probe_must_not_restart_a_healthy_core():
             state_file=ws / "rec.json",
             oldest_task_fn=lambda: ("task-stuck", 5000),
             status_ts_fn=lambda: None,
-            restart_fn=lambda standard_context: restarts.append(True) or True,
+            restart_fn=lambda: restarts.append(True) or True,
             sender=lambda text: True,
         )   # alive_fn / just_booted_fn DELIBERATELY not injected — the defaults
             # are the thing under test.
@@ -890,7 +890,7 @@ def case_u_peer_boot_does_not_suppress_local_recovery():
             # alive_fn and just_booted_fn deliberately NOT injected
             oldest_task_fn=lambda: ("task-peer-started", 5000),
             status_ts_fn=lambda: None,
-            restart_fn=lambda standard_context: True,
+            restart_fn=lambda: True,
             sender=lambda text: True,
         )
     finally:
