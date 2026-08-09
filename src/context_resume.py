@@ -31,6 +31,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from util_paths import claude_project_slug  # noqa: E402
+
 # Harness-injected noise that must not survive into the resumed context.
 _NOISE_BLOCK_RE = re.compile(
     r"<system-reminder>.*?</system-reminder>"
@@ -127,7 +130,7 @@ def _latest_transcript() -> Path:
         ["bash", str(repo / "scripts" / "sutando-config.sh"), "claude-home-path", "projects"],
         capture_output=True, text=True, timeout=15,
     ).stdout.strip()
-    slug = re.sub(r"[^a-zA-Z0-9]", "-", str(repo))
+    slug = claude_project_slug(repo)
     candidates = sorted(
         Path(proj, slug).glob("*.jsonl"),
         key=lambda p: p.stat().st_mtime,
