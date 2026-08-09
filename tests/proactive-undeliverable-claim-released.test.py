@@ -10,6 +10,7 @@ import ast
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -43,6 +44,48 @@ class ClaimForDeliveryTest(unittest.TestCase):
         """Another poller renamed it first; the caller must see None, not a traceback."""
         gone = self.box / "proactive-vanished.txt"
         self.assertIsNone(claim_for_delivery(gone, "UOWNER"))
+
+    def test_claim_never_clobbers_an_existing_sending(self):
+        """POSIX rename REPLACES the destination; an in-flight peer body must survive."""
+        other = self.box / "proactive-x.sending"
+        other.write_text("a peer's in-flight body")
+        self.assertIsNone(claim_for_delivery(self.msg, "UOWNER"),
+                          "claimed over an existing .sending")
+        self.assertEqual(other.read_text(), "a peer's in-flight body",
+                         "destroyed a peer's in-flight claim")
+        self.assertTrue(self.msg.exists(), "consumed the .txt while losing the collision")
+        self.assertEqual(self.msg.read_text(), "body")
+
+    def test_release_never_clobbers_an_existing_txt(self):
+        """Same hazard on the way back: a newer .txt must not be overwritten."""
+        claim = self.box / "proactive-y.sending"
+        claim.write_text("older claim body")
+        newer = self.box / "proactive-y.txt"
+        newer.write_text("newer body")
+        self.assertFalse(release_claim(claim), "reported release over an existing .txt")
+        self.assertEqual(newer.read_text(), "newer body", "clobbered the newer .txt")
+        self.assertTrue(claim.exists(), "dropped the claim it could not release")
+
+    def test_release_loses_the_check_then_act_race_without_clobbering(self):
+        """An exists() guard cannot see a .txt that lands inside its own window.
+
+        The guard is simulated as blind, which is what a concurrent writer makes
+        it; only a no-clobber primitive survives, so this fails on rename.
+        """
+        claim = self.box / "proactive-z.sending"
+        claim.write_text("older claim body")
+        target = self.box / "proactive-z.txt"
+        target.write_text("newer body")
+        real_exists = Path.exists
+
+        def blind(self_path):
+            return False if self_path == target else real_exists(self_path)
+
+        with mock.patch.object(Path, "exists", blind):
+            released = release_claim(claim)
+        self.assertEqual(target.read_text(), "newer body",
+                         "clobbered a .txt the exists() guard could not see")
+        self.assertFalse(released)
 
     def test_falsy_but_present_recipient_still_claims(self):
         """Only None means 'no recipient' — 0 or '' are recipients a provider may use."""

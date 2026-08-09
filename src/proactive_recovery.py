@@ -7,6 +7,7 @@ same collision, race, and failure policy at startup.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -20,10 +21,16 @@ def claim_for_delivery(path: Path, recipient: object | None) -> Path | None:
     if recipient is None:
         return None
     claim = path.with_suffix(".sending")
+    # link, not rename: POSIX rename REPLACES an existing claim and destroys a
+    # peer's in-flight body. link fails with EEXIST, which is the collision gate.
     try:
-        path.rename(claim)
-    except FileNotFoundError:
+        os.link(path, claim)
+    except (FileExistsError, FileNotFoundError):
         return None
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
     return claim
 
 
@@ -35,11 +42,11 @@ def release_claim(claim: Path) -> bool:
     """
     target = claim.with_suffix(".txt")
     try:
-        if target.exists():
-            return False
-        claim.rename(target)
+        # Same clobber hazard as the claim: exists()-then-rename is check-then-act.
+        os.link(claim, target)
+        claim.unlink()
         return True
-    except FileNotFoundError:
+    except (FileExistsError, FileNotFoundError):
         return False
     except OSError as exc:
         print(f"  [proactive] could not release claim {claim.name}: {exc}", flush=True)
