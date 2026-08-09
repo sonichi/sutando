@@ -32,6 +32,10 @@
 
 set -euo pipefail
 
+# Tests must never emit product telemetry. The suite runs real code paths and
+# an unstubbed one would hit PostHog from CI/dev; opt out for every test here.
+export SUTANDO_TELEMETRY=0
+
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$REPO_ROOT"
 
@@ -91,7 +95,7 @@ skipped_total=0
 fully_skipped=()
 partly_skipped=()
 while IFS= read -r f; do
-    if ! output=$(python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1); then
+    if ! output=$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1); then
         echo "✖ test failed under instrumentation: $f"
         echo "$output"
         failed=1
