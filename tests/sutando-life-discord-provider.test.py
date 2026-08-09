@@ -284,6 +284,50 @@ class DiscordProviderTests(unittest.TestCase):
         self.assertTrue(result["partial"])
         self.assertTrue(result["coverage"]["gapPossible"])
 
+    def test_message_delta_does_not_skip_an_ordinary_backlog(self):
+        channel = {"id": CHANNEL_ID, "guild_id": GUILD_ID, "type": 0}
+        previous_id = 1600000000000001000
+        backlog_rows = [
+            {
+                "id": str(previous_id + index),
+                "timestamp": PROVIDER._snowflake_time(str(previous_id + index)),
+                "content": f"backlog {index}",
+                "author": {"id": "900000000000000005", "username": "member"},
+            }
+            for index in range(1, 101)
+        ]
+        later_rows = [
+            {
+                "id": str(previous_id + index),
+                "timestamp": PROVIDER._snowflake_time(str(previous_id + index)),
+                "content": f"later {index}",
+                "author": {"id": "900000000000000005", "username": "member"},
+            }
+            for index in range(101, 201)
+        ]
+        fake, _, read = self.ready(channel, backlog_rows, later_rows)
+
+        result = read({
+            "operation": "channel.messages.delta",
+            "resource": {"channelId": CHANNEL_ID},
+            "cursor": {
+                "version": 1,
+                "ts": PROVIDER._snowflake_time(str(previous_id)),
+                "id": str(previous_id),
+            },
+            "limit": 100,
+        })
+
+        message_calls = [call for call in fake.calls if "/messages?" in call["url"]]
+        self.assertEqual(len(message_calls), 1)
+        self.assertEqual(
+            [item["providerId"] for item in result["items"]],
+            [str(previous_id + index) for index in range(1, 101)],
+        )
+        self.assertEqual(result["nextCursor"]["id"], str(previous_id + 100))
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["coverage"]["gapPossible"])
+
     def test_invalid_resource_and_cursor_do_not_invoke_discord(self):
         fake, _, read = self.ready()
         before = len(fake.calls)

@@ -508,17 +508,18 @@ def _read_messages(requester: _Requester, token: str, access_path: Path,
             if isinstance(row, Mapping) and isinstance(row.get("id"), str)
             and _is_snowflake(row["id"])
         ]
-        forward_after = str(max([int(previous[1]), *page_ids]))
-        forward_rows = _api_get(
-            requester, token, f"/channels/{channel.get('id')}/messages",
-            {"limit": str(limit), "after": forward_after},
-        )
-        if not isinstance(forward_rows, list):
-            raise ProviderFailure(
-                "invalid_provider_response", "Discord returned an invalid message list.",
-                retryable=True,
+        forward_after = max([int(previous[1]), *page_ids])
+        if forward_after == int(previous[1]):
+            forward_rows = _api_get(
+                requester, token, f"/channels/{channel.get('id')}/messages",
+                {"limit": str(limit), "after": str(forward_after)},
             )
-        pages.append(forward_rows)
+            if not isinstance(forward_rows, list):
+                raise ProviderFailure(
+                    "invalid_provider_response", "Discord returned an invalid message list.",
+                    retryable=True,
+                )
+            pages.append(forward_rows)
     rows = [row for page in pages for row in page]
     bounded = [row for page in pages for row in page[:limit]]
     valid = [
