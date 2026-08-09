@@ -92,10 +92,11 @@ MEDIA_FORMS = frozenset({"attachment", "live_stream"})
 # the schema names). Consumer semantics: highest first, mtime FIFO tiebreak.
 PRIORITIES = ("urgent", "normal", "low")
 
-# Access tiers (CLAUDE.md access-control sections). `owner` is full
-# processing; team/other are sandboxed. A missing header reads as owner for
+# Access tiers (CLAUDE.md access-control sections). `owner` is full processing;
+# team is workspace-write sandboxed; guest/legacy-other are read-only sandboxed.
+# A missing header reads as owner for
 # legacy local files — that default belongs to consumers, not this module.
-ACCESS_TIERS = ("owner", "team", "other")
+ACCESS_TIERS = ("owner", "team", "guest", "other")
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is

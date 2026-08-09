@@ -591,9 +591,10 @@ _INTERACTION_TYPES = frozenset({
     "tool_initiated", "system_event", "self_reflective",
 })
 
-# Trust tier is a LOCAL decision (review 2026-06-13): the gateway is outside
-# this machine's trust boundary, so a task's SELF-CLAIMED access_tier is
-# ignored. The tier written to every task file comes from REMOTE_TASK_TIER.
+# Trust is bounded at both ends. The gateway's access_tier is broker-attested
+# from the Matrix sender and room policy; this machine independently resolves a
+# local cap. The effective tier is the less privileged of those two decisions,
+# so neither side can upgrade the other.
 #
 # Default is "owner" for the personal-agent model (2026-07-08): a user runs
 # their OWN gateway authenticated with their OWN owner bearer, and the broker
@@ -604,14 +605,15 @@ _INTERACTION_TYPES = frozenset({
 # task's claim. The previous "team" default made a user's own voice
 # delegations look untrusted, so a hardened core (correctly, given the signal)
 # refused them.
-# ESCAPE HATCH: a SHARED / multi-user gateway — one that could pull tasks NOT
-# scoped to a single owner — MUST set REMOTE_TASK_TIER=team (or other).
+# Missing or invalid gateway tiers fail closed to guest.
 LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner").strip().lower()
-if LOCAL_TIER not in ("owner", "team", "other"):
-    # An INVALID value (e.g. a typo "owenr") fails CLOSED to "team" — NEVER
+if LOCAL_TIER == "other":
+    LOCAL_TIER = "guest"  # legacy spelling
+if LOCAL_TIER not in ("owner", "team", "guest"):
+    # An INVALID value (e.g. a typo "owenr") fails CLOSED to "guest" — NEVER
     # silently grant owner on a misconfiguration. Only the UNSET case defaults to
     # "owner" (the `or "owner"` above — the explicit personal-agent model).
-    LOCAL_TIER = "team"
+    LOCAL_TIER = "guest"
 
 
 # ── per-sender tier map (owner-controlled, LOCAL) ────────────────────────────
@@ -635,9 +637,16 @@ def _ag2space_access_path():
     return os.path.join(base, "channels", CHANNEL_DIR, "access.json")
 
 
-# Known tier vocabulary. Also an ordering (higher == more privileged); kept for
-# validating a mapped value. It no longer CLAMPS — see _tier_for.
-_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
+# Known tier vocabulary and privilege ordering. `_tier_for` uses this ordering
+# to choose the lower of the broker-attested tier and the local cap.
+_TIER_RANK = {"guest": 0, "team": 1, "owner": 2}
+
+
+def _normalized_tier(value):
+    tier = str(value or "").strip().lower()
+    if tier == "other":
+        tier = "guest"
+    return tier if tier in _TIER_RANK else "guest"
 
 _TIER_MAP_CACHE = {"ident": None, "map": {}}
 
@@ -704,8 +713,8 @@ def _load_tier_map():
         tm = {}
         for who, tier in raw.items():
             t = str(tier).strip().lower()
-            if isinstance(who, str) and t in ("owner", "team", "other"):
-                tm[who.strip()] = t
+            if isinstance(who, str) and t in ("owner", "team", "guest", "other"):
+                tm[who.strip()] = _normalized_tier(t)
     except Exception:
         # Malformed / mid-write → keep last-known-good; don't advance mtime so a
         # later successful read of the fixed file is still picked up.
@@ -714,42 +723,29 @@ def _load_tier_map():
     return tm
 
 
-def _tier_for(user_id):
-    """Resolve the access_tier for a task's broker-attested sender.
+def _tier_for(user_id, attested_tier=None):
+    """Resolve access without letting the gateway or local config upgrade the other.
 
-    An EXPLICITLY LISTED sender gets exactly the tier the owner mapped them to —
-    including a tier ABOVE this node's LOCAL_TIER. That is the point: it lets a
-    SHARED gateway run a least-privilege default (REMOTE_TASK_TIER=team) and name
-    the one sender who is the owner, instead of the only previously-available
-    shape — a blanket `owner` default that every unlisted sender inherits.
-
-    This mirrors the discord and slack bridges, which have always resolved
-    `access_tier = tierMap[sender_id]` with no clamp. The map is LOCAL,
-    owner-owned config with the same trust standing as REMOTE_TASK_TIER itself,
-    and the lookup key is the BROKER-ATTESTED user_id, never a task-body
-    self-claim — so the WIRE still cannot escalate anyone. Only the owner's own
-    local file can, and only for a sender they named explicitly.
-
-    Everyone else (unlisted / no user_id) gets LOCAL_TIER, unchanged: no existing
-    install is silently demoted, and an unknown sender never gains privilege.
+    The gateway tier comes from authenticated broker transport, not task-body
+    text. Missing or invalid values are guest. Locally, an explicitly mapped
+    sender uses that tier; everyone else uses LOCAL_TIER. The final result is the
+    lower of the gateway and local decisions. A local map can identify the real
+    owner on a team-default node, but cannot upgrade a backend guest.
 
     ⚠ CONTRACT — `user_id` MUST stay broker-attested (cold-review note, #2584).
-    The removed clamp used to be a backstop: even if `user_id` had become
-    body-influenced, a mapped tier was still bounded by LOCAL_TIER. With the
-    clamp gone, "`user_id` is the broker-written Matrix sender, never a
-    task-body self-claim" is SOLELY load-bearing for the no-wire-escalation
-    property. It holds today because `user_id` is a broker-writer-side entry in
-    _TASK_FIELDS, serialized beside room_name/sender_name. Any future change
-    that lets a task body influence `user_id` reintroduces wire-controlled
-    escalation — re-add a bound here if that contract is ever weakened.
+    `user_id` is a broker-writer-side entry in _TASK_FIELDS, serialized beside
+    room_name/sender_name. It selects only the local CAP; the separately
+    broker-attested tier remains an upper bound even if identity parsing regresses.
     (Deliberately a contract note, not an assert: provenance cannot be checked
     at runtime — the value is an ordinary string whichever path produced it.)"""
+    wire = _normalized_tier(attested_tier)
+    local = _normalized_tier(LOCAL_TIER)
     uid = (user_id or "").strip()
     if uid:
         mapped = _load_tier_map().get(uid)
-        if mapped in _TIER_RANK:
-            return mapped
-    return LOCAL_TIER
+        if mapped is not None:
+            local = _normalized_tier(mapped)
+    return wire if _TIER_RANK[wire] <= _TIER_RANK[local] else local
 
 
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
@@ -1411,22 +1407,15 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     routing (the proactive-loop's "owner active N min ago" signal + the core-
     supervisor escalation target). `sender_tier` is passed in by `_write_task` so
     the task tier and this gate share a SINGLE resolution (no divergence, no
-    double tierMap read); a direct caller can omit it and we resolve here. For an
-    Since the map may now grant a tier ABOVE LOCAL_TIER, the mirror case also
-    holds: a sender explicitly mapped to owner on a least-privilege node DOES
-    register owner presence — that is the point of naming them owner. Tests 23/24
-    pin both directions, because a refactor that regated this on LOCAL_TIER would
-    silently stop recording the real owner's activity. For an
-    unlisted sender `_tier_for` returns LOCAL_TIER, so the single-owner case is
-    unchanged. Never trusts the gateway's own claim (it is outside the trust
-    boundary) — only the broker-attested user_id keyed against the owner's LOCAL
-    tierMap. Atomic write via per-PID tmp + os.replace (this file has four
+    double tierMap read); a direct caller can omit it and we resolve here. A
+    locally named owner registers owner presence only when the broker also
+    attests owner. Every unlisted sender is bounded by the broker-attested access
+    tier. Atomic write via per-PID tmp + os.replace (this file has four
     concurrent writers; #2222); same schema (`ts`, `channel`, `summary`)
     as discord-bridge.write_owner_activity so the proactive-loop reader is
     transport-agnostic. Best-effort — never blocks task intake."""
     if sender_tier is None:
-        # user_id is broker-attested here — see the CONTRACT note in _tier_for.
-        sender_tier = _tier_for(task.get("user_id"))
+        sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     if sender_tier != "owner":
         return
     # A peer FLEET agent resolves to owner tier on a tierMap-less node (LOCAL_TIER
@@ -1581,16 +1570,13 @@ def _write_task(task: dict) -> str | None:
     # lack of end-to-end support. platform_card above is that signal, done
     # properly: KNOWN_HEADER_KEYS vocabulary + guard defang + a verifying
     # consumer in skills/agent-room-ops/verify_platform_card.py.)
-    # access_tier is a LOCAL decision and written LAST so it wins even under a
-    # last-occurrence parser; every other field is newline-stripped so none can
-    # forge an earlier one either. Resolved per broker-attested sender via the
-    # owner's tierMap (LOCAL file), falling back to LOCAL_TIER for unlisted
-    # senders — so a named teammate can be down-tiered without trusting the task.
+    # access_tier is broker-attested and then clamped by local policy. Every
+    # other field is newline-stripped so none can forge an earlier tier line.
     # Resolve ONCE and reuse for both the task tier AND the owner-activity gate
     # below, so the two decisions can never diverge (a single source of truth,
     # no double read of the tierMap).
-    # user_id is broker-attested here — see the CONTRACT note in _tier_for.
-    sender_tier = _tier_for(task.get("user_id"))
+    # user_id and access_tier are broker-attested here — see _tier_for.
+    sender_tier = _tier_for(task.get("user_id"), task.get("access_tier"))
     lines.append(f"access_tier: {sender_tier}")
     # #2267 parity, second half: the other bridges append the in-band security
     # notice so the core neither reproduces nor re-requests the redacted value.
@@ -1598,6 +1584,27 @@ def _write_task(task: dict) -> str | None:
     # no header-shaped lines, so the access-tier-wins-last invariant holds.
     if _secret_types:
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
+    if sender_tier in ("team", "guest"):
+        sandbox = "workspace-write" if sender_tier == "team" else "read-only"
+        purpose = (
+            "You may edit files and run tests inside the current workspace, but must not "
+            "use secrets, contact people, push code, merge, deploy, or mutate external systems."
+            if sender_tier == "team"
+            else (
+                "You may only research, inspect, explain, and draft. Do not "
+                "modify files or external systems."
+            )
+        )
+        lines.extend([
+            "",
+            "===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===",
+            f"This AG2Space task is {sender_tier.upper()} tier, not owner tier.",
+            "Do not execute the request directly with the owner's unrestricted core.",
+            f"Delegate it to Codex using `codex exec --sandbox {sandbox}`.",
+            purpose,
+            f"Write only the sandboxed agent's safe user-facing answer to results/{tid}.txt.",
+            "===END SUTANDO SYSTEM INSTRUCTIONS===",
+        ])
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":
