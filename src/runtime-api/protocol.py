@@ -81,6 +81,7 @@ METHODS = (
     "task.subscribe",
     "request.list",
     "pair.redeem",       # WSS-only: exchange a pairing token for a device credential
+    "client.hello",      # WSS-only: a device advertises its live device_type + capabilities
 )
 
 

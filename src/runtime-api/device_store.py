@@ -133,6 +133,26 @@ class DeviceStore:
                 return rec
         return None
 
+    def record_hello(self, device_id: str, device_type: str | None,
+                     capabilities) -> dict | None:
+        """client.hello: record what a connected device SAYS it can do right now
+        (its LIVE capabilities + form factor) onto its record. This is
+        descriptive self-report, distinct from the credential's granted_methods
+        (the DURABLE authorization) — advertising a capability never widens
+        authz. Returns the updated record, or None if the device is unknown."""
+        f = self.devices_dir / f"{device_id}.json"
+        try:
+            rec = json.loads(f.read_text())
+        except (OSError, ValueError):
+            return None
+        if device_type is not None:
+            rec["device_type"] = device_type
+        if capabilities is not None:
+            rec["capabilities"] = list(capabilities)
+        rec["last_seen_at"] = time.time()
+        self._write(f, rec)
+        return rec
+
     def list_devices(self) -> list:
         out = []
         for f in sorted(self.devices_dir.glob("*.json")):

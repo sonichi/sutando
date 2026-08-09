@@ -131,6 +131,17 @@ async def probe():
         st = await rpc(sess, cred, "sutando.status")
         check("error" not in st, "paired device can read sutando.status (status glance)")
 
+        # 5c. client.hello: the device advertises its live capabilities, which
+        # the server records on the device record (descriptive, not authz).
+        hello = await rpc(sess, cred, "client.hello",
+                          {"device_type": "watch",
+                           "capabilities": ["display", "microphone", "speaker",
+                                            "vibration", "imu"]})
+        rec = hello.get("result", {}).get("recorded") or {}
+        check(rec.get("device_type") == "watch"
+              and "vibration" in rec.get("capabilities", []),
+              "client.hello records the device's advertised type + capabilities")
+
         # 6. pairing token is single-use — once redeemed it no longer authorizes
         #    ANY connection, so reuse is rejected at connect (stronger than a
         #    redeem-time error: a burned token can't even open a session).

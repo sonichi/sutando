@@ -166,6 +166,22 @@ class WsTransport:
                 return
             await ws.send_str(result_frame(req_id, issued).decode())
             return
+        if method == "client.hello":
+            # A device advertises its LIVE capabilities + form factor. Recorded
+            # onto its device record (descriptive self-report — never widens
+            # authz). Non-device connections (shared token) just get an ack.
+            recorded = None
+            if auth["kind"] == "device" and self.device_store is not None:
+                rec = self.device_store.record_hello(
+                    auth.get("device_id"), params.get("device_type"),
+                    params.get("capabilities"))
+                if rec is not None:
+                    recorded = {"device_id": rec.get("device_id"),
+                                "device_type": rec.get("device_type"),
+                                "capabilities": rec.get("capabilities", [])}
+            await ws.send_str(result_frame(
+                req_id, {"hello": True, "recorded": recorded}).decode())
+            return
         if method == "task.subscribe":
             # Transport mode-switch (read-only stream), before the grant check —
             # the sink joins the server's subscriber sets; watchers do the rest.
