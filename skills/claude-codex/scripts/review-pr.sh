@@ -61,11 +61,8 @@ $DIFF" < /dev/null
 rc=$?
 
 if [[ $rc -eq 0 && -s "$OUT" ]]; then
-    # Delimit the verdict. codex's own exec trace goes to OUR stdout unredirected
-    # (deliberately -- codex-bounded.sh --stall watches that stream to tell a working
-    # run from a wedged one), and that trace includes source the agent inlined while
-    # working. A consumer reading "the tail" can therefore quote repository code as
-    # the PR's content. Everything after the LAST marker is the verdict.
+    # codex's trace shares this stdout and --stall watches it, so it cannot be
+    # silenced; the marker is what separates that trace from the verdict.
     printf '%s\n' "$VERDICT_MARKER"
     cat "$OUT"
 else
