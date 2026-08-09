@@ -353,13 +353,23 @@ class WsTransport:
             return
         self._voice.on_audio(stream_id, payload)
 
+    async def _scp_voice_js(self, _request: web.Request):
+        """Drop-in toggle-live voice client module (ES module + window global)
+        for any web surface — the desktop chat's talk button imports this."""
+        page = Path(__file__).with_name("scp-voice.js")
+        try:
+            return web.Response(text=page.read_text(encoding="utf-8"),
+                                content_type="application/javascript")
+        except OSError:
+            return web.Response(status=404, text="scp-voice.js not installed")
+
     async def _companion(self, _request: web.Request):
         """The web-companion page — a phone-browser SCP client served from the
         same origin as the WSS endpoint. The static page carries no secrets and
         needs no auth; its WebSocket authenticates with the user's token."""
         page = Path(__file__).with_name("companion.html")
         try:
-            return web.Response(text=page.read_text(), content_type="text/html")
+            return web.Response(text=page.read_text(encoding="utf-8"), content_type="text/html")
         except OSError:
             return web.Response(status=404, text="companion page not installed")
 
@@ -367,6 +377,7 @@ class WsTransport:
         app = web.Application()
         app.router.add_get(self.route, self._handle)
         app.router.add_get("/companion", self._companion)
+        app.router.add_get("/scp-voice.js", self._scp_voice_js)
         return app
 
     # ── lifecycle (runs on the daemon's asyncio loop, non-blocking) ──────────
