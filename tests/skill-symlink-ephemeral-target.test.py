@@ -1,14 +1,5 @@
-"""A skill symlink that resolves INTO a temp dir must warn, not read healthy.
-
-`check_skill_symlinks` modelled four states (linked / unlinked / dangling /
-shadowed-by-a-real-dir). A fifth slipped through as healthy: a link that
-resolves, but into a scratch worktree. It loads code `git pull` never reaches,
-and disappears on the next tmp sweep — at which point it becomes a dangling
-link with nothing recording how it got there.
-
-Also pins the inverse: a link to a DIFFERENT DURABLE clone is a supported
-layout and must NOT warn. An earlier draft compared against the running
-checkout instead, which flagged 57 of 57 links when run from a worktree.
+"""A skill symlink resolving INTO a temp dir must warn; one resolving into a
+different DURABLE clone must not — that layout is supported.
 """
 import importlib.util
 import os
@@ -51,10 +42,8 @@ class EphemeralSkillTarget(unittest.TestCase):
     def _inject_classifier(self, temp_subtree: Path):
         """Call `temp_subtree` ephemeral and nothing else.
 
-        The integration cases need a path the predicate calls DURABLE. Getting one
-        from the real classifier means writing outside a temp root — under $HOME it
-        raises PermissionError in a restricted environment and mutates a live home
-        when it does not. The predicate itself is unit-tested below.
+        A path the real classifier calls DURABLE would have to be written outside a
+        temp root, i.e. under $HOME. The predicate is unit-tested separately below.
         """
         root = str(temp_subtree.resolve())
         self.hc._is_ephemeral = lambda t: os.path.realpath(t) == root or \
@@ -107,14 +96,9 @@ class EphemeralSkillTarget(unittest.TestCase):
             self.assertTrue(self.hc._is_ephemeral(root + "/"), root + "/")
 
     def test_sibling_named_like_a_root_is_not_ephemeral(self):
-        """Boundary the other way: containment is by path component, not by string.
-
-        Derived per root, so the case is real on every platform — a hardcoded
-        `/private/tmpfoo` is trivially false on Linux and proves nothing there.
-
-        Only SHALLOWEST roots qualify: macOS roots nest (`/private/var/folders` and
-        `/private/var/folders/<id>/T`), and `<deep-root>foo` sits inside the shallow
-        one, so it is ephemeral for a correct reason and is not a sibling case."""
+        """Containment is by path component, not string prefix. Derived per root so the
+        case is real on any platform, and only the SHALLOWEST root can be the sibling
+        because macOS roots nest."""
         roots = self.hc._ephemeral_roots()
         shallow = [r for r in roots
                    if not any(r != o and r.startswith(o + "/") for o in roots)]
@@ -134,11 +118,8 @@ class EphemeralSkillTarget(unittest.TestCase):
     def _with_tmpdir(self, value, fn):
         """Evaluate `fn()` as if the platform reported `value` as its temp dir.
 
-        The predicate MUST be called inside this window. Calling `_is_ephemeral`
-        after the helper returns re-derives from the real platform: on macOS
-        `/var/folders` is a genuine root so such a test passes by coincidence, and
-        on Linux it is not — which is exactly the platform-specific assumption this
-        file exists to remove.
+        The predicate MUST be called INSIDE this window; after it returns the roots
+        re-derive from the real platform and the assertion is platform-dependent.
         """
         orig = tempfile.gettempdir
         tempfile.gettempdir = lambda: value
@@ -153,9 +134,8 @@ class EphemeralSkillTarget(unittest.TestCase):
         return self._with_tmpdir(value, self.hc._ephemeral_roots)
 
     def test_macos_tmpdir_also_yields_the_shared_folders_base(self):
-        """macOS $TMPDIR is <base>/folders/xx/yy/T; the shared `/folders` base must
-        also be a root so ANOTHER session's scratch dir is still ephemeral. Driven
-        through gettempdir so a Linux runner exercises this branch too."""
+        """macOS $TMPDIR is <base>/folders/xx/yy/T, so the shared `/folders` base must
+        also be a root or ANOTHER session's scratch dir reads durable."""
         def check():
             roots = self.hc._ephemeral_roots()
             self.assertIn("/var/folders", roots)
