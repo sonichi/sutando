@@ -7,6 +7,7 @@ which is a structural property a source regex cannot see.
 from __future__ import annotations
 
 import ast
+import os
 import sys
 import tempfile
 import unittest
@@ -16,7 +17,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from proactive_recovery import claim_for_delivery, release_claim  # noqa: E402
+from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,
+                                release_claim)  # noqa: E402
 
 
 class ClaimForDeliveryTest(unittest.TestCase):
@@ -285,6 +287,38 @@ class UndeliverableClaimDelegationTest(unittest.TestCase):
                                 f"-- runs on delivered, failed and unaddressed alike",
                             )
                 self.assertTrue(checked, f"{name}: no owner branch found -- test is stale")
+
+
+class InterruptedClaimIsIdempotentTest(unittest.TestCase):
+    """A crash BETWEEN the claim's link and unlink must not leave a double-send."""
+
+    def test_both_names_on_one_inode_are_reconciled_to_the_txt(self):
+        box = Path(tempfile.mkdtemp(prefix="claim-crash-"))
+        txt = box / "proactive-crash.txt"
+        txt.write_text("one body")
+        claim = box / "proactive-crash.sending"
+        os.link(txt, claim)          # exactly the state a crash after link leaves
+        self.assertEqual(txt.stat().st_ino, claim.stat().st_ino)
+
+        recover_orphan_sending_files(box)
+
+        self.assertTrue(txt.exists(), "destroyed the only copy of the body")
+        self.assertEqual(txt.read_text(), "one body")
+        self.assertFalse(claim.exists(),
+                         "left a .sending beside the .txt — the message is "
+                         "visible to the poller AND held as a claim: double send")
+
+    def test_a_REAL_collision_is_still_left_alone(self):
+        """Different inodes mean two distinct bodies; recovery must not merge them."""
+        box = Path(tempfile.mkdtemp(prefix="claim-collide-"))
+        txt = box / "proactive-x.txt"; txt.write_text("new body")
+        claim = box / "proactive-x.sending"; claim.write_text("older in-flight body")
+        self.assertNotEqual(txt.stat().st_ino, claim.stat().st_ino)
+
+        recover_orphan_sending_files(box)
+
+        self.assertEqual(txt.read_text(), "new body")
+        self.assertEqual(claim.read_text(), "older in-flight body")
 
 
 class ReleasedClaimIsRecoverableTest(unittest.TestCase):

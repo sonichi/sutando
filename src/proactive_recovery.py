@@ -66,6 +66,17 @@ def recover_orphan_sending_files(results_dir: Path) -> int:
         target = orphan.with_suffix(".txt")
         try:
             if target.exists():
+                # A crash between the claim's link and unlink leaves BOTH names
+                # on ONE inode; the .txt is already the correct state, so drop
+                # the half-made claim. Different inodes ARE a real collision.
+                if orphan.stat().st_ino == target.stat().st_ino:
+                    orphan.unlink()
+                    print(
+                        f"  [startup] dropped half-made claim {orphan.name} "
+                        f"(same inode as {target.name}; claim never completed)",
+                        flush=True,
+                    )
+                    continue
                 print(
                     f"  [startup] skipping orphan recovery: {target.name} "
                     f"already exists (collision with {orphan.name})",
