@@ -87,8 +87,9 @@ class RebindCoversEveryDerivedPath(unittest.TestCase):
             bridge_paths.restore(self.mod, originals)
         self.assertEqual(leaked, {}, f"still aimed at the live workspace: {leaked}")
 
-    def test_the_member_2615_missed_is_covered(self):
-        """PENDING_REPLIES_FILE — bound like OWNER_ACTIVITY_FILE, not rebound by #2615."""
+    def test_pending_replies_file_is_rebound_like_its_sibling(self):
+        """PENDING_REPLIES_FILE is derived the same way as OWNER_ACTIVITY_FILE, so a
+        rebind helper that covers one and not the other leaves a path on live state."""
         with tempfile.TemporaryDirectory() as td:
             originals = bridge_paths.rebind_workspace(self.mod, Path(td))
             got = str(self.mod.PENDING_REPLIES_FILE)
