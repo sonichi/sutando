@@ -7,8 +7,8 @@ Motivated by the 2026-06-02 incident: the core crossed into 1M extended
 context, hit the interactive `/usage-credits` gate (which cannot be
 pre-authorized for an unattended agent), and looped silently — alive (heartbeat
 ticking) but draining nothing. --notify-slack makes that visible; this makes it
-self-healing by restarting the core via src/agent/start-cli.sh --restart, with
-1M preserved on the first attempt and a graceful 200K fallback if it recurs.
+self-healing by restarting the core via src/agent/start-cli.sh --restart. The
+restart preserves whatever model the core is configured for; it never pins one.
 
 Because auto-restarting a 24/7 agent is consequential, the guards are the whole
 point. These cover:
@@ -16,9 +16,9 @@ point. These cover:
   b) wedged but core just booted     → no action (catching up, not stuck)
   c) wedged, first observation       → "observed", no restart (confirm window)
   d) wedged, within confirm window   → "confirming", no restart
-  e) wedged + confirmed              → restart in 1M mode (keeps 1M), DM sent
+  e) wedged + confirmed              → restart, DM sent, NO model override
   f) within cooldown after a restart → no second restart
-  g) recurs after cooldown           → escalates to standard 200K context
+  g) recurs after cooldown           → restarts again, still NO model override
   h) give-up cap (3/hr)              → DMs "gave up", stops restarting
   i) restart launch fails            → no cooldown/history burned, retries
   j) core down (not alive)           → no action even with an old task
@@ -70,8 +70,8 @@ class Harness:
         self.sent.append(text)
         return self.send_ok
 
-    def restart(self, standard_context):
-        self.restart_calls.append(standard_context)
+    def restart(self):
+        self.restart_calls.append(True)
         return self.restart_ok
 
     def run(self, now, alive=True, age=900, key="t1", status_ts=None, booted=False):
@@ -144,10 +144,10 @@ def case_e_confirmed_restart_keeps_1m() -> list[str]:
         r = h.run(now=1_000_200, age=900)            # +200s > CONFIRM → restart
         if not r or r.get("action") != "restarted":
             fails.append(f"e) confirmed wedge should restart, got {r}")
-        if r and r.get("mode") != "1m":
-            fails.append(f"e) first restart must keep 1M, mode={r.get('mode')}")
-        if h.restart_calls != [False]:
-            fails.append(f"e) first restart should pass standard_context=False, got {h.restart_calls}")
+        if r and "mode" in r:
+            fails.append(f"e) the retired escalation must not report a mode, got {r.get('mode')}")
+        if h.restart_calls != [True]:
+            fails.append(f"e) restart_fn must be called with NO argument, got {h.restart_calls}")
         if len(h.sent) != 1:
             fails.append(f"e) restart should DM owner once, sent {len(h.sent)}")
         if r and r.get("dm_sent") is not True:
@@ -165,26 +165,30 @@ def case_f_cooldown_blocks_second_restart() -> list[str]:
         r = h.run(now=1_000_500, age=1200)           # confirmed but within cooldown
         if r and r.get("action") == "restarted":
             fails.append("f) restarted again within cooldown window")
-        if h.restart_calls != [False]:
+        if h.restart_calls != [True]:
             fails.append(f"f) cooldown should leave a single restart, got {h.restart_calls}")
     return fails
 
 
-def case_g_recurrence_escalates_to_standard() -> list[str]:
+def case_g_recurrence_does_not_downgrade_the_model() -> list[str]:
+    """A repeat wedge restarts on the configured model — no downgrade, and the
+    DM must not promise one."""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         h = Harness(Path(td) / "rec.json")
         h.run(now=1_000_000, age=900)
-        h.run(now=1_000_200, age=900)                # restart #1 (1m)
+        h.run(now=1_000_200, age=900)                # restart #1
         t2 = 1_000_200 + hc.RECOVER_COOLDOWN_SEC + 50
         h.run(now=t2, age=1500)                       # re-observe
         r = h.run(now=t2 + 200, age=1500)            # restart #2
         if not r or r.get("action") != "restarted":
             fails.append(f"g) recurrence should restart again, got {r}")
-        if r and r.get("mode") != "standard":
-            fails.append(f"g) 2nd restart must degrade to standard, mode={r.get('mode')}")
-        if h.restart_calls != [False, True]:
-            fails.append(f"g) escalation should be [1m=False, standard=True], got {h.restart_calls}")
+        if r and "mode" in r:
+            fails.append(f"g) a repeat wedge must not report a downgrade mode, got {r.get('mode')}")
+        if h.restart_calls != [True, True]:
+            fails.append(f"g) both restarts must be plain no-arg calls, got {h.restart_calls}")
+        if any("200K" in s or "didn't hold" in s for s in h.sent):
+            fails.append(f"g) the DM must not promise a context downgrade: {h.sent}")
     return fails
 
 
@@ -338,7 +342,7 @@ def case_n_failed_dm_still_restarts_and_records() -> list[str]:
             fails.append(f"n) should still restart when DM fails, got {r}")
         if r and r.get("dm_sent") is not False:
             fails.append(f"n) failed DM should record dm_sent=False, got {r.get('dm_sent')}")
-        if h.restart_calls != [False]:
+        if h.restart_calls != [True]:
             fails.append(f"n) should have restarted once, got {h.restart_calls}")
         st = json.loads(sf.read_text())
         if st.get("last_restart_dm_sent") is not False:
@@ -380,7 +384,7 @@ def main() -> int:
         ("d", case_d_within_confirm_window_no_restart),
         ("e", case_e_confirmed_restart_keeps_1m),
         ("f", case_f_cooldown_blocks_second_restart),
-        ("g", case_g_recurrence_escalates_to_standard),
+        ("g", case_g_recurrence_does_not_downgrade_the_model),
         ("h", case_h_give_up_cap),
         ("i", case_i_failed_restart_does_not_burn_state),
         ("j", case_j_core_down_no_action),

@@ -1,0 +1,19 @@
+{
+  "name": "skill-usage-report",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Drain the local skill-usage log and report it to AG2 Cloud. Manifest present to DECLARE config per the config-only convention in skills/MANIFEST.md — this skill contributes no inline tools.",
+  "config": {
+    "AG2_CLOUD_ORIGIN": "https://sutando.ag2.ai"
+  },
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": ["AG2_CLOUD_TOKEN"]
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

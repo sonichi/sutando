@@ -18,38 +18,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import personal_path  # noqa: E402
+from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from presenter_mode import presenter_mode_active  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
 LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
-PRESENTER_SENTINEL = WORKSPACE / "state" / "presenter-mode.sentinel"
-
-
-def presenter_mode_active():
-    """True if scripts/presenter-mode.sh has been started and the expiry
-    timestamp in the sentinel is still in the future. Silences all
-    notifications for the ICLR talk window. Stale sentinels (past-expiry)
-    are ignored and return False — the next `status` / `stop` call will
-    remove the file."""
-    if not PRESENTER_SENTINEL.exists():
-        return False
-    try:
-        expire_iso = PRESENTER_SENTINEL.read_text().strip()
-        # Require an ISO-8601-ish prefix (starts with a digit). Without
-        # this guard, malformed sentinel content like "garbage" compares
-        # LESS than any real now_iso ("2" < "g" in ASCII) and the mode
-        # fails OPEN — appears active forever. The same guard is in
-        # src/discord-bridge.py and src/telegram-bridge.py.
-        if not expire_iso or not expire_iso[0].isdigit():
-            return False
-        # Compare as ISO-8601 with Z suffix — sorts correctly as strings.
-        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        return now_iso < expire_iso
-    except Exception:
-        return False
+# How long an UNCHANGED question set stays quiet before it is raised again. This
+# is the floor that stops "notify only when the set changes" from turning an
+# unanswered queue permanently mute — see should_notify().
+UNCHANGED_REMINDER_SEC = 86400  # 24h
 
 
 def voice_client_connected():
@@ -73,6 +54,42 @@ def voice_client_connected():
     return False
 
 
+# A `## ` heading is not always a question. Two forms are structural, and both
+# must be classified HERE rather than by each consumer, so the notifier and the
+# briefing cannot report different counts for the same file.
+#
+# Both rules are anchored to SHAPE, not to a keyword appearing somewhere. Earlier
+# versions matched the word and each one deleted a live, `Status: open` question:
+#
+#   `^HELD\b`            -> "## HELD deployment until the owner approves the
+#                            migration" is a real ask, not a section shell.
+#   `.search()` for the
+#   inline marker        -> "## Confirm whether the UI should render a [DONE]
+#                            badge" is a question ABOUT a badge.
+#
+# So: an organizer shell is a keyword followed by a separator ("## ACTIVE — …",
+# "## FRESH – …", "## HELD: …") — a grouping label, never a sentence. And a
+# resolution marker is a bracketed group at the START of the title
+# ("## [RESOLVED 2026-07-03] shipped"), never one mentioned mid-sentence.
+_ORG_HEADING = re.compile(
+    r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\s*(?:[—–\-:]|$)',
+    re.IGNORECASE,
+)
+# Anchored with ^ and \s* — a marker leads the title or it is not a marker. The
+# closed-bracket grammar (keyword then `]` or whitespace-then-content-then-`]`)
+# rejects `[RESOLVED?]` / `[done-ish]`, which named an open uncertainty.
+# `(?:\d+[.)]\s*)?` — real entries carry an enumeration prefix
+# ("## 2. [RESOLVED 2026-07-03] shipped already"), so the marker leads the title
+# CONTENT, not necessarily character 0. Anchoring at character 0 alone dropped
+# that form (caught by tests/morning-briefing-pending-extract.test.py). It stays
+# anchored otherwise: "render a [DONE] badge" has the bracket mid-sentence and is
+# still a live question.
+_INLINE_RESOLVED = re.compile(
+    r'^\s*(?:\d+[.)]\s*)?\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]',
+    re.IGNORECASE,
+)
+
+
 def get_waiting_questions():
     """Parse pending-questions.md — matches the legacy `## Q1 — Title` and
     `## Title` / `- **Status:** unanswered` section formats AND the free-form
@@ -92,7 +109,7 @@ def get_waiting_questions():
     # this cut the heading-agnostic split below sweeps the whole file and
     # every resolved entry is miscounted as pending, re-notifying the owner
     # about already-answered questions. No-op when there is no such divider.
-    content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
+    content = active_region(content)
     questions = []
     # Walk each ## section; a section is waiting if its body contains
     # `Status: unanswered`, `Status: Waiting` or `Status: open`, OR has no
@@ -103,6 +120,8 @@ def get_waiting_questions():
         title_line, _, body = sec.partition('\n')
         title = title_line.strip()
         if not title:
+            continue
+        if _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title):
             continue
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
         if status_m:
@@ -127,7 +146,17 @@ def get_waiting_questions():
             and not re.match(r'^(\*\*)?Status:(\*\*)?', l.strip(), re.IGNORECASE)
         ]
         snippet = snippet_lines[0][:120] if snippet_lines else ""
-        questions.append({"id": title[:40], "title": title, "snippet": snippet})
+        # `body` is the FULL section text. `snippet` is a 120-char action hint and
+        # `title` a heading, so a caller checking "did my question land?" against
+        # them can only ever match the first ~100 characters of an entry. The
+        # documented verification in the proactive-loop skill does exactly that:
+        #   any('<phrase>' in str(q) for q in get_waiting_questions())
+        # and its own text calls a True "the only proof the question exists". A
+        # phrase further into the entry made that return False for a question that
+        # was filed, above the divider, and counted — a verification step whose
+        # failure mode is reporting the healthy case as broken.
+        questions.append({"id": title[:40], "title": title, "snippet": snippet,
+                          "body": body.strip()})
 
     # Also recognize the free-form bullet format the proactive-loop and skills
     # actually append in: `- **[label, timestamp]** ...`. The `## `-section walk
@@ -140,16 +169,69 @@ def get_waiting_questions():
         title = m.group(1).strip()
         if title and title not in seen:
             seen.add(title)
-            questions.append({"id": title[:40], "title": title})
+            # `title` is only the BRACKETED LABEL, so bodying to it would leave the
+            # rest of the bullet — where the actual ask lives — just as unsearchable
+            # as the section case this change exists to fix. Take the whole line.
+            # Anchor off m.end(), not m.start(): `^\s*` lets \s match the preceding
+            # NEWLINE, so on a bullet with a blank line above it the match begins on
+            # that blank line and a start-anchored slice comes back empty.
+            line_start = content.rfind("\n", 0, m.end()) + 1
+            line_end = content.find("\n", m.end())
+            body = content[line_start:line_end if line_end != -1 else len(content)].strip()
+            questions.append({"id": title[:40], "title": title,
+                              "snippet": "", "body": body or title})
     return questions
 
 
-def should_notify():
-    """Only notify once per hour to avoid spam."""
+def _last_notify_state():
+    """(mtime, key) of the last notification. `key` is None for the pre-2026-08-01
+    format, which stored a bare timestamp — so the first run after upgrading is
+    treated as "set unknown" and notifies once rather than silently suppressing."""
     if not LAST_NOTIFY_FILE.exists():
-        return True
-    last = LAST_NOTIFY_FILE.stat().st_mtime
-    return (time.time() - last) > 3600  # 1 hour
+        return None, None
+    mtime = LAST_NOTIFY_FILE.stat().st_mtime
+    parts = LAST_NOTIFY_FILE.read_text().split()
+    return mtime, (parts[1] if len(parts) > 1 else None)
+
+
+def should_notify(key=None):
+    """Notify when the SET changed, when it is genuinely new, or when an unchanged
+    set has gone unmentioned for longer than UNCHANGED_REMINDER_SEC.
+
+    The old rule was purely time-based — 3600s since the marker's mtime, with no
+    awareness of whether anything had changed — so an unchanged queue re-notified
+    every hour, forever. Observed 2026-08-01: the identical 17 items reached the
+    owner three times inside 60 minutes (05:43 cron, 06:17 briefing, 06:4x cron),
+    content hash unchanged across all three.
+
+    The script already computed the discriminator: `questions_key()` hashes the
+    sorted titles and was used to name the proactive file. The cooldown simply
+    never consulted it.
+
+    A FLOOR, NOT A CLIFF (2026-08-01, Mini's cold review). The first version of
+    this fix ended at `key != last_key`, which discarded mtime on that path — so
+    an unchanged set was announced exactly once, EVER. That is wrong in the case
+    the file exists for: questions are unchanged precisely BECAUSE nobody has
+    answered them, and one host already carries 54 such items. They would have
+    gone permanently silent, with no error — a queue that stops asking. Keeping
+    the daily floor bounds the spam (the bug above was 3 sends in 60 min) while
+    the queue stays audible.
+
+    `key=None` preserves the old time-only rule. No production caller passes it —
+    the only live call site hashes the set — so treat it as a compatibility
+    default for an embedder, not as a path this repo exercises."""
+    mtime, last_key = _last_notify_state()
+    if mtime is None:
+        return True                      # never notified
+    if key is None:
+        return (time.time() - mtime) > 3600
+    if last_key is None:
+        return True                      # legacy marker: key unknown, notify once
+    if key != last_key:
+        return True                      # the set changed
+    # Unchanged set: quiet, but not forever — re-raise once a day so an
+    # unanswered queue keeps asking instead of going mute.
+    return (time.time() - mtime) > UNCHANGED_REMINDER_SEC
 
 
 def notify_macos(count, titles):
@@ -281,17 +363,87 @@ def deliver(questions, count, titles):
     return summary
 
 
+def zero_reason():
+    """Explain a zero so a parse fault cannot look like a quiet day.
+
+    Every other early return in main() prints something; this one did not, and on
+    2026-07-30 that cost ~11 hours. A divider-anchor bug made the active region
+    collapse to the file's own header, `get_waiting_questions()` returned 0 while 43
+    questions were open, and each hourly run exited in silence. The silence was
+    indistinguishable from "nothing to report" — worse, it was misread as the
+    cooldown branch, which actually does print.
+
+    The tell was available the whole time: **zero out of a 5000-line file is a
+    suspicious answer.** So report the denominator, not just the verdict. A count is
+    only meaningful next to what was counted.
+    """
+    if not PQ_FILE.exists():
+        return f"0 pending questions — no file at {PQ_FILE}"
+
+    text = PQ_FILE.read_text()
+    active_text = active_region(text)
+
+    # The denominator must cover the SAME populations the numerator counts.
+    # get_waiting_questions() recognizes BOTH `## ` sections and the free-form
+    # `- **[label]** ...` bullets the proactive loop writes in practice, so counting
+    # only sections leaves the bullet-only file — a real, supported shape — able to
+    # report a trusted-looking zero in exactly the situation this function exists to
+    # flag. Found in review of the first revision, with a reproduction: a file that is
+    # nothing but `# Resolved` + one bullet yielded "every one is explicitly
+    # resolved/answered", which is the opposite of the intended signal.
+    SECTION_RE = r'^## '
+    BULLET_RE = r'^\s*-\s+\*\*\['
+
+    def _tally(s: str) -> tuple[int, int]:
+        return (len(re.findall(SECTION_RE, s, flags=re.MULTILINE)),
+                len(re.findall(BULLET_RE, s, flags=re.MULTILINE)))
+
+    file_secs, file_bullets = _tally(text)
+    act_secs, act_bullets = _tally(active_text)
+    file_total = file_secs + file_bullets
+    act_total = act_secs + act_bullets
+
+    def _describe(secs: int, bullets: int) -> str:
+        parts = []
+        if secs:
+            parts.append(f"{secs} '## ' section(s)")
+        if bullets:
+            parts.append(f"{bullets} bullet entr(ies)")
+        return " + ".join(parts) if parts else "nothing"
+
+    if file_total == 0:
+        return "0 pending questions — the file holds no sections or bullets at all"
+
+    # Suspicious shape: the file has entries, the ACTIVE region has none. Fires for
+    # sections, bullets, or any mix — the population that vanished does not matter.
+    if act_total == 0:
+        return (
+            f"0 pending questions, but {PQ_FILE.name} holds {_describe(file_secs, file_bullets)} "
+            f"and NONE are in the active region (above the archive divider). "
+            f"That is the shape of a parse fault, not a quiet day — check the "
+            f"'# Resolved' divider before trusting this zero."
+        )
+
+    return (
+        f"0 pending questions — the active region holds "
+        f"{_describe(act_secs, act_bullets)} (of {_describe(file_secs, file_bullets)} "
+        f"in the file) and every one is explicitly resolved/answered"
+    )
+
+
 def main():
     force = "--force" in sys.argv
     questions = get_waiting_questions()
     if not questions:
+        # Never return silently: see zero_reason.__doc__.
+        print(zero_reason())
         return
 
-    if not force and presenter_mode_active():
+    if not force and presenter_mode_active(WORKSPACE):
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
         return
 
-    if not force and not should_notify():
+    if not force and not should_notify(questions_key(questions)):
         print(f"(cooldown) {len(questions)} pending questions — skipping notification")
         return
 
@@ -303,7 +455,7 @@ def main():
     # exact "claimed an outcome it never achieved" failure this script exists to
     # remove, reproduced in its own control flow.
     summary = deliver(questions, count, titles)
-    LAST_NOTIFY_FILE.write_text(str(int(time.time())))
+    LAST_NOTIFY_FILE.write_text(f"{int(time.time())} {questions_key(questions)}")
     print(summary)
 
 

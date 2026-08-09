@@ -8,7 +8,7 @@ Usage:
     python3 skills/bot2bot-post/post.py --to lucy opinion "disagreement axis below"
     python3 skills/bot2bot-post/post.py done "shipped PR #472"
 
-Kinds: claim | blocked | done | ping | opinion
+Kinds: claim | blocked | done | ping | nack | opinion
 Peers (for --to): a name from ~/.claude/channels/discord/peers.json, or a raw numeric id
 
 The target channel ID is read from `$CLAUDE_CONFIG_DIR/channels/discord/access.json`:
@@ -17,13 +17,16 @@ pick the first such channel. If none is tagged, we fall back to the first
 group whose value is just `true` (legacy convention), or error out.
 
 Recipient targeting: pass `--to <peer|id>` to @-mention a specific peer. This
-is the correct way when more than one peer exists — the old auto-resolve below
-assumes a SINGLE other bot and silently mis-fires otherwise (it mentioned Mini
-for a post addressed to Pro, 2026-06-06). Without `--to`, the other bot's user
-ID is read from the bot2bot CHANNEL's `allowFrom`, excluding this bot
-(identified via Discord GET /users/@me) — fine only while exactly one peer is
-allowlisted there. The resulting `<@id>` mention is prepended so the receiving
-bot's bridge will process it as a task (discord-bridge.py line 244 exception).
+is the correct way when more than one peer exists — the old auto-resolve
+assumed a SINGLE other bot and silently mis-fired otherwise (it mentioned Mini
+for a post addressed to Pro, 2026-06-06; on 2026-07-29 both Pro and Mini
+mispinged Air the same way, each stray ping triggering the target's team-tier
+auto-refusal). Without `--to`, the peer id is auto-resolved from the bot2bot
+CHANNEL's `allowFrom` (excluding this bot, via GET /users/@me) ONLY when
+exactly one peer exists; with 2+ peers the post goes out WITHOUT a mention
+(peers ingest the channel anyway) and a stderr NOTE says to use `--to`. The
+resulting `<@id>` mention, when present, makes the receiving bot's bridge
+process the post as a task (discord-bridge.py line 244 exception).
 
 SCOPE GUARD (2026-07-27): bot2bot-post only ever posts to the one bot2bot channel
 (resolved from access.json's `role: bot2bot` tag — NOT hardcoded). A `--to <X>`
@@ -61,7 +64,7 @@ def _claude_home() -> Path:
 _DISCORD_DIR = _claude_home() / "channels" / "discord"
 ACCESS_JSON = _DISCORD_DIR / "access.json"
 ENV_FILE = _DISCORD_DIR / ".env"
-VALID_KINDS = {"claim", "blocked", "done", "ping", "opinion"}
+VALID_KINDS = {"claim", "blocked", "done", "ping", "opinion", "nack"}
 
 
 def load_token() -> str:
@@ -140,11 +143,32 @@ def resolve_other_bot(access: dict, self_id: str, channel_id: str):
     # prefer the ID that is NOT in the top-level allowFrom (owner-only).
     global_allow = set(str(x) for x in access.get("allowFrom", []))
     bot_candidates = [uid for uid in others if str(uid) not in global_allow]
-    if bot_candidates:
+    if len(bot_candidates) == 1:
         return bot_candidates[0]
-    # Last resort: any non-self ID (legacy configs where owner+bot share the
-    # top-level allowFrom).
-    return others[0]
+    if len(bot_candidates) > 1:
+        # Ambiguous multi-peer fleet: NEVER guess. 2026-07-29 double misfire:
+        # with three bots allowlisted, the old `[0]` pick sent Pro's ping to
+        # Air (meant for Mini) and Mini's to Air (meant for Pro) — and every
+        # stray ping triggers the target's team-tier sandbox auto-refusal, a
+        # reply-noise cascade. An unaddressed post is strictly better: peers
+        # ingest the channel anyway, and callers who need a specific peer's
+        # task-queue attention say so with --to.
+        print(
+            f"NOTE: {len(bot_candidates)} peer bots in the bot2bot allowlist — "
+            "posting WITHOUT a mention (use --to <peer|id> to address one).",
+            file=sys.stderr,
+        )
+        return None
+    # Legacy configs where owner+bot share the top-level allowFrom leave no
+    # bot_candidates. Same rule: exactly one non-self id → safe; else no guess.
+    if len(others) == 1:
+        return others[0]
+    print(
+        f"NOTE: {len(others)} non-self ids in allowFrom and none identifiable "
+        "as the sole peer bot — posting WITHOUT a mention (use --to).",
+        file=sys.stderr,
+    )
+    return None
 
 
 def _recipient_in_channel(access: dict, channel_id: str, recipient_id: str) -> bool:
@@ -161,7 +185,45 @@ def _recipient_in_channel(access: dict, channel_id: str, recipient_id: str) -> b
     return str(recipient_id) in {str(x) for x in cfg.get("allowFrom", [])}
 
 
-def post(channel_id: str, text: str, token: str):
+#: Discord rejects a message whose `content` exceeds this many characters.
+DISCORD_MAX_CONTENT = 2000
+
+
+def check_length(text: str, overhead: int = 0) -> "str | None":
+    """The refusal message if `text` is over the limit, else None.
+
+    Measures the FINAL content — the routing prefix and `kind:` tag are part of
+    what Discord counts, and they are the part callers forget. A body sized to
+    exactly 2000 is already over once `<@id> done: ` is prepended.
+
+    Returned rather than raised so the caller decides how to fail, and so a test
+    can assert the wording without trapping SystemExit.
+    """
+    n = len(text)
+    if n <= DISCORD_MAX_CONTENT:
+        return None
+    over = n - DISCORD_MAX_CONTENT
+    room = DISCORD_MAX_CONTENT - overhead
+    detail = (
+        f" The count INCLUDES the {overhead}-char routing prefix, so the body "
+        f"itself must be <= {room} chars."
+        if overhead else ""
+    )
+    return (
+        f"ERROR: content is {n} chars — {over} over Discord's "
+        f"{DISCORD_MAX_CONTENT} limit. NOTHING WAS SENT.{detail} "
+        f"Cut ~{over} chars and retry."
+    )
+
+
+def post(channel_id: str, text: str, token: str, overhead: int = 0):
+    # Refuse locally rather than spending a round trip to be told the same thing
+    # by a 400 that reports no numbers. The API's error names the limit but not
+    # the actual length or the overage, so the caller cannot tell how much to
+    # cut without measuring again.
+    problem = check_length(text, overhead)
+    if problem:
+        sys.exit(problem)
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     body = json.dumps({"content": text}).encode()
     req = urllib.request.Request(
@@ -265,7 +327,7 @@ def main():
     prefix = f"<@{other_id}> " if other_id else ""
     message = f"{prefix}{kind}: {text}"
 
-    result = post(channel_id, message, token)
+    result = post(channel_id, message, token, overhead=len(message) - len(text))
     print(f"Posted to #{channel_id} (msg_id {result.get('id')}): {message[:80]}")
 
 
