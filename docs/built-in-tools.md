@@ -127,8 +127,12 @@ node src/browser.mjs "https://example.com"                    # get page text
 node src/browser.mjs "https://example.com" screenshot         # full-page screenshot → path
 node src/browser.mjs "https://example.com" "fill:#email:me@x.com" "click:#submit"  # fill + click
 node src/browser.mjs "https://example.com" --headed           # watch automation live
+node src/browser.mjs "https://example.com" screenshot --timeout=60000  # override the 45s command limit
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
+Non-interactive commands are bounded to 45 seconds by default. Normal completion,
+errors, timeouts, `SIGINT`, and `SIGTERM` all close the page, context, and browser
+before the command exits.
 
 **File search (Spotlight)** — find any file on the Mac:
 ```bash

@@ -10,6 +10,7 @@
  *   node src/browser.mjs <url> "click:#submit"          # click a selector
  *   node src/browser.mjs <url> "fill:#email:me@x.com"   # fill an input
  *   node src/browser.mjs <url> pdf                       # save as PDF → path
+ *   node src/browser.mjs <url> screenshot --timeout=60000
  *
  * Uses system Chrome with a Sutando-owned persistent profile (no bundled
  * browser download needed). Set SUTANDO_BROWSER_PROFILE to override its path,
@@ -49,22 +50,89 @@ const setupMode = command === 'setup';
 const url = setupMode ? (process.argv[3] || 'about:blank') : command;
 const rawActions = process.argv.slice(setupMode ? 4 : 3);
 const headed = setupMode || rawActions.includes('--headed') || process.env.SUTANDO_BROWSER_HEADLESS === '0';
-const actions = rawActions.filter((action) => action !== '--headed');
+const timeoutOptions = rawActions.filter((action) => action.startsWith('--timeout='));
+if (timeoutOptions.length > 1 || (timeoutOptions[0] && !/^--timeout=[1-9]\d*$/.test(timeoutOptions[0]))) {
+  console.error('Error: --timeout must be one positive integer in milliseconds');
+  process.exit(1);
+}
+const operationTimeoutMs = Math.min(
+  timeoutOptions[0] ? Number(timeoutOptions[0].slice('--timeout='.length)) : 45000,
+  300000,
+);
+const actions = rawActions.filter((action) => action !== '--headed' && !action.startsWith('--timeout='));
 // Per-user temp dir: a shared /tmp/sutando-screenshots is owned by whichever
 // macOS account created it first and EACCES-blocks every other account.
 const SCREENSHOT_DIR = process.env.SUTANDO_SCREENSHOT_DIR || join(tmpdir(), 'sutando-screenshots');
 mkdirSync(SCREENSHOT_DIR, { recursive: true });
 mkdirSync(PROFILE_DIR, { recursive: true });
 
-const { chromium } = await import('playwright');
-const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-  channel: 'chrome',
-  headless: !headed,
-  viewport: headed ? null : { width: 1440, height: 1000 },
-});
+class BrowserInterruption extends Error {
+  constructor(signal) {
+    super(`interrupted by ${signal}`);
+    this.exitCode = signal === 'SIGINT' ? 130 : 143;
+  }
+}
 
-try {
-  const page = context.pages()[0] || await context.newPage();
+class BrowserOperationTimeout extends Error {
+  constructor(timeoutMs) {
+    super(`browser operation timed out after ${timeoutMs}ms`);
+  }
+}
+
+async function closeQuietly(resource) {
+  if (!resource || typeof resource.close !== 'function') return;
+  try {
+    await resource.close();
+  } catch {
+    // A parent close may already have closed this resource.
+  }
+}
+
+const { chromium } = await import('playwright');
+let context;
+let page;
+let browser;
+let launchPromise;
+let cleanupPromise;
+let stopping = false;
+
+async function cleanup() {
+  if (cleanupPromise) return cleanupPromise;
+  cleanupPromise = (async () => {
+    await closeQuietly(page);
+    await closeQuietly(context);
+    await closeQuietly(browser);
+  })();
+  return cleanupPromise;
+}
+
+let rejectInterruption;
+const interruption = new Promise((resolve, reject) => {
+  rejectInterruption = reject;
+});
+let receivedSignal;
+const signalHandlers = new Map(['SIGINT', 'SIGTERM'].map((signal) => {
+  const handler = () => {
+    if (receivedSignal) return;
+    receivedSignal = signal;
+    rejectInterruption(new BrowserInterruption(signal));
+  };
+  process.on(signal, handler);
+  return [signal, handler];
+}));
+
+const operation = (async () => {
+  launchPromise = chromium.launchPersistentContext(PROFILE_DIR, {
+    channel: 'chrome',
+    headless: !headed,
+    viewport: headed ? null : { width: 1440, height: 1000 },
+    timeout: Math.min(operationTimeoutMs, 30000),
+  });
+  const launchedContext = await launchPromise;
+  if (stopping) return;
+  context = launchedContext;
+  browser = context.browser?.();
+  page = context.pages()[0] || await context.newPage();
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
   if (setupMode) {
@@ -116,9 +184,33 @@ try {
       }
     }
   }
+})();
+
+let timeoutId;
+const timeout = setupMode
+  ? new Promise(() => {})
+  : new Promise((resolve, reject) => {
+    timeoutId = setTimeout(() => reject(new BrowserOperationTimeout(operationTimeoutMs)), operationTimeoutMs);
+  });
+
+try {
+  await Promise.race([operation, interruption, timeout]);
 } catch (err) {
   console.error(`Error: ${err.message}`);
-  process.exit(1);
+  process.exitCode = err.exitCode || 1;
 } finally {
-  if (!setupMode) await context.close();
+  stopping = true;
+  clearTimeout(timeoutId);
+  await cleanup();
+  if (!context && launchPromise) {
+    const launchedContext = await launchPromise.catch(() => null);
+    if (launchedContext) {
+      context = launchedContext;
+      browser = context.browser?.();
+      page = context.pages()[0];
+      cleanupPromise = null;
+      await cleanup();
+    }
+  }
+  for (const [signal, handler] of signalHandlers) process.off(signal, handler);
 }
