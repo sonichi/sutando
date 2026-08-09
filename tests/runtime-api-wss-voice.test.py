@@ -135,6 +135,27 @@ async def probe():
                   and c2.get("result", {}).get("closed") is False,
                   "voice.close tears down the stream (idempotent: second close = not open)")
 
+            # FULL DUPLEX: a loopback stream echoes upstream audio back
+            # downstream — device → server → device round-trip proven with no
+            # voice stack (what the M5/web echo-test will exercise).
+            vo2 = await rpc(w, "voice.open", {"loopback": True}, rid=5)
+            sid2 = vo2["result"]["streamId"]
+            check(vo2["result"].get("loopback") is True,
+                  "voice.open {loopback} opens an echo stream")
+            probe_payload = bytes(range(200)) * 2
+            await w.send_bytes(mf.encode(mf.STREAM_AUDIO, sid2, probe_payload))
+            echo = None
+            dl = time.monotonic() + 5
+            while time.monotonic() < dl:
+                msg = await asyncio.wait_for(w.receive(), timeout=5)
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    echo = msg.data
+                    break
+            st_e, sid_e, pl_e = mf.decode(echo) if echo else (None, None, b"")
+            check(st_e == mf.STREAM_AUDIO and sid_e == sid2 and pl_e == probe_payload,
+                  "upstream audio echoes back downstream (full-duplex round trip)")
+            await rpc(w, "voice.close", {"streamId": sid2}, rid=6)
+
         # a device WITHOUT the voice grant is refused voice.open
         async with sess.ws_connect(URL, headers={"Authorization": f"Bearer {tok_novoice}"}) as w:
             cred2 = (await rpc(w, "pair.redeem", {"label": "novoice"}))["result"]["credential"]

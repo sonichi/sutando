@@ -12,32 +12,42 @@ audio-pipe pattern), behind this same interface — so wiring the voice stack do
 not touch the transport.
 
 Interface (a bridge implements these):
-    open(params) -> {"streamId": int, "streamType": "audio", ...}
-    on_audio(stream_id, payload: bytes) -> None
+    open(params, send_media=None) -> {"streamId": int, "streamType": "audio", ...}
+        send_media: async callable(payload: bytes) — the DOWNSTREAM path. The
+        transport builds it per-stream (it wraps the payload in the media
+        envelope and writes a binary frame to that connection); the bridge may
+        invoke it at any time from the event loop (e.g. when the voice stack
+        produces response audio).
+    on_audio(stream_id, payload: bytes) -> None      (upstream, device → server)
     close(stream_id) -> bool
 """
 from __future__ import annotations
 
+import asyncio
 import threading
 
 
 class StubVoiceBridge:
-    """First-slice stub: records opened streams and received audio bytes so the
-    lifecycle + routing can be proven end-to-end with no voice dependency. A
-    real audio downstream (server→device) is a later slice; open() returns a
-    stream id and on_audio() counts frames/bytes."""
+    """First-slice stub: proves stream lifecycle + BOTH audio directions with no
+    voice dependency. open({"loopback": true}) echoes every upstream payload
+    back downstream — so a device can round-trip mic → server → speaker and
+    measure the full path before any voice stack exists."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._streams: dict[int, dict] = {}
         self._next_id = 1
 
-    def open(self, params: dict | None = None) -> dict:
+    def open(self, params: dict | None = None, send_media=None) -> dict:
+        p = params or {}
         with self._lock:
             sid = self._next_id
             self._next_id = (self._next_id % 0xFFFF) + 1
-            self._streams[sid] = {"frames": 0, "bytes": 0}
-        return {"streamId": sid, "streamType": "audio"}
+            self._streams[sid] = {"frames": 0, "bytes": 0,
+                                  "send": send_media,
+                                  "loopback": bool(p.get("loopback"))}
+        return {"streamId": sid, "streamType": "audio",
+                "loopback": bool(p.get("loopback"))}
 
     def on_audio(self, stream_id: int, payload: bytes) -> None:
         with self._lock:
@@ -46,6 +56,13 @@ class StubVoiceBridge:
                 return  # unknown/closed stream — drop, never crash the transport
             s["frames"] += 1
             s["bytes"] += len(payload)
+            send = s["send"] if s["loopback"] else None
+        if send is not None:
+            # Called from the transport's event loop; schedule, don't block.
+            try:
+                asyncio.get_running_loop().create_task(send(payload))
+            except RuntimeError:
+                pass  # no loop (unit-test direct call) — loopback is loop-only
 
     def close(self, stream_id: int) -> bool:
         with self._lock:

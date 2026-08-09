@@ -167,7 +167,19 @@ class WsTransport:
                     req_id, -32601, f"{method} not permitted").decode())
                 return
             if method == "voice.open":
-                opened = self._voice.open(params)
+                # Downstream path: the bridge gets a per-stream async callback
+                # that wraps payloads in the media envelope and writes a binary
+                # frame back to THIS connection. The transport still never
+                # interprets audio — it only frames both directions.
+                sid_box: list = []
+
+                async def _send_media(payload: bytes) -> None:
+                    if sid_box:
+                        await ws.send_bytes(media_frame.encode(
+                            media_frame.STREAM_AUDIO, sid_box[0], payload))
+
+                opened = self._voice.open(params, _send_media)
+                sid_box.append(opened["streamId"])
                 streams.add(opened["streamId"])
                 await ws.send_str(result_frame(req_id, opened).decode())
             else:
