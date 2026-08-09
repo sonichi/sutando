@@ -4893,9 +4893,12 @@ def check_skill_symlinks() -> dict:
         # Reproduced independently by qingyun-wu and bassilkhilo-ag2 (#2660) against
         # `/private/tmp/pr2660 spaced repro .../{src,dst} tree`. The activation test
         # below runs the emitted command under a spaced fixture for this reason.
+        #
+        # The backup goes OUTSIDE <dst>: the skill loader registers every directory
+        # in <dst> as a skill, so a backup left there loads as a phantom duplicate.
         parts.append(
             f"{len(shadowed)} a real dir, not a link (diverges silently; repair with "
-            f'`mv "<dst>/<name>" "<dst>/<name>.local-backup" && ln -s "<src>/<name>" "<dst>/<name>"` '
+            f'`mv "<dst>/<name>" "<dst>/../<name>.skill-backup" && ln -s "<src>/<name>" "<dst>/<name>"` '
             f"— move aside, do NOT `ln -sfn` over it, and keep the backup until you have "
             f"checked it for local edits): "
             f"{', '.join(shadowed[:4])}{'...' if len(shadowed) > 4 else ''}"
