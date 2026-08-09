@@ -25,7 +25,7 @@ import { VoiceSession, type MainAgent, type ToolDefinition } from 'bodhi-realtim
 import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 
@@ -45,7 +45,7 @@ let nextBodhiPort = Number(process.env.SUTANDO_VOICE_HOST_BODHI_BASE || 8850);
 /** The `work` tool — durable-task handoff, the conversation-server pattern:
  * the MODEL decides an utterance is work and calls this; the implementation
  * writes a canonical task file the core's watcher picks up. */
-function buildWorkTool(): ToolDefinition {
+function buildWorkTool(device: { deviceId?: string; label?: string }): ToolDefinition {
 	return {
 		name: 'work',
 		description:
@@ -62,7 +62,9 @@ function buildWorkTool(): ToolDefinition {
 				`task: ${task.replace(/\n/g, ' ')}`,
 				'source: wearable-voice',
 				'channel_id: voice-host',
-				'user_id: wearable',
+				`user_id: ${device.label || 'wearable'}`,
+				...(device.deviceId ? [`device_id: ${device.deviceId}`] : []),
+				...(device.label ? [`device_label: ${device.label}`] : []),
 				'access_tier: owner',
 				'priority: urgent',
 				'',
@@ -75,7 +77,7 @@ function buildWorkTool(): ToolDefinition {
 	};
 }
 
-function buildWearableAgent(): MainAgent {
+function buildWearableAgent(device: { deviceId?: string; label?: string }): MainAgent {
 	return {
 		name: 'wearable',
 		instructions:
@@ -88,7 +90,7 @@ function buildWearableAgent(): MainAgent {
 		// Spoken the moment a session opens: tells the wearer the session is
 		// live, and exercises the downstream path with no mic dependency.
 		greeting: 'Say only: "Hi, I\'m listening."',
-		tools: [buildWorkTool()],
+		tools: [buildWorkTool(device)],
 	} as MainAgent;
 }
 
@@ -97,22 +99,52 @@ async function handleSession(ws: WebSocket): Promise<void> {
 	const bodhiPort = nextBodhiPort++;
 	let session: VoiceSession | null = null;
 	let bytesIn = 0, bytesOut = 0;
+	let resultsPoll: ReturnType<typeof setInterval> | null = null;
 
 	const teardown = () => {
 		const s = session as any;
 		session = null;
+		if (resultsPoll) { clearInterval(resultsPoll); resultsPoll = null; }
 		try { s?.stop?.(); s?.close?.(); } catch { /* best-effort */ }
+	};
+
+	// Spoken results: while the session is live, results for wearable-delegated
+	// tasks are read INTO the conversation so ask-by-voice completes by voice.
+	// Files are not consumed — the daemon's task.result push (screen flash)
+	// works on the same files independently; a seen-set prevents re-speaking.
+	const startResultsPoll = (since: number) => {
+		const dir = join(resolveWorkspace(), 'results');
+		const spoken = new Set<string>();
+		resultsPoll = setInterval(() => {
+			if (!session) return;
+			let names: string[] = [];
+			try { names = readdirSync(dir); } catch { return; }
+			for (const f of names) {
+				if (!/^task-wearable-.*\.txt$/.test(f) || spoken.has(f)) continue;
+				try {
+					if (statSync(join(dir, f)).mtimeMs < since) { spoken.add(f); continue; }
+					const body = readFileSync(join(dir, f), 'utf8').trim();
+					spoken.add(f);
+					if (!body) continue;
+					console.log(`${ts()} [session ${n}] speaking result ${f}`);
+					(session as any).notifyBackground(
+						`A delegated task just finished. Relay the result to the user in one or two spoken sentences: ${body}`,
+						{ priority: 'high' });
+				} catch { /* unreadable file — retry next pass is pointless; skip */ }
+			}
+		}, 2000);
 	};
 
 	ws.once('message', async (first: Buffer, isBinary: boolean) => {
 		try {
 			if (isBinary) throw new Error('first frame must be the {"open"} handshake');
 			const params = JSON.parse(first.toString()).open ?? {};
+			const device = params.device ?? {};   // transport-stamped, not client-supplied
 			session = new VoiceSession({
 				sessionId: `wearable_${Date.now()}_${n}`,
 				userId: 'wearable_user',
 				apiKey: GEMINI_API_KEY,
-				agents: [buildWearableAgent()],
+				agents: [buildWearableAgent(device)],
 				initialAgent: 'wearable',
 				port: bodhiPort,
 				host: '127.0.0.1',
@@ -153,12 +185,14 @@ async function handleSession(ws: WebSocket): Promise<void> {
 			bus?.subscribe?.('turn.end', () => { spokeThisTurn = false; sendState('listening'); });
 			bus?.subscribe?.('turn.interrupted', () => { spokeThisTurn = false; sendState('interrupted'); });
 			await (session as any).start();
-			console.log(`${ts()} [session ${n}] open (bodhi :${bodhiPort})`);
+			console.log(`${ts()} [session ${n}] open (bodhi :${bodhiPort}, `
+				+ `device ${device.label || '?'}${device.deviceId ? '/' + device.deviceId : ''})`);
 			// The {"ok"} ack MUST be the first text frame — the bridge handshake
 			// reads it before anything else; state comes after.
 			ws.send(JSON.stringify({ ok: true }));
 			sendState('listening');
 			try { (session as any).sendGreeting?.(); } catch { /* greeting is best-effort */ }
+			startResultsPoll(Date.now());
 		} catch (e) {
 			console.error(`${ts()} [session ${n}] open failed:`, e);
 			try { ws.send(JSON.stringify({ ok: false, error: String(e) })); } catch { /* */ }

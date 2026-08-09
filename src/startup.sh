@@ -971,6 +971,35 @@ else
   echo "  ✓ screen capture (already running)"
 fi
 
+# 5a. Sutando Server (SCP WSS :8787) + voice host (:8788) — the companion/
+# wearable chain. Opt-in via SUTANDO_SCP_WSS_ENABLE=1 in .env; the voice host
+# additionally needs GEMINI_API_KEY (voice.open fail-softs without it).
+if [ "${SUTANDO_SCP_WSS_ENABLE:-0}" = "1" ]; then
+  if ! lsof -i :8788 > /dev/null 2>&1; then
+    if [ -n "${GEMINI_API_KEY:-}" ]; then
+      echo "  Starting voice host (port 8788)..."
+      npx tsx src/voice-host.ts > "$LOGS_DIR/voice-host.log" 2>&1 &
+      echo "  ✓ voice host"
+    else
+      echo "  ⊘ voice host skipped — GEMINI_API_KEY not set"
+    fi
+  else
+    echo "  ✓ voice host (already running)"
+  fi
+  if ! lsof -i "${SUTANDO_SCP_WSS_PORT:-8787}" > /dev/null 2>&1; then
+    if [ -n "$PY" ]; then
+      echo "  Starting Sutando Server (SCP WSS :${SUTANDO_SCP_WSS_PORT:-8787})..."
+      SUTANDO_VOICE_HOST_URL="${SUTANDO_VOICE_HOST_URL:-http://127.0.0.1:8788}" \
+        "$PY" src/runtime-api/server.py > "$LOGS_DIR/runtime-api.log" 2>&1 &
+      echo "  ✓ sutando server"
+    else
+      echo "  ⊘ sutando server skipped — no runnable python3"
+    fi
+  else
+    echo "  ✓ sutando server (already running)"
+  fi
+fi
+
 # 5a-bis. Portfolio + research dashboard (port 8899) — idempotent self-guard.
 # Serves the research webapp with the live (read-only) portfolio panel and keeps
 # its snapshot fresh via a background refresher daemon. No-op if not initialised.

@@ -138,6 +138,7 @@ class WsTransport:
             if dev is not None:
                 return {"kind": "device", "token": tok,
                         "device_id": dev.get("device_id"),
+                        "label": dev.get("label"),
                         "grants": frozenset(dev.get("granted_methods", ()))}
         if self.token and hmac.compare_digest(tok, self.token):
             # shared read-only bearer — includes the streaming subscribe
@@ -203,6 +204,15 @@ class WsTransport:
                             "jsonrpc": "2.0", "method": ev["method"],
                             "params": params_out}))
 
+                # Server-stamped device identity (overwrites any client-supplied
+                # key — the resolved credential, not the request, names the
+                # device) so downstream consumers can attribute the session.
+                params = dict(params)
+                if auth["kind"] == "device":
+                    params["device"] = {"deviceId": auth.get("device_id"),
+                                        "label": auth.get("label")}
+                else:
+                    params.pop("device", None)
                 opened = self._voice.open(params, _send_media, _send_event)
                 sid_box.append(opened["streamId"])
                 streams.add(opened["streamId"])
