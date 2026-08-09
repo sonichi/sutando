@@ -1,0 +1,171 @@
+<!doctype html>
+<!-- Sutando web companion — a minimal phone-browser SCP client.
+     Served by the Server itself (GET /companion) so it shares the WSS origin.
+     Auth: paste a pairing token (one-time; auto-redeems to a device credential
+     stored in localStorage) or an existing credential. No CDN, no build. -->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Sutando</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: #0b0d10; color: #e8eaed; font: 16px/1.45 -apple-system, system-ui, sans-serif;
+         max-width: 560px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 18px; letter-spacing: .12em; text-align: center; margin: 8px 0 2px; }
+  .sub { text-align: center; color: #9aa0a6; font-size: 12px; margin-bottom: 14px; }
+  .card { background: #14171c; border: 1px solid #23272f; border-radius: 14px; padding: 14px; margin: 10px 0; }
+  .dot { width: 14px; height: 14px; border-radius: 50%; display: inline-block; margin-right: 8px;
+         background: #5f6368; vertical-align: -1px; }
+  .dot.on { background: #34d399; } .dot.off { background: #f87171; } .dot.busy { background: #fbbf24; }
+  #state { font-weight: 700; letter-spacing: .08em; }
+  #step { color: #9aa0a6; font-size: 13px; margin-top: 4px; min-height: 18px; }
+  input, textarea, button { font: inherit; border-radius: 10px; border: 1px solid #2c313a;
+         background: #0f1216; color: #e8eaed; padding: 10px 12px; width: 100%; }
+  button { background: #2563eb; border: 0; font-weight: 600; margin-top: 8px; cursor: pointer; }
+  button.secondary { background: #23272f; }
+  button.approve { background: #059669; width: 49%; } button.reject { background: #b91c1c; width: 49%; }
+  .row { display: flex; gap: 2%; }
+  #feed { font-size: 13px; max-height: 42vh; overflow-y: auto; }
+  .evt { padding: 6px 8px; border-left: 3px solid #2c313a; margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+  .evt.result { border-color: #34d399; } .evt.act { border-color: #4b5563; color: #9aa0a6; }
+  .evt.req { border-color: #fbbf24; background: #1c1a12; }
+  .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: #9aa0a6; margin-bottom: 6px; }
+  #authcard.hidden, .hidden { display: none; }
+</style>
+</head>
+<body>
+<h1>SUTANDO</h1>
+<div class="sub" id="agent">&nbsp;</div>
+
+<div class="card" id="authcard">
+  <div class="lbl">Connect</div>
+  <input id="token" placeholder="pairing token or device credential" autocomplete="off">
+  <button onclick="connect()">Connect</button>
+  <div id="autherr" style="color:#f87171;font-size:13px;margin-top:6px;"></div>
+</div>
+
+<div class="card hidden" id="statuscard">
+  <div><span class="dot" id="dot"></span><span id="state">OFFLINE</span></div>
+  <div id="step"></div>
+</div>
+
+<div class="card hidden" id="askcard">
+  <div class="lbl">Ask / assign</div>
+  <textarea id="task" rows="2" placeholder="Tell Sutando what to do…"></textarea>
+  <button onclick="submitTask()">Send</button>
+</div>
+
+<div class="card hidden" id="feedcard">
+  <div class="lbl">Live</div>
+  <div id="feed"></div>
+</div>
+
+<script>
+'use strict';
+let ws = null, rpcId = 0, pend = {};
+const $ = id => document.getElementById(id);
+const wsUrl = t => (location.protocol === 'https:' ? 'wss://' : 'ws://')
+                 + location.host + '/scp?token=' + encodeURIComponent(t);
+
+function rpc(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'w' + (++rpcId);
+    pend[id] = { res, rej };
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params: params || {} }));
+    setTimeout(() => { if (pend[id]) { pend[id].rej(new Error('timeout')); delete pend[id]; } }, 15000);
+  });
+}
+
+function feed(cls, text) {
+  const d = document.createElement('div');
+  d.className = 'evt ' + cls; d.textContent = text;
+  $('feed').prepend(d);
+  while ($('feed').children.length > 60) $('feed').lastChild.remove();
+}
+
+function approvalCard(p) {
+  const d = document.createElement('div');
+  d.className = 'evt req';
+  d.textContent = '⚠ ' + (p.requestType || 'request') + ': ' + (p.action || p.question || '')
+                + (p.reason ? ' — ' + p.reason : '');
+  const row = document.createElement('div'); row.className = 'row'; row.style.marginTop = '8px';
+  for (const dec of ['approve', 'reject']) {
+    const b = document.createElement('button');
+    b.className = dec; b.textContent = dec === 'approve' ? 'Approve' : 'Reject';
+    b.onclick = async () => {
+      try {
+        const r = await rpc('approval.respond', { requestId: p.requestId, decision: dec });
+        d.textContent = '✔ ' + (p.action || '') + ' → ' + r.status; row.remove();
+      } catch (e) { b.textContent = 'not permitted'; b.disabled = true; }
+    };
+    row.appendChild(b);
+  }
+  d.appendChild(row); $('feed').prepend(d);
+}
+
+function setState(s, cls) { $('state').textContent = s; $('dot').className = 'dot ' + (cls || ''); }
+
+async function onOpen(token) {
+  localStorage.setItem('scp_credential', token);
+  $('authcard').classList.add('hidden');
+  for (const id of ['statuscard', 'askcard', 'feedcard']) $(id).classList.remove('hidden');
+  try { const i = await rpc('sutando.info'); $('agent').textContent = i.agentId || ''; } catch (e) {}
+  try { await rpc('client.hello', { device_type: 'web', capabilities: ['display', 'touch'] }); } catch (e) {}
+  try {
+    const st = await rpc('sutando.status');
+    setState((st.status || 'unknown').toUpperCase(), st.status === 'running' ? 'on' : 'busy');
+    $('step').textContent = st.step || '';
+  } catch (e) { setState('UNKNOWN', 'busy'); }
+  try { await rpc('task.subscribe', { results: true, activity: true, requests: true }); } catch (e) {}
+}
+
+function onMessage(ev) {
+  let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+  if (m.id && pend[m.id]) {
+    const p = pend[m.id]; delete pend[m.id];
+    m.error ? p.rej(new Error(m.error.message || 'error')) : p.res(m.result);
+    return;
+  }
+  const p = m.params || {};
+  if (m.method === 'task.result') feed('result', '✔ ' + (p.taskId || '') + '\n' + (p.result || '').slice(0, 400));
+  else if (m.method === 'activity') { $('step').textContent = p.step || ''; feed('act', '⚙ ' + (p.step || '')); }
+  else if (m.method === 'request.pending') approvalCard(p);
+}
+
+// Robust auth flow: always try pair.redeem first; if it fails (this is already
+// a device credential, which cannot redeem), fall through to normal use.
+async function onOpenSmart(token) {
+  let redeemed = null;
+  try { redeemed = await rpc('pair.redeem', { label: 'web-companion' }); } catch (e) { /* not a pairing token */ }
+  if (redeemed && redeemed.credential) {
+    localStorage.setItem('scp_credential', redeemed.credential);
+    ws.close();
+    setTimeout(() => start(redeemed.credential), 300);
+    return;
+  }
+  await onOpen(token);
+}
+
+function start(token) {
+  try { if (ws) ws.close(); } catch (e) {}
+  ws = new WebSocket(wsUrl(token));
+  ws.onopen = () => onOpenSmart(token);
+  ws.onmessage = onMessage;
+  ws.onclose = () => setState('OFFLINE', 'off');
+  ws.onerror = () => { $('autherr').textContent = 'connection failed — check the token / network'; };
+}
+
+function connect() { const t = $('token').value.trim(); if (t) start(t); }
+function submitTask() {
+  const t = $('task').value.trim(); if (!t) return;
+  rpc('task.submit', { task: t }).then(r => { feed('act', '→ submitted ' + r.taskId); $('task').value = ''; })
+    .catch(e => feed('act', '✗ ' + e.message));
+}
+
+const saved = localStorage.getItem('scp_credential');
+if (saved) { $('token').value = saved; start(saved); }
+</script>
+</body>
+</html>

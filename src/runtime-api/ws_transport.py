@@ -26,6 +26,7 @@ SUTANDO_SCP_WSS_ENABLE) so UDS-only deployments are unchanged.
 from __future__ import annotations
 
 import hmac
+from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
@@ -289,9 +290,20 @@ class WsTransport:
             return
         self._voice.on_audio(stream_id, payload)
 
+    async def _companion(self, _request: web.Request):
+        """The web-companion page — a phone-browser SCP client served from the
+        same origin as the WSS endpoint. The static page carries no secrets and
+        needs no auth; its WebSocket authenticates with the user's token."""
+        page = Path(__file__).with_name("companion.html")
+        try:
+            return web.Response(text=page.read_text(), content_type="text/html")
+        except OSError:
+            return web.Response(status=404, text="companion page not installed")
+
     def build_app(self) -> web.Application:
         app = web.Application()
         app.router.add_get(self.route, self._handle)
+        app.router.add_get("/companion", self._companion)
         return app
 
     # ── lifecycle (runs on the daemon's asyncio loop, non-blocking) ──────────
