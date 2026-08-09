@@ -17,8 +17,8 @@ Slack and Telegram each hand-rolled a naive `range(0, len, N)` byte-slice, so:
 
 Pure functions only — no I/O, no bridge state — so any delivery path can adopt
 it without coupling. `chunk_message` is the single source of truth; the Discord
-bridge keeps its `_chunk_for_discord(text)` name as a thin `max_len=1900` alias
-so its call sites and byte-for-byte output are unchanged.
+bridge uses it beneath its network-facing delivery budget while retaining a
+lossless private alias for golden reassembly tests.
 """
 
 from __future__ import annotations
