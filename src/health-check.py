@@ -5893,12 +5893,8 @@ def bridge_log_content_status(name: str, status: str, tail: list[str],
       Event Subscriptions clearly ARE enabled and it's a stale false alarm.
     telegram-bridge: a 409 Conflict is a competing getUpdates poller splitting
       updates. Only counts if no message arrived after the last conflict.
-      It also overrides the stale-HEARTBEAT warn specifically, because the
-      heartbeat advances only on a poll Telegram accepted, so a sustained 409 is
-      what makes it stale. NOT every warn: the call site also warns for a stale
-      LOG and a dead log inode, and replacing those would state an active
-      conflict on evidence that is merely old — so `detail` is what tells them
-      apart.
+      Overrides the stale-HEARTBEAT warn too, since the heartbeat only advances on
+      an accepted poll; `detail` keeps stale-LOG and dead-inode warns intact.
     """
     if name == "discord-bridge":
         if any("LoginFailure" in ln or "Improper token" in ln for ln in tail):
