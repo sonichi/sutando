@@ -103,18 +103,29 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("GUI /login", m)
         self.assertNotIn("reply here or open the app", m)
 
-    def test_non_login_blocker_keeps_reply_here_remedy(self):
+    def test_non_login_blocker_names_the_cli_terminal(self):
+        """A `blocked-human` prompt waits on the core's stdin. Neither a chat reply
+        nor the app can answer it, so the remedy must name the terminal."""
         sig = {"state": "blocked-human", "detail": "awaiting user: selection",
                "prompt": "pick one", "kind": "selection"}
         m = compose_message(sig)
-        self.assertIn("reply here or open the app to resolve.", m)
+        self.assertIn("CLI terminal", m)
+        self.assertIn("sutando-core", m)
+        self.assertNotIn("reply here", m)
+        self.assertNotIn("open the app to resolve", m)
         self.assertNotIn("GUI /login", m)
 
     def test_truncates_long_prompt(self):
-        big = {"state": "blocked-human", "detail": "awaiting user: unknown",
-               "prompt": "x" * 500, "kind": "unknown"}
-        m = compose_message(big)
-        self.assertLess(len(m), 260)
+        """The prompt ECHO is bounded; the remedy is not. A 500-char prompt must
+        not reach the message, and the bound holds for BOTH remedy branches —
+        the login branch was previously only tested with a short prompt, so its
+        long-prompt case exceeded this bound unnoticed."""
+        for state, kind in (("blocked-human", "unknown"), ("logged-out", "login")):
+            big = {"state": state, "detail": "awaiting user: unknown",
+                   "prompt": "x" * 500, "kind": kind}
+            m = compose_message(big)
+            self.assertNotIn("x" * 130, m, f"{state}: prompt echo not truncated")
+            self.assertLess(len(m), 400, f"{state}: message too long")
 
     def test_kind_appended_when_not_in_detail(self):
         sig = {"state": "blocked-human", "detail": "the core is waiting",

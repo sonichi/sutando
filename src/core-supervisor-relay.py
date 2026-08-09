@@ -95,14 +95,22 @@ def compose_message(signal: dict) -> str:
         parts.append(f"({kind})")
     msg = " ".join(parts)
     if excerpt:
-        msg += f": {excerpt[:160]}"
+        # The remedy is the actionable half, so it keeps its length; the prompt
+        # echo is what gives way to stay inside the message-length bound.
+        msg += f": {excerpt[:110]}"
     if _is_login_class(signal):
         host = platform.node().split(".")[0] or "the host"
         msg += (f" — needs GUI /login on {host}: open Terminal there, run"
                 " `bash src/restart.sh` from the repo, then complete /login."
                 " A chat reply can't resolve this.")
     else:
-        msg += " — reply here or open the app to resolve."
+        # `blocked-human` is a CLI prompt waiting on stdin. Neither route the old
+        # text offered can answer it: no consumer turns a chat reply into a prompt
+        # answer, and the app's only core levers are a restart intent and a fixed
+        # `watcher` keystroke — restarting discards the in-flight work.
+        host = platform.node().split(".")[0] or "the host"
+        msg += (f" — answer it at the core's CLI terminal on {host}"
+                " (tmux `sutando-core`). A chat reply can't answer it.")
     return msg
 
 
