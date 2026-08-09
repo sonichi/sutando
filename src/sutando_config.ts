@@ -370,12 +370,20 @@ export function resolveVault(repoRoot?: string): VaultConfig {
 	const sync = (vault.sync as { [k: string]: Json } | undefined) ?? {};
 	const includeRaw = sync.include;
 	const excludeRaw = sync.exclude;
+	const strings = (v: Json | undefined): string[] =>
+		Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+	// `exclude_extra` APPENDS (deep-merge replaces lists, so a local `exclude`
+	// override silently drops the shipped carve-outs). Must match resolve_vault().
+	const exclude = strings(excludeRaw);
+	for (const p of strings(sync.exclude_extra)) {
+		if (!exclude.includes(p)) exclude.push(p);
+	}
 	return {
 		enabled: typeof vault.enabled === 'boolean' ? vault.enabled : false,
 		remote_url: typeof vault.remote_url === 'string' ? vault.remote_url : '',
 		sync: {
-			include: Array.isArray(includeRaw) ? includeRaw.filter((v): v is string => typeof v === 'string') : [],
-			exclude: Array.isArray(excludeRaw) ? excludeRaw.filter((v): v is string => typeof v === 'string') : [],
+			include: strings(includeRaw),
+			exclude,
 		},
 		interval_seconds: typeof vault.interval_seconds === 'number' ? vault.interval_seconds : 1800,
 	};

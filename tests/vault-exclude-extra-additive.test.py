@@ -13,6 +13,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("sutando_config", REPO / "src" / "sutando_config.py")
@@ -31,7 +32,7 @@ def check(label, cond, extra=""):
         print(f"  FAIL {label}  {extra}")
 
 
-def _resolve(shipped: dict, local: dict | None):
+def _resolve(shipped: dict, local: Optional[dict]):
     """resolve_vault() against a throwaway repo root, never the real config."""
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)

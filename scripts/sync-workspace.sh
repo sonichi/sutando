@@ -41,11 +41,8 @@
 # script goes on printing "pushed to <branch>" on every run. To add an INCLUDE
 # path you must restate the full carrier set.
 #
-# `exclude` has an additive twin: `vault.sync.exclude_extra` appends instead of
-# replacing, so a clone can add a carve-out and keep the shipped ones. Use it
-# rather than restating `exclude`, which silently drops the shipped denies.
-# `include` has no such key on purpose — it is the whitelist, and unioning it
-# would widen what the vault carries.
+# `vault.sync.exclude_extra` appends instead of replacing — use it rather than
+# restating `exclude`. No `include_extra`: unioning a whitelist widens the vault.
 #
 # `exclude` subtracts, carving subpaths out of an included parent (emitted after
 # the includes so gitignore's last-match-wins applies).

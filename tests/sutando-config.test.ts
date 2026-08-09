@@ -326,6 +326,55 @@ describe('sutando_config loader', () => {
 		}
 	});
 
+	// exclude_extra must resolve IDENTICALLY here and in resolve_vault(). This file
+	// is the twin of sutando_config.py, so a key implemented on one side only makes
+	// the same config mean different things to a TS caller and a Python caller.
+	it('resolveVault appends exclude_extra without dropping the shipped excludes', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			vault: { enabled: true, sync: { include: ['notes/'], exclude: ['tasks/', 'results/'] } },
+		});
+		writeConfig(repo, 'sutando.config.local.json', {
+			vault: { sync: { exclude_extra: ['notes/generated/', 'notes/media/'] } },
+		});
+		try {
+			const vault = resolveVault(repo);
+			// shipped denies FIRST — gitignore is last-match-wins
+			assert.deepEqual(vault.sync.exclude,
+				['tasks/', 'results/', 'notes/generated/', 'notes/media/']);
+			assert.equal((vault.sync as Record<string, unknown>).exclude_extra, undefined);
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('resolveVault de-duplicates an exclude_extra path already shipped', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			vault: { enabled: true, sync: { include: ['notes/'], exclude: ['tasks/'] } },
+		});
+		writeConfig(repo, 'sutando.config.local.json', {
+			vault: { sync: { exclude_extra: ['tasks/', 'notes/media/'] } },
+		});
+		try {
+			assert.deepEqual(resolveVault(repo).sync.exclude, ['tasks/', 'notes/media/']);
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('resolveVault keeps include REPLACING — no include_extra widening', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			vault: { enabled: true, sync: { include: ['notes/', 'hosts/*/'], exclude: [] } },
+		});
+		writeConfig(repo, 'sutando.config.local.json', {
+			vault: { sync: { include: ['only/'] } },
+		});
+		try {
+			assert.deepEqual(resolveVault(repo).sync.include, ['only/']);
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
 	// ------------------------------------------------------------------ //
 	//  Bonus: detectEnvWorkspaceInDotenv                                  //
 	// ------------------------------------------------------------------ //

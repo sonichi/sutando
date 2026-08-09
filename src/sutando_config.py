@@ -443,9 +443,8 @@ def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     extra = sync.pop("exclude_extra", None)
     if extra:
         base = list(sync.get("exclude") or [])
-        # Order is load-bearing: gitignore is last-match-wins, and appending
-        # keeps every shipped deny ahead of the added ones. De-duplicated so a
-        # clone restating a shipped path cannot emit it twice.
+        # Order is load-bearing: gitignore is last-match-wins, so appending keeps
+        # every shipped deny ahead of the added ones. De-duplicated.
         for p in extra:
             if p not in base:
                 base.append(p)
