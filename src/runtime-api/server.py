@@ -185,6 +185,59 @@ class RuntimeServer:
         return [r["requestType"] for r in self.store.pending()
                 if r.get("taskId") == task_id]
 
+    # ── LAN WSS transport (SCP over the network — opt-in) ────────────────────
+    def _wss_token(self) -> str:
+        """Resolve the bearer token: env wins, else a durable per-host token
+        under state/auth/ (survives transient-state cleanup, like the other
+        auth material there); generate + persist 0600 on first use."""
+        env = os.environ.get("SUTANDO_SCP_WSS_TOKEN")
+        if env:
+            return env
+        if not self._state_dir:
+            import secrets  # noqa: PLC0415
+            return secrets.token_urlsafe(32)  # ephemeral — no place to persist
+        auth_dir = Path(self._state_dir) / "auth"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(auth_dir, 0o700)
+        tok_path = auth_dir / "scp-wss.token"
+        try:
+            tok = tok_path.read_text().strip()
+            if tok:
+                return tok
+        except OSError:
+            pass
+        import secrets  # noqa: PLC0415
+        tok = secrets.token_urlsafe(32)
+        tok_path.write_text(tok)
+        os.chmod(tok_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        _log(f"generated SCP WSS token at {tok_path}")
+        return tok
+
+    async def _maybe_start_wss(self):
+        """Start the LAN WSS transport iff SUTANDO_SCP_WSS_ENABLE is truthy.
+        Best-effort: any failure here must NOT stop the UDS daemon from
+        serving. Returns the transport (for cleanup) or None."""
+        if (os.environ.get("SUTANDO_SCP_WSS_ENABLE") or "").lower() not in (
+                "1", "true", "yes", "on"):
+            return None
+        try:
+            from ws_transport import WsTransport  # noqa: PLC0415
+            host = os.environ.get("SUTANDO_SCP_WSS_HOST") or "127.0.0.1"
+            try:
+                port = int(os.environ.get("SUTANDO_SCP_WSS_PORT") or "8787")
+            except ValueError:
+                port = 8787
+            wss = WsTransport(self.dispatcher, token=self._wss_token(),
+                              host=host, port=port, log=_log)
+            await wss.start()
+            if host not in ("127.0.0.1", "localhost", "::1"):
+                _log(f"SCP WSS is LAN-exposed on {host}:{port} "
+                     f"(bearer-gated, read-only method set)")
+            return wss
+        except Exception as e:  # noqa: BLE001
+            _log(f"SCP WSS start failed (non-fatal, UDS unaffected): {e}")
+            return None
+
     # ── transport ──────────────────────────────────────────────────────────
     async def client(self, reader: asyncio.StreamReader,
                      writer: asyncio.StreamWriter) -> None:
@@ -378,11 +431,16 @@ class RuntimeServer:
         self.dispatcher.recover()
         self._register_instance()
         _log(f"listening on {sp} (actor={self.actor_id})")
-        async with server:
-            await asyncio.gather(server.serve_forever(),
-                                 self.dispatcher.resolver_loop(),
-                                 self._results_watcher(),
-                                 self._activity_watcher())
+        wss = await self._maybe_start_wss()
+        try:
+            async with server:
+                await asyncio.gather(server.serve_forever(),
+                                     self.dispatcher.resolver_loop(),
+                                     self._results_watcher(),
+                                     self._activity_watcher())
+        finally:
+            if wss is not None:
+                await wss.cleanup()
 
 
 def main() -> None:
